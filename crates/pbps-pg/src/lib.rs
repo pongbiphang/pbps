@@ -24,6 +24,8 @@ use std::borrow::Cow;
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
+pub mod catalog;
+pub mod introspect;
 mod types;
 
 /// A part of the dialect that Phase 5 has not built yet.

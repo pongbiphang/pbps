@@ -4266,3 +4266,176 @@ SPEC is in sync with all of these.
     the declarations and the ids file and so is in neither `appeared` nor
     `disappeared`. A test pins that, so nobody widens the guard onto a case
     that is covered.
+247. **A catalog row of a kind the reader does not know is reported, never
+    folded into the nearest kind it does.** `pg_constraint.contype` is an open
+    set at the engine's end, and PostgreSQL 18 proved it: every `NOT NULL` now
+    has a constraint row of kind `n`. A reader that had parsed the characters it
+    knew into an enum and let the rest fall through to "a check" would have
+    started reporting one phantom check per `NOT NULL` column on an engine
+    upgrade — and the differ would have planned to drop each one. So the kind
+    travels as the engine's own character, the assembler matches the kinds it
+    holds, and anything else becomes a named limitation carrying the
+    constraint's own definition. The cost is a warning on a database using a
+    feature pbps does not manage; the alternative is a plan against a phantom.
+
+248. **A foreign key whose referential action the model cannot spell is left
+    out and named, not read back as the nearest action it can.** PostgreSQL has
+    `RESTRICT` and `ReferentialAction` does not. The two are close enough to
+    tempt: `NO ACTION` and `RESTRICT` both refuse the delete. They are not the
+    same — `NO ACTION` is checked at the end of the statement and can be
+    deferred, `RESTRICT` fires immediately — so a pull that folded one into the
+    other would let a plan replace a key's behaviour while reporting no change
+    at all. The key is therefore absent from the pull and present in the
+    warnings, which is the shape every other unexpressible fact takes here.
+
+249. **A foreign key's referenced columns are read out of
+    `pg_get_constraintdef`, not resolved with a second catalog join.**
+    `confkey` holds attnums on the *referenced* table, which the constrained
+    table's attnum map cannot answer for. Resolving them properly means another
+    join, and it would put the answer inside the query file — where no test can
+    reach it without a server. The definition already spells them and its shape
+    is fixed, so the assembler parses it there, in the pure half, and refuses
+    the parse when the column count disagrees with `confkey`. A misparse
+    becomes a named limitation rather than a foreign key over the wrong
+    columns.
+
+250. **The whole catalog read is one `REPEATABLE READ READ ONLY` transaction,
+    and the canonical search path is set inside it.** Five autocommit
+    statements are five snapshots. A table dropped between the tables query and
+    the columns query comes back as a live table with no columns — which
+    assembles cleanly, compares as a table whose every column was deleted, and
+    plans accordingly; nothing about it looks like a failure. One snapshot
+    makes the five reads unable to disagree about what exists. `READ ONLY` is
+    the engine enforcing what a comment would otherwise only promise (measured:
+    `cannot execute CREATE TABLE in a read-only transaction`). And the path is
+    set with `is_local`, so **ending** the transaction restores it — measured on
+    `COMMIT` and on `ROLLBACK` alike. That is the difference between handling
+    "a read failed halfway and left the session changed" and making it
+    unrepresentable.
+
+251. **A property of an object the model cannot hold means the object is left
+    out; a fact about the rows already there means it is carried.** Both are
+    named either way, and the line decides which way the resulting plan is
+    wrong. `RESTRICT`, `DEFERRABLE`, a `gin` index: carried, each compares
+    equal to an object that behaves differently, so a plan reports no change
+    while the behaviour stays wrong — the failure this tool exists to prevent.
+    Left out, the plan tries to create something that is already there and
+    fails on apply, loudly, with the warning saying why. `NOT VALID` is the
+    other kind: the constraint itself is exactly what the model says, and what
+    recreating it changes is which rows get checked. Carried and named, that is
+    a plan that may fail on apply rather than one that lies.
+
+252. **A foreign key's referenced columns are resolved against the referenced
+    table's own columns, which the pull already has. Supersedes 249.** That
+    entry chose to parse them out of `pg_get_constraintdef`, on the grounds that
+    `confkey` names attnums on the *other* table and a second catalog join would
+    put the answer where no test can reach it. The parse is wrong on a legal
+    name: `FOREIGN KEY (x, y) REFERENCES q(x, "a)b")` stops at the `)` inside
+    the quoted identifier, produces two items, passes its own count check
+    against `confkey`, and records the column `"a`. The count check was the
+    guard, and it agreed with the wrong answer. What 249 missed is that the
+    columns of every table in the pull are already in the assembler: no parse,
+    no second query, and an attnum with nothing behind it is the same named
+    limitation as everywhere else.
+
+253. **A pull inside the caller's own transaction is refused, not
+    accommodated.** PostgreSQL does not nest transactions: inside an open one a
+    plain `BEGIN` is a warning, so the `COMMIT` that ends a successful read
+    would commit whatever the caller had written, while the `REPEATABLE READ
+    READ ONLY` snapshot 250 exists for was never established. A savepoint would
+    give back the framing but not the meaning — a read inside somebody's
+    transaction answers from their uncommitted writes, which is not what "what
+    the database looks like" is. So the pull asks first and refuses.
+
+    The asking is a `SET LOCAL` on a custom GUC, read back in a second
+    statement: a local setting outlives its own statement only inside a
+    transaction block. Every cheaper question was measured and reads the same in
+    both states **through this driver** — `xact_start = query_start` and
+    `transaction_timestamp() = statement_timestamp()` are both false even
+    outside a transaction, because the extended query protocol opens the
+    implicit transaction before the statement's own clock starts. Measured with
+    `psql`, which speaks the simple protocol, both looked like reliable
+    detectors.
+
+254. **The pull's canonical scope pins how values print, not only how names
+    do.** 250 set `search_path` empty so that a rendered name does not depend on
+    the reader's session. The expressions this pull carries are carried verbatim
+    (ADR-0013 §4), and the same argument applies to every setting the deparser
+    consults: measured on 18.6, `quote_all_identifiers` turns `id > 0` into
+    `"id" > 0`, `DateStyle` turns `'2020-01-02'::date` into `'02.01.2020'::date`,
+    `TimeZone` moves a `timestamptz` default to another wall clock,
+    `IntervalStyle` turns `'1 day 02:00:00'` into `'1 2:00:00'`, and
+    `bytea_output` turns `'\x0102'` into `'\\001\\002'`. Two operators with
+    different sessions would otherwise see drift on an unchanged database, and a
+    plan would rebuild every constraint and index it touched.
+
+    `extra_float_digits` is pinned on the same argument without a case that
+    demonstrated it. `lc_monetary` is deliberately **not**: it belongs to the
+    same class, and `SET` fails outright on a locale the server does not have,
+    which would turn a readable database into an unreadable one for a difference
+    nobody has yet shown.
+
+255. **A name is round-tripped through the declaration format, not checked
+    against a rule.** `TableName` is written `schema.name` and read back by
+    splitting on every `.`; `ColumnRef` the same with three parts. PostgreSQL
+    will hand out a schema called `"a.b"`, and then a pull that succeeded
+    produces a schema whose own file does not load — or worse, one where
+    `a.b` + `t` and `a` + `b.t` write to the same key. The pull performs the
+    round trip on every table name and every column name it is about to record,
+    and a name that does not survive takes its whole table out with a warning.
+
+    Performing it rather than validating against a list of forbidden characters:
+    the format is what decides, the format changes, and a rule written here
+    would be a second opinion that can fall out of step with it. The whole table
+    goes, not the offending column, because a table missing one column is a
+    table a plan would add it to.
+
+256. **The foreign keys are assembled in a second pass, after everything that
+    could take their uniqueness away.** A foreign key is legal only against a
+    unique index on the referenced table, and `conindid` says which one. That
+    index may not reach the pull — its key constraint carries an `INCLUDE`
+    payload, or is `NULLS NOT DISTINCT`, or is deferrable, or any of the other
+    reasons 251 leaves an object out — and a key recorded against it describes a
+    schema that cannot be built: adding the key back fails for want of a
+    uniqueness nothing mentions.
+
+    Whether it survived is not knowable from the constraint's own row, only from
+    what the constraint and index arms did, so the arms report it: they return
+    whether they recorded the object, and the foreign keys run afterwards
+    against the set that did. Asking the arms rather than re-deriving the
+    predicates, because a second copy of "which indexes this file refuses" is a
+    second opinion that can fall out of step with the first.
+
+    This is the third time in this file that a decision was reachable through a
+    map built before the decision was made — 252's `confkey`, round 8's refused
+    table, and this. The shape is in PITFALLS.
+
+257. **The pull's own SQL carries no backslash escape.** 254 pins the settings
+    that decide how the engine *prints* an answer. This is the other direction:
+    `standard_conforming_strings` decides how the engine *reads* the query's own
+    string literals, and with it off a backslash in an ordinary literal is
+    consumed — measured, with a warning nothing here reads. `'pg\_%'` becomes
+    the pattern `pg_%`, its `_` becomes a wildcard, and a project's schema
+    called `pga` disappears from the pull, which is a plan that creates tables
+    that are already there.
+
+    The setting is now pinned in the canonical scope, and no query depends on
+    that having worked: the schema filter is `left(nspname, 3) <> 'pg_'`, and a
+    test asserts that no query contains a backslash at all. A filter with no
+    escape in it cannot be read two ways, which is worth more than a filter that
+    is correct as long as a `SET` succeeded.
+
+258. **The declaration round trip asks for the same value, not for a value.**
+    255 made the pull perform the round trip rather than reason about it, and
+    the first version of it for a column's type asked the wrong question: does
+    the spelling parse. Measured, `bit(3)` is a legal type this catalogue does
+    not hold, so it is stored opaque — the base `bit(3)` with no arguments — and
+    it writes out as `bit(3)` and parses back as the base `bit` with the
+    argument `3`. That parses, and it is a different type: a schema written and
+    reloaded is not the schema that was pulled, and wherever equality falls back
+    to the raw spelling it is a difference no plan can act on.
+
+    The check is now `render, parse, compare equal`, and it is asked of the
+    value the column will actually be recorded with — one function decides that
+    value for both the guard and the construction, because a check on something
+    *like* what is stored is a check on nothing.

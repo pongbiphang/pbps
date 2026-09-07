@@ -1029,3 +1029,930 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
         .await
         .expect("drop");
 }
+
+// ---------------------------------------------------------------------------
+// Introspection (Phase 5 step 3)
+// ---------------------------------------------------------------------------
+
+/// A schema of this test's own.
+///
+/// The process id keeps two runs against the shared container apart, and the
+/// caller's own name keeps the tests in *this* run apart: they run in parallel
+/// by default, and `build` drops the schema it is about to create.
+fn probe_schema(test: &str) -> String {
+    format!("pbps_pull_{}_{test}", std::process::id())
+}
+
+async fn build(conn: &mut Conn, schema: &str, body: &str) {
+    conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .expect("drop the probe schema");
+    conn.execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("create the probe schema");
+    for statement in body.split(";\n") {
+        if statement.trim().is_empty() {
+            continue;
+        }
+        conn.execute(statement)
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+}
+
+/// A pull, retried while another test in this same run is applying DDL.
+///
+/// The suite is its own concurrent writer: these tests run in parallel and each
+/// builds and drops a schema. A pull taken across another's `DROP` fails by
+/// design — `pg_get_constraintdef` reads through the syscache rather than the
+/// transaction's snapshot, so the object it is rendering can be gone. That is
+/// the guard firing, not a defect, and the assertion here is that it fires with
+/// the message that says so rather than as a bare driver error.
+async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
+    for _ in 0..4 {
+        match pbps_pg::catalog::introspect(conn).await {
+            Ok(pulled) => return pulled,
+            Err(e) => {
+                assert!(
+                    e.to_string()
+                        .contains("the catalog changed while it was being read"),
+                    "the pull failed for a reason this suite does not cause: {e}"
+                );
+            }
+        }
+    }
+    panic!("four pulls in a row were taken across another test's DDL");
+}
+
+/// The limitations this suite's own schema earned.
+///
+/// Scoped for the same reason as [`ours`]: the container is shared, and a bare
+/// `limitations.is_empty()` asserts something about every other session's
+/// tables as well — which is a test that passes or fails on what somebody else
+/// left behind.
+fn ours_limitations<'a>(
+    pulled: &'a pbps_pg::introspect::Pulled,
+    schema: &str,
+) -> Vec<&'a pbps_pg::introspect::Limitation> {
+    pulled
+        .limitations
+        .iter()
+        .filter(|l| l.table.schema == schema)
+        .collect()
+}
+
+/// Only this suite's own schema, so that another session's tables in the same
+/// container cannot decide whether an assertion holds.
+fn ours(pulled: &pbps_pg::introspect::Pulled, schema: &str) -> Vec<pbps_model::TableName> {
+    let mut names: Vec<_> = pulled
+        .schema
+        .tables
+        .keys()
+        .filter(|t| t.schema == schema)
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// The whole of step 3 in one table: every field the model holds, compared
+/// against what was written rather than against what this code believes it
+/// wrote.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_table_built_by_hand_reads_back_field_by_field() {
+    let mut conn = connect().await;
+    let s = probe_schema("fields");
+    build(
+        &mut conn,
+        &s,
+        &format!(
+            "CREATE TABLE {s}.parent (
+                 id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 code varchar(10) NOT NULL,
+                 CONSTRAINT parent_code_uq UNIQUE (code)
+             );
+             CREATE TABLE {s}.child (
+                 id bigint NOT NULL,
+                 parent_id integer NOT NULL,
+                 gone text,
+                 label varchar NOT NULL DEFAULT 'x',
+                 amount numeric(10,2) DEFAULT 0,
+                 kind char(4),
+                 note text,
+                 CONSTRAINT child_pk PRIMARY KEY (id, parent_id),
+                 CONSTRAINT child_amount_ck CHECK (amount >= 0),
+                 CONSTRAINT child_fk FOREIGN KEY (parent_id)
+                     REFERENCES {s}.parent (id) ON DELETE CASCADE
+             );
+             ALTER TABLE {s}.child DROP COLUMN gone;
+             CREATE INDEX child_note_ix ON {s}.child (note DESC, label)
+                 INCLUDE (kind) WHERE note IS NOT NULL"
+        ),
+    )
+    .await;
+
+    let pulled = pull(&mut conn).await;
+    assert!(
+        ours_limitations(&pulled, &s).is_empty(),
+        "nothing here is beyond the model: {:?}",
+        ours_limitations(&pulled, &s)
+    );
+    assert_eq!(
+        ours(&pulled, &s),
+        [
+            pbps_model::TableName::new(&s, "child"),
+            pbps_model::TableName::new(&s, "parent"),
+        ]
+    );
+
+    let parent = &pulled.schema.tables[&pbps_model::TableName::new(&s, "parent")];
+    assert_eq!(
+        parent.columns["id"].identity,
+        Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1
+        })
+    );
+    assert!(!parent.columns["id"].nullable);
+    // The respelling ADR-0009 §2 is about: `varchar(10)` comes back as the
+    // engine's own name for it, and the catalogue of step 2 agrees.
+    assert_eq!(
+        parent.columns["code"].ty.to_string(),
+        "character varying(10)"
+    );
+    assert_eq!(
+        parent.primary_key.as_ref().unwrap().name.as_deref(),
+        Some("parent_pkey"),
+        "an unnamed primary key comes back under the name the engine gave it"
+    );
+    assert_eq!(parent.unique["parent_code_uq"].columns, ["code"]);
+    // The index behind a constraint is that constraint, and not also an index.
+    assert!(parent.indexes.is_empty(), "{:?}", parent.indexes);
+
+    let child = &pulled.schema.tables[&pbps_model::TableName::new(&s, "child")];
+    // ADR-0012 §6: the dropped column keeps its catalog slot and must not be
+    // in the pull — and `attnum` keeps the hole, so everything after it would
+    // be off by one if anything read a position.
+    assert_eq!(
+        child.columns.keys().collect::<Vec<_>>(),
+        ["id", "parent_id", "label", "amount", "kind", "note"]
+    );
+    assert_eq!(
+        child.primary_key.as_ref().unwrap().columns,
+        ["id", "parent_id"]
+    );
+
+    // The three verbatim expressions, exactly as the engine respelled them.
+    assert_eq!(
+        child.columns["label"].default.as_deref(),
+        Some("'x'::character varying"),
+        "ADR-0013 §4's welded cast"
+    );
+    assert_eq!(child.columns["amount"].default.as_deref(), Some("0"));
+    assert_eq!(
+        child.checks["child_amount_ck"].expression, "(amount >= (0)::numeric)",
+        "the expression, not the `CHECK (…)` clause `pg_get_constraintdef` wraps it in"
+    );
+    let ix = &child.indexes["child_note_ix"];
+    assert_eq!(ix.filter.as_deref(), Some("(note IS NOT NULL)"));
+    assert_eq!(ix.columns[0].name, "note");
+    assert!(ix.columns[0].descending);
+    assert_eq!(ix.columns[1].name, "label");
+    assert!(!ix.columns[1].descending);
+    assert_eq!(ix.include, ["kind"]);
+    assert!(!ix.unique);
+
+    let fk = &child.foreign_keys["child_fk"];
+    assert_eq!(fk.columns, ["parent_id"]);
+    assert_eq!(
+        fk.references_table,
+        pbps_model::TableName::new(&s, "parent")
+    );
+    assert_eq!(fk.references_columns, ["id"]);
+    assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
+    assert_eq!(fk.on_update, pbps_model::ReferentialAction::NoAction);
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The reason ADR-0013 §3 pins the search path, measured rather than asserted.
+///
+/// The engine renders a name in `pg_get_constraintdef` and `format_type` only
+/// as qualified as the path makes necessary, so two operators with different
+/// paths would take two different snapshots of one database. The pull must not
+/// move when the session does.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
+    let mut conn = connect().await;
+    let s = probe_schema("path");
+    build(
+        &mut conn,
+        &s,
+        &format!(
+            "CREATE TABLE {s}.p (id integer PRIMARY KEY);
+             CREATE TABLE {s}.c (pid integer REFERENCES {s}.p (id),
+                 born date DEFAULT '2020-01-02'::date,
+                 CONSTRAINT c_ck CHECK (pid > 0))"
+        ),
+    )
+    .await;
+
+    // What the engine does under a path that makes the schema visible: the
+    // reference loses its qualification.
+    conn.execute(&format!("SET search_path TO {s}, public"))
+        .await
+        .expect("set the path");
+    let under_a_path = text(
+        &mut conn,
+        &format!(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+              WHERE conrelid = '{s}.c'::regclass AND contype = 'f'"
+        ),
+    )
+    .await;
+    assert_eq!(under_a_path, "FOREIGN KEY (pid) REFERENCES p(id)");
+
+    // And the pull, taken from that same session, is the qualified one.
+    let pulled = pull(&mut conn).await;
+    let fk = &pulled.schema.tables[&pbps_model::TableName::new(&s, "c")].foreign_keys;
+    let key = fk.values().next().expect("one foreign key");
+    assert_eq!(key.references_table, pbps_model::TableName::new(&s, "p"));
+    assert_eq!(key.references_columns, ["id"]);
+
+    // The same question about the settings that decide how a *value* is
+    // printed, not how a name is. The expressions are carried verbatim, so a
+    // session that prints them differently would manufacture drift.
+    for (setting, value) in [
+        ("quote_all_identifiers", "on"),
+        ("datestyle", "German, DMY"),
+        ("timezone", "Asia/Taipei"),
+        ("intervalstyle", "sql_standard"),
+        ("bytea_output", "escape"),
+    ] {
+        conn.execute(&format!("SET {setting} TO '{value}'"))
+            .await
+            .unwrap_or_else(|e| panic!("set {setting}: {e}"));
+    }
+    // Measured through the session itself: these are not settings the engine
+    // ignores.
+    let hostile = text(
+        &mut conn,
+        &format!(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+              WHERE conrelid = '{s}.c'::regclass AND contype = 'c'"
+        ),
+    )
+    .await;
+    assert_eq!(hostile, "CHECK ((\"pid\" > 0))");
+
+    let pulled = pull(&mut conn).await;
+    let c = &pulled.schema.tables[&pbps_model::TableName::new(&s, "c")];
+    assert_eq!(
+        c.checks.values().next().expect("one check").expression,
+        "(pid > 0)",
+        "the pull is taken under its own canonical scope, not the session's"
+    );
+    assert_eq!(
+        c.columns["born"].default.as_deref(),
+        Some("'2020-01-02'::date")
+    );
+    // And these come back too, for the same reason the path does.
+    assert_eq!(
+        text(&mut conn, "SELECT current_setting('quote_all_identifiers')").await,
+        "on"
+    );
+
+    // And the session is handed back exactly as it was found — which is not a
+    // restore this code performs but a consequence of the setting being local
+    // to the transaction the pull runs in.
+    let after = text(&mut conn, "SELECT current_setting('search_path')").await;
+    assert_eq!(after, format!("{s}, public"));
+    // No transaction is left open either: a pull that returned inside one
+    // would hold every lock it took until the caller happened to commit.
+    let in_transaction = truth(
+        &mut conn,
+        "SELECT pg_catalog.txid_current_if_assigned() IS NOT NULL
+             OR current_setting('transaction_read_only') = 'on'",
+    )
+    .await;
+    assert!(!in_transaction);
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// PostgreSQL does not nest transactions, so a pull that ran inside the
+/// caller's would commit it — and would not have the snapshot it committed for.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_pull_inside_the_callers_own_transaction_is_refused() {
+    let mut conn = connect().await;
+    let s = probe_schema("xact");
+    build(
+        &mut conn,
+        &s,
+        &format!("CREATE TABLE {s}.kept (id integer)"),
+    )
+    .await;
+
+    // A transaction with a write in it, which the pull must not commit.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!("CREATE TABLE {s}.uncommitted (id integer)"))
+        .await
+        .expect("create inside the transaction");
+
+    let e = pbps_pg::catalog::introspect(&mut conn)
+        .await
+        .expect_err("a pull inside a caller's transaction is refused");
+    let message = e.to_string();
+    assert!(
+        message.contains("already has an open transaction"),
+        "{message}"
+    );
+
+    // The caller's transaction is still the caller's: rolling it back takes the
+    // write with it. A `COMMIT` inside the pull would have made this table
+    // permanent, which is the failure the refusal exists for.
+    conn.execute("ROLLBACK").await.expect("rollback");
+    let survived = truth(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 'uncommitted')"
+        ),
+    )
+    .await;
+    assert!(!survived, "the pull committed the caller's transaction");
+
+    // And the connection is usable afterwards: a refusal is not a broken
+    // session.
+    let pulled = pull(&mut conn).await;
+    assert!(ours(&pulled, &s).contains(&pbps_model::TableName::new(&s, "kept")));
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// Two settings that decide how the pull's *own SQL* is read, rather than how
+/// the answer is printed: the string-literal mode a `LIKE` pattern is parsed
+/// under, and a schema whose name that pattern can swallow.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_schema_a_broken_pattern_would_swallow_is_in_the_pull() {
+    let mut conn = connect().await;
+    // Not under the probe schema: the name has to begin `pg`, which is what a
+    // pattern of `pg_%` — what `'pg\_%'` becomes when the engine eats the
+    // backslash — matches with its `_` acting as a wildcard.
+    let s = format!("pga_{}", std::process::id());
+    build(&mut conn, &s, &format!("CREATE TABLE {s}.t (id integer)")).await;
+
+    // Measured: with this off the engine consumes the backslash and warns,
+    // and nothing in the driver reads that warning.
+    conn.execute("SET standard_conforming_strings = off")
+        .await
+        .expect("set the literal mode");
+    let swallowed = truth(
+        &mut conn,
+        &format!("SELECT '{s}' LIKE 'pg\\_%' AS swallowed"),
+    )
+    .await;
+    assert!(
+        swallowed,
+        "the session really does read the pattern that way"
+    );
+
+    let pulled = pull(&mut conn).await;
+    assert!(
+        ours(&pulled, &s).contains(&pbps_model::TableName::new(&s, "t")),
+        "a project schema is not the engine's bookkeeping: {:?}",
+        ours(&pulled, &s)
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// Every kind of object the model cannot hold, in one database, each measured
+/// to be **named** rather than missing.
+///
+/// This is the test the issue asks for above all the others: absent, empty and
+/// unreadable are three different things, and a pull that quietly returned the
+/// expressible half of this schema would be the failure this tool is most
+/// dangerous for.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
+    let mut conn = connect().await;
+    let s = probe_schema("limits");
+    build(
+        &mut conn,
+        &s,
+        &format!(
+            "CREATE DOMAIN {s}.money_amount AS numeric(10,2);
+             CREATE TABLE {s}.odd (
+                 id integer PRIMARY KEY,
+                 total integer GENERATED ALWAYS AS (id * 2) STORED,
+                 by_default integer GENERATED BY DEFAULT AS IDENTITY,
+                 note text
+             );
+             -- Two spellings the catalogue cannot read, in a table of their
+             -- own: they take it out of the pull, and the rest of this fixture
+             -- points at `odd`.
+             CREATE TABLE {s}.unspellable (
+                 id integer,
+                 amt {s}.money_amount,
+                 stamp timestamp(3) with time zone,
+                 -- The one that parses back as a different value rather than
+                 -- failing to parse at all.
+                 flags bit(3)
+             );
+             CREATE INDEX odd_gin ON {s}.odd USING gin (to_tsvector('simple', note));
+             CREATE INDEX odd_expr ON {s}.odd ((id + 1));
+             CREATE INDEX odd_nulls ON {s}.odd (id DESC NULLS LAST);
+             ALTER TABLE {s}.odd ADD CONSTRAINT odd_ck CHECK (id > 0) NOT VALID;
+             CREATE TABLE {s}.restricted (
+                 id integer PRIMARY KEY,
+                 oid_ integer REFERENCES {s}.odd (id) ON DELETE RESTRICT
+             );
+             ALTER TABLE {s}.restricted
+                 ADD CONSTRAINT restricted_uq UNIQUE (id) DEFERRABLE INITIALLY DEFERRED;
+             CREATE TABLE {s}.unchecked (id integer, oid_ integer);
+             ALTER TABLE {s}.unchecked ADD CONSTRAINT unchecked_fk
+                 FOREIGN KEY (oid_) REFERENCES {s}.odd (id) NOT VALID;
+             CREATE TABLE {s}.serialised (id serial PRIMARY KEY, note text);
+             CREATE TABLE {s}.full_match (a integer, b integer, UNIQUE (a, b));
+             CREATE TABLE {s}.partly (a integer, b integer,
+                 CONSTRAINT partly_fk FOREIGN KEY (a, b)
+                     REFERENCES {s}.full_match (a, b) MATCH FULL);
+             CREATE TABLE {s}.nulls (a integer);
+             CREATE UNIQUE INDEX nulls_nnd ON {s}.nulls (a) NULLS NOT DISTINCT;
+             CREATE TABLE {s}.half_built (a integer);
+             CREATE INDEX half_built_ix ON {s}.half_built (a);
+             -- The state a `CREATE INDEX CONCURRENTLY` that failed leaves
+             -- behind. Reached here by writing the catalog directly, because
+             -- the honest route is to interrupt a build at the right instant.
+             UPDATE pg_catalog.pg_index SET indisvalid = false
+                 WHERE indexrelid = '{s}.half_built_ix'::regclass;
+             CREATE TABLE {s}.quoted (x integer, \"a)b\" integer, UNIQUE (x, \"a)b\"));
+             CREATE TABLE {s}.pointing (x integer, y integer,
+                 CONSTRAINT pointing_fk FOREIGN KEY (x, y)
+                     REFERENCES {s}.quoted (x, \"a)b\"));
+             CREATE TABLE {s}.guarded (id integer PRIMARY KEY);
+             ALTER TABLE {s}.guarded ENABLE ROW LEVEL SECURITY;
+             -- A policy with the switch off does nothing today, which is the
+             -- trap: a rebuild drops it, and turning the switch on afterwards
+             -- gives a table with no policies at all.
+             CREATE TABLE {s}.dormant (id integer);
+             CREATE POLICY dormant_p ON {s}.dormant USING (id > 0);
+             -- And `FORCE` is its own flag, which a table can carry with
+             -- row-level security not enabled.
+             CREATE TABLE {s}.forced (id integer);
+             ALTER TABLE {s}.forced FORCE ROW LEVEL SECURITY;
+             CREATE UNLOGGED TABLE {s}.volatile_ (id integer);
+             CREATE TABLE {s}.collated (a text, b text COLLATE \"C\",
+                 c varchar(20), d varchar(20));
+             CREATE INDEX collated_pat ON {s}.collated (a text_pattern_ops);
+             -- Measured: no default btree operator class has `opcintype =
+             -- varchar`, so an exact-type lookup answers NULL for both of
+             -- these — for the ordinary one as much as for the pattern one.
+             CREATE INDEX collated_vpat ON {s}.collated (c varchar_pattern_ops);
+             CREATE INDEX collated_vplain ON {s}.collated (d);
+             -- Measured: a column that is already an identity may also own a
+             -- second sequence, and then `pg_depend` has both an `i` row and
+             -- an `a` row for it. One join returned the column twice and took
+             -- the seed from whichever came back first.
+             CREATE TABLE {s}.twinned (
+                 id integer GENERATED ALWAYS AS IDENTITY (START WITH 7 INCREMENT BY 3));
+             CREATE SEQUENCE {s}.spare START 900 INCREMENT 11;
+             ALTER SEQUENCE {s}.spare OWNED BY {s}.twinned.id;
+             CREATE TABLE {s}.bounded (
+                 id integer GENERATED ALWAYS AS IDENTITY (MINVALUE 5 MAXVALUE 99 CYCLE));
+             CREATE TABLE {s}.cached (
+                 id integer GENERATED ALWAYS AS IDENTITY (CACHE 100));
+             CREATE TABLE {s}.setnull (a integer, b integer,
+                 CONSTRAINT setnull_fk FOREIGN KEY (a) REFERENCES {s}.odd (id)
+                     ON DELETE SET NULL (a));
+             CREATE TABLE {s}.covering (a integer, b integer,
+                 CONSTRAINT covering_pk PRIMARY KEY (a) INCLUDE (b));
+             -- The key that uniqueness makes legal. It has to go with it.
+             CREATE TABLE {s}.leaning (a integer,
+                 CONSTRAINT leaning_fk FOREIGN KEY (a) REFERENCES {s}.covering (a));
+             CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA {s};
+             CREATE TABLE {s}.temporal (
+                 id integer, valid daterange,
+                 CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+             CREATE TABLE {s}.unenforced (
+                 id integer, CONSTRAINT unenforced_ck CHECK (id > 0) NOT ENFORCED);
+             CREATE SEQUENCE {s}.loose;
+             CREATE TABLE {s}.borrowing (id integer DEFAULT nextval('{s}.loose'));
+             CREATE TABLE {s}.published (id integer PRIMARY KEY);
+             ALTER TABLE {s}.published REPLICA IDENTITY FULL;
+             -- A column name the declaration format cannot write, and a key
+             -- that points at the table carrying it.
+             CREATE TABLE {s}.dotted (a integer PRIMARY KEY, \"x.y\" integer);
+             CREATE TABLE {s}.dotting (a integer,
+                 CONSTRAINT dotting_fk FOREIGN KEY (a) REFERENCES {s}.dotted (a));
+             CREATE TYPE {s}.shape AS (a integer, b text);
+             CREATE TABLE {s}.shaped OF {s}.shape;
+             CREATE TABLE {s}.pointed_at (a integer PRIMARY KEY);
+             CREATE TABLE {s}.silent (a integer,
+                 CONSTRAINT silent_fk FOREIGN KEY (a) REFERENCES {s}.pointed_at (a));
+             ALTER TABLE {s}.silent DISABLE TRIGGER ALL;
+             CREATE TABLE {s}.rewritten (id integer);
+             CREATE RULE rewritten_swallows AS ON INSERT TO {s}.rewritten DO INSTEAD NOTHING;
+             CREATE TABLE {s}.stops (
+                 id integer, CONSTRAINT stops_ck CHECK (id > 0) NO INHERIT);
+             -- The referenced table's own standalone unique index, which the
+             -- engine records in the foreign key's `conindid`. It belongs to
+             -- `referenced`, not to the key, and it has to survive the pull.
+             CREATE TABLE {s}.referenced (a integer);
+             CREATE UNIQUE INDEX referenced_uq ON {s}.referenced (a);
+             CREATE TABLE {s}.referring (
+                 a integer, CONSTRAINT referring_fk FOREIGN KEY (a)
+                     REFERENCES {s}.referenced (a));
+             CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
+             CREATE TABLE {s}.ancestor (a integer, b integer);
+             CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
+             CREATE TABLE {s}.__pbps_state (id integer);
+             CREATE TABLE {s}.__pbps_lock (id integer);
+             -- Not this tool's: nothing refuses this declaration, so hiding it
+             -- would report a table that is there as absent.
+             CREATE TABLE {s}.__pbps_customers (id integer)"
+        ),
+    )
+    .await;
+
+    let pulled = pull(&mut conn).await;
+    // This suite's own schema only. `warnings` covers the whole database, so
+    // joining all of them lets another session's table — or this suite's own
+    // leftovers from a run that crashed before its `DROP SCHEMA` — satisfy an
+    // expectation that the fixture below no longer produces.
+    let all = ours_limitations(&pulled, &s)
+        .iter()
+        .map(|l| l.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Each of these is a fact about the database that the pull cannot carry,
+    // and each has to reach the operator.
+    for expected in [
+        // A type the catalogue of step 2 cannot spell, and a domain, which
+        // ADR-0012 §1 refuses to fold into its base type. And `bit(3)`, which
+        // parses on the way back into a type that is not the one written out.
+        "timestamp(3) with time zone",
+        "money_amount",
+        "`flags` (`bit(3)`)",
+        // A generated column, and an identity whose kind the model loses.
+        "generated column",
+        "GENERATED BY DEFAULT AS IDENTITY",
+        // An index method, an expression index, and a null ordering that is
+        // not its direction's default.
+        "gin",
+        "over an expression",
+        "NULLS LAST",
+        // A check that has never been checked.
+        "NOT VALID",
+        // An action the model has no word for.
+        "RESTRICT",
+        // A table of a kind the model does not hold at all — one whose
+        // `relkind` says so, and one whose does not.
+        "partitioned table",
+        "inherits from another",
+        // And the other end of it, which is no more an ordinary table.
+        "whose reads return their rows",
+        // A key whose check can be put off to the end of the transaction.
+        "DEFERRABLE INITIALLY DEFERRED",
+        // A composite key that refuses a partly-null row where the default
+        // accepts it.
+        "MATCH FULL",
+        // A unique index that admits at most one null key.
+        "NULLS NOT DISTINCT",
+        // An index the planner will not use.
+        "indisvalid = false",
+        // A table whose rows are not all a reader's to see, one whose
+        // policies are not in force, and one whose owner is not exempt.
+        "row-level security",
+        "not in force",
+        "FORCE ROW LEVEL SECURITY",
+        // A table that does not survive a crash.
+        "UNLOGGED",
+        // A collation that decides which values compare equal. Named down to
+        // the column and out to the collation itself: the operator-class
+        // message says `COLLATE` too, and the table is named schema-qualified,
+        // so a bare "`collated`" matches nothing.
+        ".collated`.`b` is `COLLATE \"C\"`",
+        // An identity that runs out, or wraps, somewhere else.
+        "and cycles",
+        // A `SET NULL` that names its columns.
+        "ON DELETE SET",
+        // An operator class that is not the column's own — on `text`, where
+        // the type has a default operator class of its own, and on `varchar`,
+        // where it does not and the engine resolves one through a preferred
+        // type it is binary coercible to.
+        "operator class",
+        "`collated_vpat` on",
+        // A sequence that hands out values in blocks.
+        "`CACHE 100`",
+        // The sequence a column owns without defaulting from it.
+        "`spare`",
+        // A key that asks about ranges, wearing an ordinary key's `contype`.
+        // Named down to the phrase: the fixture's table is called `temporal`
+        // too, so the bare word is satisfied by any warning about it.
+        "is temporal — `WITHOUT OVERLAPS`",
+        // A constraint the engine records and never checks. Not `NOT VALID`,
+        // which does check every new row — the two are one field apart in the
+        // catalog and opposite in what they promise. Named down to the
+        // constraint, because the definition it quotes says `NOT ENFORCED` too.
+        "constraint `unenforced_ck` on",
+        // A check that reaches this table's rows and no child's.
+        "`stops_ck` on",
+        // A default over a sequence nobody in the pull owns.
+        "which it does not own",
+        // A table whose old rows reach logical replication differently.
+        "REPLICA IDENTITY FULL",
+        // A table where an `INSERT` does whatever a rule says instead.
+        "rewrite rules",
+        // A table whose row shape follows a composite type.
+        "composite type",
+        // A column name that does not survive the declaration format, and the
+        // key that pointed at its table.
+        "cannot write back",
+        "`dotting_fk`",
+        // A foreign key whose triggers are not running, while the catalog
+        // still calls it validated and enforced.
+        "ordinary enable mode",
+        // A key constraint whose index covers more than its key, and the
+        // foreign key that has nothing to point at once it is gone.
+        "INCLUDE",
+        "`leaning_fk` on",
+        // The sequence a `serial` owns and this model cannot hold.
+        "serialised`.`id` defaults from the sequence",
+        // A check the rows already there were never checked against, and a
+        // foreign key likewise — the constraint's own name, because `NOT
+        // VALID` on its own is satisfied by either of them.
+        "check constraint `odd_ck`",
+        "foreign key `unchecked_fk` on",
+        // Measured: a generated column's expression is in `pg_attrdef`, where
+        // an ordinary default lives, so the warning has to name it.
+        "(id * 2)",
+    ] {
+        assert!(
+            all.contains(expected),
+            "no warning mentions `{expected}`:\n{all}"
+        );
+    }
+
+    // The two that must be left out rather than read back wrong.
+    let odd = &pulled.schema.tables[&pbps_model::TableName::new(&s, "odd")];
+    assert!(
+        !odd.indexes.contains_key("odd_gin") && !odd.indexes.contains_key("odd_expr"),
+        "{:?}",
+        odd.indexes
+    );
+    assert!(
+        odd.indexes.contains_key("odd_nulls"),
+        "an index the model holds all but one property of is still read back"
+    );
+    // The other side of that resolution: an ordinary index on a `varchar`
+    // column has no exact-type default operator class either, and it is not a
+    // limitation. A rule that reported every `varchar` index would be silence
+    // of a different kind — a warning nobody reads.
+    let collated = &pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")];
+    assert!(
+        collated.indexes.contains_key("collated_vplain")
+            && !collated.indexes.contains_key("collated_vpat")
+            && !collated.indexes.contains_key("collated_pat"),
+        "{:?}",
+        collated.indexes
+    );
+
+    // A foreign key's backing index is the *referenced* table's, and skipping
+    // it would drop the only uniqueness the key is legal against — a pull that
+    // compares clean and describes a schema that cannot be built.
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "referenced")]
+            .indexes
+            .contains_key("referenced_uq"),
+        "{:?}",
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "referenced")].indexes
+    );
+    assert_eq!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "referring")]
+            .foreign_keys
+            .len(),
+        1
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "temporal")]
+            .primary_key
+            .is_none(),
+        "a temporal key is not an ordinary one"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "unenforced")]
+            .checks
+            .is_empty(),
+        "a check the engine never applies is not a check"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "leaning")]
+            .foreign_keys
+            .is_empty(),
+        "a key against a uniqueness the pull left out is not a key"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "dotting")]
+            .foreign_keys
+            .is_empty(),
+        "a key pointing at a table the pull refused is not a key"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "silent")]
+            .foreign_keys
+            .is_empty(),
+        "a foreign key whose triggers are not running is not a foreign key"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "stops")]
+            .checks
+            .is_empty(),
+        "a check that stops at this table is not the check a plan would write"
+    );
+
+    // One row per column, and each fact from the dependency that means it.
+    let twinned = &pulled.schema.tables[&pbps_model::TableName::new(&s, "twinned")];
+    assert_eq!(twinned.columns.len(), 1, "{:?}", twinned.columns);
+    let identity = twinned.columns["id"]
+        .identity
+        .as_ref()
+        .expect("the identity is read");
+    assert_eq!(
+        (identity.seed, identity.increment),
+        (7, 3),
+        "the identity's own sequence, not the one merely owned by the column"
+    );
+
+    let restricted = &pulled.schema.tables[&pbps_model::TableName::new(&s, "restricted")];
+    assert!(
+        restricted.foreign_keys.is_empty(),
+        "{:?}",
+        restricted.foreign_keys
+    );
+    assert!(
+        restricted.unique.is_empty(),
+        "a deferrable key is a property of the object, so the object is left out: {:?}",
+        restricted.unique
+    );
+    // And the other side of that line: `NOT VALID` is about the rows already
+    // there, not about the key, so the key is carried and the fact is named.
+    let unchecked = &pulled.schema.tables[&pbps_model::TableName::new(&s, "unchecked")];
+    assert!(unchecked.foreign_keys.contains_key("unchecked_fk"));
+    // A `MATCH FULL` key and a `NULLS NOT DISTINCT` index are properties of
+    // the object, so the objects are left out.
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "partly")]
+            .foreign_keys
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "nulls")]
+            .indexes
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "half_built")]
+            .indexes
+            .is_empty(),
+        "an index the planner will not use is not an index"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "setnull")]
+            .foreign_keys
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "covering")]
+            .primary_key
+            .is_none(),
+        "a key constraint whose index covers more than its key is left out"
+    );
+    // A collated column is carried — the type is what the model says — and the
+    // collation beside it is named.
+    assert_eq!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")].columns["b"]
+            .ty
+            .to_string(),
+        "text"
+    );
+    // A `serial`'s column is carried — an `integer` with a `nextval` default,
+    // which is exactly what the model says — and the sequence beside it named.
+    let serialised = &pulled.schema.tables[&pbps_model::TableName::new(&s, "serialised")];
+    assert_eq!(serialised.columns["id"].ty.to_string(), "integer");
+    assert!(
+        serialised.columns["id"]
+            .default
+            .as_deref()
+            .is_some_and(|d| d.starts_with("nextval(")),
+        "{:?}",
+        serialised.columns["id"].default
+    );
+    // And a referenced column whose name contains the `)` that a parse of
+    // `pg_get_constraintdef` would have stopped inside of.
+    let pointing = &pulled.schema.tables[&pbps_model::TableName::new(&s, "pointing")];
+    assert_eq!(
+        pointing.foreign_keys["pointing_fk"].references_columns,
+        ["x", "a)b"]
+    );
+    // A generated column's expression shares `pg_attrdef` with the defaults,
+    // and reading it back as one would make a plan that computes it once.
+    assert_eq!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "odd")].columns["total"].default,
+        None
+    );
+
+    // The partitioned table is not in the pull at all — and this is why the
+    // warning above matters, because otherwise it reads as a table to create.
+    // This tool's own tables are not in it either.
+    assert_eq!(
+        ours(&pulled, &s),
+        [
+            // Not this tool's table: the filter that keeps `__pbps_state` and
+            // `__pbps_lock` out names them, and a prefix would have reported a
+            // project's own table as absent.
+            pbps_model::TableName::new(&s, "__pbps_customers"),
+            pbps_model::TableName::new(&s, "borrowing"),
+            pbps_model::TableName::new(&s, "bounded"),
+            pbps_model::TableName::new(&s, "cached"),
+            pbps_model::TableName::new(&s, "collated"),
+            pbps_model::TableName::new(&s, "covering"),
+            pbps_model::TableName::new(&s, "dotting"),
+            pbps_model::TableName::new(&s, "full_match"),
+            pbps_model::TableName::new(&s, "half_built"),
+            pbps_model::TableName::new(&s, "leaning"),
+            pbps_model::TableName::new(&s, "nulls"),
+            pbps_model::TableName::new(&s, "odd"),
+            pbps_model::TableName::new(&s, "partly"),
+            pbps_model::TableName::new(&s, "pointed_at"),
+            pbps_model::TableName::new(&s, "pointing"),
+            pbps_model::TableName::new(&s, "quoted"),
+            pbps_model::TableName::new(&s, "referenced"),
+            pbps_model::TableName::new(&s, "referring"),
+            pbps_model::TableName::new(&s, "restricted"),
+            pbps_model::TableName::new(&s, "serialised"),
+            pbps_model::TableName::new(&s, "setnull"),
+            pbps_model::TableName::new(&s, "silent"),
+            pbps_model::TableName::new(&s, "stops"),
+            pbps_model::TableName::new(&s, "temporal"),
+            pbps_model::TableName::new(&s, "twinned"),
+            pbps_model::TableName::new(&s, "unchecked"),
+            pbps_model::TableName::new(&s, "unenforced"),
+        ],
+        "the partitioned table, the inheritance child, the row-level-secured \
+         table, the UNLOGGED table and this tool's own tables are not in the \
+         pull"
+    );
+
+    // Every limitation names its table, so a caller can tell drift inside the
+    // managed set from a fact about somebody else's — and the only tables a
+    // limitation names that are *not* in the pull are the ones the pull refused
+    // whole. "Absent" and "named but left out" are the two answers that must
+    // not be confused; a table missing from both lists would be silence.
+    let mut refused: Vec<_> = ours_limitations(&pulled, &s)
+        .iter()
+        .map(|l| l.table.clone())
+        .filter(|t| !pulled.schema.tables.contains_key(t))
+        .collect();
+    refused.sort();
+    refused.dedup();
+    assert_eq!(
+        refused,
+        vec![
+            pbps_model::TableName::new(&s, "ancestor"),
+            pbps_model::TableName::new(&s, "descendant"),
+            pbps_model::TableName::new(&s, "dormant"),
+            pbps_model::TableName::new(&s, "dotted"),
+            pbps_model::TableName::new(&s, "forced"),
+            pbps_model::TableName::new(&s, "guarded"),
+            pbps_model::TableName::new(&s, "parted"),
+            pbps_model::TableName::new(&s, "published"),
+            pbps_model::TableName::new(&s, "rewritten"),
+            pbps_model::TableName::new(&s, "shaped"),
+            pbps_model::TableName::new(&s, "unspellable"),
+            pbps_model::TableName::new(&s, "volatile_"),
+        ],
+        "a limitation about a table that is in the pull must name it, and the \
+         tables left out whole must each earn one"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}

@@ -601,6 +601,169 @@ avoid it:** an arm that matches both orderings of a pair needs its comment to
 say something about each, or it needs to be two arms. Splitting it is what
 forced the measurement that found the precision.
 
+## Measured on the right engine, through the wrong client
+
+`psql` speaks the simple query protocol; `tokio-postgres` speaks the extended
+one. Asked from `psql`, `xact_start < query_start` on `pg_stat_activity` was
+exactly "a transaction was already open when this statement began" — equal
+outside a transaction block, earlier inside one, and earlier too for a caller
+that had run `BEGIN` and nothing else. Three cases, all correct, and the check
+built on it refused **every** pull: through the driver the two timestamps differ
+in both states, because Parse opens the implicit transaction before Execute
+starts the statement's clock. `transaction_timestamp() =
+statement_timestamp()` fails the same way and for the same reason.
+
+**"Measure against a real engine" is not enough when the client is part of the
+answer.** The question here was not what PostgreSQL stores but what this
+connection can observe about itself, and only the driver the code actually uses
+can answer that. What survived is a probe whose mechanism is the transaction
+itself rather than a clock: `SET LOCAL` a custom GUC, read it back in a second
+statement, and a value that is still there is a transaction block that outlived
+the statement.
+
+## The snapshot the rendering functions do not read from
+
+`REPEATABLE READ` was added to the PostgreSQL pull so that five catalog queries
+could not disagree about what exists. It does that. What it does **not** do is
+make the pull immune to concurrent DDL, because `pg_get_constraintdef`,
+`pg_get_expr` and `format_type` do not read the catalog tables — they go through
+the syscache, which follows the latest committed state. **Measured**: with a
+transaction open on a fixed snapshot, another session's `DROP TABLE` makes the
+next rendering call fail with
+
+```text
+ERROR:  cache lookup failed for attribute 1 of relation 115849   (XX000)
+```
+
+**The shape:** a mechanism that fixes one layer, applied to a problem that
+spans two. The isolation level governs what the *rows* say; the rendering
+functions are a second source of truth reached by a different path, and no
+isolation level covers them.
+
+**How to avoid it:** name what the guard actually guarantees, in the place the
+guard is set. Here the snapshot buys "the reads cannot disagree about what
+exists" and not "the read cannot fail", and the loud failure is the better half
+of that trade only because it is labelled — an `XX000` rendered by the seam as
+`db error` (issue #167) would have been the third of absent, empty and
+unreadable, wearing the clothes of the first.
+
+## A join widened by one letter, matching a third thing
+
+The columns query found an identity's sequence through `pg_depend` with
+`deptype = 'i'`. Review pointed out that a `serial`'s sequence is `deptype =
+'a'`, so the join was widened to `IN ('i', 'a')` — correct as far as it went,
+and wrong, because `'a'` is *also* how an **index** depends on the columns it
+indexes. Every indexed column acquired a sequence it does not have, and every
+column with two indexes on it appeared in the pull twice.
+
+The fix is one more condition — the dependent object has to be `relkind = 'S'`
+— and the point is that the widening read as a two-value set when it is a
+predicate over a relationship whose *other end* was never constrained.
+
+**The shape:** a filter that names one kind of relationship is widened to a
+second, and the widened form admits a third that was never in view. Nothing in
+the diff shows the third one; it lives in the catalog's documentation.
+
+**How to avoid it:** when a filter selects rows by a *kind*, say what the row
+points at as well. Here the query asked "which dependency" and never "of what".
+It was caught by the live test asserting that an ordinary table earns **no
+warning at all** — the negative case, which is the one that noticed a warning
+appearing where nothing had changed.
+
+**And the widening was wrong a second way, which the narrowing did not fix.**
+`IN ('i', 'a')` still asks one question of two relationships that can both hold
+at once: measured, `ALTER SEQUENCE s OWNED BY t.c` on a column that is *already*
+an identity is legal, and then the column has an `i` row and an `a` row. The
+join returned the column twice, `RawIdentity` was built from whichever row came
+back first, and the assembler's map kept the last — so a column declared
+`IDENTITY (START WITH 7 INCREMENT BY 3)` read back as `START WITH 900 INCREMENT
+BY 11`, the unrelated sequence's. Two joins now, one per dependency type, each
+supplying the fact it means.
+
+**The general form:** a set in an `IN` says "either of these", and the row set
+says "both of these, sometimes". Widening a filter to a second kind is only safe
+where the two kinds are exclusive, and nothing in the query says whether they
+are.
+
+**The same shape, one field over.** `pg_constraint.conindid` is "the index this
+constraint is enforced by", and the pull built its skip set — the indexes not to
+report again under `indexes:`, because they *are* a constraint — from every
+constraint's `conindid`. Measured, a foreign key's `conindid` is the unique
+index on the **referenced** table: another table's ordinary standalone index,
+enforcing nothing for this key, and the only thing that makes the key legal. The
+skip set swallowed it, so the pull compared clean while describing a schema that
+cannot be built — adding the foreign key back would fail for want of the index
+the pull did not mention. The filter said "constraints that have an index" where
+it meant "constraints whose index is their own": `p`, `u`, `x`, and not `f`.
+
+**And once more, in `pg_constraint`'s flags.** PostgreSQL 18 keeps `contype`
+unchanged for two constraints that are not ordinary ones — `conperiod` marks
+`WITHOUT OVERLAPS` / `PERIOD`, `conenforced = false` marks `NOT ENFORCED` — and
+`connoinherit` has done the same for checks since long before. Each was read
+back as the ordinary constraint it wears the type of. `NOT ENFORCED` is the
+sharpest: it sits beside `convalidated`, which the pull *did* read, and the two
+say opposite things — a `NOT VALID` constraint checks every new row, a
+`NOT ENFORCED` one checks nothing and never will.
+
+**And the second order of the fix itself.** The guard that takes a table out of
+the pull for a name the declaration cannot write was a `continue` in the
+per-table loop — after the lookup maps were built from every table the catalog
+returned. A foreign key is assembled on the *referencing* table's turn, which
+can come first, so it still resolved its target through a map that had not heard
+about the refusal, and the pull recorded a key pointing at a table it had just
+decided not to record. **A guard placed after the thing it guards is a guard for
+one caller.** The decision now runs before anything that names a table is built,
+and the maps describe the tables in the pull rather than the tables the catalog
+returned.
+
+**And a third time, from the other end.** A foreign key was recorded against a
+uniqueness the pull had just refused — the referenced primary key had an
+`INCLUDE` payload, so it was left out, and its backing index with it, and the
+key still went in because the arm checked only that the target table and columns
+existed. **A decision reachable through a map built before the decision was
+made is a decision that has not happened yet.** The foreign keys now run in a
+second pass, against what the constraint and index arms actually recorded
+(DECISIONS 256).
+
+**A guard whose condition is narrower than its reason.** The pull refused a
+table with `relrowsecurity`, and the message said why: "whose policies this
+model does not hold". The policies were the reason; the switch was the
+condition. Measured, `CREATE POLICY` without `ENABLE ROW LEVEL SECURITY` leaves
+`relrowsecurity` false and the policy rows there, so the table came through as
+an ordinary one — and a rebuild drops the policies, after which whoever turns
+row-level security on gets a table that is open where this one was about to be
+closed. `relforcerowsecurity` is a third flag, independent of both. **Read the
+guard's own sentence and check the code says the same thing**: when the reason
+names an object and the condition names a switch, the condition is the narrower
+of the two.
+
+**A round trip that asked whether it parses.** The guard that refuses a value
+the declaration format cannot write back was performed rather than reasoned
+about — and then asked `is_err()`. `bit(3)` parses. It parses into a *different
+type* than the one written out, because the pull stores an unreadable spelling
+whole as the base and the parser splits it at the parenthesis. **"It parses" and
+"it comes back the same" are two questions, and only the second one is the round
+trip.** The check is now render-parse-compare-equal, and it is asked of the
+value that is actually stored: one function decides that value for both the
+guard and the construction, because a check on something *like* what is stored
+is a check on nothing.
+
+**One end of a relationship guarded, the other left open.** An inheritance
+child was refused — its columns are somebody else's — and the parent was pulled
+as an ordinary table. Measured, it is not one: a `SELECT` from the parent
+returns the children's rows as well as its own, and `ALTER TABLE parent ADD
+COLUMN` gives the column to every child. A managed parent would compare clean
+while a plan against it silently changed tables nobody had declared. The live
+test even asserted the wrong half, in a comment that stated the behaviour
+instead of justifying it: "the inheritance parent is an ordinary table and
+stays". **A relationship has two ends, and refusing one of them is a decision
+about the other that nobody wrote down.**
+
+**The shape both share:** the catalog answers "what kind of thing is this?" in
+one column and "and is it that kind of thing after all?" in another. A reader
+that switches on the first and never looks at the second is not reading the
+catalog, it is reading half of it.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run
@@ -792,6 +955,16 @@ stop mending the bookkeeping and derive the answer from the thing itself.**
 
 ## Tests that pass for the wrong reason
 
+**And its mirror: a test that is green under the command you happened to run.**
+The three introspection live tests each built a probe schema named from the
+process id, and each dropped it before creating it. Run with
+`--test-threads=1` — the command a developer reaches for while writing one —
+all three passed. Run through `scripts/live-tests-pg.sh`, which does not
+serialise, two of them destroyed the third's schema mid-read. The failure was
+loud, so this cost minutes rather than a release; the lesson is that **the local
+command and the CI command are two different tests**, and only one of them
+counts. A fixture name must be unique per test, not per process.
+
 Eleven so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
@@ -823,6 +996,19 @@ three ways a state can be unreadable rather than one row asserted about twice.
   findings" from the truncated page. Not code, but the same shape as every
   entry in section 1, and the reason this bullet is here: **a paginated read
   that does not check `hasNextPage` is an absence, not an emptiness.**
+- A live introspection test that asserted over `pulled.warnings` — every
+  warning in the **whole database**. The shared test server carries the probe
+  schemas of every run that crashed before its `DROP SCHEMA`, so an expectation
+  the current fixture no longer produced was still satisfied, by a schema
+  written by an older build of the same test. Two of its expectations had also
+  drifted out of matching the message they named (`` `collated` `` where the
+  message says `` `schema.collated` ``, and a trailing backtick where the
+  message says `COLLATE "C"`), and neither showed. **A live assertion scoped to
+  the server rather than to the fixture is answered by whatever else is on the
+  server.** Scoped to this suite's own schema, both drifts failed at once — and
+  a third thing fell out: a table the pull refuses whole earned a warning but no
+  `Limitation`, so the list that names a table said nothing about the tables
+  nothing could be said about.
 - A format-version test asserting `json.contains(r#""version":1"#)` on a
   serialized state snapshot — which embeds an ids file whose own version is 1.
   It matched the *nested* field and went on passing through the bumps to 2, 3
