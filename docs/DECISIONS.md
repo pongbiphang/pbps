@@ -4146,50 +4146,47 @@ SPEC is in sync with all of these.
     (§8.2). The fold is an approximation, and a much closer one than ASCII: it
     agrees on 964 of the 1180.
 
-    What that costs is bounded by asking a second question the loader *can*
-    answer. Two declarations that a fold reads as one name are a question that
-    fold cannot answer — asked whether a definition names either of them it
-    would say *both*, and two such over-answers make an ordering cycle out of
-    modules that have none, which `creation_order` then emits in name order.
-    But both colliding declarations are right in front of it. Each name
-    therefore gets the *widest* fold that still tells it from every other
-    declaration: the whole alphabet where nothing collides, ASCII where
-    something does, exact where even ASCII collides.
+    What that costs is bounded by a question the loader *can* answer: did the
+    fold's answer make a cycle? A fold is wider than a collation or equal to
+    it and never narrower, so what it gets wrong it gets wrong by saying
+    *yes* too often — asked whether a definition names `dbo.CAFÉ` it says yes
+    to `dbo.café` as well, and two such over-answers make an ordering cycle
+    out of modules that have none. A missing edge is invisible to
+    `creation_order`; a false one is not, because a false one is exactly what
+    stops Kahn's algorithm. So the order is taken with the whole-alphabet
+    fold, whatever it leaves unplaced is re-scanned under the ASCII fold —
+    the one every case-insensitive collation performs — and what is still
+    unplaced is re-scanned under no fold at all, which only a case-sensitive
+    database needs. A cycle no comparison separates is emitted in name order,
+    as it was before.
 
-    Widest and not narrowest, because a collision is not evidence of a
-    case-sensitive database: where the fold is wider than the collation — the
-    Kelvin sign, say — a case-insensitive server can be holding `dbo.ktbl`
-    and `dbo.Ktbl` at once, and there `SELECT * FROM DBO.KTBL` still means
-    `dbo.ktbl`. Comparing that pair exactly would drop a real edge over an
-    ASCII case difference no case-insensitive collation keeps. The ASCII fold
-    separates them and keeps the case-insensitivity every collation does have;
-    only a pair that collides under it as well — `dbo.Z` beside `dbo.z` — is
-    compared exactly, and only a case-sensitive database can hold that pair.
+    Narrowing where a cycle appeared and nowhere else is what keeps the price
+    proportionate. An over-answer that merely orders two modules more
+    strictly than the engine would have costs nothing — the `CREATE` still
+    runs after everything it reads — and it is left alone. Only the pair
+    whose over-answers closed a loop pays, and it pays with the widest
+    comparison that opens the loop again, so a plan is never ordered by a
+    narrower fold than its own evidence calls for.
 
-    The collision is counted over *distinct spellings*, so two overloads of
-    one routine are not mistaken for one, and it is asked of both needles: the
-    scan looks for the bare object name as well as the qualified one, and
-    `s9.ktbl` beside `s2.Ktbl` is one folded bare spelling for two names. The
-    bare form is counted by spelling rather than by identity, because `dbo.t`
-    beside `sales.t` shares a bare name without differing in case — the scan's
-    ordinary ambiguity, which a narrower fold does not help.
+    The obvious alternative — decide a comparison per name from the
+    declarations, before the scan, wherever two of them fold together — was
+    written first and gave up more than it bought. Two measured reasons. It
+    cannot see a collision with a name it is not ordering: `creation_order`
+    is given the modules, the tables are an earlier ordering class, and a
+    view `dbo.ktbl` beside a table `dbo.Ktbl` is a pair no map of its
+    arguments holds. And it narrows a name in every position because one
+    position collided: `dbo.t` beside `sales.T` is one bare name in two
+    spellings and two qualified names in one spelling each — a pair a
+    case-insensitive database holds without complaint — and comparing the
+    qualified form exactly loses the edge from any definition writing
+    `WAREHOUSE.T`, which is 239's failure reached through the guard meant to
+    prevent it. A cycle is later evidence than a collision, but it is
+    evidence about the answer rather than about the question.
 
-    Each needle is then answered on its own, because they collide
-    independently. `warehouse.t` beside `app.T` is one bare name in two
-    spellings and two qualified names in one spelling each, and a
-    case-insensitive database holds that pair without complaint — the
-    qualifiers tell them apart. Narrowing the qualified needle along with the
-    bare one would lose the edge from any definition that writes
-    `WAREHOUSE.T`, which is 239's failure reached through the guard put there
-    to prevent it. The needle that collides narrows; the other keeps the
-    widest fold it is entitled to.
-
-    Two prices are left, both of them the scan's ordinary over-reach and both
-    with `depends_on:` for an escape hatch. A definition may name a spelling
-    nothing declares, and the fold then attaches it to a declaration it does
-    not belong to. And a name narrowed by a collision is narrowed everywhere,
-    so where a definition writes a *different* part of that name in another
-    case — `CAFÉ.KTBL` for the declared `café.ktbl`, with `café.Ktbl` also
-    declared — the edge is missed. Narrowing only the colliding character
-    would need the scan to match by comparator rather than by substring, which
-    is a rewrite of it and not this entry.
+    One price is left, and it has `depends_on:` for an escape hatch. Where a
+    cycle is broken, the edge dropped is the one the narrower comparison does
+    not find, and on a case-insensitive database that edge may have been
+    real — two declarations the engine reads as one name are a schema this
+    tool cannot order correctly in any case, and the narrowing picks the
+    spelling rather than the meaning. Declaring the dependency says what the
+    scan cannot read.
