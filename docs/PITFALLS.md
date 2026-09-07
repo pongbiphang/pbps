@@ -698,6 +698,17 @@ Two lessons, and the second is the one that cost the round:
   that polarity has to be told what it does not understand; leaving a
   construct unhandled is not neutral there, it is a permit.
 
+The second lesson came back in the next round, in the same guard. The unwrap
+that takes `('01/02/2026')` down to its literal counted **every** parenthesis,
+and a comment beside the code said so on purpose: a stray one in a literal can
+only make the test fail, and failing to unwrap merely costs a refusal. Same
+mistake, written down and reviewed and kept — `(/* ) */ '01/02/2026')` is one
+`)` of comment text, and the ambiguous default sails through (DECISIONS 279).
+
+When a comment argues that a guard is *allowed* to be wrong in one direction,
+check that direction against what the guard's answer does, not against how the
+sentence sounds. Both of these read as caution and both were permits.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

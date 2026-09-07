@@ -5149,3 +5149,29 @@ SPEC is in sync with all of these.
 
     An unterminated `/*` is left alone: the engine refuses that by name
     (`unterminated /* comment`), and 266 draws the line there.
+
+279. **The grouping unwrap counts only the parentheses that are code.** The
+    same guard as 278, the same polarity, one round later. `without_grouping`
+    takes `DEFAULT ('01/02/2026')` down to the literal it wraps, by finding a
+    paren depth that does not return to zero before the end. It counted every
+    parenthesis, including ones inside literals and comments, and the code said
+    that was deliberate: a stray one can only make the test *fail*, failing to
+    unwrap only costs a refusal, and this guard is allowed to be wrong in that
+    direction.
+
+    The first half is true and the second is backwards. The guard refuses when
+    it answers *yes*, so an expression it cannot unwrap is one it **permits**,
+    and a single parenthesis that is data is enough to write the hazard down:
+
+    ```text
+    CREATE TABLE t (d date DEFAULT (/* ) */ '01/02/2026'))
+        -> stores 2026-01-02 under DateStyle MDY, 2026-02-01 under DMY
+    ```
+
+    Measured, and accepted silently either way. So the scan now steps over
+    literals and comments through one helper — the same constructs the
+    bare-literal scanner already knows, listed once — and it is still not an
+    expression parser: it never asks what any of it means. What stays outside
+    remains outside (174): a cast, a concatenation or a function is structure,
+    and this guard does not read structure.
+

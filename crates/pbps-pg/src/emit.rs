@@ -123,25 +123,31 @@ const SETTING_SENSITIVE: &[&str] = &[
 /// character let it past.
 ///
 /// The test is a paren *depth* that never returns to zero before the end, and
-/// it counts every parenthesis, including ones inside string literals. That is
-/// deliberate rather than lazy, and the argument is what makes this not the
-/// beginning of an expression parser:
+/// it counts only the parentheses that are **code**: one inside a literal or a
+/// comment is data, and the scan steps over it.
 ///
-/// - A stray parenthesis in a literal can only push the depth up or down at
-///   the wrong moment, and either way the test *fails* and nothing is
-///   unwrapped. Failing to unwrap costs a refusal that would have been made,
-///   which is the direction this guard is allowed to be wrong in
-///   (`refuse_an_unresolved_default` explains why it refuses only what is
-///   *provably* unresolved).
-/// - It cannot unwrap wrongly in the direction that matters. Stripping the
-///   first and last characters can only produce a single complete literal if
-///   what was there was `(` literal `)` — so no expression that is not a
-///   parenthesised literal can be turned into one, and no valid declaration
-///   can be refused because of this.
+/// **An earlier version counted every parenthesis and argued that it could
+/// afford to.** The argument was that a stray one in a literal can only make
+/// the test fail, that failing to unwrap merely costs a refusal, and that this
+/// guard is allowed to be wrong in that direction. The first half is true and
+/// the second is backwards: this guard refuses when it says *yes*, so an
+/// expression it cannot unwrap is one it **permits**. Measured, that is a
+/// working way to write the hazard down:
+///
+/// ```text
+/// CREATE TABLE t (d date DEFAULT (/* ) */ '01/02/2026'))
+///     -> stores 2026-01-02 under DateStyle MDY, 2026-02-01 under DMY
+/// ```
+///
+/// One `)` inside a comment, and a declaration whose value the applying
+/// session decides goes through unrefused. So the scan skips literals and
+/// comments — the same constructs [`is_a_bare_literal`] already knows, through
+/// the same helpers — and that is still not an expression parser: it never
+/// asks what any of it *means*.
 ///
 /// Anything more structural — a cast, a concatenation, a function — stays
-/// outside the guard on purpose (DECISIONS 174: this tool does not parse
-/// expressions), covered instead by the settings the framing pins.
+/// outside the guard on purpose (DECISIONS 174 and 279: this tool does not
+/// parse expressions), covered instead by the settings the framing pins.
 fn without_grouping(expression: &str) -> &str {
     let mut e = expression.trim();
     loop {
@@ -150,26 +156,88 @@ fn without_grouping(expression: &str) -> &str {
             return e;
         }
         let mut depth = 0usize;
-        for (i, b) in bytes.iter().enumerate() {
-            match b {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
+        let mut consumed_to = 0usize;
+        let mut paired = true;
+        // By character rather than by byte: a name outside a literal may hold
+        // any of them, and slicing at a continuation byte would panic.
+        for (i, ch) in e.char_indices() {
+            if i < consumed_to {
+                continue;
+            }
+            if let Some(len) = skip_datum(&e[i..]) {
+                consumed_to = i + len;
+                continue;
+            }
+            match ch {
+                '(' => depth += 1,
+                ')' => {
                     // Back to nothing before the end: the leading `(` was
                     // closed by something other than the last character, so
-                    // these two are not a pair.
-                    if depth == 0 && i + 1 != bytes.len() {
-                        return e;
+                    // these two are not a pair. A `)` at depth zero is the
+                    // same answer, reached by broken text rather than by two
+                    // groups.
+                    if depth == 0 || (depth == 1 && i + 1 != e.len()) {
+                        paired = false;
+                        break;
                     }
+                    depth -= 1;
                 }
                 _ => {}
             }
         }
-        if depth != 0 {
+        if !paired || depth != 0 {
             return e;
         }
         e = e[1..e.len() - 1].trim();
     }
+}
+
+/// The length of the literal or comment beginning at the start of `rest`, or
+/// `None` when what begins there is code.
+///
+/// One list of the constructs this engine reads as something other than
+/// syntax, for every scan that walks an expression: read any of them as code
+/// and a parenthesis, a quote or a comment introducer *inside* one is counted
+/// as though the declaration had written it.
+///
+/// An unterminated literal or comment consumes the rest of the text rather
+/// than answering `None`. Nothing after it is code — the engine refuses the
+/// whole expression by name — and a scan that resumed there would count
+/// parentheses that are inside the run-on literal.
+fn skip_datum(rest: &str) -> Option<usize> {
+    // Longest opener first: `E'` and `U&'` are openers of their own, not a
+    // name followed by a literal.
+    for (opener, escapes) in [
+        ("E'", true),
+        ("e'", true),
+        ("U&'", false),
+        ("u&'", false),
+        ("'", false),
+    ] {
+        if let Some(after) = rest.strip_prefix(opener) {
+            return Some(match end_of_literal(after, escapes) {
+                Some(end) => opener.len() + end,
+                None => rest.len(),
+            });
+        }
+    }
+    if let Some(delim) = dollar_delimiter(rest) {
+        let body = &rest[delim.len()..];
+        return Some(match body.find(delim) {
+            Some(at) => delim.len() + at + delim.len(),
+            None => rest.len(),
+        });
+    }
+    if rest.starts_with("--") {
+        return Some(rest.find('\n').map_or(rest.len(), |at| at + 1));
+    }
+    if let Some(after) = rest.strip_prefix("/*") {
+        return Some(match end_of_block_comment(after) {
+            Some(tail) => rest.len() - tail.len(),
+            None => rest.len(),
+        });
+    }
+    None
 }
 
 fn is_a_bare_literal(expression: &str) -> bool {
@@ -350,34 +418,41 @@ fn end_of_literal(rest: &str, escapes: bool) -> Option<usize> {
     None
 }
 
-/// Whether `e` is one `$tag$…$tag$` literal and nothing else.
-fn is_one_dollar_quoted_literal(e: &str) -> bool {
-    let Some(rest) = e.strip_prefix('$') else {
-        return false;
-    };
-    let Some(at) = rest.find('$') else {
-        return false;
-    };
-    let tag = &rest[..at];
-    // The tag's own rule: empty, or a name that does not start with a digit.
-    //
-    // Asked with the scanner's predicate, not with `char::is_alphanumeric`.
-    // The engine's grammar is over **bytes** — `dolq_start [A-Za-z\200-\377_]`,
-    // `dolq_cont` the same plus digits (DECISIONS 233) — so every byte of a
-    // non-ASCII character is a tag character, including ones Unicode calls
-    // marks rather than letters. Measured, `$á$…$á$` with `á` spelled `a` then
-    // U+0301 is one dollar-quoted literal to the engine; `is_alphanumeric`
-    // says the mark is neither letter nor digit, so this read the expression
-    // as *not* a bare literal and the default guard never looked at it.
+/// The opening `$tag$` of a dollar-quoted literal at the start of `rest` —
+/// the delimiter itself, both dollars included — or `None` when what starts
+/// there is not one. `$1` is a parameter placeholder and not an opener, which
+/// is the same answer.
+///
+/// The tag's own rule: empty, or a name that does not start with a digit.
+///
+/// Asked with the scanner's predicate, not with `char::is_alphanumeric`. The
+/// engine's grammar is over **bytes** — `dolq_start [A-Za-z\200-\377_]`,
+/// `dolq_cont` the same plus digits (DECISIONS 233) — so every byte of a
+/// non-ASCII character is a tag character, including ones Unicode calls marks
+/// rather than letters. Measured, `$á$…$á$` with `á` spelled `a` then U+0301
+/// is one dollar-quoted literal to the engine; `is_alphanumeric` says the mark
+/// is neither letter nor digit, so this read the expression as *not* a bare
+/// literal and the default guard never looked at it.
+fn dollar_delimiter(rest: &str) -> Option<&str> {
+    let after = rest.strip_prefix('$')?;
+    let at = after.find('$')?;
+    let tag = &after[..at];
     if !tag.is_empty()
         && !(tag.starts_with(|c: char| !c.is_ascii_digit() && pbps_dialect::continues_ident(c))
             && tag.chars().all(pbps_dialect::continues_ident))
     {
-        return false;
+        return None;
     }
-    let delim = format!("${tag}$");
+    Some(&rest[..at + 2])
+}
+
+/// Whether `e` is one `$tag$…$tag$` literal and nothing else.
+fn is_one_dollar_quoted_literal(e: &str) -> bool {
+    let Some(delim) = dollar_delimiter(e) else {
+        return false;
+    };
     let rest = &e[delim.len()..];
-    let Some(close) = rest.find(&delim) else {
+    let Some(close) = rest.find(delim) else {
         return false;
     };
     // Whitespace and comments may follow it and nothing else: a *second* pair
@@ -1512,6 +1587,15 @@ mod tests {
             "/* leading */ '2026-01-02'",
             "(/* inside the grouping */ '2026-01-02')",
             "$$2026-01-02$$ -- trailing",
+            // A parenthesis that is data cannot be the one that closes the
+            // grouping. Measured, each of these is the same session-decided
+            // value as the same declaration without the comment — the first
+            // stores 2026-01-02 under MDY and 2026-02-01 under DMY as a column
+            // default, which is the whole hazard written behind one `)`.
+            "(/* ) */ '01/02/2026')",
+            "('01/02/2026' /* ( */)",
+            "('01/02/2026' -- (\n)",
+            "($$01/02/2026$$ /* ) */)",
         ] {
             assert!(is_a_bare_literal(yes), "{yes}");
         }
@@ -1551,9 +1635,11 @@ mod tests {
             "('a')::date",
             "('a'",
             // A literal's own parentheses cannot make a pair out of two
-            // groups; the depth never returns to zero between them, so the
-            // unwrap is refused rather than guessed.
+            // groups: the `(` inside the string is data, so the depth returns
+            // to zero at the first group's own `)` and the two are not a pair.
             "('(') || (b)",
+            // The same, with the parenthesis hidden in a comment instead.
+            "(/* ( */ 'a') || ('b')",
             // The recorded gap: two literals with a keyword between them.
             "U&'a' UESCAPE '!'",
             // A block comment is whitespace too, but not the kind a
