@@ -505,6 +505,36 @@ is what `transaction_framing().begin` is for; one that decides how a name
 setting is takes one measurement and cannot be reasoned out from the
 documentation, which describes both as session settings.
 
+## A guard shaped for one carrier of a hazard the model carries three ways
+
+`pbps-pg` learned that a session setting decides what a verbatim expression
+means, and grew a guard: a bare literal default on a date-or-time column is
+refused, because the applying session's `DateStyle` would pick the day. The
+guard was right and it was one third of the sweep. ADR-0013 §3 names **three**
+verbatim expressions — `Column::default`, `CheckConstraint::expression`,
+`Index::filter` — and `CHECK (d >= '01/02/2026')` stores a different date under
+a different `DateStyle` exactly as the default does. Review found it, and the
+fix that covers all three is not a bigger guard.
+
+The two halves are worth separating, because the second was the trap:
+
+- The guard is **type-directed**. A default sits on a column whose type is
+  right there, so "is this literal read through a session-sensitive input
+  function" is answerable. A check expression names columns and carries no
+  type, and no offline rule can tell `'01/02/2026'` inside one from a string
+  that merely looks like a date. Extending the guard by shape would have
+  refused `CHECK (status <> 'deleted')` — a valid plan refused, which is the
+  one outcome worse than the hazard.
+- So the fix went to the **reader** instead of to each carrier: pin the three
+  settings in the transaction framing (DECISIONS 267) and the same text means
+  one thing wherever it appears. One change, all three expressions, and nothing
+  correct refused.
+
+When a hazard is "a setting decides what this text means", count the places the
+model can carry that text before writing the check, and ask whether the fix
+belongs on the text or on the thing reading it. A guard per carrier is a sweep
+you have to repeat every time the model grows a fourth.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

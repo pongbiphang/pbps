@@ -581,6 +581,31 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     column.name
                 )));
             }
+            // The same refusal, for the same reason, on a change the risk
+            // classes cannot say no to. Gaining or losing the time zone is a
+            // conversion the applying session's `TimeZone` decides — measured,
+            // `12:00` becomes `12:00:00+00` from a `UTC` session and
+            // `17:00:00+00` from `America/New_York` — so two operators running
+            // one approved plan store two different instants. `change_risk`
+            // knows the shape and answers `Narrowing`, but `Narrowing` is a
+            // risk a human clears at the gate, and what the human cleared was
+            // the loss, not a zone that was never in the plan. The framing
+            // pins `TimeZone = UTC` for everything pbps applies, which makes
+            // the result *reproducible* — it does not make it *declared*, and
+            // a silent UTC reinterpretation of every stored value is exactly
+            // the undeclared transformation ADR-0012 §5 refuses.
+            if types::depends_on_the_session_time_zone(&was, &normalized) {
+                return Err(invalid(format!(
+                    "column `{}` cannot be changed from `{was}` to `{normalized}`: the \
+                     conversion gains or loses the time zone, and what each stored value \
+                     becomes is then read from a session setting rather than from anything \
+                     declared — the same value converts to a different instant depending on \
+                     the zone the applying session happens to hold. Say what the values mean \
+                     instead: add the new column, fill it in a declared step with the zone \
+                     written out (`AT TIME ZONE \'…\'`), and drop the old one.",
+                    column.name
+                )));
+            }
             // One `ALTER TABLE` takes both subcommands (ADR-0011, Amendment 1),
             // and the nullability is restated only when it moves: unlike SQL
             // Server, a `TYPE` subcommand here leaves `NOT NULL` where it was,
@@ -888,7 +913,7 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
 mod tests {
     use super::*;
     use pbps_dialect::Dialect;
-    use pbps_model::{CheckConstraint, ColumnType, Identity, IndexColumn, Uid, UidKind};
+    use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid, UidKind};
 
     fn ty(s: &str) -> ColumnType {
         s.parse().expect("a type parses")
@@ -965,6 +990,58 @@ mod tests {
         assert!(
             matches!(refusal, DialectError::UnquotableIdent(_)),
             "{refusal}"
+        );
+    }
+
+    fn retype(from: &str, to: &str) -> Change {
+        Change::AlterColumnType {
+            uid: Uid::generate(UidKind::Column),
+            column: ColumnRef {
+                table: name("app", "t"),
+                name: "at".into(),
+            },
+            from: ty(from),
+            to: ty(to),
+            from_nullable: false,
+            to_nullable: false,
+        }
+    }
+
+    /// Both refusals in the type arm, and the pair that must still pass
+    /// between them. The zone one is not reachable through the risk classes:
+    /// every row of the first list is `Narrowing`, which a human is allowed to
+    /// clear at the gate, and clearing a loss is not approving a
+    /// reinterpretation of every stored value.
+    #[test]
+    fn a_type_change_the_engine_or_the_session_would_decide_is_refused_by_name() {
+        let pg = Postgres::new();
+        for (from, to, named) in [
+            ("timestamp", "timestamptz", "time zone"),
+            ("timestamptz", "timestamp", "time zone"),
+            ("date", "timestamptz", "time zone"),
+            ("character varying(10)", "integer", "USING"),
+        ] {
+            let refusal = pg
+                .emit(&retype(from, to), Strategy::default())
+                .expect_err("neither conversion is pbps's to choose");
+            let DialectError::Invalid { message, .. } = &refusal else {
+                panic!("`{from}` -> `{to}`: {refusal}");
+            };
+            assert!(message.contains(named), "`{from}` -> `{to}`: {message}");
+            assert!(message.contains("at"), "`{from}` -> `{to}`: {message}");
+        }
+        // The widening beside them still goes through, in one statement: a
+        // guard that cannot say yes is a guard nobody can use.
+        assert_eq!(
+            sql_of(
+                &pg,
+                &retype("character varying(10)", "character varying(20)")
+            ),
+            vec![
+                "SET search_path = \"app\";\n\
+                 ALTER TABLE \"app\".\"t\" ALTER COLUMN \"at\" TYPE character varying(20);\n\
+                 RESET search_path;"
+            ]
         );
     }
 

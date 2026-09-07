@@ -3129,3 +3129,200 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
     let again = plan(&state_b, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
 }
+
+/// The other three settings the framing pins, and the reason they are pinned
+/// there rather than around each statement: unlike `search_path` they do not
+/// vary per object, so they are established once and the plan a reviewer reads
+/// stays the SQL and not the scaffolding (SPEC §14.1).
+///
+/// What they decide is measured here, not recalled. The same three declared
+/// expressions, created by an operator whose session says `DMY`, New York and
+/// `sql_standard`, become three different stored constraints — a different day,
+/// a different instant, and an interval with the opposite sign. None of it is
+/// an error and none of it is visible afterwards: `pg_get_constraintdef` gives
+/// back the *value* the session decided, so the environment that decided it is
+/// gone by the time anybody looks.
+///
+/// This is the whole reason a verbatim expression can be carried at all. The
+/// emitter refuses a bare literal *default* on a setting-sensitive column, but
+/// a check and a filter name columns rather than carrying a type, and no
+/// offline rule can tell `'01/02/2026'` inside one from a string that merely
+/// looks like a date. Pinning the reader is what makes the text mean one thing.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
+    let s = emit_schema("temporal");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+
+    let mut t = Table::default();
+    t.columns.insert("d".into(), Column::new(ty("date")));
+    t.columns
+        .insert("at".into(), Column::new(ty("timestamptz")));
+    t.columns.insert("i".into(), Column::new(ty("interval")));
+    // Three literals, each unambiguous to the person who wrote it and each read
+    // through a different one of the three settings.
+    for (name, expression) in [
+        ("ck_d", "d >= '01/02/2026'"),
+        ("ck_at", "at >= '2026-01-02 00:00'"),
+        ("ck_i", "i >= '-1 2:00:00'"),
+    ] {
+        t.checks.insert(
+            name.into(),
+            CheckConstraint {
+                expression: expression.into(),
+            },
+        );
+    }
+    let change = pbps_model::Change::CreateTable {
+        uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        name: TableName::new(&s, "temporal"),
+        table: Box::new(t),
+    };
+    let statements = Postgres::new()
+        .emit(&change, Strategy::default())
+        .expect("emit");
+
+    async fn stored(conn: &mut Conn, schema: &str) -> String {
+        text(
+            conn,
+            &format!(
+                "SELECT string_agg(pg_catalog.pg_get_constraintdef(oid), ' | ' ORDER BY conname) \
+                 FROM pg_catalog.pg_constraint \
+                 WHERE conrelid = '{schema}.temporal'::pg_catalog.regclass AND contype = 'c'"
+            ),
+        )
+        .await
+    }
+    async fn run(conn: &mut Conn, statements: &[pbps_dialect::Statement]) {
+        for stmt in statements {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+
+    // The operator's environment, as an `ALTER ROLE … SET` would leave it.
+    conn.execute(
+        "SET DateStyle = 'ISO, DMY'; SET TimeZone = 'America/New_York'; \
+         SET IntervalStyle = 'sql_standard'",
+    )
+    .await
+    .expect("the operator's settings");
+    run(&mut conn, &statements).await;
+    // Read from a canonical session, and that is not a detail: two of these
+    // three settings render on the way *out* as well as reading on the way in,
+    // so a definition fetched by the session that wrote it shows its own
+    // spelling of its own value and the two runs look alike. One reader, and
+    // what is left between them is the value.
+    conn.execute("SET TimeZone = 'UTC'; SET IntervalStyle = 'postgres'")
+        .await
+        .expect("the reader's settings");
+    let theirs = stored(&mut conn, &s).await;
+    conn.execute(&format!("DROP TABLE {s}.temporal"))
+        .await
+        .expect("drop what the unpinned session decided");
+    conn.execute("SET TimeZone = 'America/New_York'; SET IntervalStyle = 'sql_standard'")
+        .await
+        .expect("the operator's settings again");
+
+    // The same statements, under the framing, with the operator's settings
+    // still in the session underneath it.
+    let framing = Postgres::new().transaction_framing();
+    conn.begin(framing).await.expect("begin");
+    run(&mut conn, &statements).await;
+    // Read it back before the rollback takes the table away; the catalogue sees
+    // this transaction's own DDL.
+    let ours = stored(&mut conn, &s).await;
+    conn.rollback(framing).await.expect("rollback");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    // A day, an instant and a sign, all three decided by the session.
+    assert!(theirs.contains("'2026-02-01'"), "{theirs}");
+    assert!(theirs.contains("05:00:00+00"), "{theirs}");
+    assert!(theirs.contains("-1 days -02:00:00"), "{theirs}");
+    // Under the pin, one meaning, and it is the one the framing names.
+    assert!(ours.contains("'2026-01-02'"), "{ours}");
+    assert!(ours.contains("00:00:00+00"), "{ours}");
+    assert!(ours.contains("-1 days +02:00:00"), "{ours}");
+}
+
+/// A type change that gains or loses the time zone is refused by name, and the
+/// measurement beside it is why: the engine does not fail it, it *answers* it
+/// from a session setting, and two operators applying one approved plan store
+/// two different instants.
+///
+/// The framing pins `TimeZone` to UTC, which makes the answer reproducible.
+/// Reproducible is not declared: it would silently reinterpret every stored
+/// value as UTC, which is a data transformation nobody wrote down and nobody
+/// reviewed — the same ground the `USING` refusal stands on (ADR-0012 §5).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
+    let s = emit_schema("zone");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+
+    // What the refusal is about, on this server. The same stored value, the
+    // same `ALTER`, two sessions, two instants.
+    let mut instants = Vec::new();
+    for zone in ["UTC", "America/New_York"] {
+        conn.execute(&format!(
+            "SET TimeZone = '{zone}'; \
+             CREATE TABLE {s}.z (at timestamp); \
+             INSERT INTO {s}.z VALUES ('2026-01-02 12:00'); \
+             ALTER TABLE {s}.z ALTER COLUMN at TYPE timestamptz"
+        ))
+        .await
+        .expect("the engine performs it without a word");
+        // `AT TIME ZONE 'UTC'` for the reading, because a `timestamptz` is
+        // *rendered* in the session's zone too: read from the session that
+        // wrote it, both rows name the same wall clock and the difference the
+        // refusal is about is invisible.
+        instants.push(
+            text(
+                &mut conn,
+                &format!("SELECT (at AT TIME ZONE 'UTC')::text FROM {s}.z"),
+            )
+            .await,
+        );
+        conn.execute(&format!("DROP TABLE {s}.z"))
+            .await
+            .expect("drop");
+    }
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        instants,
+        vec![
+            "2026-01-02 12:00:00".to_owned(),
+            "2026-01-02 17:00:00".to_owned()
+        ],
+        "the conversion reads the naive value in the session's zone"
+    );
+
+    // So pbps does not emit it. The message names the zone and the two-step
+    // remedy, because a refusal a reader cannot act on is a wall.
+    let refusal = Postgres::new()
+        .emit(
+            &pbps_model::Change::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: pbps_model::ColumnRef {
+                    table: TableName::new(&s, "z"),
+                    name: "at".into(),
+                },
+                from: ty("timestamp"),
+                to: ty("timestamptz"),
+                from_nullable: true,
+                to_nullable: true,
+            },
+            Strategy::default(),
+        )
+        .expect_err("the zone is not pbps's to choose");
+    let message = refusal.to_string();
+    assert!(message.contains("time zone"), "{message}");
+    assert!(message.contains("AT TIME ZONE"), "{message}");
+}

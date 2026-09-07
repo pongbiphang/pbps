@@ -4662,3 +4662,66 @@ SPEC is in sync with all of these.
     type cannot be part of a key — is missing here too and is issue #175: those
     four fail loudly at the server, which is late but not silent, and this one
     does not fail at all.
+
+267. **`DateStyle`, `TimeZone` and `IntervalStyle` are pinned in the transaction
+    framing, not around each statement.** The three verbatim expressions the
+    model carries — a column default, a check expression and an index filter
+    (ADR-0013 §3) — are text the engine reads through an input function, and
+    three settings decide what that text means. Measured on 18.6, the identical
+    declaration created by two sessions:
+
+    ```text
+    CHECK (d >= '01/02/2026')       MDY -> '2026-01-02'   DMY -> '2026-02-01'
+    CHECK (at >= '2026-01-02 00:00')
+      on a timestamptz              UTC -> 00:00:00+00    New_York -> 05:00:00+00
+    CHECK (i >= '-1 2:00:00')       postgres -> -1 days +02:00:00
+                                    sql_standard -> -1 days -02:00:00
+    ```
+
+    A different day, a different instant, and an interval with the opposite
+    sign. No error, no warning, and nothing afterwards can say which session
+    decided it.
+
+    They go in `begin` and not in the per-statement scope because they are
+    *constants*: unlike `search_path`, which is the object's own schema and
+    therefore varies per statement (DECISIONS 259), one value serves the whole
+    plan. Five `SET`s and five `RESET`s around every line of `plan.sql` would
+    bury the SQL a reviewer has to read (SPEC §14.1) to say the same thing
+    once.
+
+    `bytea_output` and `extra_float_digits` are named by ADR-0013 §3 and are
+    deliberately **not** here. Measured, both are output-only — identical stored
+    constraints under `hex`/`1` and under `escape`/`0` — so they belong to the
+    read scope, which already sets them, and pinning them on the write side
+    would suggest they decide something they do not.
+
+    This is also the answer to a check constraint that a `Column::default`
+    guard cannot reach (DECISIONS 261): a default is refused when its literal
+    is bare because the column's type is known there, while a check names
+    columns and carries no type, and no offline rule can tell `'01/02/2026'`
+    inside one from a string that merely looks like a date. Pinning the reader
+    is what makes the text mean one thing.
+
+268. **A type change that gains or loses the time zone is refused, the way a
+    `USING` clause is.** `timestamp` → `timestamptz` and its three relatives do
+    not fail on this engine — they are *answered* from the session's `TimeZone`.
+    Measured, one stored `2026-01-02 12:00` under one `ALTER`:
+
+    ```text
+    session TimeZone = UTC               -> 2026-01-02 12:00:00 UTC
+    session TimeZone = America/New_York  -> 2026-01-02 17:00:00 UTC
+    ```
+
+    `types::change_risk` already knows the shape and answers `Narrowing`, with a
+    comment naming exactly this. That is not enough: `Narrowing` is a risk class
+    a human clears at the gate, and what the human cleared was the *loss*. The
+    zone was never in the plan to approve.
+
+    The framing (267) pins `TimeZone` to UTC, which makes the result
+    reproducible — and reproducible is not declared. Under the pin the change
+    would silently reinterpret every stored value as UTC, which is a data
+    transformation nobody wrote down and nobody reviewed: the same ground
+    ADR-0012 §5 refuses a `USING` clause on. So the emitter asks a separate
+    question, `types::depends_on_the_session_time_zone`, and refuses on it by
+    name with the two-step remedy — add the column, fill it in a declared step
+    with the zone written out, drop the old one.
