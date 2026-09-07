@@ -171,6 +171,30 @@ An absent table gives **Msg 208** on that same statement. `HAS_PERMS_BY_NAME` �
 the natural repair — answers 0 for both cases, so only attempting the statement
 separates them. Measurement changed the fix here, it did not merely confirm it.
 
+A permission held on a column is held nowhere the object question can see it.
+SQL Server authorizes `SELECT`, `UPDATE` and `REFERENCES` column by column, and
+`app.t(code PK, label)` with `GRANT UPDATE ON app.t(label)` and nothing wider:
+
+| question | answer |
+|---|---|
+| `HAS_PERMS_BY_NAME('app.t','OBJECT','UPDATE')` | **0** |
+| the same, `…,'UPDATE','label','COLUMN'` | 1 |
+| `UPDATE app.t SET label = …` | **runs** |
+| the same question for `'INSERT'` or `'DELETE'` at column scope | **NULL** |
+| `GRANT INSERT ON app.t(label)` | **syntax error** |
+
+Three lessons, all of them measured. A gap is not the only wrong answer a
+readiness check can give: this one was an *over*-demand, and the remedy it
+printed (`GRANT UPDATE ON app.t`) widened a grant a careful DBA had narrowed on
+purpose. The permissions that take a column sub-entity are a fact about the
+engine and not a property of the enum — asked for `INSERT`, the question
+answers NULL, and NULL read as "not held" would have turned the repair into a
+gap on every table. And the column list to ask about is the **declared** one,
+not the catalog's: after `ALTER TABLE app.t ADD extra`, a column-only grantee
+answers 0 on `extra` and its `UPDATE` is denied, while an object-level grantee
+answers 1 and its `UPDATE` runs — so a list read from the catalog would have
+called the account ready for the column the next plan adds.
+
 A list of "the kinds of thing a principal can own", written from memory, had
 six entries; the catalog has nineteen views with an owner column, and the one
 that mattered — a role owning another role — was not on the list. **When the
