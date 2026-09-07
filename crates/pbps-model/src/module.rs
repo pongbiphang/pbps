@@ -190,7 +190,16 @@ impl FromStr for RoutineArg {
                 quoted = true;
                 out.push(c);
             } else {
-                out.extend(c.to_lowercase());
+                // **ASCII only**, which is the engine's rule and not a
+                // simplification of it: measured, `CREATE FUNCTION
+                // mn.f(a mn.Ätype)` reads back as `mn.f(mn."Ätype")` — the
+                // engine left the byte alone and quoted the name rather than
+                // folding it. A Unicode fold would turn the declared spelling
+                // into `ätype`, which is a *different* type name, and the key
+                // would then point at nothing. The dialect's own folding is
+                // ASCII (`unquoted` in the emitters), and this is the same
+                // rule in the model.
+                out.push(c.to_ascii_lowercase());
             }
         }
         if quoted || parens != 0 || brackets != 0 {
@@ -1858,6 +1867,13 @@ mod tests {
             ("md .my_type", "md.my_type"),
             ("md. my_type", "md.my_type"),
             ("s . \"Odd Name\" []", "s.\"Odd Name\"[]"),
+            // ASCII only, which is the engine's rule: measured,
+            // `CREATE FUNCTION mn.f(a mn.Ätype)` reads back as
+            // `mn.f(mn.\"Ätype\")` — the byte is left alone and the name is
+            // quoted rather than folded. A Unicode fold would write `ätype`,
+            // which names a type that does not exist.
+            ("MN.Ätype", "mn.Ätype"),
+            ("ÄÖÜ", "ÄÖÜ"),
             ("\"char\"", "\"char\""),
             ("\"CHAR\"", "\"CHAR\""),
             ("s.\"Odd Name\"", "s.\"Odd Name\""),
@@ -1873,6 +1889,11 @@ mod tests {
             "\"char\"".parse::<RoutineArg>().unwrap(),
             "\"CHAR\"".parse::<RoutineArg>().unwrap(),
             "a quoted type name keeps its case, and these are two types"
+        );
+        assert_ne!(
+            "Ätype".parse::<RoutineArg>().unwrap().as_str(),
+            "ätype",
+            "a fold that changes a byte the engine leaves alone names another type"
         );
     }
 

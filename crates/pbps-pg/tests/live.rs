@@ -5428,6 +5428,31 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
             "CREATE TRIGGER noted AFTER DELETE ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"
         ),
         format!("COMMENT ON TRIGGER noted ON {s}.t IS 'why this trigger exists'"),
+        // A security label. Written into `pg_seclabel` directly because no
+        // label provider is loaded in this image — `SECURITY LABEL` answers
+        // `no security label providers have been loaded` — and the honest
+        // route needs one. The same reason, and the same precedent, as the
+        // `pg_index` write in the limits fixture: what is under test is what
+        // the reader does with the row, and the row is what the provider would
+        // have written. Measured, a `DROP` takes it.
+        format!("CREATE VIEW {s}.labelled AS SELECT id FROM {s}.t"),
+        format!(
+            "INSERT INTO pg_catalog.pg_seclabel (objoid, classoid, objsubid, provider, label)
+             VALUES ('{s}.labelled'::regclass, 'pg_class'::regclass, 0, 'a_provider', \
+             'classified')"
+        ),
+        // And an outgoing tie the definition does not carry: measured,
+        // `pg_get_functiondef` does not write `DEPENDS ON EXTENSION`, so a
+        // rebuild creates a routine that outlives the extension it was tied
+        // to. `plpgsql` because it is installed in every database — the tie
+        // points *at* the extension, so dropping this schema leaves it alone.
+        format!("CREATE FUNCTION {s}.tied(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        format!("ALTER FUNCTION {s}.tied(int) DEPENDS ON EXTENSION plpgsql"),
+        format!(
+            "CREATE TRIGGER tied AFTER TRUNCATE ON {s}.t FOR EACH STATEMENT \
+             EXECUTE FUNCTION {s}.trf()"
+        ),
+        format!("ALTER TRIGGER tied ON {s}.t DEPENDS ON EXTENSION plpgsql"),
     ] {
         conn.execute(&sql)
             .await
@@ -5470,6 +5495,17 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
             Trigger,
             Some("why this trigger exists"),
         ),
+        (
+            format!("{s}.labelled"),
+            View,
+            Some("a_provider: classified"),
+        ),
+        (
+            format!("{s}.tied(integer)"),
+            Function,
+            Some("extension plpgsql"),
+        ),
+        (format!("{s}.t.tied"), Trigger, Some("extension plpgsql")),
     ];
     for (id, kind, expected) in &cases {
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
@@ -6096,6 +6132,55 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// The enumeration ADR-0009 §3 obliges, checked against the engine rather than
+/// against the last time somebody thought about it.
+///
+/// A `DROP` takes with it every row the catalog keys by the object's *address*
+/// — `(classoid, objoid)` — and that list was written from memory twice and
+/// was short both times: a comment first, then a security label. So it is
+/// asked of the server, and the reader's list has to be the same list.
+///
+/// A sixth catalog arriving in a later release fails here, which is the whole
+/// point: this test is the reason the list can be trusted.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn every_catalog_keyed_by_an_object_is_read() {
+    let mut conn = connect().await;
+    let engines: Vec<String> = conn
+        .query(
+            "SELECT c.relname AS name FROM pg_catalog.pg_class c
+              WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                             WHERE a.attrelid = c.oid AND a.attname = 'classoid'
+                               AND a.attnum > 0)
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                             WHERE a.attrelid = c.oid AND a.attname = 'objoid'
+                               AND a.attnum > 0)
+              ORDER BY 1",
+        )
+        .await
+        .expect("ask the engine which catalogs key a row by an object")
+        .iter()
+        .map(|row| {
+            row.try_get::<&str>("name")
+                .expect("a name")
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let mut ours = pbps_pg::modules::catalogs_read_by_address();
+    ours.sort_unstable();
+    assert_eq!(
+        engines, ours,
+        "the rebuild reads every catalog keyed by an object's address, or it is not an \
+         enumeration"
+    );
+    assert!(
+        !engines.is_empty(),
+        "a query that found nothing would agree with an empty reader"
+    );
+}
+
 /// The probe that decides whether there is a transaction has to be asking the
 /// engine, not reading back something the session was already holding.
 ///
@@ -6651,6 +6736,20 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
         // and it may be written on either side of the name.
         ("", "(out x text) LANGUAGE sql AS $$ SELECT 'q' $$"),
         ("", "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$"),
+        // And a comment is whitespace inside the list, so it hides neither the
+        // mode nor the type.
+        (
+            "",
+            "(/* note */ out value integer) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "integer",
+            "(-- which one\n a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "integer",
+            "(a integer /* trailing */) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
         (
             "integer",
             "(a integer, out b text) LANGUAGE sql AS $$ SELECT 'q' $$",
@@ -6846,6 +6945,45 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     ))
     .await
     .expect("the engine accepts every declared spelling");
+
+    // The fold is ASCII, and that is the engine's rule rather than a
+    // simplification of it. Measured here, before the schema goes: an unquoted
+    // non-ASCII type name is neither lower-cased nor left bare — the engine
+    // keeps the byte and quotes the name.
+    conn.execute(&format!("CREATE TYPE {s}.\"Ätype\" AS ENUM ('a')"))
+        .await
+        .expect("a type whose name is not ASCII");
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.folded(a {s}.Ätype) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
+    ))
+    .await
+    .expect("declared unquoted, which is what a Unicode fold would change");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT p.oid::regprocedure::text FROM pg_catalog.pg_proc p
+                  WHERE p.pronamespace = '{s}'::regnamespace AND p.proname = 'folded'"
+            )
+        )
+        .await,
+        format!("{s}.folded({s}.\"Ätype\")"),
+        "the engine left the case alone; a fold that lower-cased it would name another type"
+    );
+    let ascii_only: pbps_model::RoutineArg = "Ätype".parse().expect("a routine argument");
+    assert_eq!(
+        pbps_dialect::Dialect::normalize_routine_arg(&pg, &ascii_only)
+            .expect("normalize")
+            .as_str(),
+        "Ätype",
+        "and so does the dialect"
+    );
+    conn.execute(&format!("DROP FUNCTION {s}.folded({s}.\"Ätype\")"))
+        .await
+        .expect("drop it before the pull, which is about the other fixture");
+    conn.execute(&format!("DROP TYPE {s}.\"Ätype\""))
+        .await
+        .expect("and its type");
 
     let pulled = our_modules(&pull(&mut conn).await, &s);
     drop_schema(&mut conn, &s).await;

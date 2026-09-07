@@ -5980,15 +5980,45 @@ SPEC is in sync with all of these.
     the other side), so there is nothing to restore it from and it refuses like
     the rest.
 
-    That is the second time this enumeration was short — a column ACL was the
-    first — so this time the other half was measured too, and it is what makes
-    the list *closed* rather than merely longer: `pg_get_functiondef` writes
-    the volatility, `SECURITY DEFINER`, `LEAKPROOF`, `COST` and every `SET`
-    clause, so a routine's settings come back with its body; a view's column
-    cannot hold `attoptions` at all, since `ALTER VIEW … ALTER COLUMN … SET` is
-    `not supported for views`; and a trigger or a rule attached to a view is a
-    *dependent*, enumerated and refused on its own terms. **A list is closed by
-    saying what is not on it and why, not by growing.**
+    That was the second time this enumeration was short — a column ACL was the
+    first — so the other half was measured too: `pg_get_functiondef` writes the
+    volatility, `SECURITY DEFINER`, `LEAKPROOF`, `COST` and every `SET` clause,
+    so a routine's settings come back with its body; a view's column cannot
+    hold `attoptions` at all, since `ALTER VIEW … ALTER COLUMN … SET` is `not
+    supported for views`; and a trigger or a rule attached to a view is a
+    *dependent*, enumerated and refused on its own terms.
+
+    **And that argument was still wrong.** The round after it found a security
+    label, and the round after that would have found something else: a `DROP`
+    takes every row the catalog keys by the object's *address*, and there is no
+    amount of thinking that turns a remembered list of those into a complete
+    one. So the list is now asked of the engine:
+
+    ```sql
+    SELECT c.relname FROM pg_class c
+     WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+       AND EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'classoid')
+       AND EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'objoid');
+    ```
+
+    Five on 18.6 — `pg_description`, `pg_seclabel`, `pg_init_privs`, and the
+    two `pg_sh*` ones — and the reader reads all five, including the two a
+    module can never be in, because "a module cannot be there" is the shape of
+    claim that has been wrong every time. A live test runs that query and
+    compares it with the reader's list, so a sixth catalog in a later release
+    fails a test instead of passing unnoticed.
+
+    Beside them, one thing `pg_depend` keys the other way: `ALTER FUNCTION …
+    DEPENDS ON EXTENSION` writes a `deptype = 'x'` row *from* the routine, and
+    measured, `pg_get_functiondef` does not write the clause — so a rebuild
+    creates a routine that outlives the extension it was tied to. Measured too,
+    the grammar allows it on a routine and a trigger and not on a view; the
+    query runs for all three anyway, for the reason above.
+
+    **A list is closed by a test against the engine, not by an argument about
+    what is on it.** Three arguments were made here and three were wrong.
 
     **Amended: a fallback covers a missing arm, not a leaky one.** The next
     case arrived inside a class the list already knew. A domain's check
@@ -6184,3 +6214,18 @@ SPEC is in sync with all of these.
     equal only if *this* call's `set_config` survived — which is the question
     being asked. A type that cannot hold the bad value beats a branch that
     checks for it, and here the value is the type.
+
+295. **A routine argument folds ASCII case only.** `RoutineArg` lower-cased
+    with `char::to_lowercase`, which is Unicode's fold and not this engine's.
+    Measured:
+
+    ```text
+    CREATE FUNCTION mn.f(a mn.Ätype) …   ->  mn.f(mn."Ätype")
+    ```
+
+    The engine left the byte alone and *quoted* the name rather than folding
+    it. A Unicode fold turns the declared spelling into `ätype`, which names a
+    type that does not exist — so the key points at nothing, `module_oid`
+    resolves nothing, and the object is planned as absent. The emitters' own
+    `unquoted` has always been `to_ascii_lowercase`; this is the same rule in
+    the model, where the two were quietly disagreeing.

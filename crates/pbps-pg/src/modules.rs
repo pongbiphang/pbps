@@ -199,12 +199,14 @@ pub async fn before_a_rebuild(
             read_column_acls(conn, oid, &mut carries).await?;
             read_view_column_defaults(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "r", &mut carries).await?;
-            read_comments(conn, oid, "pg_class", &mut carries).await?;
+            read_attached(conn, oid, "pg_class", &mut carries).await?;
+            read_extension_ties(conn, oid, "pg_class", &mut carries).await?;
         }
         ModuleKind::Function | ModuleKind::Procedure => {
             read_routine(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "f", &mut carries).await?;
-            read_comments(conn, oid, "pg_proc", &mut carries).await?;
+            read_attached(conn, oid, "pg_proc", &mut carries).await?;
+            read_extension_ties(conn, oid, "pg_proc", &mut carries).await?;
         }
         // A trigger has no owner and no ACL of its own — it is not a grantable
         // object — and `pg_default_acl` has no entry kind that reaches one. Its
@@ -212,7 +214,8 @@ pub async fn before_a_rebuild(
         // one may have left on it.
         ModuleKind::Trigger => {
             read_trigger_enabled(conn, oid, &mut carries).await?;
-            read_comments(conn, oid, "pg_trigger", &mut carries).await?;
+            read_attached(conn, oid, "pg_trigger", &mut carries).await?;
+            read_extension_ties(conn, oid, "pg_trigger", &mut carries).await?;
         }
     }
     Ok(Rebuild {
@@ -586,29 +589,101 @@ fn push_acl(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
     Ok(())
 }
 
-/// What somebody wrote on the object, which a `DROP` takes with it.
+/// The catalogs that key a row by an object's *address* — `(classoid, objoid)`
+/// — and what a row in each of them is.
 ///
-/// **Measured**, on all three kinds and on a view's columns:
+/// **Enumerated from the engine, not from memory**, which this list has now
+/// earned the hard way: it was a comment first, then a security label, and
+/// each time the answer was one more name. PostgreSQL 18 has exactly five such
+/// catalogs, and the query that says so is
+///
+/// ```sql
+/// SELECT c.relname FROM pg_class c
+///  WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+///    AND EXISTS (SELECT 1 FROM pg_attribute a
+///                 WHERE a.attrelid = c.oid AND a.attname = 'classoid')
+///    AND EXISTS (SELECT 1 FROM pg_attribute a
+///                 WHERE a.attrelid = c.oid AND a.attname = 'objoid');
+/// ```
+///
+/// which `every_catalog_keyed_by_an_object_is_read` runs against the live
+/// server and compares with this constant. A sixth one arriving in a later
+/// release fails that test instead of going unnoticed.
+///
+/// The two `pg_sh*` ones hold rows for shared objects — roles, databases,
+/// tablespaces — so a module is never in them. They are read anyway: "a module
+/// cannot be there" is exactly the kind of claim the three before it were.
+///
+/// Each entry is the catalog, what a row in it means, the expression that
+/// renders one, and whether it can name a column of the object.
+const ATTACHED_BY_ADDRESS: [(&str, &str, &str, bool); 5] = [
+    (
+        "pg_description",
+        "a comment, which a `DROP` destroys and no declaration here can restore",
+        "x.description",
+        true,
+    ),
+    (
+        "pg_seclabel",
+        "a security label, which a `DROP` destroys and no declaration here can restore",
+        "x.provider || ': ' || x.label",
+        true,
+    ),
+    (
+        "pg_shdescription",
+        "a comment on the shared-object side of the catalog",
+        "x.description",
+        false,
+    ),
+    (
+        "pg_shseclabel",
+        "a security label on the shared-object side of the catalog",
+        "x.provider || ': ' || x.label",
+        false,
+    ),
+    (
+        "pg_init_privs",
+        "the privileges this object was installed with, which only an extension sets",
+        "x.initprivs::text",
+        true,
+    ),
+];
+
+/// The catalogs [`before_a_rebuild`] reads by object address.
+///
+/// Public so that a live test can put it beside the engine's own answer:
+/// a list of catalogs written down anywhere is a list that can fall behind the
+/// server it describes, and this one already has, twice.
+#[must_use]
+pub fn catalogs_read_by_address() -> Vec<&'static str> {
+    ATTACHED_BY_ADDRESS
+        .iter()
+        .map(|(catalog, ..)| *catalog)
+        .collect()
+}
+
+/// Everything the catalog attaches to this object's address, which a `DROP`
+/// takes with it.
+///
+/// **Measured**, on all three kinds and on a view's column:
 ///
 /// ```text
 /// COMMENT ON VIEW mk.v … / FUNCTION mk.f(int) … / TRIGGER au ON mk.t …
 /// drop and create each     ->  <gone>  <gone>  <gone>
 /// ```
 ///
-/// `pg_get_viewdef` and `pg_get_functiondef` do not carry it, so the
-/// declaration this project holds cannot put it back — and `Module` has a
-/// `description`, but nothing writes it to the database (the `COMMENT ON`
-/// round trip is a decision of its own, and `SetColumnDeprecated` says so on
-/// the other side). A comment in the catalog is therefore somebody else's
-/// state, exactly like an ACL or an owner, and it refuses for the reason
-/// DECISIONS 288 gives for all of them.
+/// and a `pg_seclabel` row written directly goes the same way. Neither
+/// `pg_get_viewdef` nor `pg_get_functiondef` carries any of this, and nothing
+/// in this project writes `COMMENT ON` or `SECURITY LABEL` — the `COMMENT ON`
+/// round trip is a decision of its own, and `SetColumnDeprecated` says so from
+/// the other side. So each is somebody else's state, exactly like an ACL or an
+/// owner, and refuses for the reason DECISIONS 288 gives for all of them.
 ///
-/// A column's comment is here too: it is a row on the same object with
-/// `objsubid > 0`, and a rebuild destroys it just as completely. The name is
-/// looked up only for a relation, because for `pg_proc` and `pg_trigger` the
-/// `objoid` is not an `attrelid` and a join on it would match another table's
-/// column by coincidence.
-async fn read_comments(
+/// A column's row is here too: same object, `objsubid > 0`, and a rebuild
+/// destroys it just as completely. The name is looked up only for a relation,
+/// because for `pg_proc` and `pg_trigger` the `objoid` is not an `attrelid`
+/// and a join on it would match another table's column by coincidence.
+async fn read_attached(
     conn: &mut Conn,
     oid: i64,
     class: &str,
@@ -616,34 +691,80 @@ async fn read_comments(
 ) -> Result<(), DbError> {
     let column = if class == "pg_class" {
         "(SELECT a.attname FROM pg_catalog.pg_attribute a
-            WHERE a.attrelid = d.objoid AND a.attnum = d.objsubid)"
+            WHERE a.attrelid = x.objoid AND a.attnum = x.objsubid)"
     } else {
         "NULL::name"
     };
+    for (catalog, what, detail, has_subid) in ATTACHED_BY_ADDRESS {
+        let sub = if has_subid { "x.objsubid" } else { "0" };
+        let column = if has_subid { column } else { "NULL::name" };
+        let rows = conn
+            .query_with(
+                &format!(
+                    "SELECT ({sub})::int8 AS sub, ({detail})::text AS detail,
+                            COALESCE(({column})::text, '') AS column_name
+                       FROM pg_catalog.{catalog} x
+                      WHERE x.classoid = 'pg_catalog.{class}'::regclass
+                        AND x.objoid = ($1::int8)::oid
+                      ORDER BY 1"
+                ),
+                &[Param::I64(oid)],
+            )
+            .await?;
+        for row in rows {
+            let found = text(&row, "detail")?;
+            let column_name = text(&row, "column_name")?;
+            carries.push(Carried {
+                what,
+                detail: if column_name.is_empty() {
+                    found
+                } else {
+                    format!("on column `{column_name}`: {found}")
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+/// An outgoing dependency the object itself declares, which its definition
+/// does not carry.
+///
+/// `ALTER FUNCTION … DEPENDS ON EXTENSION e` records `deptype = 'x'` from the
+/// routine to the extension, and the routine is then dropped when `e` is.
+/// **Measured**, `pg_get_functiondef` does not write the clause, so a rebuild
+/// creates a routine that outlives the extension it was tied to — the same
+/// silent loss as an ACL, in the other direction along `pg_depend`.
+///
+/// Routines and triggers only, and that is the grammar's doing rather than a
+/// choice: measured, `ALTER VIEW … DEPENDS ON EXTENSION` is a syntax error.
+/// The query runs for a view too, because "this kind cannot have one" is the
+/// claim that has been wrong every time it was made here.
+async fn read_extension_ties(
+    conn: &mut Conn,
+    oid: i64,
+    class: &str,
+    carries: &mut Vec<Carried>,
+) -> Result<(), DbError> {
     let rows = conn
         .query_with(
             &format!(
-                "SELECT d.objsubid::int8 AS sub, d.description AS note,
-                        COALESCE({column}::text, '') AS column_name
-                   FROM pg_catalog.pg_description d
-                  WHERE d.classoid = 'pg_catalog.{class}'::regclass
-                    AND d.objoid = ($1::int8)::oid
+                "SELECT pg_catalog.pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid)
+                          AS on_what
+                   FROM pg_catalog.pg_depend d
+                  WHERE d.classid = 'pg_catalog.{class}'::regclass
+                    AND d.objid = ($1::int8)::oid
+                    AND d.deptype = 'x'
                   ORDER BY 1"
             ),
             &[Param::I64(oid)],
         )
         .await?;
     for row in rows {
-        let note = text(&row, "note")?;
-        let column_name = text(&row, "column_name")?;
-        let detail = if column_name.is_empty() {
-            note
-        } else {
-            format!("on column `{column_name}`: {note}")
-        };
         carries.push(Carried {
-            what: "a comment, which a `DROP` destroys and no declaration here can restore",
-            detail,
+            what: "a `DEPENDS ON EXTENSION` tie, which a `DROP` destroys and no declaration here \
+                   can restore",
+            detail: text(&row, "on_what")?,
         });
     }
     Ok(())

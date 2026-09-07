@@ -1422,6 +1422,34 @@ the thing the order needed. And a topological sort has a failure case a depth
 walk cannot even represent — a cycle — so it has to say so rather than emit an
 order that does not exist.
 
+## A list closed by an argument
+
+The carried-state enumeration was short four times. Each time the fix was to
+add the missing one; the third time it also came with an argument for why the
+list was now complete — what else a `DROP` could take, and why each of those
+was carried back by the declaration. The argument was careful and it was wrong
+by the next round.
+
+What closed it was a query:
+
+```sql
+-- every catalog that keys a row by an object's address
+SELECT c.relname FROM pg_class c
+ WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+   AND EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = c.oid AND a.attname = 'classoid')
+   AND EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = c.oid AND a.attname = 'objoid');
+```
+
+run in a test and compared against the list in the code, so the next release's
+sixth catalog fails a test rather than passing unnoticed.
+
+**The rule.** "Enumerate from the catalog, not from memory" applies to the
+*reasoning* as much as to the list. A justification for why a list is complete
+is memory with more words in it. Where the engine can be asked, ask it in a
+test.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

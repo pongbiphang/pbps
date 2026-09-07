@@ -1300,6 +1300,12 @@ fn is_a_mode(word: &str) -> bool {
 /// so `OUT` is the one mode a parameter can carry and stay out of
 /// `proargtypes`, and `VARIADIC text[]` is carried as `text[]` (ADR-0009 §1).
 fn after_the_mode(parameter: &str) -> (bool, &str) {
+    // Through the gap first: a comment is whitespace to this engine, and
+    // measured, `CREATE FUNCTION mo.c(/* note */ OUT value integer)` has the
+    // identity `mo.c()`. Left in, the mode is invisible, the parameter counts
+    // as one the identity carries, and a correctly keyed routine is refused
+    // for a count that is only wrong to this scan.
+    let parameter = after_the_gap(parameter).0;
     let Some(first) = one_ident_len(parameter) else {
         return (true, parameter);
     };
@@ -1376,10 +1382,10 @@ fn before_the_default(text: &str) -> &str {
 /// this dialect cannot parse as a type counts as agreement, because a scan
 /// that cannot read a spelling has not learned it is wrong.
 fn certainly_not(parameter: &str, identity: &RoutineArg) -> bool {
-    let rest = before_the_default(after_the_mode(parameter).1);
+    let rest = without_trailing_trivia(before_the_default(after_the_mode(parameter).1));
     let readings = [
         Some(rest),
-        one_ident_len(rest).map(|n| rest[n..].trim_start()),
+        one_ident_len(rest).map(|n| after_the_gap(&rest[n..]).0),
     ];
     !readings.into_iter().flatten().any(|reading| {
         reading
@@ -2170,6 +2176,23 @@ mod tests {
             ),
             // Measured: the mode may follow the name as well as precede it.
             ("app.f()", "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$"),
+            // A comment is whitespace to this engine, inside the list as much
+            // as before it: measured, `mo.c(/* note */ OUT value integer)` has
+            // the identity `mo.c()`. Read as code it hides the mode, and a
+            // correctly keyed routine is refused for a count only this scan
+            // gets wrong.
+            (
+                "app.f()",
+                "(/* note */ out value integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(-- which one\n a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(a integer /* trailing */) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
             // A bare name the write path may qualify to the identity's — this
             // dialect cannot know whether it does, so it does not refuse.
             (
