@@ -1497,7 +1497,7 @@ loud, so this cost minutes rather than a release; the lesson is that **the local
 command and the CI command are two different tests**, and only one of them
 counts. A fixture name must be unique per test, not per process.
 
-Eleven so far, every one invisible in a green run. **Assert the specific failure,
+Twelve so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 A fixture for "a state recorded by a version this build cannot read", written
@@ -1549,6 +1549,17 @@ three ways a state can be unreadable rather than one row asserted about twice.
   meant.** Assert the parsed field. The same shape was one bump away in the
   plan and ids tests, and all three were fixed together (DECISIONS 149's
   commit).
+- A guard over several kinds, asserted on the one kind where it does nothing.
+  The PostgreSQL dependency reader filters `pg_depend`'s **internal** edges,
+  `deptype <> 'i'`, and the test that covered it asked for the dependents of a
+  *function* — which has no internal reverse edges at all, so removing the
+  filter changed nothing and the test stayed green. A view has two, its
+  `_RETURN` rule and its row type, and without the filter every view depends on
+  itself and no view can be rebuilt. **Revert-and-watch-fail is what found it,
+  and only because the revert was run:** the test was written first and looked
+  like coverage. When a guard names a set — kinds, catalogs, classes — the case
+  it is asserted on has to be one the guard actually changes, which is not
+  always the first one that comes to hand.
 
 Since these appeared, every fix is reverted and its new test watched to fail
 before the fix is kept. That habit caught three of them. It did not catch
