@@ -1769,8 +1769,10 @@ fn conversion_probe(
     let table = qualified(&stored.table)?;
     let col = quote(&stored.name)?;
     let from = types::normalize(from)?;
-    let unicode_to_non_unicode = matches!(from.base.as_str(), "nchar" | "nvarchar" | "ntext")
-        && matches!(to.base.as_str(), "char" | "varchar");
+    let unicode_to_non_unicode = matches!(
+        from.base.as_str(),
+        "nchar" | "nvarchar" | "ntext" | "sysname"
+    ) && matches!(to.base.as_str(), "char" | "varchar");
     let character_loss_probe = || {
         Probe::new(
             format!("values in {column} changed when converted to {to}"),
@@ -2029,6 +2031,7 @@ mod tests {
             ("nvarchar(255)", "varchar(50)"),
             ("nchar(255)", "char(50)"),
             ("ntext", "varchar(50)"),
+            ("sysname", "varchar(50)"),
         ] {
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
@@ -2053,7 +2056,11 @@ mod tests {
             );
         }
 
-        for (from, to) in [("nvarchar(255)", "varchar(max)"), ("ntext", "varchar(max)")] {
+        for (from, to) in [
+            ("nvarchar(255)", "varchar(max)"),
+            ("ntext", "varchar(max)"),
+            ("sysname", "varchar(max)"),
+        ] {
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),

@@ -5658,8 +5658,8 @@ SPEC is in sync with all of these.
 
     The existing length probe stays beside it. It is the direct, readable count
     for ordinary length loss, while the round trip is added only when the
-    source is `nchar`, `nvarchar` or `ntext` and the target is `char` or
-    `varchar`. A max target gets only the round trip because it has no length
+    source is `nchar`, `nvarchar`, `ntext` or the Unicode `sysname` alias and
+    the target is `char` or `varchar`. A max target gets only the round trip because it has no length
     question, but it can still replace characters under a legacy code page.
     Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep their one
     length probe rather than paying for a question they do not ask.
