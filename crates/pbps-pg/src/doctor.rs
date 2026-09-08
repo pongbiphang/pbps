@@ -475,11 +475,34 @@ SELECT w.schema_name,
 /// role's privileges without `SET ROLE`, which is what makes a member of the
 /// owning role able to `ALTER` the table.
 ///
-/// `relkind = 'r'` for the same reason [`crate::catalog`] filters on it: an
-/// index and a sequence are rows in `pg_class` too, and a declared table whose
-/// name collides with one of them must read as absent rather than as a table
-/// this role does not own.
-fn table_question(count: usize) -> String {
+/// The kinds are the caller's, because the two lists ask about different things.
+///
+/// A **managed** table is an ordinary one (`r`), for the reason
+/// [`crate::catalog`] filters on it: an index and a sequence are rows in
+/// `pg_class` too, and a declared table whose name collides with one of them
+/// must read as absent rather than as a table this role does not own. A
+/// partitioned table is not a table this model can hold at all — the pull names
+/// it as unexpressible rather than reading it.
+///
+/// A **referenced** target is not this project's, so what the model can hold
+/// says nothing about it. Measured on 18.6, a foreign key into a partitioned
+/// table is an ordinary declaration and is authorized on the parent:
+///
+/// ```text
+/// CREATE TABLE app.child (..., pid integer REFERENCES shared.parent(id))
+///   with shared.parent PARTITION BY RANGE (id)  ->  42501: permission denied for table parent
+///   once REFERENCES is granted on it            ->  CREATE TABLE
+/// ```
+///
+/// Read at `r` alone, that target came back *absent*, so no gap was reported
+/// for a grant the very next `apply` needs — the under-demand this list exists
+/// to remove.
+fn table_question(count: usize, kinds: &[&str]) -> String {
+    let kinds = kinds
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "WITH wanted(schema_name, table_name) AS (VALUES {})
 SELECT w.schema_name, w.table_name,
@@ -492,10 +515,18 @@ SELECT w.schema_name, w.table_name,
   FROM wanted w
   LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name
   LEFT JOIN pg_catalog.pg_class c
-         ON c.relnamespace = n.oid AND c.relname = w.table_name AND c.relkind = 'r'",
+         ON c.relnamespace = n.oid AND c.relname = w.table_name AND c.relkind IN ({kinds})",
         values_list(count, 2)
     )
 }
+
+/// A table this project manages, or one of the two the tool owns: an ordinary
+/// table, and nothing else.
+const MANAGED_KINDS: [&str; 1] = ["r"];
+
+/// A table a declared foreign key points at: ordinary or partitioned, which are
+/// the two kinds this engine lets a key reference.
+const REFERENCED_KINDS: [&str; 2] = ["r", "p"];
 
 /// `($1::text), ($2::text)` — or `($1::text, $2::text), ($3::text, $4::text)`
 /// for pairs.
@@ -560,7 +591,7 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
     let ledger = ledger_tables();
     let mut tables: Vec<ObjectName> = ask.managed_tables.to_vec();
     tables.extend(ledger.iter().cloned());
-    for (object, present, rights) in read_tables(conn, &tables).await? {
+    for (object, present, rights) in read_tables(conn, &tables, &MANAGED_KINDS).await? {
         let is_ledger = ledger.contains(&object);
         match (present, is_ledger) {
             (true, true) => {
@@ -579,7 +610,7 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
         }
     }
 
-    for (object, present, rights) in read_tables(conn, ask.referenced).await? {
+    for (object, present, rights) in read_tables(conn, ask.referenced, &REFERENCED_KINDS).await? {
         if present {
             held.referenced_objects.insert(object, rights);
         }
@@ -622,6 +653,7 @@ async fn read_schemas(
 async fn read_tables(
     conn: &mut Conn,
     objects: &[ObjectName],
+    kinds: &[&str],
 ) -> Result<Vec<(ObjectName, bool, TableRights)>, DbError> {
     if objects.is_empty() {
         return Ok(Vec::new());
@@ -631,7 +663,7 @@ async fn read_tables(
         .flat_map(|o| [Param::Str(o.schema.as_str()), Param::Str(o.name.as_str())])
         .collect();
     let rows = conn
-        .query_with(&table_question(objects.len()), &params)
+        .query_with(&table_question(objects.len(), kinds), &params)
         .await?;
     rows.iter()
         .map(|row| {
@@ -1036,7 +1068,10 @@ mod tests {
     /// name appears in these statements is a placeholder.
     #[test]
     fn every_name_a_question_asks_about_is_bound() {
-        for (sql, columns) in [(schema_question(3), 1), (table_question(3), 2)] {
+        for (sql, columns) in [
+            (schema_question(3), 1),
+            (table_question(3, &MANAGED_KINDS), 2),
+        ] {
             let cells = values_list(3, columns);
             assert!(!cells.contains('\''), "{cells}");
             assert!(sql.contains(&cells), "{sql}");
@@ -1053,10 +1088,29 @@ mod tests {
     /// project keeps getting bitten by.
     #[test]
     fn a_securable_that_is_absent_still_comes_back_as_a_row() {
-        for sql in [schema_question(1), table_question(1)] {
+        for sql in [schema_question(1), table_question(1, &MANAGED_KINDS)] {
             assert!(sql.contains("LEFT JOIN"), "{sql}");
             assert!(sql.contains("IS NOT NULL AS present"), "{sql}");
         }
+    }
+
+    /// The two lists ask about different kinds, and the difference is measured:
+    /// a partitioned table is not a table this model can hold, and it is a
+    /// perfectly ordinary thing for somebody else's foreign-key target to be.
+    /// Asked at `r` alone, such a target read as absent and no grant was
+    /// demanded for it.
+    #[test]
+    fn a_referenced_target_may_be_partitioned_where_a_managed_table_may_not() {
+        assert!(
+            table_question(1, &MANAGED_KINDS).contains("c.relkind IN ('r')"),
+            "{}",
+            table_question(1, &MANAGED_KINDS)
+        );
+        assert!(
+            table_question(1, &REFERENCED_KINDS).contains("c.relkind IN ('r', 'p')"),
+            "{}",
+            table_question(1, &REFERENCED_KINDS)
+        );
     }
 
     /// Ownership is asked as the engine asks it, and about the table's own
@@ -1064,7 +1118,7 @@ mod tests {
     /// role this one can `SET ROLE` to without holding its privileges.
     #[test]
     fn ownership_is_asked_as_the_engine_asks_it() {
-        let sql = table_question(1);
+        let sql = table_question(1, &MANAGED_KINDS);
         assert!(
             sql.contains("pg_has_role(current_user, c.relowner, 'USAGE') AS owned"),
             "{sql}"

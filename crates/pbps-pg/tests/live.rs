@@ -4744,6 +4744,93 @@ async fn a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted
     db.drop().await;
 }
 
+/// A foreign key into a **partitioned** table outside the managed schemas.
+///
+/// The model cannot hold a partitioned table and the pull names it as
+/// unexpressible, which is what made `relkind = 'r'` look like the right filter
+/// everywhere. It is not the right filter for somebody else's table: measured
+/// on 18.6, a key into one is an ordinary declaration, authorized on the parent
+/// like any other, and read at `r` alone the target came back *absent* — so
+/// `doctor` demanded nothing and the next `apply` was refused.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_needs() {
+    let mut db = TestDb::create("partitioned_fk").await;
+    let role = least_privilege_role(&mut db, "fk").await;
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA shared; \
+             CREATE TABLE shared.parent (id integer PRIMARY KEY, v text) PARTITION BY RANGE (id); \
+             CREATE TABLE shared.parent_lo PARTITION OF shared.parent FOR VALUES FROM (0) TO (100); \
+             CREATE SCHEMA app; ALTER SCHEMA app OWNER TO {role}; \
+             GRANT USAGE ON SCHEMA shared TO {role}; \
+             GRANT USAGE, CREATE ON SCHEMA app TO {role}"
+        ))
+        .await
+        .expect("a partitioned table in a schema this project does not manage");
+
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the least-privilege role");
+
+    let parent = ObjectName {
+        schema: "shared".to_owned(),
+        name: "parent".to_owned(),
+    };
+    let ask = doctor::Ask {
+        managed_schemas: &["app".to_owned()],
+        managed_tables: &[],
+        referenced: std::slice::from_ref(&parent),
+    };
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read permissions");
+    // The premise: the target is seen at all. Read at `r` alone it was absent,
+    // and an absent target is asked for nothing.
+    assert!(held.referenced_objects.contains_key(&parent), "{held:?}");
+
+    let gaps = doctor::missing(&held);
+    for permission in ["REFERENCES", "SELECT"] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == permission
+                    && g.securable() == "TABLE \"shared\".\"parent\""),
+            "{permission} on the referenced parent: {gaps:?}"
+        );
+    }
+
+    // And the engine agrees, in both directions.
+    let refused = theirs
+        .execute("CREATE TABLE app.child (id integer PRIMARY KEY, pid integer REFERENCES shared.parent(id))")
+        .await
+        .expect_err("a key into a table this role may not reference");
+    assert_eq!(sqlstate(&refused), "42501", "{refused:?}");
+
+    db.conn
+        .execute(&format!(
+            "GRANT REFERENCES, SELECT ON shared.parent TO {role}"
+        ))
+        .await
+        .expect("grant what the report named");
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read again");
+    let gaps = doctor::missing(&held);
+    // Only the referenced target is this test's business: this database has no
+    // ledger yet, so the create-time gap on its schema is a true report about
+    // something else.
+    assert!(
+        !gaps.iter().any(|g| g.securable().contains("shared")),
+        "{gaps:?}"
+    );
+    theirs
+        .execute("CREATE TABLE app.child (id integer PRIMARY KEY, pid integer REFERENCES shared.parent(id))")
+        .await
+        .expect("the key the report said was now possible");
+
+    db.drop().await;
+}
+
 /// A managed schema that is not there is not a permission problem, and not
 /// nothing either: the emitter never writes `CREATE SCHEMA`, so the first
 /// statement of the plan would fail.

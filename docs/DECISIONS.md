@@ -5532,3 +5532,27 @@ SPEC is in sync with all of these.
     Referenced` asked for `REFERENCES` and not for the `SELECT` the probe for
     that key performs, which the SQL Server list has carried since it was
     written.
+
+294. **A referenced foreign-key target may be a partitioned table; a managed
+    table may not.** `doctor`'s table question filtered `relkind = 'r'` for
+    every list it asks about, taking the rule from the pull — where it is right,
+    because an index and a sequence are rows in `pg_class` too and a partitioned
+    table is one this model cannot hold at all.
+
+    A target of somebody else's is not this project's table, so what the model
+    can hold says nothing about it. Measured on 18.6:
+
+    ```text
+    shared.parent PARTITION BY RANGE (id)             ->  relkind = 'p'
+    CREATE TABLE app.child (..., pid integer REFERENCES shared.parent(id))
+      as a role with no grant on the parent            ->  42501: permission denied for table parent
+      once REFERENCES is granted on it                 ->  CREATE TABLE
+    ```
+
+    Read at `r` alone, the target came back *absent* — and an absent securable
+    is asked for nothing, by design (there is nothing to grant on) — so the
+    check demanded neither the `REFERENCES` the key needs nor the `SELECT` its
+    probe performs, and reported an environment ready that the very next
+    statement refuses. The kinds are the caller's now: `r` for what this project
+    manages and for the ledger, `r` and `p` for what a declared key points at,
+    which are the two kinds this engine lets a key reference.

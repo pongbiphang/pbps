@@ -349,14 +349,16 @@ called that environment ready. The staged apply's session pins land with it
 (`Dialect::session_pins`), which is what `transaction_framing` said step 8 owed
 it.
 
-Two things review found in that check, both measured and both the same shape
-(DECISIONS 292–293): `CREATE TABLE IF NOT EXISTS` is refused for want of
+Three things review found in that check, each measured (DECISIONS 292–294): `CREATE TABLE IF NOT EXISTS` is refused for want of
 `CREATE` on the schema **even when the table is already there**, so the ledger's
 DDL is not sent when the catalog says there is nothing to create; and
 `has_table_privilege` answers `true` for a table in a schema the role may not
 enter, so `USAGE` is required wherever objects are used and not only where they
 are created — on the ledger's schema, and on the schema of a referenced foreign
-key target, which also wants the `SELECT` its probe performs.
+key target, which also wants the `SELECT` its probe performs. And that target
+may be a **partitioned** table, which this model cannot hold and somebody else's
+schema may perfectly well contain: filtered to ordinary tables it read as
+absent, and an absent securable is asked for nothing.
 
 What remains is steps 5, 6, 7, 9 and 10: modules, roles, reference data,
 probes, and the suite in full.
