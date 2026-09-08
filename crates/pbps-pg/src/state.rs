@@ -35,7 +35,10 @@
 //! `app.__pbps_state` stays visible — is #185, which was waiting on this module
 //! to say where the ledger lives.
 
-use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, ids_to_prune};
+use pbps_db::ledger::{
+    LOCK_TABLE_NAME, LedgerEntry, LedgerError, LockInfo, STATE_TABLE_NAME, TimelineEntry,
+    ids_to_prune,
+};
 use pbps_db::{Conn, DbError, Row};
 use pbps_model::StateSnapshot;
 
@@ -224,13 +227,57 @@ const DELETE_LOCK: &str = "DELETE FROM public.__pbps_lock WHERE id = 1";
 /// statement at all.
 const PROBE_STATE: &str = "SELECT 1 AS present FROM public.__pbps_state LIMIT 0";
 
+/// Whether both tables are already there, asked of the catalog.
+///
+/// `pg_class` and `pg_namespace` are world-readable and this is a **join on
+/// names**, not a name resolution: measured, `to_regclass('hidden.t')` raises
+/// `42501` for a schema this role cannot enter, while a join like this one
+/// answers about it. So this question can be asked by a role holding nothing
+/// at all, and it cannot fail where the answer matters.
+///
+/// It asks exactly what `CREATE TABLE IF NOT EXISTS` asks — **any relation of
+/// that name**, whatever its kind — because the point is to predict whether
+/// that statement would do anything, and a probe that asked a narrower question
+/// would send DDL the engine is about to skip.
+///
+/// This is not the question [`is_initialized`] asks and must not be confused
+/// with it (DECISIONS 287): that one asks whether *this caller* has a ledger to
+/// read, which only a statement can answer, and answering it from the catalog
+/// would report a table this role cannot touch as one it can.
+fn ledger_is_there() -> String {
+    format!(
+        "SELECT count(*)::int8 AS present
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = '{LEDGER_SCHEMA}'
+        AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}')"
+    )
+}
+
 /// Creates the ledger and lock tables if they are not there yet.
+///
+/// **The DDL is not sent when there is nothing to create**, and that is a
+/// permission question rather than an optimization. Measured on 18.6: a role
+/// with `SELECT`, `INSERT` and `DELETE` on both ledger tables and no `CREATE`
+/// on their schema gets `42501: permission denied for schema public` from
+/// `CREATE TABLE IF NOT EXISTS public.__pbps_state` — the engine checks the
+/// schema privilege before it notices the relation is already there. That is
+/// exactly the least-privilege configuration SPEC §8.1 asks for and
+/// [`crate::doctor`] reports as ready, and every `record` and every `lock` runs
+/// this, so the whole deployment failed on a grant `doctor` had correctly said
+/// was spent.
 ///
 /// One batch, which on this engine is one transaction: PostgreSQL's DDL is
 /// transactional, so the pair arrives whole or not at all. The other engine
 /// can leave the ledger created and the lock missing, and its callers have to
 /// cope; here that state is unreachable.
 pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
+    let rows = conn.query(&ledger_is_there()).await?;
+    let present = rows.first().map(|row| number(row, "present")).transpose()?;
+    if present == Some(2) {
+        return Ok(());
+    }
+
     match conn
         .execute(&format!("{CREATE_STATE};\n{CREATE_LOCK};"))
         .await
@@ -553,7 +600,6 @@ fn number(row: &Row, column: &str) -> Result<i64, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_db::ledger::{LOCK_TABLE_NAME, STATE_TABLE_NAME};
 
     /// Every statement this module can send, in one list, so that a rule
     /// asserted about "the SQL here" cannot quietly stop covering a statement

@@ -5481,3 +5481,54 @@ SPEC is in sync with all of these.
     there now, which is what the caller asked for; anything else is still a
     failure. Every command that writes a ledger row calls this, so two
     pipelines starting together really do race on it.
+
+292. **The ledger's DDL is not sent when there is nothing to create**, and that
+    is a permission decision rather than an optimization. Measured on 18.6: a
+    role holding `SELECT`, `INSERT` and `DELETE` on both ledger tables and no
+    `CREATE` on their schema gets `42501: permission denied for schema public`
+    from `CREATE TABLE IF NOT EXISTS public.__pbps_state` — **even though the
+    table is already there.** The engine checks the schema privilege before it
+    notices the relation exists.
+
+    That is exactly the least-privilege configuration SPEC §8.1 asks for and
+    `pbps_pg::doctor` reports as ready, once 288's create-time requirement has
+    been spent. Every `record` and every `lock` calls `ensure_tables`, so the
+    whole deployment failed on a grant `doctor` had correctly said was no longer
+    needed.
+
+    So `ensure_tables` asks the catalog first, and this is **not** the question
+    269/287 refuses to ask there. That one is "does *this caller* have a ledger
+    to read", which only a statement can answer without turning "not authorized
+    to look" into "nothing there". This one is "would `CREATE TABLE IF NOT
+    EXISTS` do anything", which is about the database and not about the caller —
+    so it is asked as a join on `pg_class` and `pg_namespace`, which are
+    world-readable, and asked in the statement's own terms: *any* relation of
+    that name, whatever its kind, because that is what `IF NOT EXISTS` looks
+    for. A narrower predicate would send DDL the engine is about to skip, which
+    is the failure this removes.
+
+    The race is unchanged and still tolerated (291): between the probe and the
+    `CREATE`, another session may create the table, and `23505`/`42P07` still
+    mean it is there now.
+
+293. **`doctor` asks for `USAGE` on a schema wherever objects in it are used,
+    not only where they are created.** `Needed::LedgerCreation` asked for
+    `CREATE` on the ledger's schema while the ledger did not exist, and
+    `Needed::Ledger` asked for the DML on the two tables once it did — and
+    between them nobody asked whether the role could enter the schema at all.
+
+    Measured on 18.6, with `USAGE` on `public` revoked from a role holding
+    `SELECT`, `INSERT` and `DELETE` on both tables: `has_table_privilege`
+    answers **`t`** — the question is asked by oid and never resolves the name —
+    while every statement naming the ledger is `42501: permission denied for
+    schema public`. This is 288's shape a second time, and from the same
+    direction: a privilege question with a true answer, about something the
+    engine decides elsewhere.
+
+    Swept for, as CLAUDE.md asks, and found again one securable out: a foreign
+    key into `shared.parent` needs `USAGE` on `shared`, and nothing asked about
+    the *managed* schemas can see that. `Needed::ReferencedSchema` is that
+    entry. The same sweep found the plain omission beside it — `Needed::
+    Referenced` asked for `REFERENCES` and not for the `SELECT` the probe for
+    that key performs, which the SQL Server list has carried since it was
+    written.

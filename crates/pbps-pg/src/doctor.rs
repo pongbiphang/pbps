@@ -91,6 +91,18 @@ pub enum Needed {
     /// `public` for the rest of the project's life.
     LedgerCreation,
 
+    /// Held on the ledger's schema for as long as the ledger is used.
+    ///
+    /// `USAGE`, which is not spent when the tables are created and is not
+    /// implied by any grant on them. **Measured on 18.6**, with `USAGE` on
+    /// `public` revoked from a role holding `SELECT`, `INSERT` and `DELETE` on
+    /// both ledger tables: `has_table_privilege` still answers `t` — the
+    /// question is asked by oid and never resolves the name — while every
+    /// statement is `42501: permission denied for schema public`. So a
+    /// requirement that asked only about the two objects reported an
+    /// environment ready in which no ledger statement can run.
+    LedgerSchema,
+
     /// Held on the ledger and the lock themselves, once they exist.
     ///
     /// Asked on those two **objects**, not on their schema: a careful DBA
@@ -105,6 +117,13 @@ pub enum Needed {
     /// probe for an added foreign key reads it — so both are needed there, and
     /// neither is covered by anything asked about the managed schemas.
     Referenced,
+
+    /// Held on the schema a referenced table lives in.
+    ///
+    /// [`Needed::LedgerSchema`]'s rule, one securable out and found by sweeping
+    /// for it: a grant on `shared.parent` reaches nothing without `USAGE` on
+    /// `shared`, and nothing asked about the *managed* schemas can see that.
+    ReferencedSchema,
 }
 
 /// A permission pbps needs, what needs it, and where it has to be held.
@@ -131,7 +150,7 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// or `GRANT <owning role> TO <deployer>`, and the caller writes it.
 pub const OWNERSHIP: &str = "OWNERSHIP";
 
-pub const REQUIRED: [Requirement; 9] = [
+pub const REQUIRED: [Requirement; 12] = [
     req(
         "USAGE",
         "naming anything inside a schema pbps manages",
@@ -161,6 +180,11 @@ pub const REQUIRED: [Requirement; 9] = [
         Needed::LedgerCreation,
     ),
     req(
+        "USAGE",
+        "naming the ledger and the lock at all, which no grant on them confers",
+        Needed::LedgerSchema,
+    ),
+    req(
         "SELECT",
         "reading the recorded state and the deployment lock",
         Needed::Ledger,
@@ -185,6 +209,24 @@ pub const REQUIRED: [Requirement; 9] = [
         "adding a foreign key into a table this project does not manage, which the engine \
          authorizes on the referenced table",
         Needed::Referenced,
+    ),
+    // The other half of that foreign key, and the entry the SQL Server list
+    // already carries: the probe for an added key reads the referenced table
+    // (`NOT EXISTS (SELECT 1 FROM <parent> ...)`), and `REFERENCES` does not
+    // confer a read.
+    // The other half of that foreign key, and the entry the SQL Server list
+    // already carries: the probe for an added key reads the referenced table
+    // (`NOT EXISTS (SELECT 1 FROM <parent> ...)`), and `REFERENCES` does not
+    // confer a read.
+    req(
+        "SELECT",
+        "the pre-flight probe for that foreign key, which reads the referenced table",
+        Needed::Referenced,
+    ),
+    req(
+        "USAGE",
+        "naming that referenced table at all, which no grant on it confers",
+        Needed::ReferencedSchema,
     ),
 ];
 
@@ -275,6 +317,10 @@ pub struct Held {
     /// them, and the role that creates a table owns it, so no ownership gap
     /// can be reported against one.
     pub absent_tables: BTreeSet<ObjectName>,
+
+    /// Per schema a referenced target lives in, what is held on it. A schema
+    /// that is not there is absent from the map, like a managed one.
+    pub referenced_schemas: BTreeMap<String, SchemaRights>,
 
     /// Per foreign-key target outside the managed schemas that exists, what is
     /// held on it. A target the database does not have is absent from this map
@@ -481,13 +527,25 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
     // apart in the answer: a project that manages `public` needs both answers,
     // and they are not the same question.
     let mut schemas: Vec<String> = ask.managed_schemas.to_vec();
-    if !schemas.iter().any(|s| s == LEDGER_SCHEMA) {
+    if !schemas.contains(&LEDGER_SCHEMA.to_owned()) {
         schemas.push(LEDGER_SCHEMA.to_owned());
     }
+    // The schemas the referenced targets live in, asked about for the reason
+    // `Needed::ReferencedSchema` gives: a grant on the table reaches nothing
+    // without `USAGE` on the schema around it.
+    for object in ask.referenced {
+        if !schemas.contains(&object.schema) {
+            schemas.push(object.schema.clone());
+        }
+    }
+    let referenced_schemas: BTreeSet<&String> = ask.referenced.iter().map(|o| &o.schema).collect();
     for (name, present, rights) in read_schemas(conn, &schemas).await? {
         let managed = ask.managed_schemas.contains(&name);
         if name == LEDGER_SCHEMA {
             held.ledger_schema = present.then_some(rights);
+        }
+        if present && referenced_schemas.contains(&name) && !managed {
+            held.referenced_schemas.insert(name.clone(), rights);
         }
         if !managed {
             continue;
@@ -669,6 +727,20 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 }
             }
             Needed::LedgerCreation => {}
+            // Not spent when the ledger is created, unlike the branch above:
+            // every statement that names the ledger needs it, for as long as
+            // the ledger is used.
+            Needed::LedgerSchema => {
+                if let Some(rights) = held.ledger_schema
+                    && !rights.holds(r.name)
+                {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Schema(LEDGER_SCHEMA.to_owned()),
+                    });
+                }
+            }
             Needed::Ledger => {
                 for (object, rights) in &held.ledger_objects {
                     if !rights.privileges.contains(r.name) {
@@ -687,6 +759,17 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                             permission: r.name,
                             why: r.why,
                             securable: Securable::Object(object.clone()),
+                        });
+                    }
+                }
+            }
+            Needed::ReferencedSchema => {
+                for (schema, rights) in &held.referenced_schemas {
+                    if !rights.holds(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Schema(schema.clone()),
                         });
                     }
                 }
@@ -842,6 +925,66 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 2, "{gaps:?}");
         assert!(gaps.iter().all(|g| g.permission == "DELETE"), "{gaps:?}");
+    }
+
+    /// The ledger's schema is asked about for as long as the ledger is used,
+    /// not only while it is being created. Measured on 18.6, a role holding
+    /// every privilege on both tables and no `USAGE` on their schema cannot run
+    /// one ledger statement — and `has_table_privilege` says nothing about it,
+    /// because it is asked by oid and never resolves the name.
+    #[test]
+    fn a_ledger_whose_schema_this_role_cannot_enter_is_a_gap_after_it_exists() {
+        let mut held = Held {
+            ledger_schema: Some(SchemaRights {
+                usage: false,
+                create: true,
+            }),
+            ..Held::default()
+        };
+        for table in ledger_tables() {
+            held.ledger_objects
+                .insert(table, rights(true, &["SELECT", "INSERT", "DELETE"]));
+        }
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "USAGE");
+        assert_eq!(gaps[0].securable(), "SCHEMA \"public\"");
+    }
+
+    /// A foreign key into a table this project does not manage needs the read
+    /// as well as the reference: the probe for the key counts rows in that
+    /// table, and `REFERENCES` confers no read.
+    #[test]
+    fn a_referenced_table_has_to_be_readable_as_well_as_referable() {
+        let mut held = Held::default();
+        held.referenced_objects
+            .insert(object("shared", "parent"), rights(false, &["REFERENCES"]));
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
+        assert_eq!(gaps[0].securable(), "TABLE \"shared\".\"parent\"");
+    }
+
+    /// And the schema around it: the same rule as the ledger's, one securable
+    /// out, which is where a sweep for the shape found it.
+    #[test]
+    fn a_referenced_tables_schema_has_to_be_enterable() {
+        let mut held = Held::default();
+        held.referenced_objects.insert(
+            object("shared", "parent"),
+            rights(false, &["REFERENCES", "SELECT"]),
+        );
+        held.referenced_schemas.insert(
+            "shared".to_owned(),
+            SchemaRights {
+                usage: false,
+                create: false,
+            },
+        );
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "USAGE");
+        assert_eq!(gaps[0].securable(), "SCHEMA \"shared\"");
     }
 
     /// A schema that is not there produces no `GRANT` advice, because there is

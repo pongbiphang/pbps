@@ -4599,6 +4599,151 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
     db.drop().await;
 }
 
+/// The least-privilege configuration SPEC §8.1 asks for, run end to end: a DBA
+/// creates the ledger, grants the deployment role the DML on those two tables
+/// and nothing else, and the role deploys.
+///
+/// Two things are pinned here and both were found by review.
+///
+/// `ensure_tables` must send no DDL when there is nothing to create. Measured
+/// on 18.6, `CREATE TABLE IF NOT EXISTS public.__pbps_state` is
+/// `42501: permission denied for schema public` for this role **even though the
+/// table is already there** — the engine checks the schema privilege before it
+/// notices. Every `record` and every `lock` calls it, so the whole deployment
+/// failed on a grant `doctor` had correctly reported as spent.
+///
+/// And the identity column needs no sequence privilege. The ledger's `id` is
+/// `GENERATED ALWAYS AS IDENTITY`, and measured, this role holds no `USAGE` on
+/// `__pbps_state_id_seq` and the insert returns its id — where a `serial`
+/// column would be `permission denied for sequence` (ADR-0010 §7).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_role_that_may_write_the_ledger_and_not_create_it_deploys() {
+    let mut db = TestDb::create("ledger_dml_only").await;
+    let role = least_privilege_role(&mut db, "dmlonly").await;
+
+    // The DBA's half: the ledger exists, and the role is granted exactly what
+    // writing it needs.
+    state::ensure_tables(&mut db.conn).await.expect("create");
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT, INSERT, DELETE ON {}, {} TO {role}",
+            state::STATE_TABLE,
+            state::LOCK_TABLE
+        ))
+        .await
+        .expect("grant the ledger's DML");
+
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the least-privilege role");
+
+    // The premise, asserted rather than assumed: no `CREATE` on the schema, and
+    // no privilege on the identity's sequence.
+    assert!(
+        !truth(
+            &mut theirs,
+            "SELECT has_schema_privilege('public', 'CREATE')"
+        )
+        .await
+    );
+    assert!(
+        !truth(
+            &mut theirs,
+            "SELECT has_sequence_privilege('public.__pbps_state_id_seq', 'USAGE')"
+        )
+        .await
+    );
+
+    let id = state::record(&mut theirs, &snapshot(StateKind::Apply))
+        .await
+        .expect("a role granted the ledger's DML must be able to record a state");
+    assert!(id > 0);
+    state::lock(&mut theirs, "pipeline-one")
+        .await
+        .expect("and to take the lock");
+    assert!(state::unlock(&mut theirs).await.expect("and release it"));
+
+    // And `doctor` agrees with the engine about this configuration: nothing
+    // missing, with the create-time privilege spent and not asked for.
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+    };
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read permissions");
+    assert_eq!(doctor::missing(&held), Vec::new(), "{held:?}");
+
+    db.drop().await;
+}
+
+/// `USAGE` on the ledger's schema is not spent when the ledger is created, and
+/// no grant on the two tables confers it.
+///
+/// Measured on 18.6 and the reason this is asked at all: with `USAGE` revoked,
+/// `has_table_privilege` still answers `true` — it is asked by oid and never
+/// resolves the name — while every statement that names the ledger is
+/// `42501: permission denied for schema public`. A check that asked only about
+/// the two objects called this environment ready.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted() {
+    let mut db = TestDb::create("ledger_usage").await;
+    let role = least_privilege_role(&mut db, "usage").await;
+    state::ensure_tables(&mut db.conn).await.expect("create");
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT, INSERT, DELETE ON {}, {} TO {role}; \
+             REVOKE USAGE ON SCHEMA public FROM {role}; \
+             REVOKE USAGE ON SCHEMA public FROM PUBLIC",
+            state::STATE_TABLE,
+            state::LOCK_TABLE
+        ))
+        .await
+        .expect("grant the tables and close the schema");
+
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the least-privilege role");
+
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+    };
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read permissions");
+    // The premise: the table privileges really do read as held.
+    for table in doctor::ledger_tables() {
+        assert!(
+            held.ledger_objects[&table].privileges.contains("INSERT"),
+            "{held:?}"
+        );
+    }
+    let gaps = doctor::missing(&held);
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "USAGE" && g.securable() == "SCHEMA \"public\""),
+        "{gaps:?}"
+    );
+
+    // And the engine agrees: the statement the grants describe cannot run.
+    let refused = state::record(&mut theirs, &snapshot(StateKind::Apply))
+        .await
+        .expect_err("a closed schema is not a writable ledger");
+    match refused {
+        LedgerError::Db(e) => assert_eq!(sqlstate(&e), "42501", "{e:?}"),
+        other @ (LedgerError::NotInitialized
+        | LedgerError::Locked(_)
+        | LedgerError::BadEntry { .. }) => panic!("expected the server's refusal: {other:?}"),
+    }
+
+    db.drop().await;
+}
+
 /// A managed schema that is not there is not a permission problem, and not
 /// nothing either: the emitter never writes `CREATE SCHEMA`, so the first
 /// statement of the plan would fail.
