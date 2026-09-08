@@ -5661,3 +5661,7 @@ SPEC is in sync with all of these.
     source is `nchar`, `nvarchar` or `ntext` and the bounded target is `char` or
     `varchar`. Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep
     their one length probe rather than paying for a question they do not ask.
+    Because SQL Server does not accept `LEN(ntext)` or `LEN(text)`, those legacy
+    sources are first converted to their corresponding max type for the length
+    count; the round-trip comparison likewise converts `ntext` before using
+    the comparison operator.

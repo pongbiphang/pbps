@@ -1286,11 +1286,11 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
 async fn unicode_to_varchar_probes_character_loss() {
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
-    let plan = |to: &str| ChangeSet {
+    let plan = |column: &str, from: &str, to: &str| ChangeSet {
         changes: vec![PlannedChange::new(Change::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
-            column: "dbo.t.label".parse().unwrap(),
-            from: ty("nvarchar(20)"),
+            column: column.parse().unwrap(),
+            from: ty(from),
             to: ty(to),
             from_nullable: true,
             to_nullable: true,
@@ -1323,11 +1323,17 @@ async fn unicode_to_varchar_probes_character_loss() {
         .conn
         .execute(
             "CREATE TABLE dbo.t (label nvarchar(20) NULL);\n\
-             INSERT dbo.t VALUES (N'王小明');",
+             INSERT dbo.t VALUES (N'王小明');\n\
+             CREATE TABLE dbo.old_text (label ntext NULL);\n\
+             INSERT dbo.old_text VALUES (N'王小明');",
         )
         .await
         .unwrap();
-    let measured = counts(&mut legacy.conn, &plan("varchar(20)")).await;
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.t.label", "nvarchar(20)", "varchar(20)"),
+    )
+    .await;
     assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
     assert_eq!(
         count(&measured, "changed when converted"),
@@ -1340,6 +1346,29 @@ async fn unicode_to_varchar_probes_character_loss() {
         .await
         .unwrap();
     let rows = legacy.conn.query("SELECT label FROM dbo.t;").await.unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.old_text.label", "ntext", "varchar(20)"),
+    )
+    .await;
+    assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.old_text ALTER COLUMN label varchar(20) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.old_text;")
+        .await
+        .unwrap();
     let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
     assert_eq!(changed, "???");
     legacy.drop().await;
@@ -1359,7 +1388,11 @@ async fn unicode_to_varchar_probes_character_loss() {
         )
         .await
         .unwrap();
-    let measured = counts(&mut utf8.conn, &plan("varchar(4)")).await;
+    let measured = counts(
+        &mut utf8.conn,
+        &plan("dbo.t.label", "nvarchar(20)", "varchar(4)"),
+    )
+    .await;
     assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
     assert_eq!(
         count(&measured, "changed when converted"),

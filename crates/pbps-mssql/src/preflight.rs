@@ -1782,10 +1782,16 @@ fn conversion_probe(
             // shortens a character column — counting them would report rows
             // that convert perfectly well.
             "char" | "nchar" | "varchar" | "nvarchar" => {
+                let from = types::normalize(from)?;
+                let len = match from.base.as_str() {
+                    "text" => format!("LEN(CONVERT(varchar(max), {col}))"),
+                    "ntext" => format!("LEN(CONVERT(nvarchar(max), {col}))"),
+                    _ => format!("LEN({col})"),
+                };
                 let mut probes = vec![Probe::new(
                     format!("values in {column} too long for {to}"),
                     format!(
-                        "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND LEN({col}) > {n};"
+                        "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND {len} > {n};"
                     ),
                 )];
                 // LEN counts characters, while a non-Unicode target stores
@@ -1795,14 +1801,13 @@ fn conversion_probe(
                 // ALTER conversion round-trips, under a binary comparison so
                 // the source column's collation cannot call changed text the
                 // same value (DECISIONS 299).
-                let from = types::normalize(from)?;
                 if matches!(from.base.as_str(), "nchar" | "nvarchar" | "ntext")
                     && matches!(to.base.as_str(), "char" | "varchar")
                 {
                     probes.push(Probe::new(
                         format!("values in {column} changed when converted to {to}"),
                         format!(
-                            "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {col} COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> {col} COLLATE Latin1_General_BIN2;"
+                            "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {col} COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
                         ),
                     ));
                 }
@@ -2025,10 +2030,15 @@ mod tests {
                 to_nullable: true,
             });
             assert_eq!(sql.len(), 2, "{from} -> {to}: {sql:?}");
-            assert!(sql[0].contains("LEN([label]) > 50"), "{sql:?}");
+            let expected_len = if from == "ntext" {
+                "LEN(CONVERT(nvarchar(max), [label])) > 50"
+            } else {
+                "LEN([label]) > 50"
+            };
+            assert!(sql[0].contains(expected_len), "{sql:?}");
             assert!(
                 sql[1].contains(&format!(
-                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> [label] COLLATE Latin1_General_BIN2"
+                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
             );
@@ -2038,6 +2048,7 @@ mod tests {
             ("nvarchar(255)", "nvarchar(50)"),
             ("varchar(255)", "varchar(50)"),
             ("varchar(255)", "nvarchar(50)"),
+            ("text", "varchar(50)"),
         ] {
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
@@ -2048,7 +2059,12 @@ mod tests {
                 to_nullable: true,
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
-            assert!(sql[0].contains("LEN([label]) > 50"), "{sql:?}");
+            let expected_len = if from == "text" {
+                "LEN(CONVERT(varchar(max), [label])) > 50"
+            } else {
+                "LEN([label]) > 50"
+            };
+            assert!(sql[0].contains(expected_len), "{sql:?}");
         }
     }
 
