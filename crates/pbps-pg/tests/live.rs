@@ -4551,6 +4551,105 @@ async fn the_loser_of_the_creation_race_keeps_the_transaction_it_was_called_in()
     db.drop().await;
 }
 
+/// Every answer this module gives by *tolerating an error* has to leave the
+/// caller's transaction where it found it.
+///
+/// Measured on 18.6, each of these raises inside the call and is handled by it:
+/// `is_initialized` on a database with no ledger is `42P01`, and so are
+/// `unlock` and `lock_holder` against a missing lock table. An error aborts the
+/// transaction it happens in, so without a savepoint each of them would hand
+/// back `Ok(...)` on a connection whose next statement is `25P02` and whose
+/// `COMMIT` is a `ROLLBACK` — and the ledger is read inside the apply's own
+/// transaction (DECISIONS 147).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_expected_failure_leaves_the_callers_transaction_where_it_found_it() {
+    let mut db = TestDb::create("expected_failures").await;
+
+    db.conn.execute("BEGIN").await.expect("the caller's own");
+    assert!(!state::is_initialized(&mut db.conn).await.expect("probe"));
+    assert_eq!(
+        number(&mut db.conn, "SELECT 1").await,
+        1,
+        "the absent-ledger answer must not cost the caller its transaction"
+    );
+    assert!(matches!(
+        state::latest(&mut db.conn).await,
+        Err(LedgerError::NotInitialized)
+    ));
+    assert_eq!(number(&mut db.conn, "SELECT 1").await, 1);
+    assert!(
+        state::lock_holder(&mut db.conn)
+            .await
+            .expect("no lock table is not a held lock")
+            .is_none()
+    );
+    assert_eq!(number(&mut db.conn, "SELECT 1").await, 1);
+    assert!(
+        !state::unlock(&mut db.conn)
+            .await
+            .expect("nothing to unlock")
+    );
+    assert_eq!(number(&mut db.conn, "SELECT 1").await, 1);
+
+    // And the transaction is still the caller's to finish: the work it opened
+    // it for commits.
+    db.conn
+        .execute("CREATE TABLE public.the_callers_own (id integer)")
+        .await
+        .expect("the caller's own work");
+    db.conn.execute("COMMIT").await.expect("commit");
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM pg_class WHERE relname = 'the_callers_own'"
+        )
+        .await,
+        1,
+        "a COMMIT after a handled failure must commit, not roll back"
+    );
+
+    db.drop().await;
+}
+
+/// `42P07` names *a* relation the DDL would create, not the ledger, so the
+/// answer is not taken from the error.
+///
+/// Measured on 18.6: with an unrelated `public.pk___pbps_state` — the name this
+/// DDL gives the ledger's primary key, and an ordinary name for something else
+/// to have — `CREATE TABLE IF NOT EXISTS public.__pbps_state` fails with
+/// `42P07` and the ledger is **still absent**. Read as "somebody else created
+/// it", that is `ensure_tables` reporting success over a database with no
+/// ledger.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_name_collision_that_is_not_the_ledger_is_not_reported_as_a_ledger() {
+    let mut db = TestDb::create("name_collision").await;
+    db.conn
+        .execute("CREATE TABLE public.pk___pbps_state (x integer)")
+        .await
+        .expect("something else holding the primary key's name");
+
+    let error = state::ensure_tables(&mut db.conn)
+        .await
+        .expect_err("a ledger that was not created is not a ledger");
+    assert_eq!(sqlstate(&error), "42P07", "{error:?}");
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM pg_class WHERE relname = '__pbps_state'"
+        )
+        .await,
+        0,
+        "the premise is wrong if the table was created after all"
+    );
+    // And the caller is told what to do about it by the engine's own words:
+    // the name in the error is the squatter's, not the ledger's.
+    assert!(state::latest(&mut db.conn).await.is_err());
+
+    db.drop().await;
+}
+
 /// `doctor` against a **real least-privilege role**, which is the only way this
 /// answer means anything: `postgres` is a superuser and passes every question
 /// without the catalog being asked.

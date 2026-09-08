@@ -5590,3 +5590,35 @@ SPEC is in sync with all of these.
     written for an engine where a failed statement costs a statement, on an
     engine where it costs the transaction. The other two are the lock (285) and
     the reason it does not read its holder after a failed insert.
+
+296. **Every answer this ledger gives by tolerating an error is taken under a
+    savepoint, and the tolerated `42P07` is verified rather than believed.** 295
+    fixed one arm; a sweep of the file — which is what PITFALLS' own entry says
+    to do about this shape — found three more, and one of them was tolerating
+    the wrong thing.
+
+    **The savepoint, everywhere.** `is_initialized`'s answer *is* an error
+    (`42P01`, there is no ledger), and so are `unlock`'s and `lock_holder`'s
+    against a missing lock table. Measured, each aborts the transaction it
+    happens in, so each returned `Ok(...)` on a connection whose next statement
+    is `25P02` and whose `COMMIT` is a `ROLLBACK`. `latest`, `history`,
+    `timeline` and `prune` all reach `is_initialized`, so one guard covers the
+    readers. It is a struct (`Recoverable`) rather than four copies of the same
+    three lines, because the next arm someone adds should have somewhere to
+    reach for.
+
+    **And the collision is checked, not inferred.** `42P07` names *a* relation
+    the DDL would create, not the ledger. Measured, an unrelated
+    `public.pk___pbps_state` — the name this DDL gives the ledger's primary key,
+    and an ordinary name for something else to have — makes
+    `CREATE TABLE IF NOT EXISTS public.__pbps_state` fail with `42P07` while the
+    ledger is **still absent**. Read as "somebody else created it", that is
+    `ensure_tables` reporting success over a database with no ledger, and the
+    next `record` failing with `42P01` about a table this call said it had made
+    sure of. So the answer comes from the catalog — both tables there, or the
+    engine's own error, which names the squatter.
+
+    The cost is one round trip per call that can tolerate something: the
+    `SAVEPOINT` attempt, which outside a transaction is `25P01` and does
+    nothing. That is the same round trip a separate "am I in a transaction"
+    probe would cost, and it answers both questions.

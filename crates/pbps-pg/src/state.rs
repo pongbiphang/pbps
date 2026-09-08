@@ -254,6 +254,74 @@ fn ledger_is_there() -> String {
     )
 }
 
+/// A savepoint held around one statement whose failure this code expects to
+/// handle.
+///
+/// **On this engine a failed statement aborts the whole transaction**, so every
+/// `Err(e) if ... => Ok(...)` arm below is a claim that the connection is still
+/// usable — and without something to rewind to, that claim is false inside a
+/// transaction: the caller's next statement is `25P02` and its `COMMIT` becomes
+/// a `ROLLBACK`. The ledger is read and written inside the apply's own
+/// transaction (DECISIONS 147), so the callers are real ones.
+///
+/// Taken by **trying** it: measured, `SAVEPOINT` outside a transaction block is
+/// `25P01` and harms nothing, so one round trip both establishes the savepoint
+/// and answers whether this call is in a transaction at all — where a separate
+/// probe would cost the same round trip and tell it less. Outside a transaction
+/// there is nothing to protect and nothing is taken.
+struct Recoverable {
+    inside_a_transaction: bool,
+}
+
+impl Recoverable {
+    async fn take(conn: &mut Conn) -> Result<Self, DbError> {
+        match conn.execute(SAVEPOINT).await {
+            Ok(()) => Ok(Recoverable {
+                inside_a_transaction: true,
+            }),
+            Err(e) if is_outside_a_transaction(&e) => Ok(Recoverable {
+                inside_a_transaction: false,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The statement did what was wanted: end the savepoint and leave the
+    /// caller's transaction exactly as deep as it was.
+    async fn release(self, conn: &mut Conn) -> Result<(), DbError> {
+        if self.inside_a_transaction {
+            conn.execute(RELEASE_SAVEPOINT).await?;
+        }
+        Ok(())
+    }
+
+    /// The statement failed and this code is handling that failure: put the
+    /// transaction back where it was, so that "handled" means what it says.
+    async fn rewind(self, conn: &mut Conn) -> Result<(), DbError> {
+        if self.inside_a_transaction {
+            conn.execute(ROLLBACK_TO_SAVEPOINT).await?;
+        }
+        Ok(())
+    }
+
+    /// The same, for a failure that is **not** being handled: the caller is
+    /// about to be given the error, and this only leaves it able to run the
+    /// diagnostics it wants to print. Its own failure is dropped, so it cannot
+    /// replace the error that caused it.
+    async fn rewind_quietly(self, conn: &mut Conn) {
+        let _ = self.rewind(conn).await;
+    }
+}
+
+/// How many of the two tables the catalog holds.
+async fn ledger_present(conn: &mut Conn) -> Result<i64, DbError> {
+    let rows = conn.query(&ledger_is_there()).await?;
+    rows.first()
+        .map(|row| number(row, "present"))
+        .transpose()?
+        .ok_or_else(|| missing("present"))
+}
+
 /// Creates the ledger and lock tables if they are not there yet.
 ///
 /// **The DDL is not sent when there is nothing to create**, and that is a
@@ -272,30 +340,17 @@ fn ledger_is_there() -> String {
 /// can leave the ledger created and the lock missing, and its callers have to
 /// cope; here that state is unreachable.
 pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
-    let rows = conn.query(&ledger_is_there()).await?;
-    let present = rows.first().map(|row| number(row, "present")).transpose()?;
-    if present == Some(2) {
+    if ledger_present(conn).await? == 2 {
         return Ok(());
     }
 
-    // The savepoint is what makes the tolerated failure below *survivable*, and
-    // it is established by trying it: `SAVEPOINT` outside a transaction block
-    // is `25P01` and harms nothing, so this is also how this call finds out
-    // where it is. One round trip, and only on the path that sends DDL at all.
-    let inside_a_transaction = match conn.execute(SAVEPOINT).await {
-        Ok(()) => true,
-        Err(e) if is_outside_a_transaction(&e) => false,
-        Err(e) => return Err(e),
-    };
-
+    let guard = Recoverable::take(conn).await?;
     let created = conn
         .execute(&format!("{CREATE_STATE};\n{CREATE_LOCK};"))
         .await;
     match created {
         Ok(()) => {
-            if inside_a_transaction {
-                conn.execute(RELEASE_SAVEPOINT).await?;
-            }
+            guard.release(conn).await?;
             Ok(())
         }
         // `IF NOT EXISTS` is not atomic against a concurrent creator: measured,
@@ -305,28 +360,36 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
         // not hold. Both mean the table is there now, which is what the caller
         // asked for.
         //
-        // **Tolerating it is not enough.** Measured, the loser's *transaction*
-        // is aborted by that error, so a bare `Ok(())` would hand back a
-        // connection on which the caller's next statement is
-        // `25P02: current transaction is aborted` — and `record` runs inside
-        // the apply's transaction (DECISIONS 147), so the whole deployment
-        // would fail on a race this arm claims to have handled. Rolling back to
-        // the savepoint is what makes the claim true.
+        // **Tolerating it is not enough**, twice over.
+        //
+        // The transaction: measured, the loser's *transaction* is aborted by
+        // that error, so a bare `Ok(())` would hand back a connection on which
+        // the caller's next statement is `25P02` — and `record` runs inside the
+        // apply's transaction (DECISIONS 147), so the whole deployment would
+        // fail on a race this arm claims to have handled.
+        //
+        // And the claim itself: the SQLSTATE says a relation the DDL creates
+        // was already there, **not** which one. Measured, a table called
+        // `public.pk___pbps_state` — the name this DDL gives the ledger's
+        // primary key, and an ordinary name for something else to have — makes
+        // `CREATE TABLE IF NOT EXISTS public.__pbps_state` fail with `42P07`
+        // while the ledger is still absent. So the answer is not taken from the
+        // error at all: the catalog is asked again, and only both tables being
+        // there is success. Otherwise the original failure is the answer, with
+        // the name the engine put in it.
         Err(e) if made_by_someone_else(&e) => {
-            if inside_a_transaction {
-                conn.execute(ROLLBACK_TO_SAVEPOINT).await?;
+            guard.rewind(conn).await?;
+            if ledger_present(conn).await? == 2 {
+                Ok(())
+            } else {
+                Err(e)
             }
-            Ok(())
         }
         // Anything else is still a failure — and the caller is left able to
-        // report it: without the rollback its transaction is aborted, so even
-        // the diagnostics it wants to run would come back `25P02`. The
-        // rollback's own error is dropped, so it cannot replace the failure
-        // that caused it.
+        // report it: without the rewind its transaction is aborted, so even the
+        // diagnostics it wants to run would come back `25P02`.
         Err(e) => {
-            if inside_a_transaction {
-                let _ = conn.execute(ROLLBACK_TO_SAVEPOINT).await;
-            }
+            guard.rewind_quietly(conn).await;
             Err(e)
         }
     }
@@ -374,10 +437,24 @@ fn is_outside_a_transaction(e: &DbError) -> bool {
 /// one had to be found by measurement, because its catalog *hides* an object a
 /// login has no permission on and answers NULL for it, DECISIONS 219.)
 pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
+    // Under a savepoint, because the answer this call is *for* — `42P01`, there
+    // is no ledger — is an error, and an error inside a transaction takes the
+    // transaction with it. See [`Recoverable`]. Every reader below goes through
+    // here, so this is where the four of them get that protection.
+    let guard = Recoverable::take(conn).await?;
     match conn.query(PROBE_STATE).await {
-        Ok(_) => Ok(true),
-        Err(e) if is_missing_table(&e) => Ok(false),
-        Err(e) => Err(e),
+        Ok(_) => {
+            guard.release(conn).await?;
+            Ok(true)
+        }
+        Err(e) if is_missing_table(&e) => {
+            guard.rewind(conn).await?;
+            Ok(false)
+        }
+        Err(e) => {
+            guard.rewind_quietly(conn).await;
+            Err(e)
+        }
     }
 }
 
@@ -555,10 +632,23 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
     // mean a database whose `__pbps_state` had been dropped by hand reported
     // "not held" and left a live lock in place — with no command able to clear
     // it.
+    let guard = Recoverable::take(conn).await?;
     match conn.execute_with(DELETE_LOCK, &[]).await {
-        Ok(n) => Ok(n > 0),
-        Err(e) if is_missing_table(&e) => Ok(false),
-        Err(e) => Err(e),
+        Ok(n) => {
+            guard.release(conn).await?;
+            Ok(n > 0)
+        }
+        // The tolerated answer is an error, so it needs the rewind the others
+        // do: a `pbps unlock` against a database with no lock table must not
+        // leave the caller's transaction dead on its way to saying "not held".
+        Err(e) if is_missing_table(&e) => {
+            guard.rewind(conn).await?;
+            Ok(false)
+        }
+        Err(e) => {
+            guard.rewind_quietly(conn).await;
+            Err(e)
+        }
     }
 }
 
@@ -570,10 +660,20 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
 /// differently, and "I could not look" must never be flattened into "nothing
 /// there".
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
+    let guard = Recoverable::take(conn).await?;
     let rows = match conn.query(&select_lock()).await {
-        Ok(rows) => rows,
-        Err(e) if is_missing_table(&e) => return Ok(None),
-        Err(e) => return Err(e),
+        Ok(rows) => {
+            guard.release(conn).await?;
+            rows
+        }
+        Err(e) if is_missing_table(&e) => {
+            guard.rewind(conn).await?;
+            return Ok(None);
+        }
+        Err(e) => {
+            guard.rewind_quietly(conn).await;
+            return Err(e);
+        }
     };
     match rows.first() {
         Some(row) => Ok(Some(LockInfo {

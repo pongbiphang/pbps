@@ -349,7 +349,7 @@ called that environment ready. The staged apply's session pins land with it
 (`Dialect::session_pins`), which is what `transaction_framing` said step 8 owed
 it.
 
-Four things review found, each measured (DECISIONS 292–295): `CREATE TABLE IF NOT EXISTS` is refused for want of
+Five things review found, each measured (DECISIONS 292–296): `CREATE TABLE IF NOT EXISTS` is refused for want of
 `CREATE` on the schema **even when the table is already there**, so the ledger's
 DDL is not sent when the catalog says there is nothing to create; and
 `has_table_privilege` answers `true` for a table in a schema the role may not
@@ -358,10 +358,13 @@ are created — on the ledger's schema, and on the schema of a referenced foreig
 key target, which also wants the `SELECT` its probe performs. And that target
 may be a **partitioned** table, which this model cannot hold and somebody else's
 schema may perfectly well contain: filtered to ordinary tables it read as
-absent, and an absent securable is asked for nothing. The fourth is the ledger
-again: tolerating the creation race is only tolerable in autocommit, because
-inside a transaction that error aborts it — so the `CREATE` runs under a
-savepoint, taken by trying it.
+absent, and an absent securable is asked for nothing. The last two are the ledger
+again, and one shape: tolerating an error is only tolerable in autocommit,
+because inside a transaction that error aborts it — so every arm that turns a
+failure into a value runs under a savepoint, `is_initialized`'s `42P01`
+included; and a tolerated `42P07` is verified against the catalog rather than
+believed, because it names *a* relation the DDL would create and not the
+ledger.
 
 What remains is steps 5, 6, 7, 9 and 10: modules, roles, reference data,
 probes, and the suite in full.
