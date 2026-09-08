@@ -5662,6 +5662,9 @@ SPEC is in sync with all of these.
     the target is `char`, `varchar` or legacy `text`. A max or `text` target
     gets only the round trip because it has no length question, but it can
     still replace characters under a legacy code page.
+    Both endpoints are normalized before classification, so accepted aliases
+    such as `character varying(max)` ask the same probe as `varchar(max)`,
+    matching the type spelling the emitter will use.
     Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep their one
     length probe rather than paying for a question they do not ask.
     Because SQL Server does not accept `LEN(ntext)` or `LEN(text)`, those legacy

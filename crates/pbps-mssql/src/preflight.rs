@@ -1769,6 +1769,9 @@ fn conversion_probe(
     let table = qualified(&stored.table)?;
     let col = quote(&stored.name)?;
     let from = types::normalize(from)?;
+    let Ok(to) = types::normalize(to) else {
+        return Ok(Vec::new());
+    };
     let unicode_to_non_unicode = matches!(
         from.base.as_str(),
         "nchar" | "nvarchar" | "ntext" | "sysname"
@@ -1844,9 +1847,6 @@ fn conversion_probe(
     // type, and a type is not a value a parameter can carry. It comes from the
     // dialect's own catalogue, never from user text — `normalize` has already
     // rejected anything that is not a type this dialect knows.
-    if types::normalize(to).is_err() {
-        return Ok(Vec::new());
-    }
     Ok(vec![Probe::new(
         format!("values in {column} that cannot become {to}"),
         format!(
@@ -2027,17 +2027,23 @@ mod tests {
 
     #[test]
     fn unicode_into_a_bounded_non_unicode_string_is_probed_for_changed_bytes() {
-        for (from, to) in [
-            ("nvarchar(255)", "varchar(50)"),
-            ("nchar(255)", "char(50)"),
-            ("ntext", "varchar(50)"),
-            ("sysname", "varchar(50)"),
+        for (from, to, normalized_to) in [
+            ("nvarchar(255)", "varchar(50)", "varchar(50)"),
+            ("nchar(255)", "char(50)", "char(50)"),
+            ("ntext", "varchar(50)", "varchar(50)"),
+            ("sysname", "varchar(50)", "varchar(50)"),
+            ("nvarchar(255)", "character varying(50)", "varchar(50)"),
         ] {
+            let target = if to.starts_with("character") {
+                to.parse().unwrap()
+            } else {
+                ty(to)
+            };
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty(from),
-                to: ty(to),
+                to: target,
                 from_nullable: true,
                 to_nullable: true,
             });
@@ -2050,23 +2056,29 @@ mod tests {
             assert!(sql[0].contains(expected_len), "{sql:?}");
             assert!(
                 sql[1].contains(&format!(
-                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
             );
         }
 
-        for (from, to) in [
-            ("nvarchar(255)", "varchar(max)"),
-            ("ntext", "varchar(max)"),
-            ("sysname", "varchar(max)"),
-            ("nvarchar(255)", "text"),
+        for (from, to, normalized_to) in [
+            ("nvarchar(255)", "varchar(max)", "varchar(max)"),
+            ("ntext", "varchar(max)", "varchar(max)"),
+            ("sysname", "varchar(max)", "varchar(max)"),
+            ("nvarchar(255)", "text", "text"),
+            ("nvarchar(255)", "character varying(max)", "varchar(max)"),
         ] {
+            let target = if to.starts_with("character") {
+                to.parse().unwrap()
+            } else {
+                ty(to)
+            };
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty(from),
-                to: ty(to),
+                to: target,
                 from_nullable: true,
                 to_nullable: true,
             });
@@ -2074,7 +2086,7 @@ mod tests {
             assert!(!sql[0].contains("LEN("), "{sql:?}");
             assert!(
                 sql[0].contains(&format!(
-                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
             );
