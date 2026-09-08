@@ -5622,3 +5622,18 @@ SPEC is in sync with all of these.
     `SAVEPOINT` attempt, which outside a transaction is `25P01` and does
     nothing. That is the same round trip a separate "am I in a transaction"
     probe would cost, and it answers both questions.
+
+298. **A `timestamp` / `rowversion` declaration may be nullable, but its
+    nullability may never be altered.** Measured on SQL Server 2025,
+    `CREATE TABLE ... rowversion NULL` succeeds and the catalog records the
+    column as nullable. The same engine refuses every `ALTER COLUMN` that names
+    either spelling with 4927, even when the type is unchanged and only
+    nullability is restated.
+
+    The refusal therefore belongs to the nullability-change arm of the dialect
+    emitter, using the same `alter_column_is_refused` fact as type-change
+    planning. Refusing the declaration in offline `validate` would reject a
+    state the engine does represent; classifying the intrinsic nullability risk
+    differently would merely ask for approval before emitting SQL that cannot
+    run. Ordinary `varbinary(8)` remains alterable, so binary capacity is not
+    used as a proxy for the engine's `timestamp` rule.

@@ -7351,6 +7351,44 @@ async fn a_timestamp_column_cannot_be_altered_into_or_out_of() {
         "{error}"
     );
 
+    // Restating the same type only to change nullability is still an ALTER
+    // COLUMN that names `timestamp`, so both of its spellings are refused.
+    for statement in [
+        "ALTER TABLE dbo.rv ALTER COLUMN v timestamp NOT NULL;",
+        "ALTER TABLE dbo.rv ALTER COLUMN v rowversion NULL;",
+    ] {
+        let error = db
+            .conn
+            .execute(statement)
+            .await
+            .expect_err("SQL Server refuses a nullability-only timestamp alteration");
+        assert_eq!(
+            error.server_error_code().as_deref(),
+            Some("4927"),
+            "{statement}: {error}"
+        );
+    }
+
+    // CREATE accepts and stores the nullable spelling. The declaration is
+    // valid; only a later attempt to change its nullability is impossible.
+    db.conn
+        .execute("CREATE TABLE dbo.rv_nullable (id int NOT NULL, v rowversion NULL);")
+        .await
+        .expect("SQL Server accepts rowversion NULL at CREATE time");
+    let rows = db
+        .conn
+        .query(
+            "SELECT c.is_nullable FROM sys.columns c \
+             WHERE c.object_id = OBJECT_ID('dbo.rv_nullable') AND c.name = 'v';",
+        )
+        .await
+        .unwrap();
+    let nullable: bool = rows[0].try_get_at(0).unwrap().unwrap();
+    assert!(
+        nullable,
+        "SQL Server stores an explicitly nullable rowversion"
+    );
+
     // Nothing moved: a refusal that left the column half-changed would make
     // the risk classification the least of the problems.
     let rows = db
@@ -7401,7 +7439,10 @@ async fn a_timestamp_column_cannot_be_altered_into_or_out_of() {
          prohibition, the classification is not the only thing carrying it"
     );
 
-    db.conn.execute("DROP TABLE dbo.rv;").await.unwrap();
+    db.conn
+        .execute("DROP TABLE dbo.rv_nullable; DROP TABLE dbo.rv;")
+        .await
+        .unwrap();
     db.drop().await;
 }
 
