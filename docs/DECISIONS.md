@@ -5645,7 +5645,7 @@ SPEC is in sync with all of these.
     Measured, the legacy ALTER succeeds and silently stores the changed value,
     while the UTF-8 ALTER refuses with truncation; `LEN` reports 3 in each case.
 
-    The second probe converts through the bounded target and back to
+    The second probe converts through the non-Unicode target and back to
     `nvarchar(max)`, then compares under `Latin1_General_BIN2`. The binary
     collation is part of the question: the source column's own collation may
     call two spellings equal, which would turn another loss into a clean count.
@@ -5675,8 +5675,8 @@ SPEC is in sync with all of these.
     A legacy `text` source is first converted to `varchar(max)` under its
     source collation before applying `DATABASE_DEFAULT`; SQL Server refuses a
     direct cross-code-page `COLLATE` on `text` itself.
-    Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep their one
-    length probe rather than paying for a question they do not ask.
+    Unicode-to-Unicode and non-Unicode-to-Unicode changes keep their one length
+    probe rather than paying for a question they do not ask.
     Because SQL Server does not accept `LEN(ntext)` or `LEN(text)`, those legacy
     sources are first converted to their corresponding max type for the length
     count; the round-trip comparison likewise converts `ntext` before using
