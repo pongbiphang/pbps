@@ -424,6 +424,18 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             to_nullable,
             ..
         } => {
+            // `CREATE TABLE` accepts nullable timestamp / rowversion, but the
+            // engine refuses every ALTER COLUMN that names either spelling —
+            // including one whose only change is nullability (DECISIONS 298).
+            if types::alter_column_is_refused(ty) {
+                return Err(DialectError::Invalid {
+                    dialect: DIALECT,
+                    message: format!(
+                        "column `{column}` has type `{ty}`, which SQL Server refuses to name in \
+                         ALTER COLUMN; its nullability cannot be changed"
+                    ),
+                });
+            }
             let normalized = types::normalize(ty)?;
             one(format!(
                 "ALTER TABLE {} ALTER COLUMN {} {} {}{};",
@@ -1640,6 +1652,35 @@ mod tests {
         assert_eq!(
             sql,
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [email] nvarchar(255) NOT NULL;"]
+        );
+    }
+
+    #[test]
+    fn a_timestamp_nullability_change_is_refused_before_sql() {
+        for spelling in ["timestamp", "rowversion"] {
+            let change = Change::AlterColumnNullability {
+                uid: uid("c_k7x2mq"),
+                column: cref("dbo.t.version"),
+                ty: ty(spelling),
+                to_nullable: true,
+            };
+            let msg = emit(&change, Strategy::default()).unwrap_err().to_string();
+            assert!(msg.contains("`dbo.t.version`"), "{spelling}: {msg}");
+            assert!(msg.contains(&format!("`{spelling}`")), "{spelling}: {msg}");
+            assert!(
+                msg.contains("nullability cannot be changed"),
+                "{spelling}: {msg}"
+            );
+        }
+
+        assert_eq!(
+            sql_of(&Change::AlterColumnNullability {
+                uid: uid("c_k7x2mq"),
+                column: cref("dbo.t.version"),
+                ty: ty("varbinary(8)"),
+                to_nullable: false,
+            }),
+            ["ALTER TABLE [dbo].[t] ALTER COLUMN [version] varbinary(8) NOT NULL;"]
         );
     }
 
