@@ -1795,11 +1795,16 @@ fn conversion_probe(
         from.base.as_str(),
         "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
     ) && matches!(to.base.as_str(), "char" | "varchar" | "text");
+    let target_input = match from.base.as_str() {
+        "text" => format!("CONVERT(varchar(max), {col}) COLLATE DATABASE_DEFAULT"),
+        "ntext" => format!("CONVERT(nvarchar(max), {col}) COLLATE DATABASE_DEFAULT"),
+        _ => format!("{col} COLLATE DATABASE_DEFAULT"),
+    };
     let character_loss_probe = || {
         Probe::new(
             format!("values in {column} changed when converted to {to}"),
             format!(
-                "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {col} COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
+                "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
             ),
         )
     };
@@ -2075,9 +2080,14 @@ mod tests {
                 _ => "LEN([label]) > 50",
             };
             assert!(sql[0].contains(expected_len), "{sql:?}");
+            let target_input = match from {
+                "text" => "CONVERT(varchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                "ntext" => "CONVERT(nvarchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                _ => "[label] COLLATE DATABASE_DEFAULT",
+            };
             assert!(
                 sql[1].contains(&format!(
-                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
             );
@@ -2105,9 +2115,14 @@ mod tests {
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
+            let target_input = match from {
+                "text" => "CONVERT(varchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                "ntext" => "CONVERT(nvarchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                _ => "[label] COLLATE DATABASE_DEFAULT",
+            };
             assert!(
                 sql[0].contains(&format!(
-                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
             );

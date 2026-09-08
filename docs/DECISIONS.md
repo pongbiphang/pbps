@@ -5672,6 +5672,9 @@ SPEC is in sync with all of these.
     UTF-8 value when the ALTER resets the column to a legacy database default.
     Such a widening gets the round-trip probe without a meaningless length
     probe.
+    A legacy `text` source is first converted to `varchar(max)` under its
+    source collation before applying `DATABASE_DEFAULT`; SQL Server refuses a
+    direct cross-code-page `COLLATE` on `text` itself.
     Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep their one
     length probe rather than paying for a question they do not ask.
     Because SQL Server does not accept `LEN(ntext)` or `LEN(text)`, those legacy
