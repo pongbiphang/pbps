@@ -5638,8 +5638,8 @@ SPEC is in sync with all of these.
     run. Ordinary `varbinary(8)` remains alterable, so binary capacity is not
     used as a proxy for the engine's `timestamp` rule.
 
-299. **A Unicode-to-non-Unicode narrowing is probed by exact round trip, in
-    addition to any character count.** `LEN` answers whether the source has
+299. **A narrowing into a non-Unicode character type is probed by exact round
+    trip, in addition to any character count.** `LEN` answers whether the source has
     more characters than a bounded target. It cannot see a legacy code page replacing
     `王小明` with `???`, or a UTF-8 `varchar(4)` exceeding its byte capacity.
     Measured, the legacy ALTER succeeds and silently stores the changed value,
@@ -5658,8 +5658,10 @@ SPEC is in sync with all of these.
 
     The existing length probe stays beside it. It is the direct, readable count
     for ordinary length loss, while the round trip is added only when the
-    source is `nchar`, `nvarchar`, `ntext` or the Unicode `sysname` alias and
-    the target is `char`, `varchar` or legacy `text`. A max or `text` target
+    source is any supported character type and the target is `char`, `varchar`
+    or legacy `text`. This includes non-Unicode sources because an explicitly
+    UTF-8 or otherwise non-default source collation moves to `DATABASE_DEFAULT`
+    under the emitted ALTER and can lose characters. A max or `text` target
     gets only the round trip because it has no length question, but it can
     still replace characters under a legacy code page.
     Both endpoints are normalized before classification, so accepted aliases

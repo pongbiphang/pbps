@@ -1772,9 +1772,9 @@ fn conversion_probe(
     let Ok(to) = types::normalize(to) else {
         return Ok(Vec::new());
     };
-    let unicode_to_non_unicode = matches!(
+    let character_to_non_unicode = matches!(
         from.base.as_str(),
-        "nchar" | "nvarchar" | "ntext" | "sysname"
+        "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
     ) && matches!(to.base.as_str(), "char" | "varchar" | "text");
     let character_loss_probe = || {
         Probe::new(
@@ -1816,7 +1816,7 @@ fn conversion_probe(
                 // ALTER conversion round-trips, under a binary comparison so
                 // the source column's collation cannot call changed text the
                 // same value (DECISIONS 299).
-                if unicode_to_non_unicode {
+                if character_to_non_unicode {
                     probes.push(character_loss_probe());
                 }
                 return Ok(probes);
@@ -1835,7 +1835,7 @@ fn conversion_probe(
 
     // A max target has no length question, but changing the code page can
     // still replace characters without making CONVERT fail (DECISIONS 299).
-    if unicode_to_non_unicode {
+    if character_to_non_unicode {
         return Ok(vec![character_loss_probe()]);
     }
 
@@ -2026,12 +2026,14 @@ mod tests {
     }
 
     #[test]
-    fn unicode_into_a_bounded_non_unicode_string_is_probed_for_changed_bytes() {
+    fn character_narrowing_to_non_unicode_is_probed_for_changed_bytes() {
         for (from, to, normalized_to) in [
             ("nvarchar(255)", "varchar(50)", "varchar(50)"),
             ("nchar(255)", "char(50)", "char(50)"),
             ("ntext", "varchar(50)", "varchar(50)"),
             ("sysname", "varchar(50)", "varchar(50)"),
+            ("varchar(255)", "varchar(50)", "varchar(50)"),
+            ("text", "varchar(50)", "varchar(50)"),
             ("nvarchar(255)", "character varying(50)", "varchar(50)"),
         ] {
             let target = if to.starts_with("character") {
@@ -2048,10 +2050,10 @@ mod tests {
                 to_nullable: true,
             });
             assert_eq!(sql.len(), 2, "{from} -> {to}: {sql:?}");
-            let expected_len = if from == "ntext" {
-                "LEN(CONVERT(nvarchar(max), [label])) > 50"
-            } else {
-                "LEN([label]) > 50"
+            let expected_len = match from {
+                "ntext" => "LEN(CONVERT(nvarchar(max), [label])) > 50",
+                "text" => "LEN(CONVERT(varchar(max), [label])) > 50",
+                _ => "LEN([label]) > 50",
             };
             assert!(sql[0].contains(expected_len), "{sql:?}");
             assert!(
@@ -2094,9 +2096,7 @@ mod tests {
 
         for (from, to) in [
             ("nvarchar(255)", "nvarchar(50)"),
-            ("varchar(255)", "varchar(50)"),
             ("varchar(255)", "nvarchar(50)"),
-            ("text", "varchar(50)"),
         ] {
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
@@ -2107,12 +2107,7 @@ mod tests {
                 to_nullable: true,
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
-            let expected_len = if from == "text" {
-                "LEN(CONVERT(varchar(max), [label])) > 50"
-            } else {
-                "LEN([label]) > 50"
-            };
-            assert!(sql[0].contains(expected_len), "{sql:?}");
+            assert!(sql[0].contains("LEN([label]) > 50"), "{sql:?}");
         }
     }
 
