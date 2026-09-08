@@ -5637,3 +5637,27 @@ SPEC is in sync with all of these.
     differently would merely ask for approval before emitting SQL that cannot
     run. Ordinary `varbinary(8)` remains alterable, so binary capacity is not
     used as a proxy for the engine's `timestamp` rule.
+
+299. **A Unicode-to-non-Unicode narrowing is probed by exact round trip as
+    well as character count.** `LEN` answers whether the source has more
+    characters than the bound. It cannot see a legacy code page replacing
+    `王小明` with `???`, or a UTF-8 `varchar(4)` exceeding its byte capacity.
+    Measured, the legacy ALTER succeeds and silently stores the changed value,
+    while the UTF-8 ALTER refuses with truncation; `LEN` reports 3 in each case.
+
+    The second probe converts through the bounded target and back to
+    `nvarchar(max)`, then compares under `Latin1_General_BIN2`. The binary
+    collation is part of the question: the source column's own collation may
+    call two spellings equal, which would turn another loss into a clean count.
+    The inner value is collated to `DATABASE_DEFAULT` before conversion because
+    that is the target collation the emitter's `ALTER COLUMN` establishes when
+    it writes no `COLLATE`; measured, a source column with an explicit UTF-8
+    collation moves to the database default after that ALTER. This does not
+    solve the separate declaration/read-back gap for explicit collations
+    (#94); it makes the preflight match the statement this emitter writes.
+
+    The existing length probe stays beside it. It is the direct, readable count
+    for ordinary length loss, while the round trip is added only when the
+    source is `nchar`, `nvarchar` or `ntext` and the bounded target is `char` or
+    `varchar`. Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep
+    their one length probe rather than paying for a question they do not ask.
