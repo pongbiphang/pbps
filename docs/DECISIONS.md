@@ -5319,7 +5319,7 @@ SPEC is in sync with all of these.
     prohibition must not stand beside the classification that can (#141).
 ## Phase 5 — the ledger, the lock and `doctor` (step 8, #83)
 
-283. **The PostgreSQL ledger lives in `public`, and the qualified names move
+284. **The PostgreSQL ledger lives in `public`, and the qualified names move
     out of `pbps-db` into the dialects.** SPEC §8.1 puts the two tables in
     `dbo`, which is a SQL Server schema, and `pbps_db::ledger` held
     `dbo.__pbps_state` as a constant — in the crate documented as holding no
@@ -5348,7 +5348,7 @@ SPEC is in sync with all of these.
     one now, and qualifying the filter stays that issue's work with that
     issue's tests.
 
-284. **The lock is a table on this engine too, not an advisory lock.**
+285. **The lock is a table on this engine too, not an advisory lock.**
     `pg_advisory_lock` is the obvious PostgreSQL answer and it answers a
     different question: it is held by a *session*, and measured, `pg_locks`
     shows nothing of a `pg_try_advisory_lock(42)` once the connection that took
@@ -5358,7 +5358,7 @@ SPEC is in sync with all of these.
     command rather than as a timeout. A row in a table is what a dead process
     leaves behind.
 
-285. **The lock is taken with `INSERT ... ON CONFLICT (id) DO NOTHING`, and
+286. **The lock is taken with `INSERT ... ON CONFLICT (id) DO NOTHING`, and
     zero rows affected is the refusal.** The SQL Server ledger inserts and, when
     the insert *fails*, reads the holder to name it. That shape cannot be
     ported: measured on 18.6, a failed statement aborts the whole transaction,
@@ -5379,7 +5379,7 @@ SPEC is in sync with all of these.
     than as a lock this call did not win, because claiming it would be a claim
     that is false.
 
-286. **The ledger's times are defaulted from `clock_timestamp()` and read
+287. **The ledger's times are defaulted from `clock_timestamp()` and read
     through `to_char`, never cast.** Two measurements, one per half.
 
     `now()` is the transaction's start time and does not move inside it —
@@ -5399,7 +5399,7 @@ SPEC is in sync with all of these.
     same reason one step further out: a `timestamptz` is rendered in whatever
     `TimeZone` the reading session has.
 
-287. **`is_initialized` attempts a statement here too, and this engine answers
+288. **`is_initialized` attempts a statement here too, and this engine answers
     the three cases apart in the SQLSTATE.** DECISIONS 219 had to find that out
     by measurement on SQL Server, whose catalog *hides* an object a login has no
     permission on: `OBJECT_ID` and `HAS_PERMS_BY_NAME` both answer as if the
@@ -5416,7 +5416,7 @@ SPEC is in sync with all of these.
     `42P01` like an absent table, which is the right answer to "is there a
     ledger": there is not, and `bootstrap` makes both absences visible.
 
-288. **`doctor` asks about ownership on this engine, because no privilege
+289. **`doctor` asks about ownership on this engine, because no privilege
     authorizes DDL.** Measured on 18.6, as a role holding
     `GRANT ALL PRIVILEGES ON own.t`:
 
@@ -5444,7 +5444,7 @@ SPEC is in sync with all of these.
     (as on the other engine) rather than covered by a grant that also permits
     creating any schema at all.
 
-289. **A staged apply pins its session, through `Dialect::session_pins`.**
+290. **A staged apply pins its session, through `Dialect::session_pins`.**
     `Postgres::transaction_framing`'s `begin` carries nine settings, because
     each of them decides what a declared expression *means* (DECISIONS 254 and
     the method's own comment). A staged apply opens no transaction, so `begin`
@@ -5459,7 +5459,7 @@ SPEC is in sync with all of these.
     so the transactional and staged paths cannot pin different things — the
     failure this replaces, where the staged path pinned nothing at all.
 
-290. **A reason is cut by characters here and by UTF-16 units there.** The
+291. **A reason is cut by characters here and by UTF-16 units there.** The
     column is `varchar(1000)` and this engine counts characters: measured,
     `varchar(4)` accepts four emoji and reports `length = 4,
     octet_length = 16`, where `NVARCHAR(4)` refuses them. A shared helper would
@@ -5474,7 +5474,7 @@ SPEC is in sync with all of these.
     truncate, where a failed attempt that cannot be recorded is the opposite of
     what the row exists for.
 
-291. **`ensure_tables` treats a concurrent creator's failure as success.**
+292. **`ensure_tables` treats a concurrent creator's failure as success.**
     `CREATE TABLE IF NOT EXISTS` is not atomic against another session doing the
     same thing: the check and the create are two steps, and the loser gets
     `23505` on `pg_type_typname_nsp_index` — the row for the table's implicit
@@ -5483,7 +5483,7 @@ SPEC is in sync with all of these.
     failure. Every command that writes a ledger row calls this, so two
     pipelines starting together really do race on it.
 
-292. **The ledger's DDL is not sent when there is nothing to create**, and that
+293. **The ledger's DDL is not sent when there is nothing to create**, and that
     is a permission decision rather than an optimization. Measured on 18.6: a
     role holding `SELECT`, `INSERT` and `DELETE` on both ledger tables and no
     `CREATE` on their schema gets `42501: permission denied for schema public`
@@ -5492,13 +5492,13 @@ SPEC is in sync with all of these.
     notices the relation exists.
 
     That is exactly the least-privilege configuration SPEC §8.1 asks for and
-    `pbps_pg::doctor` reports as ready, once 288's create-time requirement has
+    `pbps_pg::doctor` reports as ready, once 289's create-time requirement has
     been spent. Every `record` and every `lock` calls `ensure_tables`, so the
     whole deployment failed on a grant `doctor` had correctly said was no longer
     needed.
 
     So `ensure_tables` asks the catalog first, and this is **not** the question
-    269/287 refuses to ask there. That one is "does *this caller* have a ledger
+    219/288 refuses to ask there. That one is "does *this caller* have a ledger
     to read", which only a statement can answer without turning "not authorized
     to look" into "nothing there". This one is "would `CREATE TABLE IF NOT
     EXISTS` do anything", which is about the database and not about the caller —
@@ -5508,11 +5508,11 @@ SPEC is in sync with all of these.
     for. A narrower predicate would send DDL the engine is about to skip, which
     is the failure this removes.
 
-    The race is unchanged and still tolerated (291): between the probe and the
+    The race is unchanged and still tolerated (292): between the probe and the
     `CREATE`, another session may create the table, and `23505`/`42P07` still
     mean it is there now.
 
-293. **`doctor` asks for `USAGE` on a schema wherever objects in it are used,
+294. **`doctor` asks for `USAGE` on a schema wherever objects in it are used,
     not only where they are created.** `Needed::LedgerCreation` asked for
     `CREATE` on the ledger's schema while the ledger did not exist, and
     `Needed::Ledger` asked for the DML on the two tables once it did — and
@@ -5522,7 +5522,7 @@ SPEC is in sync with all of these.
     `SELECT`, `INSERT` and `DELETE` on both tables: `has_table_privilege`
     answers **`t`** — the question is asked by oid and never resolves the name —
     while every statement naming the ledger is `42501: permission denied for
-    schema public`. This is 288's shape a second time, and from the same
+    schema public`. This is 289's shape a second time, and from the same
     direction: a privilege question with a true answer, about something the
     engine decides elsewhere.
 
@@ -5534,7 +5534,7 @@ SPEC is in sync with all of these.
     that key performs, which the SQL Server list has carried since it was
     written.
 
-294. **A referenced foreign-key target may be a partitioned table; a managed
+295. **A referenced foreign-key target may be a partitioned table; a managed
     table may not.** `doctor`'s table question filtered `relkind = 'r'` for
     every list it asks about, taking the rule from the pull — where it is right,
     because an index and a sequence are rows in `pg_class` too and a partitioned
@@ -5558,8 +5558,8 @@ SPEC is in sync with all of these.
     manages and for the ledger, `r` and `p` for what a declared key points at,
     which are the two kinds this engine lets a key reference.
 
-295. **Tolerating the creation race is not enough inside a transaction, so the
-    `CREATE` runs under a savepoint.** 291 tolerates the loser's `23505`/`42P07`
+296. **Tolerating the creation race is not enough inside a transaction, so the
+    `CREATE` runs under a savepoint.** 292 tolerates the loser's `23505`/`42P07`
     because the table is there now, which is what the caller asked for. Measured
     on 18.6, that is only true in autocommit: the error **aborts the loser's
     transaction**, so a bare `Ok(())` hands back a connection whose every next
@@ -5582,17 +5582,17 @@ SPEC is in sync with all of these.
     The savepoint is taken by **trying** it: `SAVEPOINT` outside a transaction
     block is `25P01` and harms nothing, so one round trip both establishes the
     savepoint and tells this call whether it is in a transaction at all. It is
-    taken only on the path that sends DDL, which 292 has already made rare. The
+    taken only on the path that sends DDL, which 293 has already made rare. The
     untolerated failures roll back to it too, so a caller can still run the
     diagnostics it wants to print — without that, even those come back `25P02`.
 
     This is the third instance of one shape in this dialect: an error path
     written for an engine where a failed statement costs a statement, on an
-    engine where it costs the transaction. The other two are the lock (285) and
+    engine where it costs the transaction. The other two are the lock (286) and
     the reason it does not read its holder after a failed insert.
 
-296. **Every answer this ledger gives by tolerating an error is taken under a
-    savepoint, and the tolerated `42P07` is verified rather than believed.** 295
+297. **Every answer this ledger gives by tolerating an error is taken under a
+    savepoint, and the tolerated `42P07` is verified rather than believed.** 296
     fixed one arm; a sweep of the file — which is what PITFALLS' own entry says
     to do about this shape — found three more, and one of them was tolerating
     the wrong thing.

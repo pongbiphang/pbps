@@ -241,7 +241,7 @@ const PROBE_STATE: &str = "SELECT 1 AS present FROM public.__pbps_state LIMIT 0"
 /// would send DDL the engine is about to skip.
 ///
 /// This is not the question [`is_initialized`] asks and must not be confused
-/// with it (DECISIONS 287): that one asks whether *this caller* has a ledger to
+/// with it (DECISIONS 288): that one asks whether *this caller* has a ledger to
 /// read, which only a statement can answer, and answering it from the catalog
 /// would report a table this role cannot touch as one it can.
 fn ledger_is_there() -> String {

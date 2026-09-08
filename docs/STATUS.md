@@ -331,7 +331,7 @@ foreign key, a table already there gaining a column, a key, a unique, an index
 and a foreign key, and a bootstrap whose next plan must be empty — each as
 emit, read back, compare, against a plan the differ produced.
 
-**Step 8 is in**: the ledger, the lock and `doctor` (DECISIONS 283–291). The
+**Step 8 is in**: the ledger, the lock and `doctor` (DECISIONS 284–292). The
 two tables live in `public` — the schema every database is created with, and
 the one grant narrower than the `CREATE` on the database a `pbps` schema of its
 own would need — and the qualified spelling now belongs to each dialect, with
@@ -349,8 +349,8 @@ called that environment ready. The staged apply's session pins land with it
 (`Dialect::session_pins`), which is what `transaction_framing` said step 8 owed
 it.
 
-Five things review found, each measured (DECISIONS 292–296): `CREATE TABLE IF NOT EXISTS` is refused for want of
-`CREATE` on the schema **even when the table is already there**, so the ledger's
+Five things review found, each measured (DECISIONS 293–297):
+`CREATE TABLE IF NOT EXISTS` is refused for want of `CREATE` on the schema **even when the table is already there**, so the ledger's
 DDL is not sent when the catalog says there is nothing to create; and
 `has_table_privilege` answers `true` for a table in a schema the role may not
 enter, so `USAGE` is required wherever objects are used and not only where they
