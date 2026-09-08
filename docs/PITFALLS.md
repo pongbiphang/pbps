@@ -990,6 +990,120 @@ engine that does not. Port the *question* the rule asks, then measure the
 second engine's answer — it can be worse than the first one's, which is not
 what "inherit the scar" leads you to expect.
 
+## A vocabulary the engine has, answering a question it does not ask
+
+`pbps-mssql`'s `doctor` is 1,773 lines of hard-won scope: which permission,
+asked at which securable, and a comment on each saying which false positive or
+false negative it was written for. Porting it to PostgreSQL is a translation
+job — `HAS_PERMS_BY_NAME` becomes `has_table_privilege`, `ALTER` becomes... and
+that is where it stops being one.
+
+Measured on 18.6, as a role holding `GRANT ALL PRIVILEGES ON own.t`:
+
+```text
+has_table_privilege('own.t', 'SELECT,INSERT,UPDATE,DELETE,REFERENCES,TRIGGER')  ->  t
+ALTER TABLE own.t ADD COLUMN c int   ->  42501: must be owner of table t
+```
+
+**On this engine DDL is authorized by ownership, and ownership is not a
+privilege.** A readiness check built from the privilege vocabulary asks real
+questions, gets true answers, and reports an environment ready that cannot run
+one statement of a plan. It is not a check that is *sometimes* wrong: it is a
+check that cannot ever fire, on the commonest misconfiguration there is.
+
+**The shape:** the second engine has the *word* the first engine's question was
+about, so the port compiles, runs, and reads plausibly — while the thing the
+question was for is decided somewhere the port never looks. It is the sibling
+of "the second implementation did not inherit the first one's scar": there, the
+defence was missing; here, the defence is present and pointed at nothing.
+
+**How to avoid it:** for each requirement, run the statement it is about as the
+role the check just described, and assert the engine agrees. The live test does
+exactly that — it reports the gap, then attempts the `ALTER TABLE` and asserts
+`42501` — so the check and the engine are pinned to the same answer rather than
+to the same vocabulary.
+
+**And it is not one question, it is a family.** Review found the same shape
+twice more in the same file, both times with `has_table_privilege` answering
+`true`:
+
+```text
+REVOKE USAGE ON SCHEMA public FROM <role>;   -- the grants on the tables stay
+has_table_privilege('public.__pbps_state', 'INSERT')  ->  t   (asked by oid)
+INSERT INTO public.__pbps_state ...          ->  42501: permission denied for schema public
+```
+
+The privilege function is asked **by oid** and never resolves the name, so it
+answers about the table's own ACL and knows nothing about the schema around it.
+A check that asked only about the two ledger tables therefore reported an
+environment ready in which no ledger statement can run — and the same hole was
+one securable out, on the schema a referenced foreign-key target lives in.
+
+The lesson for the *next* dialect: when a permission model has containers
+(schemas, databases, roles), a check that asks about a leaf has to ask about
+every container on the path to it. "Which securables does this statement touch"
+is the question, not "which privilege does this statement need".
+
+## A recovery path that the engine's own transaction rules delete
+
+The SQL Server lock takes itself with an `INSERT` and, *when that insert fails*,
+reads the lock table to name the holder. It is the natural shape: the insert is
+the gate, and the read is only for the message.
+
+Measured on PostgreSQL 18.6, the same shape does not merely fail — it takes the
+caller's transaction with it. A failed statement aborts the whole transaction,
+so the read that was supposed to produce the message comes back
+`25P02: current transaction is aborted, commands ignored until end of
+transaction block`, and everything the caller had done in that transaction is
+gone. The refusal an operator sees would name no holder, and the deployment
+that hit it would be in a state its own code did not put it in.
+
+`INSERT ... ON CONFLICT (id) DO NOTHING` is the same gate without the failure:
+a second inserter blocks on the index until the first commits and then affects
+zero rows, so exactly one caller ever sees a count of 1.
+
+**The shape:** an error path that is fine on one engine because errors there are
+cheap, ported to one where an error is a cliff. The code reads identically; what
+changed is what "the statement failed" costs. Look for it wherever the first
+dialect *recovers* from a failure rather than propagating it — a `match` on an
+error that continues working with the same connection is the tell.
+
+**And the tell caught a second one in the same file, one review round later.**
+`ensure_tables` tolerates the loser's `23505` from a concurrent
+`CREATE TABLE IF NOT EXISTS`, because the table is there now and that is what
+the caller asked for. True in autocommit; measured, inside a transaction the
+same error aborts it, so `Ok(())` handed back a connection whose next statement
+was `25P02`. The ledger entry is written inside the apply's transaction, so the
+caller was always going to be one. The fix is a savepoint around the `CREATE` —
+and the savepoint is taken by *trying* it, because `SAVEPOINT` outside a
+transaction is `25P01` and harms nothing, which makes one round trip answer both
+"can I recover here" and "am I in a transaction at all".
+
+Two instances, one file, one shape: **every** `Err(e) if ... => Ok(())` in a
+PostgreSQL path is a claim that the connection is still usable, and on this
+engine that claim is false inside a transaction unless something rolled back.
+
+## A time that reads differently to whoever asks
+
+The ledger stores an ISO 8601 timestamp as text, and the obvious way to produce
+it is `applied_at::text`. Measured on 18.6, under `DateStyle = 'German, DMY'`
+that cast is `31.08.2026 09:14:22.517` — not sortable as text, not parseable as
+ISO 8601, and produced by the *reading* session's setting rather than by
+anything the writer did. Two operators reading the same row get two answers, and
+one of them is a history that will not sort.
+
+`to_char` with an explicit pattern is the fix, and the pattern has to be checked
+for locale-sensitive fields as well: `TM`-prefixed ones read `lc_time`, so a
+pattern holding one would have moved the same way for a different reason.
+
+**The shape:** a rendering that looks like a property of the data and is a
+property of the session. This crate already had the rule on the read side —
+`catalog.rs` pins nine settings before it reads a definition — and the ledger is
+a *different* file that renders a *different* kind of value, so the rule did not
+arrive with it. The test that keeps it honest asserts the negative half too:
+that the same column cast under that session really is unreadable, so it cannot
+pass because the setting failed to take.
+
 ## One match arm, two directions, one direction's reason
 
 `change_risk` classified `time -> interval` and `interval -> time` in a single

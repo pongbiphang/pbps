@@ -68,8 +68,19 @@ pinned by digest there and in CI), or set
 script also runs `pbps-cli`'s ignored tests, which include the `plan --dev`
 rehearsal. They are `#[ignore]`d so the ordinary suite stays offline; CI has a
 dedicated job. PostgreSQL has its own suite and its own job:
-`scripts/live-tests-pg.sh`, or set `PBPS_TEST_PG_DB` and
-`cargo test -p pbps-pg --test live -- --ignored`. When touching the emitter, the catalog queries or the ledger, run
+`scripts/live-tests-pg.sh` (set `PBPS_TEST_PG_PORT` if 54320 is taken), or set
+`PBPS_TEST_PG_DB` and `cargo test -p pbps-pg --test live -- --ignored`. Its
+ledger tests each work in a database of their own, created and dropped by the
+test: the ledger is one pair of tables in `public`, so two tests sharing a
+database would take each other's lock. They cover the same §11.5 invariants —
+the round trip, the lock admitting one holder and naming it to the second, a
+staged checkpoint surviving `state_json`, and a ledger that was never
+initialized, one that is empty and a server that cannot be reached staying three
+answers — plus what only this engine can be asked: a lock contended inside a
+caller's transaction that leaves the transaction alive, a recorded time that
+does not move with the reading session's `DateStyle`, and `doctor` against a
+**real least-privilege role** whose every table privilege still does not let it
+`ALTER` the table it does not own. When touching the emitter, the catalog queries or the ledger, run
 them — they have caught four bugs the unit suite structurally could not: FK
 ordering between two new tables; `EXEC()` rejecting function calls in its
 argument; `sql_expression_dependencies` returning one row per referenced
@@ -320,7 +331,42 @@ foreign key, a table already there gaining a column, a key, a unique, an index
 and a foreign key, and a bootstrap whose next plan must be empty — each as
 emit, read back, compare, against a plan the differ produced.
 
-What remains is steps 5 to 10: modules, roles, reference data, the ledger,
+**Step 8 is in**: the ledger, the lock and `doctor` (DECISIONS 284–292). The
+two tables live in `public` — the schema every database is created with, and
+the one grant narrower than the `CREATE` on the database a `pbps` schema of its
+own would need — and the qualified spelling now belongs to each dialect, with
+`pbps-db` keeping only the two names that are the same on both. The lock stays
+a table, because an advisory lock dies with the session that took it and this
+one exists to survive a pipeline that did; it is taken with `ON CONFLICT DO
+NOTHING`, because a failed statement here aborts the caller's whole transaction
+and the other dialect's "insert, then name the holder" would leave nothing to
+answer with. Times are defaulted from `clock_timestamp()` and rendered by
+`to_char`, so two entries of one transaction are not simultaneous and a session
+that renders dates its own way does not move the history. And `doctor` asks
+about **ownership**: measured, a role holding every privilege PostgreSQL has to
+give on a table cannot alter it, so the SQL Server list ported across would have
+called that environment ready. The staged apply's session pins land with it
+(`Dialect::session_pins`), which is what `transaction_framing` said step 8 owed
+it.
+
+Five things review found, each measured (DECISIONS 293–297):
+`CREATE TABLE IF NOT EXISTS` is refused for want of `CREATE` on the schema **even when the table is already there**, so the ledger's
+DDL is not sent when the catalog says there is nothing to create; and
+`has_table_privilege` answers `true` for a table in a schema the role may not
+enter, so `USAGE` is required wherever objects are used and not only where they
+are created — on the ledger's schema, and on the schema of a referenced foreign
+key target, which also wants the `SELECT` its probe performs. And that target
+may be a **partitioned** table, which this model cannot hold and somebody else's
+schema may perfectly well contain: filtered to ordinary tables it read as
+absent, and an absent securable is asked for nothing. The last two are the ledger
+again, and one shape: tolerating an error is only tolerable in autocommit,
+because inside a transaction that error aborts it — so every arm that turns a
+failure into a value runs under a savepoint, `is_initialized`'s `42P01`
+included; and a tolerated `42P07` is verified against the catalog rather than
+believed, because it names *a* relation the DDL would create and not the
+ledger.
+
+What remains is steps 5, 6, 7, 9 and 10: modules, roles, reference data,
 probes, and the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy

@@ -20,6 +20,24 @@ use pbps_model::StateSnapshot;
 
 use crate::catalog::{get, opt};
 
+/// The schema this engine's ledger lives in (SPEC §8.1).
+///
+/// `dbo` is the schema every SQL Server database has and the one the spec
+/// names. It is deliberately *not* treated as a managed schema — see
+/// [`crate::doctor::Needed::LedgerCreation`] — and it is qualified into every
+/// statement below rather than left to the login's own default schema, which
+/// is a per-login setting and would put the ledger somewhere else.
+pub const LEDGER_SCHEMA: &str = "dbo";
+
+/// The two tables, as this engine spells them.
+///
+/// The names are `pbps_db::ledger`'s, which is where the *meaning* of a ledger
+/// row lives; the schema in front of them is this dialect's. Whoever has to
+/// name these tables from outside — the pull's exclusion filter, `doctor`'s
+/// permission questions — asks here rather than repeating the spelling.
+pub const STATE_TABLE: &str = "dbo.__pbps_state";
+pub const LOCK_TABLE: &str = "dbo.__pbps_lock";
+
 /// `IF OBJECT_ID` rather than `CREATE OR ALTER`: creating the ledger must be
 /// safe to run on every command that writes one, and re-running must not
 /// disturb the rows already there.
@@ -438,15 +456,20 @@ mod tests {
         assert_eq!(cut.encode_utf16().count(), REASON_UTF16_UNITS - 1);
         assert!(cut.chars().all(|c| c == 'x' || c == '😀'));
     }
-    use pbps_db::ledger::{LOCK_TABLE, STATE_TABLE};
+    use pbps_db::ledger::{LOCK_TABLE_NAME, STATE_TABLE_NAME};
 
     /// The two table names in the SQL must be the ones `pbps-db` documents and
     /// the ones the catalog query excludes; a mismatch would have the tool
     /// planning changes to its own ledger.
+    ///
+    /// The qualified spellings are this crate's and the bare names are
+    /// `pbps-db`'s, so the assertion is the join of the two rather than a
+    /// literal: a schema edited here and not there would otherwise leave two
+    /// constants that each look right on their own.
     #[test]
     fn the_statements_name_the_documented_tables() {
-        assert_eq!(STATE_TABLE, "dbo.__pbps_state");
-        assert_eq!(LOCK_TABLE, "dbo.__pbps_lock");
+        assert_eq!(STATE_TABLE, format!("{LEDGER_SCHEMA}.{STATE_TABLE_NAME}"));
+        assert_eq!(LOCK_TABLE, format!("{LEDGER_SCHEMA}.{LOCK_TABLE_NAME}"));
         for sql in [
             CREATE_STATE,
             SELECT_LATEST,

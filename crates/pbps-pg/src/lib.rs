@@ -25,8 +25,10 @@ use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
 pub mod catalog;
+pub mod doctor;
 mod emit;
 pub mod introspect;
+pub mod state;
 mod types;
 
 /// A part of the dialect that Phase 5 has not built yet.
@@ -41,7 +43,6 @@ pub enum Unbuilt {
     Modules,
     Roles,
     ReferenceData,
-    Ledger,
     Probes,
 }
 
@@ -52,7 +53,6 @@ impl Unbuilt {
             Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
             Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
             Unbuilt::ReferenceData => "reference data (Phase 5 step 7)",
-            Unbuilt::Ledger => "the state ledger (Phase 5 step 8)",
             Unbuilt::Probes => "preflight probes (Phase 5 step 9)",
         }
     }
@@ -226,6 +226,25 @@ fn quote(ident: &str) -> Result<String, DialectError> {
     Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
 }
 
+/// The settings every write of this dialect runs under, as one statement.
+///
+/// A macro rather than a constant because both users need it as a **literal**:
+/// [`Dialect::transaction_framing`] builds `begin` by `concat!`ing it with
+/// `BEGIN;`, and `concat!` takes literals and not constants. One text, two
+/// call sites, and no way for the transactional and staged paths to pin
+/// different things — which is the failure this replaces, since the staged path
+/// pinned nothing at all.
+macro_rules! session_pins {
+    () => {
+        "SET standard_conforming_strings = on; SET check_function_bodies = on; \
+         SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
+         SET IntervalStyle = 'postgres'; \
+         SET timezone_abbreviations = 'Default'; \
+         SET transform_null_equals = off; \
+         SET bytea_output = 'hex'; SET extra_float_digits = 1;"
+    };
+}
+
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
@@ -357,17 +376,27 @@ impl Dialect for Postgres {
     /// this deployment.
     fn transaction_framing(&self) -> TransactionFraming {
         TransactionFraming {
-            begin: "SET standard_conforming_strings = on; SET check_function_bodies = on; \
-                    SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
-                    SET IntervalStyle = 'postgres'; \
-                    SET timezone_abbreviations = 'Default'; \
-                    SET transform_null_equals = off; \
-                    SET bytea_output = 'hex'; SET extra_float_digits = 1; BEGIN;",
+            begin: concat!(session_pins!(), " BEGIN;"),
             commit: "COMMIT;",
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.
             rollback: "ROLLBACK;",
         }
+    }
+
+    /// The same pins, for the mode that opens no transaction to carry them.
+    ///
+    /// This is the hole [`Dialect::transaction_framing`] names above: a staged
+    /// apply runs statement by statement outside a transaction, so `begin` is
+    /// never sent, and a `--resume` starts on a fresh connection partway
+    /// through the plan. Every settings-dependent meaning in that doc comment
+    /// applies to those statements too — a declared `CHECK (d >= '01/02/2026')`
+    /// is a different constraint under `DMY` — so the pins are established on
+    /// the connection instead. Plain `SET`, not `SET LOCAL`, for the reason
+    /// given there: outside a transaction `SET LOCAL` is a warning and a no-op,
+    /// and a pin that quietly does nothing is the failure it exists to prevent.
+    fn session_pins(&self) -> Option<&'static str> {
+        Some(session_pins!())
     }
 
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
@@ -624,7 +653,6 @@ mod tests {
             Unbuilt::Modules,
             Unbuilt::Roles,
             Unbuilt::ReferenceData,
-            Unbuilt::Ledger,
             Unbuilt::Probes,
         ] {
             let message = part.refuse().to_string();

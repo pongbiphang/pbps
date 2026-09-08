@@ -830,6 +830,26 @@ pub trait Dialect {
     /// of its own (ADR-0014 §2).
     fn transaction_framing(&self) -> TransactionFraming;
 
+    /// The settings a deployment must run under, for a mode that opens no
+    /// transaction to carry them.
+    ///
+    /// A dialect whose [`Dialect::transaction_framing`] `begin` carries session
+    /// settings — because what a declared expression *means* depends on them —
+    /// has a hole where a **staged** apply runs: that mode commits each
+    /// statement on its own and never opens a transaction, so `begin` is never
+    /// sent and the pins never happen. `--resume` makes it worse, because it
+    /// starts on a fresh connection partway through the plan.
+    ///
+    /// So this is the same pins without the `BEGIN`, established on the
+    /// connection before the first statement of a staged run. `None` is the
+    /// right answer for a dialect whose framing carries nothing but the
+    /// transaction — SQL Server's `SET XACT_ABORT ON` governs a transaction and
+    /// means nothing outside one — and it is the default, so a dialect says
+    /// this only when it has something to say.
+    fn session_pins(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether a read-back can tell a cell of this column that is at its
     /// default from one that is not.
     ///
