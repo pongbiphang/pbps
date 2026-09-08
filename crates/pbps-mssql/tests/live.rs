@@ -7404,3 +7404,137 @@ async fn a_timestamp_column_cannot_be_altered_into_or_out_of() {
     db.conn.execute("DROP TABLE dbo.rv;").await.unwrap();
     db.drop().await;
 }
+
+/// Digit counts hide both integer overflow and fractional binary rounding.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn numeric_capacity_requires_approval_for_overflow_and_changed_values() {
+    use pbps_dialect::TypeChangeRisk;
+    let mut db = TestDb::create("numeric_loss").await;
+    for (from, to, value) in [
+        ("decimal(3,0)", "tinyint", "999"),
+        ("decimal(2,0)", "tinyint", "-1"),
+        ("decimal(5,0)", "smallint", "99999"),
+        ("decimal(10,0)", "int", "9999999999"),
+        ("decimal(19,0)", "bigint", "9999999999999999999"),
+        ("decimal(10,4)", "smallmoney", "999999.9999"),
+        ("decimal(19,4)", "money", "999999999999999.9999"),
+    ] {
+        db.conn.execute(&format!(
+            "CREATE TABLE dbo.numeric_loss (v {from}); INSERT dbo.numeric_loss VALUES ({value});"
+        )).await.unwrap();
+        db.conn
+            .execute(&format!(
+                "ALTER TABLE dbo.numeric_loss ALTER COLUMN v {to};"
+            ))
+            .await
+            .expect_err("the source boundary must overflow the target");
+        assert_eq!(
+            Mssql.type_change_risk(&ty(from), &ty(to)),
+            TypeChangeRisk::Narrowing,
+            "{from} -> {to}"
+        );
+        db.conn
+            .execute("DROP TABLE dbo.numeric_loss;")
+            .await
+            .unwrap();
+    }
+    for (from, to, value) in [
+        ("decimal(2,1)", "real", "0.1"),
+        ("decimal(8,0)", "real", "16777217"),
+        ("decimal(16,0)", "float", "9007199254740993"),
+    ] {
+        db.conn.execute(&format!(
+            "CREATE TABLE dbo.numeric_loss (v {from}); INSERT dbo.numeric_loss VALUES ({value});              ALTER TABLE dbo.numeric_loss ALTER COLUMN v {to};"
+        )).await.unwrap();
+        // Compare in an exact domain: comparing to a float would convert the
+        // expected value to the same rounded float and conceal the loss.
+        let rows = db.conn.query(&format!(
+            "SELECT CAST(CASE WHEN CONVERT(decimal(38,20), v) =              CONVERT(decimal(38,20), {value}) THEN 1 ELSE 0 END AS int) FROM dbo.numeric_loss;"
+        )).await.unwrap();
+        assert_eq!(
+            rows[0].try_get_at::<i32>(0).unwrap(),
+            Some(0),
+            "{from} -> {to}"
+        );
+        assert_eq!(
+            Mssql.type_change_risk(&ty(from), &ty(to)),
+            TypeChangeRisk::Narrowing
+        );
+        db.conn
+            .execute("DROP TABLE dbo.numeric_loss;")
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn numeric_capacity_safe_alters_preserve_both_endpoints() {
+    use pbps_dialect::TypeChangeRisk;
+    let mut db = TestDb::create("numeric_safe").await;
+    for (from, to, min, max) in [
+        ("bit", "tinyint", "0", "1"),
+        ("tinyint", "decimal(3,0)", "0", "255"),
+        ("decimal(4,0)", "smallint", "-9999", "9999"),
+        ("decimal(9,0)", "int", "-999999999", "999999999"),
+        (
+            "decimal(18,0)",
+            "bigint",
+            "-999999999999999999",
+            "999999999999999999",
+        ),
+        (
+            "bigint",
+            "decimal(19,0)",
+            "-9223372036854775808",
+            "9223372036854775807",
+        ),
+        ("decimal(9,4)", "smallmoney", "-99999.9999", "99999.9999"),
+        (
+            "decimal(18,4)",
+            "money",
+            "-99999999999999.9999",
+            "99999999999999.9999",
+        ),
+        ("smallmoney", "money", "-214748.3648", "214748.3647"),
+        (
+            "money",
+            "decimal(19,4)",
+            "-922337203685477.5808",
+            "922337203685477.5807",
+        ),
+        ("smallint", "real", "-32768", "32767"),
+        ("int", "float", "-2147483648", "2147483647"),
+        ("decimal(7,0)", "real", "-9999999", "9999999"),
+        (
+            "decimal(15,0)",
+            "float",
+            "-999999999999999",
+            "999999999999999",
+        ),
+    ] {
+        assert_eq!(
+            Mssql.type_change_risk(&ty(from), &ty(to)),
+            TypeChangeRisk::Safe,
+            "{from} -> {to}"
+        );
+        db.conn.execute(&format!(
+            "CREATE TABLE dbo.numeric_safe (v {from}, expected decimal(38,4));              INSERT dbo.numeric_safe VALUES ({min}, {min}), ({max}, {max});              ALTER TABLE dbo.numeric_safe ALTER COLUMN v {to};"
+        )).await.unwrap_or_else(|e| panic!("{from} -> {to}: {e}"));
+        let rows = db.conn.query(
+            "SELECT COUNT(*) FROM dbo.numeric_safe WHERE CONVERT(decimal(38,4), v) <> expected;"
+        ).await.unwrap();
+        assert_eq!(
+            rows[0].try_get_at::<i32>(0).unwrap(),
+            Some(0),
+            "{from} -> {to}"
+        );
+        db.conn
+            .execute("DROP TABLE dbo.numeric_safe;")
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+}

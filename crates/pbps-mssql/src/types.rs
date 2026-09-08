@@ -318,14 +318,15 @@ pub fn is_indexable(ty: &ColumnType) -> bool {
 /// is a conversion, and conversions are judged conservatively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
-    /// Exact numeric, described by how many digits fit either side of the point.
+    /// Exact numeric bounds, in units of 10^-scale (DECISIONS 244).
     Exact {
-        int_digits: i64,
-        scale: i64,
+        min: i128,
+        max: i128,
+        scale: u32,
     },
-    /// Approximate numeric, described by significant decimal digits.
+    /// Every integer through this magnitude is exactly representable.
     Approx {
-        digits: i64,
+        max_exact_int: i128,
     },
     /// A string, described by its length, whether it is unicode, and whether it
     /// is blank-padded to a fixed width.
@@ -383,7 +384,7 @@ fn family(t: &ColumnType) -> Family {
         Some(TypeArg::Ident(_)) | None => Len::Bounded(1),
     };
 
-    let exact = |int_digits, scale| Family::Exact { int_digits, scale };
+    let exact = |min, max, scale| Family::Exact { min, max, scale };
     let text = |unicode, fixed| Family::Text {
         len: len(),
         unicode,
@@ -398,18 +399,25 @@ fn family(t: &ColumnType) -> Family {
     };
 
     match t.base.as_str() {
-        // `bit` holds 0/1, so one digit and no fraction: it widens into every
-        // other exact numeric, and nothing widens into it.
-        "bit" => exact(1, 0),
-        "tinyint" => exact(3, 0),
-        "smallint" => exact(5, 0),
-        "int" => exact(10, 0),
-        "bigint" => exact(19, 0),
-        "decimal" => exact(int_arg(0) - int_arg(1), int_arg(1)),
-        "smallmoney" => exact(6, 4),
-        "money" => exact(15, 4),
-        "real" => Family::Approx { digits: 7 },
-        "float" => Family::Approx { digits: 15 },
+        "bit" => exact(0, 1, 0),
+        "tinyint" => exact(0, u8::MAX.into(), 0),
+        "smallint" => exact(i16::MIN.into(), i16::MAX.into(), 0),
+        "int" => exact(i32::MIN.into(), i32::MAX.into(), 0),
+        "bigint" => exact(i64::MIN.into(), i64::MAX.into(), 0),
+        "decimal" => {
+            // Normalization bounds precision at 38, so even the largest
+            // coefficient fits in i128 without approximating its endpoints.
+            let max = 10_i128.pow(int_arg(0) as u32) - 1;
+            exact(-max, max, int_arg(1) as u32)
+        }
+        "smallmoney" => exact(i32::MIN.into(), i32::MAX.into(), 4),
+        "money" => exact(i64::MIN.into(), i64::MAX.into(), 4),
+        "real" => Family::Approx {
+            max_exact_int: 1 << 24,
+        },
+        "float" => Family::Approx {
+            max_exact_int: 1 << 53,
+        },
         "char" => text(false, true),
         "varchar" => text(false, false),
         "nchar" => text(true, true),
@@ -490,25 +498,33 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     match (a, b) {
         (
             Family::Exact {
-                int_digits: ai,
+                min: amin,
+                max: amax,
                 scale: asc,
             },
             Family::Exact {
-                int_digits: bi,
+                min: bmin,
+                max: bmax,
                 scale: bsc,
             },
         ) => {
-            // Both halves have to grow: losing integer digits overflows, losing
-            // scale rounds. Either is a loss.
-            safe_if(bi >= ai && bsc >= asc)
+            if bsc < asc {
+                return TypeChangeRisk::Narrowing;
+            }
+            // Divide the target bounds instead of scaling the source: an
+            // integer times 10^38 could overflow i128. Truncation toward zero
+            // gives the first/last source coefficient the target can hold.
+            let factor = 10_i128.pow(bsc - asc);
+            safe_if(amin >= bmin / factor && amax <= bmax / factor)
         }
-
-        // An exact value survives a float only if every digit it can hold still
-        // fits in the float's significant digits.
-        (Family::Exact { int_digits, scale }, Family::Approx { digits }) => {
-            safe_if(int_digits + scale <= digits)
+        (Family::Exact { min, max, scale }, Family::Approx { max_exact_int }) => {
+            // Fractional decimal domains contain 0.1, which no binary float
+            // holds exactly, even when its printed decimal looks unchanged.
+            safe_if(scale == 0 && min >= -max_exact_int && max <= max_exact_int)
         }
-        (Family::Approx { digits: a }, Family::Approx { digits: b }) => safe_if(b >= a),
+        (Family::Approx { max_exact_int: a }, Family::Approx { max_exact_int: b }) => {
+            safe_if(b >= a)
+        }
         // A float into an exact type rounds, and its range is far wider.
         (Family::Approx { .. }, Family::Exact { .. }) => TypeChangeRisk::Narrowing,
 
@@ -787,18 +803,61 @@ mod tests {
     }
 
     #[test]
-    fn crossing_between_exact_and_approximate_follows_the_digits() {
+    fn crossing_between_exact_and_approximate_requires_exact_binary_capacity() {
         assert_eq!(risk("int", "float"), TypeChangeRisk::Safe);
         assert_eq!(
             risk("int", "real"),
             TypeChangeRisk::Narrowing,
-            "7 digits is not 10"
+            "real cannot hold every 32-bit integer"
         );
         assert_eq!(risk("bigint", "float"), TypeChangeRisk::Narrowing);
         assert_eq!(risk("real", "float"), TypeChangeRisk::Safe);
         assert_eq!(risk("float", "real"), TypeChangeRisk::Narrowing);
         // A float into an exact type rounds, whatever the widths are.
         assert_eq!(risk("real", "decimal(38,10)"), TypeChangeRisk::Narrowing);
+    }
+
+    #[test]
+    fn numeric_capacity_compares_signed_bounds_and_binary_mantissas() {
+        use TypeChangeRisk::{Narrowing, Safe};
+        for (from, to, expected) in [
+            ("decimal(3,0)", "tinyint", Narrowing),
+            ("decimal(2,0)", "tinyint", Narrowing),
+            ("decimal(1,0)", "bit", Narrowing),
+            ("tinyint", "decimal(3,0)", Safe),
+            ("tinyint", "decimal(2,0)", Narrowing),
+            ("smallint", "tinyint", Narrowing),
+            ("decimal(5,0)", "smallint", Narrowing),
+            ("decimal(4,0)", "smallint", Safe),
+            ("decimal(10,0)", "int", Narrowing),
+            ("decimal(9,0)", "int", Safe),
+            ("decimal(19,0)", "bigint", Narrowing),
+            ("decimal(18,0)", "bigint", Safe),
+            ("bigint", "decimal(19,0)", Safe),
+            ("bigint", "decimal(18,0)", Narrowing),
+            ("decimal(10,4)", "smallmoney", Narrowing),
+            ("decimal(9,4)", "smallmoney", Safe),
+            ("decimal(19,4)", "money", Narrowing),
+            ("decimal(18,4)", "money", Safe),
+            ("decimal(1,1)", "decimal(38,38)", Safe),
+            ("decimal(38,38)", "decimal(1,1)", Narrowing),
+            ("bigint", "decimal(38,38)", Narrowing),
+            ("decimal(38,0)", "decimal(38,38)", Narrowing),
+            ("bit", "real", Safe),
+            ("tinyint", "real", Safe),
+            ("smallint", "real", Safe),
+            ("decimal(7,0)", "real", Safe),
+            ("decimal(8,0)", "real", Narrowing),
+            ("decimal(15,0)", "float", Safe),
+            ("decimal(16,0)", "float", Narrowing),
+            ("decimal(2,1)", "real", Narrowing),
+            ("decimal(2,1)", "float", Narrowing),
+            ("decimal(38,38)", "float", Narrowing),
+            ("smallmoney", "float", Narrowing),
+            ("money", "float", Narrowing),
+        ] {
+            assert_eq!(risk(from, to), expected, "{from} -> {to}");
+        }
     }
 
     #[test]
