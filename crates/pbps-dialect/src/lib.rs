@@ -418,9 +418,10 @@ impl Lexicon {
                     };
                 }
                 At::Line => {
-                    if ch == '\n' {
+                    if matches!(ch, '\r' | '\n') {
                         // The newline is the comment's terminator, so it is
-                        // structure. Its own trailing spaces are not.
+                        // structure. Canonicalize CR as LF; a following LF
+                        // is ordinary Code whitespace, not another terminator.
                         while out.ends_with(' ') {
                             out.pop();
                         }
@@ -1295,6 +1296,29 @@ mod tests {
             d.normalize_definition("SELECT 1   --  note\n   UNION ALL SELECT 2"),
             d.normalize_definition("SELECT 1 -- note\nUNION ALL SELECT 2")
         );
+    }
+
+    #[test]
+    fn line_comment_endings_preserve_literal_data_and_ignore_layout() {
+        for lexicon in [Lexicon::ANSI, T_SQL, PG] {
+            let expected = "SELECT 1 -- c\nWHERE x = 'a  b'";
+            for ending in ["\r", "\n", "\r\n"] {
+                let wide = format!("SELECT 1 -- c{ending}WHERE x = 'a  b'");
+                let narrow = format!("SELECT 1 -- c{ending}WHERE x = 'a b'");
+                assert_eq!(lexicon.normalize_definition(&wide), expected);
+                assert_ne!(
+                    lexicon.normalize_definition(&wide),
+                    lexicon.normalize_definition(&narrow)
+                );
+            }
+            for lookalike in ['\u{85}', '\u{2028}'] {
+                assert_eq!(
+                    lexicon
+                        .normalize_definition(&format!("SELECT 1 -- c{lookalike}WHERE x = 'a  b'")),
+                    "SELECT 1 -- c WHERE x = 'a b'"
+                );
+            }
+        }
     }
 
     /// A block comment ends at `*/` wherever that falls, so nothing inside it
