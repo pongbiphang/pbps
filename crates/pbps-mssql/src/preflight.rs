@@ -1772,7 +1772,7 @@ fn conversion_probe(
     let unicode_to_non_unicode = matches!(
         from.base.as_str(),
         "nchar" | "nvarchar" | "ntext" | "sysname"
-    ) && matches!(to.base.as_str(), "char" | "varchar");
+    ) && matches!(to.base.as_str(), "char" | "varchar" | "text");
     let character_loss_probe = || {
         Probe::new(
             format!("values in {column} changed when converted to {to}"),
@@ -2060,6 +2060,7 @@ mod tests {
             ("nvarchar(255)", "varchar(max)"),
             ("ntext", "varchar(max)"),
             ("sysname", "varchar(max)"),
+            ("nvarchar(255)", "text"),
         ] {
             let sql = sql_of(&Change::AlterColumnType {
                 uid: uid("c_aaaaaa"),
