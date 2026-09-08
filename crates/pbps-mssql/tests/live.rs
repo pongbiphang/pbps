@@ -1325,7 +1325,9 @@ async fn unicode_to_varchar_probes_character_loss() {
             "CREATE TABLE dbo.t (label nvarchar(20) NULL);\n\
              INSERT dbo.t VALUES (N'王小明');\n\
              CREATE TABLE dbo.old_text (label ntext NULL);\n\
-             INSERT dbo.old_text VALUES (N'王小明');",
+             INSERT dbo.old_text VALUES (N'王小明');\n\
+             CREATE TABLE dbo.max_text (label nvarchar(20) NULL);\n\
+             INSERT dbo.max_text VALUES (N'王小明');",
         )
         .await
         .unwrap();
@@ -1367,6 +1369,29 @@ async fn unicode_to_varchar_probes_character_loss() {
     let rows = legacy
         .conn
         .query("SELECT label FROM dbo.old_text;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.max_text.label", "nvarchar(20)", "varchar(max)"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.max_text ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.max_text;")
         .await
         .unwrap();
     let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();

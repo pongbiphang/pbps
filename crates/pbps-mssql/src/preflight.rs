@@ -1768,10 +1768,21 @@ fn conversion_probe(
 ) -> Result<Vec<Probe>, DialectError> {
     let table = qualified(&stored.table)?;
     let col = quote(&stored.name)?;
+    let from = types::normalize(from)?;
+    let unicode_to_non_unicode = matches!(from.base.as_str(), "nchar" | "nvarchar" | "ntext")
+        && matches!(to.base.as_str(), "char" | "varchar");
+    let character_loss_probe = || {
+        Probe::new(
+            format!("values in {column} changed when converted to {to}"),
+            format!(
+                "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {col} COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
+            ),
+        )
+    };
 
     // A bounded string or binary target truncates silently under CONVERT, so
-    // `TRY_CONVERT` would return a value and report nothing. Length is the only
-    // question that has an answer here.
+    // `TRY_CONVERT` would return a value and report nothing. Count the values
+    // beyond its declared capacity before asking any code-page question.
     let bound = match to.args.first() {
         Some(TypeArg::Int(n)) => Some(*n),
         Some(TypeArg::Max) | Some(TypeArg::Ident(_)) | None => None,
@@ -1782,7 +1793,6 @@ fn conversion_probe(
             // shortens a character column — counting them would report rows
             // that convert perfectly well.
             "char" | "nchar" | "varchar" | "nvarchar" => {
-                let from = types::normalize(from)?;
                 let len = match from.base.as_str() {
                     "text" => format!("LEN(CONVERT(varchar(max), {col}))"),
                     "ntext" => format!("LEN(CONVERT(nvarchar(max), {col}))"),
@@ -1801,15 +1811,8 @@ fn conversion_probe(
                 // ALTER conversion round-trips, under a binary comparison so
                 // the source column's collation cannot call changed text the
                 // same value (DECISIONS 299).
-                if matches!(from.base.as_str(), "nchar" | "nvarchar" | "ntext")
-                    && matches!(to.base.as_str(), "char" | "varchar")
-                {
-                    probes.push(Probe::new(
-                        format!("values in {column} changed when converted to {to}"),
-                        format!(
-                            "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {col} COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
-                        ),
-                    ));
+                if unicode_to_non_unicode {
+                    probes.push(character_loss_probe());
                 }
                 return Ok(probes);
             }
@@ -1823,6 +1826,12 @@ fn conversion_probe(
             }
             _ => {}
         }
+    }
+
+    // A max target has no length question, but changing the code page can
+    // still replace characters without making CONVERT fail (DECISIONS 299).
+    if unicode_to_non_unicode {
+        return Ok(vec![character_loss_probe()]);
     }
 
     // Anything else: let the engine answer. `TRY_CONVERT` returns NULL exactly
@@ -2038,6 +2047,25 @@ mod tests {
             assert!(sql[0].contains(expected_len), "{sql:?}");
             assert!(
                 sql[1].contains(&format!(
+                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                )),
+                "{sql:?}"
+            );
+        }
+
+        for (from, to) in [("nvarchar(255)", "varchar(max)"), ("ntext", "varchar(max)")] {
+            let sql = sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty(from),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+            });
+            assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
+            assert!(!sql[0].contains("LEN("), "{sql:?}");
+            assert!(
+                sql[0].contains(&format!(
                     "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
