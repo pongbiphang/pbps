@@ -1068,6 +1068,21 @@ changed is what "the statement failed" costs. Look for it wherever the first
 dialect *recovers* from a failure rather than propagating it — a `match` on an
 error that continues working with the same connection is the tell.
 
+**And the tell caught a second one in the same file, one review round later.**
+`ensure_tables` tolerates the loser's `23505` from a concurrent
+`CREATE TABLE IF NOT EXISTS`, because the table is there now and that is what
+the caller asked for. True in autocommit; measured, inside a transaction the
+same error aborts it, so `Ok(())` handed back a connection whose next statement
+was `25P02`. The ledger entry is written inside the apply's transaction, so the
+caller was always going to be one. The fix is a savepoint around the `CREATE` —
+and the savepoint is taken by *trying* it, because `SAVEPOINT` outside a
+transaction is `25P01` and harms nothing, which makes one round trip answer both
+"can I recover here" and "am I in a transaction at all".
+
+Two instances, one file, one shape: **every** `Err(e) if ... => Ok(())` in a
+PostgreSQL path is a claim that the connection is still usable, and on this
+engine that claim is false inside a transaction unless something rolled back.
+
 ## A time that reads differently to whoever asks
 
 The ledger stores an ISO 8601 timestamp as text, and the obvious way to produce

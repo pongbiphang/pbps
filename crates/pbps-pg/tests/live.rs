@@ -4497,6 +4497,60 @@ async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
     db.drop().await;
 }
 
+/// The loser of the creation race, inside a transaction of its own.
+///
+/// `record` runs inside the apply's transaction (DECISIONS 147), so this is the
+/// shape that matters: measured on 18.6, the loser's `CREATE TABLE IF NOT
+/// EXISTS` returns `23505` **and aborts its transaction**, so tolerating that
+/// error without rolling back to a savepoint hands the caller a connection
+/// whose every next statement is `25P02: current transaction is aborted` — a
+/// deployment failing on a race the code claims to have handled.
+///
+/// The race is made rather than hoped for: the winner holds its transaction
+/// open until the loser is already blocked on the relation lock.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_loser_of_the_creation_race_keeps_the_transaction_it_was_called_in() {
+    let mut db = TestDb::create("create_race").await;
+    let mut winner = db.second().await;
+
+    winner.execute("BEGIN").await.expect("the winner's own");
+    state::ensure_tables(&mut winner)
+        .await
+        .expect("the winner creates the pair");
+
+    // The loser starts while the winner still holds the tables uncommitted: its
+    // catalog probe sees nothing, and its `CREATE` blocks on the winner's lock.
+    db.conn.execute("BEGIN").await.expect("the loser's own");
+    let (committed, lost) = tokio::join!(
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            winner.execute("COMMIT").await
+        },
+        state::ensure_tables(&mut db.conn)
+    );
+    committed.expect("the winner commits");
+    lost.expect("the loser must find the table, not a duplicate-key failure");
+
+    // The point of the fix: the loser's transaction is still its own.
+    assert_eq!(number(&mut db.conn, "SELECT 1").await, 1);
+    let id = state::record(&mut db.conn, &snapshot(StateKind::Bootstrap))
+        .await
+        .expect("and it can still do the work it opened the transaction for");
+    assert!(id > 0);
+    db.conn.execute("COMMIT").await.expect("commit");
+
+    assert_eq!(
+        state::timeline(&mut db.conn, 10)
+            .await
+            .expect("timeline")
+            .len(),
+        1
+    );
+
+    db.drop().await;
+}
+
 /// `doctor` against a **real least-privilege role**, which is the only way this
 /// answer means anything: `postgres` is a superuser and passes every question
 /// without the catalog being asked.

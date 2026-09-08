@@ -5477,7 +5477,8 @@ SPEC is in sync with all of these.
 291. **`ensure_tables` treats a concurrent creator's failure as success.**
     `CREATE TABLE IF NOT EXISTS` is not atomic against another session doing the
     same thing: the check and the create are two steps, and the loser gets
-    `23505` on `pg_class_relname_nsp_index` or `42P07`. Both mean the table is
+    `23505` on `pg_type_typname_nsp_index` — the row for the table's implicit
+    composite type is where the collision lands — or `42P07`. Both mean the table is
     there now, which is what the caller asked for; anything else is still a
     failure. Every command that writes a ledger row calls this, so two
     pipelines starting together really do race on it.
@@ -5556,3 +5557,36 @@ SPEC is in sync with all of these.
     statement refuses. The kinds are the caller's now: `r` for what this project
     manages and for the ledger, `r` and `p` for what a declared key points at,
     which are the two kinds this engine lets a key reference.
+
+295. **Tolerating the creation race is not enough inside a transaction, so the
+    `CREATE` runs under a savepoint.** 291 tolerates the loser's `23505`/`42P07`
+    because the table is there now, which is what the caller asked for. Measured
+    on 18.6, that is only true in autocommit: the error **aborts the loser's
+    transaction**, so a bare `Ok(())` hands back a connection whose every next
+    statement is `25P02: current transaction is aborted`.
+
+    ```text
+    A: BEGIN; CREATE TABLE IF NOT EXISTS public.__pbps_state (...);   -- holds the lock
+    B: BEGIN; CREATE TABLE IF NOT EXISTS public.__pbps_state (...);   -- blocks
+    A: COMMIT;
+    B:   -> 23505 duplicate key ... pg_type_typname_nsp_index
+       SELECT 1  -> 25P02: current transaction is aborted
+       COMMIT    -> ROLLBACK
+    ```
+
+    That is not a hypothetical caller: `record` runs inside the apply's own
+    transaction (147), so a deployment would have failed on a race this arm
+    claims to have handled — and failed two statements later, with an error
+    about a transaction rather than about the race.
+
+    The savepoint is taken by **trying** it: `SAVEPOINT` outside a transaction
+    block is `25P01` and harms nothing, so one round trip both establishes the
+    savepoint and tells this call whether it is in a transaction at all. It is
+    taken only on the path that sends DDL, which 292 has already made rare. The
+    untolerated failures roll back to it too, so a caller can still run the
+    diagnostics it wants to print — without that, even those come back `25P02`.
+
+    This is the third instance of one shape in this dialect: an error path
+    written for an engine where a failed statement costs a statement, on an
+    engine where it costs the transaction. The other two are the lock (285) and
+    the reason it does not read its holder after a failed insert.

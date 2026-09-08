@@ -278,20 +278,74 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
         return Ok(());
     }
 
-    match conn
+    // The savepoint is what makes the tolerated failure below *survivable*, and
+    // it is established by trying it: `SAVEPOINT` outside a transaction block
+    // is `25P01` and harms nothing, so this is also how this call finds out
+    // where it is. One round trip, and only on the path that sends DDL at all.
+    let inside_a_transaction = match conn.execute(SAVEPOINT).await {
+        Ok(()) => true,
+        Err(e) if is_outside_a_transaction(&e) => false,
+        Err(e) => return Err(e),
+    };
+
+    let created = conn
         .execute(&format!("{CREATE_STATE};\n{CREATE_LOCK};"))
-        .await
-    {
-        Ok(()) => Ok(()),
+        .await;
+    match created {
+        Ok(()) => {
+            if inside_a_transaction {
+                conn.execute(RELEASE_SAVEPOINT).await?;
+            }
+            Ok(())
+        }
         // `IF NOT EXISTS` is not atomic against a concurrent creator: measured,
         // two sessions creating the same table at once leave one of them with
-        // `23505` on `pg_class_relname_nsp_index` or `42P07`, because the check
+        // `23505` on `pg_type_typname_nsp_index` or `42P07`, because the check
         // and the create are two steps under one lock the second session does
         // not hold. Both mean the table is there now, which is what the caller
-        // asked for. Anything else is still a failure.
-        Err(e) if made_by_someone_else(&e) => Ok(()),
-        Err(e) => Err(e),
+        // asked for.
+        //
+        // **Tolerating it is not enough.** Measured, the loser's *transaction*
+        // is aborted by that error, so a bare `Ok(())` would hand back a
+        // connection on which the caller's next statement is
+        // `25P02: current transaction is aborted` — and `record` runs inside
+        // the apply's transaction (DECISIONS 147), so the whole deployment
+        // would fail on a race this arm claims to have handled. Rolling back to
+        // the savepoint is what makes the claim true.
+        Err(e) if made_by_someone_else(&e) => {
+            if inside_a_transaction {
+                conn.execute(ROLLBACK_TO_SAVEPOINT).await?;
+            }
+            Ok(())
+        }
+        // Anything else is still a failure — and the caller is left able to
+        // report it: without the rollback its transaction is aborted, so even
+        // the diagnostics it wants to run would come back `25P02`. The
+        // rollback's own error is dropped, so it cannot replace the failure
+        // that caused it.
+        Err(e) => {
+            if inside_a_transaction {
+                let _ = conn.execute(ROLLBACK_TO_SAVEPOINT).await;
+            }
+            Err(e)
+        }
     }
+}
+
+/// The savepoint [`ensure_tables`] takes, named for what takes it: a caller
+/// that already holds one of its own keeps it, because a `SAVEPOINT` of the
+/// same name shadows rather than replaces, and the `RELEASE` below ends only
+/// this one.
+const SAVEPOINT: &str = "SAVEPOINT pbps_ensure_tables";
+const ROLLBACK_TO_SAVEPOINT: &str = "ROLLBACK TO SAVEPOINT pbps_ensure_tables";
+const RELEASE_SAVEPOINT: &str = "RELEASE SAVEPOINT pbps_ensure_tables";
+
+/// `no_active_sql_transaction`: this connection is in autocommit, so there is
+/// no savepoint to take and nothing an error here could abort.
+const NO_ACTIVE_TRANSACTION: &str = "25P01";
+
+fn is_outside_a_transaction(e: &DbError) -> bool {
+    e.server_error_code().as_deref() == Some(NO_ACTIVE_TRANSACTION)
 }
 
 /// Whether this database has a ledger at all.
