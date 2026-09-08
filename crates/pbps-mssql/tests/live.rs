@@ -1335,7 +1335,9 @@ async fn unicode_to_varchar_probes_character_loss() {
              CREATE TABLE dbo.alias_target (label nvarchar(20) NULL);\n\
              INSERT dbo.alias_target VALUES (N'王小明');\n\
              CREATE TABLE dbo.utf8_source (label varchar(20) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL);\n\
-             INSERT dbo.utf8_source VALUES (N'王小明');",
+             INSERT dbo.utf8_source VALUES (N'王小明');\n\
+             CREATE TABLE dbo.utf8_widening (label varchar(20) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL);\n\
+             INSERT dbo.utf8_widening VALUES (N'王小明');",
         )
         .await
         .unwrap();
@@ -1496,6 +1498,29 @@ async fn unicode_to_varchar_probes_character_loss() {
     let rows = legacy
         .conn
         .query("SELECT label FROM dbo.utf8_source;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.utf8_widening.label", "varchar(20)", "varchar(max)"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.utf8_widening ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.utf8_widening;")
         .await
         .unwrap();
     let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();

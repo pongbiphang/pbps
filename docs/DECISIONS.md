@@ -5667,6 +5667,11 @@ SPEC is in sync with all of these.
     Both endpoints are normalized before classification, so accepted aliases
     such as `character varying(max)` ask the same probe as `varchar(max)`,
     matching the type spelling the emitter will use.
+    This code-page question is independent of the ordinary narrowing risk:
+    even widening `varchar(20)` to `varchar(max)` can replace an explicitly
+    UTF-8 value when the ALTER resets the column to a legacy database default.
+    Such a widening gets the round-trip probe without a meaningless length
+    probe.
     Unicode-to-Unicode and non-Unicode-to-non-Unicode changes keep their one
     length probe rather than paying for a question they do not ask.
     Because SQL Server does not accept `LEN(ntext)` or `LEN(text)`, those legacy

@@ -509,11 +509,18 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // as a pass. Classifying the change `Incompatible` is what stops
             // it; a probe beside that would only argue with it
             // (DECISIONS 283).
-            if types::change_risk(from, to).risk_class().is_some()
+            let probes_capacity = types::change_risk(from, to).risk_class().is_some();
+            if (probes_capacity || character_to_non_unicode(from, to)?)
                 && !types::alter_column_is_refused(from)
                 && !types::alter_column_is_refused(to)
             {
-                out.extend(conversion_probe(column, &stored, from, to)?);
+                out.extend(conversion_probe(
+                    column,
+                    &stored,
+                    from,
+                    to,
+                    probes_capacity,
+                )?);
             }
             Ok(out)
         }
@@ -1759,12 +1766,24 @@ fn duplicate_probe(
     ))
 }
 
-/// The probe for narrowing a column's type, or `None` when no count exists.
+fn character_to_non_unicode(from: &ColumnType, to: &ColumnType) -> Result<bool, DialectError> {
+    let from = types::normalize(from)?;
+    let Ok(to) = types::normalize(to) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        from.base.as_str(),
+        "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
+    ) && matches!(to.base.as_str(), "char" | "varchar" | "text"))
+}
+
+/// The probes for a column type change whose rows or code page may lose data.
 fn conversion_probe(
     column: &ColumnRef,
     stored: &ColumnRef,
     from: &ColumnType,
     to: &ColumnType,
+    probes_capacity: bool,
 ) -> Result<Vec<Probe>, DialectError> {
     let table = qualified(&stored.table)?;
     let col = quote(&stored.name)?;
@@ -1792,7 +1811,7 @@ fn conversion_probe(
         Some(TypeArg::Int(n)) => Some(*n),
         Some(TypeArg::Max) | Some(TypeArg::Ident(_)) | None => None,
     };
-    if let Some(n) = bound {
+    if let Some(n) = bound.filter(|_| probes_capacity) {
         match to.base.as_str() {
             // LEN ignores trailing blanks, and so does the engine when it
             // shortens a character column — counting them would report rows
@@ -2089,6 +2108,25 @@ mod tests {
             assert!(
                 sql[0].contains(&format!(
                     "CONVERT(nvarchar(max), CONVERT({normalized_to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                )),
+                "{sql:?}"
+            );
+        }
+
+        for to in ["varchar(50)", "varchar(max)"] {
+            let sql = sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty("varchar(20)"),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+            });
+            assert_eq!(sql.len(), 1, "varchar(20) -> {to}: {sql:?}");
+            assert!(!sql[0].contains("LEN("), "{sql:?}");
+            assert!(
+                sql[0].contains(&format!(
+                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
                 )),
                 "{sql:?}"
             );
