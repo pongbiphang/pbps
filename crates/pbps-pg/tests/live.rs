@@ -5702,7 +5702,7 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
     fresh(&mut admin, &s).await;
     for sql in [
         format!("DROP ROLE IF EXISTS {deployer}"),
-        format!("CREATE ROLE {deployer} LOGIN PASSWORD 'Pbps!Test12345'"),
+        format!("CREATE ROLE {deployer} LOGIN PASSWORD 'live-test'"),
         format!("GRANT CREATE, USAGE ON SCHEMA {s} TO {deployer}"),
     ] {
         admin
@@ -5712,7 +5712,10 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
     }
 
     // As the deploying account, which owns what it creates and nothing else.
-    let as_deployer = conn_str().replace("user=postgres", &format!("user={deployer}"));
+    // The password goes with the user: a string that swapped the user and kept
+    // the admin's password held only where the two were spelled alike, and CI
+    // spells them differently.
+    let as_deployer = settings_with(&[("user", deployer.as_str()), ("password", "live-test")]);
     let mut conn = Conn::connect(Driver::Postgres, &as_deployer)
         .await
         .expect("connect as the deploying account");
