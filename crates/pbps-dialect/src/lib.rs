@@ -536,6 +536,199 @@ impl Lexicon {
     }
 }
 
+impl Lexicon {
+    /// The definition with everything that is not code blanked out, by this
+    /// engine's lexis.
+    ///
+    /// String literals and both comment forms are replaced by spaces,
+    /// character for character, so line structure and offsets survive; a
+    /// quoted identifier is passed through, because it is a name and a name
+    /// is what the callers look for. The reader is the dependency scan
+    /// (`creation_order`), and it used to lex every engine with one engine's
+    /// rules: **measured**, `CREATE VIEW es.b AS SELECT E'x\' , es.a' AS s`
+    /// is one literal to PostgreSQL, and the shared scanner closed it at the
+    /// `\'`, read `, es.a` as code, and invented an edge from `b` to `a`.
+    /// With `a` selecting from `b`, that edge closed a cycle, the two were
+    /// emitted in name order, and `CREATE VIEW es.a` failed inside the plan's
+    /// own transaction (DECISIONS 315).
+    ///
+    /// A dollar-quoted string is **read as code**, and this is the one place
+    /// this scan and [`normalize_definition`] part company on purpose. On the
+    /// engine that has them, a routine's body is itself one — `AS $$ SELECT
+    /// app.f(1) $$` — and the name scans exist to read what that body says:
+    /// blanked, every routine would call nothing and depend on nothing. A
+    /// dollar-quoted *datum* in a view is read as code too, which errs in the
+    /// safe direction — a name in it draws an edge that may not be there,
+    /// never loses one that is — and is what the shared scanner did before.
+    /// Inside the body the ordinary rules apply: its literals and comments
+    /// are blanked, an `E'…'` by the escape rule.
+    ///
+    /// [`normalize_definition`]: Lexicon::normalize_definition
+    pub fn code_only(&self, definition: &str) -> String {
+        enum At {
+            Code,
+            /// Inside `'…'`: a doubled quote is the first closing and the
+            /// second opening again, and everything between is blanked either
+            /// way.
+            Literal,
+            /// Inside `E'…'`: a backslash speaks for the character after it.
+            Escape {
+                after_backslash: bool,
+            },
+            /// Inside a quoted identifier: kept. The flag marks the second
+            /// delimiter of an escaped pair so it cannot also close the name.
+            Ident {
+                close: char,
+                escaped: bool,
+            },
+            Line,
+            Block {
+                depth: usize,
+                seen: usize,
+            },
+        }
+        fn blank(out: &mut String, ch: char) {
+            if matches!(ch, '\n' | '\r') {
+                out.push(ch);
+            } else {
+                for _ in 0..ch.len_utf8() {
+                    out.push(' ');
+                }
+            }
+        }
+        let mut out = String::with_capacity(definition.len());
+        let bytes = definition.as_bytes();
+        let mut at = At::Code;
+        let mut consumed_to = 0usize;
+        for (i, ch) in definition.char_indices() {
+            if i < consumed_to {
+                continue;
+            }
+            let next = bytes.get(i + ch.len_utf8()).copied();
+            match at {
+                At::Literal => {
+                    if ch == '\'' {
+                        at = At::Code;
+                    }
+                    blank(&mut out, ch);
+                }
+                At::Escape { after_backslash } => {
+                    at = if after_backslash {
+                        At::Escape {
+                            after_backslash: false,
+                        }
+                    } else if ch == '\\' {
+                        At::Escape {
+                            after_backslash: true,
+                        }
+                    } else if ch == '\'' {
+                        if next == Some(b'\'') {
+                            blank(&mut out, '\'');
+                            consumed_to = i + 2;
+                            At::Escape {
+                                after_backslash: false,
+                            }
+                        } else {
+                            At::Code
+                        }
+                    } else {
+                        At::Escape {
+                            after_backslash: false,
+                        }
+                    };
+                    blank(&mut out, ch);
+                }
+                At::Ident { close, escaped } => {
+                    at = if escaped {
+                        At::Ident {
+                            close,
+                            escaped: false,
+                        }
+                    } else if ch == close {
+                        if next == Some(close as u8) {
+                            At::Ident {
+                                close,
+                                escaped: true,
+                            }
+                        } else {
+                            At::Code
+                        }
+                    } else {
+                        At::Ident {
+                            close,
+                            escaped: false,
+                        }
+                    };
+                    out.push(ch);
+                }
+                At::Line => {
+                    if matches!(ch, '\n' | '\r') {
+                        at = At::Code;
+                    }
+                    blank(&mut out, ch);
+                }
+                At::Block { depth, seen } => {
+                    at = if ch == '/' && seen >= 2 && bytes[i - 1] == b'*' {
+                        if depth == 1 {
+                            At::Code
+                        } else {
+                            At::Block {
+                                depth: depth - 1,
+                                seen: 2,
+                            }
+                        }
+                    } else if ch == '/' && next == Some(b'*') {
+                        At::Block {
+                            depth: depth + 1,
+                            seen: 0,
+                        }
+                    } else {
+                        At::Block {
+                            depth,
+                            seen: seen + 1,
+                        }
+                    };
+                    blank(&mut out, ch);
+                }
+                At::Code => match (ch, next) {
+                    ('-', Some(b'-')) => {
+                        at = At::Line;
+                        blank(&mut out, ch);
+                    }
+                    ('/', Some(b'*')) => {
+                        at = At::Block { depth: 1, seen: 0 };
+                        blank(&mut out, ch);
+                    }
+                    ('\'', _) => {
+                        at = if self.escape_strings && opens_escape_string(definition, i) {
+                            At::Escape {
+                                after_backslash: false,
+                            }
+                        } else {
+                            At::Literal
+                        };
+                        blank(&mut out, ch);
+                    }
+                    _ => {
+                        if let Some(&(_, close)) = self
+                            .quoted_identifiers
+                            .iter()
+                            .find(|&&(open, _)| open == ch)
+                        {
+                            at = At::Ident {
+                                close,
+                                escaped: false,
+                            };
+                        }
+                        out.push(ch);
+                    }
+                },
+            }
+        }
+        out
+    }
+}
+
 /// The length in bytes of the `$tag$` that `s` opens with, if it opens with one.
 ///
 /// The tag follows the rules of an unquoted identifier and may not contain a
@@ -691,6 +884,12 @@ pub trait Dialect {
     /// it means something.
     fn normalize_definition(&self, definition: &str) -> String {
         self.lexicon().normalize_definition(definition)
+    }
+
+    /// The definition with everything that is not code blanked out, by this
+    /// engine's lexis: the text the dependency scan reads (DECISIONS 315).
+    fn code_only(&self, definition: &str) -> String {
+        self.lexicon().code_only(definition)
     }
 
     /// Checks whether this dialect supports the features the module uses.
@@ -1709,5 +1908,83 @@ impl Dialect for MinimalDialect {
             dialect: "minimal",
             feature: "SQL generation (the real emitter arrives in Phase 2)".to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod code_only_tests {
+    use super::*;
+
+    const PG: Lexicon = Lexicon {
+        quoted_identifiers: &[('"', '"')],
+        escape_strings: true,
+        dollar_quoted_strings: true,
+    };
+    const MSSQL: Lexicon = Lexicon {
+        quoted_identifiers: &[('[', ']'), ('"', '"')],
+        escape_strings: false,
+        dollar_quoted_strings: false,
+    };
+
+    /// `text` with each of `regions` replaced by spaces, character for
+    /// character — what the blanking of exactly those regions looks like.
+    fn blanked(text: &str, regions: &[&str]) -> String {
+        regions.iter().fold(text.to_owned(), |out, region| {
+            out.replace(region, &" ".repeat(region.chars().count()))
+        })
+    }
+
+    /// Measured: `SELECT E'x\' , es.a'` is one literal to PostgreSQL. Read
+    /// with the other engine's rules it closed at the `\'`, the name after
+    /// it was code, and the quote before `AS` opened a literal that ran to
+    /// the end.
+    #[test]
+    fn an_escape_string_is_one_literal_where_the_engine_has_them() {
+        let text = "SELECT E'x\\' , es.a' AS s";
+        assert_eq!(PG.code_only(text), blanked(text, &["'x\\' , es.a'"]));
+        assert_eq!(MSSQL.code_only(text), blanked(text, &["'x\\'", "' AS s"]));
+        // A doubled quote inside one does not close it either.
+        assert_eq!(PG.code_only("E'a''b' x"), blanked("E'a''b' x", &["'a''b'"]));
+        // And the prefix has to be a token of its own: `note'x'` is a name
+        // followed by a plain literal, whose backslash is a character.
+        assert_eq!(
+            PG.code_only("note'x\\' y"),
+            blanked("note'x\\' y", &["'x\\'"])
+        );
+    }
+
+    /// A routine's body is a dollar-quoted string on this engine, and the
+    /// scans are about what it says; so the string is code, and what is
+    /// inside it is lexed as code — its own literals blanked, an escape
+    /// string by the escape rule.
+    #[test]
+    fn a_dollar_quoted_string_is_read_as_code_because_a_routines_body_is_one() {
+        let body = "() RETURNS int LANGUAGE sql AS $$ SELECT app.f('x', E'y\\'z') $$";
+        assert_eq!(PG.code_only(body), blanked(body, &["'x'", "'y\\'z'"]));
+        let datum = "SELECT $$ es.a $$ AS t";
+        assert_eq!(PG.code_only(datum), datum);
+        // `$` inside an identifier is a name byte on either engine.
+        assert_eq!(PG.code_only("SELECT a$b$c FROM t"), "SELECT a$b$c FROM t");
+        assert_eq!(MSSQL.code_only(datum), datum);
+    }
+
+    #[test]
+    fn a_quoted_identifier_is_kept_and_a_bracket_is_only_a_quote_where_it_quotes() {
+        let text = "SELECT (ARRAY['a]b'])[1], \"es\".\"a\"";
+        assert_eq!(PG.code_only(text), blanked(text, &["'a]b'"]));
+        let bracketed = "SELECT [dbo].[a]]b], 'x'";
+        assert_eq!(MSSQL.code_only(bracketed), blanked(bracketed, &["'x'"]));
+    }
+
+    #[test]
+    fn comments_are_blanked_and_line_structure_survives() {
+        let text = "SELECT 1 -- es.a\nFROM /* a /* es.a */ c */ es.b";
+        assert_eq!(
+            PG.code_only(text),
+            blanked(text, &["-- es.a", "/* a /* es.a */ c */"])
+        );
+        for open in ["'unterminated", "E'x\\'", "/* open", "\"open"] {
+            assert_eq!(PG.code_only(open).len(), open.len(), "{open}");
+        }
     }
 }

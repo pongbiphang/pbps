@@ -38,6 +38,15 @@ use pbps_model::{
 pub mod catalog;
 pub mod doctor;
 mod emit;
+
+/// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):
+/// `"` quotes an identifier and `[` does not, `E'…'` is an escape string and
+/// `$tag$…$tag$` a literal closed only by its own tag.
+pub(crate) const LEXICON: Lexicon = Lexicon {
+    quoted_identifiers: &[('"', '"')],
+    escape_strings: true,
+    dollar_quoted_strings: true,
+};
 pub mod introspect;
 pub mod modules;
 pub mod state;
@@ -266,11 +275,7 @@ impl Dialect for Postgres {
     /// `E'…'`, where `\'` does not close the string, and `$tag$…$tag$`, which
     /// nothing inside it can close early (ADR-0011 Amendment 2).
     fn lexicon(&self) -> Lexicon {
-        Lexicon {
-            quoted_identifiers: &[('"', '"')],
-            escape_strings: true,
-            dollar_quoted_strings: true,
-        }
+        LEXICON
     }
 
     /// PostgreSQL runs DDL inside a transaction, and a failed statement aborts

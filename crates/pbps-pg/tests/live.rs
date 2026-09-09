@@ -7773,3 +7773,60 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
     );
     drop_schema(&mut conn, &s).await;
 }
+
+/// A plan that creates two views orders them by what each really selects
+/// from, not by a name the other engine's lexer would read out of a literal.
+///
+/// **Measured**: `SELECT E'x\' , es.a' AS s` is one literal to this engine.
+/// Read with the shared scanner's rules it closed at the `\'`, `, es.a` was
+/// code, and the scan drew an edge from `b` to `a`; with `a` selecting from
+/// `b`, that closed a cycle, the two were emitted in name order, and
+/// `CREATE VIEW a` failed inside the plan's transaction (DECISIONS 315).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() {
+    let s = emit_schema("escape_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.a").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT * FROM {s}.b"),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.b").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT E'x\\' , {s}.a' AS s"),
+        ),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.b"), format!("{s}.a")],
+        "the view that is selected from comes first, whatever its literal says"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT s FROM {s}.a")).await,
+        format!("x' , {s}.a"),
+        "and the literal reached the engine as the one string it is"
+    );
+    drop_schema(&mut conn, &s).await;
+}

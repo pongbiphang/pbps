@@ -6431,3 +6431,32 @@ SPEC is in sync with all of these.
     **Duplication that repeats a row is a tidiness problem; duplication that
     feeds a join is a wrong value.** The two look the same in the query and
     nothing distinguishes them but knowing what the rows are for.
+
+315. **The dependency scan lexes with the dialect's rules.** `creation_order`
+    reads what is left of a definition after literals and comments are
+    blanked, and the shared `code_only` blanked them by one engine's rules:
+    `[…]` a quoted identifier, `'…'` closed by the next single quote, no
+    `E'…'`, no `$tag$…$tag$`. Measured, `CREATE VIEW es.b AS SELECT E'x\' ,
+    es.a' AS s` is one literal to PostgreSQL; the shared scanner closed it at
+    the `\'`, read `, es.a` as code, and drew an edge from `b` to `a`. With
+    `a` selecting from `b` that edge closed a cycle, the members were emitted
+    in name order, `a` came first, and its `CREATE VIEW` failed inside the
+    plan's transaction — a valid plan refused, with no `depends_on:` able to
+    remove the edge that refused it.
+
+    The `Lexicon` a dialect already supplies for the comparison scanner
+    (ADR-0011 Amendment 2) is what decides where a region ends, so it now
+    supplies `code_only` too, and `Dialect::code_only` hands it to
+    `creation_order_with` and to the emitter's name scans. Not a second table
+    of delimiters in the model: the model keeps its `code_only` for the
+    callers that have no dialect, and the differ, which has one, lexes with
+    it.
+
+    A dollar-quoted string is read as **code** by this scan, where the
+    comparison scanner reads it as a literal. On this engine a routine's body
+    is itself one — `AS $$ SELECT app.f(1) $$` — and the name scans exist to
+    read what the body says; blanked, every routine would call nothing and
+    depend on nothing. A dollar-quoted datum in a view is read as code too,
+    which errs toward an edge that may not be there and never loses one that
+    is — the direction the shared scanner already erred in. The body written
+    as a plain `'…'` literal stays blanked, which is #228.

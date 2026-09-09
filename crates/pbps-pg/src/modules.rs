@@ -1647,7 +1647,7 @@ pub fn callers_by_name(declared: &Schema, id: &ModuleId) -> Vec<ModuleId> {
         .modules
         .iter()
         .filter(|(other, _)| *other != id)
-        .filter(|(_, m)| pbps_model::module::references(&m.definition, &name))
+        .filter(|(_, m)| pbps_model::module::references_with(&m.definition, &name, &code_only))
         .map(|(other, _)| other.clone())
         .collect()
 }
@@ -1706,6 +1706,13 @@ pub struct Rebound {
 ///
 /// `pg_catalog` is not a schema a write path may list (DECISIONS 277), so
 /// nothing this plan creates can arrive there and it is not considered.
+/// The definition lexed by this engine's rules, for every name scan in this
+/// file: where a literal ends is the engine's, not the shared scanner's
+/// (DECISIONS 315).
+fn code_only(definition: &str) -> String {
+    crate::LEXICON.code_only(definition)
+}
+
 #[must_use]
 pub fn rebound_by_this_plan(
     declared: &Schema,
@@ -1738,7 +1745,7 @@ pub fn rebound_by_this_plan(
             let Some(name) = new.referenced_name() else {
                 continue;
             };
-            if pbps_model::module::references(&definition.definition, &name) {
+            if pbps_model::module::references_with(&definition.definition, &name, &code_only) {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2078,6 +2085,35 @@ mod tests {
                 &nothing_changed
             )
             .is_empty()
+        );
+
+        // What the shared scanner reads as code past `\'` is a literal to
+        // this engine, so a name inside an escape string is no shadow — and
+        // the order among modules is decided the same way.
+        declared.modules.insert(
+            id("app.quoted()"),
+            module("() RETURNS text LANGUAGE sql AS $$ SELECT E'x\\' , f(1)' $$"),
+        );
+        assert!(
+            !rebound_by_this_plan(
+                &declared,
+                &extras,
+                &[id("app.f(integer)")],
+                &nothing_changed
+            )
+            .iter()
+            .any(|r| r.module == id("app.quoted()"))
+        );
+        let mut views = BTreeMap::new();
+        views.insert(id("app.a"), module("SELECT * FROM app.b"));
+        views.insert(id("app.b"), module("SELECT E'x\\' , app.a' AS s"));
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &views,
+                &pbps_model::ModuleDeps::default(),
+                &code_only
+            ),
+            vec![id("app.b"), id("app.a")]
         );
 
         // A trigger arriving is not a shadow, whatever its name: nothing calls

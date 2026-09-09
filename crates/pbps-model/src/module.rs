@@ -792,7 +792,14 @@ pub struct Hints {
 /// and the environment is unchanged. The escape hatch for the cases it gets
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
-    references_as(definition, name, Case::Folded)
+    references_with(definition, name, &code_only)
+}
+
+/// [`references`], with the definition lexed by `lex` rather than by the
+/// shared scanner — a dialect's own `code_only`, where the caller has one
+/// (DECISIONS 315).
+pub fn references_with(definition: &str, name: &ObjectName, lex: &dyn Fn(&str) -> String) -> bool {
+    references_in(&lex(definition), name, Case::Folded)
 }
 
 /// How the scan compares letters, narrowest last.
@@ -828,8 +835,14 @@ fn qualified(name: &ObjectName, case: Case) -> String {
     format!("{}.{}", cased(&name.schema, case), cased(&name.name, case))
 }
 
+#[cfg(test)]
 fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
-    let haystack = scannable(definition, case);
+    references_in(&code_only(definition), name, case)
+}
+
+/// Whether `code` — a definition already lexed to code — mentions `name`.
+fn references_in(code: &str, name: &ObjectName, case: Case) -> bool {
+    let haystack = scannable_code(code, case);
 
     // The qualified form, and the bare one — a definition written inside its
     // own schema very often omits the qualifier.
@@ -1049,8 +1062,13 @@ fn folded(s: &str) -> String {
 
 /// Lower-cases, drops the quoting characters and closes the gaps around dots,
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
+#[cfg(test)]
 fn scannable(definition: &str, case: Case) -> String {
-    let lowered = cased(&code_only(definition), case);
+    scannable_code(&code_only(definition), case)
+}
+
+fn scannable_code(code: &str, case: Case) -> String {
+    let lowered = cased(code, case);
     // A quoting character goes; a bracket that stood between two identifier
     // characters leaves a space behind. On PostgreSQL `[` is a subscript and
     // `ARRAY[` an array constructor, not a quote — measured, a view over
@@ -1148,14 +1166,36 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 /// One edge the scan cannot supply: between the overloads of one routine name,
 /// which the scan cannot tell apart, only `depends_on:` orders (DECISIONS 212).
 pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
+    creation_order_with(modules, deps, &code_only)
+}
+
+/// [`creation_order`], with every definition lexed by `lex` — the dialect's
+/// own `code_only` — rather than by the shared scanner.
+///
+/// The scan reads what is left after literals and comments are blanked, and
+/// where a literal ends is the engine's rule: **measured**, `SELECT E'x\' ,
+/// es.a'` is one literal to PostgreSQL, and the shared scanner closed it at
+/// the `\'` and read the name after it as code — an edge that was not
+/// there, which closed a cycle, which put a view before the one it selects
+/// from (DECISIONS 315).
+pub fn creation_order_with(
+    modules: &BTreeMap<ModuleId, Module>,
+    deps: &ModuleDeps,
+    lex: &dyn Fn(&str) -> String,
+) -> Vec<ModuleId> {
     let names: Vec<ModuleId> = modules.keys().cloned().collect();
+    // Lexed once each, not once per comparison.
+    let lexed: BTreeMap<&ModuleId, String> = modules
+        .iter()
+        .map(|(name, module)| (name, lex(&module.definition)))
+        .collect();
 
     // The edges for one comparison. Only the scanned ones move with it:
     // `depends_on:` and a trigger's target are identities, not text.
     let needs_among = |pending: &[ModuleId], case: Case| {
         let mut needs: BTreeMap<ModuleId, BTreeSet<ModuleId>> = BTreeMap::new();
         for name in pending {
-            let module = &modules[name];
+            let code = &lexed[name];
             let mut set: BTreeSet<ModuleId> = BTreeSet::new();
             for other in pending {
                 if other == name {
@@ -1187,7 +1227,7 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
                 let referenced = !sibling
                     && other
                         .referenced_name()
-                        .is_some_and(|n| references_as(&module.definition, &n, case));
+                        .is_some_and(|n| references_in(code, &n, case));
                 if declared || attached || referenced {
                     set.insert(other.clone());
                 }
@@ -1485,6 +1525,36 @@ mod tests {
             creation_order(&m, &ModuleDeps::default()),
             vec![id("app.z()"), id("app.a")]
         );
+    }
+
+    /// Where a literal ends is the engine's rule, and the order is decided on
+    /// what is left after the engine's literals are blanked: a lexer that
+    /// reads `E'x\' , app.a'` as one literal sees no edge from `b` to `a`,
+    /// and the shared scanner, which closes it at the `\'`, sees one and
+    /// makes a cycle of the two.
+    #[test]
+    fn the_order_is_decided_on_the_code_the_dialect_lexes() {
+        let m = modules(&[
+            ("app.a", "SELECT * FROM app.b"),
+            ("app.b", "SELECT E'x\\' , app.a' AS s"),
+        ]);
+        let engine_reads_an_escape_string =
+            |d: &str| d.replace("E'x\\' , app.a'", "               ");
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &engine_reads_an_escape_string),
+            vec![id("app.b"), id("app.a")]
+        );
+        // The shared scanner's reading: a cycle, broken by name order, which
+        // puts `a` before the view it selects from.
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.a"), id("app.b")]
+        );
+        assert!(!references_with(
+            "SELECT E'x\\' , app.a' AS s",
+            &n("app.a"),
+            &engine_reads_an_escape_string
+        ));
     }
 
     /// The escape hatch has to work where the scan sees nothing — a view

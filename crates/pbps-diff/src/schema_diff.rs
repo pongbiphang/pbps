@@ -270,13 +270,19 @@ pub fn diff_partial(
 
     // Modules are ordered among themselves by dependency: a view over a view
     // has to be created second, and dropped first (ADR-0002).
-    let create_rank = rank_of(&pbps_model::module::creation_order(
+    // Lexed by the dialect: where a literal ends is the engine's rule, and an
+    // edge read out of a literal the engine had not closed put a view before
+    // the one it selects from (DECISIONS 315).
+    let lex = |definition: &str| dialect.code_only(definition);
+    let create_rank = rank_of(&pbps_model::module::creation_order_with(
         &declared.schema.modules,
         &hints.module_deps,
+        &lex,
     ));
-    let drop_rank = rank_of(&pbps_model::module::creation_order(
+    let drop_rank = rank_of(&pbps_model::module::creation_order_with(
         &base.schema.modules,
         &hints.module_deps,
+        &lex,
     ));
     // The tiebreaker within an ordering class is the table name, then the
     // change's rendering. Debug output alone would sort by uid, which is random
