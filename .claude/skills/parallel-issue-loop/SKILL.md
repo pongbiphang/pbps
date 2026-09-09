@@ -149,10 +149,17 @@ scripts/live-tests-pg.sh
 ```
 
 The live suites need a database container, and concurrent workers sharing one
-container make each other fail. Assign each worker its own container port up
-front, or serialize the live suites through you. A worker that cannot run a
-required command reports the command and the reason and stops before pushing —
-it never reports a skipped suite as green.
+container make each other fail. Serialize them through you: hold a single live
+suite token and hand it to one worker at a time. A separate port per worker is
+**not** enough — `scripts/live-tests.sh` and `scripts/live-tests-pg.sh` hardcode
+the container names `pbps-test-mssql` and `pbps-test-pg` and reuse an existing
+container as-is, so a second worker with its own port silently connects to a
+port nothing is listening on, and two simultaneous starts race on
+`docker run --name`. Until those scripts take a container name as well as a
+port, serialization is the only safe arrangement.
+
+A worker that cannot run a required command reports the command and the reason
+and stops before pushing — it never reports a skipped suite as green.
 
 ## Merge gate
 
