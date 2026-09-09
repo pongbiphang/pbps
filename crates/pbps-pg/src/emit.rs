@@ -968,7 +968,7 @@ const fn keyword(kind: ModuleKind) -> &'static str {
 ///
 /// which is the same fact ADR-0009 §1 records from the other side: the schema
 /// in `ModuleId::Trigger` is the table's, and there is nowhere else for it to
-/// come from (DECISIONS 284).
+/// come from (DECISIONS 302).
 fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statement, DialectError> {
     let body = module.definition.trim();
     if body.is_empty() {

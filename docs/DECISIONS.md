@@ -5697,14 +5697,17 @@ SPEC is in sync with all of these.
     structure, independent of which types or callers happen to accept the
     expression today. Both upper- and lower-case openers are accepted, and
     neither gives backslashes escape semantics.
-    **Amended by the module emitter (284).** A module's whole `definition` is
+
+    **Amended by the module emitter (302).** A module's whole `definition` is
     verbatim text, so the statement's own `;` is on a line of its own too. The
     write scope puts a `RESET search_path;` after every statement, and a
     definition ending in `-- note` swallowed the terminator and ran on into it.
     The rule is not about expressions; it is about where the user's text ends
     and this tool's begins.
 
-283. **A routine argument type is its own text type, not a `ColumnType`.**
+## Phase 5 — modules (step 5, #80)
+
+301. **A routine argument type is its own text type, not a `ColumnType`.**
     `RoutineId` held `Vec<ColumnType>`, which was right while the only dialect
     was SQL Server, where a parameter's type is a column's type. PostgreSQL
     identifies a routine by the types in `proargtypes`, printed through
@@ -5760,7 +5763,7 @@ SPEC is in sync with all of these.
     now drops the whitespace beside `.` as well, outside quotes only, so a
     quoted name keeps whatever it holds.
 
-284. **A PostgreSQL trigger's table is in its identity *and* in its
+302. **A PostgreSQL trigger's table is in its identity *and* in its
     definition, and a declaration where the two disagree is refused.**
     ADR-0002 fixed where a module's `definition:` begins by what the emitter
     can derive, and for a trigger that was `CREATE OR ALTER TRIGGER <name> ON
@@ -5820,7 +5823,7 @@ SPEC is in sync with all of these.
     is the direction a scan may be wrong in: the remedy is to write the clause
     where the engine expects it.
 
-285. **A routine argument this dialect's catalogue does not know is passed
+303. **A routine argument this dialect's catalogue does not know is passed
     through, not refused.** `Postgres::normalize_type` refuses an unknown
     column type, and the obvious move was to answer the same way for a
     routine's arguments. It is wrong here for a reason that does not apply
@@ -5856,7 +5859,7 @@ SPEC is in sync with all of these.
     permanently unequal to the `bit varying` the catalog reads back, so the
     routine was one to create and one to drop on **every** connected plan.
 
-    That is not the bargain this entry struck. DECISIONS 285 accepts one loud
+    That is not the bargain this entry struck. DECISIONS 303 accepts one loud
     mismatch that a user fixes by writing what `pull` showed them; it does not
     accept the cry-wolf loop ADR-0002 names as the failure to avoid. So the
     fold is three attempts — with the modifier, without it, and without it and
@@ -5874,7 +5877,7 @@ SPEC is in sync with all of these.
     are part of the name — `m8."odd(name)"` keeps them — so the modifier is
     found outside quotes or not at all.
 
-286. **A module whose deparsed statement this reader cannot cut is named and
+304. **A module whose deparsed statement this reader cannot cut is named and
     left out, never recorded with an empty body.** The declaration holds
     everything after the object's name, and PostgreSQL hands back the whole
     statement, so the pull has to cut it. Measured, the three shapes:
@@ -5901,7 +5904,7 @@ SPEC is in sync with all of these.
     module id that does not survive `ModuleId::from_str(&id.to_string())` takes
     its object out of the pull rather than into a schema that will not load.
 
-287. **Extension-owned objects are left out of the pull silently, and that is
+305. **Extension-owned objects are left out of the pull silently, and that is
     not the "absent, empty and unreadable" failure.** `CREATE EXTENSION …
     SCHEMA app` puts an extension's functions and views in a project's schema.
     A reader without the `pg_depend deptype = 'e'` filter reports every one of
@@ -5923,7 +5926,7 @@ SPEC is in sync with all of these.
     rule the ordinary reader applies and the reader beside it does not is a
     rule with a hole in it, and the hole is on the path that refuses.
 
-288. **On this dialect every carried attribute refuses the rebuild today,
+306. **On this dialect every carried attribute refuses the rebuild today,
     because there is no declared grant for one to come back from.**
     ADR-0009 §3 decides that a grant to a **declared** role survives a module
     replacement, by the machinery ADR-0005 built — and roles and grants are
@@ -6032,7 +6035,7 @@ SPEC is in sync with all of these.
     project cannot put back" into "there is nothing there", and the second is
     what makes a plan applyable and predictably failing.
 
-289. **The rebind test is a name and a path, not a position on it.**
+307. **The rebind test is a name and a path, not a position on it.**
     ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
     the modules it could capture, in that same plan. The obvious
     implementation asks which candidate is *earlier* on the write path than the
@@ -6059,10 +6062,10 @@ SPEC is in sync with all of these.
     thing and the declarations mean another, with nothing in the plan that
     created the shadow having said so.
 
-290. **A routine's parameter list is checked against its identity, and only
+308. **A routine's parameter list is checked against its identity, and only
     where the disagreement is certain.** The emitter writes
     `CREATE FUNCTION <name>` and the declaration writes everything after the
-    name (283, ADR-0009 §1), so the identity's argument types live in the key
+    name (301, ADR-0009 §1), so the identity's argument types live in the key
     *and* in the body — the same split the trigger's `ON` clause has, and the
     same silent failure. Measured: `CREATE FUNCTION app.f\n(x text) …` under
     the key `app.f(integer)` is accepted without a word and creates
@@ -6115,7 +6118,7 @@ SPEC is in sync with all of these.
     there is no second reading. A gate is allowed to be undecided; it is not
     allowed to invent a reading the grammar does not have.
 
-291. **A module the deparse could not find is the catalog moving, not a reader
+309. **A module the deparse could not find is the catalog moving, not a reader
     out of step with its query.** The pull reads the catalog in one
     `REPEATABLE READ READ ONLY` transaction so that it cannot report half of a
     change as a whole schema, and 267's guard turns the `XX000` a moved catalog
@@ -6138,7 +6141,7 @@ SPEC is in sync with all of these.
 
     So the modules read takes the definition as optional and turns `NULL` into
     the same "the catalog changed while it was being read" the `XX000` path
-    gives. Not into a limitation and not into a skipped module (286): 286 is
+    gives. Not into a limitation and not into a skipped module (304): 304 is
     for a statement this reader cannot *cut*, which is a fact about the object
     and stays true on the next pull. This is a fact about the moment, and the
     answer to it is to read again.
@@ -6148,7 +6151,7 @@ SPEC is in sync with all of these.
     pull is nearly always running across somebody's `DROP`. A defect that only
     appears when two things happen at once has no other way to be found.
 
-292. **A pull and a rebuild can deadlock, and the answer is a sentence rather
+310. **A pull and a rebuild can deadlock, and the answer is a sentence rather
     than a lock order.** Reading a module's definition means deparsing it, and
     `pg_get_viewdef` opens the view — so a pull holds `ACCESS SHARE` on every
     view in the database for as long as that query runs. A rebuild takes
@@ -6183,7 +6186,7 @@ SPEC is in sync with all of these.
     lock objects. The suite retries, and says in the helper that the retry is
     its own concurrency rather than the product's.
 
-293. **The drop order for dependents is a topological order, not a depth.**
+311. **The drop order for dependents is a topological order, not a depth.**
     A breadth-first walk gives each dependent the depth of the *shortest* path
     to it, and two dependents at one depth come out in whatever order the
     catalog gave. Measured, that is wrong the moment a diamond appears:
@@ -6212,7 +6215,7 @@ SPEC is in sync with all of these.
 
     A depth is the answer to "how far", and the question was "in what order".
 
-294. **The transaction probe compares against a value it invented, not against
+312. **The transaction probe compares against a value it invented, not against
     a constant.** Both sides of it — the pull refusing a caller's transaction,
     the rebuild requiring one — are `set_config(…, is_local => true)` in one
     statement and `current_setting` in the next: inside a transaction the
@@ -6232,7 +6235,7 @@ SPEC is in sync with all of these.
     being asked. A type that cannot hold the bad value beats a branch that
     checks for it, and here the value is the type.
 
-295. **A routine argument folds ASCII case only.** `RoutineArg` lower-cased
+313. **A routine argument folds ASCII case only.** `RoutineArg` lower-cased
     with `char::to_lowercase`, which is Unicode's fold and not this engine's.
     Measured:
 
@@ -6247,7 +6250,7 @@ SPEC is in sync with all of these.
     `unquoted` has always been `to_ascii_lowercase`; this is the same rule in
     the model, where the two were quietly disagreeing.
 
-296. **`pg_depend` holds a row per column a dependent uses, not a row per
+314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
     edges to it:
 

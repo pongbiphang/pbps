@@ -670,7 +670,7 @@ fn add_module(
 /// against would have to reproduce the engine's own quoting rules — which is
 /// the deparser's job, not this reader's. `None` where the text is not this
 /// shape at all, so that the caller can say so rather than record an empty
-/// body (DECISIONS 286).
+/// body (DECISIONS 304).
 fn after_the_name<'a>(deparsed: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = deparsed.trim_start().strip_prefix(prefix)?;
     Some(after_a_qualified_name(rest)?.trim())

@@ -340,18 +340,18 @@ decided by text §8.2 forbids parsing, and measured, the replace path drops
 prefix is not the SQL Server shape: this grammar puts the table after the event
 list, so the table is in the identity **and** in the body, and a declaration
 where the two disagree is refused offline — measured, the engine accepts it
-without a word and the mismatch only surfaces a plan later (DECISIONS 284).
+without a word and the mismatch only surfaces a plan later (DECISIONS 302).
 A routine argument became its own text type, which closes issue #59: measured,
 of one function's twelve identity arguments the column catalogue knows three by
 name, and the rest are arrays, a quoted name whose case the engine keeps, and a
-schema-qualified domain (DECISIONS 283, 285).
+schema-qualified domain (DECISIONS 301, 303).
 
 The pull reads views, routines and triggers back, cutting the declaration out of
 the statement the engine deparses by stepping over the name rather than
 searching for a bracket; a statement it cannot cut is named and left out, never
-recorded with an empty body (DECISIONS 286). Extension-owned objects are left
+recorded with an empty body (DECISIONS 304). Extension-owned objects are left
 out silently, because they are somebody else's objects and not a limitation of
-the model (DECISIONS 287).
+the model (DECISIONS 305).
 
 What a connected plan has to know before it rebuilds one is read from the
 catalog and not from a list: an ACL, a revocation from `PUBLIC` that is the
@@ -360,7 +360,7 @@ column default in `pg_attrdef`, a trigger's `tgenabled`, and the grants a *new*
 object would arrive with from `pg_default_acl`. Every one of them refuses today,
 because roles and grants are step 6 and there is no declared grant for one to
 come back from; step 6 narrows that and ADR-0010 §5 keeps `PUBLIC` on the
-refusing side for good (DECISIONS 288). The read is taken under the object's own
+refusing side for good (DECISIONS 306). The read is taken under the object's own
 lock where the account can take one — a view's own, a trigger's parent table's,
 a routine's `pg_proc` row lock — and says so where nothing serialized it, which
 is the honest answer for the accounts this tool is built for. The dependency
@@ -370,7 +370,7 @@ what the plan has to drop and restore around the rebuild, `DROP … CASCADE` is
 never written, and a caller only a name scan can see is **reported** — a name is
 not an identity where routines overload. And a same-named object this plan
 introduces on a module's write path rebuilds that module in the same plan rather
-than one plan late, on a name and a path rather than a position (DECISIONS 289).
+than one plan late, on a name and a path rather than a position (DECISIONS 307).
 None of this is reached by a command yet: the CLI still refuses the dialect, so
 the live suite is what exercises it.
 

@@ -996,7 +996,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
 }
 
 /// The spelling this engine puts in a routine's identity, from a declared one
-/// (ADR-0009 §1, DECISIONS 283 and 285).
+/// (ADR-0009 §1, DECISIONS 301 and 303).
 ///
 /// The rules and the measurements behind them are on
 /// `Postgres::normalize_routine_arg`, which is the only caller. Total by
@@ -1071,7 +1071,7 @@ pub(crate) fn peel_array(text: &str) -> (&str, bool) {
 ///    `bit varying(4)` never equalled the `bit varying` the catalog reads back,
 ///    and the routine was one to create and one to drop on every plan for
 ///    ever — the cry-wolf loop ADR-0002 names as the failure to avoid, which
-///    is a different and worse thing from DECISIONS 285's one loud mismatch.
+///    is a different and worse thing from DECISIONS 303's one loud mismatch.
 fn identity_element(element: &str) -> String {
     if let Some(folded) = folded(element) {
         return folded.base;

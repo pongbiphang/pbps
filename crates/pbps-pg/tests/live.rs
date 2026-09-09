@@ -1725,7 +1725,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         );
     }
 
-    // An extension's own objects are left out **silently** (DECISIONS 287),
+    // An extension's own objects are left out **silently** (DECISIONS 305),
     // and that holds for the limitation reader as much as for the ordinary
     // one. Reported, they would be worse than noise: `managed_limitations`
     // refuses every command for a limitation whose name is in the managed set,

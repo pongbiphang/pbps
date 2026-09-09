@@ -30,7 +30,7 @@
 //! dialect cannot rebuild, and it says so by name. The step that adds grants
 //! narrows this to what the declarations still cannot reproduce; it does not
 //! remove it, because ADR-0010 §5 records that pbps cannot express "revoked
-//! from `PUBLIC`" and therefore must not take it away (DECISIONS 288).
+//! from `PUBLIC`" and therefore must not take it away (DECISIONS 306).
 //!
 //! # Nothing here is called by a command yet
 //!
@@ -677,7 +677,7 @@ pub fn catalogs_read_by_address() -> Vec<&'static str> {
 /// in this project writes `COMMENT ON` or `SECURITY LABEL` — the `COMMENT ON`
 /// round trip is a decision of its own, and `SetColumnDeprecated` says so from
 /// the other side. So each is somebody else's state, exactly like an ACL or an
-/// owner, and refuses for the reason DECISIONS 288 gives for all of them.
+/// owner, and refuses for the reason DECISIONS 306 gives for all of them.
 ///
 /// A column's row is here too: same object, `objsubid > 0`, and a rebuild
 /// destroys it just as completely. The name is looked up only for a relation,
@@ -1662,7 +1662,7 @@ pub struct Rebound {
 ///
 /// So the test is: this plan brings an object into a schema on that module's
 /// effective write path, and the module's text mentions that object's bare
-/// name. One rebuild, once, and the state re-recorded (DECISIONS 289).
+/// name. One rebuild, once, and the state re-recorded (DECISIONS 307).
 ///
 /// `pg_catalog` is not a schema a write path may list (DECISIONS 277), so
 /// nothing this plan creates can arrive there and it is not considered.

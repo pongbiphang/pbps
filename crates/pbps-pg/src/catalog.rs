@@ -112,7 +112,7 @@ fn tables_query() -> String {
 ///
 /// Left out rather than reported: they are not a limitation of the model, they
 /// are somebody else's objects. `DROP EXTENSION` is how one goes away
-/// (DECISIONS 287).
+/// (DECISIONS 305).
 const NOT_AN_EXTENSIONS: &str = "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                     WHERE d.objid = %OID% AND d.classid = %CLASS%::regclass
                       AND d.deptype = 'e')";
@@ -210,7 +210,7 @@ fn module_args_query() -> String {
 ///
 /// [`NOT_AN_EXTENSIONS`] here too, and for the same reason it is on the module
 /// queries: an extension installed into a project's schema owns aggregates and
-/// materialized views of its own, and DECISIONS 287 says those are left out
+/// materialized views of its own, and DECISIONS 305 says those are left out
 /// **silently** rather than reported. Reported, they are worse than noise —
 /// `managed_limitations` refuses every command for a limitation whose name is
 /// in the managed set, so an extension object colliding with a declared name
