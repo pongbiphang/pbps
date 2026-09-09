@@ -149,7 +149,7 @@ const SETTING_SENSITIVE: &[&str] = &[
 /// outside the guard on purpose (DECISIONS 174 and 279: this tool does not
 /// parse expressions), covered instead by the settings the framing pins.
 fn without_grouping(expression: &str) -> &str {
-    let mut e = expression.trim();
+    let mut e = ascii_trim(expression);
     loop {
         let bytes = e.as_bytes();
         if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
@@ -188,7 +188,7 @@ fn without_grouping(expression: &str) -> &str {
         if !paired || depth != 0 {
             return e;
         }
-        e = e[1..e.len() - 1].trim();
+        e = ascii_trim(&e[1..e.len() - 1]);
     }
 }
 
@@ -1012,7 +1012,12 @@ const fn keyword(kind: ModuleKind) -> &'static str {
 /// in `ModuleId::Trigger` is the table's, and there is nowhere else for it to
 /// come from (DECISIONS 302).
 fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statement, DialectError> {
-    let body = module.definition.trim();
+    // ASCII, not Unicode: a non-breaking space is an identifier byte to this
+    // engine (DECISIONS 313), and **measured**, `CREATE VIEW v AS SELECT 1 AS
+    // x\u{a0}` names the column `x\u{a0}` — two characters. `str::trim` took
+    // the byte off the end of the body, and the view the plan created had a
+    // column the declaration does not name.
+    let body = ascii_trim(&module.definition);
     if body.is_empty() {
         return Err(empty_definition(id));
     }
@@ -1637,7 +1642,7 @@ fn empty_definition(id: &ModuleId) -> DialectError {
 /// time — or, for the trigger's table, one it would **not** make at all.
 pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
     let mut found = Vec::new();
-    if module.definition.trim().is_empty() {
+    if ascii_trim(&module.definition).is_empty() {
         found.push(empty_definition(id));
     }
     // The names first: `quote` refuses an identifier over the engine's byte
@@ -1654,7 +1659,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
             // An empty definition is already refused above; running the
             // parameter scan on it would say the same thing twice, in worse
             // words.
-            Some(args) if !module.definition.trim().is_empty() => {
+            Some(args) if !ascii_trim(&module.definition).is_empty() => {
                 found.extend(the_body_declares_the_identity(id, &module.definition, args));
             }
             Some(_) => {}
@@ -2465,6 +2470,13 @@ mod tests {
                 id("app.v"),
                 module(ModuleKind::View, "SELECT id FROM app.t"),
                 "CREATE VIEW \"app\".\"v\" AS\nSELECT id FROM app.t",
+            ),
+            // ASCII whitespace is trimmed off the body; a non-breaking space
+            // is an identifier byte and stays — measured, it names the column.
+            (
+                id("app.v"),
+                module(ModuleKind::View, " \n SELECT 1 AS x\u{a0}\n "),
+                "CREATE VIEW \"app\".\"v\" AS\nSELECT 1 AS x\u{a0}",
             ),
             (
                 id("app.f(integer)"),

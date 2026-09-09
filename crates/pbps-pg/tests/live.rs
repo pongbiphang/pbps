@@ -7666,3 +7666,49 @@ async fn a_routine_that_takes_or_returns_the_views_row_type_is_a_dependent_of_th
 
     drop_schema(&mut conn, &s).await;
 }
+
+/// A module body reaches the engine byte for byte, ASCII whitespace at its
+/// ends excepted — and only ASCII.
+///
+/// **Measured**: a non-breaking space is an identifier byte to this engine, so
+/// `SELECT 1 AS x\u{a0}` names a two-character column. A trim that took
+/// Unicode's word for what whitespace is cut the byte off the end of the body,
+/// and the view the plan created had a column the declaration does not name
+/// (DECISIONS 313).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_bodys_trailing_non_ascii_byte_reaches_the_engine() {
+    let s = emit_schema("nbsp_body");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    let view = module(pbps_model::ModuleKind::View, " \n SELECT 1 AS x\u{a0}\n ");
+    for statement in pg
+        .emit(
+            &pbps_model::Change::CreateModule {
+                id: id.clone(),
+                module: Box::new(view),
+            },
+            Strategy::default(),
+        )
+        .expect("emit the create")
+    {
+        conn.execute(&statement.sql)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", statement.sql));
+    }
+    let column = text(
+        &mut conn,
+        &format!(
+            "SELECT a.attname FROM pg_catalog.pg_attribute a
+              WHERE a.attrelid = '{s}.v'::regclass AND a.attnum > 0"
+        ),
+    )
+    .await;
+    drop_schema(&mut conn, &s).await;
+    assert_eq!(
+        column, "x\u{a0}",
+        "the byte the declaration ends with is the byte the engine read"
+    );
+}

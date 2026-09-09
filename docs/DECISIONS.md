@@ -6387,7 +6387,11 @@ SPEC is in sync with all of these.
     whitelist admits any non-ASCII byte, which is `continues_ident`'s rule.
     The dialect's normalizer follows the same rule wherever it looks for a
     gap — before the array keyword, after `interval`, around a modifier — so
-    `a\u{a0}array` is a type name and not `a[]`.
+    `a\u{a0}array` is a type name and not `a[]`. And so does the emitter's
+    trim of a module body: measured, `CREATE VIEW v AS SELECT 1 AS x\u{a0}`
+    names the column `x\u{a0}`, and `str::trim` had taken the byte off the
+    end of the body before the `CREATE`, so the view the plan made had a
+    column the declaration does not name.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
