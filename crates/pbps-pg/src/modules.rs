@@ -1729,7 +1729,16 @@ pub fn rebound_by_this_plan(
             if !on_the_path {
                 continue;
             }
-            if pbps_model::module::references(&definition.definition, &new.object_name()) {
+            // The name a body would call this object by — and a trigger has
+            // none: nothing invokes a trigger by name, so one arriving cannot
+            // capture a call, however a routine of the same name is spelled.
+            // Tested by `object_name`, a trigger `app.orders.audit` rebuilt
+            // every caller of `audit()` for a binding that cannot move, and
+            // the rebuild of a caller with dependents is a refusal (307).
+            let Some(name) = new.referenced_name() else {
+                continue;
+            };
+            if pbps_model::module::references(&definition.definition, &name) {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2069,6 +2078,30 @@ mod tests {
                 &nothing_changed
             )
             .is_empty()
+        );
+
+        // A trigger arriving is not a shadow, whatever its name: nothing calls
+        // a trigger, so `audit()` still binds where it did. The routine of
+        // that name arriving is, which is what tells the two apart.
+        declared.modules.insert(
+            id("app.auditor()"),
+            module("() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT audit(); END"),
+        );
+        assert!(
+            rebound_by_this_plan(
+                &declared,
+                &extras,
+                &[id("app.orders.audit")],
+                &nothing_changed
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rebound_by_this_plan(&declared, &extras, &[id("app.audit()")], &nothing_changed),
+            vec![Rebound {
+                module: id("app.auditor()"),
+                arriving: id("app.audit()"),
+            }]
         );
 
         // Once: a module this plan already changes is rebuilt by that change,

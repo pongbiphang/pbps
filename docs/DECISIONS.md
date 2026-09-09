@@ -6154,6 +6154,14 @@ SPEC is in sync with all of these.
     thing and the declarations mean another, with nothing in the plan that
     created the shadow having said so.
 
+    **Amended: a trigger arriving is not a shadow.** Nothing calls a trigger
+    by name, so the test asks for the name a body would reference the
+    arriving object by (`ModuleId::referenced_name`), which a trigger does not
+    have. Asked for the object name instead, a trigger `app.orders.audit`
+    rebuilt every caller of `audit()` for a binding that cannot move — and
+    where such a caller has dependents, that rebuild is a refusal of a plan
+    that was valid.
+
 308. **A routine's parameter list is checked against its identity, and only
     where the disagreement is certain.** The emitter writes
     `CREATE FUNCTION <name>` and the declaration writes everything after the
