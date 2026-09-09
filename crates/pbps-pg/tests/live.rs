@@ -6797,6 +6797,26 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
         // mode nor the type.
         (
             "",
+            "(value /* note */ out integer) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "",
+            "(out /* note */ value integer) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "",
+            "(value out /* note */ integer) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "",
+            "(value\n-- line comment\nout integer) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "integer",
+            "(in /* note */ x /* note */ int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "",
             "(/* note */ out value integer) LANGUAGE sql AS $$ SELECT 1 $$",
         ),
         (
@@ -7157,6 +7177,8 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
         "AFTER INSERT ON $S . t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
         "AFTER INSERT ON $S /* schema */ .\n  t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
         "AFTER INSERT ON \"$S\" . \"t\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON /* c */ $S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON\n-- c\n$S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
     ] {
         let m = on_table(body);
         assert!(
@@ -7229,6 +7251,85 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
         .await
         .expect_err("and the key that says `t` finds nothing, a plan later");
     assert_eq!(sqlstate(&not_there), "42704", "{not_there:?}");
+
+    drop_schema(&mut conn, &s).await;
+}
+
+/// A user rule on a view is a dependent the engine deletes with the view and
+/// the rebuild does not put back — measured, `DROP VIEW` then `CREATE VIEW`
+/// leaves `pg_rewrite` with only the `_RETURN` row. Its `pg_depend` edges reach
+/// the view arm, whose `ev_class` is the view itself, so the reader reported
+/// the view as its own dependent and the walk discarded it as the root: the
+/// rebuild went ahead and the rule was silently gone.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_it() {
+    let s = emit_schema("view_rule");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE TABLE {s}.log (id int)"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+        format!(
+            "CREATE RULE ins AS ON INSERT TO {s}.v DO INSTEAD INSERT INTO {s}.log VALUES (NEW.id)"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let v: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let found = pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
+        .await
+        .expect("read the dependents");
+    rollback(&mut conn).await;
+    let described: Vec<&str> = found.iter().map(|d| d.described.as_str()).collect();
+    assert_eq!(
+        described,
+        vec![format!("rule ins on view {s}.v")],
+        "the rule is a dependent of its own view, and the view is not"
+    );
+    assert!(
+        matches!(&found[0].holds, pbps_pg::modules::Holds::Unrepresentable(why) if why.contains("rewrite rule")),
+        "{:?}",
+        found[0].holds
+    );
+
+    // Declared or not, it refuses: the model has nothing to recreate it from.
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        v.clone(),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("AS SELECT id FROM {s}.t"),
+        ),
+    );
+    let refusal = pbps_pg::modules::unmanaged_refusal(&v, &found, &declared)
+        .expect("a rule refuses the rebuild");
+    assert!(refusal.contains("rule ins"), "{refusal}");
+
+    // The premise, measured: the engine drops the rule with the view, and the
+    // rebuild the plan would have emitted does not put it back.
+    conn.execute(&format!(
+        "DROP VIEW {s}.v; CREATE VIEW {s}.v AS SELECT id FROM {s}.t"
+    ))
+    .await
+    .expect("the rebuild");
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_rewrite
+                  WHERE ev_class = '{s}.v'::regclass AND rulename <> '_RETURN'"
+            )
+        )
+        .await,
+        0,
+        "a rule that survived the rebuild would make this refusal needless"
+    );
 
     drop_schema(&mut conn, &s).await;
 }

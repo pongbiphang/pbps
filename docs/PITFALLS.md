@@ -1338,6 +1338,12 @@ is not total over its own class. Every filter inside an arm has to be a
 project cannot hold it, so "there is something here I cannot put back" never
 becomes "there is nothing there".
 
+A third instance got there without a filter. The view arm was total, and it
+named a user rule on the view *as the view*, because that is what the rule's
+`ev_class` is — and the walk, seeing the root, discarded it. An arm that is
+total over its class still has to say *which* object the row is: a row named
+as one the reader already holds is the same silence with a different cause.
+
 ## The identity is in the key and in the body, and the engine trusts the body
 
 Where the emitter composes a prefix and the declaration holds the rest, any

@@ -1330,6 +1330,15 @@ fn dependent_routine_args_query(refclass: &str) -> String {
 /// here this project cannot put back". A filter inside an arm turns the second
 /// into the first, and the first is what makes a plan applyable and
 /// predictably failing (SPEC §7.5).
+///
+/// **And an arm can be total and still name the wrong object.** A user rule on
+/// a view has its edges in `pg_rewrite`, whose `ev_class` is the view the rule
+/// is on — so the view arm reported the view as its own dependent, and the
+/// walk discarded that as the root. **Measured**, `CREATE RULE ins AS ON
+/// INSERT TO v …` puts `deptype` `a` and `n` edges from the rule to `v`; `DROP
+/// VIEW v` deletes the rule and `CREATE VIEW v` does not restore it. Only the
+/// engine's own `_RETURN` rule *is* the view; any other comes back as a
+/// dependent this model cannot put back, and refuses (DECISIONS 306).
 fn dependents_query(refclass: &str) -> String {
     let edge = format!(
         "d.refclassid = '{refclass}'::regclass AND d.refobjid = ($1::int8)::oid AND d.deptype <> 'i'"
@@ -1349,7 +1358,9 @@ fn dependents_query(refclass: &str) -> String {
         "SELECT DISTINCT * FROM (
          SELECT 'view' AS what, {described}, n2.nspname AS dep_schema, c2.relname AS dep_name,
                 '' AS part, 0::int8 AS dep_oid,
-                CASE WHEN c2.relkind = 'm'
+                CASE WHEN r.rulename <> '_RETURN'
+                     THEN 'a rewrite rule on the view, which this model does not hold: the engine drops it with the view and the rebuild does not put it back'
+                     WHEN c2.relkind = 'm'
                      THEN 'a materialized view, which this model does not hold'
                      ELSE '' END AS unrepresentable
            FROM pg_catalog.pg_depend d

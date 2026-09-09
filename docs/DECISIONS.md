@@ -5838,6 +5838,8 @@ SPEC is in sync with all of these.
     `app` as the table, and refused a valid declaration; it now steps through
     the same gap on both sides of every dot — in the scan that finds the name
     and in the comparison that reads it, which are two readers of one slice.
+    The gap after `ON` itself is one too: measured, `ON /* c */ app.t` creates
+    the trigger on `app.t`, and the scan steps through it as well.
 
 303. **A routine argument this dialect's catalogue does not know is passed
     through, not refused.** `Postgres::normalize_type` refuses an unknown
@@ -6051,6 +6053,17 @@ SPEC is in sync with all of these.
     project cannot put back" into "there is nothing there", and the second is
     what makes a plan applyable and predictably failing.
 
+    **Amended again: an arm can be total and still name the wrong object.** A
+    user rule on a view (`CREATE RULE ins AS ON INSERT TO app.v …`) has its
+    `pg_depend` edges in `pg_rewrite`, whose `ev_class` is the view the rule
+    is on — the view itself. The arm reported the view as its own dependent,
+    and the walk discarded that as the root. Measured, `DROP VIEW` deletes the
+    rule and `CREATE VIEW` does not restore it: the rebuild went ahead and the
+    rule was silently gone. Only the engine's `_RETURN` rule *is* the view;
+    any other now comes back as a dependent this model cannot put back, and
+    refuses. The same silence as the filter's, reached another way — a row
+    that was there, named as something the reader already held.
+
 307. **The rebind test is a name and a path, not a position on it.**
     ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
     the modules it could capture, in that same plan. The obvious
@@ -6133,6 +6146,16 @@ SPEC is in sync with all of these.
     whole remainder is a spelling this catalogue knows, that is the type and
     there is no second reading. A gate is allowed to be undecided; it is not
     allowed to invent a reading the grammar does not have.
+
+    **Amended: every gap in the parameter is a gap.** The first comment case
+    was fixed at the front of the parameter and nowhere else. Measured,
+    `(value /* note */ OUT integer)`, `(OUT /* note */ value integer)`,
+    `(value OUT /* note */ integer)` and a line comment between the name and
+    the mode all have the identity `()`, and `(IN /* note */ x /* note */
+    int)` has `(integer)`. The scan now steps through the gap on every side of
+    the mode, not only the first; a scan that knew comments were whitespace
+    in one position and not the next was refusing a valid declaration for a
+    count only it got wrong.
 
 309. **A module the deparse could not find is the catalog moving, not a reader
     out of step with its query.** The pull reads the catalog in one

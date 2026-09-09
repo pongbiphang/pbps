@@ -1103,7 +1103,9 @@ fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
                         .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
                         .unwrap_or(definition.len() - at);
                 if depth == 0 && definition[at..end].eq_ignore_ascii_case("on") {
-                    return qualified_name_at(definition[end..].trim_start());
+                    // Through the gap, not past the spaces: measured, `ON /*
+                    // c */ app.t` creates the trigger on `app.t`.
+                    return qualified_name_at(after_the_gap(&definition[end..]).0);
                 }
                 at = end;
                 continue;
@@ -1309,11 +1311,13 @@ fn is_a_mode(word: &str) -> bool {
 /// so `OUT` is the one mode a parameter can carry and stay out of
 /// `proargtypes`, and `VARIADIC text[]` is carried as `text[]` (ADR-0009 §1).
 fn after_the_mode(parameter: &str) -> (bool, &str) {
-    // Through the gap first: a comment is whitespace to this engine, and
-    // measured, `CREATE FUNCTION mo.c(/* note */ OUT value integer)` has the
-    // identity `mo.c()`. Left in, the mode is invisible, the parameter counts
-    // as one the identity carries, and a correctly keyed routine is refused
-    // for a count that is only wrong to this scan.
+    // Through the gap first — and through every gap after it. A comment is
+    // whitespace to this engine, and measured, `CREATE FUNCTION mo.c(/* note
+    // */ OUT value integer)`, `(value /* note */ OUT integer)`, `(OUT /* note
+    // */ value integer)` and a line comment between the name and the mode all
+    // have the identity `mo.c()`. Left in, the mode is invisible, the
+    // parameter counts as one the identity carries, and a correctly keyed
+    // routine is refused for a count that is only wrong to this scan.
     let parameter = after_the_gap(parameter).0;
     let Some(first) = one_ident_len(parameter) else {
         return (true, parameter);
@@ -1321,18 +1325,18 @@ fn after_the_mode(parameter: &str) -> (bool, &str) {
     if is_a_mode(&parameter[..first]) {
         return (
             !parameter[..first].eq_ignore_ascii_case("out"),
-            parameter[first..].trim_start(),
+            after_the_gap(&parameter[first..]).0,
         );
     }
     // `name mode type`: the name is read and thrown away, because what is left
     // is the type either way.
-    let after_name = parameter[first..].trim_start();
+    let after_name = after_the_gap(&parameter[first..]).0;
     if let Some(second) = one_ident_len(after_name)
         && is_a_mode(&after_name[..second])
     {
         return (
             !after_name[..second].eq_ignore_ascii_case("out"),
-            after_name[second..].trim_start(),
+            after_the_gap(&after_name[second..]).0,
         );
     }
     (true, parameter)
@@ -2218,6 +2222,28 @@ mod tests {
                 "app.f(integer)",
                 "(-- which one\n a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
             ),
+            // And in every gap after the first one: measured, each of these
+            // has the identity `()` — or `(integer)` for the `IN`.
+            (
+                "app.f()",
+                "(value /* note */ out integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "(out /* note */ value integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "(value out /* note */ integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "(value\n-- line comment\nout integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(in /* note */ x /* note */ int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
             (
                 "app.f(integer)",
                 "(a integer /* trailing */) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
@@ -2514,6 +2540,9 @@ mod tests {
             "AFTER INSERT ON app . t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON app /* schema */ .\n  t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON \"app\" . \"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // And the gap after `ON` itself is a gap.
+            "AFTER INSERT ON /* c */ app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON\n-- c\napp.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             // The keyword is found past a literal and a comment that both
             // contain something that looks like one.
             "AFTER INSERT -- on app.other\nON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
