@@ -5841,6 +5841,17 @@ SPEC is in sync with all of these.
     The gap after `ON` itself is one too: measured, `ON /* c */ app.t` creates
     the trigger on `app.t`, and the scan steps through it as well.
 
+    **Amended: `U&"…"` is one identifier.** Measured, `ON U&"r11".U&"\0074"`,
+    `u&"r11"."t"` and `U&"r11".U&"!0074" UESCAPE '!'` all create the trigger
+    on `r11.t`, and `U & "r11"` with a space is a syntax error. The scan read
+    `U` as the table and refused a valid declaration. A Unicode-escaped part
+    is read whole now, with its own `UESCAPE` or the default, and decoded the
+    way the engine decodes it — `\XXXX`, `\+XXXXXX`, a doubled escape, a
+    surrogate pair. A part that does not decode is one the gate cannot be
+    certain about, and it refuses only what it is certain about: the engine
+    refuses that spelling by name, and the catalog assertion after the
+    `CREATE` covers the rest.
+
 303. **A routine argument this dialect's catalogue does not know is passed
     through, not refused.** `Postgres::normalize_type` refuses an unknown
     column type, and the obvious move was to answer the same way for a
@@ -5894,6 +5905,17 @@ SPEC is in sync with all of these.
     qualifier goes the way a modifier does. And a quoted name's own parentheses
     are part of the name — `m8."odd(name)"` keeps them — so the modifier is
     found outside quotes or not at all.
+
+    **Amended: an alias the engine identifies as something else is not a
+    spelling the catalogue does not know.** Passing `varbit` through as
+    written keyed a routine the `CREATE` never made — measured, `varbit(4)`
+    is identified as `bit varying` — and `module_oid` resolved nothing. The
+    aliases the column catalogue does not carry (`varbit`, `bpchar`, `nchar`,
+    the `national …` spellings, `char varying`) are folded to the identity
+    `format_type` writes, each measured, in a table a test keeps disjoint
+    from the column catalogue so that one rule is not spelled twice. A
+    domain, an enum, a composite still pass through: the engine is still the
+    normalizer for what this table does not know.
 
 304. **A module whose deparsed statement this reader cannot cut is named and
     left out, never recorded with an empty body.** The declaration holds

@@ -1155,7 +1155,15 @@ fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
 /// with one.
 fn qualified_name_at(text: &str) -> Option<&str> {
     let mut at = one_ident_len(text)?;
-    while let Some(after_dot) = after_the_gap(&text[at..]).0.strip_prefix('.') {
+    loop {
+        // A Unicode-escaped part may carry its `UESCAPE 'x'` right after it,
+        // and that clause is part of the name.
+        if let Some(n) = uescape_len(after_the_gap(&text[at..]).0) {
+            at = text.len() - after_the_gap(&text[at..]).0.len() + n;
+        }
+        let Some(after_dot) = after_the_gap(&text[at..]).0.strip_prefix('.') else {
+            break;
+        };
         let rest = after_the_gap(after_dot).0;
         let next = one_ident_len(rest)?;
         at = text.len() - rest.len() + next;
@@ -1163,7 +1171,42 @@ fn qualified_name_at(text: &str) -> Option<&str> {
     Some(&text[..at])
 }
 
+/// The length of a `UESCAPE 'x'` clause at the front of `text`, or `None`.
+///
+/// The engine takes any single character but a quote, a hex digit, `+` or
+/// whitespace; a clause spelled otherwise is left to the engine to refuse.
+fn uescape_len(text: &str) -> Option<usize> {
+    let word = one_ident_len(text)?;
+    if !text[..word].eq_ignore_ascii_case("uescape") {
+        return None;
+    }
+    let rest = after_the_gap(&text[word..]).0;
+    let mut chars = rest.chars();
+    let (Some('\''), Some(escape), Some('\'')) = (chars.next(), chars.next(), chars.next()) else {
+        return None;
+    };
+    if escape == '\'' || escape == '+' || escape.is_ascii_hexdigit() || escape.is_whitespace() {
+        return None;
+    }
+    Some(text.len() - rest.len() + 2 + escape.len_utf8())
+}
+
+/// The `"…"` a Unicode-escaped identifier `U&"…"` wraps, or `None` where
+/// `text` does not start with one. The prefix is glued to the quote: measured,
+/// `U & "r11"` is a syntax error, `U&"r11".U&"\0074"`, `u&"r11"."t"` and
+/// `U&"r11".U&"!0074" UESCAPE '!'` all create the trigger on `r11.t`.
+fn unicode_quoted(text: &str) -> Option<&str> {
+    (text.len() > 2
+        && text.is_char_boundary(2)
+        && text[..2].eq_ignore_ascii_case("u&")
+        && text[2..].starts_with('"'))
+    .then(|| &text[2..])
+}
+
 fn one_ident_len(text: &str) -> Option<usize> {
+    if let Some(quoted) = unicode_quoted(text) {
+        return one_ident_len(quoted).map(|n| n + 2);
+    }
     if !text.starts_with('"') {
         let end = text
             .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
@@ -1201,10 +1244,29 @@ fn names_the_same_table(named: &str, on: &TableName) -> bool {
             Some(len) => len,
             None => return false,
         };
-        parts.push(unquoted(&rest[..len]));
+        let part = &rest[..len];
+        rest = after_the_gap(&rest[len..]).0;
+        // A Unicode-escaped part reads with its own `UESCAPE`, or the default.
+        let escape = match uescape_len(rest) {
+            Some(n) => {
+                // The clause is `UESCAPE 'x'`: the character before the
+                // closing quote.
+                let escape = rest[..n].chars().rev().nth(1).unwrap_or('\\');
+                rest = after_the_gap(&rest[n..]).0;
+                escape
+            }
+            None => '\\',
+        };
+        // A part this reader cannot decode is one it cannot be certain about,
+        // and the gate refuses only what it is certain about: the catalog
+        // assertion after the `CREATE` stands behind the rest.
+        let Some(part) = unquoted(part, escape) else {
+            return true;
+        };
+        parts.push(part);
         // The same gap `qualified_name_at` stepped through: it is inside the
         // slice that scan returned, so this reader of it steps through it too.
-        match after_the_gap(&rest[len..]).0.strip_prefix('.') {
+        match rest.strip_prefix('.') {
             Some(after) => rest = after_the_gap(after).0,
             None => break,
         }
@@ -1216,14 +1278,77 @@ fn names_the_same_table(named: &str, on: &TableName) -> bool {
     }
 }
 
-fn unquoted(ident: &str) -> String {
-    ident
-        .strip_prefix('"')
-        .and_then(|i| i.strip_suffix('"'))
-        .map_or_else(
-            || ident.to_ascii_lowercase(),
-            |inner| inner.replace("\"\"", "\""),
-        )
+/// The name an identifier spells: an unquoted one folded the way this engine
+/// folds it, a quoted one as written, a Unicode-escaped one decoded with its
+/// escape character. `None` where an escape does not decode — a lone
+/// surrogate, a digit that is not hex — which the engine refuses by name.
+fn unquoted(ident: &str, escape: char) -> Option<String> {
+    if let Some(quoted) = unicode_quoted(ident) {
+        let inner = quoted
+            .strip_prefix('"')?
+            .strip_suffix('"')?
+            .replace("\"\"", "\"");
+        return decode_unicode_escapes(&inner, escape);
+    }
+    Some(
+        ident
+            .strip_prefix('"')
+            .and_then(|i| i.strip_suffix('"'))
+            .map_or_else(
+                || ident.to_ascii_lowercase(),
+                |inner| inner.replace("\"\"", "\""),
+            ),
+    )
+}
+
+/// `\XXXX` and `\+XXXXXX` to the code point they name, a doubled escape to
+/// itself, and a surrogate pair to the one character it encodes — the rules
+/// the engine reads `U&"…"` by.
+fn decode_unicode_escapes(inner: &str, escape: char) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    let mut high: Option<u32> = None;
+    while let Some(c) = chars.next() {
+        if c != escape {
+            if high.is_some() {
+                return None;
+            }
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&escape) {
+            chars.next();
+            if high.is_some() {
+                return None;
+            }
+            out.push(escape);
+            continue;
+        }
+        let digits = if chars.peek() == Some(&'+') {
+            chars.next();
+            6
+        } else {
+            4
+        };
+        let mut code = 0u32;
+        for _ in 0..digits {
+            code = code * 16 + chars.next()?.to_digit(16)?;
+        }
+        match (high.take(), code) {
+            (None, 0xD800..=0xDBFF) => high = Some(code),
+            (Some(h), 0xDC00..=0xDFFF) => {
+                out.push(char::from_u32(
+                    0x10000 + ((h - 0xD800) << 10) + (code - 0xDC00),
+                )?);
+            }
+            (None, code) => out.push(char::from_u32(code)?),
+            (Some(_), _) => return None,
+        }
+    }
+    if high.is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 /// The parameter list at the front of a routine's definition, without its
@@ -2506,6 +2631,42 @@ mod tests {
     /// requires, and the engine accepts a disagreement between them: a trigger
     /// created on another table sits under this key until a `DROP` a plan
     /// later cannot find it.
+    /// The escapes the engine reads a `U&"…"` identifier by, and the ones it
+    /// refuses — which this reader does not decide, so that a name it cannot
+    /// read is left to the engine rather than compared wrongly.
+    #[test]
+    fn a_unicode_escaped_identifier_decodes_the_way_the_engine_reads_it() {
+        for (written, name) in [
+            ("U&\"d\\0061t\\+000061\"", "data"),
+            ("U&\"a\\\\b\"", "a\\b"),
+            ("U&\"\\D83D\\DE00\"", "😀"),
+            ("u&\"a\"\"b\"", "a\"b"),
+            ("U&\"Ätype\"", "Ätype"),
+        ] {
+            assert_eq!(unquoted(written, '\\').as_deref(), Some(name), "{written}");
+        }
+        assert_eq!(unquoted("U&\"!0074\"", '!').as_deref(), Some("t"));
+        for malformed in [
+            "U&\"\\00G1\"",
+            "U&\"\\D83D\"",
+            "U&\"\\DE00\"",
+            "U&\"\\D83Dx\"",
+        ] {
+            assert_eq!(unquoted(malformed, '\\'), None, "{malformed}");
+        }
+        assert_eq!(uescape_len("UESCAPE '!' FOR"), Some(11));
+        assert_eq!(uescape_len("uescape  '!'"), Some(12));
+        for not_one in [
+            "UESCAPE '+'",
+            "UESCAPE 'a'",
+            "UESCAPE ''",
+            "UESCAPED '!'",
+            "ON app.t",
+        ] {
+            assert_eq!(uescape_len(not_one), None, "{not_one}");
+        }
+    }
+
     #[test]
     fn a_trigger_whose_body_names_another_table_is_refused_offline() {
         // What decides the outcome is the name after `ON`, and nothing else.
@@ -2519,6 +2680,8 @@ mod tests {
             "AFTER INSERT ON elsewhere.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             // Trivia around the dot changes nothing about which table it is.
             "AFTER INSERT ON app . other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // Nor does spelling the other table with Unicode escapes.
+            "AFTER INSERT ON U&\"app\".U&\"\\006Fther\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
         ] {
             let found = Postgres::new()
                 .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body));
@@ -2573,6 +2736,14 @@ mod tests {
             // And the gap after `ON` itself is a gap.
             "AFTER INSERT ON /* c */ app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON\n-- c\napp.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // A Unicode-escaped identifier is one identifier, read with its
+            // escape: measured, each of these lands on `app.t`.
+            "AFTER INSERT ON U&\"app\".U&\"\\0074\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON u&\"app\".\"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON U&\"app\".U&\"!0074\" UESCAPE '!' FOR EACH ROW EXECUTE FUNCTION \
+             app.trf()",
+            "AFTER INSERT ON U&\"\\0061pp\" UESCAPE '\\'.U&\"\\+000074\" FOR EACH ROW EXECUTE \
+             FUNCTION app.trf()",
             // The keyword is found past a literal and a comment that both
             // contain something that looks like one.
             "AFTER INSERT -- on app.other\nON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",

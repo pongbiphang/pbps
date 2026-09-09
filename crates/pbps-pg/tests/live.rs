@@ -7049,6 +7049,17 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "bit(3)",
         "interval hour to minute",
         "text[][]",
+        // Aliases the engine identifies as something else and the column
+        // catalogue does not carry.
+        "varbit(4)",
+        "bpchar(3)",
+        "nchar(2)",
+        "national character",
+        "national char",
+        "char varying(5)",
+        "nchar varying(5)",
+        "national character varying(5)",
+        "national char varying(5)",
         // The standard's spelling of an array, with and without a dimension,
         // and with the space the grammar allows before the bracket.
         "text ARRAY",
@@ -7272,6 +7283,10 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
         "AFTER INSERT ON \"$S\" . \"t\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
         "AFTER INSERT ON /* c */ $S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
         "AFTER INSERT ON\n-- c\n$S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        // A Unicode-escaped identifier, with the default escape and its own.
+        "AFTER INSERT ON U&\"$S\".U&\"\\0074\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON u&\"$S\".\"t\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON U&\"$S\".U&\"!0074\" UESCAPE '!' FOR EACH ROW EXECUTE FUNCTION $S.trf()",
     ] {
         let m = on_table(body);
         assert!(

@@ -1120,8 +1120,37 @@ fn identity_element(element: &str) -> String {
     {
         return "interval".to_owned();
     }
+    if let Some((_, identity)) = ROUTINE_ALIASES.iter().find(|(alias, _)| *alias == bare) {
+        return (*identity).to_owned();
+    }
     bare
 }
+
+/// Spellings the engine accepts for a routine argument and identifies as
+/// something else, that the column catalogue does not carry.
+///
+/// The catalogue is closed on purpose (ADR-0011): a column of `varbit` is a
+/// column this model does not hold. A routine argument is a wider language
+/// (DECISIONS 301), and a spelling the catalogue does not know is passed
+/// through as written (303) — which is right for a domain, and wrong for an
+/// alias: **measured**, `varbit(4)` is identified as `bit varying`, so a
+/// declaration keyed `f(varbit)` named a routine the `CREATE` never made, and
+/// `module_oid` resolved nothing. Every row was measured through
+/// `format_type`; the live suite keys a routine with each and asks the catalog.
+///
+/// Pinned to the catalogue by `a_routine_alias_is_one_the_column_catalogue_lacks`:
+/// a row the catalogue folds already is a second spelling of one rule.
+const ROUTINE_ALIASES: &[(&str, &str)] = &[
+    ("varbit", "bit varying"),
+    ("bpchar", "character"),
+    ("nchar", "character"),
+    ("national character", "character"),
+    ("national char", "character"),
+    ("char varying", "character varying"),
+    ("nchar varying", "character varying"),
+    ("national character varying", "character varying"),
+    ("national char varying", "character varying"),
+];
 
 fn folded(text: &str) -> Option<ColumnType> {
     normalize(&text.parse::<ColumnType>().ok()?).ok()
@@ -1225,6 +1254,14 @@ mod tests {
             ("bit varying(4)", "bit varying"),
             ("bit(3)", "bit"),
             ("m2.money(2)", "m2.money"),
+            // Aliases the engine identifies as something else and the column
+            // catalogue does not carry: measured through `format_type`.
+            ("varbit", "bit varying"),
+            ("varbit(4)", "bit varying"),
+            ("bpchar(3)", "character"),
+            ("nchar(2)", "character"),
+            ("national character varying(5)", "character varying"),
+            ("char varying(5)", "character varying"),
             // The one type this grammar follows with words rather than a
             // parenthesis. Measured: `interval hour to minute` is identified
             // as `interval`.
@@ -1232,6 +1269,21 @@ mod tests {
             ("interval second(3)", "interval"),
         ] {
             assert_eq!(arg(declared), identity, "{declared}");
+        }
+    }
+
+    /// A row the column catalogue folds already is one rule spelled twice,
+    /// and the second spelling is the one that drifts.
+    #[test]
+    fn a_routine_alias_is_one_the_column_catalogue_lacks() {
+        for (alias, identity) in ROUTINE_ALIASES {
+            assert!(
+                folded(alias).is_none(),
+                "`{alias}` is in the column catalogue already"
+            );
+            assert_eq!(arg(alias), *identity, "{alias}");
+            // And the identity is the engine's spelling, not another alias.
+            assert_eq!(arg(identity), *identity, "{identity}");
         }
     }
 
