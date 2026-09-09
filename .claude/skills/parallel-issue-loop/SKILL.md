@@ -116,11 +116,15 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   every shared change. If stacking cannot represent the dependency safely, pause
   that downstream issue and decide yourself; workers must not invent an
   integration branch or copy unreviewed changes between worktrees.
-- Merge in topological order. After an upstream merge, rebase or retarget each
-  downstream branch onto the updated base and rerun the required tests. A
-  conflict-free rebase requires CI again on the new remote head; a rebase that
-  needs conflict resolution follows the resulting-head code-review gate in the
-  review reference. Do not automatically repeat the draft or ready streak.
+- Merge in topological order. After an upstream merge, **rebase** each
+  downstream branch onto the updated `master`, push with
+  `--force-with-lease`, and rerun the required tests. Retargeting the PR base
+  is not an alternative: it leaves the downstream head untested against the new
+  base, and because `ci-gate` is a commit status on that head, the stale green
+  from before the upstream merge survives the retarget. A conflict-free rebase
+  requires CI again on the new remote head; a rebase that needs conflict
+  resolution follows the resulting-head code-review gate in the review
+  reference. Do not automatically repeat the draft or ready streak.
 - Never merge a downstream PR while its required upstream issue is unmerged.
   Related issues without a true prerequisite may merge independently.
 
