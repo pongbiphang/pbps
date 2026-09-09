@@ -5681,3 +5681,19 @@ SPEC is in sync with all of these.
     sources are first converted to their corresponding max type for the length
     count; the round-trip comparison likewise converts `ntext` before using
     the comparison operator.
+
+300. **The PostgreSQL datum scanner recognizes national-character literals even
+    where the current caller would reject them later.** `N'…'` is one string
+    literal to the lexer, and a parenthesis inside it is data. Leaving that
+    opener out of `skip_datum` therefore makes the grouping scan treat data as
+    syntax; leaving it out of `is_a_bare_literal` makes the two views of the
+    same token disagree.
+
+    Measured on PostgreSQL 18.6, a bare `N'01/02/2026'` default on a `date`
+    column is rejected because the literal is typed `character` and there is
+    no assignment cast. The unresolved-default guard now refuses it earlier
+    with its own actionable `DateStyle` diagnostic. That earlier refusal is
+    not the reason for recognizing the token: the scanner records lexical
+    structure, independent of which types or callers happen to accept the
+    expression today. Both upper- and lower-case openers are accepted, and
+    neither gives backslashes escape semantics.

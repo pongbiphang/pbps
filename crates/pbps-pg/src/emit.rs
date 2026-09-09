@@ -212,6 +212,8 @@ fn skip_datum(rest: &str) -> Option<usize> {
         ("e'", true),
         ("U&'", false),
         ("u&'", false),
+        ("N'", false),
+        ("n'", false),
         ("'", false),
     ] {
         if let Some(after) = rest.strip_prefix(opener) {
@@ -262,6 +264,8 @@ fn is_a_bare_literal(expression: &str) -> bool {
     let (escapes, rest) = if let Some(r) = e.strip_prefix("E'").or_else(|| e.strip_prefix("e'")) {
         (true, r)
     } else if let Some(r) = e.strip_prefix("U&'").or_else(|| e.strip_prefix("u&'")) {
+        (false, r)
+    } else if let Some(r) = e.strip_prefix("N'").or_else(|| e.strip_prefix("n'")) {
         (false, r)
     } else if let Some(r) = e.strip_prefix('\'') {
         (false, r)
@@ -1644,10 +1648,13 @@ mod tests {
             "  '2026-01-02'  ",
             "''",
             "'it''s'",
-            // The three other spellings of one literal, each of which a rule
+            // The other spellings of one literal, each of which a rule
             // about `'…'` alone would have let through on a `date`.
             r"E'2026-01-02'",
             r"e'it\'s'",
+            "N'2026-01-02'",
+            "n'2026-01-02'",
+            "(N') ')",
             "$$2026-01-02$$",
             "$d$2026-01-02$d$",
             // A tag the engine's byte grammar accepts and Unicode's letter
