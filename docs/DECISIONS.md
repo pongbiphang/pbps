@@ -3942,6 +3942,15 @@ SPEC is in sync with all of these.
     dropped, however long the run. The tests ask `scannable` directly rather
     than going through `references`, because the bare-name fallback matches a
     half-closed gap too and would hide the difference.
+
+    **Amended: a bracket between two words leaves a space behind.** On
+    PostgreSQL `[` is a subscript and `ARRAY[` an array constructor, not a
+    quote — measured, `CREATE VIEW ao.a AS SELECT (ARRAY[ao.z()])[1]` is
+    refused until `ao.z()` exists. Dropped as a quote, the bracket glued
+    `ARRAY[ao.z` into `arrayao.z`, the needle found no word boundary, no edge
+    ordered the function first, and the plan's `CREATE VIEW` failed. The
+    space is put only where two identifier characters would otherwise touch,
+    so `[dbo].[v]` still folds to `dbo.v`.
 240. **The PostgreSQL catalogue is closed, and every bound in it is the
     engine's own — including the two the engine does not enforce.** A name the
     table does not hold is refused, never passed through. Passed through, a

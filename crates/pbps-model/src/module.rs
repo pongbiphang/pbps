@@ -1051,7 +1051,33 @@ fn folded(s: &str) -> String {
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 fn scannable(definition: &str, case: Case) -> String {
     let lowered = cased(&code_only(definition), case);
-    let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
+    // A quoting character goes; a bracket that stood between two identifier
+    // characters leaves a space behind. On PostgreSQL `[` is a subscript and
+    // `ARRAY[` an array constructor, not a quote — measured, a view over
+    // `(ARRAY[app.z()])[1]` is refused until `app.z()` exists — and dropping
+    // the bracket outright glued `ARRAY[app.z` into `arrayapp.z`, where no word
+    // boundary was left for the needle to match. The space is only put where
+    // the glue would form, so `[dbo].[v]` still folds to `dbo.v` (239).
+    let mut unquoted = String::with_capacity(lowered.len());
+    for (i, ch) in lowered.char_indices() {
+        match ch {
+            '"' | '`' => {}
+            '[' | ']' => {
+                let glued = unquoted
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_regular_identifier_continue)
+                    && lowered[i + ch.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| is_regular_identifier_continue(c) || c == '.');
+                if glued {
+                    unquoted.push(' ');
+                }
+            }
+            _ => unquoted.push(ch),
+        }
+    }
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
         if ch.is_whitespace() {
@@ -1430,6 +1456,34 @@ mod tests {
         assert_eq!(
             creation_order(&m, &ModuleDeps::default()),
             vec![id("dbo.base"), id("dbo.middle"), id("dbo.top")]
+        );
+    }
+
+    /// A bracket is a subscript or an array constructor on PostgreSQL, and
+    /// dropping it as a quote glued `ARRAY[app.z` into one word — measured,
+    /// the view is refused until the function exists, and the scan saw no
+    /// edge to put the function first.
+    #[test]
+    fn a_bracket_between_two_words_keeps_them_apart() {
+        assert_eq!(
+            scannable("SELECT (ARRAY[app.z()])[1] AS v", Case::Folded),
+            "select (array app.z())1 as v"
+        );
+        assert!(references("SELECT (ARRAY[app.z()])[1]", &n("app.z")));
+        assert!(references("SELECT x[app.z()]", &n("app.z")));
+        // And where nothing would be glued, nothing is added: the quoted
+        // spellings fold to the same string they always did.
+        assert_eq!(
+            scannable("SELECT * FROM [dbo].[active_customer]", Case::Folded),
+            "select * from dbo.active_customer"
+        );
+        let m = modules(&[
+            ("app.a", "SELECT (ARRAY[app.z()])[1] AS v"),
+            ("app.z()", "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.z()"), id("app.a")]
         );
     }
 

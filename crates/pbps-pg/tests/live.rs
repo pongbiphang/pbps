@@ -7716,3 +7716,60 @@ async fn a_bodys_trailing_non_ascii_byte_reaches_the_engine() {
         "the byte the declaration ends with is the byte the engine read"
     );
 }
+
+/// A plan that creates a routine and a view over `ARRAY[routine()]` creates
+/// the routine first.
+///
+/// **Measured**: `CREATE VIEW ao.a AS SELECT (ARRAY[ao.z()])[1]` is refused
+/// with `function ao.z() does not exist` until the function is there. The
+/// dependency scan is the one that orders the two, and it read `[` as the
+/// quote it is on the other engine — dropped it, glued `ARRAY[ao.z` into one
+/// word, and saw no edge (DECISIONS 239).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
+    let s = emit_schema("array_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.a").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT (ARRAY[{s}.z()])[1] AS v"),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.z()").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.z()"), format!("{s}.a")],
+        "the routine the view's array holds comes first"
+    );
+    // And the engine agrees with the order: the plan applies as written.
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT v::text FROM {s}.a")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &s).await;
+}
