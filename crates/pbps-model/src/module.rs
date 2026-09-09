@@ -131,6 +131,9 @@ impl FromStr for RoutineArg {
         if t.is_empty() {
             return Err(RoutineArgError::Empty);
         }
+        // A Unicode-escaped identifier first, so that the pass below sees the
+        // plain quoted name it spells and nothing else has to know the form.
+        let t = &*without_unicode_escapes(t)?;
         // Structure and canonical form in one pass, because the second needs
         // the first: whether a character is punctuation to fold around, or a
         // byte of a quoted name to leave alone, is what the quote state says.
@@ -221,6 +224,139 @@ impl FromStr for RoutineArg {
 
 fn shape(s: &str) -> RoutineArgError {
     RoutineArgError::Shape(s.to_owned())
+}
+
+/// Every `U&"…"` outside a quoted region, with or without its `UESCAPE 'x'`,
+/// rewritten as the plain quoted identifier it spells.
+///
+/// PostgreSQL accepts the form wherever an identifier goes, a routine's
+/// argument type included: **measured**, `CREATE FUNCTION r12.a(v
+/// r12.U&"\006doney")` has the identity `r12.a(r12.money)`, and with
+/// `UESCAPE '!'` the escape character is the one given. Canonicalized here to
+/// the quoted form rather than carried, so that one spelling of a name is one
+/// key. A form that does not decode is refused as text that is not one
+/// argument, which is what the engine says of it too.
+fn without_unicode_escapes(t: &str) -> Result<std::borrow::Cow<'_, str>, RoutineArgError> {
+    if !t.contains("&\"") {
+        return Ok(std::borrow::Cow::Borrowed(t));
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while !rest.is_empty() {
+        if rest.starts_with('"') {
+            let end = quoted_end(rest).ok_or_else(|| shape(t))?;
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        let opens = rest.len() > 2
+            && rest.is_char_boundary(2)
+            && rest[..2].eq_ignore_ascii_case("u&")
+            && rest[2..].starts_with('"')
+            && !out
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !opens {
+            let c = rest.chars().next().expect("not empty");
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let end = quoted_end(&rest[2..]).ok_or_else(|| shape(t))? + 2;
+        let inner = rest[3..end - 1].replace("\"\"", "\"");
+        rest = &rest[end..];
+        let mut escape = '\\';
+        // `UESCAPE 'x'`, after ASCII whitespace: the engine's whitespace.
+        let after = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if after.len() > 7
+            && after.is_char_boundary(7)
+            && after[..7].eq_ignore_ascii_case("uescape")
+        {
+            let clause = after[7..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let mut chars = clause.chars();
+            match (chars.next(), chars.next(), chars.next()) {
+                (Some('\''), Some(e), Some('\''))
+                    if e != '\'' && e != '+' && !e.is_ascii_hexdigit() && !e.is_whitespace() =>
+                {
+                    escape = e;
+                    rest = &clause[2 + e.len_utf8()..];
+                }
+                _ => return Err(shape(t)),
+            }
+        }
+        let decoded = decode_unicode_escapes(&inner, escape).ok_or_else(|| shape(t))?;
+        out.push('"');
+        out.push_str(&decoded.replace('"', "\"\""));
+        out.push('"');
+    }
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// The end of the `"…"` at the front of `text`, a doubled quote being a quote
+/// inside the name.
+fn quoted_end(text: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// `\XXXX` and `\+XXXXXX` to the code point they name, a doubled escape to
+/// itself, and a surrogate pair to the one character it encodes — the rules
+/// PostgreSQL reads `U&"…"` by. `None` where the text does not decode: a
+/// digit that is not hex, a lone surrogate.
+pub fn decode_unicode_escapes(inner: &str, escape: char) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    let mut high: Option<u32> = None;
+    while let Some(c) = chars.next() {
+        if c != escape {
+            if high.is_some() {
+                return None;
+            }
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&escape) {
+            chars.next();
+            if high.is_some() {
+                return None;
+            }
+            out.push(escape);
+            continue;
+        }
+        let digits = if chars.peek() == Some(&'+') {
+            chars.next();
+            6
+        } else {
+            4
+        };
+        let mut code = 0u32;
+        for _ in 0..digits {
+            code = code * 16 + chars.next()?.to_digit(16)?;
+        }
+        match (high.take(), code) {
+            (None, 0xD800..=0xDBFF) => high = Some(code),
+            (Some(h), 0xDC00..=0xDFFF) => {
+                out.push(char::from_u32(
+                    0x10000 + ((h - 0xD800) << 10) + (code - 0xDC00),
+                )?);
+            }
+            (None, code) => out.push(char::from_u32(code)?),
+            (Some(_), _) => return None,
+        }
+    }
+    if high.is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 impl fmt::Display for RoutineArg {
@@ -1888,6 +2024,18 @@ mod tests {
             // to the engine — measured, `r8.a\u{a0}b` is a type and `r8.a b`
             // is not — so it is neither folded to a space nor trimmed away.
             ("r8.a\u{a0}b", "r8.a\u{a0}b"),
+            // A Unicode-escaped identifier is the plain quoted name it spells,
+            // decoded with its own escape or the default. Measured:
+            // `r12.U&"\006doney"` is identified as `r12.money`.
+            ("app.U&\"\\006doney\"", "app.\"money\""),
+            ("app.u&\"M!00f6ney\" UESCAPE '!'", "app.\"Möney\""),
+            ("U&\"\\0061pp\".t", "\"app\".t"),
+            ("U&\"d\\0061t\\+000061\"[]", "\"data\"[]"),
+            ("U&\"\\D83D\\DE00\"", "\"😀\""),
+            ("U&\"a\"\"b\"", "\"a\"\"b\""),
+            // Inside a quoted name it is text, and after a name byte `U&` is
+            // not the prefix.
+            ("\"U&\"\"x\"\"\"", "\"U&\"\"x\"\"\""),
             ("  r8.a\u{2003}b  ", "r8.a\u{2003}b"),
             ("\u{a0}r8.x\u{a0}", "\u{a0}r8.x\u{a0}"),
             ("r8.→", "r8.→"),
@@ -1919,6 +2067,18 @@ mod tests {
     /// back out of one is refused rather than stored.
     #[test]
     fn text_that_is_not_one_argument_is_refused() {
+        // A Unicode-escaped identifier that does not decode, or a `UESCAPE`
+        // the engine would refuse: not one argument either.
+        for malformed in [
+            "U&\"\\00G1\"",
+            "U&\"\\D83D\"",
+            "U&\"\\DE00\"",
+            "U&\"!0074\" UESCAPE '+'",
+            "U&\"!0074\" UESCAPE ''",
+            "U&\"\\0074",
+        ] {
+            assert!(malformed.parse::<RoutineArg>().is_err(), "{malformed}");
+        }
         for bad in [
             "",
             "   ",

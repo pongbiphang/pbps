@@ -6868,6 +6868,16 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
             "%S%.my_type",
             "(a %S%.my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
         ),
+        // A Unicode-escaped identifier, in the key and in the body: measured,
+        // `r12.U&"\006doney"` is identified as `r12.money`.
+        (
+            "%S%.U&\"\\006dy_type\"",
+            "(a %S%.U&\"\\006dy_type\") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "%S%.my_type",
+            "(a %S%.u&\"!006dy_type\" UESCAPE '!') RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
         // A non-breaking space is the last byte of the type's name, before
         // the comma and before a default alike — measured, the identity keeps
         // it and quotes the name.
@@ -7036,6 +7046,11 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     conn.execute(&format!("CREATE DOMAIN {s}.money_amount AS numeric(10, 2)"))
         .await
         .expect("a domain");
+    for keyword in ["select", "zone"] {
+        conn.execute(&format!("CREATE TYPE {s}.\"{keyword}\" AS ENUM ('a')"))
+            .await
+            .expect("a type named by a keyword");
+    }
 
     // Left: what a declaration may reasonably say. Right: nothing — the key is
     // asserted against the catalog, not against a second copy of this list.
@@ -7049,6 +7064,10 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "bit(3)",
         "interval hour to minute",
         "text[][]",
+        // A built-in written with its schema is the built-in.
+        "pg_catalog.int4",
+        "pg_catalog.varbit(4)",
+        "pg_catalog.timestamptz(3)",
         // Aliases the engine identifies as something else and the column
         // catalogue does not carry.
         "varbit(4)",
@@ -7072,6 +7091,16 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         // writes one back. Unfolded, the declared key and the catalog key are
         // two keys for one routine, and every plan drops and creates it again.
         format!("{s} . money_amount").as_str(),
+        // A quoted name is bare where the engine's `quote_identifier` leaves
+        // it bare — a plain name, an unreserved keyword — and quoted where it
+        // does not; and a Unicode-escaped name is the name it spells.
+        format!("{s}.\"money_amount\"").as_str(),
+        format!("\"{s}\".\"money_amount\"").as_str(),
+        format!("{s}.\"zone\"").as_str(),
+        format!("{s}.\"select\"").as_str(),
+        format!("{s}.U&\"\\006doney_amount\"").as_str(),
+        format!("{s}.u&\"!006doney_amount\" UESCAPE '!'").as_str(),
+        format!("U&\"{s}\".U&\"\\0073elect\"").as_str(),
     ]
     .map(str::to_owned);
 

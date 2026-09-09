@@ -1288,7 +1288,8 @@ fn unquoted(ident: &str, escape: char) -> Option<String> {
             .strip_prefix('"')?
             .strip_suffix('"')?
             .replace("\"\"", "\"");
-        return decode_unicode_escapes(&inner, escape);
+        // The model's decoder: the one `RoutineArg` canonicalizes a key by (313).
+        return pbps_model::module::decode_unicode_escapes(&inner, escape);
     }
     Some(
         ident
@@ -1299,56 +1300,6 @@ fn unquoted(ident: &str, escape: char) -> Option<String> {
                 |inner| inner.replace("\"\"", "\""),
             ),
     )
-}
-
-/// `\XXXX` and `\+XXXXXX` to the code point they name, a doubled escape to
-/// itself, and a surrogate pair to the one character it encodes — the rules
-/// the engine reads `U&"…"` by.
-fn decode_unicode_escapes(inner: &str, escape: char) -> Option<String> {
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
-    let mut high: Option<u32> = None;
-    while let Some(c) = chars.next() {
-        if c != escape {
-            if high.is_some() {
-                return None;
-            }
-            out.push(c);
-            continue;
-        }
-        if chars.peek() == Some(&escape) {
-            chars.next();
-            if high.is_some() {
-                return None;
-            }
-            out.push(escape);
-            continue;
-        }
-        let digits = if chars.peek() == Some(&'+') {
-            chars.next();
-            6
-        } else {
-            4
-        };
-        let mut code = 0u32;
-        for _ in 0..digits {
-            code = code * 16 + chars.next()?.to_digit(16)?;
-        }
-        match (high.take(), code) {
-            (None, 0xD800..=0xDBFF) => high = Some(code),
-            (Some(h), 0xDC00..=0xDFFF) => {
-                out.push(char::from_u32(
-                    0x10000 + ((h - 0xD800) << 10) + (code - 0xDC00),
-                )?);
-            }
-            (None, code) => out.push(char::from_u32(code)?),
-            (Some(_), _) => return None,
-        }
-    }
-    if high.is_some() {
-        return None;
-    }
-    Some(out)
 }
 
 /// The parameter list at the front of a routine's definition, without its

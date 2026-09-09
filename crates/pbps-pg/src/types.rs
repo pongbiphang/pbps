@@ -1104,6 +1104,14 @@ fn ascii_trim_start(text: &str) -> &str {
 ///    ever — the cry-wolf loop ADR-0002 names as the failure to avoid, which
 ///    is a different and worse thing from DECISIONS 303's one loud mismatch.
 fn identity_element(element: &str) -> String {
+    // A built-in written with its schema is the built-in: **measured**,
+    // `pg_catalog.int4`, `PG_CATALOG.INT4`, `"pg_catalog".int4` and
+    // `pg_catalog."int4"` are all identified as `integer`, and
+    // `pg_catalog.varbit` as `bit varying` — the qualifier is dropped before
+    // the name is folded, so a routine declared with any of them is keyed on
+    // the identity `format_type` writes.
+    let element = as_the_engine_spells(element);
+    let element = element.strip_prefix("pg_catalog.").unwrap_or(&element);
     if let Some(folded) = folded(element) {
         return folded.base;
     }
@@ -1125,6 +1133,252 @@ fn identity_element(element: &str) -> String {
     }
     bare
 }
+
+/// A quoted name spelled the way the engine spells it in an identity: bare
+/// where its `quote_identifier` leaves it bare, quoted everywhere else.
+///
+/// **Measured**, `zq."my_type"`, `"zq"."my_type"` and `zq."zone"` are
+/// identified as `zq.my_type` and `zq.zone`, while `zq."select"`, `zq."int"`,
+/// `zq."user"`, `zq."Order"`, `zq."möney"`, `zq."a$b"` and `zq."my""q"` keep
+/// their quotes: the engine writes a name bare only when it is
+/// `[a-z_][a-z0-9_]*` and not a keyword the grammar reserves in some
+/// position. A quoted spelling of a plain name is therefore a second spelling
+/// of the bare one — and a Unicode-escaped name (DECISIONS 313) is decoded to
+/// the quoted form by the model, so without this step `U&"\006dy_type"` was a
+/// key for a routine the catalog spells `my_type`.
+fn as_the_engine_spells(element: &str) -> String {
+    let mut out = String::with_capacity(element.len());
+    let mut rest = element;
+    while !rest.is_empty() {
+        if !rest.starts_with('"') {
+            let len = rest.find('"').unwrap_or(rest.len());
+            out.push_str(&rest[..len]);
+            rest = &rest[len..];
+            continue;
+        }
+        let Some(end) = quoted_len(rest) else {
+            out.push_str(rest);
+            break;
+        };
+        let inner = rest[1..end - 1].replace("\"\"", "\"");
+        if bare_to_the_engine(&inner) {
+            out.push_str(&inner);
+        } else {
+            out.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// The length of the `"…"` at the front of `text`, a doubled quote being a
+/// quote inside the name; `None` where it never closes.
+fn quoted_len(text: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// Whether the engine writes this name without quotes: `quote_identifier`'s
+/// rule, which is the character class above and the keyword table below.
+fn bare_to_the_engine(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && QUOTED_KEYWORDS.binary_search(&name).is_err()
+}
+
+/// Every keyword the engine quotes when it is used as a name: the reserved,
+/// type-or-function-name and column-name categories, which are the ones
+/// `quote_identifier` does not let stand bare. The unreserved category is
+/// left out because the engine leaves it out — measured, `zq."zone"` is
+/// `zq.zone`.
+///
+/// Read from the engine, not from memory, and kept sorted for the search:
+///
+/// ```sql
+/// SELECT word FROM pg_get_keywords() WHERE catcode <> 'U' ORDER BY word
+/// ```
+///
+/// PostgreSQL 18.6, 164 rows. A keyword a later engine adds is a name this
+/// table lets stand bare, which the catalog assertion after the `CREATE`
+/// (ADR-0009 §3) reports as a routine not found under its key — loud, not
+/// silent.
+const QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
 
 /// Spellings the engine accepts for a routine argument and identifies as
 /// something else, that the column catalogue does not carry.
@@ -1258,6 +1512,30 @@ mod tests {
             // catalogue does not carry: measured through `format_type`.
             ("varbit", "bit varying"),
             ("varbit(4)", "bit varying"),
+            // A built-in written with its schema is the built-in, measured.
+            ("pg_catalog.int4", "integer"),
+            ("pg_catalog.text", "text"),
+            ("pg_catalog.varbit", "bit varying"),
+            ("pg_catalog.name", "name"),
+            ("\"pg_catalog\".int4", "integer"),
+            ("pg_catalog.\"int4\"", "integer"),
+            ("pg_catalog.timestamptz(3)", "timestamp with time zone"),
+            // A quoted name is bare where the engine's `quote_identifier`
+            // leaves it bare, and quoted where it does not — measured.
+            ("zq.\"my_type\"", "zq.my_type"),
+            ("\"zq\".\"my_type\"", "zq.my_type"),
+            ("zq.\"zone\"", "zq.zone"),
+            ("zq.\"my_type\"[]", "zq.my_type[]"),
+            ("\"int4\"", "integer"),
+            ("zq.\"select\"", "zq.\"select\""),
+            ("zq.\"int\"", "zq.\"int\""),
+            ("zq.\"user\"", "zq.\"user\""),
+            ("zq.\"Order\"", "zq.\"Order\""),
+            ("zq.\"möney\"", "zq.\"möney\""),
+            ("zq.\"a$b\"", "zq.\"a$b\""),
+            ("zq.\"my\"\"q\"", "zq.\"my\"\"q\""),
+            ("zq.\"1a\"", "zq.\"1a\""),
+            ("zq.\"a b\"", "zq.\"a b\""),
             ("bpchar(3)", "character"),
             ("nchar(2)", "character"),
             ("national character varying(5)", "character varying"),

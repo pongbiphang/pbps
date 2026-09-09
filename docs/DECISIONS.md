@@ -5772,6 +5772,23 @@ SPEC is in sync with all of these.
     `text[]`, and the routine the `CREATE` had just made was not found under
     its own key — a valid plan refused.
 
+    **Amended: a Unicode-escaped identifier is the plain quoted name it
+    spells.** The engine accepts `U&"…"` wherever an identifier goes, a
+    routine's argument type included — measured, `r12.a(v r12.U&"\006doney")`
+    has the identity `r12.a(r12.money)`, and with `UESCAPE '!'` the escape is
+    the one given. `RoutineArg` decodes the form the way the engine does
+    (`\XXXX`, `\+XXXXXX`, a doubled escape, a surrogate pair) and canonicalizes
+    it to `"…"`, so one spelling of a name is one key; a form that does not
+    decode is refused as text that is not one argument, which is what the
+    engine says of it too. The decoder lives in the model, and the emitter's
+    trigger scan (302) reads it from there. The quoted form is then spelled
+    the way the engine spells a quoted name in an identity: bare where its
+    `quote_identifier` leaves it bare — `[a-z_][a-z0-9_]*` and not a keyword
+    the grammar reserves in some position — and quoted everywhere else.
+    Measured, `zq."my_type"` and `zq."zone"` are `zq.my_type` and `zq.zone`,
+    while `zq."select"`, `zq."Order"` and `zq."möney"` keep their quotes; the
+    keyword table is read from `pg_get_keywords()`, not from memory.
+
 302. **A PostgreSQL trigger's table is in its identity *and* in its
     definition, and a declaration where the two disagree is refused.**
     ADR-0002 fixed where a module's `definition:` begins by what the emitter
@@ -5915,7 +5932,10 @@ SPEC is in sync with all of these.
     `format_type` writes, each measured, in a table a test keeps disjoint
     from the column catalogue so that one rule is not spelled twice. A
     domain, an enum, a composite still pass through: the engine is still the
-    normalizer for what this table does not know.
+    normalizer for what this table does not know. And a built-in written with
+    its schema is the built-in: measured, `pg_catalog.int4`, `PG_CATALOG.INT4`,
+    `"pg_catalog".int4` and `pg_catalog."int4"` are all `integer`, so the
+    qualifier is dropped before the name is folded.
 
 304. **A module whose deparsed statement this reader cannot cut is named and
     left out, never recorded with an empty body.** The declaration holds
