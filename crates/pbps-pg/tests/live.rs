@@ -2867,6 +2867,11 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
     ))
     .await
     .expect("the resolved spelling, still under DMY");
+    conn.execute(&format!(
+        "CREATE TABLE {s}.national (d date DEFAULT N'01/02/2026')"
+    ))
+    .await
+    .expect_err("a national-character literal has no assignment cast to date");
     // And the cast does **not** resolve anything, which is the reason the gap
     // below is recorded rather than closed: an ambiguous literal moves with the
     // session whether it is cast or not.
@@ -2920,6 +2925,9 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         r"E'01/02/2026'",
         "$$01/02/2026$$",
         "U&'01/02/2026'",
+        "N'01/02/2026'",
+        "n'01/02/2026'",
+        "(N') ')",
         "'01/02/' -- split here\n'2026'",
         "(/* ) */ '01/02/2026')",
     ] {
