@@ -7011,6 +7011,12 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "bit(3)",
         "interval hour to minute",
         "text[][]",
+        // The standard's spelling of an array, with and without a dimension,
+        // and with the space the grammar allows before the bracket.
+        "text ARRAY",
+        "text ARRAY[4]",
+        "int ARRAY [2]",
+        "character varying array",
         format!("{s}.\"odd(name)\"").as_str(),
         format!("{s}.money_amount").as_str(),
         // The engine accepts a space around a qualified type's dot and never
@@ -7146,6 +7152,11 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
         "AFTER UPDATE OF a ON $S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
         "AFTER INSERT ON \"$S\".\"t\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
         "AFTER INSERT ON $S.t FOR EACH ROW WHEN (new.a = 'on other') EXECUTE FUNCTION $S.trf()",
+        // The dot is a token of its own to the engine: trivia around it is
+        // trivia, and the trigger still lands on `t`.
+        "AFTER INSERT ON $S . t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON $S /* schema */ .\n  t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON \"$S\" . \"t\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
     ] {
         let m = on_table(body);
         assert!(

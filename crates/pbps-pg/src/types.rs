@@ -1037,6 +1037,14 @@ pub(crate) fn catalogued(arg: &RoutineArg) -> bool {
 ///
 /// One `[]` comes back however many went in, and a dimension is not part of
 /// the identity: **measured**, `text[][]` and `text[3]` are both `text[]`.
+///
+/// The standard's spelling is an array too: **measured**, `text ARRAY`,
+/// `text ARRAY[4]`, `int ARRAY [2]` and `character varying array` are
+/// identified as `text[]`, `text[]`, `integer[]` and `character varying[]`,
+/// while `text ARRAY[]` and `text[] ARRAY` are syntax errors — so the word is
+/// peeled once, after the brackets and never before them. Left in, a declared
+/// `text ARRAY` keyed a routine the catalog spells `text[]`, and the routine
+/// the `CREATE` had just made was not found under its own key.
 pub(crate) fn peel_array(text: &str) -> (&str, bool) {
     let mut element = text.trim_end();
     let mut array = false;
@@ -1049,6 +1057,17 @@ pub(crate) fn peel_array(text: &str) -> (&str, bool) {
             break;
         }
         element = without[..open].trim_end();
+        array = true;
+    }
+    // The word has to be a word of its own: `myarray` is a name, and a quoted
+    // name ends in `"`.
+    let n = element.len();
+    if n > 5
+        && element.is_char_boundary(n - 5)
+        && element[n - 5..].eq_ignore_ascii_case("array")
+        && element[..n - 5].ends_with(char::is_whitespace)
+    {
+        element = element[..n - 5].trim_end();
         array = true;
     }
     (element, array)
@@ -1175,6 +1194,13 @@ mod tests {
             ("double precision[]", "double precision[]"),
             ("text[][]", "text[]"),
             ("int[3]", "integer[]"),
+            // The standard's spelling, which the engine identifies the same
+            // way — measured, with and without a dimension and with the space
+            // the grammar allows before the bracket.
+            ("text ARRAY", "text[]"),
+            ("text ARRAY[4]", "text[]"),
+            ("int ARRAY [2]", "integer[]"),
+            ("character varying array", "character varying[]"),
             // `float(24)` is `real` and `float` is `double precision`, which is
             // why the modifier is not thrown away before the catalogue is
             // asked.
@@ -1216,6 +1242,10 @@ mod tests {
             "m2.money_amount",
             "m2.mood",
             "m2.money_amount[]",
+            // A name that merely ends in the array keyword's letters, and a
+            // quoted name with the word inside it: neither is an array.
+            "m2.myarray",
+            "m2.\"my array\"",
             // A pseudo-type, which no column may ever be.
             "anyelement",
             "record",

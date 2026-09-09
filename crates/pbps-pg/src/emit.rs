@@ -1122,15 +1122,22 @@ fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
     None
 }
 
-/// The qualified name at the front of `text`: `t`, `app.t`, `"App"."T"`.
+/// The qualified name at the front of `text`: `t`, `app.t`, `"App"."T"` — and
+/// `app . t`, because the dot is a token of its own to this engine.
+/// **Measured**, `ON app . orders`, and a comment or a line break on either
+/// side of the dot, all create the trigger on `app.orders`; a scan that wanted
+/// the dot glued to the name read `app` as the table and refused a valid
+/// declaration.
 ///
-/// Returns the slice the name occupies, so a caller can both read it and skip
-/// it. `None` where the text does not start with one.
+/// Returns the slice the name occupies, the trivia inside it included, so a
+/// caller can both read it and skip it. `None` where the text does not start
+/// with one.
 fn qualified_name_at(text: &str) -> Option<&str> {
     let mut at = one_ident_len(text)?;
-    while text[at..].starts_with('.') {
-        let next = one_ident_len(&text[at + 1..])?;
-        at += 1 + next;
+    while let Some(after_dot) = after_the_gap(&text[at..]).0.strip_prefix('.') {
+        let rest = after_the_gap(after_dot).0;
+        let next = one_ident_len(rest)?;
+        at = text.len() - rest.len() + next;
     }
     Some(&text[..at])
 }
@@ -1174,8 +1181,10 @@ fn names_the_same_table(named: &str, on: &TableName) -> bool {
             None => return false,
         };
         parts.push(unquoted(&rest[..len]));
-        match rest[len..].strip_prefix('.') {
-            Some(after) => rest = after,
+        // The same gap `qualified_name_at` stepped through: it is inside the
+        // slice that scan returned, so this reader of it steps through it too.
+        match after_the_gap(&rest[len..]).0.strip_prefix('.') {
+            Some(after) => rest = after_the_gap(after).0,
             None => break,
         }
     }
@@ -2452,6 +2461,8 @@ mod tests {
             "AFTER UPDATE OF t ON app.other FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON other FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON elsewhere.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // Trivia around the dot changes nothing about which table it is.
+            "AFTER INSERT ON app . other FOR EACH ROW EXECUTE FUNCTION app.trf()",
         ] {
             let found = Postgres::new()
                 .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body));
@@ -2498,6 +2509,11 @@ mod tests {
             // stepped over whole and the clause after it is the one found.
             "AFTER UPDATE OF \"on\" ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER UPDATE OF \"a on b\" ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // The dot is a token of its own: measured, the engine takes trivia
+            // on either side of it and creates the trigger on `app.t`.
+            "AFTER INSERT ON app . t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON app /* schema */ .\n  t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON \"app\" . \"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
             // The keyword is found past a literal and a comment that both
             // contain something that looks like one.
             "AFTER INSERT -- on app.other\nON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",

@@ -5763,6 +5763,15 @@ SPEC is in sync with all of these.
     now drops the whitespace beside `.` as well, outside quotes only, so a
     quoted name keeps whatever it holds.
 
+    **Amended: the standard's array spelling is peeled too.** Measured,
+    `text ARRAY`, `text ARRAY[4]`, `int ARRAY [2]` and `character varying
+    array` are identified as `text[]`, `text[]`, `integer[]` and `character
+    varying[]`, while `text ARRAY[]` and `text[] ARRAY` are syntax errors. So
+    the word is peeled once, after the brackets and never before them. Left
+    in, a declared `text ARRAY` was keyed as a routine the catalog spells
+    `text[]`, and the routine the `CREATE` had just made was not found under
+    its own key — a valid plan refused.
+
 302. **A PostgreSQL trigger's table is in its identity *and* in its
     definition, and a declaration where the two disagree is refused.**
     ADR-0002 fixed where a module's `definition:` begins by what the emitter
@@ -5822,6 +5831,13 @@ SPEC is in sync with all of these.
     A definition with no readable `ON` is refused rather than guessed at, which
     is the direction a scan may be wrong in: the remedy is to write the clause
     where the engine expects it.
+
+    **Amended: the dot is a token of its own.** Measured, `ON app . orders`,
+    and a comment or a line break on either side of the dot, all create the
+    trigger on `app.orders`. The scan wanted the dot glued to the name, read
+    `app` as the table, and refused a valid declaration; it now steps through
+    the same gap on both sides of every dot — in the scan that finds the name
+    and in the comparison that reads it, which are two readers of one slice.
 
 303. **A routine argument this dialect's catalogue does not know is passed
     through, not refused.** `Postgres::normalize_type` refuses an unknown
