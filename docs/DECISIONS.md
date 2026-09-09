@@ -6178,6 +6178,14 @@ SPEC is in sync with all of these.
     in one position and not the next was refusing a valid declaration for a
     count only it got wrong.
 
+    **Amended: the scans' whitespace is ASCII.** The rule of 313, applied to
+    the emitter's own scans: measured, `CREATE FUNCTION r10.f(a r10.x\u{a0}, b
+    int)` has the identity `r10.f(r10."x\u{a0}",integer)`, the non-breaking
+    space being the last byte of the type's name. `str::trim` at a parameter's
+    boundary, before a default and after a gap cut that byte off and compared
+    `r10.x` with a catalog that says `r10."x\u{a0}"`. Every trim in these
+    scans is an ASCII one now.
+
 309. **A module the deparse could not find is the catalog moving, not a reader
     out of step with its query.** The pull reads the catalog in one
     `REPEATABLE READ READ ONLY` transaction so that it cannot report half of a

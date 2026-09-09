@@ -6753,6 +6753,9 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
     conn.execute(&format!("CREATE TYPE {s}.my_type AS ENUM ('a', 'b')"))
         .await
         .expect("a user type to qualify");
+    conn.execute(&format!("CREATE TYPE {s}.\"x\u{a0}\" AS ENUM ('a')"))
+        .await
+        .expect("a user type whose name ends in a non-breaking space");
     let pg = Postgres::new();
 
     // Every one of these is a spelling a declaration may reasonably carry, and
@@ -6865,6 +6868,17 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
             "%S%.my_type",
             "(a %S%.my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
         ),
+        // A non-breaking space is the last byte of the type's name, before
+        // the comma and before a default alike — measured, the identity keeps
+        // it and quotes the name.
+        (
+            "%S%.x\u{a0}, integer",
+            "(a %S%.x\u{a0}, b integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "%S%.x\u{a0}",
+            "(a %S%.x\u{a0} DEFAULT NULL) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -6911,8 +6925,12 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
             ),
         )
         .await;
+        // Compared through the engine's own resolution of the key, not as
+        // text: a name the engine quotes when it writes it back — one ending
+        // in a non-breaking space — is spelled bare in a declaration.
+        let resolved = text(&mut conn, &format!("SELECT '{key}'::regprocedure::text")).await;
         assert_eq!(
-            written, key,
+            written, resolved,
             "`{definition}` under the key `{key}` created another object"
         );
     }

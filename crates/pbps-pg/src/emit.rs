@@ -343,7 +343,7 @@ fn after_the_gap(tail: &str) -> (&str, bool) {
     let mut newline = false;
     let mut blocked = false;
     loop {
-        let trimmed = rest.trim_start();
+        let trimmed = ascii_trim_start(rest);
         newline |= rest[..rest.len() - trimmed.len()].contains(NEWLINE);
         rest = trimmed;
         if let Some(after) = rest.strip_prefix("--") {
@@ -417,11 +417,30 @@ fn without_trailing_trivia(e: &str) -> &str {
             end = consumed_to;
             continue;
         }
-        if !ch.is_whitespace() {
+        if !ch.is_ascii_whitespace() {
             end = i + ch.len_utf8();
         }
     }
     &e[..end]
+}
+
+/// Whitespace is ASCII wherever these scans look for it: to this engine a
+/// non-ASCII byte is an identifier byte, a non-breaking space included.
+/// Measured, `CREATE FUNCTION r10.f(a r10.x\u{a0}, b int)` has the identity
+/// `r10.f(r10."x\u{a0}",integer)` — the byte is the end of the type's name,
+/// and a scan that trimmed it read a type that does not exist and refused a
+/// valid declaration. `str::trim` is Unicode's answer, and the wrong one here
+/// (DECISIONS 313).
+fn ascii_trim(text: &str) -> &str {
+    ascii_trim_end(ascii_trim_start(text))
+}
+
+fn ascii_trim_start(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn ascii_trim_end(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c.is_ascii_whitespace())
 }
 
 /// The characters this engine ends a line with, either of them alone.
@@ -1275,14 +1294,14 @@ fn parameters(list: &str) -> Vec<&str> {
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                parts.push(list[start..at].trim());
+                parts.push(ascii_trim(&list[start..at]));
                 start = at + 1;
             }
             _ => {}
         }
         at += c.len_utf8();
     }
-    parts.push(list[start..].trim());
+    parts.push(ascii_trim(&list[start..]));
     if parts.len() == 1 && parts[0].is_empty() {
         return Vec::new();
     }
@@ -1367,14 +1386,14 @@ fn before_the_default(text: &str) -> &str {
             }
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
-            '=' if depth == 0 => return text[..at].trim_end(),
+            '=' if depth == 0 => return ascii_trim_end(&text[..at]),
             _ if depth == 0 && pbps_dialect::continues_ident(c) && c != '"' => {
                 let end = at
                     + text[at..]
                         .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
                         .unwrap_or(text.len() - at);
                 if text[at..end].eq_ignore_ascii_case("default") {
-                    return text[..at].trim_end();
+                    return ascii_trim_end(&text[..at]);
                 }
                 at = end;
                 continue;
@@ -1383,7 +1402,7 @@ fn before_the_default(text: &str) -> &str {
         }
         at += c.len_utf8();
     }
-    text.trim_end()
+    ascii_trim_end(text)
 }
 
 /// Whether a type the body declares is **certainly not** the one the identity
@@ -2243,6 +2262,17 @@ mod tests {
             (
                 "app.f(integer)",
                 "(in /* note */ x /* note */ int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A non-breaking space is the last byte of the type's name, not
+            // whitespace before the comma: measured, the identity is
+            // `f(md."x\u{a0}",integer)`.
+            (
+                "app.f(md.x\u{a0}, integer)",
+                "(a md.x\u{a0}, b integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(md.x\u{a0})",
+                "(a md.x\u{a0} DEFAULT NULL) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
             ),
             (
                 "app.f(integer)",
