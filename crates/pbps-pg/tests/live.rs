@@ -7144,6 +7144,33 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         identity,
         "and the folded key resolves to the routine the body created"
     );
+    // And not the gap before the array keyword either: `a\u{a0}array` is a
+    // type name, and peeled as `a[]` the key named a routine that was never
+    // made.
+    conn.execute(&format!(
+        "CREATE TYPE {s}.\"a\u{a0}array\" AS ENUM ('a');
+         CREATE FUNCTION {s}.nbsp_array(a {s}.a\u{a0}array) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
+    ))
+    .await
+    .expect("a type whose name ends in the array keyword after a non-breaking space");
+    let kept: pbps_model::RoutineArg = format!("{s}.a\u{a0}array")
+        .parse()
+        .expect("a routine argument");
+    let kept_folded = pbps_dialect::Dialect::normalize_routine_arg(&pg, &kept).expect("normalize");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT '{s}.nbsp_array({kept_folded})'::regprocedure::text")
+        )
+        .await,
+        format!("{s}.nbsp_array({s}.\"a\u{a0}array\")"),
+        "the folded key resolves to the routine the body created"
+    );
+    conn.execute(&format!(
+        "DROP FUNCTION {s}.nbsp_array({s}.\"a\u{a0}array\"); DROP TYPE {s}.\"a\u{a0}array\""
+    ))
+    .await
+    .expect("drop them too");
     conn.execute(&format!(
         "DROP FUNCTION {s}.nbsp({s}.\"a\u{a0}b\"); DROP TYPE {s}.\"a\u{a0}b\""
     ))
@@ -7411,6 +7438,18 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.scratch FOR EACH ROW EXECUTE FUNCTION \
              {s}.tg()"
         ),
+        // A view an extension owns is left out of the pull (DECISIONS 305); a
+        // user's trigger on it is not extension-owned — measured — and has to
+        // go with the view. An extension is database-global, and a run that
+        // panicked before its `drop_schema` leaves this one installed in a
+        // schema that is not this run's — so it is dropped first, not created
+        // `IF NOT EXISTS`, which would keep the stale one where it is.
+        "DROP EXTENSION IF EXISTS pg_buffercache".to_owned(),
+        format!("CREATE EXTENSION pg_buffercache WITH SCHEMA {s}"),
+        format!(
+            "CREATE TRIGGER user_tg INSTEAD OF INSERT ON {s}.pg_buffercache FOR EACH ROW EXECUTE \
+             FUNCTION {s}.tg()"
+        ),
     ] {
         conn.execute(&sql)
             .await
@@ -7452,13 +7491,24 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         .iter()
         .map(|l| l.table.name.as_str())
         .collect();
-    for left_out in ["part", "part.audit", "scratch", "scratch.audit"] {
+    for left_out in [
+        "part",
+        "part.audit",
+        "scratch",
+        "scratch.audit",
+        "pg_buffercache.user_tg",
+    ] {
         assert!(
             named.contains(&left_out),
             "{left_out} is not named in {named:?}"
         );
     }
     assert!(!named.contains(&"t.audit"), "{named:?}");
+    assert!(
+        !named.contains(&"pg_buffercache"),
+        "the extension's view is left out silently, and only the user's trigger on it is named: \
+         {named:?}"
+    );
     let detail = &ours_limitations(&pulled, &s)
         .iter()
         .find(|l| l.table.name == "part.audit")
@@ -7468,6 +7518,75 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         detail.contains(&format!("a trigger on `{s}.part`")),
         "{detail}"
     );
+
+    drop_schema(&mut conn, &s).await;
+}
+
+/// A routine that takes the view's row type, or an array of it, or returns
+/// it, depends on `type v` — and the type depends on the view internally, an
+/// edge the walk rightly does not follow. Measured, `DROP VIEW v` names all
+/// three routines. Asked only about edges to the view itself, the walk saw
+/// none of them and called the rebuild unblocked.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_that_takes_or_returns_the_views_row_type_is_a_dependent_of_the_view() {
+    let s = emit_schema("row_type");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+        format!("CREATE FUNCTION {s}.takes(x {s}.v) RETURNS int LANGUAGE sql AS $$ SELECT x.id $$"),
+        format!(
+            "CREATE FUNCTION {s}.takes_many(x {s}.v[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
+        ),
+        format!(
+            "CREATE FUNCTION {s}.gives() RETURNS {s}.v LANGUAGE sql AS $$ SELECT * FROM {s}.v \
+             LIMIT 1 $$"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let v: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let found = pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
+        .await
+        .expect("read the dependents");
+    rollback(&mut conn).await;
+    let described: Vec<&str> = found.iter().map(|d| d.described.as_str()).collect();
+    assert_eq!(
+        described,
+        vec![
+            format!("function {s}.gives()"),
+            format!("function {s}.takes({s}.v)"),
+            format!("function {s}.takes_many({s}.v[])"),
+        ],
+        "every routine the engine would name"
+    );
+    // With their identities whole: a routine the dependents query returns and
+    // the argument query does not is keyed `f()`, a different object.
+    let holds: Vec<pbps_pg::modules::Holds> = found.iter().map(|d| d.holds.clone()).collect();
+    for id in [
+        format!("{s}.gives()"),
+        format!("{s}.takes({s}.v)"),
+        format!("{s}.takes_many({s}.v[])"),
+    ] {
+        let id: pbps_model::ModuleId = id.parse().expect("a module id");
+        assert!(
+            holds.contains(&pbps_pg::modules::Holds::Module(id.clone())),
+            "{id} is not held as itself in {holds:?}"
+        );
+    }
+
+    // The engine's own refusal names the same three.
+    let engine = conn
+        .execute(&format!("DROP VIEW {s}.v"))
+        .await
+        .expect_err("the engine refuses too");
+    assert_eq!(sqlstate(&engine), "2BP01", "{engine:?}");
 
     drop_schema(&mut conn, &s).await;
 }

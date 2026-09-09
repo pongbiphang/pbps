@@ -119,7 +119,13 @@ const ORDINARY_TABLE: &str = "c.relkind = 'r'
 /// as a limitation by [`partitioned_query`]; the trigger is named beside it
 /// by [`unheld_modules_query`] rather than silently gone.
 fn on_a_relation_the_pull_holds() -> String {
-    format!("(c.relkind = 'v' OR ({ORDINARY_TABLE} AND {NOT_ONE_OF_OURS}))")
+    // The view reader's own filter too: measured, a user's `INSTEAD OF`
+    // trigger on a view an extension owns is not extension-owned itself, and
+    // read back it named a view the pull had left out.
+    let view_not_extension = not_an_extensions("c.oid", "pg_class");
+    format!(
+        "((c.relkind = 'v' AND {view_not_extension}) OR ({ORDINARY_TABLE} AND {NOT_ONE_OF_OURS}))"
+    )
 }
 
 /// Objects owned by an extension, which are nobody's declarations.
@@ -1210,6 +1216,7 @@ mod tests {
         let held = on_a_relation_the_pull_holds();
         assert!(held.contains(ORDINARY_TABLE));
         assert!(held.contains("c.relkind = 'v'"));
+        assert!(held.contains(&not_an_extensions("c.oid", "pg_class")));
         assert!(
             modules_query().contains(&format!("AND {held}")),
             "{}",

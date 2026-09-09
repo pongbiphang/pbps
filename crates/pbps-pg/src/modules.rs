@@ -1291,15 +1291,14 @@ async fn direct_dependents(
 /// the join, because duplication here changes a value instead of repeating
 /// one.
 fn dependent_routine_args_query(refclass: &str) -> String {
+    let edge = reverse_edge(refclass);
     format!(
         "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
                 pg_catalog.format_type(u.ty, NULL) AS ty
            FROM (SELECT DISTINCT d.objid
                    FROM pg_catalog.pg_depend d
-                  WHERE d.refclassid = '{refclass}'::regclass
-                    AND d.refobjid = ($1::int8)::oid
-                    AND d.classid = 'pg_catalog.pg_proc'::regclass
-                    AND d.deptype <> 'i') e
+                  WHERE {edge}
+                    AND d.classid = 'pg_catalog.pg_proc'::regclass) e
            JOIN pg_catalog.pg_proc p ON p.oid = e.objid
      CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes) WITH ORDINALITY AS u(ty, pos)
           ORDER BY 1, 2"
@@ -1340,9 +1339,7 @@ fn dependent_routine_args_query(refclass: &str) -> String {
 /// engine's own `_RETURN` rule *is* the view; any other comes back as a
 /// dependent this model cannot put back, and refuses (DECISIONS 306).
 fn dependents_query(refclass: &str) -> String {
-    let edge = format!(
-        "d.refclassid = '{refclass}'::regclass AND d.refobjid = ($1::int8)::oid AND d.deptype <> 'i'"
-    );
+    let edge = reverse_edge(refclass);
     let described = "pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) AS described";
     let known = KNOWN_DEPENDENT_CLASSES
         .iter()
@@ -1433,6 +1430,38 @@ fn dependents_query(refclass: &str) -> String {
          ) every_edge
           ORDER BY 2"
     )
+}
+
+/// The `pg_depend` rows that point at the module a walk is standing on — one
+/// spelling for the dependents query and the argument query, because a routine
+/// the first returns and the second does not is keyed `f()`.
+///
+/// **For a view, the reference is the view and its row type.** Measured, a
+/// routine that takes `v` or `v[]` as an argument, or returns `v`, depends on
+/// `type v` or `type v[]` (`deptype` `n`), and the type depends on the view
+/// internally (`i`); `DROP VIEW v` names all three routines. Filtering the
+/// internal edge is right — the type is not a dependent anybody drops — but
+/// with the type never asked about as a *reference*, those routines were
+/// unseen, the walk reported the rebuild unblocked, and the `DROP` failed at
+/// apply: the applyable-and-predictably-fails outcome, one edge further away
+/// (DECISIONS 306).
+fn reverse_edge(refclass: &str) -> String {
+    let mut referenced =
+        format!("(d.refclassid = '{refclass}'::regclass AND d.refobjid = ($1::int8)::oid");
+    if refclass == "pg_catalog.pg_class" {
+        referenced.push_str(
+            "
+             OR d.refclassid = 'pg_catalog.pg_type'::regclass
+                AND d.refobjid IN (SELECT c.reltype FROM pg_catalog.pg_class c
+                                    WHERE c.oid = ($1::int8)::oid
+                                   UNION ALL
+                                   SELECT t.typarray FROM pg_catalog.pg_class c
+                                     JOIN pg_catalog.pg_type t ON t.oid = c.reltype
+                                    WHERE c.oid = ($1::int8)::oid)",
+        );
+    }
+    referenced.push(')');
+    format!("{referenced} AND d.deptype <> 'i'")
 }
 
 /// The catalogs the arms above have a rule for.
@@ -1740,6 +1769,31 @@ mod tests {
     /// excludes, and nothing else is. A seventh arm added without touching the
     /// constant would produce two rows for one dependent; a class removed from
     /// the constant without removing its arm would produce none.
+    /// The dependents query and the argument query have to agree about which
+    /// edges lead to a dependent, and for a view that is the view and its row
+    /// type; for a routine or a trigger there is no row type to ask about.
+    #[test]
+    fn the_dependents_and_their_arguments_are_selected_by_one_edge() {
+        for refclass in [
+            "pg_catalog.pg_class",
+            "pg_catalog.pg_proc",
+            "pg_catalog.pg_trigger",
+        ] {
+            let edge = reverse_edge(refclass);
+            assert!(dependents_query(refclass).contains(&edge), "{refclass}");
+            assert!(
+                dependent_routine_args_query(refclass).contains(&edge),
+                "{refclass}"
+            );
+            assert_eq!(
+                edge.contains("c.reltype"),
+                refclass == "pg_catalog.pg_class",
+                "{refclass}: only a relation has a row type"
+            );
+            assert!(edge.contains("d.deptype <> 'i'"), "{edge}");
+        }
+    }
+
     #[test]
     fn every_known_class_has_an_arm_and_the_rest_fall_through() {
         let sql = dependents_query("pg_catalog.pg_proc");

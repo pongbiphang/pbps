@@ -1045,8 +1045,12 @@ pub(crate) fn catalogued(arg: &RoutineArg) -> bool {
 /// peeled once, after the brackets and never before them. Left in, a declared
 /// `text ARRAY` keyed a routine the catalog spells `text[]`, and the routine
 /// the `CREATE` had just made was not found under its own key.
+///
+/// Whitespace is ASCII throughout, here and in the helpers below: to this
+/// engine a non-breaking space is a name byte (DECISIONS 313), so `a\u{a0}array`
+/// is a type name and not `a` with the keyword after it.
 pub(crate) fn peel_array(text: &str) -> (&str, bool) {
-    let mut element = text.trim_end();
+    let mut element = ascii_trim_end(text);
     let mut array = false;
     while let Some(without) = element.strip_suffix(']') {
         let Some(open) = without.rfind('[') else {
@@ -1056,7 +1060,7 @@ pub(crate) fn peel_array(text: &str) -> (&str, bool) {
         if without[open + 1..].chars().any(|c| !c.is_ascii_digit()) {
             break;
         }
-        element = without[..open].trim_end();
+        element = ascii_trim_end(&without[..open]);
         array = true;
     }
     // The word has to be a word of its own: `myarray` is a name, and a quoted
@@ -1065,12 +1069,20 @@ pub(crate) fn peel_array(text: &str) -> (&str, bool) {
     if n > 5
         && element.is_char_boundary(n - 5)
         && element[n - 5..].eq_ignore_ascii_case("array")
-        && element[..n - 5].ends_with(char::is_whitespace)
+        && element[..n - 5].ends_with(|c: char| c.is_ascii_whitespace())
     {
-        element = element[..n - 5].trim_end();
+        element = ascii_trim_end(&element[..n - 5]);
         array = true;
     }
     (element, array)
+}
+
+fn ascii_trim_end(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn ascii_trim_start(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c.is_ascii_whitespace())
 }
 
 /// One argument's element type as `format_type` prints it.
@@ -1104,7 +1116,7 @@ fn identity_element(element: &str) -> String {
     // `interval hour to minute` is identified as `interval`, so the field
     // qualifier goes the same way a modifier does.
     if let Some(rest) = bare.strip_prefix("interval")
-        && rest.starts_with(char::is_whitespace)
+        && rest.starts_with(|c: char| c.is_ascii_whitespace())
     {
         return "interval".to_owned();
     }
@@ -1128,8 +1140,8 @@ fn without_modifier(element: &str) -> String {
     if close < open {
         return element.to_owned();
     }
-    let mut out = element[..open].trim_end().to_owned();
-    let rest = element[close + 1..].trim_start();
+    let mut out = ascii_trim_end(&element[..open]).to_owned();
+    let rest = ascii_trim_start(&element[close + 1..]);
     if !rest.is_empty() {
         out.push(' ');
         out.push_str(rest);
@@ -1246,6 +1258,11 @@ mod tests {
             // quoted name with the word inside it: neither is an array.
             "m2.myarray",
             "m2.\"my array\"",
+            // A non-breaking space is a name byte, not the gap before the
+            // keyword, a field qualifier or a modifier.
+            "m2.a\u{a0}array",
+            "m2.x\u{a0}",
+            "interval\u{a0}hour",
             // A pseudo-type, which no column may ever be.
             "anyelement",
             "record",

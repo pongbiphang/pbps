@@ -5928,8 +5928,10 @@ SPEC is in sync with all of these.
     `UNLOGGED` one, and read back without its relation the trigger was a
     module whose `on:` named a table the schema did not have — `check_names`
     refused the pull whole. The arm now selects by the table reader's own
-    predicate (or a view), the complement is named as a limitation beside the
-    relation's own, and a test ties the three to one string.
+    predicate (or a view the view reader holds — measured, a user's `INSTEAD
+    OF` trigger on a view an extension owns is not extension-owned itself),
+    the complement is named as a limitation beside the relation's own, and a
+    test ties the three to one string.
 
 305. **Extension-owned objects are left out of the pull silently, and that is
     not the "absent, empty and unreadable" failure.** `CREATE EXTENSION …
@@ -6072,6 +6074,16 @@ SPEC is in sync with all of these.
     any other now comes back as a dependent this model cannot put back, and
     refuses. The same silence as the filter's, reached another way — a row
     that was there, named as something the reader already held.
+
+    **Amended: a view's row type is a reference to the view.** Measured, a
+    routine that takes `v` or `v[]` as an argument, or returns `v`, depends on
+    `type v` or `type v[]` with `deptype` `n`, and the type depends on the
+    view with `i`; `DROP VIEW v` names all three routines. Filtering the
+    internal edge is right — the type is not a dependent anybody drops — but
+    never asking about the type as a *reference* left those routines unseen,
+    and the walk called the rebuild unblocked. The reverse-edge predicate now
+    names the view, its row type and the row type's array type, in one
+    spelling shared by the dependents query and the argument query.
 
 307. **The rebind test is a name and a path, not a position on it.**
     ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
@@ -6306,6 +6318,9 @@ SPEC is in sync with all of these.
     no type at all — so the fold turned a valid key into one that resolved
     nothing. The fold trims and collapses ASCII whitespace only, and the
     whitelist admits any non-ASCII byte, which is `continues_ident`'s rule.
+    The dialect's normalizer follows the same rule wherever it looks for a
+    gap — before the array keyword, after `interval`, around a modifier — so
+    `a\u{a0}array` is a type name and not `a[]`.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
