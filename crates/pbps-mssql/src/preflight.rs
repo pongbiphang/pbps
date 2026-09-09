@@ -509,11 +509,18 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // as a pass. Classifying the change `Incompatible` is what stops
             // it; a probe beside that would only argue with it
             // (DECISIONS 283).
-            if types::change_risk(from, to).risk_class().is_some()
+            let probes_capacity = types::change_risk(from, to).risk_class().is_some();
+            if (probes_capacity || character_to_non_unicode(from, to)?)
                 && !types::alter_column_is_refused(from)
                 && !types::alter_column_is_refused(to)
             {
-                out.extend(conversion_probe(column, &stored, to)?);
+                out.extend(conversion_probe(
+                    column,
+                    &stored,
+                    from,
+                    to,
+                    probes_capacity,
+                )?);
             }
             Ok(out)
         }
@@ -1759,34 +1766,84 @@ fn duplicate_probe(
     ))
 }
 
-/// The probe for narrowing a column's type, or `None` when no count exists.
+fn character_to_non_unicode(from: &ColumnType, to: &ColumnType) -> Result<bool, DialectError> {
+    let from = types::normalize(from)?;
+    let Ok(to) = types::normalize(to) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        from.base.as_str(),
+        "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
+    ) && matches!(to.base.as_str(), "char" | "varchar" | "text"))
+}
+
+/// The probes for a column type change whose rows or code page may lose data.
 fn conversion_probe(
     column: &ColumnRef,
     stored: &ColumnRef,
+    from: &ColumnType,
     to: &ColumnType,
+    probes_capacity: bool,
 ) -> Result<Vec<Probe>, DialectError> {
     let table = qualified(&stored.table)?;
     let col = quote(&stored.name)?;
+    let from = types::normalize(from)?;
+    let Ok(to) = types::normalize(to) else {
+        return Ok(Vec::new());
+    };
+    let character_to_non_unicode = matches!(
+        from.base.as_str(),
+        "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
+    ) && matches!(to.base.as_str(), "char" | "varchar" | "text");
+    let target_input = match from.base.as_str() {
+        "text" => format!("CONVERT(varchar(max), {col}) COLLATE DATABASE_DEFAULT"),
+        "ntext" => format!("CONVERT(nvarchar(max), {col}) COLLATE DATABASE_DEFAULT"),
+        _ => format!("{col} COLLATE DATABASE_DEFAULT"),
+    };
+    let character_loss_probe = || {
+        Probe::new(
+            format!("values in {column} changed when converted to {to}"),
+            format!(
+                "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
+            ),
+        )
+    };
 
     // A bounded string or binary target truncates silently under CONVERT, so
-    // `TRY_CONVERT` would return a value and report nothing. Length is the only
-    // question that has an answer here.
+    // `TRY_CONVERT` would return a value and report nothing. Count the values
+    // beyond its declared capacity before asking any code-page question.
     let bound = match to.args.first() {
         Some(TypeArg::Int(n)) => Some(*n),
         Some(TypeArg::Max) | Some(TypeArg::Ident(_)) | None => None,
     };
-    if let Some(n) = bound {
+    if let Some(n) = bound.filter(|_| probes_capacity) {
         match to.base.as_str() {
             // LEN ignores trailing blanks, and so does the engine when it
             // shortens a character column — counting them would report rows
             // that convert perfectly well.
             "char" | "nchar" | "varchar" | "nvarchar" => {
-                return Ok(vec![Probe::new(
+                let len = match from.base.as_str() {
+                    "text" => format!("LEN(CONVERT(varchar(max), {col}))"),
+                    "ntext" => format!("LEN(CONVERT(nvarchar(max), {col}))"),
+                    _ => format!("LEN({col})"),
+                };
+                let mut probes = vec![Probe::new(
                     format!("values in {column} too long for {to}"),
                     format!(
-                        "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND LEN({col}) > {n};"
+                        "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND {len} > {n};"
                     ),
-                )]);
+                )];
+                // LEN counts characters, while a non-Unicode target stores
+                // bytes in the database default code page. A value can fit
+                // the character bound and still become `?`, or exceed the
+                // byte bound under a UTF-8 default. Ask whether the exact
+                // ALTER conversion round-trips, under a binary comparison so
+                // the source column's collation cannot call changed text the
+                // same value (DECISIONS 299).
+                if character_to_non_unicode {
+                    probes.push(character_loss_probe());
+                }
+                return Ok(probes);
             }
             "binary" | "varbinary" => {
                 return Ok(vec![Probe::new(
@@ -1800,6 +1857,12 @@ fn conversion_probe(
         }
     }
 
+    // A max target has no length question, but changing the code page can
+    // still replace characters without making CONVERT fail (DECISIONS 299).
+    if character_to_non_unicode {
+        return Ok(vec![character_loss_probe()]);
+    }
+
     // Anything else: let the engine answer. `TRY_CONVERT` returns NULL exactly
     // where `CONVERT` would raise, which is the definition of the rows that
     // would break the ALTER.
@@ -1808,9 +1871,6 @@ fn conversion_probe(
     // type, and a type is not a value a parameter can carry. It comes from the
     // dialect's own catalogue, never from user text — `normalize` has already
     // rejected anything that is not a type this dialect knows.
-    if types::normalize(to).is_err() {
-        return Ok(Vec::new());
-    }
     Ok(vec![Probe::new(
         format!("values in {column} that cannot become {to}"),
         format!(
@@ -1987,6 +2047,121 @@ mod tests {
         assert_eq!(sql.len(), 1);
         assert!(sql[0].contains("LEN([email]) > 50"), "{sql:?}");
         assert!(!sql[0].contains("TRY_CONVERT"), "{sql:?}");
+    }
+
+    #[test]
+    fn character_narrowing_to_non_unicode_is_probed_for_changed_bytes() {
+        for (from, to, normalized_to) in [
+            ("nvarchar(255)", "varchar(50)", "varchar(50)"),
+            ("nchar(255)", "char(50)", "char(50)"),
+            ("ntext", "varchar(50)", "varchar(50)"),
+            ("sysname", "varchar(50)", "varchar(50)"),
+            ("varchar(255)", "varchar(50)", "varchar(50)"),
+            ("text", "varchar(50)", "varchar(50)"),
+            ("nvarchar(255)", "character varying(50)", "varchar(50)"),
+        ] {
+            let target = if to.starts_with("character") {
+                to.parse().unwrap()
+            } else {
+                ty(to)
+            };
+            let sql = sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty(from),
+                to: target,
+                from_nullable: true,
+                to_nullable: true,
+            });
+            assert_eq!(sql.len(), 2, "{from} -> {to}: {sql:?}");
+            let expected_len = match from {
+                "ntext" => "LEN(CONVERT(nvarchar(max), [label])) > 50",
+                "text" => "LEN(CONVERT(varchar(max), [label])) > 50",
+                _ => "LEN([label]) > 50",
+            };
+            assert!(sql[0].contains(expected_len), "{sql:?}");
+            let target_input = match from {
+                "text" => "CONVERT(varchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                "ntext" => "CONVERT(nvarchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                _ => "[label] COLLATE DATABASE_DEFAULT",
+            };
+            assert!(
+                sql[1].contains(&format!(
+                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                )),
+                "{sql:?}"
+            );
+        }
+
+        for (from, to, normalized_to) in [
+            ("nvarchar(255)", "varchar(max)", "varchar(max)"),
+            ("ntext", "varchar(max)", "varchar(max)"),
+            ("sysname", "varchar(max)", "varchar(max)"),
+            ("nvarchar(255)", "text", "text"),
+            ("nvarchar(255)", "character varying(max)", "varchar(max)"),
+        ] {
+            let target = if to.starts_with("character") {
+                to.parse().unwrap()
+            } else {
+                ty(to)
+            };
+            let sql = sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty(from),
+                to: target,
+                from_nullable: true,
+                to_nullable: true,
+            });
+            assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
+            assert!(!sql[0].contains("LEN("), "{sql:?}");
+            let target_input = match from {
+                "text" => "CONVERT(varchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                "ntext" => "CONVERT(nvarchar(max), [label]) COLLATE DATABASE_DEFAULT",
+                _ => "[label] COLLATE DATABASE_DEFAULT",
+            };
+            assert!(
+                sql[0].contains(&format!(
+                    "CONVERT(nvarchar(max), CONVERT({normalized_to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                )),
+                "{sql:?}"
+            );
+        }
+
+        for to in ["varchar(50)", "varchar(max)"] {
+            let sql = sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty("varchar(20)"),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+            });
+            assert_eq!(sql.len(), 1, "varchar(20) -> {to}: {sql:?}");
+            assert!(!sql[0].contains("LEN("), "{sql:?}");
+            assert!(
+                sql[0].contains(&format!(
+                    "CONVERT(nvarchar(max), CONVERT({to}, [label] COLLATE DATABASE_DEFAULT)) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), [label]) COLLATE Latin1_General_BIN2"
+                )),
+                "{sql:?}"
+            );
+        }
+
+        for (from, to) in [
+            ("nvarchar(255)", "nvarchar(50)"),
+            ("varchar(255)", "nvarchar(50)"),
+        ] {
+            let sql = sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty(from),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+            });
+            assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
+            assert!(sql[0].contains("LEN([label]) > 50"), "{sql:?}");
+        }
     }
 
     #[test]

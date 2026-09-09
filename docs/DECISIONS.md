@@ -5637,3 +5637,47 @@ SPEC is in sync with all of these.
     differently would merely ask for approval before emitting SQL that cannot
     run. Ordinary `varbinary(8)` remains alterable, so binary capacity is not
     used as a proxy for the engine's `timestamp` rule.
+
+299. **A narrowing into a non-Unicode character type is probed by exact round
+    trip, in addition to any character count.** `LEN` answers whether the source has
+    more characters than a bounded target. It cannot see a legacy code page replacing
+    `王小明` with `???`, or a UTF-8 `varchar(4)` exceeding its byte capacity.
+    Measured, the legacy ALTER succeeds and silently stores the changed value,
+    while the UTF-8 ALTER refuses with truncation; `LEN` reports 3 in each case.
+
+    The second probe converts through the non-Unicode target and back to
+    `nvarchar(max)`, then compares under `Latin1_General_BIN2`. The binary
+    collation is part of the question: the source column's own collation may
+    call two spellings equal, which would turn another loss into a clean count.
+    The inner value is collated to `DATABASE_DEFAULT` before conversion because
+    that is the target collation the emitter's `ALTER COLUMN` establishes when
+    it writes no `COLLATE`; measured, a source column with an explicit UTF-8
+    collation moves to the database default after that ALTER. This does not
+    solve the separate declaration/read-back gap for explicit collations
+    (#94); it makes the preflight match the statement this emitter writes.
+
+    The existing length probe stays beside it. It is the direct, readable count
+    for ordinary length loss, while the round trip is added only when the
+    source is any supported character type and the target is `char`, `varchar`
+    or legacy `text`. This includes non-Unicode sources because an explicitly
+    UTF-8 or otherwise non-default source collation moves to `DATABASE_DEFAULT`
+    under the emitted ALTER and can lose characters. A max or `text` target
+    gets only the round trip because it has no length question, but it can
+    still replace characters under a legacy code page.
+    Both endpoints are normalized before classification, so accepted aliases
+    such as `character varying(max)` ask the same probe as `varchar(max)`,
+    matching the type spelling the emitter will use.
+    This code-page question is independent of the ordinary narrowing risk:
+    even widening `varchar(20)` to `varchar(max)` can replace an explicitly
+    UTF-8 value when the ALTER resets the column to a legacy database default.
+    Such a widening gets the round-trip probe without a meaningless length
+    probe.
+    A legacy `text` source is first converted to `varchar(max)` under its
+    source collation before applying `DATABASE_DEFAULT`; SQL Server refuses a
+    direct cross-code-page `COLLATE` on `text` itself.
+    Unicode-to-Unicode and non-Unicode-to-Unicode changes keep their one length
+    probe rather than paying for a question they do not ask.
+    Because SQL Server does not accept `LEN(ntext)` or `LEN(text)`, those legacy
+    sources are first converted to their corresponding max type for the length
+    count; the round-trip comparison likewise converts `ntext` before using
+    the comparison operator.

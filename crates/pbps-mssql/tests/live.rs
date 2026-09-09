@@ -1278,6 +1278,315 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
 
+/// A character count cannot answer whether a Unicode value survives the
+/// target code page, or whether it fits a UTF-8 target's byte bound. The
+/// round-trip probe must count both before ALTER changes or refuses them.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn unicode_to_varchar_probes_character_loss() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let plan = |column: &str, from: &str, to: &str| ChangeSet {
+        changes: vec![PlannedChange::new(Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: column.parse().unwrap(),
+            from: ty(from),
+            to: ty(to),
+            from_nullable: true,
+            to_nullable: true,
+        })],
+    };
+    async fn counts(conn: &mut Conn, plan: &ChangeSet) -> std::collections::BTreeMap<String, i32> {
+        let mut counts = std::collections::BTreeMap::new();
+        for probe in Mssql.preflight(plan) {
+            let rows = conn
+                .query(&probe.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probe.sql));
+            counts.insert(probe.description, rows[0].try_get_at(0).unwrap().unwrap());
+        }
+        counts
+    }
+    let count = |counts: &std::collections::BTreeMap<String, i32>, needle: &str| {
+        *counts
+            .iter()
+            .find(|(description, _)| description.contains(needle))
+            .unwrap_or_else(|| panic!("no probe mentioning `{needle}` in {counts:?}"))
+            .1
+    };
+
+    // The legacy database code page cannot represent the three characters.
+    // They fit varchar(20), so the old LEN-only probe reported clean while
+    // ALTER stored three question marks.
+    let mut legacy = TestDb::create("unicode_narrow_legacy").await;
+    legacy
+        .conn
+        .execute(
+            "CREATE TABLE dbo.t (label nvarchar(20) NULL);\n\
+             INSERT dbo.t VALUES (N'王小明');\n\
+             CREATE TABLE dbo.old_text (label ntext NULL);\n\
+             INSERT dbo.old_text VALUES (N'王小明');\n\
+             CREATE TABLE dbo.max_text (label nvarchar(20) NULL);\n\
+             INSERT dbo.max_text VALUES (N'王小明');\n\
+             CREATE TABLE dbo.system_name (label sysname NULL);\n\
+             INSERT dbo.system_name VALUES (N'王小明');\n\
+             CREATE TABLE dbo.legacy_text_target (label nvarchar(20) NULL);\n\
+             INSERT dbo.legacy_text_target VALUES (N'王小明');\n\
+             CREATE TABLE dbo.alias_target (label nvarchar(20) NULL);\n\
+             INSERT dbo.alias_target VALUES (N'王小明');\n\
+             CREATE TABLE dbo.utf8_source (label varchar(20) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL);\n\
+             INSERT dbo.utf8_source VALUES (N'王小明');\n\
+             CREATE TABLE dbo.utf8_widening (label varchar(20) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL);\n\
+             INSERT dbo.utf8_widening VALUES (N'王小明');\n\
+             CREATE TABLE dbo.legacy_code_page_text (label text COLLATE Chinese_PRC_CI_AS NULL);\n\
+             INSERT dbo.legacy_code_page_text VALUES (N'王小明');",
+        )
+        .await
+        .unwrap();
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.t.label", "nvarchar(20)", "varchar(20)"),
+    )
+    .await;
+    assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN label varchar(20) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy.conn.query("SELECT label FROM dbo.t;").await.unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.old_text.label", "ntext", "varchar(20)"),
+    )
+    .await;
+    assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.old_text ALTER COLUMN label varchar(20) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.old_text;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.max_text.label", "nvarchar(20)", "varchar(max)"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.max_text ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.max_text;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.system_name.label", "sysname", "varchar(max)"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.system_name ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.system_name;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.legacy_text_target.label", "nvarchar(20)", "text"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.legacy_text_target ALTER COLUMN label text NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT CONVERT(varchar(max), label) FROM dbo.legacy_text_target;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan(
+            "dbo.alias_target.label",
+            "nvarchar(20)",
+            "character varying(max)",
+        ),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.alias_target ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.alias_target;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.utf8_source.label", "varchar(20)", "varchar(10)"),
+    )
+    .await;
+    assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.utf8_source ALTER COLUMN label varchar(10) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.utf8_source;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.utf8_widening.label", "varchar(20)", "varchar(max)"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.utf8_widening ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.utf8_widening;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    let measured = counts(
+        &mut legacy.conn,
+        &plan("dbo.legacy_code_page_text.label", "text", "varchar(max)"),
+    )
+    .await;
+    assert_eq!(measured.len(), 1, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    legacy
+        .conn
+        .execute("ALTER TABLE dbo.legacy_code_page_text ALTER COLUMN label varchar(max) NULL;")
+        .await
+        .unwrap();
+    let rows = legacy
+        .conn
+        .query("SELECT label FROM dbo.legacy_code_page_text;")
+        .await
+        .unwrap();
+    let changed: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(changed, "???");
+    legacy.drop().await;
+
+    // Under a UTF-8 database default the characters survive, but varchar(4)
+    // holds only the first three-byte character. LEN still answers 3 <= 4;
+    // the round trip catches the byte truncation that makes ALTER refuse.
+    let mut utf8 = TestDb::create("unicode_narrow_utf8").await;
+    utf8.conn
+        .execute("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS_SC_UTF8;")
+        .await
+        .unwrap();
+    utf8.conn
+        .execute(
+            "CREATE TABLE dbo.t (label nvarchar(20) NULL);\n\
+             INSERT dbo.t VALUES (N'王小明');",
+        )
+        .await
+        .unwrap();
+    let measured = counts(
+        &mut utf8.conn,
+        &plan("dbo.t.label", "nvarchar(20)", "varchar(4)"),
+    )
+    .await;
+    assert_eq!(count(&measured, "too long"), 0, "{measured:?}");
+    assert_eq!(
+        count(&measured, "changed when converted"),
+        1,
+        "{measured:?}"
+    );
+    let err = utf8
+        .conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN label varchar(4) NULL;")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("2628"), "{err}");
+    utf8.drop().await;
+}
+
 /// A unique index is a constraint, and a *filtered* one constrains only the
 /// rows its predicate keeps. Both halves are claims about this engine, and
 /// both decide whether a valid plan is refused, so the engine answers them:
