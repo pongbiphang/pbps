@@ -6236,6 +6236,15 @@ SPEC is in sync with all of these.
     `r10.x` with a catalog that says `r10."x\u{a0}"`. Every trim in these
     scans is an ASCII one now.
 
+    **Amended: a `$` after an identifier byte is part of the name.** `$`
+    continues an identifier on this engine, and measured, `CREATE FUNCTION
+    dq.f(foo$tag$ integer)` is accepted with the identity `dq.f(integer)`.
+    The per-character scans asked the literal test from the `$` alone, read
+    `$tag$` as the opener of a dollar-quoted literal nothing closed, and
+    refused the routine. The literal test now knows the byte before it — the
+    rule the dialect's normalizer already applied — in one helper every such
+    scan goes through.
+
 309. **A module the deparse could not find is the catalog moving, not a reader
     out of step with its query.** The pull reads the catalog in one
     `REPEATABLE READ READ ONLY` transaction so that it cannot report half of a

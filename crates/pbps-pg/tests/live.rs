@@ -6892,6 +6892,17 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
             "%S%.x\u{a0}",
             "(a %S%.x\u{a0} DEFAULT NULL) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
         ),
+        // `$` continues a name — measured, `foo$tag$` is one parameter name,
+        // and a scan that read its `$tag$` as a literal's opener refused the
+        // routine the engine creates under this very key.
+        (
+            "integer",
+            "(foo$tag$ integer) RETURNS int LANGUAGE sql AS $$ SELECT foo$tag$ $$",
+        ),
+        (
+            "integer, text",
+            "(a$ integer, b$c$ text DEFAULT $x$a$x$) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
     ]
     .into_iter()
     .enumerate()

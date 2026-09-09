@@ -164,7 +164,7 @@ fn without_grouping(expression: &str) -> &str {
             if i < consumed_to {
                 continue;
             }
-            if let Some(len) = skip_datum(&e[i..]) {
+            if let Some(len) = skip_datum_at(e, i) {
                 consumed_to = i + len;
                 continue;
             }
@@ -204,6 +204,29 @@ fn without_grouping(expression: &str) -> &str {
 /// than answering `None`. Nothing after it is code — the engine refuses the
 /// whole expression by name — and a scan that resumed there would count
 /// parentheses that are inside the run-on literal.
+/// [`skip_datum`] for the text at `at`, which knows what came before it.
+///
+/// A `$` after an identifier byte is a byte of that identifier, not the
+/// opener of a dollar-quoted literal: `$` continues a name on this engine
+/// (`continues_ident`), and **measured**, `CREATE FUNCTION dq.f(foo$tag$
+/// integer)` is accepted with the identity `dq.f(integer)` and the name
+/// `"foo$tag$"`. Read from the `$` alone, `$tag$` opened a literal nothing
+/// closed, the scan consumed the rest of the definition, and the gate refused
+/// a routine the engine creates under exactly the declared key. Every scan
+/// that walks per character asks this rather than [`skip_datum`] directly,
+/// so that there is one place the rule is spelled.
+fn skip_datum_at(text: &str, at: usize) -> Option<usize> {
+    if text[at..].starts_with('$')
+        && text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(pbps_dialect::continues_ident)
+    {
+        return None;
+    }
+    skip_datum(&text[at..])
+}
+
 fn skip_datum(rest: &str) -> Option<usize> {
     // Longest opener first: `E'` and `U&'` are openers of their own, not a
     // name followed by a literal.
@@ -407,7 +430,7 @@ fn without_trailing_trivia(e: &str) -> &str {
             consumed_to = e.len() - tail.len();
             continue;
         }
-        if let Some(len) = skip_datum(rest) {
+        if let Some(len) = skip_datum_at(e, i) {
             // A literal, which is code. An *unterminated* block comment reaches
             // here too, because the branch above wanted a closed one: it stays
             // code, so the expression reaches the engine as written and is
@@ -1108,7 +1131,7 @@ fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
     let mut depth = 0usize;
     let mut at = 0usize;
     while at < definition.len() {
-        if let Some(skip) = skip_datum(&definition[at..]) {
+        if let Some(skip) = skip_datum_at(definition, at) {
             at += skip;
             continue;
         }
@@ -1320,7 +1343,7 @@ fn parameter_list(definition: &str) -> Option<&str> {
     let mut depth = 0usize;
     let mut at = 0usize;
     while at < body.len() {
-        if let Some(skip) = skip_datum(&body[at..]) {
+        if let Some(skip) = skip_datum_at(body, at) {
             at += skip;
             continue;
         }
@@ -1353,7 +1376,7 @@ fn parameters(list: &str) -> Vec<&str> {
     let mut start = 0usize;
     let mut at = 0usize;
     while at < list.len() {
-        if let Some(skip) = skip_datum(&list[at..]) {
+        if let Some(skip) = skip_datum_at(list, at) {
             at += skip;
             continue;
         }
@@ -1446,7 +1469,7 @@ fn before_the_default(text: &str) -> &str {
     let mut depth = 0usize;
     let mut at = 0usize;
     while at < text.len() {
-        if let Some(skip) = skip_datum(&text[at..]) {
+        if let Some(skip) = skip_datum_at(text, at) {
             at += skip;
             continue;
         }
@@ -2262,6 +2285,16 @@ mod tests {
             (
                 "app.f(integer)",
                 "(integer) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+            ),
+            // `$` continues a name: measured, `foo$tag$` is one parameter
+            // name and not `foo` followed by a literal that never closes.
+            (
+                "app.f(integer)",
+                "(foo$tag$ integer) RETURNS int LANGUAGE sql AS $$ SELECT foo$tag$ $$",
+            ),
+            (
+                "app.f(integer, text)",
+                "(a$ integer, b$c$ text DEFAULT $x$a$x$) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
             ),
             // A spelling the engine folds to the identity's.
             (
