@@ -1,0 +1,4 @@
+interface:
+  display_name: "Parallel Issue Loop"
+  short_description: "Run coordinated parallel pbps issue and review loops"
+  default_prompt: "Use $parallel-issue-loop to select and run parallel pbps issue loops."
