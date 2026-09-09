@@ -25,8 +25,8 @@ them before advancing a PR.
    ```
 
    Run `cargo deny check` when dependencies change. If a required command cannot
-   run, report the command, failure output, and reason; do not call the issue
-   locally verified.
+   run or does not pass, report the command, failure output, and reason, then
+   stop before committing or pushing until every required check runs and passes.
 6. Commit with a conventional commit message, push only the assigned branch,
    and open or update a draft PR when authorized. Record the pushed head SHA.
 

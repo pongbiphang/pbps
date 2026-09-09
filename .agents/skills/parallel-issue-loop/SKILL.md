@@ -22,7 +22,11 @@ session slot for the primary; if the host cannot run all requested workers at
 once, batch the excess. Accept `reasoning`, `effort`, or
 `model_reasoning_effort` as aliases for `reasoning_effort`. Validate the chosen
 model/effort pair against the current host before spawning and never silently
-substitute another pair.
+substitute another pair. Apply the selected values through `spawn_agent`'s
+`model` and `reasoning_effort` parameters. Because explicit model or effort
+overrides are incompatible with a full-history fork, set `fork_turns` to
+`"none"` or a positive turn count and include all required issue and repository
+context in the worker message.
 
 When the user invokes this skill for parallel processing, that run supersedes
 the older sequential "one active issue/PR at a time" convention. It does not
@@ -31,8 +35,10 @@ change the one-issue-per-subagent rule or silently alter future non-skill runs.
 Treat these as spawn-time defaults, not global Codex configuration changes. Do
 not edit `.codex/config.toml` merely to apply one invocation. If the requested
 agent count exceeds the session concurrency limit, run issues in batches and
-report the effective concurrency. If fewer eligible issues exist, spawn only
-the number that can be safely assigned.
+report the effective concurrency. Finishing later batches from that originally
+requested set is completion of the same wave, not a refill or an additional
+wave. If fewer eligible issues exist, spawn only the number that can be safely
+assigned.
 
 The default stopping condition is one wave: select at most `agents` eligible
 issues, run those issues to a terminal state, and stop. Refill freed slots only
@@ -133,5 +139,8 @@ when every condition in the review reference is satisfied.
 
 After a merge, verify the intended issue closed, capture the merge commit, clean
 the issue worktree and local branch safely, update dependent agents, and report
-the review count and any explicitly deferred findings. Continue filling free
-slots only when the user's requested stopping condition permits it.
+the review count and any explicitly deferred findings. If the merge touched
+`Cargo.toml`, `Cargo.lock`, `deny.toml`, or the dependency-audit workflow, wait
+for the dependency audit; a failure becomes the next task before any free slot
+is refilled. Otherwise, continue filling free slots only when the user's
+requested stopping condition permits it.
