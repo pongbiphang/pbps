@@ -5781,7 +5781,10 @@ SPEC is in sync with all of these.
     it to `"…"`, so one spelling of a name is one key; a form that does not
     decode is refused as text that is not one argument, which is what the
     engine says of it too. The decoder lives in the model, and the emitter's
-    trigger scan (302) reads it from there. The quoted form is then spelled
+    trigger scan (302) reads it from there. The escape character may itself
+    be the punctuation an identity is split on — measured, `UESCAPE ','` and
+    `UESCAPE ')'` are accepted — so the identity's own split steps over the
+    clause as the three characters it is. The quoted form is then spelled
     the way the engine spells a quoted name in an identity: bare where its
     `quote_identifier` leaves it bare — `[a-z_][a-z0-9_]*` and not a keyword
     the grammar reserves in some position — and quoted everywhere else.

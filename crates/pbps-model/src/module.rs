@@ -585,6 +585,21 @@ fn split_top_level(args: &str) -> Option<Vec<&str>> {
         }
         match c {
             '"' => quoted = true,
+            // The one place a single quote is part of an argument: the
+            // escape character of a `UESCAPE 'x'` clause, which may be the
+            // very punctuation this scan splits on — measured, `CREATE
+            // FUNCTION ue.f(a ue.U&"d,0061ta" UESCAPE ',', b ue.U&"d)0061ta"
+            // UESCAPE ')')` is accepted with the identity `ue.f(ue.data,
+            // ue.data)`. Stepped over as the three characters it is; a quote
+            // that is not one is left for `RoutineArg` to refuse.
+            '\'' => {
+                let mut rest = args[i + 1..].chars();
+                if let (Some(escape), Some('\'')) = (rest.next(), rest.next()) {
+                    chars.next();
+                    let _ = escape;
+                    chars.next();
+                }
+            }
             '(' => parens += 1,
             ')' => parens = parens.checked_sub(1)?,
             '[' => brackets += 1,
@@ -2108,6 +2123,43 @@ mod tests {
 
     /// The identity string carries them the same way, which is what makes the
     /// map key and the JSON key the same text.
+    /// A `UESCAPE` character may be the punctuation the identity is split
+    /// on — measured, the engine accepts `,`, `(`, `)`, `[`, `]` and `.` as
+    /// the escape — and the split has to step over the clause rather than
+    /// cut the identity at it.
+    #[test]
+    fn an_escape_character_that_is_punctuation_does_not_split_the_identity() {
+        for (spelled, canonical) in [
+            (
+                "app.f(app.U&\"d,0061ta\" UESCAPE ',')",
+                "app.f(app.\"data\")",
+            ),
+            (
+                "app.f(app.U&\"d)0061ta\" UESCAPE ')')",
+                "app.f(app.\"data\")",
+            ),
+            (
+                "app.f(app.U&\"d(0061ta\" UESCAPE '(')",
+                "app.f(app.\"data\")",
+            ),
+            (
+                "app.f(app.U&\"d[0061ta\" UESCAPE '[', integer)",
+                "app.f(app.\"data\",integer)",
+            ),
+            (
+                "app.f(integer, app.U&\"d]0061ta\" UESCAPE ']', text)",
+                "app.f(integer,app.\"data\",text)",
+            ),
+        ] {
+            let id: ModuleId = spelled.parse().unwrap_or_else(|e| panic!("{spelled}: {e}"));
+            assert_eq!(id.to_string(), canonical, "{spelled}");
+        }
+        // A quote that is not an escape clause is still not an argument.
+        for malformed in ["app.f(a'b)", "app.f('x')", "app.f(app.U&\"x\" UESCAPE ',)"] {
+            assert!(malformed.parse::<ModuleId>().is_err(), "{malformed}");
+        }
+    }
+
     #[test]
     fn an_identity_holding_an_array_and_a_quoted_name_round_trips() {
         for spelling in [

@@ -7115,6 +7115,10 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         format!("{s}.U&\"\\006doney_amount\"").as_str(),
         format!("{s}.u&\"!006doney_amount\" UESCAPE '!'").as_str(),
         format!("U&\"{s}\".U&\"\\0073elect\"").as_str(),
+        // And the escape character may be the punctuation an identity is
+        // split on.
+        format!("{s}.U&\",006doney_amount\" UESCAPE ','").as_str(),
+        format!("{s}.U&\"money_amount\" UESCAPE ')'").as_str(),
     ]
     .map(str::to_owned);
 
