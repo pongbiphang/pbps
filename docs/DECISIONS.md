@@ -5922,6 +5922,15 @@ SPEC is in sync with all of these.
     module id that does not survive `ModuleId::from_str(&id.to_string())` takes
     its object out of the pull rather than into a schema that will not load.
 
+    **Amended: a trigger is held only where its relation is.** The trigger
+    arm read every user trigger; the table reader does not hold every table.
+    Measured, the engine allows a trigger on a partitioned table and on an
+    `UNLOGGED` one, and read back without its relation the trigger was a
+    module whose `on:` named a table the schema did not have — `check_names`
+    refused the pull whole. The arm now selects by the table reader's own
+    predicate (or a view), the complement is named as a limitation beside the
+    relation's own, and a test ties the three to one string.
+
 305. **Extension-owned objects are left out of the pull silently, and that is
     not the "absent, empty and unreadable" failure.** `CREATE EXTENSION …
     SCHEMA app` puts an extension's functions and views in a project's schema.
@@ -6288,6 +6297,15 @@ SPEC is in sync with all of these.
     resolves nothing, and the object is planned as absent. The emitters' own
     `unquoted` has always been `to_ascii_lowercase`; this is the same rule in
     the model, where the two were quietly disagreeing.
+
+    **Amended: whitespace is ASCII too.** The same rule, one character class
+    over. `char::is_whitespace` is Unicode's answer, and a non-breaking space
+    is whitespace to it; to this engine every non-ASCII byte is an identifier
+    character. Measured, `CREATE FUNCTION r8.f(v r8.a\u{a0}b)` is accepted with
+    the identity `r8.f(r8."a\u{a0}b")`, and `r8.a b` with a plain space names
+    no type at all — so the fold turned a valid key into one that resolved
+    nothing. The fold trims and collapses ASCII whitespace only, and the
+    whitelist admits any non-ASCII byte, which is `continues_ident`'s rule.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three

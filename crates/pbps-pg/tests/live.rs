@@ -7102,6 +7102,54 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "Ätype",
         "and so does the dialect"
     );
+    // And whitespace is ASCII to the engine for the same reason: a
+    // non-breaking space is a name byte. Measured here, `a\u{a0}b` unquoted is
+    // one identifier, kept and quoted, where `a b` with a plain space names no
+    // type at all — so the fold that took Unicode's word for what a space is
+    // turned a valid key into one that resolved nothing.
+    conn.execute(&format!("CREATE TYPE {s}.\"a\u{a0}b\" AS ENUM ('a')"))
+        .await
+        .expect("a type whose name holds a non-breaking space");
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.nbsp(a {s}.a\u{a0}b) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
+    ))
+    .await
+    .expect("declared unquoted, which is what a Unicode whitespace fold would change");
+    let identity = format!("{s}.nbsp({s}.\"a\u{a0}b\")");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT p.oid::regprocedure::text FROM pg_catalog.pg_proc p
+                  WHERE p.pronamespace = '{s}'::regnamespace AND p.proname = 'nbsp'"
+            )
+        )
+        .await,
+        identity,
+        "the engine kept the byte and quoted the name"
+    );
+    let kept: pbps_model::RoutineArg = format!("{s}.a\u{a0}b").parse().expect("a routine argument");
+    let kept_folded = pbps_dialect::Dialect::normalize_routine_arg(&pg, &kept).expect("normalize");
+    assert_eq!(
+        kept_folded.as_str(),
+        format!("{s}.a\u{a0}b"),
+        "the fold leaves the byte alone"
+    );
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT '{s}.nbsp({kept_folded})'::regprocedure::text")
+        )
+        .await,
+        identity,
+        "and the folded key resolves to the routine the body created"
+    );
+    conn.execute(&format!(
+        "DROP FUNCTION {s}.nbsp({s}.\"a\u{a0}b\"); DROP TYPE {s}.\"a\u{a0}b\""
+    ))
+    .await
+    .expect("drop them before the pull, which is about the other fixture");
+
     conn.execute(&format!("DROP FUNCTION {s}.folded({s}.\"Ätype\")"))
         .await
         .expect("drop it before the pull, which is about the other fixture");
@@ -7329,6 +7377,96 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
         .await,
         0,
         "a rule that survived the rebuild would make this refusal needless"
+    );
+
+    drop_schema(&mut conn, &s).await;
+}
+
+/// A trigger on a relation the table reader leaves out — a partitioned table,
+/// an `UNLOGGED` one — came back in the pull without the relation it is on, and
+/// `check_names` refused the whole schema: a pull nothing could load. Measured,
+/// the engine allows a trigger on both. The trigger is left out with its
+/// relation now, and named beside it rather than silently gone.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_named() {
+    let s = emit_schema("trigger_unheld");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!(
+            "CREATE FUNCTION {s}.tg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!(
+            "CREATE TRIGGER audit BEFORE INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
+        ),
+        format!("CREATE TABLE {s}.part (id int, d date) PARTITION BY RANGE (d)"),
+        format!(
+            "CREATE TRIGGER audit BEFORE INSERT ON {s}.part FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
+        ),
+        format!("CREATE UNLOGGED TABLE {s}.scratch (id int)"),
+        format!(
+            "CREATE TRIGGER audit BEFORE INSERT ON {s}.scratch FOR EACH ROW EXECUTE FUNCTION \
+             {s}.tg()"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let pulled = pull(&mut conn).await;
+    let modules = our_modules(&pulled, &s);
+    let triggers: Vec<String> = modules
+        .keys()
+        .filter(|id| matches!(id, pbps_model::ModuleId::Trigger { .. }))
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        triggers,
+        vec![format!("{s}.t.audit")],
+        "only the trigger whose table the pull holds"
+    );
+
+    // What the trigger without its table broke: the pull's own schema is one
+    // the model refuses to name-check. Scoped to this schema, because the
+    // container is shared.
+    let ours = Schema {
+        tables: pulled
+            .schema
+            .tables
+            .iter()
+            .filter(|(name, _)| name.schema == s)
+            .map(|(name, table)| (name.clone(), table.clone()))
+            .collect(),
+        modules,
+        ..Schema::default()
+    };
+    let problems = pbps_model::module::check_names(&ours);
+    assert!(problems.is_empty(), "{problems:?}");
+
+    // Named, beside the relations they are on, which are named already.
+    let named: Vec<&str> = ours_limitations(&pulled, &s)
+        .iter()
+        .map(|l| l.table.name.as_str())
+        .collect();
+    for left_out in ["part", "part.audit", "scratch", "scratch.audit"] {
+        assert!(
+            named.contains(&left_out),
+            "{left_out} is not named in {named:?}"
+        );
+    }
+    assert!(!named.contains(&"t.audit"), "{named:?}");
+    let detail = &ours_limitations(&pulled, &s)
+        .iter()
+        .find(|l| l.table.name == "part.audit")
+        .expect("named")
+        .detail;
+    assert!(
+        detail.contains(&format!("a trigger on `{s}.part`")),
+        "{detail}"
     );
 
     drop_schema(&mut conn, &s).await;

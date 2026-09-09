@@ -84,9 +84,19 @@ fn tables_query() -> String {
         "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r'
+      WHERE {ORDINARY_TABLE}
         AND {NOT_A_PROJECTS_SCHEMA}
         AND {NOT_ONE_OF_OURS}
+      ORDER BY n.nspname, c.relname"
+    )
+}
+
+/// What makes a `pg_class` row `c` a table this model holds: the predicate of
+/// [`tables_query`], as one string, so that the one other reader that has to
+/// agree with it — the trigger arm of [`modules_query`], and its complement in
+/// [`unheld_modules_query`] — cannot drift from it. Each flag is the negation
+/// of a case [`partitioned_query`] names.
+const ORDINARY_TABLE: &str = "c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                          WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
         AND NOT c.relrowsecurity
@@ -96,9 +106,20 @@ fn tables_query() -> String {
         AND c.relreplident = 'd'
         AND NOT c.relhasrules
         AND c.reloftype = 0
-        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')
-      ORDER BY n.nspname, c.relname"
-    )
+        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')";
+
+/// Whether the relation `c` a trigger is on is one the pull reads back — a
+/// view, or a table [`tables_query`] holds.
+///
+/// A trigger is read with its relation or not at all. **Measured**, the engine
+/// allows a trigger on a partitioned table and on an `UNLOGGED` one, and a
+/// trigger read back without the relation it is on is a module whose `on:`
+/// names a table the schema does not have — `check_names` refuses that, so
+/// the whole pull was one nothing could load. The relation is already named
+/// as a limitation by [`partitioned_query`]; the trigger is named beside it
+/// by [`unheld_modules_query`] rather than silently gone.
+fn on_a_relation_the_pull_holds() -> String {
+    format!("(c.relkind = 'v' OR ({ORDINARY_TABLE} AND {NOT_ONE_OF_OURS}))")
 }
 
 /// Objects owned by an extension, which are nobody's declarations.
@@ -149,6 +170,7 @@ fn modules_query() -> String {
     let view_not_extension = not_an_extensions("c.oid", "pg_class");
     let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
     let trigger_not_extension = not_an_extensions("tg.oid", "pg_trigger");
+    let held = on_a_relation_the_pull_holds();
     format!(
         "SELECT c.oid::int8 AS oid, 'v' AS kind, n.nspname AS schema_name,
                 c.relname AS name, '' AS on_table,
@@ -175,6 +197,7 @@ fn modules_query() -> String {
           WHERE NOT tg.tgisinternal
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
+            AND {held}
           ORDER BY 3, 4, 1"
     )
 }
@@ -219,6 +242,8 @@ fn module_args_query() -> String {
 fn unheld_modules_query() -> String {
     let matview_not_extension = not_an_extensions("c.oid", "pg_class");
     let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
+    let trigger_not_extension = not_an_extensions("tg.oid", "pg_trigger");
+    let held = on_a_relation_the_pull_holds();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS name,
                 'a materialized view, which holds rows a plan would have to refresh' AS detail
@@ -236,6 +261,17 @@ fn unheld_modules_query() -> String {
           WHERE p.prokind IN ('a', 'w')
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {proc_not_extension}
+          UNION ALL
+         SELECT n.nspname, c.relname || '.' || tg.tgname,
+                'a trigger on `' || n.nspname || '.' || c.relname
+                  || '` (not a table or a view this pull holds)'
+           FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT tg.tgisinternal
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {trigger_not_extension}
+            AND NOT {held}
           ORDER BY 1, 2"
     )
 }
@@ -1164,6 +1200,28 @@ mod tests {
     /// a routine the first returns and the second does not is keyed `f()`,
     /// which is a different object from `f(integer)` under a name that looks
     /// right.
+    /// A trigger is read with its relation or not at all: the arm that reads
+    /// it and the arm that names it as left out are the table reader's own
+    /// predicate and its negation, and a copy of that predicate would be a
+    /// rule with two spellings.
+    #[test]
+    fn a_trigger_is_selected_by_the_predicate_that_selects_its_table() {
+        assert!(tables_query().contains(ORDINARY_TABLE));
+        let held = on_a_relation_the_pull_holds();
+        assert!(held.contains(ORDINARY_TABLE));
+        assert!(held.contains("c.relkind = 'v'"));
+        assert!(
+            modules_query().contains(&format!("AND {held}")),
+            "{}",
+            modules_query()
+        );
+        assert!(
+            unheld_modules_query().contains(&format!("AND NOT {held}")),
+            "{}",
+            unheld_modules_query()
+        );
+    }
+
     #[test]
     fn a_routine_and_its_arguments_are_selected_by_one_predicate() {
         for query in [modules_query(), module_args_query()] {

@@ -120,7 +120,14 @@ impl FromStr for RoutineArg {
     type Err = RoutineArgError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let t = s.trim();
+        // ASCII whitespace, here and below: to this engine every non-ASCII
+        // byte is an identifier character, a non-breaking space included.
+        // Measured, `CREATE FUNCTION r8.f(v r8.a\u{a0}b)` is accepted and its
+        // identity reads `r8.f(r8."a\u{a0}b")` — the byte kept and the name
+        // quoted — while `r8.a b` with a plain space names no type at all. A
+        // fold that took Unicode's word for what whitespace is turned the
+        // first spelling into the second, and the key pointed at nothing.
+        let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
         if t.is_empty() {
             return Err(RoutineArgError::Empty);
         }
@@ -148,7 +155,7 @@ impl FromStr for RoutineArg {
                 }
                 continue;
             }
-            if c.is_whitespace() {
+            if c.is_ascii_whitespace() {
                 pending_space = !out.is_empty();
                 continue;
             }
@@ -159,7 +166,10 @@ impl FromStr for RoutineArg {
                 ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
                 ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
                 ',' | '"' | '.' | '_' => {}
-                c if c.is_alphanumeric() => {}
+                // Any non-ASCII byte is a name byte, which is the engine's own
+                // rule (`continues_ident`): a letter, a symbol, a space that is
+                // not the ASCII one.
+                c if c.is_alphanumeric() || !c.is_ascii() => {}
                 // Everything else. A type name is written with letters,
                 // digits, `_`, `.`, and the punctuation above; a semicolon, an
                 // apostrophe or the start of a comment is not one, and this
@@ -1874,6 +1884,13 @@ mod tests {
             // which names a type that does not exist.
             ("MN.Ätype", "mn.Ätype"),
             ("ÄÖÜ", "ÄÖÜ"),
+            // And ASCII whitespace only: a non-breaking space is a name byte
+            // to the engine — measured, `r8.a\u{a0}b` is a type and `r8.a b`
+            // is not — so it is neither folded to a space nor trimmed away.
+            ("r8.a\u{a0}b", "r8.a\u{a0}b"),
+            ("  r8.a\u{2003}b  ", "r8.a\u{2003}b"),
+            ("\u{a0}r8.x\u{a0}", "\u{a0}r8.x\u{a0}"),
+            ("r8.→", "r8.→"),
             ("\"char\"", "\"char\""),
             ("\"CHAR\"", "\"CHAR\""),
             ("s.\"Odd Name\"", "s.\"Odd Name\""),
