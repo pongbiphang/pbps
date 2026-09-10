@@ -78,9 +78,8 @@ fn default_constraint_name(table: &TableName, column: &str) -> String {
 /// 235 units — accepted by `plan` and refused at `apply`, which moves the
 /// failure from the cheap end to the expensive one.
 ///
-/// `quote` itself still counts characters. That is the same distinction on
-/// names the *user* wrote rather than on the ones generated here, so it is
-/// tracked separately and not changed under this one.
+/// `quote` applies the same unit to names the *user* wrote, so generated and
+/// user-written identifiers meet one measured boundary.
 fn utf16_units(s: &str) -> usize {
     s.encode_utf16().count()
 }
