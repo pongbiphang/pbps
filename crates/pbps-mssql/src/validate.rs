@@ -173,9 +173,13 @@ fn key_shape(base: &str, text: &str) -> Option<&'static str> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let fits = match base {
         "decimal" | "numeric" | "money" | "smallmoney" | "float" | "real" => {
-            let n = text
-                .strip_prefix(['-', '+'])
-                .map_or(text, |s| s.trim_start_matches(' '));
+            let n = text.strip_prefix(['-', '+']).map_or(text, |s| {
+                if matches!(base, "float" | "real") {
+                    s
+                } else {
+                    s.trim_start_matches(' ')
+                }
+            });
             let (mantissa, exponent) = match n.split_once(['e', 'E']) {
                 Some((m, e)) => (m, Some(e)),
                 None => (n, None),
@@ -1051,6 +1055,10 @@ mod tests {
     #[test]
     fn signed_numeric_keys_allow_spaces_but_not_sql_expressions() {
         use pbps_model::{DataMode, Row, RowKey, TableData};
+        for base in ["float", "real"] {
+            assert!(key_shape(base, "- 1").is_some());
+            assert!(key_shape(base, "+1").is_none());
+        }
         for base in ["int", "decimal(10,2)"] {
             let (name, mut t) = base_table();
             t.columns

@@ -119,6 +119,131 @@ async fn signed_defaults_are_comparable_before_and_after_catalog_folding() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn throwing_signed_defaults_do_not_break_explicit_row_reads() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("signed_cast_safety").await;
+    for (i, (default, safe)) in [
+        ("-CAST('abc' AS int)", false),
+        ("-CAST('256' AS tinyint)", false),
+        ("-CAST('255' AS tinyint)", true),
+        ("-CAST('-32768' AS smallint)", false),
+        ("+CAST('-32768' AS smallint)", true),
+        ("-CAST('-9223372036854775808' AS bigint)", false),
+        ("+CAST('-9223372036854775808' AS bigint)", true),
+        ("-CAST(1.25 AS int)", true),
+        ("-CAST('1.25' AS int)", false),
+        ("-CAST(CAST(1.5 AS money) AS int)", true),
+        ("-CAST('9.995' AS decimal(3,2))", false),
+        ("-CAST('9.994' AS decimal(3,2))", true),
+        ("-CAST('922337203685477.5807' AS money)", true),
+        ("-CAST('922337203685477.5808' AS money)", false),
+        ("-CAST('-922337203685477.5808' AS money)", false),
+        ("+CAST('-922337203685477.5808' AS money)", true),
+        ("-CAST('214748.3647' AS smallmoney)", true),
+        ("-CAST('214748.3648' AS smallmoney)", false),
+        ("-CAST('214748.36475' AS smallmoney)", false),
+        ("-CAST('-214748.3648' AS smallmoney)", false),
+        ("+CAST('-214748.3648' AS smallmoney)", true),
+        ("-CAST('-0.00005' AS money)", true),
+        ("-CAST('+ 1' AS float)", false),
+        ("-CAST('+-1' AS float)", false),
+        ("-CAST('--1' AS real)", false),
+        ("-CAST('1e38' AS real)", true),
+        ("-CAST('1e39' AS real)", false),
+        ("-CAST('1e308' AS float)", true),
+        ("-CAST('1e309' AS float)", false),
+        ("-CAST('1e-400' AS float)", true),
+        ("-CAST('1e-100' AS real)", true),
+        // Valid engine conversions outside the proof's grammar stay unknown.
+        ("-CAST(CAST('1.25' AS float) AS int)", false),
+        ("-CAST('$1' AS money)", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = TableName::new("dbo", format!("t{i}"));
+        let approximate = default.contains("float") || default.contains("real");
+        let column_type = if approximate {
+            "float"
+        } else {
+            "decimal(38,10)"
+        };
+        db.conn.execute(&format!("CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {column_type} DEFAULT ({default})); INSERT dbo.t{i}(id,n) VALUES(1,1);")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        let mut column = Column::new(column_type.parse().unwrap());
+        // The catalog deparse is the spelling that broke actual row reads.
+        let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
+        column.default = Some(
+            defaults[0]
+                .try_get::<&str>("definition")
+                .unwrap()
+                .unwrap()
+                .to_owned(),
+        );
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let read = |key| {
+            pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let query = read("1");
+        let rows = db
+            .conn
+            .query(&query.sql)
+            .await
+            .unwrap_or_else(|e| panic!("explicit row with {default}: {e}"));
+        let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+        assert_eq!(
+            pbps_mssql::rows::confirms_default(&table.columns["n"]),
+            safe,
+            "{default}"
+        );
+        assert_eq!(observed.unknown.contains("n"), !safe, "{default}");
+        if safe {
+            db.conn
+                .execute(&format!("INSERT dbo.t{i}(id) VALUES(2);"))
+                .await
+                .unwrap_or_else(|e| panic!("proved default {default}: {e}"));
+            // The cast proof concerns evaluation, not float-to-text style 3.
+            // Ask directly for approximate values: that existing formatter
+            // can itself throw for an otherwise valid stored float.
+            if approximate {
+                let rows = db
+                    .conn
+                    .query(&format!(
+                        "SELECT COUNT(*) AS n FROM dbo.t{i} WHERE id=2 AND n=({default})"
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1), "{default}");
+                continue;
+            }
+            let query = read("2");
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("default row with {default}: {e}; {}", query.sql));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert!(observed.at_default.contains("n"), "{default}");
+        }
+    }
+    db.drop().await;
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,

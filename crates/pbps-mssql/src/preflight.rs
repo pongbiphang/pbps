@@ -3361,10 +3361,27 @@ mod tests {
                 && sql.contains(") THEN 1 ELSE 0 END)'"),
             "the literal default is what the engine compares: {sql}"
         );
+        for default in [
+            "-CAST(1.25 AS int)",
+            "-CAST('9.994' AS decimal(3,2))",
+            "CONVERT([smallint],'-32768')",
+        ] {
+            let p = probes(&plan(vec![insert(default), delete.clone()]));
+            assert_eq!(
+                p.len(),
+                1,
+                "a safe numeric conversion must not add an unprobeable refusal: {default}: {p:?}"
+            );
+            assert!(p[0].sql.contains("N'status_code'"), "{default}: {p:?}");
+        }
         // Not a literal: nothing to compare before it runs. NULL: no row.
         // The key is still written, so a key spanning it is asked about,
         // and one spanning `status_code` is not.
-        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 1))", "(NULL)"] {
+        for default in [
+            "(NEXT VALUE FOR [dbo].[s])",
+            "(CONVERT(int, 'abc'))",
+            "(NULL)",
+        ] {
             let sql = sql_of(&plan(vec![insert(default), delete.clone()]));
             assert!(!sql.contains("N'status_code'"), "{default}: {sql}");
             assert!(
@@ -3376,7 +3393,7 @@ mod tests {
         // where a foreign key to the table spans the column the write is
         // refused, by a second probe that counts such columns (124). `NULL`
         // names no row and needs none.
-        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 1))"] {
+        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 'abc'))"] {
             let p = probes(&plan(vec![insert(default), delete.clone()]));
             assert_eq!(p.len(), 2, "{default}: {p:?}");
             assert!(

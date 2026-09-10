@@ -692,25 +692,7 @@ fn constant_trivia(text: &str) -> Option<String> {
     Some(out)
 }
 
-fn constant_operand(default: &str, depth: usize) -> bool {
-    // Declarations are untrusted input; nested signs/casts must not exhaust
-    // the reader's stack. An unusually deep constant can remain unconfirmed.
-    if depth > 64 {
-        return false;
-    }
-    let mut s = default.trim();
-    while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
-        s = s[1..s.len() - 1].trim();
-    }
-    if s.is_empty() {
-        return false;
-    }
-    if let Some(operand) = s.strip_prefix(['-', '+']) {
-        return constant_operand(operand, depth + 1);
-    }
-    // SQL Server retains a numeric CAST as CONVERT in the catalog. Restrict
-    // traversal to built-in numeric targets, whose conversion is independent
-    // of date/language settings, and never admit a nonconstant operand.
+fn numeric_cast(s: &str) -> Option<(&str, ColumnType)> {
     let lower = s.to_ascii_lowercase();
     let cast = lower.strip_prefix("cast").and_then(|rest| {
         let start = s.len() - rest.len();
@@ -742,26 +724,241 @@ fn constant_operand(default: &str, depth: usize) -> bool {
         })?;
         Some((&body[separator + 1..], body[..separator].trim()))
     });
-    if depth > 0
-        && let Some((operand, ty)) = cast.or(convert)
+    let (operand, ty) = cast.or(convert)?;
+    let ty = ty.replace(['[', ']'], "").parse::<ColumnType>().ok()?;
+    Some((operand, crate::types::normalize(&ty).ok()?))
+}
+
+// This is a bounded safety proof, not a replacement SQL evaluator: its value
+// never enters a query or the model. The original SQL still supplies the value.
+// Exact decimal syntax has at most 38 digits; numeric strings use that syntax
+// (scientific notation also reaches float/real). Approximate-to-exact casts,
+// currency-formatted strings, arbitrary expressions and user types stay unknown.
+enum Numeric {
+    Exact(ExactNumeric),
+    Approximate(f64),
+    Text(String),
+    Null,
+}
+
+struct ExactNumeric {
+    coefficient: i128,
+    scale: u32,
+    bounds: (i128, i128),
+    tiny: bool,
+    money: bool,
+}
+
+fn decimal_number(text: &str) -> Option<ExactNumeric> {
+    let text = text.trim_matches(' ');
+    let negative = text.starts_with('-');
+    let text = text
+        .strip_prefix(['-', '+'])
+        .unwrap_or(text)
+        .trim_start_matches(' ');
+    let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if integer.is_empty() && fraction.is_empty()
+        || !integer
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+        || fraction.len() > 38
     {
-        let Ok(ty) = ty.replace(['[', ']'], "").parse::<pbps_model::ColumnType>() else {
-            return false;
+        return None;
+    }
+    let digits = format!("{integer}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.len() > 38 {
+        return None;
+    }
+    let coefficient = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<i128>().ok()?
+    };
+    let limit = 10i128.pow(38) - 1;
+    Some(ExactNumeric {
+        coefficient: if negative { -coefficient } else { coefficient },
+        scale: fraction.len() as u32,
+        bounds: (-limit, limit),
+        tiny: false,
+        money: false,
+    })
+}
+
+fn rescale(coefficient: i128, from: u32, to: u32, round: bool) -> Option<i128> {
+    if to >= from {
+        coefficient.checked_mul(10i128.checked_pow(to - from)?)
+    } else {
+        let divisor = 10i128.checked_pow(from - to)?;
+        let truncated = coefficient / divisor;
+        if round && (coefficient % divisor).abs() >= divisor / 2 {
+            truncated.checked_add(coefficient.signum())
+        } else {
+            Some(truncated)
+        }
+    }
+}
+
+fn numeric_conversion(value: Numeric, ty: &ColumnType) -> Option<Numeric> {
+    let base = ty.base.as_str();
+    if !matches!(
+        base,
+        "tinyint"
+            | "smallint"
+            | "int"
+            | "bigint"
+            | "decimal"
+            | "money"
+            | "smallmoney"
+            | "real"
+            | "float"
+    ) {
+        return None;
+    }
+    if matches!(value, Numeric::Null) {
+        return Some(Numeric::Null);
+    }
+    if matches!(base, "real" | "float") {
+        let value = match value {
+            Numeric::Exact(n) => n.coefficient as f64 / 10f64.powi(n.scale as i32),
+            Numeric::Approximate(n) => n,
+            // Approximate conversions reject the sign gap that exact
+            // numeric string conversions accept; retain it for this parser.
+            Numeric::Text(s) => s.trim_matches(' ').parse::<f64>().ok()?,
+            Numeric::Null => unreachable!(),
         };
-        return matches!(
-            ty.base.to_ascii_lowercase().as_str(),
-            "tinyint"
-                | "smallint"
-                | "int"
-                | "bigint"
-                | "real"
-                | "float"
-                | "money"
-                | "smallmoney"
-                | "decimal"
-                | "numeric"
-        ) && crate::types::normalize(&ty).is_ok()
-            && constant_operand(operand, depth + 1);
+        let value = if base == "real" {
+            f64::from(value as f32)
+        } else {
+            value
+        };
+        return value.is_finite().then_some(Numeric::Approximate(value));
+    }
+    let integer_target = matches!(base, "tinyint" | "smallint" | "int" | "bigint");
+    let value = match value {
+        Numeric::Exact(n) => n,
+        Numeric::Text(s) => {
+            // Unlike a numeric operand, the string '1.25' does not convert
+            // to int at all. Fractional money operands instead round to int.
+            if integer_target && s.contains('.') {
+                return None;
+            }
+            decimal_number(&s)?
+        }
+        Numeric::Approximate(_) | Numeric::Null => return None,
+    };
+    let (scale, bounds) = match base {
+        "tinyint" => (0, (0, 255)),
+        "smallint" => (0, (i128::from(i16::MIN), i128::from(i16::MAX))),
+        "int" => (0, (i128::from(i32::MIN), i128::from(i32::MAX))),
+        "bigint" => (0, (i128::from(i64::MIN), i128::from(i64::MAX))),
+        "money" => (4, (i128::from(i64::MIN), i128::from(i64::MAX))),
+        "smallmoney" => (4, (i128::from(i32::MIN), i128::from(i32::MAX))),
+        "decimal" => {
+            let [
+                pbps_model::TypeArg::Int(precision),
+                pbps_model::TypeArg::Int(scale),
+            ] = ty.args.as_slice()
+            else {
+                return None;
+            };
+            let limit = 10i128.checked_pow((*precision).try_into().ok()?)? - 1;
+            ((*scale).try_into().ok()?, (-limit, limit))
+        }
+        _ => return None,
+    };
+    let coefficient = rescale(
+        value.coefficient,
+        value.scale,
+        scale,
+        !integer_target || value.money,
+    )?;
+    if !(bounds.0..=bounds.1).contains(&coefficient) {
+        return None;
+    }
+    Some(Numeric::Exact(ExactNumeric {
+        coefficient,
+        scale,
+        bounds,
+        tiny: base == "tinyint",
+        money: matches!(base, "money" | "smallmoney"),
+    }))
+}
+
+fn numeric_value(text: &str, depth: usize) -> Option<Numeric> {
+    if depth > 64 {
+        return None;
+    }
+    let mut s = text.trim();
+    while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if let Some(operand) = s.strip_prefix(['-', '+']) {
+        let mut value = numeric_value(operand, depth + 1)?;
+        if matches!(value, Numeric::Text(_)) {
+            return None;
+        }
+        if s.starts_with('-') {
+            match &mut value {
+                Numeric::Exact(n) => {
+                    // Measured: unary minus promotes tinyint to smallint,
+                    // but the other bounded types retain their own bounds.
+                    if n.tiny {
+                        n.bounds = (i128::from(i16::MIN), i128::from(i16::MAX));
+                        n.tiny = false;
+                    }
+                    n.coefficient = n.coefficient.checked_neg()?;
+                    if !(n.bounds.0..=n.bounds.1).contains(&n.coefficient) {
+                        return None;
+                    }
+                }
+                Numeric::Approximate(n) => *n = -*n,
+                Numeric::Text(_) | Numeric::Null => {}
+            }
+        }
+        return Some(value);
+    }
+    if let Some((operand, ty)) = numeric_cast(s) {
+        return numeric_conversion(numeric_value(operand, depth + 1)?, &ty);
+    }
+    if s.eq_ignore_ascii_case("null") {
+        return Some(Numeric::Null);
+    }
+    let quoted = s
+        .strip_prefix(['N', 'n'])
+        .filter(|rest| rest.starts_with('\''))
+        .unwrap_or(s);
+    if let Some(value) = quoted
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return (!value.contains('\'')).then(|| Numeric::Text(value.to_owned()));
+    }
+    if s.contains(['e', 'E']) {
+        let value = s.parse::<f64>().ok()?;
+        return value.is_finite().then_some(Numeric::Approximate(value));
+    }
+    decimal_number(s).map(Numeric::Exact)
+}
+
+fn constant_operand(default: &str, depth: usize) -> bool {
+    // Declarations are untrusted input; nested signs/casts must not exhaust
+    // the reader's stack. An unusually deep constant can remain unconfirmed.
+    if depth > 64 {
+        return false;
+    }
+    let mut s = default.trim();
+    while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.is_empty() {
+        return false;
+    }
+    // Unary plus is erased from a CAST's catalog deparse, so the proven
+    // numeric CONVERT spelling must be recognized without a remaining sign.
+    if s.starts_with(['-', '+']) || numeric_cast(s).is_some() {
+        return numeric_value(s, depth).is_some();
     }
     if s.eq_ignore_ascii_case("null") {
         return true;
@@ -1170,6 +1367,53 @@ mod tests {
     /// A default the engine would have to *run* is never put in the query: a
     /// `CASE` over `NEXT VALUE FOR` is refused by the engine, and one over
     /// `NEWID()` runs it once per row. Only a literal is compared.
+    #[test]
+    fn signed_numeric_casts_are_confirmed_only_when_evaluation_cannot_throw() {
+        for (default, safe) in [
+            ("-CAST('abc' AS int)", false),
+            ("-CAST('256' AS tinyint)", false),
+            ("-CAST('255' AS tinyint)", true),
+            ("-CAST('-32768' AS smallint)", false),
+            ("+CAST('-32768' AS smallint)", true),
+            ("-CAST('-9223372036854775808' AS bigint)", false),
+            ("+CAST('-9223372036854775808' AS bigint)", true),
+            ("-CAST(1.25 AS int)", true),
+            ("-CAST('1.25' AS int)", false),
+            ("-CAST(CAST(1.5 AS money) AS int)", true),
+            ("-CAST('9.995' AS decimal(3,2))", false),
+            ("-CAST('9.994' AS decimal(3,2))", true),
+            ("-CAST('922337203685477.5807' AS money)", true),
+            ("-CAST('922337203685477.5808' AS money)", false),
+            ("-CAST('-922337203685477.5808' AS money)", false),
+            ("+CAST('-922337203685477.5808' AS money)", true),
+            ("-CAST('214748.3647' AS smallmoney)", true),
+            ("-CAST('214748.3648' AS smallmoney)", false),
+            ("-CAST('214748.36475' AS smallmoney)", false),
+            ("-CAST('-214748.3648' AS smallmoney)", false),
+            ("+CAST('-214748.3648' AS smallmoney)", true),
+            ("-CAST('-0.00005' AS money)", true),
+            ("-CAST('+ 1' AS float)", false),
+            ("-CAST('+-1' AS float)", false),
+            ("-CAST('--1' AS real)", false),
+            ("-CAST('1e38' AS real)", true),
+            ("-CAST('1e39' AS real)", false),
+            ("-CAST('1e308' AS float)", true),
+            ("-CAST('1e309' AS float)", false),
+            ("-CAST('1e-400' AS float)", true),
+            ("-CAST('1e-100' AS real)", true),
+            ("-CAST('$1' AS money)", false),
+            // Approximate-to-exact conversion and strings beyond the exact
+            // engine's 38-digit grammar remain unknown, never SQL NULL.
+            ("-CAST(CAST('1.25' AS float) AS int)", false),
+            (
+                "-CAST('123456789012345678901234567890123456789' AS decimal(38,0))",
+                false,
+            ),
+        ] {
+            assert_eq!(is_constant(default), safe, "{default}");
+        }
+    }
+
     #[test]
     fn a_default_the_engine_would_have_to_run_is_never_evaluated() {
         for literal in [
