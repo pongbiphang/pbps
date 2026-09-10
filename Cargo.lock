@@ -1329,6 +1329,7 @@ dependencies = [
  "pbps-diff",
  "pbps-model",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 

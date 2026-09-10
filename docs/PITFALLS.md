@@ -942,6 +942,156 @@ second `CREATE TABLE` fails naming a table the declarations do not contain.
 to it — the failure is loud and names itself. The two are found the same way,
 and only one way: declare the out-of-range value and read the catalog back.
 
+## Both sides compared as text, only one of them through the engine
+
+A cell left to its default is held to that default by asking the engine whether
+the two are equal — the stored value against the declared expression, both read
+as text. The stored value went through the column's type on the way in. The
+declared expression did not. Measured on PostgreSQL 18.6, `numeric(5,2) DEFAULT
+1` stores `1.00` and `pg_get_expr` deparses it as `1`, so the comparison was
+false for a row the engine had just written exactly as asked, and the insert's
+own postcondition rejected it.
+
+The same shape twice more in the same file. `boolean DEFAULT true` is deparsed
+as the bare word `true`, which a "is this a literal?" test written for NULL,
+quoted strings and numbers calls an expression — so the cell was read back as
+one nobody can tell from its default, and a hand edit that flipped it was
+projected as an omission rather than as drift. And `\x`, this engine's
+spelling of the empty `bytea` and what `pull --data` writes for one, was
+refused by an emptiness test in the emitter while `validate` accepted it.
+
+**The shape:** two representations of one value are compared, and only one of
+them has been through the conversion that decides what the value *is*. It never
+fails on the simple case, because for `text` and for `integer` the two
+spellings agree; it fails on the type with a scale, the type with a canonical
+form, and the value the engine renders in a spelling of its own.
+
+**The rule.** Put the side you hold through the same conversion the engine
+made, and let the engine make it — `CAST(<declared> AS <column type>)`, not a
+formatting rule of ours that reproduces it. A conversion we reimplement is a
+conversion that will disagree on the case nobody declared in a test.
+
+**And the fourth instance, three rounds later: the key.** Every cell of a row
+write was held byte for byte; the key was compared with the column's own `=`,
+because a `Row` carries it as the map's key rather than among the cells and so
+it was never in the list anyone swept. A trigger that lowercased a newly
+inserted `New` passed the postcondition, and the alias read then agreed with
+the stored `new` for ever after. A sweep that enumerates *call sites* misses
+the value that was never a call site — enumerate the **values the plan claims
+to have written**, and check that each one is checked.
+
+**A fifth instance, in code written after this section was.** A planned
+column's backfill was spelled as its bare literal. Against a stored column the
+engine coerces it, so every test passed; against another planned column two
+unknown literals compare as text, and `'2026-01-02'` and `'01/02/2026'` — one
+`date` — were two values (DECISIONS 339). The shape does not stop recurring
+because it is written down; a comparison of a literal is suspect until the
+type it is compared under is the column's, in the SQL.
+
+## The write path was fixed and the read path asks the same question
+
+`emit::defaulted_cell` holds a cell to its default as text, byte for byte under
+`COLLATE "C"`, and through the column's type. `rows::query` asked the same
+question — is this cell at its default? — with a native `=` on the raw column.
+The two are different questions the moment the column has a collation.
+**Measured on PostgreSQL 18.6**, a `text` column under `und-u-ks-level2`
+holding `New` beside `DEFAULT 'new'`:
+
+```text
+label = ('new')                      ->  t
+the same, as text under COLLATE "C"  ->  f
+```
+
+The `t` marks the cell at its default, `ObservedRow::as_seen_by` drops it from
+the read-back, and the drift is invisible to every connected plan and to
+`verify`.
+
+The write half of this was fixed one round earlier, in the same crate, in the
+file next door. Nothing swept the read half.
+
+**The shape:** one question is asked in two places, by two expressions written
+at different times. Fixing one is not fixing the question. It is worse than a
+plain duplicate, because the two sites *look* different — one builds a
+predicate for a `CHECK`-like guard, the other a `CASE` for a projection — so a
+search for the fixed expression does not find the second one.
+
+**The rule.** When a comparison exists on both a write path and a read path,
+they are one function or they are one bug waiting. Search for the *question*
+(here: "at its default"), not for the code you just changed — and prefer
+extracting the comparison over remembering to sweep for it.
+
+## The guard outlived the reason, and took a whole type with it
+
+`rows::comparable` answered one question — does this type have a native `=`? —
+and three call sites asked it, because each wrote a native comparison. Two
+rounds of fixes turned every one of those comparisons into a comparison of
+*text*: `CAST(… AS text)` on both sides, under `COLLATE "C"`, through the
+column's type. Not one of them needs the operator any more. The guard stayed.
+
+It was not inert. `json` is the one type in this dialect's catalogue with no
+`=`, so a `json` cell with a literal default was never asked about, was read
+back as a cell nobody can tell from its default, was dropped from the
+read-back, and a hand-edited document became drift no plan would settle.
+
+**The shape:** a fix removes the reason for a check without removing the check.
+The check still runs, still refuses things, and now refuses them for a reason
+that is no longer true — and because it was correct when written, its comment
+reads as a justification rather than as a claim to re-test.
+
+**The rule.** When a fix changes *how* something is compared, computed or
+ordered, list every guard that exists because of the old way and delete or
+re-justify each one in the same commit. And prove the deletion: here, that
+`json` cannot be a key or a foreign-key column at all — measured, it has no
+default `btree` operator class — is what makes removing the guard safe rather
+than hopeful, and it is a fact about the engine, not about the code.
+
+## A filtered count read as a count of what is there
+
+Row-level security filters a `SELECT`. It does not filter a foreign key.
+Measured on 18.6: a session the policy does not satisfy sees `count(*) = 0` on
+a child table, deletes the parent row, and the `ON DELETE CASCADE` destroys the
+child it could not see — the exact silent loss the pre-delete probe exists to
+prevent, performed by the probe's own approval.
+
+`relrowsecurity` is not the test. It is true for a table under a policy even in
+the session that owns it and sees every row, so refusing on it would refuse
+plans that are perfectly safe. `row_security_active(oid)` is the question
+actually being asked — is this *session* filtered — and it is false for the
+owner and true for the restricted role.
+
+**The shape:** a query is used to establish that something is not there, and
+the query has a reason to return fewer rows than exist that is invisible in its
+result. Zero rows and zero visible rows are the same value.
+
+**The rule.** Before believing a count of zero, ask what could have removed
+rows from it between the table and the answer, and refuse rather than proceed
+when the answer is "something could have, and I cannot tell". This is
+`CLAUDE.md`'s "absent, empty and unreadable are three different things", in the
+one place where the difference destroys data.
+
+**And the sibling, two rounds later.** The refusal above went into the delete's
+own guard. The pre-delete *probe* — which this dialect's own module docs call
+"the same count" — kept answering `0`, so a human approved the plan on a number
+that meant "I cannot see", and in a staged apply everything ahead of the delete
+committed before the guard was reached. A refusal that arrives after the
+deployment is half done is not a refusal.
+
+**The rule for that:** when two pieces of code are documented as asking the same
+question, a fix to one is unfinished until the other has it. "The same count"
+in a doc comment is a claim that has to keep being true after the commit that
+changes one of them.
+
+**And a third time, in the other direction.** A foreign key this plan adds was
+made a synthetic catalog row so that every rule for a stored key would reach
+it — and a planned key on a column this plan also adds resolved no `attnum`,
+so the row vanished, with a sentence explaining why that was right: a column
+the database does not have cannot hold a stored reference. True of the
+catalog. The plan's own `ADD COLUMN … DEFAULT 'old'` backfills every stored
+row before the delete runs, and the key added after the delete fails on all of
+them (DECISIONS 336). An empty result from the catalog was read as "no key",
+when it meant "no row the catalog can spell" — absent and unrepresentable are
+different things too, and the test was a plan whose column already existed.
+
 ## A blanket refusal removed, and only part of it replaced
 
 The PostgreSQL crate refused every table outright while the type catalogue was
@@ -966,6 +1116,27 @@ coarse one held. Anything the blanket covered incidentally is now permitted.
 not what you are about to allow — and account for every item. Here that means
 every name the object owns and every field of the declaration, not only the
 ones the current step reads.
+
+## Two flags with one shape and opposite meanings
+
+The SQL Server pre-delete probe skips a foreign key whose `is_disabled` is set,
+because `NOCHECK CONSTRAINT` leaves the key in `sys.foreign_keys` and stops the
+engine enforcing it. `pg_constraint.convalidated` is the flag that looks like
+it, sits in the same place in the same kind of query, and means the opposite:
+`NOT VALID` says "the rows that were already here were not checked", and new
+rows *are* checked and the delete action *is* enforced. Measured both ways.
+
+Copying the rule would make the PostgreSQL probe count zero for a row the
+engine will not let go — the plan passes preflight and the apply fails, which is
+at least loud. The mirror mistake, in a probe that gates rather than counts,
+would not be.
+
+This is the second instance of the shape on this branch (ADR-0011 Amendment 2
+was the first): **two engines expose a similarly-named flag whose meanings are
+opposites, and the dangerous direction is the one where the shared-looking code
+compiles.** The defence that worked here was writing the reason at the call
+site and asserting both halves in one live test — the count, and the engine's
+own refusal of the same delete.
 
 ## The second implementation did not inherit the first one's scar
 
@@ -1660,7 +1831,19 @@ loud, so this cost minutes rather than a release; the lesson is that **the local
 command and the CI command are two different tests**, and only one of them
 counts. A fixture name must be unique per test, not per process.
 
-Twelve so far, every one invisible in a green run. **Assert the specific failure,
+**And a test that could not tell whether the fix was there.** The spelling
+checks guard a cast with `pg_input_is_valid` inside a `CASE`, and that guard
+holds only where the planner does not constant-fold the list it reads from —
+measured, with two rows in a `VALUES` the `CASE` protects the cast and with one
+the planner evaluates it while planning. The live test that was supposed to pin
+the `OFFSET 0` fence declared a single bad `date`, and `date` is one of the
+types this engine does **not** fold: the test passed with the fence and passed
+without it. The revert-and-watch-it-fail step is what found that, and the fix
+was to declare a `numeric` — a type whose input function is immutable and which
+does fold. **A fence tested on the case it does not apply to proves nothing**,
+and the way to know which case that is is to remove the fence and watch.
+
+Thirteen so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 A fixture for "a state recorded by a version this build cannot read", written

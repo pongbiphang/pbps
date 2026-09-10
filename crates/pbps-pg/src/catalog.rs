@@ -26,7 +26,7 @@
 
 use pbps_db::{Conn, DbError, Row};
 
-use pbps_model::TableName;
+use pbps_model::{Schema, TableName};
 
 use crate::introspect::{
     Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawModule,
@@ -1261,4 +1261,270 @@ mod tests {
             "the filter names something `OURS` does not: {NOT_ONE_OF_OURS}"
         );
     }
+}
+
+/// Reads the rows of every scoped table the schema has (ADR-0004).
+///
+/// The scope decides *which* rows — every row of an `exact` table, the declared
+/// keys of an `ensure` one — and it is supplied by the caller, because a
+/// database holds rows, not a notion of which of them are declared. A scoped
+/// table the schema does not have gets no entry: it is missing, which the
+/// managed-set check reports, and "missing" must not come back as "empty".
+///
+/// A table whose rows cannot be read (no single-column key, or a value the
+/// model cannot hold) fails the whole read rather than being skipped: a state
+/// recorded without it would say the table declares no rows, and the next drift
+/// check would be blind to the rows it exists to watch.
+///
+/// **It takes its own transaction**, for the reason [`introspect`] does and one
+/// more. `read_rows` is where this dialect's value spellings are fixed: the
+/// canonical settings are `set_config(…, is_local)` and therefore belong to a
+/// transaction, so a read outside one would render every date, interval,
+/// `bytea` and float under whatever the caller's session has (ADR-0013 §3, and
+/// [`crate::rows::read_expr`] for what that costs).
+pub async fn read_rows(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
+        table: table.clone(),
+        source: Box::new(source),
+    };
+    let any = TableName::new("", "");
+    refuse_a_caller_owned_transaction(conn)
+        .await
+        .map_err(|e| read(&any, e))?;
+    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
+    let out = read_every_scoped_table(conn, schema, scopes).await;
+    match out {
+        Ok(out) => {
+            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
+            Ok(out)
+        }
+        Err(e) => {
+            // `ROLLBACK` rather than `COMMIT`, and its own error is dropped: a
+            // transaction the server has already killed must not replace the
+            // failure that killed it.
+            let _ = conn.execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+async fn read_every_scoped_table(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    let mut out = pbps_model::ObservedRows::new();
+    let any = TableName::new("", "");
+    conn.query(CANONICAL_PATH)
+        .await
+        .map_err(|e| crate::rows::RowsError::Read {
+            table: any,
+            source: Box::new(e),
+        })?;
+    for (name, scope) in scopes {
+        let Some(table) = schema.tables.get(name) else {
+            continue;
+        };
+        let mut observed = pbps_model::ObservedTable::default();
+        if let Some(query) = crate::rows::query(name, table, scope)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            for row in &conn.query(&query.sql).await.map_err(read)? {
+                let (key, cells) = crate::rows::decode(name, &query, row)?;
+                observed.rows.insert(key, cells);
+            }
+            if let Some(sql) = &query.aliases {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    // A requested key the table does not hold has no alias to
+                    // record — the row is simply not there, which is what an
+                    // `InsertRow` is for.
+                    if let (requested, Some(canonical)) = crate::rows::decode_alias(name, row)? {
+                        observed.aliases.insert(requested, canonical);
+                    }
+                }
+            }
+        }
+        out.insert(name.clone(), observed);
+    }
+    Ok(out)
+}
+
+/// Every declared value the engine would not read back as written, and every
+/// pair of declared keys it reads as one row (DECISIONS 101, 106; ADR-0013 §5).
+///
+/// Asked before anything is written, and asked of the engine: neither the model
+/// nor this crate can spell a value the engine's way without becoming the
+/// engine.
+///
+/// Inside the canonical scope, because the answer *is* a spelling and the
+/// spelling is what the settings decide. The comparison it feeds is against a
+/// state read under those same settings, and a check run under the operator's
+/// would report a date as misspelt on one machine and clean on the next.
+pub async fn misspelt(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let any = TableName::new("", "");
+    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
+        table: table.clone(),
+        source: Box::new(source),
+    };
+    refuse_a_caller_owned_transaction(conn)
+        .await
+        .map_err(|e| read(&any, e))?;
+    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
+    let out = ask_about_every_spelling(conn, schema, at).await;
+    match out {
+        Ok(out) => {
+            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+/// What the spelling checks found.
+#[derive(Debug, Default)]
+pub struct Spellings {
+    /// Declared texts the engine reads back differently, or not at all.
+    pub misspelt: Vec<crate::rows::Misspelt>,
+    /// Two declared keys the engine reads as one row, rendered as the message
+    /// a caller shows.
+    pub conflicts: Vec<String>,
+}
+
+async fn ask_about_every_spelling(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let any = TableName::new("", "");
+    conn.query(CANONICAL_PATH)
+        .await
+        .map_err(|e| crate::rows::RowsError::Read {
+            table: any,
+            source: Box::new(e),
+        })?;
+    let mut out = Spellings::default();
+    let as_declared = crate::rows::Catalogued::default();
+    for (name, table) in &schema.tables {
+        let at = at.get(name).unwrap_or(&as_declared);
+        for q in crate::rows::spelling_queries(name, table, at)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            if let Some(sql) = &q.collisions {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
+                    let (Some((first, _)), Some((second, _))) =
+                        (q.literals.get(a), q.literals.get(b))
+                    else {
+                        continue;
+                    };
+                    out.conflicts.push(format!(
+                        "{name} declares row keys `{first}` and `{second}`, and this engine reads \
+                         both as the one row `{canonical}` — the key column's own type and \
+                         collation decide it. The second insert would fail on the primary key."
+                    ));
+                }
+            }
+            for row in &conn.query(&q.sql).await.map_err(read)? {
+                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
+                let Some((key, declared)) = q.literals.get(i) else {
+                    continue;
+                };
+                if canonical.as_deref() == Some(declared.as_str()) {
+                    continue;
+                }
+                out.misspelt.push(crate::rows::Misspelt {
+                    table: name.clone(),
+                    key: key.clone(),
+                    column: q.column.clone(),
+                    declared: declared.clone(),
+                    ty: q.ty.clone(),
+                    canonical,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What the catalog calls each declared table's key column collation *now*.
+///
+/// The one input to the spelling checks that is read from the database rather
+/// than declared, and the one that decides whether two keys are one row. A
+/// table this plan creates has none — the emitter writes no `COLLATE`, so its
+/// column will take the database default — and that is what `None` means.
+///
+/// Read under the names the catalog has now, which is the caller's to supply:
+/// the checks run before the plan's first statement, so a table this revision
+/// renames is still under its old name (DECISIONS 148).
+pub async fn key_collations(
+    conn: &mut Conn,
+    at: &mut crate::rows::CatalogNames,
+    schema: &Schema,
+) -> Result<(), DbError> {
+    let as_declared = crate::rows::Catalogued::default();
+    let mut wanted: Vec<(TableName, TableName, String)> = Vec::new();
+    for (name, table) in &schema.tables {
+        if table.data.is_none() {
+            continue;
+        }
+        let entry = at.get(name).unwrap_or(&as_declared);
+        let Some(key) = table
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.columns.len() == 1)
+            .map(|pk| pk.columns[0].clone())
+        else {
+            continue;
+        };
+        wanted.push((
+            name.clone(),
+            entry.table.clone().unwrap_or_else(|| name.clone()),
+            entry.key_column.clone().unwrap_or(key),
+        ));
+    }
+    for (declared, stored, column) in wanted {
+        // `to_regclass` and not a cast: a table this plan creates does not
+        // exist yet, and `'s.t'::regclass` is an error where this is a NULL.
+        let sql = format!(
+            "SELECT co.collname AS collation_name, ns.nspname AS collation_schema\n  \
+               FROM pg_catalog.pg_attribute a\n  \
+               JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation\n  \
+               JOIN pg_catalog.pg_namespace ns ON ns.oid = co.collnamespace\n \
+              WHERE a.attrelid = pg_catalog.to_regclass({})\n                \
+                AND a.attname = {}",
+            crate::emit::value_literal(&format!(
+                "{}.{}",
+                quote_for_regclass(&stored.schema),
+                quote_for_regclass(&stored.name)
+            )),
+            crate::emit::value_literal(&column),
+        );
+        let rows = conn.query(&sql).await?;
+        let Some(row) = rows.first() else { continue };
+        let entry = at.entry(declared).or_default();
+        entry.key_collation = Some((text(row, "collation_schema")?, text(row, "collation_name")?));
+    }
+    Ok(())
+}
+
+/// One half of a name for `to_regclass`, which parses its argument as SQL
+/// rather than taking it literally: a name with a `"` or a `.` in it has to
+/// arrive quoted or the function reads it as two.
+fn quote_for_regclass(part: &str) -> String {
+    format!("\"{}\"", part.replace('"', "\"\""))
 }

@@ -1707,6 +1707,17 @@ pub fn validate_findings(
                 .into_iter()
                 .map(|(id, problem)| output::Finding::error(id, problem)),
         );
+        // And what the dialect could *not* answer here. `validate` is offline
+        // (SPEC §9.1), and a command that reports clean about a question it
+        // never asked is the silence CLAUDE.md's own rule is about: absent,
+        // empty and unreadable are three different answers. A note, not a
+        // finding against the declarations — nothing here is wrong with them.
+        findings.extend(
+            dialect
+                .declaration_notes(&l.schema)
+                .into_iter()
+                .map(|note| output::Finding::note("dialect.not-checked", note)),
+        );
 
         // The project's own rules (ADR-0008): the declaration point. The block
         // itself is checked first — a misspelled rule id that configured
@@ -1831,7 +1842,13 @@ fn cmd_validate(
     eprint!("{}", output::human(&unlocated));
 
     if let Some(d) = &report.data {
-        if load_errors.is_empty() && unlocated.is_empty() {
+        // A note is not a problem with the declarations — it says what this
+        // run could not check — so it prints beside "declarations are valid"
+        // rather than instead of it.
+        let unresolved = unlocated
+            .iter()
+            .any(|f| f.severity != output::Severity::Note);
+        if load_errors.is_empty() && !unresolved {
             println!(
                 "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
                 d.dialect, d.tables, d.columns, d.modules

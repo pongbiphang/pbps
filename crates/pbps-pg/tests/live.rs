@@ -8334,3 +8334,6534 @@ async fn a_literals_prefix_and_a_non_ascii_byte_are_not_names_the_order_is_decid
     );
     drop_schema(&mut conn, &s).await;
 }
+// Reference data (Phase 5 step 7; ADR-0004, ADR-0013 §1–§3, §5)
+// ---------------------------------------------------------------------------
+
+use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+
+fn data_schema(test: &str) -> String {
+    format!("pbps_data_{}_{test}", std::process::id())
+}
+
+/// One declared row.
+fn row(cells: &[(&str, Value)]) -> Row {
+    Row(cells
+        .iter()
+        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+        .collect())
+}
+
+fn with_data(table: &mut Table, mode: DataMode, rows: &[(&str, Row)]) {
+    table.data = Some(TableData {
+        mode,
+        rows: rows
+            .iter()
+            .map(|(k, r)| (RowKey::from(*k), r.clone()))
+            .collect(),
+    });
+}
+
+/// The first column of the first row, as an `int4` — what a probe returns,
+/// and the width the probe runner reads it at (`deploy::preflight` asks for
+/// an `i32`, and the driver does not widen an `int8` into one; DECISIONS 342).
+async fn counted(conn: &mut Conn, sql: &str) -> i64 {
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    i64::from(
+        rows.first()
+            .expect("one row")
+            .try_get_at::<i32>(0)
+            .unwrap_or_else(|e| panic!("an int4 column, as the runner reads it: {e}\n{sql}"))
+            .expect("not null"),
+    )
+}
+
+/// The base a connected plan is made against: the live schema with the rows
+/// the read-back found, resolved the way `plan --db` resolves them.
+async fn connected_base(conn: &mut Conn, declared: &Schema, schema: &str) -> Schema {
+    let live = ours_only(&pull(conn).await, schema);
+    let scopes = declared.data_scopes();
+    let rows = pbps_pg::catalog::read_rows(
+        conn,
+        &live,
+        &pbps_model::data::read_scopes(&Default::default(), &scopes),
+    )
+    .await
+    .expect("read the declared rows back");
+    pbps_model::data::plan_base(&live, &rows, &Default::default(), declared)
+        .expect("no two declared keys are one row")
+}
+
+/// The rows of one table as the engine holds them, keyed by its own spelling.
+async fn observed(
+    conn: &mut Conn,
+    declared: &Schema,
+    schema: &str,
+    name: &TableName,
+) -> pbps_model::ObservedTable {
+    let live = ours_only(&pull(conn).await, schema);
+    let scopes = declared.data_scopes();
+    let mut rows = pbps_pg::catalog::read_rows(
+        conn,
+        &live,
+        &pbps_model::data::read_scopes(&Default::default(), &scopes),
+    )
+    .await
+    .expect("read the declared rows back");
+    rows.remove(name).expect("the table was read")
+}
+
+/// The whole reference-data path on this engine: the DML reaches the server in
+/// an order it accepts, every declared value reads back as it was written, and
+/// the plan taken straight afterwards is empty.
+///
+/// The empty plan is the assertion that matters. A value the engine stores in
+/// its own spelling — `1.5` into a `numeric(5,2)`, a padded `character(5)` —
+/// would otherwise be restated by every connected plan for ever, which is the
+/// failure DECISIONS 101 exists for and the one a read-back written against the
+/// wrong rendering produces silently.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn declared_rows_reach_the_engine_and_read_back_as_declared() {
+    let mut conn = connect().await;
+    let s = data_schema("roundtrip");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table
+        .columns
+        .insert("rank".into(), Column::new(ty("integer")));
+    table
+        .columns
+        .insert("pct".into(), Column::new(ty("numeric(5,2)")));
+    table
+        .columns
+        .insert("live".into(), Column::new(ty("boolean")));
+    table
+        .columns
+        .insert("since".into(), Column::new(ty("date")));
+    table
+        .columns
+        .insert("blob".into(), Column::new(ty("bytea")));
+    let mut noted = Column::new(ty("text"));
+    noted.default = Some("'unnamed'::text".into());
+    table.columns.insert("note".into(), noted);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[
+            (
+                "new",
+                row(&[
+                    ("label", Value::Text("New".into())),
+                    ("rank", Value::Int(1)),
+                    // The engine's own spelling, which is what the read-back
+                    // produces: a declaration of `1.5` is refused by the
+                    // spelling check, not silently stored.
+                    ("pct", Value::Text("1.50".into())),
+                    ("live", Value::Bool(true)),
+                    ("since", Value::Text("2026-01-02".into())),
+                    ("blob", Value::Text("\\x0102".into())),
+                    ("note", Value::Text("spelled".into())),
+                ]),
+            ),
+            (
+                "old",
+                // Every other cell left to the table: NULL where there is no
+                // default, the default where there is one.
+                row(&[("label", Value::Text("Old".into()))]),
+            ),
+        ],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    let creation = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    // The rows are in the plan as typed DML, not as part of the `CREATE`.
+    assert_eq!(
+        creation
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, pbps_model::Change::InsertRow { .. }))
+            .count(),
+        2,
+        "{creation:#?}"
+    );
+    apply(&mut conn, &pg, &creation).await;
+
+    let seen = observed(&mut conn, &declared, &s, &name).await;
+    assert_eq!(seen.rows.len(), 2, "{seen:#?}");
+    let new = &seen.rows[&RowKey::from("new")];
+    assert_eq!(new.cells.get("pct"), Some(&Value::Text("1.50".into())));
+    assert_eq!(new.cells.get("live"), Some(&Value::Bool(true)));
+    assert_eq!(new.cells.get("rank"), Some(&Value::Int(1)));
+    assert_eq!(
+        new.cells.get("blob"),
+        Some(&Value::Text("\\x0102".into())),
+        "a bytea reads back in the spelling the declaration writes"
+    );
+    // The cell that holds the column's default is reported as such, so the
+    // declaration that omits it and the one that spells it both compare equal.
+    let old = &seen.rows[&RowKey::from("old")];
+    assert!(old.at_default.contains("note"), "{old:#?}");
+    assert!(!new.at_default.contains("note"), "{new:#?}");
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let again = plan(&base, &ids, &declared, &ids);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    assert!(again.is_empty(), "the plan after the apply: {again:#?}");
+}
+
+/// A hand edit to a declared row is seen, and the row is put back — and the
+/// statement that puts it back refuses to run if the row moved again after the
+/// plan was made (DECISIONS 122).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded() {
+    let mut conn = connect().await;
+    let s = data_schema("drift");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("a", row(&[("label", Value::Text("One".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    // Somebody edits the row by hand.
+    conn.execute(&format!(
+        "UPDATE {s}.status SET label = 'Edited' WHERE code = 'a'"
+    ))
+    .await
+    .expect("the hand edit");
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let fix = plan(&base, &ids, &declared, &ids);
+    assert_eq!(fix.changes.len(), 1, "{fix:#?}");
+    assert!(
+        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        "{fix:#?}"
+    );
+
+    // And the row moves again before the plan runs: the statement holds itself
+    // to what it recorded rather than overwriting whatever is there now.
+    conn.execute(&format!(
+        "UPDATE {s}.status SET label = 'Moved again' WHERE code = 'a'"
+    ))
+    .await
+    .expect("the second edit");
+    let stmt = pg
+        .emit(&fix.changes[0].change, fix.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+    let refusal = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("the row is not as the plan recorded it");
+    // `P0001`: a `RAISE EXCEPTION` with no condition name of its own.
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+    let held = text(&mut conn, &format!("SELECT label FROM {s}.status")).await;
+    assert_eq!(held, "Moved again", "the refused update wrote nothing");
+
+    // With the row back where the plan recorded it, the same statement runs.
+    conn.execute(&format!(
+        "UPDATE {s}.status SET label = 'Edited' WHERE code = 'a'"
+    ))
+    .await
+    .expect("put it back");
+    conn.execute(&stmt.sql).await.expect("the recorded row");
+    assert_eq!(
+        text(&mut conn, &format!("SELECT label FROM {s}.status")).await,
+        "One"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0013 §1: `NOT VALID` is not `NOCHECK`, and the probe that assumed it
+/// was would let a delete through that this engine refuses.
+///
+/// The measurement is in the test, not only in the document: the child row is
+/// behind a `NOT VALID` foreign key, so `convalidated` is `f`, and the engine
+/// still refuses the delete. A probe that skipped the key — which is what the
+/// SQL Server rule one crate away does with its own flag — would count zero and
+/// report the delete safe.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enforcing() {
+    let mut conn = connect().await;
+    let s = data_schema("notvalid");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY, parent text);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old');
+         ALTER TABLE {s}.child ADD CONSTRAINT fk_child
+             FOREIGN KEY (parent) REFERENCES {s}.parent(code) NOT VALID;"
+    ))
+    .await
+    .expect("the fixture");
+    // The flag that looks like SQL Server's, and does not mean what it does.
+    assert!(
+        !truth(
+            &mut conn,
+            &format!(
+                "SELECT convalidated FROM pg_constraint \
+                 WHERE conname = 'fk_child' AND connamespace = '{s}'::regnamespace"
+            )
+        )
+        .await,
+        "the fixture's key is NOT VALID"
+    );
+
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    with_data(
+        declared.tables.get_mut(&name).expect("the table"),
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert_eq!(cs.changes.len(), 1, "{cs:#?}");
+    assert!(
+        matches!(cs.changes[0].change, pbps_model::Change::DeleteRow { .. }),
+        "{cs:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    // The count, and beside it the refusal that says whether this session
+    // could complete it at all (DECISIONS 333); nothing here has a policy, so
+    // that one counts nothing.
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        1,
+        "the child behind the NOT VALID key is counted: {}",
+        probes[0].sql
+    );
+    assert_eq!(counted(&mut conn, &probes[1].sql).await, 0);
+
+    // And the engine agrees, which is the half that makes the count matter: a
+    // `NOT VALID` key enforces the delete action in full.
+    let engine = conn
+        .execute(&format!("DELETE FROM {s}.parent WHERE code = 'old'"))
+        .await
+        .expect_err("a NOT VALID key still refuses the delete");
+    assert_eq!(sqlstate(&engine), "23503", "{engine:?}");
+
+    // The statement pbps emits stops earlier than that, on its own guard —
+    // which is the point of the guard: the count is taken inside the delete's
+    // own block, so a child that arrived after the probe is refused rather
+    // than cascaded away (DECISIONS 129).
+    let stmt = pg
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+    let refusal = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("the guard counts the child the probe counted");
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+
+    // With the child gone, the same probe counts nothing and the same
+    // statement runs — so the count is about the rows, not about the key.
+    conn.execute(&format!("DELETE FROM {s}.child"))
+        .await
+        .expect("clear the child");
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+    conn.execute(&stmt.sql).await.expect("the delete");
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0013 §2, measured rather than asserted: the construct SQL Server
+/// supports is refused here because this engine's equivalent leaves the
+/// sequence behind, and the failure lands in the *application* after a
+/// deployment that verified clean.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_identity_keyed_data_block_is_refused_and_the_hazard_is_measured() {
+    let mut conn = connect().await;
+    let s = data_schema("pinned");
+    fresh(&mut conn, &s).await;
+
+    // What `OVERRIDING SYSTEM VALUE` would do, if pbps offered it.
+    conn.execute(&format!(
+        "CREATE TABLE {s}.pinned (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+         INSERT INTO {s}.pinned (id, v) OVERRIDING SYSTEM VALUE VALUES (1, 'one'), (2, 'two');"
+    ))
+    .await
+    .expect("pin two rows");
+    let collision = conn
+        .execute(&format!(
+            "INSERT INTO {s}.pinned (v) VALUES ('the next one')"
+        ))
+        .await
+        .expect_err("the sequence never learned that 1 and 2 were used");
+    assert_eq!(sqlstate(&collision), "23505", "{collision:?}");
+
+    // So the declaration is refused, offline, naming the sequence and both
+    // ways forward.
+    let name = TableName::new(&s, "pinned");
+    let mut table = Table::default();
+    let mut id = Column::new(ty("integer")).not_null();
+    id.identity = Some(Identity {
+        seed: 1,
+        increment: 1,
+    });
+    table.columns.insert("id".into(), id);
+    table.columns.insert("v".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("1", row(&[("v", Value::Text("one".into()))]))],
+    );
+    let problems = Postgres::new().validate_table(&name, &table);
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    let message = problems[0].to_string();
+    assert!(message.contains(&format!("{s}.pinned_id_seq")), "{message}");
+    assert!(message.contains("pbps baseline"), "{message}");
+    // And the sequence the message names is the one this engine made.
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT pg_get_serial_sequence('{s}.pinned', 'id')")
+        )
+        .await,
+        format!("{s}.pinned_id_seq")
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0013 §3, the half that fails silently: what pbps renders has to mean
+/// one thing under either `standard_conforming_strings`, because the setting
+/// reaches the *write* and the write takes no scope of its own.
+///
+/// The `bytea` line is why this cannot be a refusal list: canonical hex under
+/// `off` is accepted and stores different bytes, with no error anywhere.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_backslash_and_a_bytea_mean_one_thing_under_either_string_setting() {
+    let mut conn = connect().await;
+    let s = data_schema("escapes");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "payload");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table.columns.insert("note".into(), Column::new(ty("text")));
+    table
+        .columns
+        .insert("blob".into(), Column::new(ty("bytea")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    // Two characters, a backslash and an `n`, which `off` would fold into one
+    // newline; and two bytes, which `off` would store as three.
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[(
+            "a",
+            row(&[
+                ("note", Value::Text("a\\nb".into())),
+                ("blob", Value::Text("\\x0102".into())),
+            ]),
+        )],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    let creation = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+
+    // Nothing pbps renders carries a bare backslash into a plain literal: the
+    // value is an `E'…'` with the backslash doubled, and the `bytea` is a
+    // `decode`, which has none at all.
+    let sql: String = creation
+        .changes
+        .iter()
+        .flat_map(|p| pg.emit(&p.change, p.strategy).expect("emit"))
+        .map(|st| st.sql)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(sql.contains(r"E'a\\nb'"), "{sql}");
+    assert!(sql.contains("decode(E'0102', 'hex')"), "{sql}");
+
+    for setting in ["on", "off"] {
+        conn.execute(&format!("SET standard_conforming_strings = {setting}"))
+            .await
+            .expect("the setting");
+        apply(&mut conn, &pg, &creation).await;
+        assert_eq!(
+            number(
+                &mut conn,
+                &format!("SELECT length(note)::int FROM {s}.payload WHERE code = 'a'")
+            )
+            .await,
+            4,
+            "the two characters survived under standard_conforming_strings = {setting}"
+        );
+        assert_eq!(
+            number(
+                &mut conn,
+                &format!("SELECT length(blob)::int FROM {s}.payload WHERE code = 'a'")
+            )
+            .await,
+            2,
+            "the two bytes survived under standard_conforming_strings = {setting}"
+        );
+        conn.execute(&format!("DROP TABLE {s}.payload"))
+            .await
+            .expect("clear for the next setting");
+    }
+    conn.execute("SET standard_conforming_strings = on")
+        .await
+        .expect("put it back");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0013 §5: whether two declared keys are one row is the engine's
+/// question, and this engine answers it from the key column's own collation —
+/// which is not in the declarations, so offline `validate` says it did not ask
+/// rather than reporting clean.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offline() {
+    let mut conn = connect().await;
+    let s = data_schema("collation");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE {s}.keys (code varchar(20) COLLATE {s}.ci PRIMARY KEY, label text);
+         CREATE TABLE {s}.plain (code varchar(20) PRIMARY KEY, label text);"
+    ))
+    .await
+    .expect("the fixture");
+
+    let mut declared = Schema::default();
+    for name in ["keys", "plain"] {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
+        table
+            .columns
+            .insert("label".into(), Column::new(ty("text")));
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+        });
+        with_data(
+            &mut table,
+            DataMode::Exact,
+            &[
+                ("New", row(&[("label", Value::Text("a".into()))])),
+                ("new", row(&[("label", Value::Text("b".into()))])),
+            ],
+        );
+        declared.tables.insert(TableName::new(&s, name), table);
+    }
+
+    // Offline: nothing is refused, and a note says why that is not a clean
+    // bill of health.
+    let pg = Postgres::new();
+    for (name, table) in &declared.tables {
+        assert!(
+            pg.validate_table(name, table).is_empty(),
+            "offline validation cannot judge the keys, so it must not try"
+        );
+    }
+    let notes = pg.declaration_notes(&declared);
+    assert_eq!(notes.len(), 2, "{notes:#?}");
+    assert!(notes.iter().all(|n| n.contains("collation")), "{notes:#?}");
+
+    // Connected: the engine is asked, under each key column's own collation,
+    // and answers differently for the two tables.
+    let mut at = pbps_pg::rows::CatalogNames::new();
+    pbps_pg::catalog::key_collations(&mut conn, &mut at, &declared)
+        .await
+        .expect("read the key collations");
+    assert_eq!(
+        at[&TableName::new(&s, "keys")].key_collation,
+        Some((s.clone(), "ci".to_owned()))
+    );
+    let found = pbps_pg::catalog::misspelt(&mut conn, &declared, &at)
+        .await
+        .expect("ask the engine");
+    assert_eq!(found.conflicts.len(), 1, "{found:#?}");
+    assert!(
+        found.conflicts[0].contains(&format!("{s}.keys")),
+        "{found:#?}"
+    );
+    assert!(found.conflicts[0].contains("`New`"), "{found:#?}");
+    assert!(found.conflicts[0].contains("`new`"), "{found:#?}");
+    // And the second insert is what that refusal is about.
+    conn.execute(&format!("INSERT INTO {s}.keys VALUES ('New', 'a')"))
+        .await
+        .expect("the first key");
+    let collision = conn
+        .execute(&format!("INSERT INTO {s}.keys VALUES ('new', 'b')"))
+        .await
+        .expect_err("the collation makes them one row");
+    assert_eq!(sqlstate(&collision), "23505", "{collision:?}");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// DECISIONS 101 on this engine: a value the engine would not read back as
+/// written is refused before anything is written, with the spelling to write.
+///
+/// Without this the declaration disagrees with its own database on every plan:
+/// `1.5` into a `numeric(5,2)` is stored and read back as `1.50`, and the
+/// update that changes nothing is proposed for ever.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_value_the_engine_spells_differently_is_refused_before_it_is_written() {
+    let mut conn = connect().await;
+    let s = data_schema("spelling");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "amounts");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("varchar(4)")).not_null());
+    table
+        .columns
+        .insert("pct".into(), Column::new(ty("numeric(5,2)")));
+    table
+        .columns
+        .insert("when_".into(), Column::new(ty("date")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[
+            (
+                "a",
+                row(&[
+                    ("pct", Value::Text("1.5".into())),
+                    ("when_", Value::Text("2026-01-02".into())),
+                ]),
+            ),
+            // A key the column cannot hold at all: the engine reads it as
+            // nothing, which is a different answer from "reads it differently".
+            ("toolong", row(&[])),
+        ],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+
+    // And a table whose column query holds exactly **one** literal, which the
+    // type cannot read. That is the case the optimization fence is for.
+    // **Measured**: with two rows in the `VALUES` the `CASE` protects the cast
+    // and the answer is NULL; with one, the planner folds the list into a
+    // `Result` node and evaluates the cast while planning —
+    //
+    // ```text
+    // one row, no fence, numeric:  ERROR: invalid input syntax for type numeric: "oops"
+    // one row, fenced:             NULL, which is the finding this query exists to make
+    // ```
+    //
+    // The type decides whether it folds at all: `numeric`, `integer` and
+    // `uuid` read their text through an immutable input function and fold,
+    // while `date` and `character varying` do not — so a fence tested on a
+    // `date` would have proved nothing.
+    let alone = TableName::new(&s, "alone");
+    let mut single = Table::default();
+    single
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    single
+        .columns
+        .insert("pct".into(), Column::new(ty("numeric(5,2)")));
+    single.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut single,
+        DataMode::Exact,
+        &[("a", row(&[("pct", Value::Text("oops".into()))]))],
+    );
+    declared.tables.insert(alone.clone(), single);
+
+    let found =
+        pbps_pg::catalog::misspelt(&mut conn, &declared, &pbps_pg::rows::CatalogNames::new())
+            .await
+            .expect("ask the engine");
+    let misspelt: Vec<String> = found
+        .misspelt
+        .iter()
+        .filter(|m| m.table == name)
+        .map(|m| format!("{:?} {:?} -> {:?}", m.column, m.declared, m.canonical))
+        .collect();
+    assert_eq!(misspelt.len(), 2, "{misspelt:#?}");
+    // The single bad cell is reported, not raised.
+    let single: Vec<&pbps_pg::rows::Misspelt> =
+        found.misspelt.iter().filter(|m| m.table == alone).collect();
+    assert_eq!(single.len(), 1, "{single:#?}");
+    assert_eq!(single[0].declared, "oops");
+    assert_eq!(single[0].canonical, None);
+    // The value the engine respells, with the spelling to write…
+    assert!(
+        misspelt.iter().any(|m| m.contains("\"pct\"")
+            && m.contains("\"1.5\"")
+            && m.contains("Some(\"1.50\")")),
+        "{misspelt:#?}"
+    );
+    // …and the key it cannot read at all, which is not the same finding.
+    assert!(
+        misspelt
+            .iter()
+            .any(|m| m.contains("None") && m.contains("\"toolong\"") && m.contains("-> None")),
+        "{misspelt:#?}"
+    );
+    // The unambiguous date is not a finding: refusing it would refuse a valid
+    // declaration.
+    assert!(
+        !misspelt.iter().any(|m| m.contains("when_")),
+        "{misspelt:#?}"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A trigger that rewrites the row inside the write's own statement is caught
+/// and the statement rolls back — rather than the apply reading the rewrite
+/// back and recording it as the plan's own result (DECISIONS 132).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
+    let mut conn = connect().await;
+    let s = data_schema("trigger");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("a", row(&[("label", Value::Text("One".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    let creation = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+
+    // The table first, then the trigger, then the row: the trigger has to be
+    // there before the write it rewrites.
+    let mut statements = Vec::new();
+    for p in &creation.changes {
+        statements.push((
+            matches!(p.change, pbps_model::Change::InsertRow { .. }),
+            pg.emit(&p.change, p.strategy).expect("emit"),
+        ));
+    }
+    for (is_row, stmts) in &statements {
+        if *is_row {
+            continue;
+        }
+        for st in stmts {
+            conn.execute(&st.sql).await.expect("the structure");
+        }
+    }
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.rewrite() RETURNS trigger LANGUAGE plpgsql AS $body$
+           BEGIN UPDATE {s}.status SET label = 'Rewritten' WHERE code = NEW.code; RETURN NULL; END
+         $body$;
+         CREATE TRIGGER rewrite AFTER INSERT ON {s}.status
+           FOR EACH ROW EXECUTE FUNCTION {s}.rewrite();"
+    ))
+    .await
+    .expect("the trigger");
+
+    for (is_row, stmts) in &statements {
+        if !*is_row {
+            continue;
+        }
+        for st in stmts {
+            let refusal = conn
+                .execute(&st.sql)
+                .await
+                .expect_err("the trigger rewrote the row the plan wrote");
+            assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+        }
+    }
+    // Nothing was left behind: the check and the write are one statement.
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.status")).await,
+        0,
+        "the refused insert wrote nothing"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The probe reports what is true before the plan runs; a child row that
+/// arrives afterwards is caught by the delete's own guard, inside the
+/// statement, rather than being cascaded away unseen (DECISIONS 129).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
+    let mut conn = connect().await;
+    let s = data_schema("arrival");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY, parent text
+             REFERENCES {s}.parent(code) ON DELETE CASCADE);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    // Nothing references the row when the human approves the plan.
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+
+    // Another session inserts a child between the probe and the apply. With
+    // `ON DELETE CASCADE` the engine would take it away silently.
+    let mut other = connect().await;
+    other
+        .execute(&format!("INSERT INTO {s}.child VALUES (1, 'old')"))
+        .await
+        .expect("the arrival");
+
+    let stmt = pg
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+    let refusal = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("the guard counts what arrived after the probe");
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.child")).await,
+        1,
+        "the child was not cascaded away"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A cell left to a *typed* default, and one the engine deparses without a
+/// cast: both are compared against the column as the column stores them.
+///
+/// The declared expression and the stored value are compared as text, and only
+/// one of them went through the column's type on the way in. **Measured**,
+/// `numeric(5,2) DEFAULT 1` stores `1.00` and deparses as `1`, so the insert's
+/// own postcondition rejected the row the engine had just written correctly —
+/// a valid plan refused, by the guard that exists to catch a trigger.
+///
+/// The boolean is the other half: this engine deparses `DEFAULT true` as the
+/// bare word, which a literal test written for strings and numbers calls an
+/// expression. The cell is then read back as one nobody can tell from its
+/// default, and a hand edit that flips it is projected as an omission and
+/// never planned away.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_cell_left_to_a_default_is_compared_as_the_column_stores_it() {
+    let mut conn = connect().await;
+    let s = data_schema("defaults");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut rank = Column::new(ty("numeric(5,2)"));
+    rank.default = Some("1".into());
+    table.columns.insert("rank".into(), rank);
+    let mut flag = Column::new(ty("boolean"));
+    flag.default = Some("true".into());
+    table.columns.insert("flag".into(), flag);
+    // And the canonical empty `bytea`, which `decode('', 'hex')` writes and
+    // this engine reads back as `\x`.
+    table
+        .columns
+        .insert("blob".into(), Column::new(ty("bytea")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("a", row(&[("blob", Value::Text("\\x".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    // The insert's own postcondition holds the two defaulted cells to their
+    // defaults, so this apply is the assertion.
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let seen = observed(&mut conn, &declared, &s, &name).await;
+    let a = &seen.rows[&RowKey::from("a")];
+    assert!(a.at_default.contains("rank"), "{a:#?}");
+    assert!(a.at_default.contains("flag"), "{a:#?}");
+    assert_eq!(a.cells.get("blob"), Some(&Value::Text("\\x".into())));
+    let base = connected_base(&mut conn, &declared, &s).await;
+    assert!(
+        plan(&base, &ids, &declared, &ids).is_empty(),
+        "the plan after the apply"
+    );
+
+    // A hand edit to the boolean is drift, not an omission — which it is only
+    // because the engine was asked about that default at all.
+    conn.execute(&format!("UPDATE {s}.status SET flag = false"))
+        .await
+        .expect("the hand edit");
+    let after = connected_base(&mut conn, &declared, &s).await;
+    let fix = plan(&after, &ids, &declared, &ids);
+    assert_eq!(fix.changes.len(), 1, "{fix:#?}");
+    assert!(
+        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        "{fix:#?}"
+    );
+    apply(&mut conn, &pg, &fix).await;
+    assert!(
+        truth(&mut conn, &format!("SELECT flag FROM {s}.status")).await,
+        "the update put the default back"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A plan that unpicks a child's reference and then deletes the parent is the
+/// ordinary shape, and an explicit NULL is what unpicks it.
+///
+/// The update runs before the delete, so by the time the delete runs the child
+/// points at nothing. A probe that could not compare a NULL generated no
+/// exclusion for that row at all, counted the child's *stored* reference, and
+/// refused the plan.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delete() {
+    let mut conn = connect().await;
+    let s = data_schema("tonull");
+    fresh(&mut conn, &s).await;
+
+    let parent = TableName::new(&s, "parent");
+    let child = TableName::new(&s, "child");
+    let mut p = Table::default();
+    p.columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    p.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    let mut c = Table::default();
+    c.columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    c.columns.insert("parent".into(), Column::new(ty("text")));
+    c.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    c.foreign_keys.insert(
+        "fk_child".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+
+    // Before: the parent has both rows and the child points at the one that
+    // is about to go.
+    let mut before = Schema::default();
+    let mut p0 = p.clone();
+    with_data(
+        &mut p0,
+        DataMode::Exact,
+        &[("old", row(&[])), ("keep", row(&[]))],
+    );
+    let mut c0 = c.clone();
+    with_data(
+        &mut c0,
+        DataMode::Exact,
+        &[("c1", row(&[("parent", Value::Text("old".into()))]))],
+    );
+    before.tables.insert(parent.clone(), p0);
+    before.tables.insert(child.clone(), c0);
+
+    // After: the child references nothing and `old` is gone.
+    let mut after = Schema::default();
+    let mut p1 = p.clone();
+    with_data(&mut p1, DataMode::Exact, &[("keep", row(&[]))]);
+    let mut c1 = c.clone();
+    with_data(
+        &mut c1,
+        DataMode::Exact,
+        &[("c1", row(&[("parent", Value::Null)]))],
+    );
+    after.tables.insert(parent.clone(), p1);
+    after.tables.insert(child.clone(), c1);
+
+    let ids0 = mint_ids(&before, &IdsFile::default(), &[]);
+    let ids1 = mint_ids(&after, &ids0, &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &before, &ids0),
+    )
+    .await;
+
+    let base = connected_base(&mut conn, &before, &s).await;
+    let cs = plan(&base, &ids0, &after, &ids1);
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        0,
+        "the row this plan sets to NULL is not counted: {}",
+        probes[0].sql
+    );
+    assert_eq!(counted(&mut conn, &probes[1].sql).await, 0);
+    // And the plan runs, in the order that makes it true.
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!("SELECT count(*)::int FROM {s}.parent WHERE code = 'old'")
+        )
+        .await,
+        0
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The same connection string, as another role.
+///
+/// A `password=` is appended rather than substituted: libpq takes the last
+/// value of a repeated keyword, so this works whether or not the original
+/// carries one.
+fn as_role(role: &str, password: &str) -> String {
+    format!("{} user={role} password={password}", conn_str())
+}
+
+/// A child table whose rows the deploying session cannot see is not a child
+/// table with no rows, and the delete refuses rather than cascading into it.
+///
+/// **Measured**: referential actions bypass row-level security and a
+/// `SELECT count(*)` does not, so the guard counted zero and the
+/// `ON DELETE CASCADE` took the hidden row anyway — a silent loss by the
+/// statement written to prevent one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
+    let mut conn = connect().await;
+    let s = data_schema("rls");
+    fresh(&mut conn, &s).await;
+    let role = format!("{s}_dep");
+    // A run that failed part-way leaves the role behind — it does not live in
+    // the schema `fresh` just dropped — and `CREATE ROLE` would then fail with
+    // something far less informative than this test's own assertions.
+    conn.execute(&format!("DROP OWNED BY {role}")).await.ok();
+    conn.execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    conn.execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'x';
+         GRANT USAGE ON SCHEMA {s} TO {role};
+         CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             parent text REFERENCES {s}.parent(code) ON DELETE CASCADE, owner text);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old', 'somebody else');
+         ALTER TABLE {s}.child ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY only_mine ON {s}.child USING (owner = current_user);
+         GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.parent, {s}.child TO {role};"
+    ))
+    .await
+    .expect("the fixture");
+
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let stmt = pg
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+
+    // As the deploying role, the count is filtered to nothing…
+    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+        .await
+        .expect("connect as the deploying role");
+    assert_eq!(
+        number(
+            &mut deployer,
+            &format!("SELECT count(*)::int FROM {s}.child")
+        )
+        .await,
+        0,
+        "the policy hides the child from this session"
+    );
+    assert!(
+        truth(
+            &mut deployer,
+            &format!("SELECT pg_catalog.row_security_active('{s}.child'::regclass)")
+        )
+        .await
+    );
+
+    // …so preflight says so before the first statement of the plan runs,
+    // which is the only place a refusal can still stop a staged apply from
+    // committing everything ahead of the delete.
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    assert_eq!(
+        counted(&mut deployer, &probes[0].sql).await,
+        0,
+        "the count this session can take is not the count: {}",
+        probes[0].sql
+    );
+    assert_eq!(
+        counted(&mut deployer, &probes[1].sql).await,
+        1,
+        "one referencing table this session cannot see in full: {}",
+        probes[1].sql
+    );
+    assert!(
+        probes[1].description.contains("cannot count"),
+        "{probes:#?}"
+    );
+    // And the negative half, from a session the policy does not filter: the
+    // same table, the same switch, and nothing refused — the probe asks about
+    // the session, not about the table.
+    assert!(
+        truth(
+            &mut conn,
+            &format!("SELECT relrowsecurity FROM pg_class WHERE oid = '{s}.child'::regclass")
+        )
+        .await,
+        "the switch is on for both sessions"
+    );
+    assert_eq!(
+        counted(&mut conn, &probes[1].sql).await,
+        0,
+        "the owner sees every row, so its count is complete: {}",
+        probes[1].sql
+    );
+
+    // …and the guard refuses too, for a plan that got past preflight anyway.
+    let refusal = deployer
+        .execute(&stmt.sql)
+        .await
+        .expect_err("a filtered count is not a complete one");
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.child")).await,
+        1,
+        "the hidden child was not cascaded away"
+    );
+
+    // And as a session the policy does not apply to, the same statement runs:
+    // that count *is* complete, and this is what makes the refusal a
+    // statement about the session rather than about the table.
+    assert!(
+        !truth(
+            &mut conn,
+            &format!("SELECT pg_catalog.row_security_active('{s}.child'::regclass)")
+        )
+        .await
+    );
+    conn.execute(&stmt.sql)
+        .await
+        .expect_err("the child still references it, so the ordinary count refuses");
+
+    drop(deployer);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    // `DROP OWNED BY`, not `REVOKE ... ON SCHEMA {s}`: the schema is already
+    // gone, and naming it here fails with 3F000 *after* every assertion has
+    // passed — a teardown that reports the test as broken.
+    conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .await
+        .expect("drop the role");
+}
+
+/// A cell the column's own collation calls equal to its default is still a
+/// cell that is not at its default.
+///
+/// The read-back asks the engine whether the stored value equals the declared
+/// default. **Measured**, a `text` column under `und-u-ks-level2` answers yes
+/// for a stored `New` against `DEFAULT 'new'` — so the cell was marked at its
+/// default, `ObservedRow::as_seen_by` left it out of the read-back entirely,
+/// and the drift was invisible to every connected plan and to `verify`. The
+/// write path already compared as text under `COLLATE "C"`; this call site was
+/// not swept with it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_cell_a_collation_calls_equal_to_its_default_is_still_drift() {
+    let mut conn = connect().await;
+    let s = data_schema("cidefault");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE {s}.status (code text PRIMARY KEY, label text COLLATE {s}.ci DEFAULT 'new');
+         INSERT INTO {s}.status (code, label) VALUES ('a', 'New');"
+    ))
+    .await
+    .expect("the fixture");
+    // The engine's own answer, which is the one the read-back used to take.
+    assert!(
+        truth(
+            &mut conn,
+            &format!("SELECT label = ('new') FROM {s}.status WHERE code = 'a'")
+        )
+        .await,
+        "this column's collation calls the two spellings equal"
+    );
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut label = Column::new(ty("text"));
+    // The engine's own rendering of `DEFAULT 'new'`, which is what `pull`
+    // writes and what a declaration therefore holds; declaring the bare
+    // literal would plan an `AlterColumnDefault` beside the row change and
+    // say nothing about the row.
+    label.default = Some("'new'::text".into());
+    table.columns.insert("label".into(), label);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    // The declaration omits `label`, which is what "leave it at its default"
+    // is spelled as. The stored `New` is therefore drift.
+    with_data(&mut table, DataMode::Exact, &[("a", row(&[]))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let seen = observed(&mut conn, &declared, &s, &name).await;
+    let a = &seen.rows[&RowKey::from("a")];
+    assert!(
+        !a.at_default.contains("label"),
+        "a different spelling is not the default: {a:#?}"
+    );
+    assert_eq!(a.cells.get("label"), Some(&Value::Text("New".into())));
+
+    // And the drift is therefore something a plan can settle.
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let fix = plan(&base, &ids, &declared, &ids);
+    assert_eq!(fix.changes.len(), 1, "{fix:#?}");
+    assert!(
+        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        "{fix:#?}"
+    );
+    let pg = Postgres::new();
+    apply(&mut conn, &pg, &fix).await;
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT label FROM {s}.status WHERE code = 'a'")
+        )
+        .await,
+        "new",
+        "the update put the default back, in the default's own spelling"
+    );
+    let after = connected_base(&mut conn, &declared, &s).await;
+    assert!(
+        plan(&after, &ids, &declared, &ids).is_empty(),
+        "the plan after the apply"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A row that references itself is not a child that survives its own delete.
+///
+/// The guard counts the rows still referencing the parent, and it runs before
+/// the `DELETE` in the same block — so a self-referencing row still points at
+/// itself when it is counted. **Measured**, this engine takes that delete
+/// without complaint, because the one statement removes both sides of the
+/// reference; the guard refused a plan the engine accepts.
+///
+/// The negative half is the same table: another row pointing at the doomed one
+/// through the same self-reference is a real child, and is still counted.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_row_that_references_only_itself_can_be_deleted() {
+    let mut conn = connect().await;
+    let s = data_schema("selfref");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.node (code text PRIMARY KEY, parent text REFERENCES {s}.node(code));
+         INSERT INTO {s}.node VALUES ('keep', NULL), ('loop', 'loop');"
+    ))
+    .await
+    .expect("the fixture");
+
+    let name = TableName::new(&s, "node");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("parent".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    table.foreign_keys.insert(
+        "node_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    with_data(&mut table, DataMode::Exact, &[("keep", row(&[]))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert_eq!(cs.changes.len(), 1, "{cs:#?}");
+    assert!(
+        matches!(cs.changes[0].change, pbps_model::Change::DeleteRow { .. }),
+        "{cs:#?}"
+    );
+
+    let pg = Postgres::new();
+    // The probe already leaves the doomed row out on its own table, so the
+    // plan is offered at all…
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+    assert_eq!(counted(&mut conn, &probes[1].sql).await, 0);
+    // …and the statement's own guard has to agree, or a plan the probe passed
+    // dies at apply time.
+    let stmt = pg
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+    conn.execute(&stmt.sql)
+        .await
+        .expect("the engine removes both sides of the reference at once");
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.node")).await,
+        1
+    );
+
+    // The negative case: a *different* row pointing at the doomed one is a
+    // child, and neither the probe nor the guard may lose it.
+    conn.execute(&format!(
+        "INSERT INTO {s}.node VALUES ('loop', 'loop'), ('leaf', 'loop')"
+    ))
+    .await
+    .expect("the second fixture");
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let doomed = cs
+        .changes
+        .iter()
+        .find(|c| {
+            matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "loop")
+        })
+        .expect("the plan deletes `loop`");
+    let stmt = pg
+        .emit(&doomed.change, doomed.strategy)
+        .expect("emit")
+        .remove(0);
+    let refusal = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("`leaf` still references `loop`");
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.node")).await,
+        3
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// DECISIONS 124 on this engine: a write left to a default the probe cannot
+/// evaluate, on a column a live foreign key into the deleted row's table
+/// spans, is refused before the first statement.
+///
+/// Which key of the parent such a default names is decided when it runs. Read
+/// as absent, the write passes preflight, commits — for good, in a staged
+/// apply — and the delete's own guard then finds the reference and aborts,
+/// leaving the deployment half applied. The remedy costs one spelled value.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans_it() {
+    let mut conn = connect().await;
+    let s = data_schema("unprobeable");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             parent text DEFAULT lower('OLD') REFERENCES {s}.parent(code));
+         CREATE TABLE {s}.loose (id integer PRIMARY KEY, parent text DEFAULT lower('OLD'));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+    // The default really does name the doomed row, which is what makes the
+    // refusal about something rather than about a shape.
+    assert_eq!(text(&mut conn, "SELECT lower('OLD')").await, "old");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    for (name, keyed) in [("child", true), ("loose", false)] {
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        let mut fk_column = Column::new(ty("text"));
+        fk_column.default = Some("lower('OLD'::text)".into());
+        t.columns.insert("parent".into(), fk_column);
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        if keyed {
+            t.foreign_keys.insert(
+                format!("{name}_parent_fkey"),
+                ForeignKey {
+                    columns: vec!["parent".into()],
+                    references_table: parent_name.clone(),
+                    references_columns: vec!["code".into()],
+                    on_delete: ReferentialAction::NoAction,
+                    on_update: ReferentialAction::NoAction,
+                },
+            );
+        }
+        // The row omits `parent`, which is what leaves it to the default.
+        with_data(&mut t, DataMode::Exact, &[("1", row(&[]))]);
+        declared.tables.insert(TableName::new(&s, name), t);
+    }
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert!(
+        cs.changes.iter().any(|c| matches!(
+            &c.change,
+            pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "old"
+        )),
+        "{cs:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    // The count, the refusal about whether it could be complete, then one
+    // refusal per table this plan writes to such a default: the keyed child
+    // and the loose one.
+    assert_eq!(probes.len(), 4, "{probes:#?}");
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        0,
+        "nothing stored references the doomed row yet: {}",
+        probes[0].sql
+    );
+
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains(&format!("{s}.child")))
+        .expect("a refusal for the keyed child");
+    assert!(
+        refusal.description.contains("parent (row `1`)"),
+        "{refusal:#?}"
+    );
+    assert!(
+        refusal.description.contains("spell the value"),
+        "{refusal:#?}"
+    );
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "a live foreign key spans the column: {}",
+        refusal.sql
+    );
+
+    // The negative half, and the reason this is a count over the catalog
+    // rather than a rule about defaults: the same unevaluable default on a
+    // column no foreign key spans refuses nothing.
+    let loose = probes
+        .iter()
+        .find(|p| p.description.contains(&format!("{s}.loose")))
+        .expect("a refusal for the loose table");
+    assert_eq!(
+        counted(&mut conn, &loose.sql).await,
+        0,
+        "no key into the parent spans it: {}",
+        loose.sql
+    );
+
+    // And the hazard the refusal is about: run the plan without heeding it and
+    // the insert commits, the delete then finds the reference, and a staged
+    // apply is left half done.
+    conn.execute(&format!("INSERT INTO {s}.child (id) VALUES (1)"))
+        .await
+        .expect("the write the probe could not evaluate");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT parent FROM {s}.child WHERE id = 1")
+        )
+        .await,
+        "old",
+        "the default did name the doomed row"
+    );
+    let delete = cs
+        .changes
+        .iter()
+        .find(|c| {
+            matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "old")
+        })
+        .expect("the delete");
+    let stmt = pg
+        .emit(&delete.change, delete.strategy)
+        .expect("emit")
+        .remove(0);
+    let aborted = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("the guard finds what the probe could not");
+    assert_eq!(sqlstate(&aborted), "P0001", "{aborted:?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A `json` cell left to its default is compared like any other, because the
+/// comparison is made as text and needs no `json = json`.
+///
+/// **Measured**, this engine has no such operator — it is the one type in this
+/// dialect's catalogue without one — and the guard that skipped `json`
+/// outlived the native comparison it was written for. A skipped cell is read
+/// back as one nobody can tell from its default, so a hand-edited document was
+/// dropped from the read-back and no plan ever proposed to put it back.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_json_cell_at_its_default_is_told_from_a_hand_edited_one() {
+    let mut conn = connect().await;
+    let s = data_schema("jsondefault");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "doc");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut body = Column::new(ty("json"));
+    body.default = Some("'{\"a\": 1}'::json".into());
+    table.columns.insert("body".into(), body);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(&mut table, DataMode::Exact, &[("a", row(&[]))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    // The type has no `=` at all, and the read-back does not need one.
+    let no_operator = match conn
+        .query(&format!("SELECT body = body FROM {s}.doc"))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("json has no equality operator"),
+    };
+    assert_eq!(sqlstate(&no_operator), "42883", "{no_operator:?}");
+    let seen = observed(&mut conn, &declared, &s, &name).await;
+    let a = &seen.rows[&RowKey::from("a")];
+    assert!(a.at_default.contains("body"), "{a:#?}");
+    assert!(!a.unknown.contains("body"), "{a:#?}");
+
+    // And a hand edit is drift, not an omission.
+    conn.execute(&format!("UPDATE {s}.doc SET body = '{{\"a\": 2}}'"))
+        .await
+        .expect("the hand edit");
+    let after = connected_base(&mut conn, &declared, &s).await;
+    let fix = plan(&after, &ids, &declared, &ids);
+    assert_eq!(fix.changes.len(), 1, "{fix:#?}");
+    assert!(
+        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        "{fix:#?}"
+    );
+    apply(&mut conn, &pg, &fix).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT body::text FROM {s}.doc")).await,
+        "{\"a\": 1}",
+        "the update put the default back"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The key a write puts there is held to its exact spelling, like every other
+/// cell the plan spells.
+///
+/// **Measured**, a trigger that lowercases a newly inserted key leaves the row
+/// under a spelling nobody declared, and a postcondition using the key
+/// column's own `=` — case-insensitive here — calls that a success. The alias
+/// read then maps the declaration's `New` onto the stored `new`, so `verify`
+/// agrees with it for ever after and no plan proposes to put the spelling
+/// back.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_trigger_that_respells_the_written_key_rolls_the_statement_back() {
+    let mut conn = connect().await;
+    let s = data_schema("keycase");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE {s}.status (code text COLLATE {s}.ci PRIMARY KEY, label text);
+         CREATE FUNCTION {s}.lower_it() RETURNS trigger LANGUAGE plpgsql AS $fn$
+         BEGIN UPDATE {s}.status SET code = lower(NEW.code) WHERE code = NEW.code; RETURN NULL; END
+         $fn$;"
+    ))
+    .await
+    .expect("the fixture");
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("New", row(&[("label", Value::Text("a".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert_eq!(cs.changes.len(), 1, "{cs:#?}");
+    let pg = Postgres::new();
+    let stmt = pg
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+
+    // Without the trigger the same statement runs and the key is what was
+    // declared — so the refusal below is about the trigger, not about the
+    // collation.
+    conn.execute(&stmt.sql).await.expect("the ordinary insert");
+    assert_eq!(
+        text(&mut conn, &format!("SELECT code FROM {s}.status")).await,
+        "New"
+    );
+    conn.execute(&format!("DELETE FROM {s}.status")).await.ok();
+
+    conn.execute(&format!(
+        "CREATE TRIGGER lower_it AFTER INSERT ON {s}.status
+             FOR EACH ROW EXECUTE FUNCTION {s}.lower_it();"
+    ))
+    .await
+    .expect("arm the trigger");
+    let refusal = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("the trigger respelled the key this plan wrote");
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+    // The engine calls the two spellings one key, which is exactly why the
+    // column's own `=` could not tell that anything had happened.
+    assert!(
+        truth(
+            &mut conn,
+            &format!("SELECT E'New' = E'new' COLLATE \"{s}\".\"ci\"")
+        )
+        .await
+    );
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.status")).await,
+        0,
+        "the whole statement rolled back"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A relation is scanned the way its foreign key covers it: `ONLY` for an
+/// ordinary table, whose key does not reach its inheritance children, and in
+/// full for a partitioned one, whose key does.
+///
+/// **Measured on 18.6**, both halves. A foreign key is not inherited, so a row
+/// in an inheritance child holding the deleted key is not constrained and the
+/// parent deletes — while an unqualified `FROM schema.table` scans that child
+/// and counted it, refusing a delete the engine performs. And a partitioned
+/// referencing table carries the key *twice* in the catalog, once on the
+/// partitioned table and once on each partition, so counting both scanned the
+/// same row twice.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
+    let mut conn = connect().await;
+    let s = data_schema("inherit");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.ref (id integer PRIMARY KEY, parent text REFERENCES {s}.parent(code));
+         CREATE TABLE {s}.ref_kid (extra text) INHERITS ({s}.ref);
+         CREATE TABLE {s}.part (id integer, parent text REFERENCES {s}.parent(code))
+             PARTITION BY RANGE (id);
+         CREATE TABLE {s}.part_1 PARTITION OF {s}.part FOR VALUES FROM (0) TO (100);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.ref_kid VALUES (1, 'old', 'x');"
+    ))
+    .await
+    .expect("the fixture");
+    // The catalog holds one key for the inheritance pair and two for the
+    // partitioned one, which is what the count has to be told apart.
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_constraint \
+                 WHERE contype = 'f' AND confrelid = '{s}.parent'::regclass"
+            )
+        )
+        .await,
+        3
+    );
+
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    // The row lives in the inheritance child, which no key covers.
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        0,
+        "an unconstrained descendant row is not a child: {}",
+        probes[0].sql
+    );
+    // And the engine agrees, which is what makes the count right rather than
+    // merely smaller.
+    let stmt = pg
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .expect("emit")
+        .remove(0);
+    conn.execute(&stmt.sql).await.expect("the delete");
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.ref")).await,
+        1,
+        "the descendant row is still there, orphaned and unconstrained"
+    );
+
+    // The negative half, on the same schema: a row a key *does* cover is
+    // counted, once, through the partitioned table and not again through its
+    // partition.
+    conn.execute(&format!(
+        "INSERT INTO {s}.part VALUES (1, 'keep');
+         DELETE FROM {s}.ref_kid;"
+    ))
+    .await
+    .expect("the second fixture");
+    // The same declaration with no rows at all, so `keep` is undeclared and
+    // the plan deletes it.
+    with_data(
+        declared.tables.get_mut(&name).expect("the table"),
+        DataMode::Exact,
+        &[],
+    );
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let doomed = cs
+        .changes
+        .iter()
+        .find(|c| {
+            matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "keep")
+        })
+        .expect("the plan deletes `keep`");
+    let probes = pg.preflight(&cs);
+    let count = probes
+        .iter()
+        .find(|p| p.description.contains("row `keep`"))
+        .expect("the count for `keep`");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        1,
+        "the partitioned row is counted exactly once: {}",
+        count.sql
+    );
+    let stmt = pg
+        .emit(&doomed.change, doomed.strategy)
+        .expect("emit")
+        .remove(0);
+    let refusal = conn
+        .execute(&stmt.sql)
+        .await
+        .expect_err("the partitioned child still references it");
+    assert_eq!(sqlstate(&refusal), "P0001", "{refusal:?}");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A key is a tuple, and so is the question the unprobeable-default refusal
+/// asks: a default nobody can evaluate says nothing about a tuple that already
+/// holds a NULL.
+///
+/// **Measured on 18.6**, `MATCH SIMPLE` is this engine's default, so a
+/// composite foreign key with a NULL in any of its columns is not checked at
+/// all — the child is accepted against a parent row that does not exist, and
+/// the parent deletes with that child sitting there. Refusing on the
+/// unprobeable column alone therefore refused a plan the engine accepts
+/// however the default evaluates.
+///
+/// The foreign key references a *unique* key and not the primary key, because
+/// it has to: rows are keyed by one column (ADR-0004), so a table with a
+/// composite primary key can carry no `data:` block and can never be the
+/// parent of a `DeleteRow`. DECISIONS 116's shape is the only way a composite
+/// foreign key and declared rows meet.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() {
+    let mut conn = connect().await;
+    let s = data_schema("tuplenull");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, x text, y text, label text,
+             CONSTRAINT parent_xy UNIQUE (x, y));
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             a text DEFAULT lower('OX'), b text,
+             CONSTRAINT child_ab FOREIGN KEY (a, b) REFERENCES {s}.parent(x, y));
+         INSERT INTO {s}.parent VALUES ('old', 'ox', 'oy', 'Old'), ('keep', 'kx', 'ky', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+    // The engine's own rule, which is what the refusal has to agree with.
+    conn.execute(&format!(
+        "INSERT INTO {s}.child (id, a, b) VALUES (99, 'nosuch', NULL)"
+    ))
+    .await
+    .expect("MATCH SIMPLE does not check a tuple holding a NULL");
+    conn.execute(&format!("DELETE FROM {s}.child WHERE id = 99"))
+        .await
+        .expect("clear it");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["x", "y", "label"] {
+        parent.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_xy".into(),
+        UniqueConstraint {
+            columns: vec!["x".into(), "y".into()],
+        },
+    );
+    // No rows declared, so both stored rows are undeclared and the plan
+    // deletes them — which is what puts a `DeleteRow` in front of the refusal.
+    with_data(&mut parent, DataMode::Exact, &[]);
+
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut a = Column::new(ty("text"));
+    a.default = Some("lower('OX'::text)".into());
+    child.columns.insert("a".into(), a);
+    child.columns.insert("b".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ab".into(),
+        ForeignKey {
+            columns: vec!["a".into(), "b".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["x".into(), "y".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // `a` is left to the unevaluable default, which names the doomed row'"'"'s
+    // `x`; `b` is spelled NULL. The tuple cannot reference anything.
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("1", row(&[("b", Value::Null)]))],
+    );
+
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the refusal is still offered, and answers nothing");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        0,
+        "the same key holds a NULL this plan writes: {}",
+        refusal.sql
+    );
+
+    // And the whole plan runs — which is the assertion, since the refusal
+    // would have stopped it before its first statement.
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        0,
+        "both parent rows are undeclared and went"
+    );
+    assert_eq!(
+        text(&mut conn, &format!("SELECT a FROM {s}.child WHERE id = 1")).await,
+        "ox",
+        "the default did name a row the plan deleted, and it did not matter"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A referencing table this session cannot read is not a referencing table
+/// with no rows.
+///
+/// **Measured**, a role with `DELETE` on the parent and no `SELECT` on the
+/// child gets `permission denied` from the count — which the probe runner
+/// reports as *unchecked*, and `apply` proceeds — while the engine's own key
+/// still sees the child and refuses the delete. So the probe asks the catalog
+/// first, and refuses on the answer rather than on the error.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
+    let mut conn = connect().await;
+    let s = data_schema("unreadable");
+    fresh(&mut conn, &s).await;
+    let role = format!("{s}_dep");
+    conn.execute(&format!("DROP OWNED BY {role}")).await.ok();
+    conn.execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    conn.execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'x';
+         GRANT USAGE ON SCHEMA {s} TO {role};
+         CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY, parent text REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old');
+         GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.parent TO {role};"
+    ))
+    .await
+    .expect("the fixture");
+
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+
+    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+        .await
+        .expect("connect as the deploying role");
+    // The count itself is an error to this session — which `apply` would read
+    // as "unchecked" and walk past…
+    let denied = match deployer.query(&probes[0].sql).await {
+        Err(e) => e,
+        Ok(_) => panic!("the role cannot read the child"),
+    };
+    assert_eq!(sqlstate(&denied), "42501", "{denied:?}");
+    // …so the refusal beside it answers from the catalog instead.
+    assert_eq!(
+        counted(&mut deployer, &probes[1].sql).await,
+        1,
+        "one referencing table this session cannot read: {}",
+        probes[1].sql
+    );
+    // And the owner, who can read it, is refused by nothing here — the
+    // ordinary count does that job for it.
+    assert_eq!(counted(&mut conn, &probes[1].sql).await, 0);
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
+
+    drop(deployer);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .await
+        .expect("drop the role");
+}
+
+/// A `DEFAULT` whose default is NULL is a NULL the probe compares, exactly as
+/// a cell spelled `null:` is (DECISIONS 329).
+///
+/// The ordinary shape — unpick a child's reference, then delete the parent —
+/// written by leaving the child's column out so it goes back to its default.
+/// Mapping that default to "cannot compare" kept the child's stored reference
+/// in the count and refused the plan, while the same plan spelled with an
+/// explicit NULL was allowed.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delete() {
+    let mut conn = connect().await;
+    let s = data_schema("nulldefault");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY,
+             parent text DEFAULT NULL REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES ('c1', 'old');"
+    ))
+    .await
+    .expect("the fixture");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut fk = Column::new(ty("text"));
+    fk.default = Some("NULL::text".into());
+    child.columns.insert("parent".into(), fk);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // `parent` is left out, which is "back to the default" — NULL.
+    with_data(&mut child, DataMode::Exact, &[("c1", row(&[]))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name, parent);
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert!(
+        cs.changes.iter().any(|c| matches!(
+            &c.change,
+            pbps_model::Change::UpdateRow { columns, .. }
+                if matches!(columns.get("parent"), Some((_, pbps_model::Cell::Default(_))))
+        )),
+        "the child goes back to its default: {cs:#?}"
+    );
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        0,
+        "the row this plan sends back to a NULL default is not counted: {}",
+        probes[0].sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1
+    );
+    assert!(
+        truth(
+            &mut conn,
+            &format!("SELECT parent IS NULL FROM {s}.child WHERE code = 'c1'")
+        )
+        .await
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A foreign key this plan adds is a foreign key the probe counts through.
+///
+/// `DeleteRow` runs at rank 12 and `AddForeignKey` at 13, so the delete runs
+/// against a catalog that does not hold the key and the `ALTER` that follows
+/// validates every stored child row — **measured**, it fails on the one the
+/// delete just orphaned, and in a staged apply the delete has committed by
+/// then. The planned key is built as a synthetic `pg_constraint` row beside
+/// the stored ones, so every rule written for a catalog row reaches it: the
+/// negative half is the same plan with the child row undeclared, where the
+/// exclusion for rows the plan deletes takes it out of the count exactly as it
+/// would for a stored key.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_break_it() {
+    let mut conn = connect().await;
+    let s = data_schema("plannedkey");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, parent text);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES ('c1', 'old');"
+    ))
+    .await
+    .expect("the fixture");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("parent".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    // The key is declared and not in the database: this plan adds it.
+    child.foreign_keys.insert(
+        "child_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("c1", row(&[("parent", Value::Text("old".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert_eq!(cs.changes.len(), 2, "{cs:#?}");
+    assert!(
+        matches!(cs.changes[0].change, pbps_model::Change::DeleteRow { .. }),
+        "the delete runs first: {cs:#?}"
+    );
+    assert!(
+        matches!(
+            cs.changes[1].change,
+            pbps_model::Change::AddForeignKey { .. }
+        ),
+        "and the key is added after it: {cs:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    // The catalog's count sees no key — it is not there yet — and the
+    // planned key is asked about from the plan (DECISIONS 345).
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is asked about from the plan");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        1,
+        "the child is counted through the key this plan adds: {}",
+        planned.sql
+    );
+    // The hazard, by hand and in the plan's own order: the delete goes
+    // through, and the key cannot then be added.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!("DELETE FROM {s}.parent WHERE code = 'old'"))
+        .await
+        .expect("nothing in the catalog stops the delete");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_parent_fkey \
+             FOREIGN KEY (parent) REFERENCES {s}.parent(code)"
+        ))
+        .await
+        .expect_err("the orphaned child fails the key's validation");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    // The negative half: the same plan with the child row undeclared, so the
+    // plan deletes it first — and the exclusion for rows this plan deletes
+    // reaches the planned key exactly as it reaches a stored one.
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[],
+    );
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.contains("row `old`")
+                && p.description.contains("on a column it also adds")
+        })
+        .expect("the planned key's count for `old`");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        0,
+        "a child this plan deletes is not counted through the planned key either: {}",
+        count.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_constraint \
+                 WHERE conname = 'child_parent_fkey' AND connamespace = '{s}'::regnamespace"
+            )
+        )
+        .await,
+        1,
+        "the key was added once the delete had nothing left to orphan"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A foreign key this plan adds on a column it also adds is counted through
+/// the value that column is added with.
+///
+/// The synthetic constraint row that stands in for a planned key is built
+/// from `pg_attribute`, and a column the database does not have has no row
+/// there — so the key vanished, and the probe counted nothing. But `ADD
+/// COLUMN … DEFAULT 'old'` backfills every stored row — **measured** — and the
+/// plan runs it at rank 8, the delete at 12, and the key at 13: the delete
+/// goes through and the key then fails validation on every backfilled row.
+/// The count is asked from the plan alone. The negative halves are the same
+/// plan with a default that names a row that stays, and with no default —
+/// where a NULL in the tuple references nothing (`MATCH SIMPLE`); and the
+/// refusal DECISIONS 124 asks for when the default is not one the probe can
+/// evaluate.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
+    let mut conn = connect().await;
+    let s = data_schema("backfilled");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES ('c1'), ('c2');"
+    ))
+    .await
+    .expect("the fixture");
+    // The hazard, by hand and in the plan's own order.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.child ADD COLUMN parent text DEFAULT 'old';
+         DELETE FROM {s}.parent WHERE code = 'old'"
+    ))
+    .await
+    .expect("nothing in the catalog stops the delete");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_parent_fkey \
+             FOREIGN KEY (parent) REFERENCES {s}.parent(code)"
+        ))
+        .await
+        .expect_err("the backfilled rows fail the key's validation");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut added = Column::new(ty("text"));
+    added.default = Some("'old'".into());
+    child.columns.insert("parent".into(), added);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let pg = Postgres::new();
+
+    let planned_count = |probes: &[pbps_dialect::Probe]| -> String {
+        probes
+            .iter()
+            .find(|p| p.description.contains("on a column it also adds"))
+            .expect("the planned key is asked about")
+            .sql
+            .clone()
+    };
+    // The base's ids first, and the declaration's minted on top of them, so
+    // the column the base does not have is an addition and not a rename.
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    assert_eq!(cs.changes.len(), 3, "{cs:#?}");
+    assert!(
+        matches!(cs.changes[0].change, pbps_model::Change::AddColumn { .. }),
+        "the column comes first: {cs:#?}"
+    );
+    let probes = pg.preflight(&cs);
+    assert_eq!(
+        counted(&mut conn, &planned_count(&probes)).await,
+        2,
+        "both stored rows will hold the default, which is the doomed row: {probes:#?}"
+    );
+    assert!(
+        !probes
+            .iter()
+            .any(|p| p.description.contains("cannot evaluate")),
+        "a literal default is one the probe evaluates: {probes:#?}"
+    );
+
+    // The same key, backfilled with a row that stays.
+    let set_default = |declared: &mut Schema, default: Option<&str>| {
+        declared
+            .tables
+            .get_mut(&child_name)
+            .expect("the child")
+            .columns
+            .get_mut("parent")
+            .expect("the column")
+            .default = default.map(Into::into);
+    };
+    set_default(&mut declared, Some("'keep'"));
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    assert_eq!(
+        counted(&mut conn, &planned_count(&probes)).await,
+        0,
+        "'keep' is not the deleted row: {probes:#?}"
+    );
+    // Added with no default: every stored row holds NULL there, which
+    // references nothing.
+    set_default(&mut declared, None);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    assert_eq!(
+        counted(&mut conn, &planned_count(&probes)).await,
+        0,
+        "a NULL tuple references no row: {probes:#?}"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "the plan with no default runs whole"
+    );
+    conn.execute(&format!(
+        "ALTER TABLE {s}.child DROP CONSTRAINT child_parent_fkey;
+         ALTER TABLE {s}.child DROP COLUMN parent;
+         INSERT INTO {s}.parent VALUES ('old', 'Old')"
+    ))
+    .await
+    .expect("back to the fixture");
+
+    // And a default the probe cannot evaluate, backfilled into every stored
+    // row: refused, counted as the rows it reaches.
+    set_default(&mut declared, Some("lower('OLD'::text)"));
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the backfill is refused");
+    assert!(
+        refusal.description.contains("parent of ")
+            && refusal
+                .description
+                .contains(".child (its default, backfilled"),
+        "{}",
+        refusal.description
+    );
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        2,
+        "every stored row gets the default: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A stored child row this plan updates to a NULL in one column of a key and
+/// to an unevaluable default in another leaves the count, as the engine's
+/// rule says it does.
+///
+/// The refusal over unevaluable defaults already asks per row whether the
+/// same key holds a NULL the same row writes. The count's own exclusion did
+/// not: its guard gave up on the unevaluable column first, the row stayed
+/// counted with its stored tuple, and the ordinary update-then-delete plan
+/// was refused for a row that will reference nothing (DECISIONS 336).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count() {
+    let mut conn = connect().await;
+    let s = data_schema("updnull");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, x text, y text, label text,
+             CONSTRAINT parent_xy UNIQUE (x, y));
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             a text DEFAULT 'ox', b text,
+             CONSTRAINT child_ab FOREIGN KEY (a, b) REFERENCES {s}.parent(x, y));
+         INSERT INTO {s}.parent VALUES ('old', 'ox', 'oy', 'Old'), ('keep', 'kx', 'ky', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'ox', 'oy');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["x", "y", "label"] {
+        parent.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_xy".into(),
+        UniqueConstraint {
+            columns: vec!["x".into(), "y".into()],
+        },
+    );
+    with_data(&mut parent, DataMode::Exact, &[]);
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut a = Column::new(ty("text"));
+    a.default = Some("lower('ZZ'::text)".into());
+    child.columns.insert("a".into(), a);
+    child.columns.insert("b".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ab".into(),
+        ForeignKey {
+            columns: vec!["a".into(), "b".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["x".into(), "y".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // The stored row references `old` and holds `a` at its default, which
+    // the declaration changes to one no probe can evaluate: the plan sets `b`
+    // to NULL and `a` to the new default, which is the update the count has
+    // to see through.
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("1", row(&[("b", Value::Null)]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let update = cs
+        .changes
+        .iter()
+        .find_map(|c| {
+            if let pbps_model::Change::UpdateRow { columns, .. } = &c.change {
+                Some(columns)
+            } else {
+                None
+            }
+        })
+        .expect("the child row is updated, not rewritten");
+    assert!(
+        update.contains_key("a") && update.contains_key("b"),
+        "both columns of the key are written: {update:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.starts_with("rows in other tables") && p.description.contains("`old`")
+        })
+        .expect("the count for the row the child references");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        0,
+        "the row's tuple after the update holds a NULL: {}",
+        count.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        0,
+        "both parent rows went"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A key this plan adds into a column it adds to the *parent* is counted
+/// through the value that column is backfilled with — and not against the
+/// parent rows the plan leaves in place.
+///
+/// The referenced side is backfilled exactly as the child side is, so the
+/// deleted row's value in the new column is the default, which every other
+/// parent row holds too. **Measured**: with every parent row deleted the key
+/// fails validation on the child (23503); with one row left it is added,
+/// because the child references that row as well as it ever referenced the
+/// deleted one. The negative half declares one parent row and keeps it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_backfill() {
+    let mut conn = connect().await;
+    let s = data_schema("parentfill");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, ref text);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES ('c1', 'x');"
+    ))
+    .await
+    .expect("the fixture");
+    // The hazard by hand, in the plan's order: every parent row deleted.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.parent ADD COLUMN alt text DEFAULT 'x';
+         DELETE FROM {s}.parent;
+         ALTER TABLE {s}.parent ADD CONSTRAINT parent_alt UNIQUE (alt)"
+    ))
+    .await
+    .expect("nothing in the catalog stops the delete");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_ref \
+             FOREIGN KEY (ref) REFERENCES {s}.parent(alt)"
+        ))
+        .await
+        .expect_err("the child references the backfilled value of no row");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut alt = Column::new(ty("text"));
+    alt.default = Some("'x'".into());
+    parent.columns.insert("alt".into(), alt);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_alt".into(),
+        UniqueConstraint {
+            columns: vec!["alt".into()],
+        },
+    );
+    with_data(&mut parent, DataMode::Exact, &[]);
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child.columns.insert("ref".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["alt".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned: Vec<_> = probes
+        .iter()
+        .filter(|p| p.description.contains("on a column it also adds"))
+        .collect();
+    assert_eq!(planned.len(), 2, "one per deleted parent row: {probes:#?}");
+    for p in &planned {
+        assert_eq!(
+            counted(&mut conn, &p.sql).await,
+            1,
+            "no parent row survives to be the one the child references: {}",
+            p.sql
+        );
+    }
+
+    // The negative half: `keep` is declared and stays, holding the same
+    // backfilled value, so the child references it and the delete is valid.
+    with_data(
+        declared.tables.get_mut(&parent_name).expect("the parent"),
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned: Vec<_> = probes
+        .iter()
+        .filter(|p| p.description.contains("on a column it also adds"))
+        .collect();
+    assert_eq!(planned.len(), 1, "{probes:#?}");
+    assert_eq!(
+        counted(&mut conn, &planned[0].sql).await,
+        0,
+        "a surviving parent row holds the tuple: {}",
+        planned[0].sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "the plan runs whole, key and all"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// An inserted row that omits a column of a key the table gives no default
+/// for puts a NULL there, and the probe knows it.
+///
+/// The plan carries every such column in the insert's `types`, and a NULL in
+/// any column of a key is the value that makes the whole tuple reference
+/// nothing (`MATCH SIMPLE`). Left out of what the probe knew about the row,
+/// it was neither compared nor seen by the refusal over unevaluable defaults,
+/// which then refused an insert leaving a sibling column of the key to such a
+/// default — for a tuple the engine never checks.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
+    let mut conn = connect().await;
+    let s = data_schema("omitnull");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, x text, y text, label text,
+             CONSTRAINT parent_xy UNIQUE (x, y));
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             a text DEFAULT lower('OX'), b text,
+             CONSTRAINT child_ab FOREIGN KEY (a, b) REFERENCES {s}.parent(x, y));
+         INSERT INTO {s}.parent VALUES ('old', 'ox', 'oy', 'Old'), ('keep', 'kx', 'ky', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["x", "y", "label"] {
+        parent.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_xy".into(),
+        UniqueConstraint {
+            columns: vec!["x".into(), "y".into()],
+        },
+    );
+    with_data(&mut parent, DataMode::Exact, &[]);
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut a = Column::new(ty("text"));
+    a.default = Some("lower('OX'::text)".into());
+    child.columns.insert("a".into(), a);
+    child.columns.insert("b".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ab".into(),
+        ForeignKey {
+            columns: vec!["a".into(), "b".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["x".into(), "y".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // The row spells neither `a` nor `b`: `a` takes the default the probe
+    // cannot evaluate, `b` has no default and is NULL.
+    with_data(&mut child, DataMode::Exact, &[("1", row(&[]))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the refusal is still offered");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        0,
+        "the omitted column is a NULL in the same key: {}",
+        refusal.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert!(
+        truth(
+            &mut conn,
+            &format!("SELECT b IS NULL AND a = 'ox' FROM {s}.child WHERE id = 1")
+        )
+        .await,
+        "the default named a deleted row's column, beside a NULL"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A planned column backfilled with a typed NULL — `NULL::text` — is a NULL.
+///
+/// Beside a sibling column of the same planned key whose default the probe
+/// cannot evaluate, the NULL makes every backfilled tuple reference nothing;
+/// read as a value, it did not, and every stored child row was refused for a
+/// key the engine will never check.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
+    let mut conn = connect().await;
+    let s = data_schema("typednull");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, x text, y text, label text,
+             CONSTRAINT parent_xy UNIQUE (x, y));
+         CREATE TABLE {s}.child (id integer PRIMARY KEY);
+         INSERT INTO {s}.parent VALUES ('old', 'ox', 'oy', 'Old'), ('keep', 'kx', 'ky', 'Keep');
+         INSERT INTO {s}.child VALUES (1), (2);"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["x", "y", "label"] {
+        parent.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_xy".into(),
+        UniqueConstraint {
+            columns: vec!["x".into(), "y".into()],
+        },
+    );
+    with_data(&mut parent, DataMode::Exact, &[]);
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut a = Column::new(ty("text"));
+    a.default = Some("lower('OX'::text)".into());
+    child.columns.insert("a".into(), a);
+    let mut b = Column::new(ty("text"));
+    b.default = Some("NULL::text".into());
+    child.columns.insert("b".into(), b);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ab".into(),
+        ForeignKey {
+            columns: vec!["a".into(), "b".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["x".into(), "y".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert!(
+        !probes
+            .iter()
+            .any(|p| p.description.contains("cannot evaluate")),
+        "a typed NULL beside the unevaluable default refuses nothing: {probes:#?}"
+    );
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is still counted");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "every backfilled tuple holds a NULL: {}",
+        planned.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        0,
+        "the plan runs whole"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The survivors a planned key's backfilled parent side is checked against
+/// are the parent rows as this plan leaves them, not as they stand.
+///
+/// An update that moves the surviving parent row off the backfilled value
+/// runs before the delete, so a child holding that value then references no
+/// row and the key fails; a parent row this plan inserts with the value is a
+/// survivor the engine will accept. Both by the plan's own apply, which is
+/// the measurement: the first is refused before it, the second runs whole.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
+    let mut conn = connect().await;
+    let s = data_schema("survivor");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, ref text);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES ('c1', 'x');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut alt = Column::new(ty("text"));
+    alt.default = Some("'x'".into());
+    parent.columns.insert("alt".into(), alt);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_alt".into(),
+        UniqueConstraint {
+            columns: vec!["alt".into()],
+        },
+    );
+    // `keep` survives, moved off the backfilled value: nothing is left for
+    // the child to reference once `old` is gone.
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[(
+            "keep",
+            row(&[
+                ("label", Value::Text("Keep".into())),
+                ("alt", Value::Text("y".into())),
+            ]),
+        )],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child.columns.insert("ref".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["alt".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::UpdateRow { .. })),
+        "the survivor is updated: {cs:#?}"
+    );
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        1,
+        "the survivor no longer holds the value: {}",
+        planned.sql
+    );
+    // The hazard by hand, in the plan's order.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.parent ADD COLUMN alt text DEFAULT 'x';
+         UPDATE {s}.parent SET alt = 'y' WHERE code = 'keep';
+         DELETE FROM {s}.parent WHERE code = 'old';
+         ALTER TABLE {s}.parent ADD CONSTRAINT parent_alt UNIQUE (alt)"
+    ))
+    .await
+    .expect("nothing in the catalog stops the delete");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_ref \
+             FOREIGN KEY (ref) REFERENCES {s}.parent(alt)"
+        ))
+        .await
+        .expect_err("the child references the value no row holds any more");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    // The inverse: a parent row this plan inserts holds the value, and the
+    // delete is valid because the child references it.
+    declared
+        .tables
+        .get_mut(&parent_name)
+        .expect("the parent")
+        .data
+        .as_mut()
+        .expect("declared rows")
+        .rows
+        .insert(
+            RowKey::from("fresh"),
+            row(&[
+                ("label", Value::Text("Fresh".into())),
+                ("alt", Value::Text("x".into())),
+            ]),
+        );
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "the inserted parent row is a survivor holding the value: {}",
+        planned.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT code FROM {s}.parent WHERE alt = 'x'")
+        )
+        .await,
+        "fresh",
+        "the plan runs whole, key and all"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A backfilled literal is compared through its column's type, as every other
+/// default is.
+///
+/// Two planned columns, one on each side of a planned key, both `date`: the
+/// parent is added with `'2026-01-02'` and the child with `'01/02/2026'`,
+/// which the engine stores as one value. **Measured**, `'2026-01-02' =
+/// '01/02/2026'` is false — two unknown literals compare as text — and the
+/// same through `CAST(… AS date)` is true; a probe comparing the spellings
+/// reported no reference and let the delete through. The negative half is a
+/// child default naming another day.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_backfilled_literal_is_compared_through_its_columns_type() {
+    let mut conn = connect().await;
+    let s = data_schema("typedfill");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY);
+         INSERT INTO {s}.parent VALUES ('old', 'Old');
+         INSERT INTO {s}.child VALUES ('c1'), ('c2');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut on = Column::new(ty("date"));
+    on.default = Some("'2026-01-02'".into());
+    parent.columns.insert("on_day".into(), on);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_on_day".into(),
+        UniqueConstraint {
+            columns: vec!["on_day".into()],
+        },
+    );
+    with_data(&mut parent, DataMode::Exact, &[]);
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut day = Column::new(ty("date"));
+    day.default = Some("'01/02/2026'".into());
+    child.columns.insert("day".into(), day);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_day".into(),
+        ForeignKey {
+            columns: vec!["day".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["on_day".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        2,
+        "two spellings of one day are one value: {}",
+        planned.sql
+    );
+    // Another day: no reference.
+    declared
+        .tables
+        .get_mut(&child_name)
+        .expect("the child")
+        .columns
+        .get_mut("day")
+        .expect("the column")
+        .default = Some("'2026-01-03'".into());
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "a different day references nothing: {}",
+        planned.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A column added as an identity is backfilled by the sequence, and no probe
+/// can say with what.
+///
+/// **Measured**: `ADD COLUMN pid integer GENERATED BY DEFAULT AS IDENTITY`
+/// hands every stored row a value — `1`, `2`, … — and a key from it into a
+/// parent whose row `1` this plan deletes fails validation after the delete
+/// (23503). Read as "no default, so NULL", the probe counted nothing; it is
+/// a backfill the probe cannot evaluate, and refused as one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate() {
+    let mut conn = connect().await;
+    let s = data_schema("identfill");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code integer PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY);
+         INSERT INTO {s}.parent VALUES (1, 'One'), (2, 'Two');
+         INSERT INTO {s}.child VALUES ('a'), ('b');"
+    ))
+    .await
+    .expect("the fixture");
+    // The hazard by hand, in the plan's order.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.child ADD COLUMN pid integer GENERATED BY DEFAULT AS IDENTITY;
+         DELETE FROM {s}.parent WHERE code = 1"
+    ))
+    .await
+    .expect("nothing in the catalog stops the delete");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_pid \
+             FOREIGN KEY (pid) REFERENCES {s}.parent(code)"
+        ))
+        .await
+        .expect_err("the sequence handed a stored row the deleted key");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("integer")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("2", row(&[("label", Value::Text("Two".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut pid = Column::new(ty("integer"));
+    pid.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    child.columns.insert("pid".into(), pid);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_pid".into(),
+        ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AddColumn { .. })),
+        "the identity column is added: {cs:#?}"
+    );
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the identity backfill is refused");
+    assert!(
+        refusal
+            .description
+            .contains("its identity, assigned to every stored row"),
+        "{}",
+        refusal.description
+    );
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        2,
+        "every stored row is handed a value: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A key this plan adds on columns it retypes compares the values the retype
+/// leaves, not the stored ones.
+///
+/// `ALTER COLUMN … TYPE` runs at rank 9, the delete at 12, the key at 13.
+/// **Measured**: a child `numeric(5,2)` holding `1.04` and the doomed parent's
+/// `1.00`, both narrowed to `numeric(5,1)`, are one value `1.0` by the time
+/// the key is validated — and the key fails on it (23503) — while as stored
+/// they are two. The negative half is a child value that rounds elsewhere.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_values() {
+    let mut conn = connect().await;
+    let s = data_schema("retyped");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, amount numeric(5,2),
+             CONSTRAINT parent_amount UNIQUE (amount));
+         CREATE TABLE {s}.child (code text PRIMARY KEY, amount numeric(5,2));
+         INSERT INTO {s}.parent VALUES ('old', 1.00), ('keep', 2.00);
+         INSERT INTO {s}.child VALUES ('c1', 1.04);"
+    ))
+    .await
+    .expect("the fixture");
+    // The hazard by hand, in the plan's order.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.parent ALTER COLUMN amount TYPE numeric(5,1);
+         ALTER TABLE {s}.child ALTER COLUMN amount TYPE numeric(5,1);
+         DELETE FROM {s}.parent WHERE code = 'old'"
+    ))
+    .await
+    .expect("nothing in the catalog stops the delete");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_amount \
+             FOREIGN KEY (amount) REFERENCES {s}.parent(amount)"
+        ))
+        .await
+        .expect_err("the converted child value is the deleted row's");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("amount".into(), Column::new(ty("numeric(5,1)")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_amount".into(),
+        UniqueConstraint {
+            columns: vec!["amount".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("amount", Value::Text("2.0".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("amount".into(), Column::new(ty("numeric(5,1)")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_amount".into(),
+        ForeignKey {
+            columns: vec!["amount".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["amount".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    assert_eq!(
+        cs.changes
+            .iter()
+            .filter(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. }))
+            .count(),
+        2,
+        "both columns are retyped: {cs:#?}"
+    );
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the key on retyped columns is asked about from the plan");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        1,
+        "1.04 and 1.00 are one value once narrowed: {}",
+        planned.sql
+    );
+    // A child value that narrows elsewhere references nothing.
+    conn.execute(&format!(
+        "UPDATE {s}.child SET amount = 1.06 WHERE code = 'c1'"
+    ))
+    .await
+    .expect("move the child");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "1.06 narrows to 1.1: {}",
+        planned.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A session that can read the columns the count reads can count, and is
+/// not refused for lacking a grant on the whole table.
+///
+/// **Measured**: with `SELECT (parent)` on the child and no table-level
+/// `SELECT`, `has_table_privilege` is false while the count — which reads
+/// only the key's columns — runs and answers. The refusal asked the table
+/// question and refused a valid delete. It now asks about the columns the
+/// generated count reads; a role with neither is still refused, and one
+/// whose plan also names the child's rows by key needs that column too.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
+    let mut conn = connect().await;
+    let s = data_schema("colgrant");
+    fresh(&mut conn, &s).await;
+    let role = format!("{s}_dep");
+    conn.execute(&format!("DROP OWNED BY {role}")).await.ok();
+    conn.execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    conn.execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'x';
+         GRANT USAGE ON SCHEMA {s} TO {role};
+         CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY, parent text REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old');
+         GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.parent TO {role};
+         GRANT SELECT (parent) ON {s}.child TO {role};"
+    ))
+    .await
+    .expect("the fixture");
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+        .await
+        .expect("connect as the deploying role");
+    assert_eq!(
+        counted(&mut deployer, &probes[0].sql).await,
+        1,
+        "the count reads only the key's column, which the role can read: {}",
+        probes[0].sql
+    );
+    assert_eq!(
+        counted(&mut deployer, &probes[1].sql).await,
+        0,
+        "and so the count is complete, and nothing is refused: {}",
+        probes[1].sql
+    );
+    // The negative half: without the column grant the count is an error and
+    // the refusal says so.
+    conn.execute(&format!("REVOKE SELECT (parent) ON {s}.child FROM {role}"))
+        .await
+        .expect("revoke");
+    let denied = match deployer.query(&probes[0].sql).await {
+        Err(e) => e,
+        Ok(_) => panic!("the role cannot read the child now"),
+    };
+    assert_eq!(sqlstate(&denied), "42501", "{denied:?}");
+    assert_eq!(counted(&mut deployer, &probes[1].sql).await, 1);
+    drop(deployer);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .await
+        .expect("drop the role");
+}
+
+/// A surviving parent row that holds the converted value is a survivor.
+///
+/// Two parent rows, `1.04` and `1.00`, both narrowed to `numeric(5,1)` by
+/// the plan, are one value `1.0`; the plan deletes the first and adds the
+/// unique key and the foreign key after. The child's converted `1.0`
+/// references the survivor, and the engine takes the plan whole. The probe
+/// converted the doomed row's side and never asked the converted survivor,
+/// so it attributed the child to the doomed row and refused. The negative
+/// half deletes both.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
+    let mut conn = connect().await;
+    let s = data_schema("retypedsurv");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, amount numeric(5,2));
+         CREATE TABLE {s}.child (code text PRIMARY KEY, amount numeric(5,2));
+         INSERT INTO {s}.parent VALUES ('old', 1.04), ('keep', 1.00);
+         INSERT INTO {s}.child VALUES ('c1', 1.04);"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("amount".into(), Column::new(ty("numeric(5,1)")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_amount".into(),
+        UniqueConstraint {
+            columns: vec!["amount".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("amount", Value::Text("1.0".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("amount".into(), Column::new(ty("numeric(5,1)")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_amount".into(),
+        ForeignKey {
+            columns: vec!["amount".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["amount".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the key on retyped columns is asked about from the plan");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "`keep` narrows to the same 1.0 and survives: {}",
+        planned.sql
+    );
+    // The negative half: nothing survives.
+    with_data(
+        declared.tables.get_mut(&parent_name).expect("the parent"),
+        DataMode::Exact,
+        &[],
+    );
+    let cs_none = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs_none);
+    let refused: Vec<_> = probes
+        .iter()
+        .filter(|p| p.description.contains("on a column it also adds"))
+        .collect();
+    assert_eq!(refused.len(), 2, "{probes:#?}");
+    let mut total = 0;
+    for p in refused {
+        total += counted(&mut conn, &p.sql).await;
+    }
+    assert_eq!(total, 2, "with both rows gone the child references nothing");
+    // And the valid plan runs whole.
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT amount::text FROM {s}.child")).await,
+        "1.0",
+        "narrowed, keyed to the survivor"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A parent row this plan inserts and a child row it inserts, spelling one
+/// `numeric` two ways, meet as one value.
+///
+/// `1.00` and `1.0` are one number to the engine — a key from the second
+/// into the first holds — and two strings to a comparison of unknown
+/// literals; both spellings read back as written, so both are values a plan
+/// can carry. The doomed parent row holds the planned column's backfill;
+/// `keep` is moved off it, `fresh` is inserted with `1.00`, and the child
+/// arrives with `1.0`. The child references `fresh`, and the plan is valid.
+/// Compared as the literals they are, the child was attributed to the
+/// doomed row and to no survivor, and the plan refused.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_type() {
+    let mut conn = connect().await;
+    let s = data_schema("typedsurv");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut amt = Column::new(ty("numeric"));
+    amt.default = Some("1.0".into());
+    parent.columns.insert("amt".into(), amt);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_amt".into(),
+        UniqueConstraint {
+            columns: vec!["amt".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[
+            (
+                "keep",
+                row(&[
+                    ("label", Value::Text("Keep".into())),
+                    ("amt", Value::Text("7".into())),
+                ]),
+            ),
+            (
+                "fresh",
+                row(&[
+                    ("label", Value::Text("Fresh".into())),
+                    ("amt", Value::Text("1.00".into())),
+                ]),
+            ),
+        ],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("amt".into(), Column::new(ty("numeric")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_amt".into(),
+        ForeignKey {
+            columns: vec!["amt".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["amt".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("c1", row(&[("amt", Value::Text("1.0".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "the arriving child references the inserted survivor: {}",
+        planned.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT p.code FROM {s}.child c JOIN {s}.parent p ON p.amt = c.amt \
+                 WHERE c.code = 'c1'"
+            )
+        )
+        .await,
+        "fresh",
+        "the plan runs whole, and the child is keyed to the inserted row"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A referencing table in a schema the session may not use is one it cannot
+/// count, whatever it holds on the table itself.
+///
+/// **Measured**: with `SELECT` on the child and no `USAGE` on its schema,
+/// `has_table_privilege(oid, 'SELECT')` is true and the count fails with
+/// `permission denied for schema` — which the probe runner reads as
+/// unchecked and walks past. The refusal asked only the table question and
+/// answered `0`. It now asks `has_schema_privilege` first; granting `USAGE`
+/// is the negative half.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_delete() {
+    let mut conn = connect().await;
+    let s = data_schema("nousage");
+    let other = format!("{s}_other");
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &other).await;
+    let role = format!("{s}_dep");
+    conn.execute(&format!("DROP OWNED BY {role}")).await.ok();
+    conn.execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    conn.execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'x';
+         GRANT USAGE ON SCHEMA {s} TO {role};
+         CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {other}.child (id integer PRIMARY KEY, parent text REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {other}.child VALUES (1, 'old');
+         GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.parent TO {role};
+         GRANT SELECT ON {other}.child TO {role};"
+    ))
+    .await
+    .expect("the fixture");
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+        .await
+        .expect("connect as the deploying role");
+    let denied = match deployer.query(&probes[0].sql).await {
+        Err(e) => e,
+        Ok(_) => panic!("the role cannot use the child's schema"),
+    };
+    assert_eq!(sqlstate(&denied), "42501", "{denied:?}");
+    assert_eq!(
+        counted(&mut deployer, &probes[1].sql).await,
+        1,
+        "the table grant does not reach through the schema: {}",
+        probes[1].sql
+    );
+    // With `USAGE` the count runs, and the refusal has nothing to say.
+    conn.execute(&format!("GRANT USAGE ON SCHEMA {other} TO {role}"))
+        .await
+        .expect("grant usage");
+    assert_eq!(counted(&mut deployer, &probes[0].sql).await, 1);
+    assert_eq!(counted(&mut deployer, &probes[1].sql).await, 0);
+    drop(deployer);
+    conn.execute(&format!(
+        "DROP SCHEMA {other} CASCADE; DROP SCHEMA {s} CASCADE"
+    ))
+    .await
+    .expect("drop");
+    conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .await
+        .expect("drop the role");
+}
+
+/// A child table this plan creates, with a key into an existing parent and
+/// rows of its own, is a child whose arrivals are counted.
+///
+/// The differ splits a new table's foreign keys out of the `CREATE` into
+/// `AddForeignKey`, which sorts after the deletes (rank 13), and its rows
+/// into `InsertRow`, which sorts before them (rank 11). **Measured**, in
+/// that order: the table is created, the row inserted, the parent row
+/// deleted, and the key then fails on the orphan (23503) — DECISIONS 335
+/// had the key created with the table, and skipped such a child. The
+/// negative half inserts a row that references the row that stays.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists() {
+    let mut conn = connect().await;
+    let s = data_schema("createdchild");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+    // The hazard by hand, in the plan's order.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "CREATE TABLE {s}.child (code text PRIMARY KEY, parent text);
+         INSERT INTO {s}.child VALUES ('c1', 'old');
+         DELETE FROM {s}.parent WHERE code = 'old'"
+    ))
+    .await
+    .expect("nothing stops the delete before the key exists");
+    let broken = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT child_parent_fkey \
+             FOREIGN KEY (parent) REFERENCES {s}.parent(code)"
+        ))
+        .await
+        .expect_err("the inserted child is an orphan");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("parent".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("c1", row(&[("parent", Value::Text("old".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        "the key is its own change, after the delete: {cs:#?}"
+    );
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the created child's key is asked about from the plan");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        1,
+        "the inserted row arrives on the doomed parent: {}",
+        planned.sql
+    );
+    // The negative half: the row references the parent row that stays.
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[("c1", row(&[("parent", Value::Text("keep".into()))]))],
+    );
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the created child's key is asked about from the plan");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "the row references `keep`: {}",
+        planned.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT parent FROM {s}.child")).await,
+        "keep",
+        "the plan runs whole, key and all"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// An inserted row that leaves a key column to an identity the table already
+/// has is refused before the first statement, as a write to any other value
+/// the probe cannot evaluate is.
+///
+/// `InsertRow::types` leaves identity columns out on purpose — the engine
+/// owns them — so the column was neither a value the probe compared nor a
+/// default it refused, and a key reaching it was simply not asked about.
+/// **Measured**: the sequence hands the row `1`, the parent row `1` is the
+/// one this plan deletes, and the delete's own guard is what stops it — after
+/// the insert has committed under a staged apply. The negative half spells
+/// the sibling column of the key NULL.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
+    let mut conn = connect().await;
+    let s = data_schema("identinsert");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code integer PRIMARY KEY, x text, label text,
+             CONSTRAINT parent_code_x UNIQUE (code, x));
+         CREATE TABLE {s}.child (code text PRIMARY KEY,
+             seq integer GENERATED BY DEFAULT AS IDENTITY, x text,
+             CONSTRAINT child_seq_x FOREIGN KEY (seq, x) REFERENCES {s}.parent(code, x));
+         INSERT INTO {s}.parent VALUES (1, 'a', 'One'), (2, 'b', 'Two');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("integer")).not_null());
+    parent.columns.insert("x".into(), Column::new(ty("text")));
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_code_x".into(),
+        UniqueConstraint {
+            columns: vec!["code".into(), "x".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[(
+            "2",
+            row(&[
+                ("x", Value::Text("b".into())),
+                ("label", Value::Text("Two".into())),
+            ]),
+        )],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut seq = Column::new(ty("integer")).not_null();
+    seq.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    child.columns.insert("seq".into(), seq);
+    child.columns.insert("x".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_seq_x".into(),
+        ForeignKey {
+            columns: vec!["seq".into(), "x".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into(), "x".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // `seq` is the engine's; `x` says `a`, which with `seq = 1` is the row
+    // this plan deletes.
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("c1", row(&[("x", Value::Text("a".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the identity is refused");
+    assert!(
+        refusal
+            .description
+            .contains("leaves to the engine to assign"),
+        "{}",
+        refusal.description
+    );
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "the key reaches the identity column: {}",
+        refusal.sql
+    );
+    // And the hazard it refuses, by hand: the sequence names the doomed row.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "INSERT INTO {s}.child (code, x) VALUES ('c1', 'a')"
+    ))
+    .await
+    .expect("the sequence hands the row 1, which references parent 1");
+    let broken = conn
+        .execute(&format!("DELETE FROM {s}.parent WHERE code = 1"))
+        .await
+        .expect_err("the parent row is now referenced");
+    assert_eq!(sqlstate(&broken), "23503", "{broken:?}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    // The negative half: with `x` NULL the tuple references nothing,
+    // whatever the sequence assigns.
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[("c1", row(&[("x", Value::Null)]))],
+    );
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the refusal is still offered");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        0,
+        "a NULL in the key: {}",
+        refusal.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    // The sequence has moved on past the rolled-back insert above — a
+    // sequence is not transactional — so only the shape is asserted.
+    assert!(
+        truth(
+            &mut conn,
+            &format!("SELECT x IS NULL AND seq > 0 FROM {s}.child WHERE code = 'c1'")
+        )
+        .await,
+        "the plan ran whole, whatever the sequence handed the row"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A foreign key whose delete action is switched off is not one the delete
+/// meets.
+///
+/// **Measured**: `ALTER TABLE parent DISABLE TRIGGER ALL` leaves the
+/// constraint row saying validated and enforced, and the parent row then
+/// deletes with its child sitting there; the same under
+/// `session_replication_role = replica`. Introspection already leaves such a
+/// key out of the model. The probe and the delete's guard counted through it
+/// and refused a delete the engine takes; both now ask whether the
+/// parent-side delete trigger will fire. The negative half is the key with
+/// its triggers back on.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_whose_delete_action_is_switched_off_is_not_counted() {
+    let mut conn = connect().await;
+    let s = data_schema("triggeroff");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY, parent text REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old');
+         ALTER TABLE {s}.parent DISABLE TRIGGER ALL;"
+    ))
+    .await
+    .expect("the fixture");
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        0,
+        "the delete action will not run, so the key is not one the delete meets: {}",
+        probes[0].sql
+    );
+    // The key with its triggers on is counted, and so is the same key under
+    // the replica role, where they will not fire either.
+    conn.execute(&format!("ALTER TABLE {s}.parent ENABLE TRIGGER ALL"))
+        .await
+        .expect("enable");
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 1);
+    conn.execute("SET session_replication_role = replica")
+        .await
+        .expect("replica role (superuser)");
+    assert_eq!(
+        counted(&mut conn, &probes[0].sql).await,
+        0,
+        "origin-mode triggers do not fire under the replica role: {}",
+        probes[0].sql
+    );
+    conn.execute("SET session_replication_role = origin")
+        .await
+        .expect("back");
+    // And the whole plan runs with the triggers off — the guard is the same
+    // count, and it takes the delete the engine takes.
+    conn.execute(&format!("ALTER TABLE {s}.parent DISABLE TRIGGER ALL"))
+        .await
+        .expect("disable");
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "`old` went, with its child left where the operator left the key"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A key this plan adds on columns it leaves alone is asked about with the
+/// same survivor check as one on columns it changes.
+///
+/// Two parent rows share the referenced value today, because nothing yet
+/// says it is unique; the plan deletes one, adds the unique key, and adds
+/// the foreign key after — the child references the survivor, and the
+/// engine takes the plan whole. Counted through a constraint row that could
+/// only say "this child's value is the deleted row's", the plan was refused.
+/// Every planned key now takes the one path that knows about survivors. The
+/// negative half deletes both rows.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
+    let mut conn = connect().await;
+    let s = data_schema("plainsurv");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, grp text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, grp text);
+         INSERT INTO {s}.parent VALUES ('old', 'g'), ('keep', 'g');
+         INSERT INTO {s}.child VALUES ('c1', 'g');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent.columns.insert("grp".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_grp".into(),
+        UniqueConstraint {
+            columns: vec!["grp".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("grp", Value::Text("g".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child.columns.insert("grp".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_grp".into(),
+        ForeignKey {
+            columns: vec!["grp".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["grp".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is asked about from the plan");
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        0,
+        "`keep` holds the value and survives: {}",
+        planned.sql
+    );
+    // The catalog's own count sees no key: it is not there yet.
+    assert_eq!(counted(&mut conn, &probes[0].sql).await, 0);
+    // The negative half: nothing survives.
+    with_data(
+        declared.tables.get_mut(&parent_name).expect("the parent"),
+        DataMode::Exact,
+        &[],
+    );
+    let cs_none = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs_none);
+    let mut total = 0;
+    for p in probes
+        .iter()
+        .filter(|p| p.description.contains("on a column it also adds"))
+    {
+        total += counted(&mut conn, &p.sql).await;
+    }
+    assert_eq!(total, 2, "with both rows gone the child references nothing");
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT code FROM {s}.parent")).await,
+        "keep",
+        "the plan runs whole, unique key, foreign key and all"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A child row arriving against a parent backfill the probe cannot evaluate
+/// is refused with the stored rows that backfill reaches.
+///
+/// The parent gains an identity column the plan then keys the child on; the
+/// deleted parent row is handed a value by the sequence, and a child row the
+/// plan inserts may spell exactly that value. The stored children were
+/// refused for it; the arriving one was not counted anywhere. The negative
+/// half is an arriving row that spells the column NULL.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
+    let mut conn = connect().await;
+    let s = data_schema("arrivefill");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, ref integer);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut alt = Column::new(ty("integer")).not_null();
+    alt.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    parent.columns.insert("alt".into(), alt);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_alt".into(),
+        UniqueConstraint {
+            columns: vec!["alt".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("ref".into(), Column::new(ty("integer")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["alt".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("c1", row(&[("ref", Value::Int(1))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the identity backfill is refused");
+    assert!(
+        refusal
+            .description
+            .contains("written against that backfill"),
+        "{}",
+        refusal.description
+    );
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "no stored child rows, one arriving: {}",
+        refusal.sql
+    );
+    // The negative half: the arriving row spells the column NULL, and
+    // references nothing whatever the sequence hands the parent.
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[("c1", row(&[("ref", Value::Null)]))],
+    );
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the refusal is still offered");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        0,
+        "a NULL arriving references nothing: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A policy on one partition of a referencing table does not make the count
+/// through the partitioned relation incomplete, and the delete's guard does
+/// not refuse for it.
+///
+/// **Measured**: a role the leaf's policy hides every row from still counts
+/// the row through the partitioned parent — partition policies do not apply
+/// to a scan of the parent — while `row_security_active` is true for the
+/// leaf. The guard asked every constraint row, the copied one for the leaf
+/// included, and refused a delete whose count was complete; the probe and
+/// the count had filtered the copies out (DECISIONS 334). The negative half
+/// puts the policy on the partitioned table itself.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_parent() {
+    let mut conn = connect().await;
+    let s = data_schema("leafrls");
+    fresh(&mut conn, &s).await;
+    let role = format!("{s}_dep");
+    conn.execute(&format!("DROP OWNED BY {role}")).await.ok();
+    conn.execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    conn.execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'x';
+         GRANT USAGE ON SCHEMA {s} TO {role};
+         CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer, parent text REFERENCES {s}.parent(code),
+             PRIMARY KEY (id, parent)) PARTITION BY LIST (parent);
+         CREATE TABLE {s}.child_old PARTITION OF {s}.child FOR VALUES IN ('old');
+         CREATE TABLE {s}.child_rest PARTITION OF {s}.child DEFAULT;
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'keep');
+         ALTER TABLE {s}.child_old ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY hide ON {s}.child_old USING (false);
+         GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.parent TO {role};
+         GRANT SELECT ON {s}.child, {s}.child_old, {s}.child_rest TO {role};"
+    ))
+    .await
+    .expect("the fixture");
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    assert_eq!(probes.len(), 2, "{probes:#?}");
+    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+        .await
+        .expect("connect as the deploying role");
+    assert_eq!(counted(&mut deployer, &probes[0].sql).await, 0);
+    assert_eq!(
+        counted(&mut deployer, &probes[1].sql).await,
+        0,
+        "the leaf's policy does not filter the count through the parent: {}",
+        probes[1].sql
+    );
+    // And the guard, which is the finding: the delete goes through as the
+    // deploying role.
+    apply(&mut deployer, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "`old` went"
+    );
+    // The negative half: the policy on the partitioned table itself filters
+    // the count, and the probe refuses.
+    conn.execute(&format!(
+        "INSERT INTO {s}.parent VALUES ('old', 'Old');
+         ALTER TABLE {s}.child ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY hide ON {s}.child USING (false);"
+    ))
+    .await
+    .expect("policy on the parent relation");
+    assert_eq!(
+        counted(&mut deployer, &probes[1].sql).await,
+        1,
+        "the partitioned relation's own policy is the one that filters: {}",
+        probes[1].sql
+    );
+    drop(deployer);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .await
+        .expect("drop the role");
+}
+
+/// A row that spells a value into a column whose backfill is NULL is a row
+/// whose tuple holds no NULL, whatever every stored row holds.
+///
+/// The child gains a column `DEFAULT NULL` the plan keys on a parent column
+/// the sequence backfills; every stored child row references nothing, and
+/// the table-wide answer said so. The row the plan inserts spells `1`, which
+/// may be what the sequence hands the deleted parent row — and it was let
+/// through on the stored rows' answer. The negative half leaves the column to
+/// its NULL default.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple() {
+    let mut conn = connect().await;
+    let s = data_schema("overnull");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY);
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES ('c0');"
+    ))
+    .await
+    .expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut alt = Column::new(ty("integer")).not_null();
+    alt.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    parent.columns.insert("alt".into(), alt);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_alt".into(),
+        UniqueConstraint {
+            columns: vec!["alt".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    let mut r = Column::new(ty("integer"));
+    r.default = Some("NULL".into());
+    child.columns.insert("ref".into(), r);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["alt".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // `c0` is stored and takes the NULL backfill; `c1` arrives spelling `1`.
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("c0", row(&[])), ("c1", row(&[("ref", Value::Int(1))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the arriving row is refused on its own tuple");
+    assert!(
+        refusal.description.contains("`c1`") && !refusal.description.contains("`c0`"),
+        "{}",
+        refusal.description
+    );
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "the stored row holds the NULL backfill; the arriving one spells a value: {}",
+        refusal.sql
+    );
+    // The negative half: the arriving row leaves the column to its NULL.
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[("c0", row(&[])), ("c1", row(&[]))],
+    );
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    for p in probes
+        .iter()
+        .filter(|p| p.description.contains("cannot evaluate"))
+    {
+        assert_eq!(
+            counted(&mut conn, &p.sql).await,
+            0,
+            "every tuple holds the NULL: {}",
+            p.description
+        );
+    }
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A stored child row holding NULL in a column of the key references nothing,
+/// whatever backfill the plan hands the parent side.
+///
+/// **Measured**: parent gains an identity column, every child `ref` is NULL,
+/// the parent row is deleted, the key is added — and the engine accepts it
+/// under `MATCH SIMPLE`. A refusal over every surviving stored row would
+/// refuse that valid plan; the refusal reaches only rows whose stored
+/// columns of the key hold a value (DECISIONS 348).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_never_meets() {
+    let mut conn = connect().await;
+    let s = data_schema("nullstored");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code integer PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, ref integer);
+         INSERT INTO {s}.parent VALUES (1, 'One'), (2, 'Two');
+         INSERT INTO {s}.child VALUES ('a', NULL), ('b', NULL);"
+    ))
+    .await
+    .expect("the fixture");
+    // The plan by hand, in its order: the engine accepts the key.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.parent ADD COLUMN pid integer GENERATED BY DEFAULT AS IDENTITY;
+         ALTER TABLE {s}.parent ADD CONSTRAINT parent_pid UNIQUE (pid);
+         DELETE FROM {s}.parent WHERE code = 1;
+         ALTER TABLE {s}.child ADD CONSTRAINT child_ref \
+          FOREIGN KEY (ref) REFERENCES {s}.parent(pid)"
+    ))
+    .await
+    .expect("a NULL tuple references nothing, so the key is added");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("integer")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    let mut pid = Column::new(ty("integer")).not_null();
+    pid.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    parent.columns.insert("pid".into(), pid);
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_pid".into(),
+        UniqueConstraint {
+            columns: vec!["pid".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("2", row(&[("label", Value::Text("Two".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("ref".into(), Column::new(ty("integer")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["pid".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name, child);
+    let pg = Postgres::new();
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let ids = mint_ids(&declared, &base_ids, &[]);
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusals: Vec<_> = probes
+        .iter()
+        .filter(|p| p.description.contains("cannot evaluate"))
+        .collect();
+    assert!(
+        !refusals.is_empty(),
+        "the identity backfill is asked about: {probes:#?}"
+    );
+    for p in &refusals {
+        assert_eq!(
+            counted(&mut conn, &p.sql).await,
+            0,
+            "a stored NULL tuple meets no backfill: {}",
+            p.sql
+        );
+    }
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(counted(&mut conn, &planned.sql).await, 0, "{}", planned.sql);
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "the plan runs whole, key and all"
+    );
+
+    // The negative half: a stored row holding a value in the key meets the
+    // backfill, and is refused.
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code integer PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, ref integer);
+         INSERT INTO {s}.parent VALUES (1, 'One'), (2, 'Two');
+         INSERT INTO {s}.child VALUES ('a', NULL), ('b', 7);"
+    ))
+    .await
+    .expect("the fixture");
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &base_ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the identity backfill is refused");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "only the row holding a value is refused: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A NULL an update leaves alone in one column of a key is a NULL of the
+/// row's tuple after the update, and the unevaluable default the same update
+/// writes into another column of that key has nothing to reference.
+///
+/// The statement holds the row to its unchanged declared cells before and
+/// after it runs, so the NULL is as sure as one the update writes. **Measured**:
+/// the update to the default, the delete, and the key are accepted with the
+/// NULL sitting there — `MATCH SIMPLE`. The refusal read only the cells the
+/// update writes and refused that valid plan (DECISIONS 349).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
+    let mut conn = connect().await;
+    let s = data_schema("heldnull");
+    fresh(&mut conn, &s).await;
+    let fixture = |b: &str| {
+        format!(
+            "CREATE TABLE {s}.parent (code text PRIMARY KEY, x text, y text, label text,
+                 CONSTRAINT parent_xy UNIQUE (x, y));
+             CREATE TABLE {s}.child (id integer PRIMARY KEY,
+                 a text DEFAULT 'ox', b text,
+                 CONSTRAINT child_ab FOREIGN KEY (a, b) REFERENCES {s}.parent(x, y));
+             INSERT INTO {s}.parent VALUES ('old', 'ox', 'oy', 'Old'), ('keep', 'kx', 'ky', 'Keep');
+             INSERT INTO {s}.child VALUES (1, 'ox', {b});"
+        )
+    };
+    conn.execute(&fixture("NULL")).await.expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["x", "y", "label"] {
+        parent.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_xy".into(),
+        UniqueConstraint {
+            columns: vec!["x".into(), "y".into()],
+        },
+    );
+    with_data(&mut parent, DataMode::Exact, &[]);
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut a = Column::new(ty("text"));
+    a.default = Some("lower('ZZ'::text)".into());
+    child.columns.insert("a".into(), a);
+    child.columns.insert("b".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ab".into(),
+        ForeignKey {
+            columns: vec!["a".into(), "b".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["x".into(), "y".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // `b` is declared as stored — NULL — and left alone; `a` goes to the new
+    // default, which no probe can evaluate.
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("1", row(&[("b", Value::Null)]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let (columns, unchanged) = cs
+        .changes
+        .iter()
+        .find_map(|c| {
+            if let pbps_model::Change::UpdateRow {
+                columns, unchanged, ..
+            } = &c.change
+            {
+                Some((columns, unchanged))
+            } else {
+                None
+            }
+        })
+        .expect("the child row is updated");
+    assert!(
+        columns.contains_key("a") && !columns.contains_key("b") && unchanged.contains_key("b"),
+        "`a` is written and `b` left alone: {columns:#?} {unchanged:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let refusals: Vec<_> = probes
+        .iter()
+        .filter(|p| p.description.contains("cannot evaluate"))
+        .collect();
+    assert!(
+        !refusals.is_empty(),
+        "the default is asked about: {probes:#?}"
+    );
+    for p in &refusals {
+        assert_eq!(
+            counted(&mut conn, &p.sql).await,
+            0,
+            "the NULL the update leaves alone is the tuple's: {}",
+            p.sql
+        );
+    }
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        0,
+        "both parent rows went, the row's tuple referencing nothing"
+    );
+
+    // The negative half: `b` left alone at a value is no NULL, and the
+    // unevaluable `a` is refused.
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    fresh(&mut conn, &s).await;
+    conn.execute(&fixture("'oy'")).await.expect("the fixture");
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[("1", row(&[("b", Value::Text("oy".into()))]))],
+    );
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the default is refused");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "a value left alone holds the tuple to the default: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The same NULL, under a key this plan adds: the update's row is not one the
+/// planned key can refuse for the default it cannot evaluate.
+///
+/// The planned key's own per-row decision reads the written cells, else the
+/// column's backfill — and `b` has none, it is stored; the NULL the update
+/// leaves the row holding is the one that decides (DECISIONS 349).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
+    let mut conn = connect().await;
+    let s = data_schema("heldnullkey");
+    fresh(&mut conn, &s).await;
+    let fixture = |b: &str| {
+        format!(
+            "CREATE TABLE {s}.parent (code text PRIMARY KEY, x text, y text, label text,
+                 CONSTRAINT parent_xy UNIQUE (x, y));
+             CREATE TABLE {s}.child (id integer PRIMARY KEY, a text DEFAULT 'ox', b text);
+             INSERT INTO {s}.parent VALUES ('old', 'ox', 'oy', 'Old'), ('keep', 'kx', 'ky', 'Keep');
+             INSERT INTO {s}.child VALUES (1, 'ox', {b});"
+        )
+    };
+    conn.execute(&fixture("NULL")).await.expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["x", "y", "label"] {
+        parent.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    parent.unique.insert(
+        "parent_xy".into(),
+        UniqueConstraint {
+            columns: vec!["x".into(), "y".into()],
+        },
+    );
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[(
+            "keep",
+            row(&[
+                ("x", Value::Text("kx".into())),
+                ("y", Value::Text("ky".into())),
+                ("label", Value::Text("Keep".into())),
+            ]),
+        )],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut a = Column::new(ty("text"));
+    a.default = Some("lower('ZZ'::text)".into());
+    child.columns.insert("a".into(), a);
+    child.columns.insert("b".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ab".into(),
+        ForeignKey {
+            columns: vec!["a".into(), "b".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["x".into(), "y".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    with_data(
+        &mut child,
+        DataMode::Exact,
+        &[("1", row(&[("b", Value::Null)]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        "the key is this plan's to add: {cs:#?}"
+    );
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let planned: Vec<_> = probes
+        .iter()
+        .filter(|p| {
+            p.description.contains("this plan adds") && p.description.contains("cannot evaluate")
+        })
+        .collect();
+    for p in &planned {
+        assert_eq!(
+            counted(&mut conn, &p.sql).await,
+            0,
+            "the NULL the update leaves alone decides: {}",
+            p.sql
+        );
+    }
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "the plan runs whole, key and all"
+    );
+
+    // The negative half: `b` left alone at a value, and the planned key
+    // refuses the row for the default it cannot evaluate.
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    fresh(&mut conn, &s).await;
+    conn.execute(&fixture("'oy'")).await.expect("the fixture");
+    with_data(
+        declared.tables.get_mut(&child_name).expect("the child"),
+        DataMode::Exact,
+        &[("1", row(&[("b", Value::Text("oy".into()))]))],
+    );
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| {
+            p.description.contains("this plan adds") && p.description.contains("cannot evaluate")
+        })
+        .expect("the planned key refuses the row");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "a value left alone holds the tuple to the default: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A default spelled `CAST(NULL AS text)` is the NULL it is, and a row left
+/// to it references nothing.
+///
+/// The engine deparses every cast as `…::type` — and a NULL default it does
+/// not store at all (**measured**: no `pg_attrdef` row) — so this spelling
+/// reaches the plan only from a declaration, verbatim. Read as an expression
+/// no probe can evaluate, the update to it was refused, and with it the
+/// ordinary plan that unpicks a reference before deleting its parent
+/// (DECISIONS 350).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
+    let mut conn = connect().await;
+    let s = data_schema("castnull");
+    fresh(&mut conn, &s).await;
+    let fixture = format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             ref text DEFAULT 'old',
+             CONSTRAINT child_ref FOREIGN KEY (ref) REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old');"
+    );
+    conn.execute(&fixture).await.expect("the fixture");
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    let mut r = Column::new(ty("text"));
+    r.default = Some("CAST(NULL AS text)".into());
+    child.columns.insert("ref".into(), r);
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // The row omits `ref`, so it goes to the declared default.
+    with_data(&mut child, DataMode::Exact, &[("1", row(&[]))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let update = cs
+        .changes
+        .iter()
+        .find_map(|c| {
+            if let pbps_model::Change::UpdateRow { columns, .. } = &c.change {
+                Some(columns)
+            } else {
+                None
+            }
+        })
+        .expect("the child row is updated to the default");
+    assert!(
+        matches!(update.get("ref"), Some((_, pbps_model::Cell::Default(d))) if d.contains("CAST")),
+        "left to the declared spelling: {update:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    for p in probes
+        .iter()
+        .filter(|p| p.description.contains("cannot evaluate"))
+    {
+        assert_eq!(
+            counted(&mut conn, &p.sql).await,
+            0,
+            "a NULL, however spelled, is nothing to refuse: {}",
+            p.sql
+        );
+    }
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.starts_with("rows in other tables") && p.description.contains("`old`")
+        })
+        .expect("the count for the row the child references");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        0,
+        "the row leaves the count through the NULL it is left to: {}",
+        count.sql
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!("SELECT count(*)::int FROM {s}.child WHERE ref IS NULL")
+        )
+        .await,
+        1,
+        "the row is left at NULL and the parent row went"
+    );
+
+    // The negative half: a cast around an expression is still an expression,
+    // and the row left to it is refused.
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    fresh(&mut conn, &s).await;
+    conn.execute(&fixture).await.expect("the fixture");
+    declared
+        .tables
+        .get_mut(&child_name)
+        .expect("the child")
+        .columns
+        .get_mut("ref")
+        .expect("ref")
+        .default = Some("CAST(lower('ZZ') AS text)".into());
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.contains("cannot evaluate"))
+        .expect("the expression is refused");
+    assert_eq!(
+        counted(&mut conn, &refusal.sql).await,
+        1,
+        "a cast around an expression is no literal: {}",
+        refusal.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A default that is NULL is one this engine does not keep, in any spelling,
+/// and the declaration is refused before a plan can restate it forever.
+///
+/// **Measured**: `SET DEFAULT NULL`, `NULL::text` and `CAST(NULL AS text)`
+/// are all accepted, and every one of the three columns reads back with no
+/// default at all — so the plan that set them is proposed again by the next
+/// one, and the deploy's check of what came back, which compares whether a
+/// default is there, refuses the column. `validate_table` names each such
+/// column and what to declare instead (DECISIONS 351).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_null_default_is_one_this_engine_does_not_keep() {
+    let mut conn = connect().await;
+    let s = data_schema("nulldef");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (code text PRIMARY KEY,
+             a text DEFAULT 'x', b text, c text DEFAULT 'y', d text DEFAULT 'z',
+             e text DEFAULT 'w', kept text DEFAULT 'k',
+             z timestamptz, i integer DEFAULT 7, p float8 DEFAULT 1.5,
+             q text DEFAULT 'q', r text DEFAULT 'r', u integer DEFAULT 8);"
+    ))
+    .await
+    .expect("the fixture");
+    let name = TableName::new(&s, "t");
+    let mut t = Table::default();
+    t.columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for (column, default) in [
+        ("a", "NULL"),
+        ("b", "NULL::text"),
+        ("c", "CAST(NULL AS text)"),
+        ("d", "NULL /* note */::text"),
+        ("e", "CAST(NULL AS text /* note */)"),
+        ("kept", "'k'::text"),
+        // A NULL of another type, or of the column's type with a modifier the
+        // column lacks, is a default this engine keeps (DECISIONS 361).
+        ("z", "NULL::timestamp(3) with time zone"),
+        // A NULL of the column's own type under an alias is erased, and so
+        // is one with a comment between the words of its type (DECISIONS 362).
+        ("i", "NULL::int"),
+        ("p", "CAST(NULL AS double /* note */ precision)"),
+        // Comments as the gaps around `AS`, and a line comment ending at a
+        // carriage return (DECISIONS 363).
+        ("q", "CAST(NULL/**/AS -- note\r text)"),
+        // The column's own type qualified, quoted, spaced and folded is
+        // still its own type (DECISIONS 364).
+        ("r", "CAST(NULL AS \"pg_catalog\" . \"text\")"),
+        ("u", "NULL::PG_CATALOG.INT4"),
+    ] {
+        let mut c = Column::new(ty(match column {
+            "z" => "timestamptz",
+            "i" | "u" => "integer",
+            "p" => "double precision",
+            _ => "text",
+        }));
+        c.default = Some(default.into());
+        t.columns.insert(column.into(), c);
+    }
+    t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    let pg = Postgres::new();
+    let mut refused: Vec<String> = pg
+        .validate_table(&name, &t)
+        .iter()
+        .map(|e| {
+            let m = e.to_string();
+            assert!(m.contains("declare no default"), "{m}");
+            m.split('`').nth(1).expect("a column name").to_owned()
+        })
+        .collect();
+    refused.sort();
+    assert_eq!(
+        refused,
+        ["a", "b", "c", "d", "e", "i", "p", "q", "r", "u"],
+        "each erased spelling, and only those"
+    );
+
+    // The measurement the refusal rests on: past the validator, the plan
+    // sets all three, the engine accepts all three, and none is there.
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), t);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let set: Vec<&String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::AlterColumnDefault {
+                column,
+                to: Some(_),
+                ..
+            } = &c.change
+            {
+                Some(&column.name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        set.len(),
+        11,
+        "the ten erased NULL defaults and the kept one are set: {cs:#?}"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let after = base.tables.get(&name).expect("the table");
+    for column in ["a", "b", "c", "d", "e", "i", "p", "q", "r", "u"] {
+        assert_eq!(
+            after.columns[column].default, None,
+            "`{column}` reads back with no default at all"
+        );
+    }
+    assert_eq!(
+        after.columns["kept"].default.as_deref(),
+        Some("'k'::text"),
+        "a default that is a value is kept"
+    );
+    assert_eq!(
+        after.columns["z"].default.as_deref(),
+        Some("NULL::timestamp(3) with time zone"),
+        "a NULL of a type the column is not is kept, as declared"
+    );
+    let again = plan(&base, &ids, &declared, &ids);
+    assert_eq!(
+        again
+            .changes
+            .iter()
+            .filter(|c| matches!(c.change, pbps_model::Change::AlterColumnDefault { .. }))
+            .count(),
+        10,
+        "and the next plan sets the erased ones again, and only those: {again:#?}"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A child collated differently from the column it references is counted
+/// under the referenced column's collation, as the engine's own check
+/// compares it.
+///
+/// **Measured**: two columns each collated explicitly and differently — the
+/// parent `"C"`, the child `"en_US.utf8"` — are a key the engine accepts and
+/// enforces, the delete refused; and `p.code = ch.ref` between them fails as
+/// soon as a row is compared, `could not determine which collation to use`,
+/// which the probe runner reads as unchecked. (A default-collated side takes
+/// the other's collation and never conflicts, so a managed parent has to be
+/// collated itself, which the pull notes and still manages.) The count now spells the parent side
+/// `COLLATE` the referenced column's collation and compares through the
+/// operator the constraint records (DECISIONS 352).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_child_collated_differently_from_its_parent_is_still_counted() {
+    let mut conn = connect().await;
+    let s = data_schema("collated");
+    let other = format!("{s}_other");
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &other).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text COLLATE \"C\" PRIMARY KEY, label text);
+         CREATE TABLE {other}.child (id integer PRIMARY KEY,
+             ref text COLLATE \"en_US.utf8\" REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {other}.child VALUES (1, 'old');"
+    ))
+    .await
+    .expect("the fixture: the engine accepts the key across collations");
+    // The hazard by hand: the plain comparison is refused, the delete is not
+    // accepted.
+    let plain = match conn
+        .query(&format!(
+            "SELECT count(*) FROM {other}.child ch, {s}.parent p WHERE p.code = ch.ref"
+        ))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("two implicit collations cannot be compared"),
+    };
+    assert_eq!(sqlstate(&plain), "42P22", "{plain:?}");
+    let refused = conn
+        .execute(&format!("DELETE FROM {s}.parent WHERE code = 'old'"))
+        .await
+        .expect_err("the key is enforced");
+    assert_eq!(sqlstate(&refused), "23503", "{refused:?}");
+
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    table
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.starts_with("rows in other tables") && p.description.contains("`old`")
+        })
+        .expect("the count for the row the child references");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        1,
+        "the child is counted under the referenced column's collation: {}",
+        count.sql
+    );
+
+    // The negative half: the child moved to the surviving parent, the same
+    // comparison finds nothing and the delete is valid.
+    conn.execute(&format!("UPDATE {other}.child SET ref = 'keep'"))
+        .await
+        .expect("move the child");
+    assert_eq!(counted(&mut conn, &count.sql).await, 0, "{}", count.sql);
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "the plan runs whole"
+    );
+    conn.execute(&format!(
+        "DROP SCHEMA {other} CASCADE; DROP SCHEMA {s} CASCADE"
+    ))
+    .await
+    .expect("drop");
+}
+
+/// A parent row this plan inserts and a child row it inserts meet under the
+/// referenced column's collation, as the engine's own check compares them.
+///
+/// **Measured** on 18.6: with both columns under one nondeterministic,
+/// case-insensitive collation, a child `'A'` inserted beside a parent `'a'`
+/// references it, and the key is added once the stored `'A'` parent is gone;
+/// `'a'::text = 'A'::text` on its own is false, the two literals comparing
+/// under the database's collation. Compared as the literals they were, the
+/// arriving child was attributed to the doomed row and the plan refused
+/// (DECISIONS 366). Under `"C"`, the same plan's child references nothing,
+/// and is counted.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_collation() {
+    let mut conn = connect().await;
+    let s = data_schema("cisurv");
+    let declare = |s: &str| {
+        let parent_name = TableName::new(s, "parent");
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        parent
+            .columns
+            .insert("code".into(), Column::new(ty("text")));
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        parent.unique.insert(
+            "parent_code".into(),
+            UniqueConstraint {
+                columns: vec!["code".into()],
+            },
+        );
+        with_data(
+            &mut parent,
+            DataMode::Exact,
+            &[("2", row(&[("code", Value::Text("a".into()))]))],
+        );
+        let child_name = TableName::new(s, "child");
+        let mut child = Table::default();
+        child
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        child.columns.insert("ref".into(), Column::new(ty("text")));
+        child.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        child.foreign_keys.insert(
+            "child_ref".into(),
+            ForeignKey {
+                columns: vec!["ref".into()],
+                references_table: parent_name.clone(),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        with_data(
+            &mut child,
+            DataMode::Exact,
+            &[("2", row(&[("ref", Value::Text("A".into()))]))],
+        );
+        let mut declared = Schema::default();
+        declared.tables.insert(parent_name, parent);
+        declared.tables.insert(child_name, child);
+        declared
+    };
+    let pg = Postgres::new();
+    let ci = format!("{s}.ci");
+    for (collation, references_the_survivor) in [(ci.as_str(), true), ("\"C\"", false)] {
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', \
+                 deterministic = false);
+             CREATE TABLE {s}.parent (id integer PRIMARY KEY, code text COLLATE {collation});
+             CREATE TABLE {s}.child (id integer PRIMARY KEY, ref text COLLATE {collation});
+             INSERT INTO {s}.parent VALUES (1, 'A');"
+        ))
+        .await
+        .expect("the fixture");
+        let declared = declare(&s);
+        let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+        let base = connected_base(&mut conn, &declared, &s).await;
+        let cs = plan(&base, &ids, &declared, &ids);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+            "the key is this plan's to add: {cs:#?}"
+        );
+        let probes = pg.preflight(&cs);
+        let planned = probes
+            .iter()
+            .find(|p| p.description.contains("on a column it also adds"))
+            .expect("the planned key is counted");
+        assert!(
+            planned.sql.contains("a.attcollation <> 0") && !planned.sql.contains('\u{1}'),
+            "{}",
+            planned.sql
+        );
+        assert_eq!(
+            counted(&mut conn, &planned.sql).await,
+            if references_the_survivor { 0 } else { 1 },
+            "under {collation}: {}",
+            planned.sql
+        );
+        if references_the_survivor {
+            apply(&mut conn, &pg, &cs).await;
+            assert_eq!(
+                number(
+                    &mut conn,
+                    &format!(
+                        "SELECT p.id FROM {s}.child c JOIN {s}.parent p ON p.code = c.ref \
+                         WHERE c.id = 2"
+                    )
+                )
+                .await,
+                2,
+                "the plan runs whole, and the child is keyed to the inserted row"
+            );
+        }
+        conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+            .await
+            .expect("drop");
+    }
+}
+
+/// A key this plan adds between two stored columns collated differently is
+/// counted under the referenced column's collation, as the engine will
+/// enforce it.
+///
+/// **Measured**: `ADD CONSTRAINT … FOREIGN KEY` between a parent `"C"` and a
+/// child `"en_US.utf8"` is accepted, and the plain comparison between the two
+/// fails the moment a row is compared. The planned key's count is assembled
+/// by the engine, and the referenced column's collation is spliced in from
+/// `pg_attribute` where a stored parent column meets a stored child column
+/// (DECISIONS 353).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_planned_key_across_collations_is_counted_under_the_referenced_collation() {
+    let mut conn = connect().await;
+    let s = data_schema("plancoll");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code text COLLATE \"C\" PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY, ref text COLLATE \"en_US.utf8\");
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'old');"
+    ))
+    .await
+    .expect("the fixture");
+    let plain = match conn
+        .query(&format!(
+            "SELECT count(*) FROM {s}.child ch, {s}.parent p WHERE p.code = ch.ref"
+        ))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("two implicit collations cannot be compared"),
+    };
+    assert_eq!(sqlstate(&plain), "42P22", "{plain:?}");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("keep", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    child.columns.insert("ref".into(), Column::new(ty("text")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_ref".into(),
+        ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name.clone(), parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        "the key is this plan's to add: {cs:#?}"
+    );
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert!(
+        planned.sql.contains("a.attcollation <> 0") && !planned.sql.contains('\u{1}'),
+        "{}",
+        planned.sql
+    );
+    assert_eq!(
+        counted(&mut conn, &planned.sql).await,
+        1,
+        "the child is counted under the referenced column's collation: {}",
+        planned.sql
+    );
+
+    // The negative half: the child moved to the survivor, and the plan runs
+    // whole, key and all.
+    conn.execute(&format!("UPDATE {s}.child SET ref = 'keep'"))
+        .await
+        .expect("move the child");
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    let planned = probes
+        .iter()
+        .find(|p| p.description.contains("on a column it also adds"))
+        .expect("the planned key is counted");
+    assert_eq!(counted(&mut conn, &planned.sql).await, 0, "{}", planned.sql);
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.parent")).await,
+        1,
+        "the plan runs whole"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A parent whose referenced columns the session cannot read is one whose
+/// children it cannot count, whatever it may read on the children.
+///
+/// **Measured**: with `DELETE` on the parent and `SELECT` on its key column
+/// alone, the count of children through a key into another column fails
+/// `permission denied for table`, the delete runs, and `ON DELETE CASCADE`
+/// takes the child the count never saw. The refusal now asks the parent's
+/// side too; granting the read is the negative half (DECISIONS 354).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_delete() {
+    let mut conn = connect().await;
+    let s = data_schema("noparentread");
+    fresh(&mut conn, &s).await;
+    let role = format!("{s}_dep");
+    conn.execute(&format!("DROP OWNED BY {role}")).await.ok();
+    conn.execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await
+        .ok();
+    conn.execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'x';
+         GRANT USAGE ON SCHEMA {s} TO {role};
+         CREATE TABLE {s}.parent (code text PRIMARY KEY, alt text UNIQUE, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             ref text REFERENCES {s}.parent(alt) ON DELETE CASCADE);
+         INSERT INTO {s}.parent VALUES ('old', 'A', 'Old'), ('keep', 'B', 'Keep');
+         INSERT INTO {s}.child VALUES (1, 'A');
+         GRANT DELETE ON {s}.parent TO {role};
+         GRANT SELECT (code) ON {s}.parent TO {role};
+         GRANT SELECT ON {s}.child TO {role};"
+    ))
+    .await
+    .expect("the fixture");
+    let name = TableName::new(&s, "parent");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for c in ["alt", "label"] {
+        table.columns.insert(c.into(), Column::new(ty("text")));
+    }
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    table.unique.insert(
+        "parent_alt_key".into(),
+        UniqueConstraint {
+            columns: vec!["alt".into()],
+        },
+    );
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[(
+            "keep",
+            row(&[
+                ("alt", Value::Text("B".into())),
+                ("label", Value::Text("Keep".into())),
+            ]),
+        )],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.starts_with("rows in other tables") && p.description.contains("`old`")
+        })
+        .expect("the count");
+    let refusal = probes
+        .iter()
+        .find(|p| p.description.starts_with("tables with a foreign key into"))
+        .expect("the refusal");
+    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+        .await
+        .expect("connect as the deploying role");
+    let denied = match deployer.query(&count.sql).await {
+        Err(e) => e,
+        Ok(_) => panic!("the role cannot read the referenced column"),
+    };
+    assert_eq!(sqlstate(&denied), "42501", "{denied:?}");
+    assert_eq!(
+        counted(&mut deployer, &refusal.sql).await,
+        1,
+        "the parent's own side is asked: {}",
+        refusal.sql
+    );
+    // With the referenced column readable the count runs and finds the
+    // child, and the refusal has nothing to say.
+    conn.execute(&format!("GRANT SELECT (alt) ON {s}.parent TO {role}"))
+        .await
+        .expect("grant the read");
+    assert_eq!(counted(&mut deployer, &count.sql).await, 1);
+    assert_eq!(counted(&mut deployer, &refusal.sql).await, 0);
+    drop(deployer);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .await
+        .expect("drop the role");
+}
+
+/// A default spelled as an escape string, a Unicode string or a dollar-quoted
+/// string is the literal it is, and a row left to it is compared by it.
+///
+/// The catalog deparses every one of them to `'…'::text`, so the spelling
+/// reaches the plan only from a declaration, verbatim. Read as an expression
+/// no probe can evaluate, the update to it was refused; read as the literal,
+/// the row's tuple after the update is compared like any other
+/// (DECISIONS 355).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
+    let mut conn = connect().await;
+    let s = data_schema("escdef");
+    fresh(&mut conn, &s).await;
+    let fixture = format!(
+        "CREATE TABLE {s}.parent (code text PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             ref text DEFAULT 'old',
+             CONSTRAINT child_ref FOREIGN KEY (ref) REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES ('old', 'Old'), ('keep', 'Keep'), ('it''s', 'Its');
+         INSERT INTO {s}.child VALUES (1, 'old');"
+    );
+    let parent_name = TableName::new(&s, "parent");
+    let child_name = TableName::new(&s, "child");
+    let declare = |default: &str| {
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("code".into(), Column::new(ty("text")).not_null());
+        parent
+            .columns
+            .insert("label".into(), Column::new(ty("text")));
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+        });
+        with_data(
+            &mut parent,
+            DataMode::Exact,
+            &[
+                ("keep", row(&[("label", Value::Text("Keep".into()))])),
+                ("it's", row(&[("label", Value::Text("Its".into()))])),
+            ],
+        );
+        let mut child = Table::default();
+        child
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        let mut r = Column::new(ty("text"));
+        r.default = Some(default.into());
+        child.columns.insert("ref".into(), r);
+        child.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        child.foreign_keys.insert(
+            "child_ref".into(),
+            ForeignKey {
+                columns: vec!["ref".into()],
+                references_table: parent_name.clone(),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        // The row omits `ref`, so it goes to the declared default.
+        with_data(&mut child, DataMode::Exact, &[("1", row(&[]))]);
+        let mut declared = Schema::default();
+        declared.tables.insert(parent_name.clone(), parent);
+        declared.tables.insert(child_name.clone(), child);
+        declared
+    };
+    let pg = Postgres::new();
+    // Every spelling, left to the surviving parent: nothing is refused, the
+    // count finds nothing, and the plan applies whole.
+    for (default, lands_on) in [
+        ("E'keep'", "keep"),
+        ("U&'keep'", "keep"),
+        ("$$keep$$", "keep"),
+        ("$q$keep$q$", "keep"),
+        ("U&'keep' UESCAPE '!'", "keep"),
+        ("U&'ke!0065p' UESCAPE '!'", "keep"),
+        // An escaped quote inside, and a cast around it, in both spellings
+        // of a cast; a dollar-quoted string whose body holds a quote
+        // (DECISIONS 357).
+        ("E'it\\'s'::text", "it's"),
+        ("CAST(E'it\\'s' AS text)", "it's"),
+        ("$$it's$$::text", "it's"),
+        // A string, a `)` or a quoted identifier ends its token without a
+        // gap before `AS`, and a quoted type needs none after (DECISIONS 364).
+        ("CAST('keep'AS text)", "keep"),
+        ("CAST($$keep$$AS\"text\")", "keep"),
+        ("CAST(('keep')AS pg_catalog.text)", "keep"),
+        // A typed literal, in the spellings of its string and of its type
+        // (DECISIONS 367).
+        ("TEXT 'keep'", "keep"),
+        ("text'keep'", "keep"),
+        ("pg_catalog.text E'it\\'s'", "it's"),
+        ("\"text\" /* c */ $$keep$$", "keep"),
+        ("VARCHAR(10) U&'k!0065ep' UESCAPE '!'", "keep"),
+    ] {
+        conn.execute(&fixture).await.expect("the fixture");
+        let declared = declare(default);
+        let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+        let base = connected_base(&mut conn, &declared, &s).await;
+        let cs = plan(&base, &ids, &declared, &ids);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(&c.change, pbps_model::Change::UpdateRow { columns, .. }
+                    if matches!(columns.get("ref"), Some((_, pbps_model::Cell::Default(d))) if d == default))),
+            "{default}: the row is left to the declared spelling: {cs:#?}"
+        );
+        let probes = pg.preflight(&cs);
+        for p in probes
+            .iter()
+            .filter(|p| p.description.contains("cannot evaluate"))
+        {
+            assert_eq!(
+                counted(&mut conn, &p.sql).await,
+                0,
+                "{default} is a literal, nothing to refuse: {}",
+                p.sql
+            );
+        }
+        let count = probes
+            .iter()
+            .find(|p| {
+                p.description.starts_with("rows in other tables") && p.description.contains("`old`")
+            })
+            .expect("the count for the row the child references");
+        assert_eq!(
+            counted(&mut conn, &count.sql).await,
+            0,
+            "{default}: {}",
+            count.sql
+        );
+        apply(&mut conn, &pg, &cs).await;
+        assert_eq!(
+            number(
+                &mut conn,
+                &format!(
+                    "SELECT count(*)::int FROM {s}.child WHERE ref = '{}'",
+                    lands_on.replace('\'', "''")
+                )
+            )
+            .await,
+            1,
+            "{default}: the row is left at the literal and the parent row went"
+        );
+        conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+            .await
+            .expect("drop");
+        fresh(&mut conn, &s).await;
+    }
+
+    // The negative half: the same spelling naming the doomed row is compared
+    // as the literal it is, and the count finds the row.
+    conn.execute(&fixture).await.expect("the fixture");
+    let declared = declare("E'old'");
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    assert!(
+        !probes
+            .iter()
+            .any(|p| p.description.contains("cannot evaluate")),
+        "a literal is never refused: {probes:#?}"
+    );
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.starts_with("rows in other tables") && p.description.contains("`old`")
+        })
+        .expect("the count for the row the child references");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        1,
+        "the row left to E'old' still references it: {}",
+        count.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A default spelled as a number in any form this engine reads — underscores
+/// between digits, a hexadecimal, octal or binary prefix — is the constant it
+/// is, and a row left to it is compared by it.
+///
+/// **Measured** on 18.6: `2_55`, `0xFF`, `0o377` and `0b11111111` are each
+/// 255 to the engine, and so are `+ 255`, `- -255` and `+-(-255)`. Read as
+/// an expression no probe can evaluate, the update to such a default was
+/// refused; read as the number, the row's tuple after the update is compared
+/// like any other (DECISIONS 360, 365).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
+    let mut conn = connect().await;
+    let s = data_schema("numdef");
+    fresh(&mut conn, &s).await;
+    let fixture = format!(
+        "CREATE TABLE {s}.parent (code integer PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (id integer PRIMARY KEY,
+             ref integer DEFAULT 1,
+             CONSTRAINT child_ref FOREIGN KEY (ref) REFERENCES {s}.parent(code));
+         INSERT INTO {s}.parent VALUES (1, 'One'), (255, 'Max');
+         INSERT INTO {s}.child VALUES (1, 1);"
+    );
+    let parent_name = TableName::new(&s, "parent");
+    let child_name = TableName::new(&s, "child");
+    let declare = |default: &str| {
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("code".into(), Column::new(ty("integer")).not_null());
+        parent
+            .columns
+            .insert("label".into(), Column::new(ty("text")));
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+        });
+        with_data(
+            &mut parent,
+            DataMode::Exact,
+            &[("255", row(&[("label", Value::Text("Max".into()))]))],
+        );
+        let mut child = Table::default();
+        child
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        let mut r = Column::new(ty("integer"));
+        r.default = Some(default.into());
+        child.columns.insert("ref".into(), r);
+        child.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        child.foreign_keys.insert(
+            "child_ref".into(),
+            ForeignKey {
+                columns: vec!["ref".into()],
+                references_table: parent_name.clone(),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        with_data(&mut child, DataMode::Exact, &[("1", row(&[]))]);
+        let mut declared = Schema::default();
+        declared.tables.insert(parent_name.clone(), parent);
+        declared.tables.insert(child_name.clone(), child);
+        declared
+    };
+    let pg = Postgres::new();
+    for default in [
+        "2_55",
+        "0xFF",
+        "0o377",
+        "0b11111111",
+        "0xF_F",
+        // A sign parted from its operand by a gap, a comment, a grouping or
+        // another sign (DECISIONS 365).
+        "+ 255",
+        "- -255",
+        "+ /* c */ 0xFF",
+        "-(-2_55)",
+        "+-(-255)",
+        "-\n-\n255",
+        // A typed literal of a number, and one under a sign (DECISIONS 367).
+        "INTEGER '255'",
+        "int4 E'255'",
+        "- NUMERIC(5, 0) '-255'",
+    ] {
+        conn.execute(&fixture).await.expect("the fixture");
+        let declared = declare(default);
+        let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+        let base = connected_base(&mut conn, &declared, &s).await;
+        let cs = plan(&base, &ids, &declared, &ids);
+        let probes = pg.preflight(&cs);
+        assert!(
+            !probes
+                .iter()
+                .any(|p| p.description.contains("cannot evaluate")),
+            "{default} is a number, nothing to refuse: {probes:#?}"
+        );
+        let count = probes
+            .iter()
+            .find(|p| {
+                p.description.starts_with("rows in other tables") && p.description.contains("`1`")
+            })
+            .expect("the count for the row the child references");
+        assert_eq!(
+            counted(&mut conn, &count.sql).await,
+            0,
+            "{default}: {}",
+            count.sql
+        );
+        apply(&mut conn, &pg, &cs).await;
+        assert_eq!(
+            number(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM {s}.child WHERE ref = 255")
+            )
+            .await,
+            1,
+            "{default}: the row is left at 255 and parent 1 went"
+        );
+        conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+            .await
+            .expect("drop");
+        fresh(&mut conn, &s).await;
+    }
+
+    // The negative half: the same spelling naming the doomed row is compared
+    // as the number it is, and the count finds the row.
+    conn.execute(&fixture).await.expect("the fixture");
+    let declared = declare("0x1");
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let probes = pg.preflight(&cs);
+    assert!(
+        !probes
+            .iter()
+            .any(|p| p.description.contains("cannot evaluate")),
+        "a number is never refused: {probes:#?}"
+    );
+    let count = probes
+        .iter()
+        .find(|p| {
+            p.description.starts_with("rows in other tables") && p.description.contains("`1`")
+        })
+        .expect("the count for the row the child references");
+    assert_eq!(
+        counted(&mut conn, &count.sql).await,
+        1,
+        "the row left to 0x1 still references 1: {}",
+        count.sql
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}

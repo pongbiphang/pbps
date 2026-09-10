@@ -1420,6 +1420,23 @@ pub trait Dialect {
     fn reads_back_at_default(&self, _column: &pbps_model::Column) -> bool {
         false
     }
+
+    /// What this dialect could **not** answer about the declarations offline.
+    ///
+    /// Not errors and not warnings about the declarations: notes about the
+    /// check itself. `validate` runs with no connection (SPEC §9.1 makes it a
+    /// preview), and some questions have no offline answer at all — whether
+    /// two declared row keys are one row is decided by the live key column's
+    /// collation, which ADR-0013 §5 keeps out of `pbps-model` on purpose. A
+    /// command that reports clean about a question it never asked is the
+    /// silence this project's own rule is about: absent, empty and unreadable
+    /// are three different answers.
+    ///
+    /// Empty by default, which is the right answer for a dialect whose offline
+    /// checks are complete (DECISIONS 327).
+    fn declaration_notes(&self, _schema: &Schema) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Renders emitted statements as one script, honouring [`Statement::own_batch`].

@@ -152,6 +152,95 @@ const ALIASES: &[(&str, &str)] = &[
     ("timestamptz", "timestamp with time zone"),
 ];
 
+/// The names among this dialect's that are rows of `pg_type` and not words
+/// of the grammar: the ones a declaration may qualify, `pg_catalog.text`,
+/// or quote, `"int4"`, and still name the type. **Measured** on 18.6 with
+/// `to_regtype('pg_catalog."<name>"')`: `integer`, `boolean`, `character
+/// varying` and `double precision` are grammar and resolve to nothing once
+/// quoted or qualified, while these do. `bpchar`, the catalog's name for
+/// `character`, is left out: `NULL::bpchar` on a `character` column is a
+/// default the engine keeps, its modifier not the column's. `char` is left
+/// out too: `"char"` in quotes is the engine's one-byte internal type, not
+/// `character` (DECISIONS 364).
+const CATALOG_NAMES: &[&str] = &[
+    "numeric",
+    "text",
+    "bytea",
+    "date",
+    "interval",
+    "uuid",
+    "json",
+    "jsonb",
+    "int2",
+    "int4",
+    "int8",
+    "float4",
+    "float8",
+    "bool",
+    "varchar",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+];
+
+/// `ty` as the grammar spells it: a `pg_catalog.` qualification taken off,
+/// quotes taken off a quoted name, a bare name folded to lower case as the
+/// lexer folds it. `None` where the qualified or quoted name is not one the
+/// catalog has under that spelling — another schema's type is another type,
+/// a domain over `text` among them, and `"integer"` or `pg_catalog.integer`
+/// is no type at all — or where the text is not a name. A plain unquoted,
+/// unqualified `ty` comes back as it is (DECISIONS 364).
+pub(crate) fn as_the_grammar_spells(ty: &str) -> Option<String> {
+    let ty = ty.trim();
+    let (head, tail) = match ty.find(['(', '[']) {
+        Some(at) => ty.split_at(at),
+        None => (ty, ""),
+    };
+    if !head.contains(['"', '.']) {
+        return Some(ty.to_owned());
+    }
+    let (first, rest) = identifier(head)?;
+    let (name, rest) = match rest.trim_start().strip_prefix('.') {
+        Some(after) => {
+            if !(first.starts_with('"') && first == "\"pg_catalog\""
+                || !first.starts_with('"') && first.eq_ignore_ascii_case("pg_catalog"))
+            {
+                return None;
+            }
+            identifier(after.trim_start())?
+        }
+        None => (first, rest),
+    };
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let name = match name.strip_prefix('"') {
+        Some(quoted) => quoted.strip_suffix('"')?.to_owned(),
+        None => name.to_ascii_lowercase(),
+    };
+    CATALOG_NAMES
+        .contains(&name.as_str())
+        .then(|| format!("{name}{tail}"))
+}
+
+/// One identifier at the start of `s` — `"quoted"`, its quotes kept, with
+/// no `""` inside (a name with a quote in it is no type of this dialect's),
+/// or a bare word of letters, digits and `_` — and what follows it.
+fn identifier(s: &str) -> Option<(&str, &str)> {
+    if let Some(inner) = s.strip_prefix('"') {
+        let close = inner.find('"')?;
+        if inner[close + 1..].starts_with('"') {
+            return None;
+        }
+        return Some(s.split_at(close + 2));
+    }
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    (end > 0).then(|| s.split_at(end))
+}
+
 fn shape_of(base: &str) -> Option<ArgShape> {
     CATALOGUE.iter().find(|(n, _)| *n == base).map(|(_, s)| *s)
 }
@@ -1944,6 +2033,52 @@ mod tests {
         normalize(&ty(s))
             .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
             .to_string()
+    }
+
+    /// A qualified or quoted name is the type only under the spelling the
+    /// catalog has; a grammar word, another schema, or a quote inside the
+    /// name is not (DECISIONS 364).
+    #[test]
+    fn a_qualified_or_quoted_name_is_the_type_only_as_the_catalog_spells_it() {
+        for (spelled, grammar) in [
+            ("text", "text"),
+            ("double precision", "double precision"),
+            ("numeric(5, 2)", "numeric(5, 2)"),
+            ("pg_catalog.text", "text"),
+            ("PG_CATALOG.INT4", "int4"),
+            ("\"pg_catalog\".\"text\"", "text"),
+            ("\"pg_catalog\" . \"text\"", "text"),
+            ("pg_catalog . varchar", "varchar"),
+            ("\"bool\"", "bool"),
+            ("\"numeric\"(5,2)", "numeric(5,2)"),
+            ("pg_catalog.numeric (5,2)", "numeric(5,2)"),
+            ("\"timestamptz\"", "timestamptz"),
+        ] {
+            assert_eq!(
+                as_the_grammar_spells(spelled).as_deref(),
+                Some(grammar),
+                "{spelled}"
+            );
+        }
+        for spelled in [
+            "pg_catalog.integer",
+            "\"integer\"",
+            "\"TEXT\"",
+            "\"Pg_Catalog\".text",
+            "app.text",
+            "public.text",
+            "\"char\"",
+            "pg_catalog.bpchar",
+            "\"te\"\"xt\"",
+            "\"unclosed",
+            "pg_catalog.",
+            "pg_catalog.text.more",
+            "pg_catalog.text more",
+            ".text",
+            "\"double precision\"",
+        ] {
+            assert_eq!(as_the_grammar_spells(spelled), None, "{spelled}");
+        }
     }
 
     fn refused(s: &str) -> String {
