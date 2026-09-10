@@ -2138,6 +2138,23 @@ mod tests {
             ),
             vec![id("app.z"), id("app.e"), id("app.y")]
         );
+        // A dollar-quoted datum is a literal too — only a routine's body,
+        // after `AS`, is code — so the name inside it draws no edge, and the
+        // real edge decides.
+        let mut views = BTreeMap::new();
+        views.insert(id("app.a"), module("SELECT * FROM app.z"));
+        views.insert(
+            id("app.z"),
+            module("SELECT $$app.a$$::text AS t, $x$ app.a $x$ AS u"),
+        );
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &views,
+                &pbps_model::ModuleDeps::default(),
+                &LEXIS
+            ),
+            vec![id("app.z"), id("app.a")]
+        );
 
         // A trigger arriving is not a shadow, whatever its name: nothing calls
         // a trigger, so `audit()` still binds where it did. The routine of

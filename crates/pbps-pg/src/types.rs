@@ -1603,6 +1603,9 @@ mod tests {
             ("zq.\"Order\"", "zq.\"Order\""),
             ("zq.\"möney\"", "zq.\"möney\""),
             ("zq.\"a$b\"", "zq.\"a$b\""),
+            // And an unquoted one: measured, `dl.money$type` is identified as
+            // `dl."money$type"`.
+            ("dl.money$type", "dl.\"money$type\""),
             ("zq.\"my\"\"q\"", "zq.\"my\"\"q\""),
             ("zq.\"1a\"", "zq.\"1a\""),
             ("zq.\"a b\"", "zq.\"a b\""),

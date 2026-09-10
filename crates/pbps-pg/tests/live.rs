@@ -7065,6 +7065,9 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
             .await
             .expect("a type named by a keyword");
     }
+    conn.execute(&format!("CREATE TYPE {s}.money$type AS ENUM ('a')"))
+        .await
+        .expect("a type with a dollar in its name");
 
     // Left: what a declaration may reasonably say. Right: nothing — the key is
     // asserted against the catalog, not against a second copy of this list.
@@ -7117,6 +7120,8 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         format!("\"{s}\".\"money_amount\"").as_str(),
         format!("{s}.\"zone\"").as_str(),
         format!("{s}.\"select\"").as_str(),
+        // `$` is a name byte, and one the engine quotes.
+        format!("{s}.money$type").as_str(),
         format!("{s}.U&\"\\006doney_amount\"").as_str(),
         format!("{s}.u&\"!006doney_amount\" UESCAPE '!'").as_str(),
         format!("U&\"{s}\".U&\"\\0073elect\"").as_str(),
@@ -7806,7 +7811,7 @@ async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() 
         format!("{s}.b").parse().expect("a module id"),
         module(
             pbps_model::ModuleKind::View,
-            &format!("SELECT E'x\\' , {s}.a' AS s"),
+            &format!("SELECT E'x\\' , {s}.a' AS s, $$ {s}.a $$ AS t"),
         ),
     );
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);

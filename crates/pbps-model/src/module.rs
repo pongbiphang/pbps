@@ -168,10 +168,11 @@ impl FromStr for RoutineArg {
                 '[' => brackets += 1,
                 ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
                 ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
-                ',' | '"' | '.' | '_' => {}
+                ',' | '"' | '.' | '_' | '$' => {}
                 // Any non-ASCII byte is a name byte, which is the engine's own
                 // rule (`continues_ident`): a letter, a symbol, a space that is
-                // not the ASCII one.
+                // not the ASCII one. So is `$`, above — measured, `dl.money$type`
+                // is a type the engine identifies as `dl."money$type"`.
                 c if c.is_alphanumeric() || !c.is_ascii() => {}
                 // Everything else. A type name is written with letters,
                 // digits, `_`, `.`, and the punctuation above; a semicolon, an
@@ -2321,6 +2322,14 @@ mod tests {
         }
         // And a comma that is *inside* something is not a separator.
         assert!("numeric(10,2)".parse::<RoutineArg>().is_ok());
+        // A `$` is a name byte: measured, `dl.money$type` is a type.
+        assert_eq!(
+            "dl.money$type"
+                .parse::<RoutineArg>()
+                .expect("one argument")
+                .as_str(),
+            "dl.money$type"
+        );
     }
 
     /// The identity string carries them the same way, which is what makes the

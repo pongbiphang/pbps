@@ -6416,7 +6416,10 @@ SPEC is in sync with all of these.
     column the declaration does not name. And the identity's own test for an
     empty argument list: measured, a type may be named by one non-breaking
     space and `g(\u{a0})` is a routine of one argument, which a Unicode trim
-    read as `g()`.
+    read as `g()`. And `$`, which `continues_ident` names and the whitelist
+    did not: measured, `CREATE FUNCTION dl.h(a dl.money$type)` is accepted
+    with the identity `dl.h(dl."money$type")`, and the argument was refused
+    before it reached the engine.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
@@ -6465,14 +6468,21 @@ SPEC is in sync with all of these.
     callers that have no dialect, and the differ, which has one, lexes with
     it.
 
-    A dollar-quoted string is read as **code** by this scan, where the
-    comparison scanner reads it as a literal. On this engine a routine's body
-    is itself one — `AS $$ SELECT app.f(1) $$` — and the name scans exist to
-    read what the body says; blanked, every routine would call nothing and
-    depend on nothing. A dollar-quoted datum in a view is read as code too,
-    which errs toward an edge that may not be there and never loses one that
-    is — the direction the shared scanner already erred in. The body written
-    as a plain `'…'` literal stays blanked, which is #228.
+    A dollar-quoted string is a literal to this scan too, blanked, with one
+    exception: a routine's body. On this engine the body is itself one — `AS
+    $$ SELECT app.f(1) $$` — and the name scans exist to read what the body
+    says; blanked, every routine would call nothing and depend on nothing. A
+    dollar-quoted *datum* is not the body, and reading it as code drew an
+    edge from the view that holds it to the view it names — with the other
+    direction real, a cycle, and the dependent created first. What tells the
+    two apart is the word before the string: a body follows `AS`, and a datum
+    never does — measured, `CREATE VIEW v AS SELECT 1 AS $x$` is a syntax
+    error, so in a definition the engine accepts a dollar-quoted string after
+    `AS` can only be a body. The body is lexed by the same rules, its own
+    literals, comments and dollar-quoted data blanked. A comment between the
+    keyword and the body is already blank by the time the question is asked:
+    measured, `AS /* c */ $$ SELECT 1 $$` is a body. The body written as a
+    plain `'…'` literal stays blanked, which is #228.
 
     **Amended: the boundaries and the prefixes are the dialect's too.** A
     literal's prefix is part of its token — measured, `N'x'`, `B'101'`,

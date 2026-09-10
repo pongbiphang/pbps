@@ -578,16 +578,12 @@ impl Lexicon {
     /// emitted in name order, and `CREATE VIEW es.a` failed inside the plan's
     /// own transaction (DECISIONS 315).
     ///
-    /// A dollar-quoted string is **read as code**, and this is the one place
-    /// this scan and [`normalize_definition`] part company on purpose. On the
-    /// engine that has them, a routine's body is itself one — `AS $$ SELECT
-    /// app.f(1) $$` — and the name scans exist to read what that body says:
-    /// blanked, every routine would call nothing and depend on nothing. A
-    /// dollar-quoted *datum* in a view is read as code too, which errs in the
-    /// safe direction — a name in it draws an edge that may not be there,
-    /// never loses one that is — and is what the shared scanner did before.
-    /// Inside the body the ordinary rules apply: its literals and comments
-    /// are blanked, an `E'…'` by the escape rule.
+    /// A dollar-quoted string is a literal, blanked — except a routine's
+    /// body, which is one on the engine that has them, and which the name
+    /// scans exist to read: the string after the word `AS` is lexed as code
+    /// by these same rules, and every other one is a datum (see
+    /// `dollar_quoted_string`). This is the one place this scan and
+    /// [`normalize_definition`] part company on purpose.
     ///
     /// [`normalize_definition`]: Lexicon::normalize_definition
     pub fn code_only(&self, definition: &str) -> String {
@@ -612,15 +608,6 @@ impl Lexicon {
                 depth: usize,
                 seen: usize,
             },
-        }
-        fn blank(out: &mut String, ch: char) {
-            if matches!(ch, '\n' | '\r') {
-                out.push(ch);
-            } else {
-                for _ in 0..ch.len_utf8() {
-                    out.push(' ');
-                }
-            }
         }
         let mut out = String::with_capacity(definition.len());
         let bytes = definition.as_bytes();
@@ -716,44 +703,127 @@ impl Lexicon {
                     };
                     blank(&mut out, ch);
                 }
-                At::Code => match (ch, next) {
-                    ('-', Some(b'-')) => {
-                        at = At::Line;
-                        blank(&mut out, ch);
+                At::Code => {
+                    // A `$` opens a string only where it opens a tag: `a$b$c`
+                    // is one name, and `$1.00` is code (see `dollar_tag`).
+                    if self.dollar_quoted_strings
+                        && ch == '$'
+                        && !continues_identifier(definition, i)
+                        && let Some(len) = dollar_tag(&definition[i..])
+                    {
+                        consumed_to = self.dollar_quoted_string(definition, i, len, &mut out);
+                        continue;
                     }
-                    ('/', Some(b'*')) => {
-                        at = At::Block { depth: 1, seen: 0 };
-                        blank(&mut out, ch);
-                    }
-                    ('\'', _) => {
-                        self.blank_string_prefix(&mut out);
-                        at = if self.escape_strings && opens_escape_string(definition, i) {
-                            At::Escape {
-                                after_backslash: false,
-                            }
-                        } else {
-                            At::Literal
-                        };
-                        blank(&mut out, ch);
-                    }
-                    _ => {
-                        if let Some(&(_, close)) = self
-                            .quoted_identifiers
-                            .iter()
-                            .find(|&&(open, _)| open == ch)
-                        {
-                            at = At::Ident {
-                                close,
-                                escaped: false,
-                            };
+                    match (ch, next) {
+                        ('-', Some(b'-')) => {
+                            at = At::Line;
+                            blank(&mut out, ch);
                         }
-                        out.push(ch);
+                        ('/', Some(b'*')) => {
+                            at = At::Block { depth: 1, seen: 0 };
+                            blank(&mut out, ch);
+                        }
+                        ('\'', _) => {
+                            self.blank_string_prefix(&mut out);
+                            at = if self.escape_strings && opens_escape_string(definition, i) {
+                                At::Escape {
+                                    after_backslash: false,
+                                }
+                            } else {
+                                At::Literal
+                            };
+                            blank(&mut out, ch);
+                        }
+                        _ => {
+                            if let Some(&(_, close)) = self
+                                .quoted_identifiers
+                                .iter()
+                                .find(|&&(open, _)| open == ch)
+                            {
+                                at = At::Ident {
+                                    close,
+                                    escaped: false,
+                                };
+                            }
+                            out.push(ch);
+                        }
                     }
-                },
+                }
             }
         }
         out
     }
+
+    /// Reads the dollar-quoted string that opens at `at` with a tag of `len`
+    /// bytes, and returns the offset the code after it resumes at.
+    ///
+    /// A routine's body is a dollar-quoted string on this engine, and the
+    /// name scans exist to read what the body says — blanked, every routine
+    /// would call nothing and depend on nothing. A dollar-quoted *datum* in a
+    /// view is a literal like any other, and a name inside one drew an edge
+    /// to a view that the datum never depends on; with the other direction
+    /// real, that edge closed a cycle and the dependent was created first
+    /// (DECISIONS 315). The two are told apart by what precedes the string:
+    /// a body follows the word `AS`, and a datum never does — measured, `AS
+    /// $x$` where a view's alias would go is a syntax error, so a
+    /// dollar-quoted string after `AS` in a definition the engine accepts can
+    /// only be a body. The body is lexed as code by the same rules: its own
+    /// literals and comments are blanked, an `E'…'` by the escape rule, and a
+    /// dollar-quoted datum inside it by this one.
+    fn dollar_quoted_string(
+        &self,
+        definition: &str,
+        at: usize,
+        len: usize,
+        out: &mut String,
+    ) -> usize {
+        let tag = &definition[at..at + len];
+        let inner_start = at + len;
+        let (inner_end, end) = match definition[inner_start..].find(tag) {
+            Some(j) => (inner_start + j, inner_start + j + len),
+            // Nothing closes it. The engine would refuse the definition; the
+            // scan reads it the way the engine's lexer would have, to its end.
+            None => (definition.len(), definition.len()),
+        };
+        if follows_the_word_as(out, self.identifier_continues) {
+            out.push_str(tag);
+            out.push_str(&self.code_only(&definition[inner_start..inner_end]));
+            out.push_str(&definition[inner_end..end]);
+        } else {
+            for ch in definition[at..end].chars() {
+                blank(out, ch);
+            }
+        }
+        end
+    }
+}
+
+/// Blanks `ch` in `out`, keeping a line break so that line structure and
+/// positions survive.
+fn blank(out: &mut String, ch: char) {
+    if matches!(ch, '\n' | '\r') {
+        out.push(ch);
+    } else {
+        for _ in 0..ch.len_utf8() {
+            out.push(' ');
+        }
+    }
+}
+
+/// Whether the code lexed so far ends with the keyword `AS` as a word of its
+/// own — `has` does not end with it, and neither does `x$as`.
+///
+/// It is asked of the *lexed* text, so a comment between the keyword and the
+/// string it introduces is already a run of blanks: measured, `AS /* c */ $$
+/// SELECT 1 $$` is accepted as a body.
+fn follows_the_word_as(code: &str, continues: fn(char) -> bool) -> bool {
+    let code = code.trim_end();
+    let Some(start) = code.len().checked_sub(2) else {
+        return false;
+    };
+    code.is_char_boundary(start)
+        && code[start..].eq_ignore_ascii_case("as")
+        && !code[..start].chars().next_back().is_some_and(continues)
 }
 
 impl Lexicon {
@@ -2021,17 +2091,38 @@ mod code_only_tests {
     }
 
     /// A routine's body is a dollar-quoted string on this engine, and the
-    /// scans are about what it says; so the string is code, and what is
-    /// inside it is lexed as code — its own literals blanked, an escape
-    /// string by the escape rule.
+    /// scans are about what it says; so the one after `AS` is code, and what
+    /// is inside it is lexed as code — its own literals blanked, an escape
+    /// string by the escape rule. Every other dollar-quoted string is a
+    /// datum, and a datum is blanked: measured, a view may not write `AS $x$`
+    /// where an alias goes, so the word tells the two apart.
     #[test]
-    fn a_dollar_quoted_string_is_read_as_code_because_a_routines_body_is_one() {
+    fn a_dollar_quoted_string_is_a_body_after_the_word_as_and_a_datum_elsewhere() {
         let body = "() RETURNS int LANGUAGE sql AS $$ SELECT app.f('x', E'y\\'z') $$";
         assert_eq!(PG.code_only(body), blanked(body, &["'x'", "E'y\\'z'"]));
-        let datum = "SELECT $$ es.a $$ AS t";
-        assert_eq!(PG.code_only(datum), datum);
-        // `$` inside an identifier is a name byte on either engine.
+        let datum = "SELECT $$ es.a $$ AS t, $x$es.a$x$ AS u";
+        assert_eq!(
+            PG.code_only(datum),
+            blanked(datum, &["$$ es.a $$", "$x$es.a$x$"])
+        );
+        // A default in the argument list is a datum, and the body after it is
+        // still the body; a comment between `AS` and the body is no
+        // objection, and `has` is not the word.
+        let routine = "(a text DEFAULT $x$es.a$x$) RETURNS int AS /* c */ $$ SELECT es.b('q') $$";
+        assert_eq!(
+            PG.code_only(routine),
+            blanked(routine, &["$x$es.a$x$", "/* c */", "'q'"])
+        );
+        let has = "SELECT * FROM es.has $$ es.a $$";
+        assert_eq!(PG.code_only(has), blanked(has, &["$$ es.a $$"]));
+        // And a datum inside the body is a datum.
+        let nested = "AS $b$ SELECT $$ es.a $$ $b$";
+        assert_eq!(PG.code_only(nested), blanked(nested, &["$$ es.a $$"]));
+        // `$` inside an identifier is a name byte on either engine, and a
+        // `$` that opens no tag is code.
         assert_eq!(PG.code_only("SELECT a$b$c FROM t"), "SELECT a$b$c FROM t");
+        assert_eq!(PG.code_only("SELECT $1.00 FROM t"), "SELECT $1.00 FROM t");
+        // SQL Server has no dollar quoting: the text is code.
         assert_eq!(MSSQL.code_only(datum), datum);
     }
 
