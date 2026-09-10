@@ -1,16 +1,75 @@
 //! What a plan is asked about a live database before its first statement runs
-//! — the reference-data half (ADR-0004).
+//! (SPEC §7.5).
 //!
-//! Only the pre-delete probe is here, with the refusal DECISIONS 124 pairs
-//! with it. The rest of this dialect's probes — the not-null backfill, the
-//! unique duplicate, the foreign-key orphan, the type change — arrive with
-//! Phase 5 step 9, which is where `pbps-mssql`'s `preflight.rs` and
-//! `impact.rs` have their counterparts. This one is here because a
-//! `DeleteRow` cannot be emitted without it: the delete's own guard and the
-//! probe are the same count, and the guard is part of the statement. Being the
-//! same count is a claim to keep true: whatever makes one of them refuse has
-//! to make the other refuse, or the refusal arrives after a staged apply has
-//! committed everything ahead of the delete (DECISIONS 333).
+//! Each risky change knows how it can fail, so each becomes a query that counts
+//! the rows that would break it. On a non-zero count `apply` stops **before the
+//! first statement**, reporting the real number rather than letting the engine
+//! find it halfway through: "4,213 rows violate ck_customer_amount" is
+//! actionable and "the ALTER failed" is not.
+//!
+//! This is not a second risk classifier. Classification is static and happens
+//! offline (§7.2); these run at apply time, where a connection is guaranteed
+//! and reading the data is the job.
+//!
+//! # Two groups, because `order_key` reads the table twice
+//!
+//! A type change and a nullability change run at **rank 9**, before every row
+//! change, so their probes meet exactly the rows that are stored now. Every
+//! constraint this plan adds runs at **rank 13**, after them, so those probes
+//! meet the rows [`rows_after`] projects — what is stored, minus what the plan
+//! deletes and rewrites, plus what it writes. Built from the stored rows alone
+//! they would refuse the ordinary ADR-0004 plan, which declares the parent rows
+//! and the key that references them together.
+//!
+//! # Where a probe is deliberately absent
+//!
+//! An empty result means "nothing was checked", never "nothing is wrong", so
+//! the cases are named here rather than left to be discovered. The caller
+//! reports how many probes could not be checked and does not count them as
+//! passes.
+//!
+//! - **A narrowing with no row to point at.** Reducing a `numeric`'s scale
+//!   rounds (measured, `1.55` into `numeric(10,1)` is `1.6`), a float into an
+//!   integer rounds, a shorter `interval` rounds, `json` into `jsonb` drops
+//!   duplicate keys and whitespace, and `double precision` into `real` drops
+//!   precision. None of them raises, so no count exists; the `narrowing` class
+//!   is what stops them at the gate. [`crate::types::cannot_become`] holds the
+//!   list.
+//! - **A narrowing whose count would be measured under the wrong settings.** A
+//!   probe runs before the deployment's transaction framing is established, so
+//!   it renders values under the operator's session and the statement it clears
+//!   renders them under the pinned one (DECISIONS 267). Measured, a `bytea`, an
+//!   `interval`, a `timestamp` and a `double precision` all print to different
+//!   lengths under the two, in both directions: a length probe over one of them
+//!   would refuse a plan this engine accepts, or clear one it refuses. Those
+//!   sources get no length probe (DECISIONS 389).
+//! - **Drops and renames.** Every row of a dropped column is "affected", and a
+//!   count of them would always look alarming and never decide anything. A
+//!   rename carries a dependency risk rather than a data one, and
+//!   [`crate::impact`] is what asks the catalog about it.
+//! - **A value this plan writes that no probe can evaluate** — a default that is
+//!   not a literal, which has no value until it runs (DECISIONS 124), and a key
+//!   spanning a column this plan *narrows*, whose projection would be a `CAST`
+//!   that can raise (DECISIONS 375).
+//! - **A check whose expression the probe cannot evaluate here.** The text is
+//!   never rewritten for a rename — rewriting SQL by substitution is how a tool
+//!   that promised not to parse SQL starts parsing it badly — and an
+//!   unqualified name in it binds under the write path the emitted statement
+//!   carries (DECISIONS 259) where a probe, being one `SELECT`, carries none.
+//!   A column this same plan *adds* is not there to read either. Each of those
+//!   makes the probe fail to run, and the runner says so by name, which is the
+//!   more visible of the two silences.
+//! - **Roles and grants**, which are Phase 5 step 6: `emit` refuses every one of
+//!   them by name until it lands, so there is no plan for a probe to be part of.
+//!
+//! # The reference-data half (ADR-0004)
+//!
+//! The pre-delete probe is here for a reason the others are not: a `DeleteRow`
+//! cannot be emitted without it. The delete's own guard and the probe are the
+//! same count, and the guard is part of the statement. Being the same count is
+//! a claim to keep true — whatever makes one of them refuse has to make the
+//! other refuse, or the refusal arrives after a staged apply has committed
+//! everything ahead of the delete (DECISIONS 333).
 //!
 //! # Why the referencing tables are found at run time
 //!

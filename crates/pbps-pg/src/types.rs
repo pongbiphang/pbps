@@ -1084,6 +1084,58 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     }
 }
 
+/// Whether this type's text rendering is the same in **every** session — the
+/// question a length probe must answer before it may measure one.
+///
+/// A probe is issued before the deployment's transaction framing is
+/// established, so it runs under the operator's own settings while the
+/// statement it clears runs under the ones that framing pins (DECISIONS 267:
+/// `DateStyle`, `TimeZone`, `IntervalStyle`, `timezone_abbreviations`,
+/// `transform_null_equals`, `bytea_output`, `extra_float_digits`). Where a
+/// rendering moves between the two, the length the probe measures is not the
+/// length the `ALTER` will measure — and it goes wrong in **both** directions,
+/// which is why the answer is an allow-list and not a correction. Where the
+/// operator's rendering is the longer (a `bytea` under `escape`, a `timestamp`
+/// under `Postgres`), the probe counts rows this engine would have taken and a
+/// valid plan is refused. Where it is the shorter (an `interval` under
+/// `sql_standard`, a `float8` under a lower `extra_float_digits`), the probe
+/// counts nothing and clears a statement the engine then refuses — the exact
+/// failure a probe exists to prevent, arriving through the probe.
+///
+/// **Measured on 18.6**, each value rendered under the pinned setting and
+/// under another, as character counts:
+///
+/// ```text
+/// bytea       '\x0102'              hex 6         escape 8
+/// interval    '1 day 02:00:00'      postgres 14   sql_standard 9
+/// timestamp   '2026-01-02 12:00'    ISO 19        Postgres 24
+/// timestamptz the same, +00         UTC 22        Asia/Kolkata 25
+/// float8      1.0/3.0               digits 1 18   digits 0 17   digits -5 12
+/// ```
+///
+/// The pinned column is the left one, and it is not consistently the longer or
+/// the shorter: `bytea` and the date-and-time types render longer unpinned,
+/// `interval` and `float8` render shorter.
+///
+/// and, with all of those settings changed at once against the pinned ones,
+/// `json` (37), `jsonb` (38), `uuid` (36), `boolean` (4) and `numeric` (10) do
+/// not move. A `date` does not move either — every `DateStyle` this engine has
+/// prints ten characters for one — but it stays excluded with the rest of its
+/// family rather than being carved out, because that equality is a coincidence
+/// of the styles that exist and not a property anything promises.
+///
+/// This is an **allow-list**, and deliberately: a type this catalogue does not
+/// know renders however its own output function chooses, and `lc_monetary`,
+/// which decides how `money` prints, is not pinned at all — `CANONICAL_PATH`
+/// says why it cannot be. Silence for a rendering nobody measured is the
+/// answer this repo wants; a guess is not.
+fn renders_alike_everywhere(t: &ColumnType) -> bool {
+    matches!(
+        family(t),
+        Family::Exact(..) | Family::Bool | Family::Text { .. } | Family::Uuid | Family::Json { .. }
+    )
+}
+
 /// What a stored value must satisfy for `ALTER COLUMN … TYPE` to **fail** on
 /// it — the predicate a pre-flight probe counts (SPEC §7.5), over `value`.
 ///
@@ -1096,6 +1148,12 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
 /// whitespace, and `double precision` into `real` drops precision. Not one of
 /// them raises, so there is no row to point at; the `narrowing` class is what
 /// stops them at the gate.
+///
+/// `None` also where the count would be **measured wrong**: a length taken over
+/// a rendering the session settings move is not the length the `ALTER` takes,
+/// so a `bytea`, an `interval`, a date-and-time type or a binary float into a
+/// bounded string gets no probe at all. `renders_alike_everywhere` holds that
+/// list and the measurements behind it.
 ///
 /// # Why this is a predicate and not a cast
 ///
@@ -1134,19 +1192,26 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
     let finite =
         format!("{not_nan} AND {exact} <> 'Infinity'::numeric AND {exact} <> '-Infinity'::numeric");
     match (family(from), family(to)) {
-        // A bounded string target, from anything. The value is measured after
-        // its **trailing spaces** are taken off and nothing else: measured,
-        // `'abc  '` into `varchar(3)` is `'abc'` and `E'abc\t'` into the same
-        // is `value too long`. `length`, not `octet_length` — the bound is in
-        // characters, measured, `'王小明'` is three of them and nine bytes and
-        // fits `varchar(3)`.
+        // A bounded string target, from a source whose rendering every session
+        // agrees on. The value is measured after its **trailing spaces** are
+        // taken off and nothing else: measured, `'abc  '` into `varchar(3)` is
+        // `'abc'` and `E'abc\t'` into the same is `value too long`. `length`,
+        // not `octet_length` — the bound is in characters, measured, `'王小明'`
+        // is three of them and nine bytes and fits `varchar(3)`.
+        //
+        // The guard is the whole difference between a length this engine will
+        // measure and one only the operator's session would:
+        // `renders_alike_everywhere` carries the measurements and the reason
+        // (DECISIONS 389).
         (
             _,
             Family::Text {
                 len: Len::Bounded(n),
                 ..
             },
-        ) => Some(format!("length(rtrim(({value})::text, ' ')) > {n}")),
+        ) if renders_alike_everywhere(from) => {
+            Some(format!("length(rtrim(({value})::text, ' ')) > {n}"))
+        }
 
         // An integer target. The engine tests the value it would *store*, so
         // the test is on the rounded one: measured, `2147483647.4` into
@@ -2180,6 +2245,60 @@ mod tests {
         normalize(&ty(s))
             .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
             .to_string()
+    }
+
+    /// A length probe is taken only over a rendering every session prints
+    /// alike (DECISIONS 389).
+    ///
+    /// The probe runs before the deployment pins its settings and the `ALTER`
+    /// runs after, so a source whose `::text` moves with `bytea_output`,
+    /// `IntervalStyle`, `DateStyle`, `TimeZone` or `extra_float_digits` would
+    /// be measured under one rendering and converted under another — and the
+    /// unpinned one is the longer, so the count refuses a plan this engine
+    /// accepts. Both halves are asserted: the sources that keep their probe
+    /// matter as much as the ones that lose it, or the gate could be a rule
+    /// that switched every probe off.
+    #[test]
+    fn a_length_probe_is_taken_only_over_a_rendering_no_setting_moves() {
+        let probe = |from: &str| {
+            let from = normalize(&ty(from)).expect("a source type normalizes");
+            let to = normalize(&ty("character varying(6)")).expect("a target type normalizes");
+            cannot_become(&from, &to, "\"v\"")
+        };
+        for from in [
+            "integer",
+            "bigint",
+            "numeric(12,2)",
+            "boolean",
+            "uuid",
+            "text",
+            "character(9)",
+            "json",
+            "jsonb",
+        ] {
+            let got = probe(from);
+            assert!(
+                got.as_deref().is_some_and(|p| p.contains("length(rtrim")),
+                "`{from}` renders the same in every session, so it keeps its probe: {got:?}"
+            );
+        }
+        for from in [
+            "bytea",
+            "interval",
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "real",
+            "double precision",
+        ] {
+            assert_eq!(
+                probe(from),
+                None,
+                "`{from}` renders differently under a setting the framing pins, \
+                 so no length may be measured for it"
+            );
+        }
     }
 
     /// A qualified or quoted name is the type only under the spelling the

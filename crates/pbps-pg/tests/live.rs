@@ -17510,3 +17510,124 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         .await
         .expect("drop");
 }
+
+/// The rendered length of the one row of `schema.table`, under `set`.
+///
+/// A free function rather than a closure: it borrows the connection across an
+/// `await`, and a closure returning a future would have to own it.
+async fn printed(conn: &mut Conn, set: &str, schema: &str, table: &str) -> i64 {
+    conn.execute(set).await.expect("a session setting");
+    counted(
+        conn,
+        &format!("SELECT length(v::text)::int FROM {schema}.{table}"),
+    )
+    .await
+}
+
+/// DECISIONS 389: a length probe is taken only over a rendering every session
+/// prints alike.
+///
+/// A probe is issued before the deployment's transaction framing is established
+/// and the statement it clears runs after, so the two can render one stored
+/// value to two different lengths. Both halves are measured here against the
+/// engine, and in **both** directions: the `bytea` renders longer in the
+/// operator's session, so a length probe over it would refuse a change this
+/// engine makes; the `interval` renders shorter, so the same probe would clear
+/// one this engine refuses. A gate that only stopped the first would leave the
+/// worse of the two.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_length_only_the_operators_own_session_would_measure_is_never_probed() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("render");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.b (id integer PRIMARY KEY, v bytea NOT NULL);
+         INSERT INTO {s}.b VALUES (1, '\\x0102'::bytea);
+         CREATE TABLE {s}.i (id integer PRIMARY KEY, v interval NOT NULL);
+         INSERT INTO {s}.i VALUES (1, interval '1 day 02:00:00');
+         CREATE TABLE {s}.n (id integer PRIMARY KEY, v integer NOT NULL);
+         INSERT INTO {s}.n VALUES (1, 1234567890);"
+    ))
+    .await
+    .expect("the fixture");
+
+    // What each session prints, measured rather than assumed. `set_config` is
+    // not used: these are exactly the statements the framing issues.
+    let escaped = printed(&mut conn, "SET bytea_output = 'escape'", &s, "b").await;
+    let hex = printed(&mut conn, "SET bytea_output = 'hex'", &s, "b").await;
+    assert_eq!(
+        (hex, escaped),
+        (6, 8),
+        "the pinned `hex` renders shorter than the operator's `escape`"
+    );
+
+    let standard = printed(&mut conn, "SET IntervalStyle = 'sql_standard'", &s, "i").await;
+    let postgres = printed(&mut conn, "SET IntervalStyle = 'postgres'", &s, "i").await;
+    assert_eq!(
+        (postgres, standard),
+        (14, 9),
+        "the pinned `postgres` renders longer than the operator's `sql_standard`"
+    );
+
+    let alter = |column: &str, from: &str, to: &str| {
+        PlannedChange::new(Change::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: column.parse().expect("a column reference"),
+            from: ty(from),
+            to: ty(to),
+            from_nullable: false,
+            to_nullable: false,
+        })
+    };
+    let cs = ChangeSet {
+        changes: vec![
+            alter(&format!("{s}.b.v"), "bytea", "varchar(6)"),
+            alter(&format!("{s}.i.v"), "interval", "varchar(9)"),
+            alter(&format!("{s}.n.v"), "integer", "varchar(6)"),
+        ],
+    };
+    let probes = Postgres::new().preflight(&cs);
+    let lengths: Vec<&str> = probes
+        .iter()
+        .map(|p| p.sql.as_str())
+        .filter(|sql| sql.contains("length(rtrim"))
+        .collect();
+    assert_eq!(
+        lengths.len(),
+        1,
+        "only the `integer`, which every session prints alike, keeps a length probe: {probes:#?}"
+    );
+    assert!(
+        lengths[0].contains("\"n\""),
+        "and it is the one over the integer column: {}",
+        lengths[0]
+    );
+
+    // The session the statement runs in is the pinned one, so it is the one
+    // that decides — and it decides the two cases opposite ways.
+    conn.execute(&format!(
+        "SET bytea_output = 'hex'; SET IntervalStyle = 'postgres';
+         ALTER TABLE {s}.b ALTER COLUMN v TYPE varchar(6);"
+    ))
+    .await
+    .expect("the pinned session takes the bytea a probe over `escape` would have refused");
+
+    let refused = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.i ALTER COLUMN v TYPE varchar(9);"
+        ))
+        .await
+        .expect_err("the pinned session refuses the interval a probe over `sql_standard` cleared");
+    assert_eq!(
+        sqlstate(&refused),
+        "22001",
+        "value too long, on the row no probe was allowed to count: {refused}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}

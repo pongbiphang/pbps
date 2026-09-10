@@ -72,6 +72,8 @@
 //! says so rather than implying the list is exact; §7.4 puts a checklist in
 //! front of a human for exactly that reason.
 
+use std::collections::BTreeMap;
+
 use pbps_db::{Conn, DbError, Row};
 use pbps_dialect::DialectError;
 use pbps_model::{ColumnRef, TableName};
@@ -106,14 +108,36 @@ impl RenameTarget {
     /// name the catalog still knows them by. Taking the new name would query
     /// something that does not exist yet and report no impact at all, which is
     /// the most dangerous possible answer.
+    ///
+    /// **Both halves of a column's name** have to be taken back, not just the
+    /// column's own. A `RenameColumn` carries the *declared*, post-rename table
+    /// (`pbps_diff::schema_diff::order_key` class 3 says why: the statement it
+    /// becomes names the table, and it runs after the table rename), so a plan
+    /// that renames `app.client` to `app.customer` and its `email` to
+    /// `contact_email` describes the column as `app.customer.email` — a table
+    /// the catalog will not have until a statement this report runs *before*
+    /// has executed. Read literally that is `ImpactError::Name` on a plan the
+    /// engine would accept, which is the refusal
+    /// [`crate::preflight::AsStored`] exists to prevent one rank further on
+    /// (DECISIONS 390).
     pub fn from_changes(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
         use pbps_model::Change;
+        // The plan's name for a table, to the catalog's. Built first and over
+        // the whole plan, because the ordering that puts a table rename before
+        // its column renames is `order_key`'s and not this list's to assume.
+        let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+        for p in &changes.changes {
+            if let Change::RenameTable { from, to, .. } = &p.change {
+                stored.insert(to, from);
+            }
+        }
         changes
             .changes
             .iter()
             .filter_map(|p| match &p.change {
                 Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
                 Change::RenameColumn { table, from, .. } => {
+                    let table = stored.get(table).map_or(table, |t| *t);
                     Some(RenameTarget::Column(table.column(from)))
                 }
                 // A module rename reaches the plan as a drop plus a create, and
@@ -453,7 +477,26 @@ fn text(row: &Row, column: &str) -> Result<String, DbError> {
 /// A dollar sign is an identifier character here and `@` and `#` are not, which
 /// is where this parts company with the SQL Server rule it is otherwise the
 /// same as.
+///
+/// # Why the step is a character and not a byte
+///
+/// A rejected match is stepped over by the width of the name's **first
+/// character**, because `body[from..]` is a string slice and Rust refuses one
+/// that starts inside a character. Stepping by one byte is the obvious way to
+/// write this and it panics: scanning `xä` for `ä` finds it at byte 1, rejects
+/// it because `x` is an identifier byte before it, and a one-byte step lands on
+/// byte 2 — the middle of the two bytes `ä` occupies. Identifiers here are not
+/// ASCII-only, deliberately: `is_ident_byte` counts every non-ASCII byte as
+/// part of a name, and the quoting rule admits any character a `"…"` can hold
+/// (DECISIONS 391).
 fn mentions(body: &str, name: &str) -> bool {
+    // No name is no scan. `find("")` matches at every position, so an empty
+    // needle would report that every body in the database mentions it — and
+    // with the step below it would still terminate, which makes the wrong
+    // answer the quiet one.
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
     if body.contains(&format!("\"{name}\"")) {
         return true;
     }
@@ -467,7 +510,7 @@ fn mentions(body: &str, name: &str) -> bool {
         if before && after {
             return true;
         }
-        from = start + 1;
+        from = start + first.len_utf8();
     }
     false
 }
@@ -488,6 +531,11 @@ mod tests {
     /// The catalog knows the object by its **old** name, so that is the one to
     /// query with. Taking `to` would query a name that does not exist yet and
     /// report no impact at all — the most dangerous possible answer.
+    ///
+    /// **Both halves of the column's name**, which is the case this fixture
+    /// carries: the plan renames the table too, so the `RenameColumn`'s own
+    /// `table` is the declared `app.customer` and the catalog still has
+    /// `app.client` (DECISIONS 390).
     #[test]
     fn targets_are_taken_from_the_old_names() {
         let cs = ChangeSet {
@@ -513,9 +561,41 @@ mod tests {
             RenameTarget::from_changes(&cs),
             [
                 RenameTarget::Table(tname("app.client")),
+                RenameTarget::Column("app.client.email".parse().expect("a column")),
+            ],
+            "only renames, and by their old names — table and column alike"
+        );
+    }
+
+    /// A column rename with no table rename beside it keeps the table it names.
+    ///
+    /// The negative half of the case above: the translation must be a lookup
+    /// and not a rewrite, or a plan that renames only the column would be
+    /// asked about under whatever table happened to be renamed elsewhere.
+    #[test]
+    fn a_column_rename_alone_keeps_the_table_it_names() {
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaaaaa".parse().expect("a uid"),
+                    from: tname("app.order"),
+                    to: tname("app.purchase"),
+                }),
+                PlannedChange::new(Change::RenameColumn {
+                    uid: "c_aaaaaa".parse().expect("a uid"),
+                    table: tname("app.customer"),
+                    from: "email".into(),
+                    to: "contact_email".into(),
+                }),
+            ],
+        };
+        assert_eq!(
+            RenameTarget::from_changes(&cs),
+            [
+                RenameTarget::Table(tname("app.order")),
                 RenameTarget::Column("app.customer.email".parse().expect("a column")),
             ],
-            "only renames, and by their old names"
+            "a table this plan does not rename is not translated"
         );
     }
 
@@ -554,6 +634,19 @@ mod tests {
         assert!(!mentions("SELECT email_address FROM t", "email"));
         assert!(!mentions("SELECT contact_email FROM t", "email"));
         assert!(!mentions("SELECT emailx FROM t", "email"));
+        // A name whose first character is multibyte, embedded in a longer
+        // identifier. The scan has to step over the rejected match by that
+        // character's width: a one-byte step lands inside it and slicing the
+        // body there panics (DECISIONS 391). Each of these is a body that once
+        // took the process with it.
+        assert!(!mentions("SELECT xä FROM t", "ä"));
+        assert!(!mentions("SELECT äx FROM t", "ä"));
+        assert!(mentions("SELECT ä FROM t", "ä"));
+        assert!(!mentions("SELECT 王小明x FROM t", "王小明"));
+        assert!(mentions("SELECT 王小明 FROM t", "王小明"));
+        // And no name is no match, rather than a match at every position.
+        assert!(!mentions("SELECT email FROM t", ""));
+
         // A dollar sign continues an identifier on this engine, where `@` and
         // `#` do not — which is the one place this parts company with the
         // SQL Server rule of the same shape.

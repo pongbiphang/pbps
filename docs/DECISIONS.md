@@ -8491,3 +8491,58 @@ SPEC is in sync with all of these.
     after `ANALYZE`. Read as a count it says the change is free on the largest
     table in the database, so `Rows` has an arm of its own for it and no
     caller can spell it as zero.
+
+389. **A probe may only measure a rendering that every session renders alike.**
+    A probe is issued *before* the deployment's transaction framing is
+    established, so it runs under the operator's own settings while the
+    statement it clears runs under the ones the framing pins (DECISIONS 267).
+    For a length taken over `::text` that is not a detail: **measured on
+    18.6**, `'\x0102'::bytea` prints 6 characters under `bytea_output = hex`
+    and 8 under `escape`; `'1 day 02:00:00'::interval` prints 14 under
+    `IntervalStyle = postgres` and 9 under `sql_standard`; a `timestamp` prints
+    19 under `DateStyle = ISO` and 24 under `Postgres`; the same value as a
+    `timestamptz` prints 22 under `TimeZone = UTC` and 25 under `Asia/Kolkata`;
+    and `1.0/3.0::float8` prints 18, 17 and 12 under `extra_float_digits` of
+    1, 0 and -5. The pinned rendering is not consistently the longer or the
+    shorter of a pair, and that is the point: a `bytea` or a `timestamp`
+    renders *longer* unpinned, so a probe measuring the operator's session
+    counts rows this engine accepts and refuses a valid plan, while an
+    `interval` or a `float8` renders *shorter*, so the same probe counts
+    nothing and clears a statement the engine then refuses — a probe passing
+    for the wrong reason, which is the failure probes exist to prevent. There
+    is no direction to correct for, so the bounded-string conversion probe is
+    gated on an **allow-list** of source families whose text no pinned setting
+    moves — measured unmoved with all of those settings changed at once: `json`,
+    `jsonb`, `uuid`, `boolean`, `numeric`, the integers and the string types
+    themselves. A `date` is excluded with the rest of its family even though
+    every `DateStyle` prints ten characters for one: that is a coincidence of
+    the styles this engine happens to have, not a promise. The ordering itself
+    — that probes run outside the framing — is a wider question than this
+    catalogue, and is filed as its own issue rather than answered here; if it
+    is ever reversed, this gate is what may be lifted.
+
+390. **A column a plan renames is named to the catalog with *both* halves taken
+    back.** A `RenameColumn` carries the declared, post-rename **table**:
+    `pbps-diff`'s `order_key` gives it a class of its own after the table
+    renames precisely because the statement it becomes names the table and must
+    run second. So a plan that renames `app.client` to `app.customer` and its
+    `email` to `contact_email` describes the column as `app.customer.email`,
+    and `impact::rename_impact`, which runs before any statement, looked up a
+    table the catalog does not have yet and answered `ImpactError::Name` — a
+    refusal of a plan the engine would accept. `RenameTarget::from_changes`
+    therefore builds the table map over the whole plan first and translates the
+    column's table through it, the same translation `preflight::AsStored` makes
+    one rank further on. Built over the whole plan rather than as it walks,
+    because the order that puts the table rename first is `order_key`'s
+    guarantee and not this list's to lean on.
+
+391. **A scan for an identifier steps by a character, not a byte.** `mentions`
+    walks a routine body looking for the renamed name bounded by non-identifier
+    characters, and stepped past a rejected match by one byte. Identifiers here
+    are not ASCII: `is_ident_byte` counts every non-ASCII byte as part of a
+    name, deliberately, so a column may be named `ä`. Scanning `xä` for `ä`
+    finds it at byte 1, rejects it because `x` precedes it, and a one-byte step
+    lands inside the two bytes `ä` occupies — where `body[from..]` panics,
+    because Rust will not slice a string off a character boundary. The step is
+    the width of the name's first character, and an empty name returns `false`
+    before the loop rather than matching at every position.
