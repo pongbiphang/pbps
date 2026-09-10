@@ -15151,6 +15151,79 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
     db.drop().await;
 }
 
+/// The reader's schema filter and the validator's, put to the engine.
+///
+/// `NOT_A_PROJECTS_SCHEMA` is SQL and `catalog::a_projects_schema` is Rust, and
+/// a declaration may name a schema directly — `schema::x` is a grant target —
+/// so the two disagreeing is a grant the engine takes and the pull never sees:
+/// the apply's own read-back refuses it and every plan after it proposes the
+/// same `GRANT` again. Measured against every schema the cluster actually has,
+/// not against a list written here.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name() {
+    use pbps_model::{Permission, Role};
+
+    let mut db = TestDb::create("skipschema").await;
+    db.conn
+        .execute("CREATE SCHEMA pga")
+        .await
+        .expect("a schema whose name merely starts with `p`");
+
+    // Every schema this cluster has, and the reader's own answer for each.
+    let rows = db
+        .conn
+        .query(
+            "SELECT n.nspname,
+                    (n.nspname NOT IN ('pg_catalog', 'information_schema')
+                     AND pg_catalog.left(n.nspname, 3) <> 'pg_')::text AS kept
+               FROM pg_catalog.pg_namespace n
+              ORDER BY 1",
+        )
+        .await
+        .expect("read the schemas");
+    assert!(rows.len() >= 4, "{} schemas", rows.len());
+
+    let pg = Postgres::new();
+    let mut kept = 0;
+    for row in &rows {
+        let name = row
+            .try_get::<&str>("nspname")
+            .expect("a name column")
+            .expect("not null")
+            .to_owned();
+        let sql_keeps = row
+            .try_get::<&str>("kept")
+            .expect("a flag column")
+            .expect("not null")
+            == "true";
+        if sql_keeps {
+            kept += 1;
+        }
+        // The validator's answer, read off a declaration naming that schema.
+        let mut role = Role::default();
+        role.grants.insert(
+            format!("schema::{name}").parse().expect("a grant target"),
+            [Permission::Usage].into_iter().collect(),
+        );
+        let problems = pg.validate_role("app_reader", &role, &Schema::default());
+        assert_eq!(
+            problems.is_empty(),
+            sql_keeps,
+            "`{name}`: the pull {} it and the validator {} a grant on it",
+            if sql_keeps { "reads" } else { "skips" },
+            if problems.is_empty() {
+                "accepts"
+            } else {
+                "refuses"
+            }
+        );
+    }
+    assert!(kept >= 2, "`public` and `pga` are both a project's");
+
+    db.drop().await;
+}
+
 /// The schema PostgreSQL puts everything in by default, and the grant that
 /// reaches through it without a schema grant of its own.
 ///

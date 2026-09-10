@@ -50,6 +50,27 @@ use crate::introspect::{
 const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
       AND pg_catalog.left(n.nspname, 3) <> 'pg_'";
 
+/// [`NOT_A_PROJECTS_SCHEMA`], asked of one name in Rust.
+///
+/// The two have to agree, and the live test
+/// `the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name` puts
+/// the question to the engine rather than to this file: it reads every schema
+/// the cluster has, asks the SQL predicate which of them the pull keeps, and
+/// requires this function to answer the same about each.
+///
+/// It exists because a declaration may name a schema directly — `schema::x` is
+/// a grant target — and a grant in a schema the pull does not read comes back
+/// as absent. Recorded that way, the apply's own read-back refuses it and
+/// every plan after it proposes the same `GRANT` again
+/// ([`crate::validate::role`] refuses the declaration instead).
+///
+/// The table and module checks that had this predicate written out ask it here
+/// now: three copies of one filter are three things to remember when a
+/// fifteenth schema of the engine's own arrives.
+pub(crate) fn a_projects_schema(name: &str) -> bool {
+    !matches!(name, "pg_catalog" | "information_schema") && !name.starts_with("pg_")
+}
+
 /// This tool's own tables, which arrive at Phase 5 step 8. They must never
 /// enter the managed set, or the tool would plan changes to itself.
 ///

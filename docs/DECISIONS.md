@@ -8244,3 +8244,21 @@ SPEC is in sync with all of these.
     is refused there — so nothing is filtered out. `unexpressible_permissions`
     asks the same question of the limitation beside the grant and gets the same
     answer (176).
+
+385. **A schema the pull does not read is a schema a declaration may not
+    name.** The rule was already there for a table and a module — a table
+    declared in `information_schema` is created and then invisible — and a
+    grant target reaches the same schemas by a shorter road, because
+    `schema::x` names one directly and nothing else has to exist. Measured,
+    `GRANT USAGE ON SCHEMA information_schema TO r` runs; the pull skips the
+    schema, so the grant reads back as absent, the apply's own read-back
+    refuses it for not having achieved its postcondition, and every plan after
+    it proposes the same `GRANT` again.
+
+    The three copies of the filter — the table check, the module check and now
+    the grant check — became one function beside the SQL it mirrors
+    (`catalog::a_projects_schema`), and the live test
+    `the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name`
+    reads every schema the cluster has and requires the reader's answer and the
+    validator's to agree about each. A list written in this repo would be the
+    thing that drifts.

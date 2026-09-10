@@ -328,6 +328,25 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 errs.push(e);
             }
         }
+        // A schema the pull does not read. The engine takes the grant —
+        // measured, `GRANT USAGE ON SCHEMA information_schema TO r` runs — and
+        // the reader skips those schemas because they are the engine's own and
+        // not a project's (`crate::catalog::a_projects_schema`). The grant
+        // would then come back as absent: the apply's own read-back would
+        // refuse it for not having achieved what it asked, and every plan after
+        // it would propose the same `GRANT` again. Refused here, where the
+        // remedy is a line in a file.
+        let schema_of = target.schema();
+        if !crate::catalog::a_projects_schema(schema_of) {
+            errs.push(invalid(format!(
+                "role `{name}`: `{target}` is in schema `{schema_of}`, which is the engine's \
+                 own and not a project's: `pg_catalog`, `information_schema` and every `pg_` \
+                 schema are left out of the pull, so a grant there reads back as absent and \
+                 every plan would propose it again (DECISIONS 385). Grant in a schema this \
+                 project declares"
+            )));
+            continue;
+        }
         // A word the model spells for the other engine (§6). Refused by name,
         // on any target — the engine's parser stops at the word before it
         // looks at the target — and left out of the kind check below, which
@@ -542,6 +561,38 @@ mod tests {
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("app.both(integer)"), "{}", problems[0]);
+    }
+
+    /// A schema the pull does not read is a schema a declaration may not name.
+    ///
+    /// The engine takes the grant — measured, `GRANT USAGE ON SCHEMA
+    /// information_schema TO r` runs — and the reader leaves those schemas out
+    /// because they are the engine's own. The grant would come back as absent,
+    /// the apply's own read-back would refuse it, and every plan after it would
+    /// propose the same `GRANT` again.
+    #[test]
+    fn a_schema_the_pull_does_not_read_is_refused_as_a_target() {
+        for target in [
+            "schema::information_schema",
+            "schema::pg_catalog",
+            "schema::pg_toast",
+            "information_schema.tables",
+        ] {
+            let role = granting(&[
+                ("schema::app", &[Permission::Usage]),
+                (target, &[Permission::Usage]),
+            ]);
+            let problems = messages("app_reader", &role);
+            assert_eq!(problems.len(), 1, "{target}: {problems:?}");
+            assert!(
+                problems[0].contains("the engine's own"),
+                "{target}: {}",
+                problems[0]
+            );
+        }
+        // A schema whose name merely starts with `p` is a project's.
+        let role = granting(&[("schema::pga", &[Permission::Usage])]);
+        assert!(messages("app_reader", &role).is_empty());
     }
 
     /// The one schema §1 does not apply to. **Measured on 18.6**: a role

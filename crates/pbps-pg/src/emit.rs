@@ -1907,7 +1907,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     // back, so every plan creates it again and the engine refuses the second
     // one for already existing.
     let schema = id.schema();
-    if schema == "information_schema" || schema.starts_with("pg_") {
+    if !crate::catalog::a_projects_schema(schema) {
         found.push(invalid(format!(
             "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again — and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
         )));

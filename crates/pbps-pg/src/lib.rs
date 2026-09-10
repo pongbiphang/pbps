@@ -550,7 +550,7 @@ impl Dialect for Postgres {
                 ),
             });
         }
-        if schema == "information_schema" || schema.starts_with("pg_") {
+        if !catalog::a_projects_schema(schema) {
             found.push(DialectError::Invalid {
                 dialect: types::DIALECT,
                 message: format!(
