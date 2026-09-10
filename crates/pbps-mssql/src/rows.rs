@@ -221,10 +221,14 @@ pub fn query(
         let asked = confirms_default(spec);
         let default_at = match &spec.default {
             Some(default) if asked => {
+                // Compare what assignment stores, as the emitter's
+                // defaulted_cell does. Type precedence must not convert a
+                // text cell to the numeric type of its default expression.
+                let ty = crate::types::normalize(&spec.ty)?;
                 select.push(format!(
                     // Both halves, because `=` is UNKNOWN for a NULL on either
                     // side and `DEFAULT NULL` is a real declaration.
-                    "CASE WHEN {quoted} = ({default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
+                    "CASE WHEN {quoted} = CONVERT({ty}, {default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
                      THEN 1 ELSE 0 END"
                 ));
                 Some(select.len() - 1)
@@ -1156,12 +1160,67 @@ mod tests {
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         assert!(
             q.sql.contains(
-                "CASE WHEN [label] = ('Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
+                "CASE WHEN [label] = CONVERT(nvarchar(50), 'Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
             ),
             "{}",
             q.sql
         );
         assert!(q.sql.trim_end().ends_with(';'), "{}", q.sql);
+    }
+
+    #[test]
+    fn default_comparisons_use_the_normalized_column_type() {
+        for (ty, expected) in [
+            ("varchar(10)", "varchar(10)"),
+            ("nvarchar(max)", "nvarchar(max)"),
+            ("numeric(8,2)", "decimal(8, 2)"),
+            ("integer", "int"),
+        ] {
+            let t = table(
+                Some(vec!["id"]),
+                &[
+                    ("id", "int", None),
+                    ("n]ame", ty, Some("-CAST('1' AS int)")),
+                ],
+            );
+            let q = query(
+                &name(),
+                &t,
+                &RowScope::Every {
+                    known: Default::default(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                q.sql.contains(&format!(
+                    "[n]]ame] = CONVERT({expected}, -CAST('1' AS int))"
+                )),
+                "{}",
+                q.sql
+            );
+        }
+        for (ty, default) in [
+            ("text", "-CAST('1' AS int)"),
+            ("varchar(10)", "NEWID()"),
+            ("int", "-CAST('abc' AS int)"),
+        ] {
+            let t = table(
+                Some(vec!["id"]),
+                &[("id", "int", None), ("n", ty, Some(default))],
+            );
+            let q = query(
+                &name(),
+                &t,
+                &RowScope::Every {
+                    known: Default::default(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!q.sql.contains("CASE WHEN"), "{}", q.sql);
+            assert!(q.columns[0].assume_default);
+        }
     }
 
     /// The engine's column, not the declaration's: never selected, so it never

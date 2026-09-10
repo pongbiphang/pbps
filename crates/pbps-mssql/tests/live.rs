@@ -244,6 +244,67 @@ async fn throwing_signed_defaults_do_not_break_explicit_row_reads() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn signed_defaults_are_compared_as_the_column_stores_them() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("signed_cast_assignment").await;
+    for (i, (ty, default, explicit)) in [
+        ("varchar(10)", "-CAST('1' AS int)", "'abc'"),
+        ("nvarchar(10)", "- /* c */ 1", "N'abc'"),
+        ("char(10)", "+CAST('1' AS int)", "'abc'"),
+        ("int", "-CAST('1.25' AS decimal(8,2))", "2"),
+        ("decimal(8,1)", "-CAST('1.25' AS decimal(8,2))", "2"),
+        ("varchar(10)", "NULL", "'abc'"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = TableName::new("dbo", format!("t{i}"));
+        db.conn.execute(&format!("CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {ty} DEFAULT ({default})); INSERT dbo.t{i}(id,n) VALUES(1,{explicit}),(3,NULL); INSERT dbo.t{i}(id) VALUES(2);")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        let mut column = Column::new(ty.parse().unwrap());
+        let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
+        column.default = Some(
+            defaults[0]
+                .try_get::<&str>("definition")
+                .unwrap()
+                .unwrap()
+                .to_owned(),
+        );
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for (key, at_default) in [("1", false), ("2", true), ("3", default == "NULL")] {
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{ty} default {default}, row {key}: {e}"));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert_eq!(
+                observed.at_default.contains("n"),
+                at_default,
+                "{ty} {default} row {key}"
+            );
+            assert!(!observed.unknown.contains("n"));
+        }
+    }
+    db.drop().await;
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,
