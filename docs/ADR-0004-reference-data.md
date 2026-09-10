@@ -149,7 +149,8 @@ Decisions taken during implementation that this document did not anticipate:
    different column is refused, because the two key sets have nothing in
    common.
    An absent baseline key is a separate state: retained rows are compared on
-   the declared key when the same plan restores that constraint. Without a
+   the declared key when it maps to an existing baseline column by uid and
+   the same plan restores that constraint. Without a
    restoration, or with a non-single-column baseline key, the differ refuses
    with a diagnostic describing that state rather than claiming the key moved.
 3. **The catalog reads rows back under a scope the caller supplies.** A

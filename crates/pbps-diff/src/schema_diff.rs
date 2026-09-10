@@ -723,9 +723,22 @@ fn diff_data(
                     Change::SetPrimaryKey { table, from: None, to: Some(pk) }
                     if table == name && pk.columns == [key_column.clone()])
                 });
-                (!restored).then(|| DiffError::DataBaselineKeyAbsent {
-                    table: name.clone(),
-                })
+                if !restored {
+                    Some(DiffError::DataBaselineKeyAbsent {
+                        table: name.clone(),
+                    })
+                } else if !base_name_of
+                    .get(&key_column)
+                    .is_some_and(|column| base.columns.contains_key(column))
+                {
+                    // Adding a new key column cannot recover the identity of
+                    // retained rows: their map keys predate that column.
+                    Some(DiffError::DataKeyColumnChanged {
+                        table: name.clone(),
+                    })
+                } else {
+                    None
+                }
             }
             BaselineDataKey::Multiple(columns) => Some(DiffError::DataBaselineKeyNotSingle {
                 table: name.clone(),
@@ -2396,6 +2409,35 @@ mod tests {
         for kind in ["SetPrimaryKey", "UpdateRow", "InsertRow", "DeleteRow"] {
             assert!(kinds(&cs).contains(&kind.to_owned()), "{:?}", kinds(&cs));
         }
+    }
+
+    #[test]
+    fn an_added_key_column_cannot_match_retained_baseline_rows() {
+        let mut base = lookup(DataMode::Exact, &[("new", "Old")]);
+        base.primary_key = None;
+        let mut declared = lookup(DataMode::Exact, &[("new", "New")]);
+        declared
+            .columns
+            .insert("new_code".to_owned(), declared.columns["code"].clone());
+        declared.primary_key.as_mut().unwrap().columns = vec!["new_code".to_owned()];
+        let name: TableName = "dbo.s".parse().unwrap();
+        let mut changes = vec![Change::SetPrimaryKey {
+            table: name.clone(),
+            from: None,
+            to: declared.primary_key.clone(),
+        }];
+        let mut errors = Vec::new();
+        let mapping = [
+            ("code".to_owned(), "code".to_owned()),
+            ("label".to_owned(), "label".to_owned()),
+        ]
+        .into();
+        diff_data(&name, &base, &declared, &mapping, &mut changes, &mut errors);
+        assert_eq!(
+            errors,
+            vec![DiffError::DataKeyColumnChanged { table: name }]
+        );
+        assert_eq!(changes.len(), 1, "{changes:?}");
     }
 
     #[test]
