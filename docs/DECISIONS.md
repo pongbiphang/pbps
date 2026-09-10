@@ -2182,8 +2182,9 @@ SPEC is in sync with all of these.
     with a new uid — would have the guard compare two unrelated tables with an
     empty skip set. It would; the plan cannot exist. `resolve` binds a
     declared name to the uid that name already has, so a drop intent for a
-    still-declared name is `UnusedIntent` and a rename onto an occupied name
-    is too. Rather than add a case for it, the rule it depends on is now
+    still-declared name is `UnusedIntent`; a rename onto an occupied name is
+    reported as a target-collision blocker before it can consume its source.
+    Rather than add a case for replacing a still-declared table, the rule it depends on is now
     pinned by a test that names the guard, so if identity ever stops working
     that way the guard is what to revisit. **A hazard made unrepresentable
     still needs the invariant written down** — otherwise the next reader adds

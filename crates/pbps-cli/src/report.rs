@@ -55,6 +55,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
         Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
         Blocker::UnusedIntent { .. } => "identity.unused-intent",
         Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
+        Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
     };
     let text = one_blocker(b);
     // The first line says what happened; the rest are the commands.
@@ -189,6 +190,9 @@ fn one_blocker(b: &Blocker) -> String {
             );
             s
         }
+        Blocker::RenameTargetExists { target } => format!(
+            "  rename target {target} already exists in the declarations; choose a different target or remove the existing declaration\n"
+        ),
     }
 }
 
@@ -1050,5 +1054,31 @@ mod tests {
         );
         assert!(text.contains("pbps rename"), "{text}");
         assert!(text.contains("renamed_from"), "{text}");
+    }
+
+    /// An occupied rename target gets a precise finding rather than the
+    /// generic unused-intent wording, and the target is named for the user.
+    #[test]
+    fn a_rename_target_collision_names_the_declared_target() {
+        let blocker = Blocker::RenameTargetExists {
+            target: "dbo.customer.full_name".into(),
+        };
+        let text = one_blocker(&blocker);
+        assert!(
+            text.contains("rename target dbo.customer.full_name"),
+            "{text}"
+        );
+        assert!(
+            text.contains("already exists in the declarations"),
+            "{text}"
+        );
+
+        let finding = blocker_finding(&blocker);
+        assert_eq!(finding.id, "identity.rename-target-exists");
+        assert!(
+            finding.message.contains("dbo.customer.full_name"),
+            "{finding:?}"
+        );
+        assert!(!finding.message.contains("likely a typo"), "{finding:?}");
     }
 }

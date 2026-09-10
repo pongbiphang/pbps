@@ -2767,9 +2767,10 @@ mod tests {
         )
         .expect_err("a rename cannot take an occupied name either");
         assert!(
-            blockers
-                .iter()
-                .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
+            blockers.iter().any(|b| matches!(
+                b,
+                crate::Blocker::RenameTargetExists { target } if target == "dbo.t"
+            )),
             "{blockers:?}"
         );
     }

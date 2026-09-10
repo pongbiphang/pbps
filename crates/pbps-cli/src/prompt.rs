@@ -184,6 +184,10 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         // committed one. The file is where the contradiction lives and where it
         // has to be resolved.
         Blocker::ConflictingRenameIntents { .. } => {}
+        // There is no safe interactive answer: the declaration already owns
+        // the target, so the user must edit the declaration or choose another
+        // rename target before planning again.
+        Blocker::RenameTargetExists { .. } => {}
     }
     out
 }
@@ -333,6 +337,9 @@ fn question(b: &Blocker) -> String {
         Blocker::ConflictingRenameIntents { name, intents, .. } => {
             format!("{} rename intents claim {name}", intents.len())
         }
+        Blocker::RenameTargetExists { target } => {
+            format!("rename target {target} already exists in the declarations")
+        }
     }
 }
 
@@ -418,6 +425,16 @@ mod tests {
                 from: table(),
                 to: "dbo.nope".parse().unwrap(),
             },
+        };
+        assert!(choices(&b).is_empty());
+    }
+
+    /// An occupied target cannot be resolved by choosing an inferred rename or
+    /// drop: the declaration has to be edited before planning again.
+    #[test]
+    fn an_occupied_rename_target_offers_nothing_to_choose() {
+        let b = Blocker::RenameTargetExists {
+            target: "dbo.customer.full_name".into(),
         };
         assert!(choices(&b).is_empty());
     }

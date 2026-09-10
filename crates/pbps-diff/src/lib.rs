@@ -11,7 +11,9 @@ pub mod identity;
 pub mod managed;
 pub mod schema_diff;
 
-pub use identity::{Blocker, Context, RenameSide, Resolution, intent_is_absorbed, resolve};
+pub use identity::{
+    Blocker, Context, RenameSide, Resolution, intent_is_absorbed, resolve, resolve_with_annotations,
+};
 pub use managed::{Scoped, observed_ids, scope};
 pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial, order_role_drops};
 
@@ -322,6 +324,319 @@ mod tests {
             errs.iter()
                 .any(|b| matches!(b, Blocker::UnusedIntent { intent: i } if i == &intent)),
             "the intent matching nothing should be reported: {errs:?}"
+        );
+    }
+
+    /// A rename cannot take the name of a table that remains declared. The
+    /// source must stay available so a companion drop intent can account for
+    /// it, and the rename itself must be reported as a target collision rather
+    /// than as an unused intent.
+    #[test]
+    fn a_rename_onto_a_declared_table_reports_its_target_collision() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.new", &["id"])]);
+        let s = schema(&[("dbo.new", &["id"])]);
+        let rename = Intent::RenameTable {
+            from: t("dbo.old"),
+            to: t("dbo.new"),
+        };
+        let drop = Intent::DropTable {
+            table: t("dbo.old"),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the target collision is the only blocker: {errs:?}"
+        );
+        assert!(
+            matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "dbo.new"),
+            "the blocker must name the occupied target: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::UnusedIntent { .. })),
+            "neither supplied intent is unused: {errs:?}"
+        );
+    }
+
+    /// The same target-collision guard applies to columns, whose target must
+    /// be rendered with its table so equal column names in different tables do
+    /// not become one diagnostic.
+    #[test]
+    fn a_rename_onto_a_declared_column_reports_its_target_collision() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "new"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let rename = Intent::RenameColumn {
+            table: t("dbo.t"),
+            from: "old".into(),
+            to: "new".into(),
+        };
+        let drop = Intent::DropColumn {
+            column: "dbo.t.old".parse().unwrap(),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the target collision is the only blocker: {errs:?}"
+        );
+        assert!(
+            matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "dbo.t.new"),
+            "the blocker must name the occupied target: {errs:?}"
+        );
+    }
+
+    /// Roles use the same identity rule even though their names are unqualified.
+    #[test]
+    fn a_rename_onto_a_declared_role_reports_its_target_collision() {
+        let ids = resolve(
+            &with_roles(&[("dbo.t", &["id"])], &["old", "new"]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["new"]);
+        let rename = Intent::RenameRole {
+            from: "old".into(),
+            to: "new".into(),
+        };
+        let drop = Intent::DropRole {
+            role: "old".into(),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the target collision is the only blocker: {errs:?}"
+        );
+        assert!(
+            matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "new"),
+            "the blocker must name the occupied target: {errs:?}"
+        );
+    }
+
+    /// A stale annotation may describe a rename that already happened before
+    /// the source name was reused. Dropping that newer identity is valid and
+    /// must not be refused as though the annotation were a fresh command.
+    #[test]
+    fn an_absorbed_table_rename_annotation_does_not_block_dropping_a_reused_source() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.new", &["id"])]);
+        let s = schema(&[("dbo.new", &["id"])]);
+        let intents = [
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.new"),
+            },
+            Intent::DropTable {
+                table: t("dbo.old"),
+                reason: "retired".into(),
+            },
+        ];
+
+        let r = resolve_with_annotations(&s, &ids, &intents, 1, &ctx())
+            .expect("a stale annotation must be absorbed when its reused source is dropped");
+        assert!(r.renamed_tables.is_empty());
+        assert_eq!(r.dropped_tables.len(), 1);
+        assert!(r.ids.table_uid(&t("dbo.old")).is_none());
+        assert!(r.ids.table_uid(&t("dbo.new")).is_some());
+    }
+
+    /// The same stale-annotation rule applies to columns, whose source and
+    /// target share a table but still represent separate identities.
+    #[test]
+    fn an_absorbed_column_rename_annotation_does_not_block_dropping_a_reused_source() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "new"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let intents = [
+            Intent::RenameColumn {
+                table: t("dbo.t"),
+                from: "old".into(),
+                to: "new".into(),
+            },
+            Intent::DropColumn {
+                column: "dbo.t.old".parse().unwrap(),
+                reason: "retired".into(),
+            },
+        ];
+
+        let r = resolve_with_annotations(&s, &ids, &intents, 1, &ctx())
+            .expect("a stale annotation must be absorbed when its reused source is dropped");
+        assert!(r.renamed_columns.is_empty());
+        assert_eq!(r.dropped_columns.len(), 1);
+        assert!(r.ids.column_uid(&"dbo.t.old".parse().unwrap()).is_none());
+        assert!(r.ids.column_uid(&"dbo.t.new".parse().unwrap()).is_some());
+    }
+
+    /// Roles carry the same identity provenance even though their names are
+    /// unqualified and their memberships make an accidental recreation costly.
+    #[test]
+    fn an_absorbed_role_rename_annotation_does_not_block_dropping_a_reused_source() {
+        let ids = resolve(
+            &with_roles(&[("dbo.t", &["id"])], &["old", "new"]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["new"]);
+        let intents = [
+            Intent::RenameRole {
+                from: "old".into(),
+                to: "new".into(),
+            },
+            Intent::DropRole {
+                role: "old".into(),
+                reason: "retired".into(),
+            },
+        ];
+
+        let r = resolve_with_annotations(&s, &ids, &intents, 1, &ctx())
+            .expect("a stale annotation must be absorbed when its reused source is dropped");
+        assert!(r.renamed_roles.is_empty());
+        assert_eq!(r.dropped_roles.len(), 1);
+        assert!(r.ids.role_uid("old").is_none());
+        assert!(r.ids.role_uid("new").is_some());
+    }
+
+    /// A rename supplied as a current decision is not stale provenance: even
+    /// with a companion drop, an occupied target must remain a blocker.
+    #[test]
+    fn an_explicit_rename_plus_drop_still_reports_its_target_collision() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.new", &["id"])]);
+        let s = schema(&[("dbo.new", &["id"])]);
+        let intents = [
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.new"),
+            },
+            Intent::DropTable {
+                table: t("dbo.old"),
+                reason: "retired".into(),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 0, &ctx()).unwrap_err();
+        assert_eq!(errs.len(), 1, "the target collision is the only blocker");
+        assert!(matches!(
+            &errs[0],
+            Blocker::RenameTargetExists { target } if target == "dbo.new"
+        ));
+    }
+
+    /// A matchable retained annotation must not lend its success to a different
+    /// current command that tries to reuse the same source at an occupied name.
+    #[test]
+    fn an_occupied_table_command_is_rejected_beside_a_matchable_annotation() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.occupied", &["id"])]);
+        let s = schema(&[("dbo.fresh", &["id"]), ("dbo.occupied", &["id"])]);
+        let intents = [
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.fresh"),
+            },
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.occupied"),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 1, &ctx()).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [Blocker::RenameTargetExists { target }] if target == "dbo.occupied"
+        ));
+    }
+
+    /// Columns have the same provenance boundary, scoped to their table.
+    #[test]
+    fn an_occupied_column_command_is_rejected_beside_a_matchable_annotation() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "occupied"])]);
+        let s = schema(&[("dbo.t", &["id", "fresh", "occupied"])]);
+        let intents = [
+            Intent::RenameColumn {
+                table: t("dbo.t"),
+                from: "old".into(),
+                to: "fresh".into(),
+            },
+            Intent::RenameColumn {
+                table: t("dbo.t"),
+                from: "old".into(),
+                to: "occupied".into(),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 1, &ctx()).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [Blocker::RenameTargetExists { target }] if target == "dbo.t.occupied"
+        ));
+    }
+
+    /// Role commands are also appended after retained annotations and cannot
+    /// borrow an annotation's match to record a different identity decision.
+    #[test]
+    fn an_occupied_role_command_is_rejected_beside_a_matchable_annotation() {
+        let ids = resolve(
+            &with_roles(&[("dbo.t", &["id"])], &["old", "occupied"]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["fresh", "occupied"]);
+        let intents = [
+            Intent::RenameRole {
+                from: "old".into(),
+                to: "fresh".into(),
+            },
+            Intent::RenameRole {
+                from: "old".into(),
+                to: "occupied".into(),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 1, &ctx()).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [Blocker::RenameTargetExists { target }] if target == "occupied"
+        ));
+    }
+
+    /// A target that is neither declared nor known is still a misspelling, not
+    /// an occupied-target collision.
+    #[test]
+    fn a_rename_to_an_unknown_target_remains_an_unused_intent() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"])]);
+        let s = Schema::default();
+        let rename = Intent::RenameTable {
+            from: t("dbo.old"),
+            to: t("dbo.missing"),
+        };
+        let drop = Intent::DropTable {
+            table: t("dbo.old"),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter()
+                .any(|b| matches!(b, Blocker::UnusedIntent { .. })),
+            "the unknown target remains an unused intent: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::RenameTargetExists { .. })),
+            "an unknown target is not an occupied target: {errs:?}"
         );
     }
 

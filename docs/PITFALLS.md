@@ -1789,6 +1789,13 @@ intent whose every name exists. **When one shape produces a wrong success and a
 misleading failure depending on which half collides, the check is missing
 upstream of both** — not in either arm.
 
+The same guard applies when a rename points at a name already held by a
+declaration. That target is not in `appeared`, but the source is still in
+`disappeared`; checking both sets before removing either one lets a companion
+drop intent account for the source. The resolver reports a target-collision
+blocker naming the occupied declaration, rather than consuming the source and
+turning both intents into `UnusedIntent`.
+
 **Ask "can two of these claim one thing?" of every loop that consumes from a
 set.** The answer decides whether the loop is a matching or a race, and the
 question is not visible in the loop's own text.

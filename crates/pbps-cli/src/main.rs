@@ -2090,10 +2090,17 @@ pub struct FmtData {
 fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
     let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids(project)?;
+    let annotation_count = loaded.intents.len();
     let mut intents = loaded.intents;
     intents.push(intent);
 
-    match pbps_diff::resolve(&loaded.schema, &ids, &intents, &context(project.root())) {
+    match pbps_diff::resolve_with_annotations(
+        &loaded.schema,
+        &ids,
+        &intents,
+        annotation_count,
+        &context(project.root()),
+    ) {
         Ok(res) => {
             if res.ids == ids {
                 println!(
@@ -2137,8 +2144,14 @@ fn resolve_with_intent(
     quiet: bool,
 ) -> anyhow::Result<Result<pbps_diff::Resolution, Vec<pbps_diff::Blocker>>> {
     let mut intents = loaded.intents.clone();
-    let original = match pbps_diff::resolve(&loaded.schema, ids, &intents, &context(project.root()))
-    {
+    let annotation_count = loaded.intents.len();
+    let original = match pbps_diff::resolve_with_annotations(
+        &loaded.schema,
+        ids,
+        &intents,
+        annotation_count,
+        &context(project.root()),
+    ) {
         Ok(r) => return Ok(Ok(r)),
         Err(b) => b,
     };
@@ -2161,7 +2174,13 @@ fn resolve_with_intent(
             // ordinary intents, and running them through the same call is what
             // makes the prompt a wrapper rather than a second implementation of
             // identity resolution.
-            match pbps_diff::resolve(&loaded.schema, ids, &intents, &context(project.root())) {
+            match pbps_diff::resolve_with_annotations(
+                &loaded.schema,
+                ids,
+                &intents,
+                annotation_count,
+                &context(project.root()),
+            ) {
                 Ok(r) => {
                     // Written now, so the answers survive whatever the rest of
                     // this plan does. They are the user's decisions, and losing
