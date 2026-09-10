@@ -480,6 +480,24 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             let Some(stored) = names.table(table) else {
                 return Ok(Vec::new());
             };
+            // The model's marker is lexical and deliberately conservative: it
+            // answers "could this expression mean NULL?" by looking for the
+            // word, and `NULLIF` is one of the words. **Measured on SQL Server
+            // 2022**, a nonempty table takes
+            // `ADD c int NOT NULL DEFAULT NULLIF(1, 2)` and every row reads
+            // `1`, while `NULLIF(1, 1)` is refused — one word, both answers.
+            // Counting the whole table on the word alone refuses the first.
+            //
+            // Keep the count only where this module can read the value without
+            // running anything: no default, or the literal `NULL`. An
+            // expression is the case DECISIONS 124 answers with no probe rather
+            // than a guess; asking the engine `(expr) IS NULL` would run the
+            // operator's expression before approval, the hazard in #274.
+            if let Some(default) = column.default.as_deref()
+                && (!crate::rows::is_constant(default) || !is_null_default(default))
+            {
+                return Ok(Vec::new());
+            }
             Ok(vec![Probe::new(
                 format!(
                     "rows that have no value for the new NOT NULL column {}",
@@ -1992,7 +2010,7 @@ mod tests {
     fn a_null_default_does_not_hide_the_required_add_probe() {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
-        column.default = Some("CONVERT(int, NULL)".into());
+        column.default = Some("((NULL))".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
@@ -2000,6 +2018,22 @@ mod tests {
             column: Box::new(column),
         });
         assert_eq!(sql, ["SELECT COUNT(*) AS n FROM [dbo].[customer];"]);
+    }
+
+    #[test]
+    fn an_expression_with_null_semantics_is_not_guessed_at() {
+        for default in ["NULLIF(1, 2)", "NULLIF(1, 1)", "CONVERT(int, NULL)"] {
+            let mut column = pbps_model::Column::new(ty("int"));
+            column.nullable = false;
+            column.default = Some(default.into());
+            let sql = sql_of(&Change::AddColumn {
+                uid: uid("c_aaaaaa"),
+                table: tname("dbo.customer"),
+                name: "score".into(),
+                column: Box::new(column),
+            });
+            assert!(sql.is_empty(), "default {default} produced: {sql:?}");
+        }
     }
 
     #[test]
