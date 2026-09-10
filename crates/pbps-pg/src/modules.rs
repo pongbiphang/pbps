@@ -2153,6 +2153,19 @@ mod tests {
             ),
             vec![id("app.z"), id("app.select")]
         );
+        // A Unicode-escaped identifier is the name it spells: measured,
+        // `FROM app.U&"\007a"` selects from `app.z`.
+        let mut views = BTreeMap::new();
+        views.insert(id("app.a"), module("SELECT * FROM app.U&\"\\007a\""));
+        views.insert(id("app.z"), module("SELECT 1 AS x"));
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &views,
+                &pbps_model::ModuleDeps::default(),
+                &LEXIS
+            ),
+            vec![id("app.z"), id("app.a")]
+        );
         // A dollar-quoted datum is a literal too — only a routine's body,
         // after `AS`, is code — so the name inside it draws no edge, and the
         // real edge decides.

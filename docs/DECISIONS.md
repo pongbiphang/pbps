@@ -5818,6 +5818,14 @@ SPEC is in sync with all of these.
     against `format_type` and never matched — so the routine a plan had just
     created was not in the catalog to the next.
 
+    **Amended: the parameter scan steps over the clause too.** A parameter's
+    mode may follow its name, and a Unicode-escaped name carries its
+    `UESCAPE 'x'` after it: measured, `CREATE FUNCTION dq.f(U&"n!0061me"
+    UESCAPE '!' OUT integer)` has the identity `dq.f()`, and with `INOUT` or
+    a bare type after the clause, `dq.g(integer)` and `dq.f(integer)`. The
+    scan looked for the mode where the clause was, counted the parameter,
+    and refused a correctly keyed routine.
+
 302. **A PostgreSQL trigger's table is in its identity *and* in its
     definition, and a declaration where the two disagree is refused.**
     ADR-0002 fixed where a module's `definition:` begins by what the emitter
@@ -6511,6 +6519,16 @@ SPEC is in sync with all of these.
     it. The model's `Lexis` carries both the dialect's `code_only` and its
     identifier rule; the differ and the emitter's name scans hand it the
     dialect's, and the shared scanner keeps SQL Server's as its own.
+
+    **Amended: a Unicode-escaped identifier is read as the name it spells.**
+    Measured, `SELECT * FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a"
+    UESCAPE '!'` both select from `dq.z`; the scan read the spelling on the
+    page, found no `z` in it, and with `a` sorting first created `a` over a
+    view that did not exist yet. `Lexicon` says whether the engine has the
+    form, and `code_only` replaces `U&"…"` and its clause with the quoted
+    name they decode to, padded so that offsets survive; a spelling that does
+    not decode is left as it is, for the engine to refuse. SQL Server has no
+    such form.
 
 316. **A bare reserved word is not a reference.** The name scans read a bare
     word as a possible mention of a module of that name, because a

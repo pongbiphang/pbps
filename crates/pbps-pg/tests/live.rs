@@ -7834,6 +7834,61 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// Measured: `FROM dq.U&"\007a"` selects from `dq.z`. The scan that read
+/// the spelling on the page found no `z` in it, and with `a` sorting first,
+/// created `a` over a view that did not exist yet.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_named_by_a_unicode_escape_is_created_after_the_view_it_names() {
+    let s = emit_schema("unicode_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.a").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT * FROM {s}.U&\"\\007a\""),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.b").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT * FROM U&\"{s}\".U&\"!007a\" UESCAPE '!'"),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.z").parse().expect("a module id"),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS x"),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.z"), format!("{s}.a"), format!("{s}.b")],
+        "the view that is selected from comes first, however its name is spelled"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT x::text FROM {s}.b")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
 /// A plan that creates two views orders them by what each really selects
 /// from, not by a name the other engine's lexer would read out of a literal.
 ///

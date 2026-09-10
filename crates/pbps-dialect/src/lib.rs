@@ -334,6 +334,15 @@ pub struct Lexicon {
     /// position takes it; on SQL Server none of the documented reserved words
     /// stands unbracketed.
     pub reserved: fn(&str) -> bool,
+
+    /// Whether `U&"…"`, with an optional `UESCAPE 'x'` after it, is a
+    /// Unicode-escaped identifier — a spelling of the name it decodes to,
+    /// which is what the name scans have to see. **Measured** on PostgreSQL
+    /// 18.6, `SELECT * FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a" UESCAPE
+    /// '!'` both select from `dq.z`; read as the spelling on the page, the
+    /// scan found no `z` in either and created the view first (DECISIONS
+    /// 315).
+    pub unicode_identifiers: bool,
 }
 
 /// Standard SQL's identifier rule: letters, digits and `_`.
@@ -359,6 +368,7 @@ impl Lexicon {
         string_prefixes: &["n"],
         identifier_continues: ansi_identifier_continues,
         reserved: never_reserved,
+        unicode_identifiers: true,
     };
 
     /// The comparison form of a module definition, for the dialect this
@@ -757,6 +767,14 @@ impl Lexicon {
                             blank(&mut out, ch);
                         }
                         _ => {
+                            if ch == '"'
+                                && self.unicode_identifiers
+                                && let Some(end) =
+                                    self.decode_unicode_identifier(definition, i, &mut out)
+                            {
+                                consumed_to = end;
+                                continue;
+                            }
                             if let Some(&(_, close)) = self
                                 .quoted_identifiers
                                 .iter()
@@ -774,6 +792,73 @@ impl Lexicon {
             }
         }
         out
+    }
+
+    /// Where the quote at `at` closes a `U&"…"` — the `U&` already in `out`
+    /// as code, as a string prefix would be — replaces the spelling with the
+    /// quoted name it decodes to and returns the offset the code after it,
+    /// and after its `UESCAPE 'x'` if it has one, resumes at. `None` where
+    /// the quote is not that, or the text does not decode: the quote then
+    /// opens an ordinary identifier, spelled as it is.
+    ///
+    /// The decoded name is never longer than its spelling, so the difference
+    /// is padded and offsets survive; a line break inside the span is kept.
+    fn decode_unicode_identifier(
+        &self,
+        definition: &str,
+        at: usize,
+        out: &mut String,
+    ) -> Option<usize> {
+        let n = out.len();
+        if n < 2
+            || !out.is_char_boundary(n - 2)
+            || !out[n - 2..].eq_ignore_ascii_case("u&")
+            || out[..n - 2]
+                .chars()
+                .next_back()
+                .is_some_and(self.identifier_continues)
+        {
+            return None;
+        }
+        let close = quoted_identifier_len(&definition[at..])?;
+        let inner = definition[at + 1..at + close - 1].replace("\"\"", "\"");
+        let mut end = at + close;
+        let mut escape = '\\';
+        // `UESCAPE 'x'`, after ASCII whitespace: the engine's whitespace.
+        let after = definition[end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if after.len() > 7
+            && after.is_char_boundary(7)
+            && after[..7].eq_ignore_ascii_case("uescape")
+            && after[7..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_whitespace() || c == '\'')
+        {
+            let clause = after[7..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let mut chars = clause.chars();
+            if let (Some('\''), Some(e), Some('\'')) = (chars.next(), chars.next(), chars.next())
+                && e != '\''
+                && e != '+'
+                && !e.is_ascii_hexdigit()
+                && !e.is_whitespace()
+            {
+                escape = e;
+                end = definition.len() - clause.len() + 2 + e.len_utf8();
+            }
+        }
+        let decoded = pbps_model::module::decode_unicode_escapes(&inner, escape)?;
+        out.truncate(n - 2);
+        let spelled = format!("\"{}\"", decoded.replace('"', "\"\""));
+        let span = end - at + 2;
+        out.push_str(&spelled);
+        let breaks = definition[at..end].matches('\n').count();
+        for _ in spelled.len() + breaks..span {
+            out.push(' ');
+        }
+        for _ in 0..breaks {
+            out.push('\n');
+        }
+        Some(end)
     }
 
     /// Reads the dollar-quoted string that opens at `at` with a tag of `len`
@@ -817,6 +902,21 @@ impl Lexicon {
             }
         }
         end
+    }
+}
+
+/// The length of the `"…"` at the front of `text`, a doubled quote being a
+/// quote inside the name; `None` where it never closes.
+fn quoted_identifier_len(text: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
     }
 }
 
@@ -1484,6 +1584,7 @@ mod tests {
         string_prefixes: &["n"],
         identifier_continues: pbps_model::module::is_regular_identifier_continue,
         reserved: never_reserved,
+        unicode_identifiers: false,
     };
 
     /// PostgreSQL's, as `pbps-pg` states it.
@@ -1494,6 +1595,7 @@ mod tests {
         string_prefixes: &["u&", "e", "n", "b", "x"],
         identifier_continues: continues_ident,
         reserved: never_reserved,
+        unicode_identifiers: true,
     };
 
     /// The row of ADR-0011 Amendment 2's table that points the other way from
@@ -2081,6 +2183,7 @@ mod code_only_tests {
         string_prefixes: &["u&", "e", "n", "b", "x"],
         identifier_continues: continues_ident,
         reserved: never_reserved,
+        unicode_identifiers: true,
     };
     const MSSQL: Lexicon = Lexicon {
         quoted_identifiers: &[('[', ']'), ('"', '"')],
@@ -2089,6 +2192,7 @@ mod code_only_tests {
         string_prefixes: &["n"],
         identifier_continues: pbps_model::module::is_regular_identifier_continue,
         reserved: never_reserved,
+        unicode_identifiers: false,
     };
 
     /// `text` with each of `regions` replaced by spaces, character for
@@ -2168,6 +2272,39 @@ mod code_only_tests {
         assert_eq!(PG.code_only(text), blanked(text, &["'a]b'"]));
         let bracketed = "SELECT [dbo].[a]]b], 'x'";
         assert_eq!(MSSQL.code_only(bracketed), blanked(bracketed, &["'x'"]));
+    }
+
+    /// Measured: `FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a" UESCAPE '!'`
+    /// select from `dq.z`, so the scan sees the name and not its spelling —
+    /// at the same offsets, the difference padded. A spelling that does not
+    /// decode, and a `u&` that continues a name, are left as they are; and
+    /// SQL Server has no such form.
+    #[test]
+    fn a_unicode_escaped_identifier_is_read_as_the_name_it_spells() {
+        assert_eq!(
+            PG.code_only("SELECT * FROM app.U&\"\\007a\" WHERE 1"),
+            "SELECT * FROM app.\"z\"       WHERE 1"
+        );
+        assert_eq!(
+            PG.code_only("FROM u&\"app\".U&\"!007a\" UESCAPE '!' x"),
+            "FROM \"app\"  .\"z\"                   x"
+        );
+        // A doubled quote inside, and an escape that spells a quote: both
+        // are one quote in the name, spelled doubled again.
+        assert_eq!(PG.code_only("U&\"a\"\"\\0022b\""), "\"a\"\"\"\"b\"     ");
+        // A line break in the span survives, at the end of it.
+        assert_eq!(
+            PG.code_only("U&\"!007a\"\nUESCAPE '!' x"),
+            "\"z\"                 \n x"
+        );
+        // Not a Unicode-escaped identifier: a name that ends in `u&` is an
+        // operator's operand, and a `\` that spells nothing does not decode.
+        assert_eq!(PG.code_only("xu&\"a\""), "xu&\"a\"");
+        assert_eq!(PG.code_only("U&\"\\00G1\""), "U&\"\\00G1\"");
+        assert_eq!(
+            MSSQL.code_only("SELECT * FROM U&\"\\007a\""),
+            "SELECT * FROM U&\"\\007a\""
+        );
     }
 
     /// Measured: `N'x'`, `B'101'`, `X'1F'`, `U&'d\0061ta'` and `E'y'` are

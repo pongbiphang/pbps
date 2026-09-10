@@ -1452,8 +1452,17 @@ fn after_the_mode(parameter: &str) -> (bool, &str) {
         );
     }
     // `name mode type`: the name is read and thrown away, because what is left
-    // is the type either way.
-    let after_name = after_the_gap(&parameter[first..]).0;
+    // is the type either way. A Unicode-escaped name may carry its `UESCAPE
+    // 'x'` after it, and the clause is part of the name: measured,
+    // `CREATE FUNCTION dq.f(U&"n!0061me" UESCAPE '!' OUT integer)` has the
+    // identity `dq.f()`. Read as the mode's position, the clause hid the
+    // `OUT`, the parameter counted, and a correctly keyed routine was refused.
+    let mut after_name = after_the_gap(&parameter[first..]).0;
+    if unicode_quoted(parameter).is_some()
+        && let Some(clause) = uescape_len(after_name)
+    {
+        after_name = after_the_gap(&after_name[clause..]).0;
+    }
     if let Some(second) = one_ident_len(after_name)
         && is_a_mode(&after_name[..second])
     {
@@ -2471,6 +2480,25 @@ mod tests {
             (
                 "app.f(integer)",
                 "/* the id */ (a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A Unicode-escaped name carries its `UESCAPE` clause, and the
+            // mode may follow the clause: measured, these are `app.f()`,
+            // `app.g(integer)`, `app.f(integer)` and `app.g(integer)`.
+            (
+                "app.f()",
+                "(U&\"n!0061me\" UESCAPE '!' OUT integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.g(integer)",
+                "(U&\"n\\0061me\" OUT integer, b int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(U&\"n!0061me\" UESCAPE '!' integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.g(integer)",
+                "(U&\"n!0061me\" UESCAPE '!' INOUT integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
             ),
         ] {
             let found = Postgres::new()

@@ -64,6 +64,7 @@ impl Dialect for Mssql {
             string_prefixes: &["n"],
             identifier_continues: pbps_model::module::is_regular_identifier_continue,
             reserved: ident::is_reserved,
+            unicode_identifiers: false,
         }
     }
 

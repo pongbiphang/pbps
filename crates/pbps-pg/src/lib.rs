@@ -51,6 +51,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     string_prefixes: &["u&", "e", "n", "b", "x"],
     identifier_continues: pbps_dialect::continues_ident,
     reserved: types::is_reserved,
+    unicode_identifiers: true,
 };
 pub mod introspect;
 pub mod modules;
