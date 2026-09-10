@@ -246,7 +246,7 @@ pub fn diff_partial(
     }
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
-    diff_roles(base, declared, &mut changes);
+    diff_roles(base, declared, dialect, &mut changes);
 
     // The ordering and risk pass below runs whether or not there are errors:
     // it is pure computation over the changes already built, and a caller that
@@ -1101,7 +1101,22 @@ fn dependency_rank(
 /// A revoke on an object this same plan drops is not emitted: the drop takes
 /// the permission with it, and a `REVOKE` that ran after it would fail on an
 /// object that is gone (and one ordered before it would be noise).
-fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
+fn diff_roles(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    changes: &mut Vec<Change>,
+) {
+    // Whether the *principal* is this tool's at all (ADR-0010 §3,
+    // DECISIONS 211). A SQL Server database role lives in the one database
+    // this connection is to, so its existence is managed here; a PostgreSQL
+    // role is a cluster object, and a plan that created, renamed or dropped
+    // one would reach every other database in the cluster.
+    //
+    // What a role *holds in this database* is managed either way, so only the
+    // three identity changes are conditional and every `Grant` and `Revoke`
+    // below is built the same on both engines.
+    let manages_roles = dialect.manages_roles();
     let dropped: Vec<pbps_model::Dropped> = changes.iter().filter_map(Change::drops).collect();
     // Base table name -> the name it has after this plan, by uid.
     let renamed: BTreeMap<&TableName, &TableName> = base
@@ -1125,12 +1140,42 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
     };
 
     for (uid, name) in &base.ids.roles {
-        if !declared.ids.roles.contains_key(uid) {
+        if declared.ids.roles.contains_key(uid) {
+            continue;
+        }
+        if manages_roles {
             changes.push(Change::DropRole {
                 uid: uid.clone(),
                 name: name.clone(),
                 // Only a connected plan can know them; see `Change::DropRole`.
                 members: Vec::new(),
+            });
+            continue;
+        }
+        // The role stays; what it was granted **here** does not. Anything
+        // else would be one of the two silent wrong answers: a plan that says
+        // "drop role" and runs nothing leaves a principal still holding every
+        // permission pbps was managing, and a plan that really dropped it
+        // would take the role out of every other database in the cluster.
+        //
+        // The revokes are the same shape as a narrowing of a role that stays,
+        // so the risk classification and the approval gate see them as what
+        // they are: access being taken away.
+        let Some(held) = base.schema.roles.get(name) else {
+            continue;
+        };
+        for (target, permissions) in &held.grants {
+            let target = forward(target);
+            // A `REVOKE` on an object this same plan drops would fail on an
+            // object that is gone — the same rule the per-target comparison
+            // below applies, and for the same reason.
+            if permissions.is_empty() || dropped.iter().any(|d| d.takes(&target)) {
+                continue;
+            }
+            changes.push(Change::Revoke {
+                role: name.clone(),
+                target,
+                permissions: permissions.clone(),
             });
         }
     }
@@ -1140,10 +1185,20 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
             continue;
         };
         let Some(base_name) = base.ids.roles.get(uid) else {
-            changes.push(Change::CreateRole {
-                uid: uid.clone(),
-                name: name.clone(),
-            });
+            // Where the principal is not this tool's, whether the cluster
+            // actually has this role is a question only a connection can
+            // answer, and it is asked there: `pbps_pg::roles::missing_roles`
+            // refuses a declared role the cluster lacks with the `CREATE ROLE`
+            // to run by hand. Emitting a `CreateRole` here instead would
+            // refuse the ordinary case as well — a DBA creating the role and
+            // the project then declaring it, which is the only way a role ever
+            // comes under management on that engine.
+            if manages_roles {
+                changes.push(Change::CreateRole {
+                    uid: uid.clone(),
+                    name: name.clone(),
+                });
+            }
             for (target, permissions) in &role.grants {
                 if !permissions.is_empty() {
                     changes.push(Change::Grant {
@@ -1155,7 +1210,22 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
             }
             continue;
         };
-        if base_name != name {
+        // A rename, where the principal is the cluster's, is a rename a human
+        // performed there — and on this engine an ACL entry holds the role's
+        // oid rather than its name, so every grant followed it and nothing has
+        // to be re-granted.
+        //
+        // **This elision is sound only behind the connected check**
+        // (`pbps_pg::roles::rename_evidence`), and the check is not "does the
+        // new name exist". If the *old* name is still there as well, the two
+        // are two principals: emitting nothing would leave the old one holding
+        // everything pbps was managing while the declared one holds nothing,
+        // and the plan would then record the declared one as holding it all.
+        // The evidence that makes the rename a rename is the old name's
+        // **absence**; and if the old role was dropped and a new one created
+        // instead, its grants went with it, the pull shows the new role
+        // holding nothing, and every declared grant is planned here anyway.
+        if base_name != name && manages_roles {
             changes.push(Change::RenameRole {
                 uid: uid.clone(),
                 from: base_name.clone(),
@@ -4294,6 +4364,181 @@ mod tests {
             .iter()
             .map(|p| crate::schema_diff::tests::roles::describe(&p.change))
             .collect()
+        }
+
+        /// A dialect whose roles are the *cluster's*, not the database's —
+        /// PostgreSQL's answer (ADR-0010 §3, DECISIONS 211). Everything else
+        /// is `MinimalDialect`'s, so what a test using it shows is exactly the
+        /// difference this one capability makes.
+        #[derive(Debug, Clone, Copy, Default)]
+        struct ClusterRoles;
+
+        impl pbps_dialect::Dialect for ClusterRoles {
+            fn name(&self) -> &'static str {
+                "cluster-roles"
+            }
+            fn manages_roles(&self) -> bool {
+                false
+            }
+            fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+                MinimalDialect.quote_ident(ident)
+            }
+            fn emit(
+                &self,
+                change: &Change,
+                strategy: pbps_model::Strategy,
+            ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+                MinimalDialect.emit(change, strategy)
+            }
+            fn normalize_type(
+                &self,
+                ty: &pbps_model::ColumnType,
+            ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+                MinimalDialect.normalize_type(ty)
+            }
+            fn type_change_risk(
+                &self,
+                from: &pbps_model::ColumnType,
+                to: &pbps_model::ColumnType,
+            ) -> pbps_dialect::TypeChangeRisk {
+                MinimalDialect.type_change_risk(from, to)
+            }
+            fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+                MinimalDialect.fold_ident(ident)
+            }
+            fn lexicon(&self) -> pbps_dialect::Lexicon {
+                MinimalDialect.lexicon()
+            }
+            fn validate_table(
+                &self,
+                name: &pbps_model::TableName,
+                table: &Table,
+            ) -> Vec<pbps_dialect::DialectError> {
+                MinimalDialect.validate_table(name, table)
+            }
+            fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+                MinimalDialect.transaction_framing()
+            }
+        }
+
+        fn kinds_on(
+            dialect: &dyn pbps_dialect::Dialect,
+            base: &(Schema, IdsFile),
+            declared: &(Schema, IdsFile),
+        ) -> Vec<String> {
+            diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                dialect,
+                &Hints::default(),
+            )
+            .unwrap()
+            .changes
+            .iter()
+            .map(|p| describe(&p.change))
+            .collect()
+        }
+
+        /// The grants are managed either way; the *principal* is not. A plan
+        /// that carried a `CreateRole` here would refuse the only way a role
+        /// ever comes under management on such an engine — a DBA creates it in
+        /// the cluster and the project then declares it.
+        #[test]
+        fn a_declared_role_is_granted_without_being_created_where_the_cluster_owns_it() {
+            let base = side(&[]);
+            let declared = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            assert_eq!(
+                kinds_on(&ClusterRoles, &base, &declared),
+                ["grant app_reader dbo.customer select"]
+            );
+            // The same declaration on an engine that owns its roles creates
+            // it, which is what says this test is about the capability and not
+            // about the fixture.
+            assert_eq!(
+                kinds_on(&MinimalDialect, &base, &declared),
+                ["create app_reader", "grant app_reader dbo.customer select"]
+            );
+        }
+
+        /// `drop-role` revokes and unmanages. A plan that said "drop role" and
+        /// ran nothing would leave a principal still holding every permission
+        /// pbps was managing; one that really dropped it would reach every
+        /// other database in the cluster.
+        #[test]
+        fn a_dropped_role_has_its_grants_revoked_and_the_principal_left_standing() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[
+                    ("dbo.customer", &[Permission::Select, Permission::Insert]),
+                    ("schema::dbo", &[Permission::Usage]),
+                ]),
+            )]);
+            let declared = side(&[]);
+            assert_eq!(
+                kinds_on(&ClusterRoles, &base, &declared),
+                [
+                    "revoke app_reader dbo.customer select+insert",
+                    "revoke app_reader schema::dbo usage",
+                ]
+            );
+            assert_eq!(
+                kinds_on(&MinimalDialect, &base, &declared),
+                ["drop app_reader"]
+            );
+        }
+
+        /// A revoke on an object the same plan drops would fail on an object
+        /// that is gone — the rule the per-target comparison already applies,
+        /// on the path that does not go through it.
+        #[test]
+        fn a_dropped_roles_grant_on_a_dropped_object_is_not_revoked() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            let mut declared = side(&[]);
+            declared.0.tables.clear();
+            declared.1.tables.clear();
+            declared.1.columns.clear();
+            let k = kinds_on(&ClusterRoles, &base, &declared);
+            assert!(
+                !k.iter().any(|c| c.starts_with("revoke")),
+                "the DROP TABLE takes the permission with it: {k:?}"
+            );
+        }
+
+        /// A rename is a rename a human performed in the cluster, and an ACL
+        /// entry holds the role's oid rather than its name — so every grant
+        /// followed it, and the plan has nothing to re-grant.
+        #[test]
+        fn a_renamed_role_is_not_renamed_again_where_the_cluster_owns_the_principal() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "old_name",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            let declared = side(&[(
+                "r_aaaaaa",
+                "new_name",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            assert!(kinds_on(&ClusterRoles, &base, &declared).is_empty());
+            assert_eq!(
+                kinds_on(&MinimalDialect, &base, &declared),
+                ["rename old_name->new_name"]
+            );
         }
 
         fn describe(c: &Change) -> String {

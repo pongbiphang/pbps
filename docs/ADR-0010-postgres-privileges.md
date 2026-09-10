@@ -465,3 +465,62 @@ most expensive thing in this project to change late (SPEC §12).
   `true` and the CLI's role-existence paths are unchanged; the reading — refuse
   a missing role with the `CREATE ROLE` to run, make `drop-role` revoke and
   stop — lands with the dialect that first answers `false`.
+
+## Amendment — what landing §1, §2, §4, §5 and §7 changed
+
+The PostgreSQL half is built (issue #81). Everything above reproduced when it
+was re-measured against 18.6, and three things were sharper than this document
+had them.
+
+- **The zero point is wider than `PUBLIC`** (DECISIONS 371). §5 argued that the
+  engine's default must not be routed down the unexpressible path, because
+  every function pbps creates arrives with `EXECUTE` to `PUBLIC` and the next
+  plan would refuse. The same argument settles the **owner**, whom §5 does not
+  name: every table pbps creates arrives owned by the deploying account with
+  the owner's whole set, so comparing that set would have the plan after a
+  successful apply revoke what the apply produced. The reader therefore expands
+  a NULL ACL with the engine's own `acldefault` and then draws the line at who
+  put an entry there — `acldefault`'s and the owner's are the zero point,
+  `PUBLIC`'s is context, and the rest is a grant.
+- **`manages_roles` has its reader** (DECISIONS 370), and the reading is in the
+  **differ**, not only in the CLI. On a dialect that answers `false` no
+  `CreateRole`, `DropRole` or `RenameRole` is built at all: a declared role is
+  granted rather than created, because refusing it would refuse the only way a
+  role ever comes under management here; a dropped role has its grants revoked
+  and is left standing; a rename emits nothing, because an ACL entry holds the
+  role's oid and every grant followed it. That last elision has a precondition
+  §3 does not state and DECISIONS 377 does: the evidence of a rename is the
+  **old** name's absence, not the new name's presence. With both names in the
+  cluster they are two principals, and an empty plan would leave the old one
+  holding everything and record the new one as holding it. The emitter keeps all five arms, and
+  the three it refuses name the statement a human runs.
+- **A name may be in two namespaces at once** (DECISIONS 379). §6's
+  permission-vs-kind table is what makes a bare object target sound — a set
+  with `execute` in it is a routine's — and landing it showed the other half:
+  relations and routines are separate catalogs here, so `co.f` may be a table
+  *and* a function, measured on 18.6. The offline check reads the namespace off
+  the permission set exactly as the emitter does; reading the relation first
+  refused a `GRANT EXECUTE` the engine runs.
+- **A routine grant has one spelling here, and it is the signature**
+  (DECISIONS 381). The bare name the engine accepts where nothing overloads is
+  not a spelling the catalog can give back — `pg_proc` holds the arguments and
+  nothing remembers the statement — so a declaration using it would differ from
+  the database on every plan. Refused offline, the mirror of the signature
+  refusal on the engine where nothing overloads.
+- **§1 has one exception, and it is the schema everything lands in by
+  default** (DECISIONS 383). `initdb` grants `USAGE` on `public` to PUBLIC in
+  every database, measured — and PUBLIC is not a role a project can declare
+  (§5), so no `schema::public: [usage]` line could appear in a pull. Requiring
+  one refused every project whose tables live where PostgreSQL puts them.
+- **`maintain` needs two servers to test at all** (DECISIONS 374). The
+  amendment above set the rule and this is what obeying it costs: the live
+  suite and the `live-pg` CI job now start a pinned PostgreSQL 16 beside the
+  pinned 18, because "refuses the word" and "takes the word" are two different
+  servers.
+
+**The gap §5 named is still open.** Expressing "revoked from `PUBLIC`" needs a
+grantee the model does not have. The pull now *reports* both halves — the
+routines `PUBLIC` can execute and the routines it no longer can, the second
+being the absence of a row rather than a row — so the state is visible; it is
+still not declarable, and ADR-0009 §3's rebuild refusal is still what stops a
+module edit from undoing it.

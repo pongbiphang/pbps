@@ -116,11 +116,27 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
             // way the question is whether pbps manages the thing named, and a
             // module's name in that namespace is its identity's
             // (ADR-0009 §1).
+            //
+            // **In that namespace**, and an id carrying a signature is not in
+            // this one. A signature is an identity only where the engine
+            // overloads, and an engine that overloads cannot be keeping those
+            // objects where a relation's name is unique — so on PostgreSQL a
+            // table `app.f` and a routine `app.f(integer)` are two objects,
+            // measured, and a managed routine does not make a grant on an
+            // unmanaged table this project's business. Kept anyway, the differ
+            // built a `REVOKE ... ON TABLE app.f` against an object outside the
+            // ids file, which is the very thing this cut exists to prevent.
+            //
+            // On SQL Server every kind shares `sys.objects`, a routine grant
+            // arrives as `Object(dbo.f)`, and its ids are `Named` — a declared
+            // signature is refused there (`check_module_names`) — so nothing
+            // is filtered out (DECISIONS 384).
             pbps_model::GrantTarget::Object(o) => {
                 managed.contains(o)
-                    || managed_modules
-                        .iter()
-                        .any(|id| id.referenced_name().as_ref() == Some(o))
+                    || managed_modules.iter().any(|id| {
+                        !matches!(id, ModuleId::Routine(_))
+                            && id.referenced_name().as_ref() == Some(o)
+                    })
             }
             pbps_model::GrantTarget::Routine(r) => managed_modules
                 .iter()
@@ -522,6 +538,44 @@ mod tests {
             .collect();
         assert_eq!(kept, ["dbo.customer", "schema::app"]);
         assert!(!scoped.schema.roles.contains_key("someone_elses"));
+    }
+
+    /// A managed routine does not make a grant on a table of its name this
+    /// project's business.
+    ///
+    /// The two are one object on SQL Server and two on PostgreSQL — measured,
+    /// a table `app.f` and a function `app.f(integer)` coexist there — and an
+    /// id carrying a signature is only an identity on the engine that keeps
+    /// them apart. Kept, the differ built a `REVOKE ... ON TABLE app.f`
+    /// against an object outside the ids file.
+    #[test]
+    fn a_managed_routine_does_not_put_a_table_of_its_name_in_scope() {
+        let mut live = schema(&["app.f"]);
+        let mut reader = pbps_model::Role::default();
+        for target in ["app.f", "app.f(integer)"] {
+            reader.grants.insert(
+                target.parse().unwrap(),
+                [pbps_model::Permission::Select].into_iter().collect(),
+            );
+        }
+        live.roles.insert("app_reader".into(), reader);
+        let mut recorded = IdsFile::default();
+        recorded
+            .roles
+            .insert("r_aaaaaa".parse().unwrap(), "app_reader".into());
+        let managed = BTreeSet::from(["app.f(integer)".parse::<ModuleId>().unwrap()]);
+
+        let scoped = scope(&live, &recorded, &managed);
+        let kept: Vec<String> = scoped.schema.roles["app_reader"]
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            kept,
+            ["app.f(integer)"],
+            "the routine is managed; the table of that name is nobody's business here"
+        );
     }
 
     #[test]

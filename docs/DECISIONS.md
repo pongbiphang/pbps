@@ -7956,3 +7956,324 @@ SPEC is in sync with all of these.
     decode_unicode_escapes`), its `UESCAPE` clause honoured by the rule the
     emitter reads one by; an escape that does not decode, or a clause
     spelled wrong, is no type, and is left to the engine to refuse by name.
+
+370. **PostgreSQL answers `manages_roles` with `false`, and the differ builds
+    no `CreateRole`, `DropRole` or `RenameRole` on such a dialect.** ADR-0010
+    §3 and DECISIONS 211 said the answer; this is the reading of it, which
+    211 deferred to "the dialect that first answers `false`".
+
+    The three identity changes are conditional and every `Grant` and `Revoke`
+    is not: what a role holds in *this* database is the tool's business either
+    way, and only the principal is the cluster's.
+
+    - **A declared role with no base entry is granted, not created.** Emitting
+      a `CreateRole` and refusing it would refuse the only way a role ever
+      comes under management on this engine — a DBA creates it in the cluster
+      and the project then declares it. Whether the cluster actually has it is
+      a connected question, asked by `pbps_pg::roles::missing_roles` and
+      answered with the `CREATE ROLE` to run by hand.
+    - **A dropped role has its declared grants revoked and is left standing.**
+      A plan that said "drop role" and ran nothing would leave a principal
+      holding every permission pbps was managing; one that really dropped it
+      would reach every other database in the cluster. The revokes skip a
+      target this same plan drops, the rule the per-target comparison already
+      applies.
+    - **A rename emits nothing.** On this engine an ACL entry holds the role's
+      oid, not its name, so a rename performed in the cluster carried every
+      grant with it and there is nothing to re-grant. The grant comparison
+      then runs against the new name, which is right because the two names are
+      one principal.
+
+    The emitter keeps all five arms: `Grant` and `Revoke` render SQL, and the
+    other three refuse with the exact statement a human runs — the second lock,
+    for a plan that arrived some other way (measured refusal texts in
+    ADR-0010 §3, §4).
+
+371. **The engine's default ACL is the zero point: expanded, reported, and
+    never compared as a grant.** ADR-0010 §5 measured this for `PUBLIC` and
+    refused to route it down the unexpressible path, because every function
+    pbps creates arrives with `EXECUTE` to `PUBLIC` and the very next
+    `plan --db` would have refused. The same argument settles the **owner**,
+    whom that section does not name: every table pbps creates arrives owned by
+    the deploying account with the owner's whole set, so comparing that set
+    would have the plan after a successful apply revoke what the apply had
+    just produced.
+
+    So the read expands a NULL ACL with the engine's own
+    `acldefault(kind, owner)` — never a table of defaults written into this
+    crate, which would have been wrong on one of the two servers the suite now
+    runs: measured, the owner's default relation ACL is `arwdDxt` on 16.15 and
+    `arwdDxtm` on 18.6 — and then draws the line at *who put the entry there*.
+    An entry out of `acldefault`, and an entry whose grantee is the object's
+    owner, are the zero point; `PUBLIC` is context (§5); everything else is a
+    grant, compared for a managed role.
+
+    Nothing is dropped. A revocation on this engine is the **absence** of an
+    entry rather than a row — measured, `REVOKE EXECUTE … FROM PUBLIC` leaves
+    `{postgres=X/postgres}` — so the pull reports both halves as context: the
+    routines `PUBLIC` can execute, and the routines it can no longer execute,
+    which is the one act that leaves no trace to list.
+
+372. **`GRANT … ON ROUTINE` is the only word that covers what this model calls
+    a routine, and which word a bare object target takes is read off the
+    permissions.** Measured on 18.6: `GRANT EXECUTE ON FUNCTION gr.p(integer)`
+    on a *procedure* is `gr.p(integer) is not a function`, while `ON ROUTINE`
+    takes a function and a procedure alike; `ON TABLE` takes a table and a
+    view.
+
+    `Change::Grant` carries no schema, so the emitter cannot look the target's
+    kind up. It reads the permission set instead — a set containing `execute`
+    is a routine's, one without is a table's — and `validate_role` is what
+    makes that sound: measured word by word against kind, no kind on this
+    engine takes `EXECUTE` and any of the table words, so a declaration that
+    mixed them is refused before a plan exists.
+
+373. **A grant's routine signature is spelled with `unnest(proargtypes)`, not
+    with `pg_get_function_identity_arguments`.** The obvious call is the wrong
+    one: measured, it renders a procedure's argument as `IN integer`, mode and
+    all, while the module pull renders the same routine's identity as
+    `integer`. The managed-set filter compares a `GrantTarget::Routine`
+    against a `ModuleId::Routine`, so two spellings of one signature would
+    have every grant on a procedure read as a grant on an object the
+    declarations do not have — and be revoked by the next plan.
+
+374. **`maintain` is gated on the connected server, and the live suite
+    therefore runs two PostgreSQLs.** ADR-0010's amendment set the rule: the
+    model holds no server version, so `validate_role` cannot ask. The reading
+    is `pbps_pg::roles::unsupported_permissions`, called on the connected path
+    the way `plan --db` gates on SQL Server's edition.
+
+    "This engine refuses the word" and "this engine takes it" are two
+    different servers, and no single one can show both, so
+    `scripts/live-tests-pg.sh` and the `live-pg` CI job start a pinned
+    PostgreSQL 16 beside the pinned 18. Measured on it: `server_version_num`
+    160015, `GRANT MAINTAIN ON t TO r` is `unrecognized privilege type
+    "maintain"` (SQLSTATE 42601, the parser stopping at the word), and the
+    owner's default relation ACL has no `m`. A bump of that pin must stay
+    below 17, or the test asserting the refusal passes for no reason.
+
+375. **A live permission test that runs as a superuser measures nothing.** The
+    SQL Server suite learned it with `sa`, which holds `CONTROL` and
+    short-circuits the whole permission list — how three permission bugs
+    survived that suite's first run. On PostgreSQL it is worse: a superuser
+    does not consult an ACL at all. So every test in the roles section of
+    `pbps-pg/tests/live.rs` acts through a `LOGIN` role created for it, and
+    the pull is exercised as that role too — a read that needs a superuser is
+    a read that fails in the one environment that matters. `pg_roles` rather
+    than `pg_authid` for the same reason: the second holds the password hashes
+    and is superuser-only.
+
+    Those tests assert on the **SQLSTATE**, not on the message.
+    `tokio_postgres::Error` renders as `db error` and keeps the server's text
+    in a source the seam deliberately does not carry (ADR-0014 §1), so a test
+    matching on prose would pass on any failure at all — including the wrong
+    one.
+
+376. **Every catalog that holds an `aclitem[]` is read, and the two kind
+    alphabets are kept apart by construction.** Two holes, one shape, both
+    found by sweeping the read this step had just written.
+
+    The relation arm filtered `relkind IN ('r','v','S')` — the kinds the model
+    declares. Measured, `GRANT SELECT` on a **materialized view** and on a
+    **partitioned table** both land in `relacl`, so the filter reported a role
+    as holding nothing on either: *absent* reading as *empty*, which is the
+    member of that set that reads as good news. The filter is now "not an index
+    and not a TOAST table" — the two that take no `GRANT` at all — and every
+    other kind is read and reported.
+
+    Widening it exposed the second hole. `pg_class.relkind` and
+    `pg_proc.prokind` overlap: `f` is a foreign table in one alphabet and a
+    function in the other, `p` a partitioned table and a procedure. Carried as
+    one `char`, a grant on a foreign table would have been read back as a grant
+    on a *function* of that name — a target the declarations may well have, and
+    therefore one the next plan would compare and revoke. `RawGrant::kind` is a
+    `GrantedKind` naming the catalog as well as the letter, so the two cannot
+    be read as one.
+
+    And the object catalogs are not the only ones. Enumerated from the engine
+    rather than from memory — the rule `crate::modules::ATTACHED_BY_ADDRESS`
+    already earned here — PostgreSQL 18 has **fourteen** `aclitem[]` columns in
+    `pg_catalog`. Three carry a target a declaration can name; eight more carry
+    a real grant on a target it cannot (a type, a language, a foreign server, a
+    configuration parameter, a large object, this database, a column), and each
+    is reported per role, class and permission rather than dropped: a role that
+    gained `USAGE ON LANGUAGE c` out of band has changed, and a reader that
+    never looked would compare the grants it did see and call it clean
+    (DECISIONS 105). Three are deliberately not read as grants and say why —
+    `pg_default_acl` is a standing instruction rather than a grant,
+    `pg_init_privs` records what an extension's objects had at *install*, and
+    `pg_tablespace` is a cluster object whose question is `pg_shdepend`'s. A
+    live test runs the enumerating query and compares it with that list, so a
+    fifteenth column in a later release fails there instead of going unnoticed.
+
+377. **A rename is elided only where the *old* name is gone from the cluster.**
+    370 has the differ build no `RenameRole` on a dialect that does not own the
+    principal, on the ground that an ACL entry holds the role's oid and every
+    grant followed the rename. That is true of a rename; it is not true of a
+    name.
+
+    If both names exist, `to` is a different principal. The plan then emits
+    nothing — the two grant sets compare equal — while `from` goes on holding
+    everything pbps was managing and `to` holds none of it, and the apply
+    records `to` as holding it all. A wrong recording with a single deployer,
+    which is the shape the finding rules always fix.
+
+    So the elision has a precondition, and it is not "the new name exists":
+    `pbps_pg::roles::rename_evidence` reads all four states and only
+    `Done` — old gone, new present — lets the rename pass. `BothPresent`,
+    `NotRunYet` and `NeitherPresent` each refuse with the
+    `ALTER ROLE … RENAME TO …` to run.
+
+    The remaining ambiguity is stated rather than hidden: `Done` cannot tell a
+    rename from a drop-and-create. It does not have to. If the old role was
+    dropped, its grants went with it, the pull shows the new role holding
+    nothing, and every declared grant is planned here anyway — so the plan is
+    right either way. Proving identity outright needs the role's oid in the
+    recorded state, which is a format change and not this step's.
+
+378. **A routine's arguments travel as rows, never as a rendered signature.**
+    A signature aggregated into one string has to be split again to be used,
+    and the separator is not a separator. **Measured**: a type named
+    `amount,type` renders as `cm."amount,type"`, so
+    `pg_get_function_identity_arguments` and any `string_agg` of `format_type`
+    both hand back a comma that belongs *inside* an argument.
+
+    Split on it, every fragment failed `RoutineArg`, and a valid grant on a
+    managed routine became targetless unexpressible state — which refuses the
+    connected plan, so a legal declaration could not be applied at all. The
+    grants query therefore returns the `pg_proc` oid and the arguments come
+    from their own query, one row per argument in order, the shape
+    `module_args_query` already uses. Nothing re-parses one string into a list,
+    which is what makes the whole class unrepresentable rather than handled.
+
+379. **On PostgreSQL a bare grant target is read in the namespace its
+    permissions name, not in the relations first.** Relations and routines are
+    two catalogs on this engine and one name may be in both: **measured on
+    18.6**, a table `co.f` and a function `co.f(integer)` coexist, `GRANT
+    SELECT ON TABLE co.f` lands in `pg_class.relacl` and `GRANT EXECUTE ON
+    ROUTINE co.f` lands in `pg_proc.proacl`.
+
+    `emit::securable` already read the class off the permission set — a set
+    with `execute` in it is a routine's — and `validate::target_kind` answered
+    "a table" whenever a table of that name existed. The two disagreed exactly
+    where the engine allows both, and the offline check refused a grant the
+    engine runs. They now read the same fact the same way; a mixed set is
+    still refused, because the kind check follows the namespace the
+    permissions chose (372).
+
+380. **A grant is folded into a role only when the pull recorded the object it
+    is on, and only when the target survives being written out.** The assembly
+    before `add_roles` leaves objects out — a `bit(3)` column is a spelling
+    read back as a different type (issue #130), a routine argument may be one
+    `RoutineArg` cannot hold — and their ACL rows arrive all the same.
+    Recorded, the role names a target the project does not declare and
+    `pbps_model::role::check` refuses the very schema `pull` just wrote.
+
+    The second half is 205's shape on this engine: `app."sales(archive)"` is a
+    legal table name this dialect writes back unchanged, and its grant target
+    parses back as the routine `app.sales(archive)` — a different object. Both
+    are reported as unexpressible with the structured target kept, so the
+    managed-set cut still applies to them; dropped instead, `pull` would write
+    a role narrower than the database holds and the next plan would revoke what
+    nobody removed (105).
+
+381. **One spelling per engine for a routine grant, and it is the one the
+    catalog gives back.** On PostgreSQL that is the signature, whatever the
+    statement used: measured, `GRANT EXECUTE ON ROUTINE app.solo` runs where
+    the name is not overloaded, and the pull reads it back out of `pg_proc` as
+    `app.solo(integer)` — nothing remembers which spelling was granted. A
+    declaration spelling it `app.solo` therefore differs from the database on
+    every comparison, and `diff_roles` compares targets by key: each plan
+    revokes the signature and grants the bare name again, for ever, and no
+    apply converges.
+
+    So `validate::role` refuses a bare `Object` target that names a routine —
+    not only the overloaded one 372 refuses for the engine's own `routine name
+    "app.f" is not unique` — with the signature to write instead. It is the
+    mirror of the refusal on the other engine, where nothing overloads and a
+    signature is the spelling *its* catalog cannot produce
+    (`pbps_mssql::validate::role`). Normalizing the two spellings instead would
+    have had to be repeated at every comparison site — the differ, the
+    post-apply verification, the managed-set cut — and a fold nobody repeats is
+    the drift that returns.
+
+    Which namespace the bare name is in is still 379's question: `select` on a
+    name that is a table and a routine is the table's and is accepted, and only
+    a set that chose the routine namespace reaches the refusal.
+
+382. **The pull's own existence check reads the target's namespace too.** 380
+    accepted any module answering to an `Object` target's name, and a routine
+    is not a relation here (379). A hidden table `app.f` beside a surviving
+    routine `app.f(integer)` therefore had its `SELECT` folded into the role
+    against the routine — and `validate::role` reads that bare relation name in
+    the relation namespace, finds nothing, and refuses the schema `pull` had
+    just written. An `Object` comes from a relation row and nothing else, so it
+    is answered for by a recorded table or view alone.
+
+383. **The `public` schema is reachable without a grant on it, so §1 does not
+    apply there.** `initdb` grants `USAGE` on `public` to PUBLIC in every
+    database it makes: measured on 18.6, its `nspacl` is
+    `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}` — the
+    second entry is PUBLIC's, and it is not `acldefault`'s doing
+    (`acldefault('n', ...)` is `{owner=UC/owner}` alone). A role holding only
+    `SELECT` on `public.pubt` reads it, measured.
+
+    PUBLIC is not a role a project can declare (ADR-0010 §5), so no
+    `schema::public: [usage]` line could appear in a pull — and requiring one
+    refused every project whose tables live where PostgreSQL puts them,
+    including the one `pull` writes from such a database. A DBA who revokes
+    that `USAGE` makes the check silent where it would have had something to
+    say; that limit is already the check's, because `USAGE` also arrives
+    through a membership, which is never declared, compared or touched
+    (ADR-0005). What it catches is the ordinary mistake — a project's own
+    schema with no `usage` line.
+
+384. **The managed-set cut reads a grant target's namespace too.** `scope`
+    kept a grant on `Object(app.f)` because *some* managed module answered to
+    the name `app.f`, and on this engine a routine `app.f(integer)` is not the
+    table `app.f` (379). A project managing the routine therefore had a grant
+    on an unmanaged table compared, and the differ built a `REVOKE ... ON TABLE
+    app.f` against an object outside the ids file — the one thing this cut
+    exists to prevent.
+
+    The filter is the id's own shape and needs no dialect: an id carrying a
+    signature is a routine on an engine that overloads, and an engine that
+    overloads cannot be keeping those objects where a relation's name is
+    unique. On SQL Server every kind shares `sys.objects`, a routine grant
+    arrives as `Object(dbo.f)`, and its ids are `Named` — a declared signature
+    is refused there — so nothing is filtered out. `unexpressible_permissions`
+    asks the same question of the limitation beside the grant and gets the same
+    answer (176).
+
+385. **A schema the pull does not read is a schema a declaration may not
+    name.** The rule was already there for a table and a module — a table
+    declared in `information_schema` is created and then invisible — and a
+    grant target reaches the same schemas by a shorter road, because
+    `schema::x` names one directly and nothing else has to exist. Measured,
+    `GRANT USAGE ON SCHEMA information_schema TO r` runs; the pull skips the
+    schema, so the grant reads back as absent, the apply's own read-back
+    refuses it for not having achieved its postcondition, and every plan after
+    it proposes the same `GRANT` again.
+
+    The three copies of the filter — the table check, the module check and now
+    the grant check — became one function beside the SQL it mirrors
+    (`catalog::a_projects_schema`), and the live test
+    `the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name`
+    reads every schema the cluster has and requires the reader's answer and the
+    validator's to agree about each. A list written in this repo would be the
+    thing that drifts.
+
+386. **The ledger is hidden by name *and* by kind.** SPEC §8.1 names two
+    **tables**, and `modules_query` already reads that way: a view is kept
+    whatever it is called, and only an ordinary table is filtered by name. The
+    grants query applied the name filter to every `pg_class` row, so a project
+    declaring a view `app.__pbps_state` had it pulled as a module while its
+    `relacl` row was thrown away — the grant on it read back as absent, the
+    apply's own read-back refused the plan for not having achieved its
+    postcondition, and every plan after it proposed the same `GRANT` again.
+
+    The filter is `relkind = 'r'` first and the two names second, so nothing
+    but the tool's own kind of object can be hidden by carrying one of its
+    names. `validate_table` refuses a declared *table* of either name
+    (DECISIONS 274), which is why the table half needs no second thought and
+    the view half needed this one.

@@ -5,8 +5,8 @@
 # suites answer questions about two engines, and a developer changing one
 # dialect should not have to start the other engine to run its tests.
 #
-# The container is left running afterwards so re-runs are instant; remove it
-# with: docker rm -f pbps-test-pg
+# The containers are left running afterwards so re-runs are instant; remove them
+# with: docker rm -f pbps-test-pg pbps-test-pg16
 set -euo pipefail
 
 NAME=pbps-test-pg
@@ -26,24 +26,47 @@ DB=pbps_test
 # this digest.
 IMAGE=postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
-    docker run -d --name "$NAME" \
-        -e "POSTGRES_PASSWORD=$PASSWORD" -e "POSTGRES_DB=$DB" \
-        -p "$PORT:5432" "$IMAGE" >/dev/null
-fi
+# A second server, older than PostgreSQL 17, and it earns its cost: the
+# `maintain` permission arrived in 17, so "this engine refuses the word" and
+# "this engine takes it" are two different servers and no single one can show
+# both (ADR-0010 §6, amendment). Measured on this digest: PostgreSQL 16.15
+# (Debian 16.15-1.pgdg13+2), `server_version_num` 160015, where
+# `GRANT MAINTAIN ON t TO r` is `unrecognized privilege type "maintain"` and
+# the owner's default relation ACL is `arwdDxt` — no `m`.
+#
+# Bump it only to another release **below 17**; a bump past that would make the
+# test that asserts the refusal pass for no reason.
+OLD_NAME=pbps-test-pg16
+OLD_PORT=${PBPS_TEST_PG_OLD_PORT:-54321}
+OLD_IMAGE=postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8
+
+start() {
+    local name=$1 port=$2 image=$3
+    if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        docker run -d --name "$name" \
+            -e "POSTGRES_PASSWORD=$PASSWORD" -e "POSTGRES_DB=$DB" \
+            -p "$port:5432" "$image" >/dev/null
+    fi
+}
+
+start "$NAME" "$PORT" "$IMAGE"
+start "$OLD_NAME" "$OLD_PORT" "$OLD_IMAGE"
 
 echo "waiting for PostgreSQL..."
-for _ in $(seq 1 60); do
-    if docker exec "$NAME" pg_isready -U postgres -d "$DB" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 2
+for name in "$NAME" "$OLD_NAME"; do
+    for _ in $(seq 1 60); do
+        if docker exec "$name" pg_isready -U postgres -d "$DB" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 2
+    done
 done
 
 # A libpq keyword string rather than a URL: both are accepted, and this one
 # does not need the password percent-encoded.
 export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWORD dbname=$DB"
+export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password=$PASSWORD dbname=$DB"
 
 # One of these tests waits out `pbps_db::CONNECT_TIMEOUT` on purpose — a
 # firewall that drops rather than refuses is a category of its own, and thirty

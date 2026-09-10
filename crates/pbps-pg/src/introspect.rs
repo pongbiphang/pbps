@@ -264,6 +264,193 @@ pub struct RawCatalog {
     pub indexes: Vec<RawIndex>,
     pub modules: Vec<RawModule>,
     pub module_args: Vec<RawModuleArg>,
+    pub roles: Vec<RawRole>,
+    pub grants: Vec<RawGrant>,
+    /// One row per argument of every routine a grant can name, in order — the
+    /// same shape as [`RawCatalog::module_args`], and a wider set: a grant may
+    /// be on a routine the module pull leaves out.
+    pub routine_args: Vec<RawModuleArg>,
+    pub default_acls: Vec<RawDefaultAcl>,
+    pub other_grants: Vec<RawOtherGrant>,
+    pub held_elsewhere: Vec<RawSharedDependency>,
+}
+
+/// A role held by something **outside this database** (ADR-0010 §4).
+///
+/// The rows of `pg_shdepend` whose `dbid` is not this database's — and the
+/// reason a `DROP ROLE` refusal cannot be answered from one database's view.
+/// **Measured**: with every grant this database holds revoked, the engine
+/// still says `role "gr_reader" cannot be dropped because some objects depend
+/// on it` / `DETAIL: 1 object in database otherdb`.
+///
+/// The objects cannot be named from here — their oids belong to that
+/// database's catalog — so what is carried is the database and a count. That
+/// is exactly as far as one connection can see, and reporting "nothing is
+/// stopping it" instead would be the answer that reads as good news.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawSharedDependency {
+    pub role: String,
+    /// `None` is a dependency on a shared object — a database, a tablespace —
+    /// which belongs to no one database.
+    pub database: Option<String>,
+    /// `pg_shdepend.deptype`: `o` owns, `a` is granted, `r` is named by a
+    /// policy.
+    pub deptype: char,
+    pub objects: i64,
+}
+
+/// One principal that could hold a grant here (ADR-0005).
+///
+/// The cluster's own `pg_*` roles are left out by the query: the engine
+/// refuses `CREATE ROLE` on such a name (measured, `role name "pg_thing" is
+/// reserved`), `validate_role` refuses declaring one, and what they are
+/// granted is the cluster's business rather than this database's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawRole {
+    pub name: String,
+    /// A superuser passes every privilege check without consulting an ACL, so
+    /// what such a role is *granted* does not decide what it can do. Carried
+    /// rather than filtered out, because a role silently missing from a pull
+    /// is the failure this project is built to avoid.
+    pub superuser: bool,
+}
+
+/// One `(grantee, permission)` pair, already expanded out of an `aclitem` by
+/// the engine's own `aclexplode`.
+///
+/// One flat row per pair, rather than an ACL string per object, because the
+/// `aclitem` text form is the engine's and parsing it here would be a second,
+/// worse copy of `aclexplode` — the letters are positional, `m` arrived in
+/// PostgreSQL 17, and a letter this code did not know would read as no
+/// permission at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawGrant {
+    /// `None` is PUBLIC — grantee oid `0`, which `regrole` renders as `-`.
+    /// Never a role: PUBLIC is every principal in the cluster, so what it
+    /// holds is reported as context and never compared (ADR-0010 §5).
+    pub grantee: Option<String>,
+    pub schema: String,
+    /// `None` when the target is the schema itself.
+    pub object: Option<String>,
+    /// The `pg_proc` oid, where the object is a routine — and **not** its
+    /// rendered signature.
+    ///
+    /// A signature aggregated into one string has to be split again to be
+    /// used, and a comma is not a separator: measured, a type named
+    /// `amount,type` renders as `cm."amount,type"`, so
+    /// `pg_get_function_identity_arguments` and any `string_agg` of
+    /// `format_type` both hand back a comma that belongs *inside* an argument.
+    /// Split on it, each fragment failed to parse and a valid grant on a
+    /// managed routine became targetless unexpressible state — which refuses
+    /// the connected plan. The arguments therefore travel as rows
+    /// ([`RawCatalog::routine_args`]), the way the module pull already carries
+    /// them, and are never re-parsed out of one string.
+    pub routine_oid: Option<i64>,
+    /// Which catalog the row came from, and that catalog's own kind letter.
+    ///
+    /// A typed pair rather than one `char`, because the two alphabets overlap
+    /// and the overlap is not harmless: `relkind` `f` is a foreign table and
+    /// `prokind` `f` is a function, `relkind` `p` is a partitioned table and
+    /// `prokind` `p` is a procedure. Read as one letter, a grant on a foreign
+    /// table would have been read back as a grant on a function of that name.
+    pub kind: GrantedKind,
+    /// The engine's own word: `SELECT`, `EXECUTE`, `MAINTAIN`.
+    pub permission: String,
+    /// `WITH GRANT OPTION`, which the model does not hold.
+    pub grantable: bool,
+    /// `Some` for a grant on one column, which the object's own ACL does not
+    /// show at all.
+    pub column: Option<String>,
+    /// Whether the stored ACL was **NULL** — that is, whether this row came
+    /// out of `acldefault` rather than out of anything anybody granted.
+    ///
+    /// The distinction the model needs and the ACL text cannot carry. A NULL
+    /// ACL is not an empty one (ADR-0010 §5), and it is not a set of grants
+    /// either: it is the engine's zero point, which every object of that kind
+    /// starts from. Compared as grants, the zero point deadlocks the tool on
+    /// its own output — every function pbps creates arrives with `EXECUTE` to
+    /// PUBLIC and every table with the owner's whole set, so the next plan
+    /// would revoke what the apply before it had just produced.
+    pub defaulted: bool,
+    /// The object's owner, for the same reason: the owner's entry is the one
+    /// `acldefault` puts there, not one anybody granted.
+    pub owner: String,
+}
+
+/// What a grant's target is, by the catalog the row came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrantedKind {
+    /// `pg_class.relkind`: `r` table, `v` view, `S` sequence, `m`
+    /// materialized view, `p` partitioned table, `f` foreign table.
+    Relation(char),
+    /// `pg_proc.prokind`: `f` function, `p` procedure, `a` aggregate, `w`
+    /// window function.
+    Routine(char),
+    #[default]
+    Schema,
+}
+
+/// One grant in a catalog whose target the model cannot name at all
+/// (ADR-0010 §6, and DECISIONS 105 on the other engine).
+///
+/// **Enumerated from the engine rather than from memory**, which this crate has
+/// earned the hard way once already (`crate::modules::ATTACHED_BY_ADDRESS`).
+/// PostgreSQL 18 has fourteen `aclitem[]` columns in `pg_catalog`, and the
+/// query that says so is
+///
+/// ```sql
+/// SELECT c.relname || '.' || a.attname
+///   FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+///  WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+///    AND a.atttypid = 'aclitem[]'::regtype;
+/// ```
+///
+/// which `every_catalog_that_holds_a_grant_is_read` runs against the live
+/// server and compares with this reader's list. A fifteenth arriving in a
+/// later release fails that test instead of going unnoticed.
+///
+/// A role that gained `USAGE ON LANGUAGE c`, or `SET ON PARAMETER`, has
+/// changed — and a read that did not look would compare the grants it *did*
+/// see and call the role clean, which is the failure DECISIONS 105 records on
+/// SQL Server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawOtherGrant {
+    /// `None` is PUBLIC.
+    pub grantee: Option<String>,
+    /// The kind of object, in the words a message uses: `a type`,
+    /// `a language`.
+    pub class: String,
+    pub name: String,
+    pub permission: String,
+    pub grantable: bool,
+    /// Who owns the object, or `None` where its catalog has no owner column
+    /// (`pg_parameter_acl`).
+    ///
+    /// Carried for the zero point (DECISIONS 371): these ACLs are NULL until
+    /// somebody touches them, and touching one writes the owner's own
+    /// inherent entry beside the change.
+    pub owner: Option<String>,
+}
+
+/// One `ALTER DEFAULT PRIVILEGES` entry (ADR-0010 §2).
+///
+/// Not a grant on anything: a standing instruction that objects **one role**
+/// creates from now on arrive already granted. The model has no such thing —
+/// a `schema::` target on the other engine covers present and future objects
+/// whoever creates them — so each entry is reported rather than folded into
+/// any role's set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawDefaultAcl {
+    /// The role whose creations it covers, and the reason this is not
+    /// portable: who runs the plan decides what the declaration means.
+    pub grantor: String,
+    /// `None` is every schema.
+    pub in_schema: Option<String>,
+    /// `r` tables and views, `S` sequences, `f` routines, `T` types,
+    /// `n` schemas.
+    pub objtype: char,
+    /// The `aclitem[]` as the engine prints it.
+    pub acl: String,
 }
 
 /// One fact about the database that the model cannot hold.
@@ -285,6 +472,32 @@ pub struct Pulled {
     /// Never empty silence — see this module's own documentation.
     pub warnings: Vec<String>,
     pub limitations: Vec<Limitation>,
+    /// Permissions the model cannot hold and a drift check must not call
+    /// clean: a grant `WITH GRANT OPTION`, a column-level grant, a grant on a
+    /// sequence, a permission on a class the model cannot name. Each is left
+    /// out of the role's set — folded in or merely warned about, `verify`
+    /// compares the sets that remain and says "no drift" about a role that has
+    /// changed — and reported here beside the other differences
+    /// (DECISIONS 95, 97).
+    pub unexpressible: Vec<Unexpressible>,
+}
+
+/// One permission the model cannot hold, and enough about it for the caller to
+/// decide whether it is any of this project's business.
+///
+/// The same type as the SQL Server pull's, for the same reason: the securable
+/// travels with it, because filtered by role alone a column-level grant on
+/// somebody else's table stopped every command — while the *plain* grant on
+/// that same table was dropped by `scope`, whose recorded reason is that it is
+/// that table's business (DECISIONS 176).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unexpressible {
+    pub role: String,
+    /// The securable, where the permission names one a declaration could.
+    /// `None` for a class the model cannot name at all.
+    pub target: Option<pbps_model::GrantTarget>,
+    /// The difference, already rendered.
+    pub what: String,
 }
 
 /// The engine's referential action characters.
@@ -535,7 +748,607 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         add_module(raw_module, &args_by_routine, &mut pulled);
     }
 
+    add_roles(raw, &mut pulled);
+
     pulled
+}
+
+/// The roles and what each holds in this database (ADR-0005, ADR-0010 §5).
+///
+/// Every role the query returned is inserted, grants or none: the managed-set
+/// cut is the ids file's, later, and a role that has had its last grant
+/// revoked must read as "a role with nothing" and not as "no such role".
+///
+/// # NULL is not empty — and it is not a set of grants either
+///
+/// A PostgreSQL object with no explicit grants has a **NULL** ACL, and the
+/// engine reads a NULL ACL as the built-in default for the object's kind:
+/// measured, a fresh function has `proacl IS NULL` and a role holding only
+/// `USAGE` on the schema can execute it, because the default is
+/// `{=X/owner,owner=X/owner}` — PUBLIC gets `EXECUTE`. Reading NULL as "no
+/// privileges" would report a function as closed where it is open to everyone,
+/// which is the member of *absent, empty and unreadable* that reads as good
+/// news.
+///
+/// So the reader expands it — with the engine's own `acldefault`, not with a
+/// table written here, because the answer moves with the release: `MAINTAIN`
+/// joined the relation default in PostgreSQL 17, measured `arwdDxt` on 16.15
+/// against `arwdDxtm` on 18.6.
+///
+/// **But the default is the zero point, not drift** (ADR-0010 §5, which
+/// measured this for PUBLIC and refused to route it down the unexpressible
+/// path). The same argument settles the owner, whom that section does not
+/// name: every table pbps creates arrives owned by the deploying account with
+/// the owner's whole set, and every function it creates arrives with `EXECUTE`
+/// to PUBLIC. Compared as grants, the plan after a successful apply would
+/// revoke what that apply had just produced — a rule that makes the tool's own
+/// output unplannable is broken, not safe.
+///
+/// The line is therefore drawn at *who put the entry there*:
+///
+/// | ACL entry | Treated as |
+/// |---|---|
+/// | out of `acldefault` (`defaulted`) | the zero point — reported, never compared |
+/// | the object's owner | the same: the entry `acldefault` puts there |
+/// | PUBLIC | context (§5): not a role, so never drift and never a gate |
+/// | anything else | a grant, compared for a managed role |
+///
+/// Nothing is dropped: what is not compared is reported, because a revocation
+/// on this engine is the *absence* of an entry rather than a row, and silence
+/// about the zero point is silence about the one act that leaves no trace.
+fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
+    for r in &raw.roles {
+        pulled
+            .schema
+            .roles
+            .insert(r.name.clone(), pbps_model::Role::default());
+        if r.superuser {
+            pulled.warnings.push(format!(
+                "role `{}` is a superuser, which passes every privilege check without consulting \
+                 an ACL: what it is granted here does not decide what it can do",
+                r.name
+            ));
+        }
+    }
+
+    // The arguments of every routine a grant can name, in order, as the
+    // catalog spells each type. Never one joined string: a comma can be part
+    // of an argument (`cm."amount,type"`), so a rendered signature cannot be
+    // split back into the list it came from.
+    let mut signatures: BTreeMap<i64, Vec<&str>> = BTreeMap::new();
+    for arg in &raw.routine_args {
+        signatures.entry(arg.routine_oid).or_default().push(&arg.ty);
+    }
+
+    let mut public_executes: Vec<String> = Vec::new();
+    let mut closed_to_public: BTreeSet<String> = raw
+        .grants
+        .iter()
+        .filter(|g| matches!(g.kind, GrantedKind::Routine('f' | 'p')) && !g.defaulted)
+        .map(|g| target_label(g, &signatures))
+        .collect();
+
+    for g in &raw.grants {
+        if g.grantee.is_none() {
+            // PUBLIC. Context, never drift (ADR-0010 §5): it is not a role,
+            // it cannot be declared, and comparing it would report every
+            // database's default `EXECUTE` on every function as a difference.
+            if matches!(g.kind, GrantedKind::Routine('f' | 'p')) && g.permission == "EXECUTE" {
+                closed_to_public.remove(&target_label(g, &signatures));
+                public_executes.push(target_label(g, &signatures));
+            } else {
+                pulled.warnings.push(format!(
+                    "PUBLIC holds {} on {}, which is every principal in the cluster and not a \
+                     role this project can declare (ADR-0010 §5)",
+                    g.permission,
+                    target_label(g, &signatures)
+                ));
+            }
+            continue;
+        }
+        // The zero point. Reported below as one line per shape rather than one
+        // per object: a database has as many of these as it has objects, and a
+        // report nobody can read is a report nobody reads.
+        if g.defaulted || g.grantee.as_deref() == Some(g.owner.as_str()) {
+            continue;
+        }
+        let grantee = g.grantee.as_deref().unwrap_or_default();
+        // A grantee outside the roles read — a `pg_*` role, or one the query
+        // filtered — still holds what it holds. Reported rather than dropped.
+        if !pulled.schema.roles.contains_key(grantee) {
+            pulled.warnings.push(format!(
+                "`{grantee}` holds {} on {}, and is not a role this project can declare",
+                g.permission,
+                target_label(g, &signatures)
+            ));
+            continue;
+        }
+        let unexpressible = |pulled: &mut Pulled, target, what: String| {
+            pulled.unexpressible.push(Unexpressible {
+                role: grantee.to_owned(),
+                target,
+                what,
+            });
+        };
+        // The target first, and every finding below carries it. `target: None`
+        // means *this grant has no target a declaration could name* — and
+        // `deploy::unexpressible_permissions` keeps every targetless finding
+        // whatever role or object it is about, because a permission on the
+        // database itself belongs to no object at all. Reported without one, a
+        // limitation on somebody else's table refused every connected plan,
+        // while the ordinary grant beside it on that same table was dropped as
+        // none of this project's business (DECISIONS 176).
+        let target = match target_of(g, &signatures) {
+            Ok(target) => target,
+            Err(e) => {
+                unexpressible(pulled, e.target, format!("role {grantee}: {}", e.what));
+                continue;
+            }
+        };
+        // The string form is what a snapshot carries, and in it a `(` opens a
+        // routine signature: a legal PostgreSQL object name may contain one,
+        // and `app."sales(archive)"` reads back as a grant on a routine
+        // (DECISIONS 205, which measured this shape on the other engine). The
+        // structured target is kept — only its *string* form is ambiguous, and
+        // the target is what scopes the report to the managed set
+        // (`unexpressible_permissions`).
+        if target
+            .to_string()
+            .parse::<pbps_model::GrantTarget>()
+            .as_ref()
+            != Ok(&target)
+        {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is on an object whose name contains a parenthesis \
+                     or a period, which a declaration cannot spell — written out it reads back \
+                     as a different target; the declarations cannot express it",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        // An object this pull did not record: a table whose shape the reader
+        // refuses, a routine with an argument the model cannot hold, a
+        // definition that came back unreadable. The grant is still there, and
+        // written into the role it would name a target no declaration in the
+        // project has — making `validate` refuse the very project `pull` just
+        // wrote. *Absent, empty and unreadable are three different things*:
+        // this is the one the role's set must not read as ordinary.
+        if !recorded(&pulled.schema, &target) {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is on an object this pull did not record, so the \
+                     declarations cannot express it",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        if let Some(column) = &g.column {
+            // Measured while building ADR-0009 §3: after `GRANT SELECT (a) ON
+            // m9.v`, `pg_class.relacl` is NULL and the grant lives in
+            // `pg_attribute.attacl`. An object-level reader sees nothing at
+            // all, which is why this is reported rather than approximated by a
+            // grant on the whole object — that would be a *widening* the
+            // declarations then plan.
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on column `{column}` of {} is a column-level grant, which \
+                     the declarations cannot express",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        let Ok(permission) = g.permission.parse::<pbps_model::Permission>() else {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is not a permission this model holds; the \
+                     declarations cannot express it",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        };
+        if g.grantable {
+            // `WITH GRANT OPTION` — a `*` in the ACL — lets the grantee grant
+            // it onward, which the model does not hold. Folded in as a plain
+            // grant, `verify` would compare the two as equal and call a role
+            // that can hand out `SELECT` the same as one that cannot.
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is `WITH GRANT OPTION`, which the declarations \
+                     cannot express",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        if let Some(role) = pulled.schema.roles.get_mut(grantee) {
+            role.grants.entry(target).or_default().insert(permission);
+        }
+    }
+
+    // The two facts about PUBLIC and routines, each as one line. The first is
+    // the exposure ADR-0010 §5 names — every routine with no explicit ACL is
+    // executable by every principal in the cluster — and the second is the
+    // hardening that undoes it, which is *the absence of a row* and would be
+    // silence in any report that only listed what the catalog holds.
+    if !public_executes.is_empty() {
+        pulled.warnings.push(format!(
+            "PUBLIC can execute {}: {}. That is this engine's default for a routine \
+             (`acldefault('f', owner)` is `{{=X/owner,owner=X/owner}}`), not something anyone \
+             granted, so it is reported rather than compared (ADR-0010 §5)",
+            plural(public_executes.len(), "routine"),
+            listed(&public_executes)
+        ));
+    }
+    if !closed_to_public.is_empty() {
+        let closed: Vec<String> = closed_to_public.into_iter().collect();
+        pulled.warnings.push(format!(
+            "`EXECUTE` has been revoked from PUBLIC on {}: {}. The declarations cannot express \
+             that — a revocation here is the absence of the engine's default rather than a row — \
+             and a rebuild restores the default, so an ordinary edit would reopen a routine \
+             somebody deliberately closed (ADR-0009 §3, ADR-0010 §5)",
+            plural(closed.len(), "routine"),
+            listed(&closed)
+        ));
+    }
+
+    // The catalogs whose targets no declaration can name. Grouped, because a
+    // database has as many of these as it has types: one line per
+    // (role, class, permission), naming the objects it covers.
+    let mut others: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    for g in &raw.other_grants {
+        let grantee = match g.grantee.as_deref() {
+            // PUBLIC holds `USAGE` on every built-in type and on `sql` and
+            // `plpgsql` in every database there is. Context, and not even
+            // interesting context: it is the same in every database, and
+            // listing it would bury the rows that are not.
+            None => continue,
+            Some(grantee) => grantee,
+        };
+        // The zero point again (DECISIONS 371), on the catalogs that carry no
+        // `acldefault` expansion because they need none: every one of these
+        // ACLs is NULL until somebody touches it. Measured on 18.6, `REVOKE
+        // USAGE ON TYPE ot.money_kind FROM PUBLIC` leaves
+        // `{ot_owner=U/ot_owner}` — the owner's inherent `USAGE`, written by
+        // the engine and not by anyone. Reported as unnameable state, it would
+        // refuse every plan connected to a role that owns a type, for a
+        // privilege nobody granted.
+        if Some(grantee) == g.owner.as_deref() {
+            continue;
+        }
+        if !pulled.schema.roles.contains_key(grantee) {
+            continue;
+        }
+        let permission = if g.grantable {
+            format!("{} WITH GRANT OPTION", g.permission)
+        } else {
+            g.permission.clone()
+        };
+        others
+            .entry((grantee.to_owned(), g.class.clone(), permission))
+            .or_default()
+            .push(g.name.clone());
+    }
+    for ((role, class, permission), names) in others {
+        pulled.unexpressible.push(Unexpressible {
+            role: role.clone(),
+            // No target: the model cannot name one of these at all, which is
+            // the point. A role that gained one out of band has changed even
+            // where every grant the model *does* hold still matches
+            // (DECISIONS 105).
+            target: None,
+            what: format!(
+                "role {role}: {permission} on {class} is not something the declarations can \
+                 name — {}",
+                listed(&names)
+            ),
+        });
+    }
+
+    for held in &raw.held_elsewhere {
+        // ADR-0010 §4. Reported by the pull because it is the fact this
+        // database's catalog hides: everything `pull` otherwise says about a
+        // role is what *this* database holds, and a reader who took that for
+        // the whole of it would plan a `drop-role` the cluster will refuse.
+        pulled.warnings.push(
+            crate::roles::DropBlocker {
+                role: held.role.clone(),
+                database: held.database.clone(),
+                deptype: held.deptype,
+                objects: held.objects,
+            }
+            // `None`: every row here is one this connection cannot look
+            // inside, which is what the query selects.
+            .rendered(None),
+        );
+    }
+
+    for d in &raw.default_acls {
+        // ADR-0010 §2. Not a grant on anything that exists: a standing
+        // instruction attached to one *creating role*, which is exactly why
+        // the other engine's schema-level grant does not translate. Reported
+        // so that a rebuild's arriving grants, and a `pull` that shows a role
+        // holding less than it will hold tomorrow, are both visible.
+        pulled.warnings.push(format!(
+            "`ALTER DEFAULT PRIVILEGES FOR ROLE {}` in {} grants {} on {} that role creates from \
+             now on; the declarations have no such thing, because on this engine who creates an \
+             object decides what it arrives with (ADR-0010 §2)",
+            d.grantor,
+            match &d.in_schema {
+                Some(s) => format!("schema `{s}`"),
+                None => "every schema".to_owned(),
+            },
+            d.acl,
+            default_acl_objects(d.objtype),
+        ));
+    }
+}
+
+/// `1 routine` / `4 routines`.
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// The names, capped, with the rest counted rather than printed.
+///
+/// A count alone sends the reader to write the query themselves; the whole
+/// list of every routine in a large database is a wall nobody reads. Ten and a
+/// remainder is the shape that answers "which ones" for the cases that have an
+/// answer and stays one paragraph for the ones that do not.
+fn listed(names: &[String]) -> String {
+    const SHOWN: usize = 10;
+    let mut out = names
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        out.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    out
+}
+
+/// What an `ALTER DEFAULT PRIVILEGES` entry's object type covers, in words.
+fn default_acl_objects(objtype: char) -> &'static str {
+    match objtype {
+        'r' => "the tables and views",
+        'S' => "the sequences",
+        'f' => "the functions and procedures",
+        'T' => "the types",
+        'n' => "the schemas",
+        _ => "the objects",
+    }
+}
+
+/// The target a grant names, or why the model cannot name it.
+/// Whether the pull recorded the object a grant is on.
+///
+/// The assembly ahead of this one leaves objects out — a table with a shape
+/// the reader refuses, a routine whose argument the model cannot spell — and
+/// their ACL rows arrive here all the same. `pbps_model::role::check` refuses
+/// a grant on a target the project does not declare, so a role written with
+/// one would make the schema `pull` just produced fail its own validation.
+///
+/// **In the target's own namespace.** An `Object` here came from a relation
+/// row — `target_of` builds one for no other kind — and relations and routines
+/// are two namespaces on this engine, so a routine of the same name does not
+/// answer for a table that was left out. Counted, a hidden table `app.f`
+/// beside a surviving routine `app.f(integer)` would put `SELECT ON app.f`
+/// into the role, and `validate::role` reads that bare name in the relation
+/// namespace and finds nothing there — the schema `pull` wrote, refused by
+/// this dialect's own check (DECISIONS 382).
+fn recorded(schema: &pbps_model::Schema, target: &pbps_model::GrantTarget) -> bool {
+    match target {
+        pbps_model::GrantTarget::Object(o) => {
+            schema.tables.contains_key(o)
+                || schema.modules.iter().any(|(id, m)| {
+                    m.kind == ModuleKind::View && id.referenced_name().as_ref() == Some(o)
+                })
+        }
+        pbps_model::GrantTarget::Routine(r) => schema
+            .modules
+            .keys()
+            .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
+        // Not an object the pull assembles: the model holds no list of
+        // schemas, and a `schema::` target names one directly.
+        pbps_model::GrantTarget::Schema(_) => true,
+    }
+}
+
+/// A grant this model cannot hold, and the object it is on where there is one.
+///
+/// The target is carried through the refusal because it is what scopes the
+/// report to the managed set (`deploy::unexpressible_permissions`): reported
+/// without one, a `SELECT` on somebody else's materialized view refused every
+/// connected plan, where the ordinary grant beside it on that same object is
+/// dropped as none of this project's business (DECISIONS 176). `None` is kept
+/// for the grants that really have no target a declaration could name.
+struct Unsupported {
+    what: String,
+    target: Option<pbps_model::GrantTarget>,
+}
+
+impl Unsupported {
+    /// A grant on an object this model does not declare, but can name.
+    fn on(target: pbps_model::GrantTarget, what: String) -> Self {
+        Unsupported {
+            what,
+            target: Some(target),
+        }
+    }
+
+    /// A grant whose target no declaration could write down at all.
+    fn nameless(what: String) -> Self {
+        Unsupported { what, target: None }
+    }
+}
+
+fn target_of(
+    g: &RawGrant,
+    signatures: &BTreeMap<i64, Vec<&str>>,
+) -> Result<pbps_model::GrantTarget, Unsupported> {
+    let Some(object) = g.object.as_deref() else {
+        return Ok(pbps_model::GrantTarget::Schema(g.schema.clone()));
+    };
+    let name = pbps_model::ObjectName::new(g.schema.clone(), object.to_owned());
+    match g.kind {
+        // A table or a view: the two the model declares, and the two that
+        // share `GRANT ... ON TABLE`.
+        GrantedKind::Relation('r' | 'v') => Ok(pbps_model::GrantTarget::Object(name)),
+        // ADR-0010 §7, and the other half of why `serial` is refused at load
+        // (#77). A `serial` column creates a sequence the declaration never
+        // named, and inserting into such a column needs a privilege on it —
+        // measured, `permission denied for sequence ser_id_seq` where the
+        // same insert into an identity column succeeds. The model has no
+        // sequence to grant on, so the grant is reported rather than dropped:
+        // dropped, `pull` would write a role that cannot insert.
+        GrantedKind::Relation('S') => Err(Unsupported::on(
+            pbps_model::GrantTarget::Object(name.clone()),
+            format!(
+                "{} on sequence `{name}` is a grant on a sequence, which this model does not \
+                 declare — an identity column needs no such grant and a `serial` column does, \
+                 which is why `serial` is refused at load (ADR-0010 §7)",
+                g.permission
+            ),
+        )),
+        // A relation this model does not hold. **Measured**, a `GRANT SELECT`
+        // on a materialized view and on a partitioned table both land in
+        // `relacl` — so leaving them out of the read reported the role as
+        // holding nothing on them, which is *absent* reading as *empty*.
+        GrantedKind::Relation(other) => Err(Unsupported::on(
+            pbps_model::GrantTarget::Object(name.clone()),
+            format!(
+                "{} on `{name}` is on {}, which this model does not declare",
+                g.permission,
+                relation_kind(other)
+            ),
+        )),
+        // A routine, written with its signature: a name is not an identity
+        // where the kind overloads (ADR-0009 §1).
+        GrantedKind::Routine('f' | 'p') => {
+            let mut args = Vec::new();
+            for spelled in routine_args(g, signatures) {
+                match spelled.parse::<RoutineArg>() {
+                    Ok(arg) => args.push(arg),
+                    // The characters a declaration's argument admits are a
+                    // closed set; one outside it is a routine whose grant the
+                    // model cannot write down. Named rather than dropped —
+                    // and named as the *whole* argument, because the reason
+                    // this is a list and not a split string is that an
+                    // argument may contain a comma.
+                    Err(_) => {
+                        // No target: the signature *is* the identity here, and
+                        // this is the argument that cannot be written down.
+                        return Err(Unsupported::nameless(format!(
+                            "{} on `{name}` is on a routine whose argument `{spelled}` a \
+                             declaration cannot spell",
+                            g.permission
+                        )));
+                    }
+                }
+            }
+            Ok(pbps_model::GrantTarget::Routine(
+                pbps_model::RoutineId::new(name, args),
+            ))
+        }
+        // An aggregate or a window function: named by signature like any
+        // other routine, so the managed-set cut can tell one on somebody
+        // else's object from one on this project's.
+        GrantedKind::Routine(other) => {
+            let what = format!(
+                "{} on `{name}` is on {}, which this model does not declare",
+                g.permission,
+                routine_kind(other)
+            );
+            let mut args = Vec::new();
+            for spelled in routine_args(g, signatures) {
+                let Ok(arg) = spelled.parse::<RoutineArg>() else {
+                    return Err(Unsupported::nameless(what));
+                };
+                args.push(arg);
+            }
+            Err(Unsupported::on(
+                pbps_model::GrantTarget::Routine(pbps_model::RoutineId::new(name, args)),
+                what,
+            ))
+        }
+        // The schema arm is taken above, where `object` is `None`. A schema
+        // row with an object name is a query and a struct that have drifted
+        // apart, and it says so rather than picking one.
+        GrantedKind::Schema => Err(Unsupported::nameless(format!(
+            "{} on `{name}` came back as a grant on a schema that also names an object",
+            g.permission
+        ))),
+    }
+}
+
+/// A `pg_class.relkind` in the words a message uses.
+fn relation_kind(relkind: char) -> &'static str {
+    match relkind {
+        'm' => "a materialized view",
+        'p' => "a partitioned table",
+        'f' => "a foreign table",
+        'c' => "a composite type",
+        _ => "a relation of a kind this reader does not know",
+    }
+}
+
+/// A `pg_proc.prokind` in the same words.
+fn routine_kind(prokind: char) -> &'static str {
+    match prokind {
+        'a' => "an aggregate",
+        'w' => "a window function",
+        _ => "a routine of a kind this reader does not know",
+    }
+}
+
+/// A grant's target as a message names it, before the model has decided
+/// whether it can hold one.
+fn target_label(g: &RawGrant, signatures: &BTreeMap<i64, Vec<&str>>) -> String {
+    match (&g.object, g.routine_oid) {
+        (Some(object), Some(_)) => format!(
+            "`{}.{object}({})`",
+            g.schema,
+            routine_args(g, signatures).join(", ")
+        ),
+        (Some(object), None) => format!("`{}.{object}`", g.schema),
+        (None, _) => format!("schema `{}`", g.schema),
+    }
+}
+
+/// The argument types of the routine this grant is on, in order.
+///
+/// Empty for a routine that takes none — which is a routine all the same, and
+/// is why `RoutineId` keeps the parentheses.
+fn routine_args<'a>(g: &RawGrant, signatures: &BTreeMap<i64, Vec<&'a str>>) -> Vec<&'a str> {
+    g.routine_oid
+        .and_then(|oid| signatures.get(&oid))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// One module, or a note saying why it is not one.
@@ -1653,6 +2466,810 @@ mod tests {
 
     fn modules(raw: RawCatalog) -> Pulled {
         assemble(&raw)
+    }
+
+    fn role(name: &str) -> RawRole {
+        RawRole {
+            name: name.to_owned(),
+            superuser: false,
+        }
+    }
+
+    /// One expanded ACL row, of the shape the query returns: an explicit grant
+    /// by somebody other than the owner.
+    fn grant(
+        grantee: Option<&str>,
+        object: Option<&str>,
+        kind: GrantedKind,
+        permission: &str,
+    ) -> RawGrant {
+        RawGrant {
+            grantee: grantee.map(str::to_owned),
+            schema: "app".to_owned(),
+            object: object.map(str::to_owned),
+            // Oid 1 is the fixture's one routine; `signature` gives it the
+            // arguments a test needs, and a test that gives it none leaves
+            // the routine `f()`.
+            routine_oid: matches!(kind, GrantedKind::Routine(_)).then_some(1),
+            kind,
+            permission: permission.to_owned(),
+            grantable: false,
+            column: None,
+            defaulted: false,
+            owner: "deploy".to_owned(),
+        }
+    }
+
+    /// The argument rows for the fixture's single routine, oid 1.
+    fn signature(types: &[&str]) -> Vec<RawModuleArg> {
+        types
+            .iter()
+            .enumerate()
+            .map(|(at, ty)| RawModuleArg {
+                routine_oid: 1,
+                position: at as i64 + 1,
+                ty: (*ty).to_owned(),
+            })
+            .collect()
+    }
+
+    fn pulled_role<'a>(pulled: &'a Pulled, name: &str) -> &'a pbps_model::Role {
+        pulled.schema.roles.get(name).expect("the role was pulled")
+    }
+
+    /// The objects the grant fixtures name, as the assembly ahead of
+    /// `add_roles` records them: the table `app.customer`, the view
+    /// `app.recent`, and one routine `app.f` of the given kind and signature.
+    ///
+    /// A fixture with no objects in it would not exercise the ordinary path at
+    /// all — a grant on something this pull did not record is reported, never
+    /// folded into a role's set, which is what `recorded` is for.
+    fn declaring(kind: char, args: &[&str]) -> RawCatalog {
+        RawCatalog {
+            tables: vec![RawTable {
+                oid: 10,
+                schema: "app".to_owned(),
+                name: "customer".to_owned(),
+            }],
+            modules: vec![
+                RawModule {
+                    oid: 2,
+                    ..raw_module('v', "recent", " SELECT 1;")
+                },
+                raw_module(
+                    kind,
+                    "f",
+                    &format!(
+                        "CREATE OR REPLACE {} app.f({})\n LANGUAGE sql\nAS $$ SELECT 1 $$\n",
+                        if kind == 'f' { "FUNCTION" } else { "PROCEDURE" },
+                        args.join(", ")
+                    ),
+                ),
+            ],
+            module_args: signature(args),
+            routine_args: signature(args),
+            ..RawCatalog::default()
+        }
+    }
+
+    /// The read-back of the ordinary case, and the one every other test here
+    /// is a deviation from.
+    #[test]
+    fn a_grant_is_read_back_under_the_target_a_declaration_would_write() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(Some("app_reader"), None, GrantedKind::Schema, "USAGE"),
+                grant(
+                    Some("app_reader"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("recent"),
+                    GrantedKind::Relation('v'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Routine('f'),
+                    "EXECUTE",
+                ),
+            ],
+            ..declaring('f', &["integer", "text"])
+        });
+        let targets: Vec<String> = pulled_role(&pulled, "app_reader")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "app.customer",
+                "app.recent",
+                "app.f(integer,text)",
+                "schema::app"
+            ]
+        );
+    }
+
+    /// ADR-0010 §5, and the reason the reader asks the engine rather than
+    /// carrying a table of defaults: a NULL ACL is expanded, and what it
+    /// expands to is the zero point rather than a set of grants. Compared as
+    /// grants it would deadlock the tool on its own output — every table pbps
+    /// creates arrives with the owner's whole set.
+    #[test]
+    fn the_engines_default_is_reported_and_never_compared_as_a_grant() {
+        let defaulted = |grantee: Option<&str>, permission: &str| RawGrant {
+            defaulted: true,
+            ..grant(grantee, Some("f"), GrantedKind::Routine('f'), permission)
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("deploy")],
+            grants: vec![
+                defaulted(Some("deploy"), "EXECUTE"),
+                defaulted(None, "EXECUTE"),
+            ],
+            ..RawCatalog::default()
+        });
+        assert!(pulled_role(&pulled, "deploy").grants.is_empty());
+        // Reported, though: silence about the default is silence about the
+        // fact that every principal in the cluster can execute it.
+        let said = pulled.warnings.join("\n");
+        assert!(said.contains("PUBLIC can execute 1 routine"), "{said}");
+        assert!(said.contains("app.f()"), "{said}");
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// The owner's entry in an ACL somebody else made explicit is still the
+    /// engine's, not a grant. Without this a single `GRANT SELECT` to a reader
+    /// would materialise the owner's eight permissions as declared ones.
+    #[test]
+    fn the_owners_own_entry_is_the_zero_point_even_in_an_explicit_acl() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("deploy"), role("app_reader")],
+            grants: vec![
+                grant(
+                    Some("deploy"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("deploy"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "MAINTAIN",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+            ],
+            ..declaring('f', &[])
+        });
+        assert!(pulled_role(&pulled, "deploy").grants.is_empty());
+        assert_eq!(pulled_role(&pulled, "app_reader").grants.len(), 1);
+    }
+
+    /// The revocation that is not a row. Measured, `REVOKE EXECUTE ... FROM
+    /// PUBLIC` leaves `{postgres=X/postgres}` — so what says it happened is
+    /// an explicit ACL with no PUBLIC entry in it, and a reader that only
+    /// listed what the catalog holds would say nothing at all.
+    #[test]
+    fn execute_revoked_from_public_is_reported_although_it_is_the_absence_of_a_row() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("deploy")],
+            grants: vec![grant(
+                Some("deploy"),
+                Some("f"),
+                GrantedKind::Routine('f'),
+                "EXECUTE",
+            )],
+            ..RawCatalog::default()
+        });
+        let said = pulled.warnings.join("\n");
+        assert!(said.contains("revoked from PUBLIC"), "{said}");
+        assert!(said.contains("app.f()"), "{said}");
+    }
+
+    /// The three ADR-0005 shapes, on this engine's catalogs. Each is left out
+    /// of the role's set and reported, because folded in `verify` compares
+    /// what remains and calls a changed role clean.
+    #[test]
+    fn what_the_model_cannot_hold_is_reported_and_never_folded_into_the_grants() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                RawGrant {
+                    grantable: true,
+                    ..grant(
+                        Some("app_reader"),
+                        Some("customer"),
+                        GrantedKind::Relation('r'),
+                        "SELECT",
+                    )
+                },
+                RawGrant {
+                    column: Some("email".to_owned()),
+                    ..grant(
+                        Some("app_reader"),
+                        Some("customer"),
+                        GrantedKind::Relation('r'),
+                        "SELECT",
+                    )
+                },
+                grant(
+                    Some("app_reader"),
+                    Some("customer_id_seq"),
+                    GrantedKind::Relation('S'),
+                    "USAGE",
+                ),
+            ],
+            ..declaring('f', &[])
+        });
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        let what: Vec<&str> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| u.what.as_str())
+            .collect();
+        assert_eq!(what.len(), 3, "{what:?}");
+        assert!(
+            what.iter().any(|w| w.contains("WITH GRANT OPTION")),
+            "{what:?}"
+        );
+        assert!(
+            what.iter().any(|w| w.contains("column-level grant")),
+            "{what:?}"
+        );
+        // ADR-0010 §7: the other half of why `serial` is refused at load.
+        assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
+        assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+    }
+
+    /// Every limitation on an object carries that object as its target, and
+    /// only a grant with no nameable target at all is targetless.
+    ///
+    /// The managed-set cut keeps every targetless finding whatever it is about
+    /// — a permission on the database itself belongs to no object, and a role
+    /// that gained one has changed. So a column-level grant on somebody
+    /// else's table, reported without a target, refused every connected plan
+    /// while the ordinary grant beside it on that same table was dropped as
+    /// none of this project's business (DECISIONS 176).
+    #[test]
+    fn a_limitation_on_an_object_carries_that_object_as_its_target() {
+        let on_customer = |permission: &str| {
+            grant(
+                Some("app_reader"),
+                Some("customer"),
+                GrantedKind::Relation('r'),
+                permission,
+            )
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                RawGrant {
+                    column: Some("email".to_owned()),
+                    ..on_customer("SELECT")
+                },
+                RawGrant {
+                    grantable: true,
+                    ..on_customer("INSERT")
+                },
+                // A word this engine has and the model does not hold.
+                on_customer("CONNECT"),
+            ],
+            ..declaring('f', &[])
+        });
+        let customer: pbps_model::GrantTarget =
+            "app.customer".parse().expect("a grant target parses");
+        assert_eq!(pulled.unexpressible.len(), 3, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled
+                .unexpressible
+                .iter()
+                .all(|u| u.target.as_ref() == Some(&customer)),
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// A comma is not a separator. **Measured**, a type named `amount,type`
+    /// renders as `cm."amount,type"`, so the comma that separates arguments
+    /// and the comma inside one are the same character — and a signature read
+    /// back as one string and split again turned a valid grant on a managed
+    /// routine into targetless unexpressible state, which refuses the
+    /// connected plan.
+    #[test]
+    fn a_comma_inside_an_argument_type_does_not_split_the_signature() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("f"),
+                GrantedKind::Routine('f'),
+                "EXECUTE",
+            )],
+            ..declaring('f', &["app.\"amount,type\"", "integer"])
+        });
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["app.f(app.\"amount,type\",integer)"]
+        );
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// And an argument the declaration really cannot spell is named whole,
+    /// which is the other half of not splitting: half an argument in an error
+    /// message sends the reader to a type that does not exist. An unbalanced
+    /// quote is the shape `RoutineArg` refuses — a quoted name with a comma or
+    /// a parenthesis inside it is perfectly spellable, which is why the test
+    /// above exists at all.
+    #[test]
+    fn an_argument_a_declaration_cannot_spell_is_named_in_full() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("f"),
+                GrantedKind::Routine('f'),
+                "EXECUTE",
+            )],
+            routine_args: signature(&["app.\"never closed"]),
+            ..RawCatalog::default()
+        });
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("app.\"never closed"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// The kinds this model does not declare still hold real grants —
+    /// **measured**, a `GRANT SELECT` on a materialized view and on a
+    /// partitioned table both land in `relacl` — so each is reported. Left out
+    /// of the read they would have made the role look as though it held
+    /// nothing there, which is *absent* reading as *empty*.
+    #[test]
+    fn a_grant_on_a_relation_kind_this_model_does_not_declare_is_reported() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(
+                    Some("app_reader"),
+                    Some("mv"),
+                    GrantedKind::Relation('m'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("parent"),
+                    GrantedKind::Relation('p'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("remote"),
+                    GrantedKind::Relation('f'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("agg"),
+                    GrantedKind::Routine('a'),
+                    "EXECUTE",
+                ),
+            ],
+            ..RawCatalog::default()
+        });
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        let what: Vec<&str> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| u.what.as_str())
+            .collect();
+        assert_eq!(what.len(), 4, "{what:?}");
+        for named in [
+            "a materialized view",
+            "a partitioned table",
+            "a foreign table",
+            "an aggregate",
+        ] {
+            assert!(what.iter().any(|w| w.contains(named)), "{named}: {what:?}");
+        }
+        // Each names the object it is on, because that is what scopes the
+        // report to the managed set: without a target, a `SELECT` on somebody
+        // else's materialized view refused every connected plan, where the
+        // ordinary grant on that same object is dropped (DECISIONS 176).
+        let targets: Vec<String> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| {
+                u.target
+                    .as_ref()
+                    .map_or("-".to_owned(), ToString::to_string)
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            ["app.mv", "app.parent", "app.remote", "app.agg()"],
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// ADR-0010 §7's report names the sequence too, for the same reason: a
+    /// `serial` column's sequence in somebody else's schema is not this
+    /// project's business, and a report with no target is every project's.
+    #[test]
+    fn a_sequence_grant_names_the_sequence_it_is_on() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("ser_id_seq"),
+                GrantedKind::Relation('S'),
+                "USAGE",
+            )],
+            ..RawCatalog::default()
+        });
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert_eq!(
+            pulled.unexpressible[0]
+                .target
+                .as_ref()
+                .map(ToString::to_string),
+            Some("app.ser_id_seq".to_owned())
+        );
+        assert!(
+            pulled.unexpressible[0].what.contains("sequence"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// The `relkind` letters and the `prokind` letters overlap, and the
+    /// overlap is not harmless: `f` is a foreign table in one alphabet and a
+    /// function in the other, `p` a partitioned table and a procedure. Read as
+    /// one letter, a grant on a foreign table came back as a grant on a
+    /// function of that name — a target the declarations may well have, and
+    /// therefore a grant the next plan would compare.
+    #[test]
+    fn the_relkind_and_prokind_alphabets_are_not_read_as_one() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Relation('f'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Routine('p'),
+                    "EXECUTE",
+                ),
+            ],
+            ..declaring('p', &["integer"])
+        });
+        // The foreign table is unexpressible; the procedure is a grant.
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["app.f(integer)"]
+        );
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("a foreign table"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// A grant in a catalog whose target no declaration can name — a type, a
+    /// language, a parameter. Reported per role, class and permission, because
+    /// a database has as many of these as it has types; a role that gained one
+    /// out of band has changed, and a reader that never looked would compare
+    /// the grants it did see and call it clean (DECISIONS 105).
+    #[test]
+    fn a_grant_on_a_class_the_model_cannot_name_is_reported_grouped() {
+        let other = |grantee: Option<&str>, class: &str, name: &str| RawOtherGrant {
+            grantee: grantee.map(str::to_owned),
+            class: class.to_owned(),
+            name: name.to_owned(),
+            permission: "USAGE".to_owned(),
+            grantable: false,
+            owner: Some("someone_else".to_owned()),
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            other_grants: vec![
+                other(Some("app_reader"), "a type", "app.money"),
+                other(Some("app_reader"), "a type", "app.code"),
+                other(Some("app_reader"), "a procedural language", "plpgsql"),
+                // PUBLIC holds `USAGE` on every built-in type in every
+                // database there is: the same everywhere, so listing it would
+                // bury the rows that are not.
+                other(None, "a type", "text"),
+                // And a role this project cannot declare is not its business.
+                other(Some("someone_else"), "a type", "app.money"),
+            ],
+            ..RawCatalog::default()
+        });
+        let what: Vec<&str> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| u.what.as_str())
+            .collect();
+        assert_eq!(what.len(), 2, "{what:?}");
+        assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(pulled.unexpressible.iter().all(|u| u.target.is_none()));
+        let types = what
+            .iter()
+            .find(|w| w.contains("a type"))
+            .expect("the type line");
+        assert!(types.contains("app.money"), "{types}");
+        assert!(types.contains("app.code"), "{types}");
+    }
+
+    /// The zero point reaches those catalogs too (DECISIONS 371). Every one of
+    /// them is NULL until somebody touches it, and **measured on 18.6**,
+    /// `REVOKE USAGE ON TYPE ot.money_kind FROM PUBLIC` turns a NULL `typacl`
+    /// into `{ot_owner=U/ot_owner}` — the owner's own inherent `USAGE`,
+    /// written by the engine. Read as a grant it says a managed role holds
+    /// something unnameable, which refuses every plan connected to it.
+    #[test]
+    fn the_owners_own_entry_in_an_unnameable_class_is_the_zero_point() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("ot_owner")],
+            other_grants: vec![RawOtherGrant {
+                grantee: Some("ot_owner".to_owned()),
+                class: "a type".to_owned(),
+                name: "app.money_kind".to_owned(),
+                permission: "USAGE".to_owned(),
+                grantable: false,
+                owner: Some("ot_owner".to_owned()),
+            }],
+            ..RawCatalog::default()
+        });
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// A grant on an object the assembly ahead of this one left out — a table
+    /// whose column type the declaration cannot write back, a routine whose
+    /// argument the model cannot hold. The grant is real and the object is
+    /// not in the pull, so folding it into the role would write a project
+    /// whose own `validate` refuses it, naming a target no declaration has.
+    #[test]
+    fn a_grant_on_an_object_this_pull_did_not_record_is_reported_not_folded_in() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(Some("app_reader"), None, GrantedKind::Schema, "USAGE"),
+                grant(
+                    Some("app_reader"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+            ],
+            // No tables and no modules: the table the grant is on was left out.
+            ..RawCatalog::default()
+        });
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["schema::app"],
+            "the schema grant stands; the one on the missing table does not"
+        );
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("did not record"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// And the object it did not record is looked for in the target's own
+    /// namespace. A relation ACL row becomes an `Object`, and a routine of the
+    /// same name is a different object on this engine — measured, a table
+    /// `co.f` and a function `co.f(integer)` coexist. Counted as an answer,
+    /// the hidden table's grant went into the role and `validate::role` then
+    /// refused the schema this pull had just written, looking for a relation
+    /// `app.f` that is not there.
+    #[test]
+    fn a_relation_left_out_is_not_answered_for_by_a_routine_of_the_same_name() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(Some("app_reader"), None, GrantedKind::Schema, "USAGE"),
+                // The routine `app.f(integer)` is in the pull; a table of that
+                // name would be too, and this fixture leaves it out.
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Routine('f'),
+                    "EXECUTE",
+                ),
+            ],
+            ..declaring('f', &["integer"])
+        });
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["app.f(integer)", "schema::app"],
+            "the routine grant stands; the one on the missing table does not"
+        );
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("did not record"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// The target crosses a snapshot as its string form, and in that form a
+    /// `(` opens a routine signature. **Measured**: `app.sales(archive)` is a
+    /// legal table name this dialect writes back unchanged, and it parses back
+    /// as `GrantTarget::Routine(app.sales(archive))` — a different object.
+    /// Recorded, the grant would reload as one on a routine, or not at all
+    /// (DECISIONS 205, the same shape on the other engine).
+    #[test]
+    fn a_target_whose_written_form_reads_back_as_another_object_is_reported() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            tables: vec![RawTable {
+                oid: 11,
+                schema: "app".to_owned(),
+                name: "sales(archive)".to_owned(),
+            }],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("sales(archive)"),
+                GrantedKind::Relation('r'),
+                "SELECT",
+            )],
+            ..RawCatalog::default()
+        });
+        // The table itself is in the pull: its name survives the *declaration*
+        // format, which is what keeps it there — only the grant target's form
+        // is ambiguous.
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&"app.sales(archive)".parse().expect("a table name parses")),
+            "{:?}",
+            pulled.schema.tables.keys().collect::<Vec<_>>()
+        );
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("parenthesis"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// `WITH GRANT OPTION` survives into the message on those classes too: a
+    /// role that can hand `USAGE` on a type onward is not the same as one that
+    /// merely holds it.
+    #[test]
+    fn a_grant_option_on_an_unnameable_class_is_said_rather_than_flattened() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            other_grants: vec![RawOtherGrant {
+                grantee: Some("app_reader".to_owned()),
+                class: "a type".to_owned(),
+                name: "app.money".to_owned(),
+                permission: "USAGE".to_owned(),
+                grantable: true,
+                owner: Some("someone_else".to_owned()),
+            }],
+            ..RawCatalog::default()
+        });
+        assert_eq!(pulled.unexpressible.len(), 1);
+        assert!(
+            pulled.unexpressible[0].what.contains("WITH GRANT OPTION"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// A role with no grants is a role with no grants — not a missing one.
+    /// The two are the difference between "nothing was revoked" and "somebody
+    /// dropped the role", and only one of them is good news.
+    #[test]
+    fn a_role_holding_nothing_is_pulled_as_a_role_and_not_left_out() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            ..RawCatalog::default()
+        });
+        assert!(pulled.schema.roles.contains_key("app_reader"));
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+    }
+
+    /// ADR-0010 §2. Not a grant on anything that exists, and not something any
+    /// declaration can say — so it is reported, with the role whose creations
+    /// it covers, which is the fact that makes it unportable.
+    #[test]
+    fn a_default_privileges_entry_names_the_role_whose_creations_it_covers() {
+        let pulled = assemble(&RawCatalog {
+            default_acls: vec![RawDefaultAcl {
+                grantor: "owner_a".to_owned(),
+                in_schema: Some("app".to_owned()),
+                objtype: 'r',
+                acl: "{all_reader=r/owner_a}".to_owned(),
+            }],
+            ..RawCatalog::default()
+        });
+        let said = pulled.warnings.join("\n");
+        assert!(said.contains("FOR ROLE owner_a"), "{said}");
+        assert!(said.contains("the tables and views"), "{said}");
+        assert!(said.contains("who creates an object"), "{said}");
+    }
+
+    /// A superuser's grants do not decide what it can do, and a pull that
+    /// silently left it out would be the failure this project is built to
+    /// avoid.
+    #[test]
+    fn a_superuser_is_pulled_and_named_rather_than_filtered_out() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![RawRole {
+                name: "deploy".to_owned(),
+                superuser: true,
+            }],
+            ..RawCatalog::default()
+        });
+        assert!(pulled.schema.roles.contains_key("deploy"));
+        assert!(
+            pulled.warnings.iter().any(|w| w.contains("superuser")),
+            "{:?}",
+            pulled.warnings
+        );
     }
 
     /// Measured on 18.6, one shape per kind. The declaration holds everything

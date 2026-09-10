@@ -29,8 +29,9 @@ use pbps_db::{Conn, DbError, Row};
 use pbps_model::{Schema, TableName};
 
 use crate::introspect::{
-    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawModule,
-    RawModuleArg, RawTable, assemble,
+    GrantedKind, Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawDefaultAcl, RawGrant,
+    RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant, RawRole, RawSharedDependency,
+    RawTable, assemble,
 };
 
 /// The schemas that are never a project's.
@@ -49,6 +50,27 @@ use crate::introspect::{
 const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
       AND pg_catalog.left(n.nspname, 3) <> 'pg_'";
 
+/// [`NOT_A_PROJECTS_SCHEMA`], asked of one name in Rust.
+///
+/// The two have to agree, and the live test
+/// `the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name` puts
+/// the question to the engine rather than to this file: it reads every schema
+/// the cluster has, asks the SQL predicate which of them the pull keeps, and
+/// requires this function to answer the same about each.
+///
+/// It exists because a declaration may name a schema directly — `schema::x` is
+/// a grant target — and a grant in a schema the pull does not read comes back
+/// as absent. Recorded that way, the apply's own read-back refuses it and
+/// every plan after it proposes the same `GRANT` again
+/// ([`crate::validate::role`] refuses the declaration instead).
+///
+/// The table and module checks that had this predicate written out ask it here
+/// now: three copies of one filter are three things to remember when a
+/// fifteenth schema of the engine's own arrives.
+pub(crate) fn a_projects_schema(name: &str) -> bool {
+    !matches!(name, "pg_catalog" | "information_schema") && !name.starts_with("pg_")
+}
+
 /// This tool's own tables, which arrive at Phase 5 step 8. They must never
 /// enter the managed set, or the tool would plan changes to itself.
 ///
@@ -61,6 +83,17 @@ const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'informatio
 /// schema SPEC §8.1 puts them in; this one cannot until step 8 says where its
 /// own ledger lives, so `app.__pbps_state` is still hidden here (#185).
 const NOT_ONE_OF_OURS: &str = "c.relname NOT IN ('__pbps_state', '__pbps_lock')";
+
+/// [`NOT_ONE_OF_OURS`], asked only of the kind this tool's own objects are.
+///
+/// The ledger is two **tables** (SPEC §8.1), and `modules_query` already reads
+/// that way: a view is kept whatever it is called, and only an ordinary table
+/// is filtered by name. The grants query has to agree, or a declared view named
+/// `app.__pbps_state` is pulled as a module while its `relacl` row is thrown
+/// away — the grant on it then reads back as absent, the apply's own read-back
+/// refuses the plan for not having achieved its postcondition, and every plan
+/// after it proposes the same `GRANT` again (DECISIONS 386).
+const NOT_ONE_OF_OUR_TABLES: &str = "(c.relkind <> 'r' OR c.relname NOT IN ('__pbps_state',                                      '__pbps_lock'))";
 
 /// The same two names, for the one other place that has to know them:
 /// `validate_table` refuses a declaration that uses one, because a table the
@@ -855,6 +888,63 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             ty: text(&row, "ty")?,
         });
     }
+    for row in conn.query(ROLES).await? {
+        raw.roles.push(RawRole {
+            name: text(&row, "name")?,
+            superuser: flag(&row, "superuser")?,
+        });
+    }
+    for row in conn.query(&grants_query()).await? {
+        raw.grants.push(RawGrant {
+            // `None` is PUBLIC, which the query spells as a NULL rather than
+            // letting `pg_get_userbyid(0)` render its own `unknown (OID=0)`:
+            // that string is a name a role could in principle have, and this
+            // one distinction must not be a string comparison.
+            grantee: optional_text(&row, "grantee")?,
+            schema: text(&row, "schema_name")?,
+            object: optional_text(&row, "object_name")?,
+            kind: granted_kind(&text(&row, "source")?, &text(&row, "kind")?),
+            routine_oid: row.try_get::<i64>("routine_oid")?,
+            permission: text(&row, "privilege_type")?,
+            grantable: flag(&row, "is_grantable")?,
+            column: optional_text(&row, "column_name")?,
+            defaulted: flag(&row, "defaulted")?,
+            owner: text(&row, "owner")?,
+        });
+    }
+    for row in conn.query(&grant_routine_args_query()).await? {
+        raw.routine_args.push(RawModuleArg {
+            routine_oid: number(&row, "oid")?,
+            position: number(&row, "pos")?,
+            ty: text(&row, "ty")?,
+        });
+    }
+    for row in conn.query(OTHER_ACLS).await? {
+        raw.other_grants.push(RawOtherGrant {
+            grantee: optional_text(&row, "grantee")?,
+            class: text(&row, "class")?,
+            name: text(&row, "name")?,
+            permission: text(&row, "privilege_type")?,
+            grantable: flag(&row, "is_grantable")?,
+            owner: optional_text(&row, "owner")?,
+        });
+    }
+    for row in conn.query(HELD_ELSEWHERE).await? {
+        raw.held_elsewhere.push(RawSharedDependency {
+            role: text(&row, "role_name")?,
+            database: optional_text(&row, "in_database")?,
+            deptype: first_char(&text(&row, "deptype")?).unwrap_or('?'),
+            objects: number(&row, "objects")?,
+        });
+    }
+    for row in conn.query(DEFAULT_ACLS).await? {
+        raw.default_acls.push(RawDefaultAcl {
+            grantor: text(&row, "grantor")?,
+            in_schema: optional_text(&row, "in_schema")?,
+            objtype: first_char(&text(&row, "objtype")?).unwrap_or('?'),
+            acl: text(&row, "acl")?,
+        });
+    }
     for row in conn.query(&unheld_modules_query()).await? {
         let schema = text(&row, "schema_name")?;
         let name = text(&row, "name")?;
@@ -870,6 +960,300 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
     }
     Ok((raw, warnings))
 }
+
+/// The principals that could hold a grant in this database (ADR-0005).
+///
+/// The cluster's reserved namespace is left out, and by the same
+/// `left(rolname, 3)` predicate [`NOT_A_PROJECTS_SCHEMA`] uses rather than a
+/// `LIKE 'pg\_%'` whose escape depends on a setting: measured, PostgreSQL 18.6
+/// has sixteen `pg_*` roles, `CREATE ROLE pg_thing` is `role name "pg_thing"
+/// is reserved`, and `validate_role` refuses a declaration that names one. What
+/// they are granted is the cluster's business rather than this database's.
+///
+/// `pg_roles` rather than `pg_authid`: the second holds the password hashes and
+/// is superuser-only, and the pull runs as the least-privileged account it can.
+const ROLES: &str = "\
+SELECT r.rolname AS name, r.rolsuper AS superuser
+  FROM pg_catalog.pg_roles r
+ WHERE pg_catalog.left(r.rolname, 3) <> 'pg_'
+ ORDER BY r.rolname";
+
+/// Every grant in this database, one row per `(grantee, permission)` pair.
+///
+/// # `coalesce(acl, acldefault(...))`, and why the engine expands it
+///
+/// A NULL ACL is not an empty one: it means the built-in default for the
+/// object's kind, and the engine will hand it out. Measured on 18.6, a fresh
+/// function has `proacl IS NULL` and `acldefault('f', owner)` is
+/// `{=X/owner,owner=X/owner}` — PUBLIC executes it. Read as empty, `pull`
+/// would write a role holding nothing where it holds the owner's whole set,
+/// and would describe an open function as closed.
+///
+/// `acldefault` is asked rather than answered here because the answer moves
+/// with the release: `MAINTAIN` joined the relation default in PostgreSQL 17,
+/// measured `{owner=arwdDxt/owner}` on 16.15 against `{owner=arwdDxtm/owner}`
+/// on 18.6. A table of defaults written into this crate would have been wrong
+/// on one of those two servers.
+///
+/// `aclexplode` is asked for the same reason: an `aclitem`'s letters are the
+/// engine's own encoding, positional and extended by releases, and a letter
+/// this code did not know would read as no permission at all.
+///
+/// # The routine arm carries an oid, not a signature
+///
+/// The signature is assembled from [`grant_routine_args_query`]'s rows, and
+/// that is the whole point: a rendered signature has to be split to be used
+/// again, and a comma is not a separator. **Measured**, a type named
+/// `amount,type` renders as `cm."amount,type"`, so the comma that separates
+/// arguments and the comma inside one are the same character. Split, every
+/// fragment failed to parse and a valid grant on a managed routine became
+/// unexpressible — which refuses the connected plan.
+///
+/// The arguments themselves are `unnest(proargtypes)` with `format_type`, and
+/// **not** `pg_get_function_identity_arguments`: measured, that renders a
+/// procedure's argument as `IN integer`, mode and all, while
+/// [`module_args_query`] renders the same routine's identity as `integer`. A
+/// grant target has to be the identity the module pull produced or nothing
+/// matches it — the managed-set filter compares `GrantTarget::Routine` against
+/// `ModuleId::Routine`.
+///
+/// The four arms are the four catalogs that carry an ACL a declaration could
+/// name. Column grants come too (`pg_attribute.attacl`), because the object's
+/// own ACL does not show them — measured, after `GRANT SELECT (a) ON m9.v`,
+/// `relacl` is NULL — and a reader that only asked the object would report a
+/// role as holding nothing on a table it can read a column of.
+fn grants_query() -> String {
+    format!(
+        "SELECT n.nspname AS schema_name, c.relname AS object_name,
+                'rel' AS source, c.relkind::text AS kind,
+                NULL::int8 AS routine_oid, NULL::text AS column_name,
+                CASE WHEN a.grantee = 0 THEN NULL
+                     ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
+                a.privilege_type, a.is_grantable,
+                c.relacl IS NULL AS defaulted,
+                pg_catalog.pg_get_userbyid(c.relowner) AS owner
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           CROSS JOIN LATERAL pg_catalog.aclexplode(
+                COALESCE(c.relacl, pg_catalog.acldefault(
+                    (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))) AS a
+          WHERE {NOT_AN_INDEX_OR_TOAST}
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {NOT_ONE_OF_OUR_TABLES}
+         UNION ALL
+         SELECT n.nspname, c.relname, 'rel', c.relkind::text,
+                NULL::int8, at.attname,
+                CASE WHEN a.grantee = 0 THEN NULL
+                     ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+                a.privilege_type, a.is_grantable,
+                false, pg_catalog.pg_get_userbyid(c.relowner)
+           FROM pg_catalog.pg_attribute at
+           JOIN pg_catalog.pg_class c ON c.oid = at.attrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           CROSS JOIN LATERAL pg_catalog.aclexplode(at.attacl) AS a
+          WHERE at.attacl IS NOT NULL
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {NOT_ONE_OF_OUR_TABLES}
+         UNION ALL
+         SELECT n.nspname, p.proname, 'pro', p.prokind::text,
+                p.oid::int8, NULL::text,
+                CASE WHEN a.grantee = 0 THEN NULL
+                     ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+                a.privilege_type, a.is_grantable,
+                p.proacl IS NULL, pg_catalog.pg_get_userbyid(p.proowner)
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+           CROSS JOIN LATERAL pg_catalog.aclexplode(
+                COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))) AS a
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+         UNION ALL
+         SELECT n.nspname, NULL::text, 'nsp', '',
+                NULL::int8, NULL::text,
+                CASE WHEN a.grantee = 0 THEN NULL
+                     ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+                a.privilege_type, a.is_grantable,
+                n.nspacl IS NULL, pg_catalog.pg_get_userbyid(n.nspowner)
+           FROM pg_catalog.pg_namespace n
+           CROSS JOIN LATERAL pg_catalog.aclexplode(
+                COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))) AS a
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+         ORDER BY 1, 2, 6, 7, 8"
+    )
+}
+
+/// The `pg_class` rows that can carry a grant at all.
+///
+/// An index and a TOAST table cannot: they have no `GRANT` of their own, and
+/// the permission that reaches them is the one on the table they belong to.
+/// Everything else is here — including the three this model does not declare —
+/// because a grant on one of them is a real grant a role really holds, and
+/// **measured**, `GRANT SELECT ON mk.mv` (a materialized view) and
+/// `GRANT SELECT ON mk.parent` (a partitioned table) both land in `relacl`. A
+/// filter that named only the declarable kinds reported the role as holding
+/// nothing there, which is *absent* reading as *empty*.
+const NOT_AN_INDEX_OR_TOAST: &str = "c.relkind NOT IN ('i', 'I', 't')";
+
+/// The argument types of every routine a grant can name, one row per
+/// argument, in order.
+///
+/// [`module_args_query`]'s wider twin. That one is filtered to the routines
+/// this model declares; a grant may be on any routine at all — an aggregate,
+/// an extension's function — and the reader has to be able to say what it is
+/// on before it can say the model cannot hold it.
+///
+/// `proargtypes` rather than `proallargtypes`, matching the module pull: it is
+/// the `IN` and `INOUT` types, which is what the engine's own identity for a
+/// routine is made of.
+fn grant_routine_args_query() -> String {
+    format!(
+        "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
+                pg_catalog.format_type(u.ty, NULL) AS ty
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes)
+                    WITH ORDINALITY AS u(ty, pos)
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+          ORDER BY 1, 2"
+    )
+}
+
+/// Every grant in a catalog whose target the model cannot name (see
+/// [`RawOtherGrant`], which lists the fourteen `aclitem[]` columns and why
+/// each is here or is not).
+///
+/// Reported, never compared. A role that gained `USAGE ON LANGUAGE c` out of
+/// band has changed, and a reader that only looked at the catalogs it *can*
+/// name would compare the rest and call it clean — the failure DECISIONS 105
+/// records on the other engine.
+///
+/// `pg_default_acl` is read by [`DEFAULT_ACLS`] instead, because it is not a
+/// grant on anything that exists. `pg_init_privs` is not read at all: it holds
+/// what an extension's objects had at *install*, which is a record of the past
+/// and not a live permission. `pg_tablespace` is not read either — a
+/// tablespace is a cluster object, and what holds a role across the cluster is
+/// [`HELD_ELSEWHERE`]'s question.
+///
+/// `pg_database` is filtered to **this** database: `CONNECT`, `TEMP` or
+/// `CREATE` on the one being deployed to is a fact about this deployment,
+/// while the same on another is that database's business.
+///
+/// Each arm carries its object's **owner**, for the same reason the ordinary
+/// ACL read does (DECISIONS 371): these columns are NULL until somebody
+/// touches them, and the moment one is touched the engine writes the owner's
+/// own inherent entry beside the change — measured on 18.6, `REVOKE USAGE ON
+/// TYPE ot.money_kind FROM PUBLIC` turns a NULL `typacl` into
+/// `{ot_owner=U/ot_owner}`. Read as a grant, that entry says a managed role
+/// holds something unnameable and refuses every plan connected to it, where
+/// nothing was granted at all.
+const OTHER_ACLS: &str = "\
+SELECT 'a type' AS class, pg_catalog.format_type(t.oid, NULL) AS name,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(t.typowner) AS owner
+  FROM pg_catalog.pg_type t
+  CROSS JOIN LATERAL pg_catalog.aclexplode(t.typacl) AS a
+ UNION ALL
+SELECT 'a procedural language', l.lanname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(l.lanowner)
+  FROM pg_catalog.pg_language l
+  CROSS JOIN LATERAL pg_catalog.aclexplode(l.lanacl) AS a
+ UNION ALL
+SELECT 'a foreign data wrapper', w.fdwname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(w.fdwowner)
+  FROM pg_catalog.pg_foreign_data_wrapper w
+  CROSS JOIN LATERAL pg_catalog.aclexplode(w.fdwacl) AS a
+ UNION ALL
+SELECT 'a foreign server', s.srvname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(s.srvowner)
+  FROM pg_catalog.pg_foreign_server s
+  CROSS JOIN LATERAL pg_catalog.aclexplode(s.srvacl) AS a
+ UNION ALL
+SELECT 'a configuration parameter', p.parname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable,
+       -- `pg_parameter_acl` has no owner column: a configuration parameter
+       -- belongs to nobody, so no entry in it can be the zero point.
+       NULL::name
+  FROM pg_catalog.pg_parameter_acl p
+  CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a
+ UNION ALL
+SELECT 'a large object', m.oid::text,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(m.lomowner)
+  FROM pg_catalog.pg_largeobject_metadata m
+  CROSS JOIN LATERAL pg_catalog.aclexplode(m.lomacl) AS a
+ UNION ALL
+SELECT 'this database', d.datname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(d.datdba)
+  FROM pg_catalog.pg_database d
+  CROSS JOIN LATERAL pg_catalog.aclexplode(d.datacl) AS a
+ WHERE d.datname = pg_catalog.current_database()
+ ORDER BY 1, 2, 3, 4";
+
+/// What holds a role **outside this database** (ADR-0010 §4).
+///
+/// Its own query, and the only read here that is not about this database at
+/// all. `pg_shdepend` is a shared catalog: it has a row per dependency on a
+/// role, keyed by the database the dependent lives in — and measured, a role
+/// with every grant *here* revoked is still refused a `DROP ROLE` with
+/// `DETAIL: 1 object in database otherdb`. So a report built from this
+/// database's own catalog would say "nothing is stopping it" and be wrong,
+/// which is the member of *absent, empty and unreadable* that reads as good
+/// news.
+///
+/// Rows for **this** database are excluded on purpose: what holds a role here
+/// is in the grants the rest of this file already reads, and repeating it
+/// would bury the one fact only this query has. The objects cannot be named
+/// either way — their oids belong to another database's catalog — so what
+/// comes back is the database and a count.
+///
+/// `pg_shdepend` is world-readable, so a least-privileged deployment account
+/// gets the same answer a superuser does.
+const HELD_ELSEWHERE: &str = "\
+SELECT pg_catalog.pg_get_userbyid(sd.refobjid) AS role_name,
+       d.datname AS in_database,
+       sd.deptype::text AS deptype,
+       count(*)::int8 AS objects
+  FROM pg_catalog.pg_shdepend sd
+  LEFT JOIN pg_catalog.pg_database d ON d.oid = sd.dbid
+ WHERE sd.refclassid = 'pg_catalog.pg_authid'::regclass
+   AND (d.datname IS NULL OR d.datname <> pg_catalog.current_database())
+   AND pg_catalog.left(pg_catalog.pg_get_userbyid(sd.refobjid), 3) <> 'pg_'
+ GROUP BY 1, 2, 3
+ ORDER BY 1, 2, 3";
+
+/// Every `ALTER DEFAULT PRIVILEGES` entry (ADR-0010 §2).
+///
+/// **Not filtered to the deploying account**, unlike the one
+/// [`crate::modules`] asks before a rebuild: that one answers "what would the
+/// replacement I am about to create arrive with", and this one answers "what
+/// standing instructions does this database carry". An entry belonging to
+/// another role is exactly the fact §2 is about — two declarations that read
+/// identically mean different things, and the difference is who runs the plan.
+const DEFAULT_ACLS: &str = "\
+SELECT pg_catalog.pg_get_userbyid(da.defaclrole) AS grantor,
+       n.nspname AS in_schema,
+       da.defaclobjtype::text AS objtype,
+       da.defaclacl::text AS acl
+  FROM pg_catalog.pg_default_acl da
+  LEFT JOIN pg_catalog.pg_namespace n ON n.oid = da.defaclnamespace
+ ORDER BY 1, 2, 3";
 
 /// The one failure the snapshot cannot prevent, named so that it does not
 /// arrive as a mystery.
@@ -1036,6 +1420,19 @@ fn small(row: &Row, column: &str) -> Result<i32, DbError> {
 
 fn flag(row: &Row, column: &str) -> Result<bool, DbError> {
     row.try_get::<bool>(column)?.ok_or_else(|| missing(column))
+}
+
+/// The catalog a grant row came from, and that catalog's kind letter.
+///
+/// The two alphabets overlap — `relkind` `f` is a foreign table and `prokind`
+/// `f` is a function — so the query says which it is, and this keeps the two
+/// apart by construction rather than by a comment nobody re-reads.
+fn granted_kind(source: &str, kind: &str) -> GrantedKind {
+    match source {
+        "rel" => GrantedKind::Relation(first_char(kind).unwrap_or('?')),
+        "pro" => GrantedKind::Routine(first_char(kind).unwrap_or('?')),
+        _ => GrantedKind::Schema,
+    }
 }
 
 fn first_char(s: &str) -> Option<char> {
@@ -1259,6 +1656,32 @@ mod tests {
             NOT_ONE_OF_OURS.matches('\'').count(),
             OURS.len() * 2,
             "the filter names something `OURS` does not: {NOT_ONE_OF_OURS}"
+        );
+    }
+
+    /// The grants query hides the ledger by name **and** by kind, because the
+    /// ledger is two tables and `modules_query` keeps a view whatever it is
+    /// called. Hiding a view's ACL row instead pulls the view and drops the
+    /// grant on it, which no plan can then reach.
+    #[test]
+    fn the_grants_query_hides_the_ledger_by_kind_as_well_as_by_name() {
+        let sql = grants_query();
+        assert!(sql.contains(NOT_ONE_OF_OUR_TABLES), "{sql}");
+        // And not the kindless filter, which is what over-applied it.
+        assert!(
+            !sql.contains(&format!("AND {NOT_ONE_OF_OURS}")),
+            "the grants query still filters every relkind by name: {sql}"
+        );
+        for name in OURS {
+            assert!(
+                NOT_ONE_OF_OUR_TABLES.contains(&format!("'{name}'")),
+                "`{name}` is hidden from the inventory and not from the grants"
+            );
+        }
+        assert_eq!(
+            NOT_ONE_OF_OUR_TABLES.matches('\'').count(),
+            OURS.len() * 2 + 2,
+            "the two names, and the `r` that says which kind: {NOT_ONE_OF_OUR_TABLES}"
         );
     }
 }

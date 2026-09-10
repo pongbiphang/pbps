@@ -357,10 +357,10 @@ What a connected plan has to know before it rebuilds one is read from the
 catalog and not from a list: an ACL, a revocation from `PUBLIC` that is the
 *absence* of a row, an owner a rebuild would transfer, `reloptions`, a view
 column default in `pg_attrdef`, a trigger's `tgenabled`, and the grants a *new*
-object would arrive with from `pg_default_acl`. Every one of them refuses today,
-because roles and grants are step 6 and there is no declared grant for one to
-come back from; step 6 narrows that and ADR-0010 §5 keeps `PUBLIC` on the
-refusing side for good (DECISIONS 306). The read is taken under the object's own
+object would arrive with from `pg_default_acl`. Every one of them still refuses:
+step 6 made a grant to a declared role expressible, and what re-emits it after
+the `CREATE` is #248 — and ADR-0010 §5 keeps `PUBLIC` on the refusing side for
+good whatever that lands (DECISIONS 306). The read is taken under the object's own
 lock where the account can take one — a view's own, a trigger's parent table's,
 a routine's `pg_proc` row lock — and says so where nothing serialized it, which
 is the honest answer for the accounts this tool is built for. The dependency
@@ -496,6 +496,58 @@ binary until step 10 wires it. Everything above is covered by the dialect's own
 live suite instead. Composite keys remain deferred, as in ADR-0004.
 
 What remains is steps 6, 9 and 10: roles, probes, and the suite in full.
+**Step 6 is in**: roles and privileges (issue #81, DECISIONS 370–375). The
+principal is the *cluster's*, so `manages_roles` answers `false` and the differ
+builds no `CreateRole`, `DropRole` or `RenameRole` at all on such a dialect — a
+declared role is granted rather than created, because refusing it would refuse
+the only way a role ever comes under management here; a dropped role has its
+grants revoked and is left standing; a rename emits nothing, because an ACL
+entry holds the role's oid and every grant already followed it — behind a
+connected check whose evidence is the **old** name's absence, since with both
+names in the cluster they are two principals and an empty plan would record the
+wrong one as holding the grants (DECISIONS 377). The emitter
+keeps all five arms and the three it refuses name the statement a human runs.
+
+`validate_role` lands ADR-0010 §1, §2 and §6 offline: a grant in a schema the
+role has no `usage` on is a **refusal**, because the plan applies cleanly and
+the role still cannot read the table; a table permission on a `schema::` target
+is refused naming the object grants to write, because
+`GRANT … ON ALL TABLES IN SCHEMA` is one-shot and `ALTER DEFAULT PRIVILEGES`
+covers only what one role creates; and the two words this engine lacks are
+refused by name, as is a bare object name for an overloaded routine.
+
+The read-back's finding is that the engine's **default** is the zero point and
+not drift (DECISIONS 371). A NULL ACL is expanded with the engine's own
+`acldefault` — never a table written here, which would have been wrong on one
+of the two servers the suite now runs — and an entry out of that default, or
+one whose grantee is the object's owner, is reported rather than compared:
+counted as grants, the plan after a successful apply would revoke what the
+apply had just produced. `PUBLIC` is context both ways, including the half that
+is the *absence* of a row.
+
+Sweeping that read found two holes of one shape (DECISIONS 376). The relation
+arm filtered to the kinds the model declares, and measured, a `GRANT SELECT` on
+a materialized view or a partitioned table lands in `relacl` all the same — so
+a role read as holding nothing there. Widening it exposed the second:
+`pg_class.relkind` and `pg_proc.prokind` overlap, `f` being a foreign table in
+one alphabet and a function in the other, so a grant on a foreign table would
+have come back as a grant on a *function* of that name. The catalogs are now
+enumerated from the engine — PostgreSQL 18 has fourteen `aclitem[]` columns —
+and the eight whose targets no declaration can name are reported rather than
+dropped, with a live test that fails when a release adds a fifteenth. A third
+of the same family came from review: a routine's arguments now travel as rows
+rather than as a rendered signature, because a type named `amount,type` puts
+the argument separator inside an argument (DECISIONS 378).
+
+Two costs the rules imposed rather than the code: the live suite and the
+`live-pg` CI job now start a pinned PostgreSQL **16** beside the pinned 18,
+because `maintain` arrived in 17 and no single server can show both halves; and
+every test in that section acts through a `LOGIN` role, because a superuser
+does not consult an ACL at all. None of it is reached by a command yet — the
+CLI still refuses the dialect.
+
+What remains is steps 7, 9 and 10: reference data, probes, and the suite in
+full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

@@ -1,0 +1,888 @@
+//! What PostgreSQL will refuse about a role, checked before anything connects.
+//!
+//! The counterpart of `pbps-mssql/src/validate.rs`'s role half, and the place
+//! [ADR-0010](../../../docs/ADR-0010-postgres-privileges.md) §1, §2 and §6
+//! land. Every rule here is a rule of the engine, measured on 18.6; a matter
+//! of taste is not a rule and does not belong in an error.
+//!
+//! # Why the schema grant is a refusal and not a warning
+//!
+//! PostgreSQL checks the *schema* before it looks at the object. A role
+//! granted `SELECT` on a table in a schema it has no `USAGE` on holds a
+//! permission the engine will never consult: measured, `has_table_privilege`
+//! answers `t` while the very same role's `SELECT` is
+//! `permission denied for schema app` (ADR-0010 §1). That is a declaration
+//! whose plan applies cleanly and leaves the role unable to reach what it was
+//! granted — the failure this project exists to make loud — so it is refused
+//! where the user has the file open, with the line to add.
+
+use std::collections::BTreeSet;
+
+use pbps_dialect::DialectError;
+use pbps_model::{GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema};
+
+use crate::quote;
+use crate::types::DIALECT;
+
+fn invalid(message: impl Into<String>) -> DialectError {
+    DialectError::Invalid {
+        dialect: DIALECT,
+        message: message.into(),
+    }
+}
+
+/// The permissions PostgreSQL has, among the words the model spells
+/// (ADR-0010 §6). The union minus SQL Server's two: measured on 18.6,
+/// `GRANT ALTER ON app.customer TO r` is
+/// `ERROR: unrecognized privilege type "alter"` and `VIEW DEFINITION` is a
+/// syntax error at `DEFINITION` — on an object and on a schema alike, so
+/// neither is a permission this engine has anywhere.
+///
+/// `maintain` **is** in this list. Whether the server has it is a question
+/// about the server, not about the word: it arrived in PostgreSQL 17, the
+/// model holds no server version, and the check therefore belongs to the
+/// connected path ([`crate::roles::unsupported_permissions`]) rather than here
+/// (ADR-0010 amendment).
+pub(crate) const PERMISSIONS: [Permission; 11] = [
+    Permission::Select,
+    Permission::Insert,
+    Permission::Update,
+    Permission::Delete,
+    Permission::References,
+    Permission::Execute,
+    Permission::Usage,
+    Permission::Create,
+    Permission::Truncate,
+    Permission::Trigger,
+    Permission::Maintain,
+];
+
+/// Whether PostgreSQL has `p` at all, on any target.
+pub(crate) fn has_permission(p: Permission) -> bool {
+    PERMISSIONS.contains(&p)
+}
+
+/// The words this engine has, for a message.
+pub(crate) fn permission_words() -> String {
+    PERMISSIONS
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The permissions the engine defines on a schema. Measured:
+/// `GRANT SELECT ON SCHEMA app TO r` is
+/// `ERROR: invalid privilege type SELECT for schema`, and
+/// `GRANT USAGE, CREATE ON SCHEMA app` is accepted and reads back as `UC`.
+const SCHEMA_PERMISSIONS: [Permission; 2] = [Permission::Usage, Permission::Create];
+
+/// PostgreSQL's own name for "everyone", which is not a role a declaration may
+/// name.
+///
+/// Measured, and the quoting is the trap: `GRANT INSERT ON gr.t TO "public"` —
+/// quoted, the way every identifier this emitter writes is quoted — grants to
+/// PUBLIC (`=a/postgres` in the ACL), while `CREATE ROLE "public"` is
+/// `role name "public" is reserved`. So a role declared under that name is not
+/// a role at all: pbps would compare a set of grants against every principal
+/// in the cluster, and a `GRANT` it wrote would open the object to all of
+/// them. `"Public"` is an ordinary role and is left alone — measured, it lands
+/// in the ACL as `Public=d/postgres`.
+const PUBLIC: &str = "public";
+
+/// The schema every principal can enter without holding a grant on it.
+///
+/// It is the same word, and for a related reason: `initdb` grants `USAGE` on
+/// the schema `public` to PUBLIC in every database it makes. **Measured on
+/// 18.6**, `pg_namespace.nspacl` for it is
+/// `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}` — the second
+/// entry is PUBLIC's `USAGE`, and it is not `acldefault`'s doing
+/// (`acldefault('n', ...)` is `{owner=UC/owner}` alone) but the state every
+/// database starts in. A role holding only `SELECT` on `public.pubt` reads it
+/// with no schema grant at all, measured.
+///
+/// So §1's rule — a grant in a schema the role cannot enter reaches nothing —
+/// does not hold here, and applying it refused every project whose tables live
+/// where PostgreSQL puts them by default, including the one `pull` writes from
+/// such a database.
+///
+/// A DBA who revokes that `USAGE` makes this check say nothing where it would
+/// have had something to say. That is the limit this check already has: `USAGE`
+/// can also arrive through a membership, which is never declared, compared or
+/// touched (ADR-0005), so what it catches is the ordinary mistake — a project's
+/// own schema with no `usage` line — and not every unreachable grant there is.
+/// What PUBLIC holds on a schema is reported by `pull` as context (ADR-0010
+/// §5, DECISIONS 383).
+const REACHABLE_WITHOUT_A_GRANT: &str = "public";
+
+/// What a grant target is, among the kinds this model can declare.
+///
+/// A trigger is missing on purpose: measured, `GRANT SELECT ON gr.gr_trg` is
+/// `relation "gr.gr_trg" does not exist` — a trigger is not a securable on
+/// this engine, and it is not an [`ObjectName`] either
+/// ([`ModuleId::referenced_name`] answers `None` for one), so the model refuses
+/// the target before this file sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Table,
+    View,
+    Function,
+    Procedure,
+}
+
+impl TargetKind {
+    /// The permissions the engine defines on this kind, among the ones a
+    /// declaration can name. Measured on 18.6, every word against every kind:
+    /// a table and a view take the same eight, and a function and a procedure
+    /// take `EXECUTE` and nothing else.
+    const fn permissions(self) -> &'static [Permission] {
+        use Permission::*;
+        match self {
+            TargetKind::Table | TargetKind::View => &[
+                Select, Insert, Update, Delete, References, Truncate, Trigger, Maintain,
+            ],
+            TargetKind::Function | TargetKind::Procedure => &[Execute],
+        }
+    }
+
+    const fn article(self) -> &'static str {
+        match self {
+            TargetKind::Table => "a table",
+            TargetKind::View => "a view",
+            TargetKind::Function => "a function",
+            TargetKind::Procedure => "a procedure",
+        }
+    }
+}
+
+/// What the declarations say `object` is, or why the name does not identify
+/// one thing.
+///
+/// `Ok(None)` is "the declarations do not have it" — the model's own finding
+/// ([`pbps_model::role::check`]), not this one's, and reporting it twice would
+/// have the user fix one message and see the other.
+///
+/// **Which namespace a bare name means is read off the permissions**, exactly
+/// as [`crate::emit`]'s `securable` reads it. PostgreSQL keeps relations and
+/// routines in two namespaces and a name may be in both — measured on 18.6, a
+/// table `co.f` and a function `co.f(integer)` coexist, `GRANT SELECT ON TABLE
+/// co.f` reaches the table and `GRANT EXECUTE ON ROUTINE co.f` reaches the
+/// routine. Answering "a table" for both would refuse the second, which is a
+/// grant this engine runs (DECISIONS 379).
+fn target_kind(
+    object: &ObjectName,
+    permissions: &BTreeSet<Permission>,
+    schema: &Schema,
+) -> Result<Option<TargetKind>, DialectError> {
+    // A relation of that name, if the declarations have one. Not consulted
+    // first when `EXECUTE` is asked for: the emitter would write `ON ROUTINE`
+    // there, and the routine is what the grant reaches.
+    let relation = || {
+        if schema.tables.contains_key(object) {
+            return Some(TargetKind::Table);
+        }
+        schema
+            .modules
+            .iter()
+            .find(|(id, m)| {
+                m.kind == ModuleKind::View && id.referenced_name().as_ref() == Some(object)
+            })
+            .map(|_| TargetKind::View)
+    };
+    if !permissions.contains(&Permission::Execute)
+        && let Some(kind) = relation()
+    {
+        return Ok(Some(kind));
+    }
+    let answering: Vec<(&ModuleId, ModuleKind)> = schema
+        .modules
+        .iter()
+        .filter(|(id, _)| matches!(id, ModuleId::Routine(_)))
+        .filter(|(id, _)| id.referenced_name().as_ref() == Some(object))
+        .map(|(id, m)| (id, m.kind))
+        .collect();
+    // Overloading is why `GrantTarget::Routine` exists (ADR-0009 §1), and a
+    // bare name is not that identity — so on this engine a routine is granted
+    // on by signature and by nothing else, however few overloads there are
+    // today.
+    //
+    // **Not only the ambiguous case.** With one overload the engine takes the
+    // bare `GRANT EXECUTE ON ROUTINE gr.f` happily, and the plan still never
+    // converges: `pull` reads every routine grant back out of `pg_proc` as
+    // `app.f(integer)` — the signature is all the catalog has — so a
+    // declaration spelling it `app.f` differs from the state on every
+    // comparison, and each plan revokes the signature and grants the bare name
+    // again for ever. The mirror of this is refused on the other engine, where
+    // nothing overloads and a signature is the spelling its catalog cannot
+    // produce (`pbps_mssql::validate::role`).
+    //
+    // (DECISIONS 381.) The two overloads case says more, because there the
+    // statement fails as well: measured, `GRANT EXECUTE ON ROUTINE gr.f` on an overloaded name is
+    // `routine name "gr.f" is not unique`, with the engine's own hint to name
+    // the argument list — after everything ordered before it has run.
+    if !answering.is_empty() {
+        let mut signatures: Vec<String> = answering
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        signatures.sort();
+        return Err(invalid(if signatures.len() == 1 {
+            format!(
+                "`{object}` is a routine, which this engine identifies by its signature and not \
+                 by its name (ADR-0009 §1): `pull` reads the grant back as `{}`, so a declaration \
+                 spelling it `{object}` would differ from the database on every plan and each \
+                 plan would revoke and re-grant it. Write `{}` instead",
+                signatures[0], signatures[0]
+            )
+        } else {
+            format!(
+                "`{object}` names {} overloads, so PostgreSQL cannot tell which one this grant is \
+                 on (`routine name \"{object}\" is not unique`); write the signature instead — \
+                 one of {}",
+                answering.len(),
+                signatures.join(", ")
+            )
+        }));
+    }
+    // `EXECUTE` on a name the declarations hold only as a relation: the kind
+    // is the relation's, so the message below names what it actually is.
+    Ok(relation())
+}
+
+/// What the declarations say the routine at this exact signature is.
+///
+/// `None` is "the declarations do not have it", which is the model's finding
+/// (`pbps_model::role::check`) and not this one's.
+fn routine_kind(routine: &pbps_model::RoutineId, schema: &Schema) -> Option<TargetKind> {
+    let (_, module) = schema
+        .modules
+        .iter()
+        .find(|(id, _)| matches!(id, ModuleId::Routine(other) if other == routine))?;
+    Some(match module.kind {
+        ModuleKind::Procedure => TargetKind::Procedure,
+        ModuleKind::View | ModuleKind::Function | ModuleKind::Trigger => TargetKind::Function,
+    })
+}
+
+/// Every problem with a role (ADR-0005, ADR-0010).
+///
+/// The names have to be ones this dialect can write, each permission has to be
+/// one this engine has at all (§6) and then one the engine defines on what the
+/// target *is*, and a grant on an object has to come with the `USAGE` that
+/// makes it reach anything (§1).
+///
+/// Returns one error per problem, all of them: a role with three unspellable
+/// grants should need one pass.
+pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+    if let Err(e) = quote(name) {
+        errs.push(e);
+    }
+    if name == PUBLIC {
+        errs.push(invalid(format!(
+            "`{PUBLIC}` is PostgreSQL's name for every principal in the cluster, not a role: \
+             `CREATE ROLE \"{PUBLIC}\"` is refused as reserved, and a `GRANT ... TO \"{PUBLIC}\"` \
+             — quoted, as this emitter writes every name — opens the object to all of them. \
+             Declare a role of your own and grant to that; what PUBLIC holds is reported by \
+             `pull` as context and never managed (ADR-0010 §5)"
+        )));
+    }
+    // `pg_` is the engine's own prefix: measured, `CREATE ROLE pg_thing` is
+    // `role name "pg_thing" is reserved`. Nothing here creates a role
+    // (`manages_roles` is false), so the refusal is not about the `CREATE` —
+    // it is that the sixteen `pg_*` roles are the cluster's predefined ones,
+    // whose membership and grants are the DBA's and not this project's.
+    if name.starts_with("pg_") {
+        errs.push(invalid(format!(
+            "`{name}` is in PostgreSQL's reserved `pg_` namespace, which holds the cluster's \
+             predefined roles; the engine refuses `CREATE ROLE` on such a name, and what those \
+             roles are granted is the cluster's business rather than this database's \
+             (ADR-0010 §3)"
+        )));
+    }
+
+    // The schemas this role holds `USAGE` on, from its own declaration. A
+    // membership could supply it too — and membership is deliberately never
+    // declared, compared or touched (ADR-0005), so it is not a fact this file
+    // could read even if it wanted to.
+    let usable: BTreeSet<&str> = role
+        .grants
+        .iter()
+        .filter(|(_, permissions)| permissions.contains(&Permission::Usage))
+        .filter_map(|(target, _)| match target {
+            GrantTarget::Schema(s) => Some(s.as_str()),
+            GrantTarget::Object(_) | GrantTarget::Routine(_) => None,
+        })
+        .collect();
+
+    for (target, permissions) in &role.grants {
+        let parts: Vec<&str> = match target {
+            GrantTarget::Object(o) => vec![&o.schema, &o.name],
+            GrantTarget::Routine(r) => vec![&r.name.schema, &r.name.name],
+            GrantTarget::Schema(s) => vec![s],
+        };
+        for part in parts {
+            if let Err(e) = quote(part) {
+                errs.push(e);
+            }
+        }
+        // A schema the pull does not read. The engine takes the grant —
+        // measured, `GRANT USAGE ON SCHEMA information_schema TO r` runs — and
+        // the reader skips those schemas because they are the engine's own and
+        // not a project's (`crate::catalog::a_projects_schema`). The grant
+        // would then come back as absent: the apply's own read-back would
+        // refuse it for not having achieved what it asked, and every plan after
+        // it would propose the same `GRANT` again. Refused here, where the
+        // remedy is a line in a file.
+        let schema_of = target.schema();
+        if !crate::catalog::a_projects_schema(schema_of) {
+            errs.push(invalid(format!(
+                "role `{name}`: `{target}` is in schema `{schema_of}`, which is the engine's \
+                 own and not a project's: `pg_catalog`, `information_schema` and every `pg_` \
+                 schema are left out of the pull, so a grant there reads back as absent and \
+                 every plan would propose it again (DECISIONS 385). Grant in a schema this \
+                 project declares"
+            )));
+            continue;
+        }
+        // A word the model spells for the other engine (§6). Refused by name,
+        // on any target — the engine's parser stops at the word before it
+        // looks at the target — and left out of the kind check below, which
+        // would otherwise report the same grant twice.
+        for p in permissions.iter().filter(|p| !has_permission(**p)) {
+            errs.push(invalid(format!(
+                "role `{name}`: `{}` on `{target}` is not a permission PostgreSQL has; it is SQL \
+                 Server's (ADR-0010 §6), and this engine takes {}",
+                p.as_str(),
+                permission_words()
+            )));
+        }
+        let engine_words = || permissions.iter().copied().filter(|p| has_permission(*p));
+
+        match target {
+            // §2. A `schema::` grant means "present and future" on SQL Server,
+            // and PostgreSQL has no such thing to mean: `GRANT SELECT ON ALL
+            // TABLES IN SCHEMA` is one-shot — measured, a table created after
+            // it is not covered — and `ALTER DEFAULT PRIVILEGES` covers only
+            // what *one* role goes on to create, which makes who runs the plan
+            // part of what the declaration means. Refused rather than
+            // approximated by either: the two spellings would read identically
+            // in the file and differ in the database.
+            GrantTarget::Schema(s) => {
+                for p in engine_words().filter(|p| !SCHEMA_PERMISSIONS.contains(p)) {
+                    errs.push(invalid(format!(
+                        "role `{name}`: `{}` on `{target}` is not a permission PostgreSQL defines \
+                         on a schema (`invalid privilege type {} for schema`), which takes only \
+                         {}. On this engine a schema grant does not carry to the objects in it: \
+                         `GRANT ... ON ALL TABLES IN SCHEMA` applies once to what is there now, \
+                         and `ALTER DEFAULT PRIVILEGES` covers only what one role creates \
+                         afterwards (ADR-0010 §2). Grant `{}` on each object instead, and keep \
+                         `schema::{s}: [usage]` so the role can reach them",
+                        p.as_str(),
+                        p.as_str().to_ascii_uppercase(),
+                        SCHEMA_PERMISSIONS
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" and "),
+                        p.as_str(),
+                    )));
+                }
+            }
+            GrantTarget::Object(_) | GrantTarget::Routine(_) => {
+                let schema_of = target.schema();
+                // §1, and it is checked once per target rather than once per
+                // permission: a grant with three permissions on a schema the
+                // role cannot enter is one mistake.
+                if !usable.contains(schema_of) && schema_of != REACHABLE_WITHOUT_A_GRANT {
+                    errs.push(invalid(format!(
+                        "role `{name}`: `{target}` is granted in schema `{schema_of}`, which this \
+                         role has no `usage` on — PostgreSQL checks the schema before the object, \
+                         so every permission here reaches nothing and the role's own query is \
+                         `permission denied for schema {schema_of}` (ADR-0010 §1, measured). Add \
+                         `schema::{schema_of}: [usage]` to this role"
+                    )));
+                }
+                let kind = match target {
+                    GrantTarget::Object(o) => match target_kind(o, permissions, schema) {
+                        Ok(kind) => kind,
+                        Err(e) => {
+                            errs.push(e);
+                            continue;
+                        }
+                    },
+                    // A signature names one overload, so the schema answers
+                    // directly. `EXECUTE` is the only permission either kind
+                    // takes, but which kind it is decides what the message
+                    // calls it — and a message that told an operator their
+                    // procedure was a function would be one more thing to
+                    // disbelieve.
+                    GrantTarget::Routine(r) => routine_kind(r, schema),
+                    GrantTarget::Schema(_) => unreachable!("matched above"),
+                };
+                let Some(kind) = kind else { continue };
+                for p in engine_words().filter(|p| !kind.permissions().contains(p)) {
+                    errs.push(invalid(format!(
+                        "role `{name}`: `{}` does not apply to `{target}`, {}: the engine refuses \
+                         that GRANT, and it would refuse it on a database the changes before it \
+                         had already altered. {} takes {}",
+                        p.as_str(),
+                        kind.article(),
+                        kind.article(),
+                        kind.permissions()
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    }
+    errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{Module, ModuleKind, RoutineArg, RoutineId, Table};
+
+    /// A schema with one table, one view, one procedure and two overloads of
+    /// one function — the shapes a grant can name, and the one that is not an
+    /// identity.
+    fn declarations() -> Schema {
+        let mut schema = Schema::default();
+        schema.tables.insert(
+            "app.customer".parse().expect("a table name parses"),
+            Table::default(),
+        );
+        let mut module = |id: &str, kind: ModuleKind| {
+            schema.modules.insert(
+                id.parse().expect("a module id parses"),
+                Module {
+                    kind,
+                    description: None,
+                    definition: "SELECT 1".to_owned(),
+                },
+            );
+        };
+        module("app.recent", ModuleKind::View);
+        module("app.archive(integer)", ModuleKind::Procedure);
+        module("app.f(integer)", ModuleKind::Function);
+        module("app.f(text)", ModuleKind::Function);
+        module("app.solo(integer)", ModuleKind::Function);
+        // A name in both namespaces. **Measured on 18.6**: a table `co.f` and
+        // a function `co.f(integer)` coexist, and each takes its own GRANT.
+        schema.tables.insert(
+            "app.both".parse().expect("a table name parses"),
+            Table::default(),
+        );
+        module("app.both(integer)", ModuleKind::Function);
+        schema
+    }
+
+    fn granting(pairs: &[(&str, &[Permission])]) -> Role {
+        let mut role = Role::default();
+        for (target, permissions) in pairs {
+            role.grants.insert(
+                target.parse().expect("a grant target parses"),
+                permissions.iter().copied().collect(),
+            );
+        }
+        role
+    }
+
+    fn messages(name: &str, role: &Role) -> Vec<String> {
+        role_errors(name, role)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    fn role_errors(name: &str, role: &Role) -> Vec<DialectError> {
+        super::role(name, role, &declarations())
+    }
+
+    /// The declaration this file exists to accept. Every rule below refuses
+    /// something; a file with only refusing tests cannot tell "correct" from
+    /// "refuses everything".
+    #[test]
+    fn a_role_that_can_reach_what_it_is_granted_has_nothing_wrong_with_it() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            (
+                "app.customer",
+                &[Permission::Select, Permission::Insert, Permission::Maintain],
+            ),
+            ("app.recent", &[Permission::Select]),
+            ("app.f(integer)", &[Permission::Execute]),
+            ("app.archive(integer)", &[Permission::Execute]),
+            ("app.solo(integer)", &[Permission::Execute]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// Relations and routines are two namespaces on this engine and a name may
+    /// be in both. **Measured on 18.6**: with a table `co.f` and a function
+    /// `co.f(integer)` in place, `GRANT SELECT ON TABLE co.f` reaches the
+    /// table and `GRANT EXECUTE ON ROUTINE co.f` reaches the routine. Which
+    /// one a bare target means is read off the permissions — the same answer
+    /// [`crate::emit`] writes into the statement — so calling it a table
+    /// whenever a table of that name exists refused a grant this engine runs.
+    #[test]
+    fn a_bare_name_in_both_namespaces_is_read_off_the_permissions() {
+        let both = |permissions: &[Permission]| {
+            granting(&[
+                ("schema::app", &[Permission::Usage]),
+                ("app.both", permissions),
+            ])
+        };
+        // A table word on the bare name is the table's, and there is nothing
+        // wrong with it.
+        let problems = messages("app_reader", &both(&[Permission::Select]));
+        assert!(problems.is_empty(), "{problems:?}");
+        // `execute` chooses the other namespace, and there the bare name is
+        // not an identity at all: refused with the signature `pull` will
+        // write. The message is the routine's, not `execute does not apply to
+        // a table`.
+        let problems = messages("app_reader", &both(&[Permission::Execute]));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("app.both(integer)"), "{}", problems[0]);
+        // And a mixed set is the routine's too — `execute` is what chooses
+        // the namespace — so it is refused as one bare routine target rather
+        // than reported as `truncate does not apply to a function`: the
+        // spelling is what is wrong with it, and the kind check never runs.
+        let problems = messages(
+            "app_reader",
+            &both(&[Permission::Execute, Permission::Truncate]),
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("app.both(integer)"), "{}", problems[0]);
+    }
+
+    /// A schema the pull does not read is a schema a declaration may not name.
+    ///
+    /// The engine takes the grant — measured, `GRANT USAGE ON SCHEMA
+    /// information_schema TO r` runs — and the reader leaves those schemas out
+    /// because they are the engine's own. The grant would come back as absent,
+    /// the apply's own read-back would refuse it, and every plan after it would
+    /// propose the same `GRANT` again.
+    #[test]
+    fn a_schema_the_pull_does_not_read_is_refused_as_a_target() {
+        for target in [
+            "schema::information_schema",
+            "schema::pg_catalog",
+            "schema::pg_toast",
+            "information_schema.tables",
+        ] {
+            let role = granting(&[
+                ("schema::app", &[Permission::Usage]),
+                (target, &[Permission::Usage]),
+            ]);
+            let problems = messages("app_reader", &role);
+            assert_eq!(problems.len(), 1, "{target}: {problems:?}");
+            assert!(
+                problems[0].contains("the engine's own"),
+                "{target}: {}",
+                problems[0]
+            );
+        }
+        // A schema whose name merely starts with `p` is a project's.
+        let role = granting(&[("schema::pga", &[Permission::Usage])]);
+        assert!(messages("app_reader", &role).is_empty());
+    }
+
+    /// The one schema §1 does not apply to. **Measured on 18.6**: a role
+    /// holding `SELECT` on `public.pubt` and nothing else reads it, because
+    /// `initdb` grants `USAGE` on `public` to PUBLIC in every database
+    /// (`nspacl` is `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`).
+    /// Requiring the usage line there refused every project whose tables live
+    /// where PostgreSQL puts them, and refused the project `pull` writes from
+    /// such a database — which no `schema::public: [usage]` grant would appear
+    /// in, because PUBLIC is not a role that can be declared.
+    #[test]
+    fn the_public_schema_needs_no_usage_line_to_be_reachable() {
+        let mut schema = declarations();
+        schema.tables.insert(
+            "public.pubt".parse().expect("a table name parses"),
+            Table::default(),
+        );
+        let mut role = Role::default();
+        role.grants.insert(
+            "public.pubt".parse().expect("a grant target parses"),
+            [Permission::Select].into_iter().collect(),
+        );
+        let problems: Vec<String> = super::role("app_reader", &role, &schema)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(problems.is_empty(), "{problems:?}");
+        // And a schema that is not `public` still needs it.
+        let mut role = Role::default();
+        role.grants.insert(
+            "app.customer".parse().expect("a grant target parses"),
+            [Permission::Select].into_iter().collect(),
+        );
+        let problems: Vec<String> = super::role("app_reader", &role, &schema)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`usage`"), "{}", problems[0]);
+    }
+
+    /// §1, and it is a refusal because the plan applies cleanly and the role
+    /// still cannot read the table: measured, `has_table_privilege` says `t`
+    /// while the role's own `SELECT` is `permission denied for schema app`.
+    #[test]
+    fn a_grant_in_a_schema_the_role_cannot_enter_is_refused_naming_the_line_to_add() {
+        let role = granting(&[("app.customer", &[Permission::Select])]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`usage`"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("schema::app: [usage]"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("permission denied for schema app"),
+            "{}",
+            problems[0]
+        );
+    }
+
+    /// One mistake, one message: a grant with three permissions on a schema
+    /// the role cannot enter is one missing `usage`, not three.
+    #[test]
+    fn the_missing_usage_is_reported_once_per_target_and_not_once_per_permission() {
+        let role = granting(&[(
+            "app.customer",
+            &[Permission::Select, Permission::Insert, Permission::Delete],
+        )]);
+        assert_eq!(messages("app_reader", &role).len(), 1);
+    }
+
+    /// `create` on the schema is not `usage` on it. The two are separate
+    /// letters in the ACL (`UC`) and only one of them opens the door.
+    #[test]
+    fn create_on_the_schema_is_not_the_usage_that_makes_a_grant_reach_anything() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Create]),
+            ("app.customer", &[Permission::Select]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("no `usage` on"), "{}", problems[0]);
+    }
+
+    /// §2. A `schema::` grant means "present and future" on the other engine
+    /// and PostgreSQL has nothing that means it, so the word is refused and
+    /// the message says what to write instead.
+    #[test]
+    fn a_table_permission_on_a_schema_target_is_refused_naming_the_object_grants() {
+        let role = granting(&[("schema::app", &[Permission::Usage, Permission::Select])]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("invalid privilege type SELECT for schema"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("ALL TABLES IN SCHEMA"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("ALTER DEFAULT PRIVILEGES"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("schema::app: [usage]"),
+            "{}",
+            problems[0]
+        );
+    }
+
+    /// §6. The two words the model holds for the other engine, refused by
+    /// name — measured, `GRANT ALTER` is `unrecognized privilege type
+    /// "alter"`, before the engine looks at the securable at all.
+    #[test]
+    fn the_two_words_this_engine_does_not_have_are_refused_by_name() {
+        for permission in [Permission::Alter, Permission::ViewDefinition] {
+            let role = granting(&[
+                ("schema::app", &[Permission::Usage]),
+                ("app.customer", &[permission]),
+            ]);
+            let problems = messages("app_reader", &role);
+            assert_eq!(problems.len(), 1, "{permission}: {problems:?}");
+            assert!(
+                problems[0].contains("is not a permission PostgreSQL has"),
+                "{}",
+                problems[0]
+            );
+            assert!(problems[0].contains("SQL Server's"), "{}", problems[0]);
+        }
+    }
+
+    /// A word this engine lacks is reported once, by name, and not a second
+    /// time as a word the kind does not take: two messages about one line
+    /// send the user to fix the same thing twice.
+    #[test]
+    fn a_word_this_engine_lacks_is_not_also_reported_against_the_kind() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.f(integer)", &[Permission::Alter]),
+        ]);
+        assert_eq!(messages("app_reader", &role).len(), 1);
+    }
+
+    /// The measured matrix: a table takes no `EXECUTE` and a routine takes
+    /// nothing but. The engine refuses each, and it would refuse it on a
+    /// database the changes before it had already altered.
+    #[test]
+    fn a_permission_the_kind_does_not_take_is_refused_before_a_plan_exists() {
+        let cases = [
+            ("app.customer", Permission::Execute, "a table"),
+            ("app.recent", Permission::Execute, "a view"),
+            ("app.f(integer)", Permission::Select, "a function"),
+            ("app.archive(integer)", Permission::Truncate, "a procedure"),
+            ("app.solo(integer)", Permission::Usage, "a function"),
+        ];
+        for (target, permission, article) in cases {
+            let role = granting(&[
+                ("schema::app", &[Permission::Usage]),
+                (target, &[permission]),
+            ]);
+            let problems = messages("app_reader", &role);
+            assert_eq!(problems.len(), 1, "{target}: {problems:?}");
+            assert!(problems[0].contains(article), "{}", problems[0]);
+            assert!(problems[0].contains("does not apply to"), "{}", problems[0]);
+        }
+    }
+
+    /// A routine target is checked against `EXECUTE` even where the routine is
+    /// named by signature, which is the path that does not go through
+    /// `target_kind`.
+    #[test]
+    fn a_signature_target_takes_execute_and_nothing_else() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.f(text)", &[Permission::Select]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("a function"), "{}", problems[0]);
+    }
+
+    /// ADR-0009 §1 again, and the case the engine itself accepts: with one
+    /// overload `GRANT EXECUTE ON ROUTINE app.solo` runs. The plan still never
+    /// converges — `pull` has only `pg_proc` to read a routine grant out of,
+    /// so it comes back as `app.solo(integer)` every time, differs from a
+    /// declaration spelling it `app.solo`, and every plan revokes the
+    /// signature and grants the bare name again.
+    ///
+    /// The mirror image is refused on the other engine, where nothing
+    /// overloads and the signature is the spelling its catalog cannot produce
+    /// (`pbps_mssql::validate::role`). One spelling per engine, and it is the
+    /// one that survives a round trip.
+    #[test]
+    fn a_bare_routine_name_is_refused_with_the_signature_the_pull_will_write() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.solo", &[Permission::Execute]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("app.solo(integer)"), "{}", problems[0]);
+        // And the signature it names is accepted.
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.solo(integer)", &[Permission::Execute]),
+        ]);
+        assert!(messages("app_reader", &role).is_empty());
+    }
+
+    /// ADR-0009 §1. A bare name is not an identity where the kind overloads,
+    /// and the engine says so at apply time — `routine name "app.f" is not
+    /// unique`. Refused here, with the signatures to write instead.
+    #[test]
+    fn a_bare_name_for_an_overloaded_routine_is_refused_with_the_signatures() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.f", &[Permission::Execute]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("is not unique"), "{}", problems[0]);
+        assert!(problems[0].contains("app.f(integer)"), "{}", problems[0]);
+        assert!(problems[0].contains("app.f(text)"), "{}", problems[0]);
+    }
+
+    /// An object the declarations do not have is the model's finding
+    /// (`pbps_model::role::check`), not this one's: reported twice, the user
+    /// fixes one message and sees the other.
+    #[test]
+    fn an_object_the_declarations_do_not_have_is_left_to_the_model_to_report() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.nowhere", &[Permission::Select]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// Measured, and the quoting is the trap: `GRANT INSERT ON gr.t TO
+    /// "public"` — quoted, the way this emitter writes every name — grants to
+    /// PUBLIC, while `CREATE ROLE "public"` is refused as reserved.
+    #[test]
+    fn public_is_not_a_role_a_declaration_may_name() {
+        let problems = messages("public", &Role::default());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("every principal in the cluster"),
+            "{}",
+            problems[0]
+        );
+        // A different name, and an ordinary role: measured, `"Public"` lands
+        // in the ACL as `Public=d/postgres`.
+        assert!(messages("Public", &Role::default()).is_empty());
+    }
+
+    /// The engine's own namespace: measured, `CREATE ROLE pg_thing` is
+    /// `role name "pg_thing" is reserved`.
+    #[test]
+    fn a_role_in_the_engines_reserved_namespace_is_refused() {
+        let problems = messages("pg_read_all_data", &Role::default());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("reserved"), "{}", problems[0]);
+    }
+
+    /// A name the engine cannot hold is refused wherever it appears — the
+    /// role's own, and each half of a target's.
+    #[test]
+    fn a_name_the_engine_cannot_hold_is_refused_on_the_role_and_on_its_targets() {
+        let long = "n".repeat(crate::MAX_IDENT_BYTES + 1);
+        assert!(!messages(&long, &Role::default()).is_empty());
+        let mut role = Role::default();
+        role.grants.insert(
+            GrantTarget::Schema(long.clone()),
+            [Permission::Usage].into_iter().collect(),
+        );
+        assert!(!messages("app_reader", &role).is_empty());
+        let mut role = Role::default();
+        role.grants.insert(
+            GrantTarget::Routine(RoutineId::new(
+                pbps_model::ObjectName::new(long, "f".to_owned()),
+                vec!["integer".parse::<RoutineArg>().expect("a type name")],
+            )),
+            [Permission::Execute].into_iter().collect(),
+        );
+        assert!(!messages("app_reader", &role).is_empty());
+    }
+}

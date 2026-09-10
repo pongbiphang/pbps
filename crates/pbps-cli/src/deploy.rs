@@ -833,11 +833,18 @@ pub(crate) fn unexpressible_permissions<'a>(
         .iter()
         .filter(|u| ids.roles.values().any(|managed| managed == &u.role))
         .filter(|u| match &u.target {
+            // In the relation namespace, the same question `pbps_diff::scope`
+            // asks of the plain grant beside it: an id carrying a signature is
+            // a routine on an engine that overloads, and there a table of that
+            // name is a different object. Counted, a limitation on somebody
+            // else's table was kept — and refused every plan — because a
+            // managed routine happened to share its name (DECISIONS 176, 384).
             Some(pbps_model::GrantTarget::Object(o)) => {
                 managed_tables.contains(o)
-                    || modules
-                        .iter()
-                        .any(|id| id.referenced_name().as_ref() == Some(o))
+                    || modules.iter().any(|id| {
+                        !matches!(id, ModuleId::Routine(_))
+                            && id.referenced_name().as_ref() == Some(o)
+                    })
             }
             Some(pbps_model::GrantTarget::Routine(r)) => modules
                 .iter()

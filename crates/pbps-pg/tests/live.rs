@@ -5374,10 +5374,10 @@ async fn rollback(conn: &mut Conn) {
 /// easiest case to wave through, and it is the one where a rebuild hands an
 /// unmanaged role `SELECT`.
 ///
-/// Roles and grants are Phase 5 step 6, so today every one of these is a
-/// refusal; the step that adds them narrows this to what the declarations still
-/// cannot reproduce, and ADR-0010 §5 keeps `PUBLIC` on the refusing side for
-/// good.
+/// Every one of these is still a refusal. Step 6 (#81) made a grant to a
+/// declared role expressible; what re-emits it after the `CREATE` is #248, and
+/// until that lands there is nothing to put an ACL back with. ADR-0010 §5 keeps
+/// `PUBLIC` on the refusing side for good either way.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
@@ -14868,4 +14868,1351 @@ async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+}
+
+// ---------------------------------------------------------------------------
+// Roles and privileges (ADR-0010, issue #81).
+//
+// **Every one of these runs as a least-privilege role, not as `postgres`.**
+// The SQL Server suite learned it first and paid for the lesson: `sa` holds
+// `CONTROL` and short-circuits the whole permission list, which is how three
+// permission bugs survived that suite's first live run. A superuser here is
+// worse — it does not consult an ACL at all — so a permission test run as
+// `postgres` measures nothing.
+// ---------------------------------------------------------------------------
+
+/// A connection as `role`, with the password `least_privilege_role` sets.
+async fn connect_as(role: &str, database: &str) -> Conn {
+    Conn::connect(Driver::Postgres, &conn_str_as(role, "live-test", database))
+        .await
+        .unwrap_or_else(|e| panic!("connect as `{role}`: {e}"))
+}
+
+/// The SQLSTATE of a statement that must fail.
+///
+/// The **code**, not the text: `tokio_postgres::Error` renders as `db error`
+/// and keeps the server's message in a source the seam deliberately does not
+/// carry (ADR-0014 §1) — so a test that matched on prose would pass on any
+/// failure at all, including the wrong one. A SQLSTATE is the engine's own
+/// identifier for *which* refusal this is.
+async fn refused(conn: &mut Conn, sql: &str) -> String {
+    match conn.execute(sql).await {
+        Ok(()) => panic!("the engine accepted `{sql}`, and this test needs it not to"),
+        Err(e) => e
+            .server_error_code()
+            .unwrap_or_else(|| panic!("`{sql}` failed without a SQLSTATE: {e:?}")),
+    }
+}
+
+/// `permission denied for ...` — the engine's answer to a privilege check.
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+/// `role "..." cannot be dropped because some objects depend on it`.
+const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
+/// `unrecognized privilege type "..."` — the parser stops at the word, before
+/// it has looked at the securable at all.
+const SYNTAX_ERROR: &str = "42601";
+
+/// ADR-0010 §1, and the reason `validate_role` refuses rather than warns.
+///
+/// The grant is real — `has_table_privilege` says so — and the role still
+/// cannot read the table, because PostgreSQL checks the schema first. A
+/// declaration that produced this would apply cleanly and leave the role
+/// unable to reach what it was granted.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_without_usage_on_the_schema_reaches_nothing() {
+    let mut db = TestDb::create("schemausage").await;
+    let role = least_privilege_role(&mut db, "schemausage").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TABLE app.customer (id integer)".to_owned(),
+        format!("GRANT CONNECT ON DATABASE {} TO {role}", db.name),
+        format!("GRANT SELECT ON app.customer TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    assert_eq!(
+        text(
+            &mut db.conn,
+            &format!("SELECT has_table_privilege('{role}', 'app.customer', 'SELECT')::text"),
+        )
+        .await,
+        "true",
+        "the grant is on the table, and the catalog says so"
+    );
+
+    let mut as_role = connect_as(&role, &db.name).await;
+    assert_eq!(
+        refused(&mut as_role, "SELECT count(*) FROM app.customer").await,
+        INSUFFICIENT_PRIVILEGE,
+        "`permission denied for schema app`, with the grant on the table in place"
+    );
+
+    // And the line `validate_role` names is the line that fixes it.
+    db.conn
+        .execute(&format!("GRANT USAGE ON SCHEMA app TO {role}"))
+        .await
+        .expect("grant usage");
+    assert_eq!(
+        text(&mut as_role, "SELECT count(*)::text FROM app.customer").await,
+        "0"
+    );
+
+    std::mem::drop(as_role);
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The emitter's own statements, run against the engine — every securable
+/// class, both directions.
+///
+/// This is the test that decides whether `securable` picked the right word:
+/// measured, `ON FUNCTION` refuses a procedure and `ON ROUTINE` takes both, and
+/// a unit test can only say what this crate believes.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
+    use pbps_model::{Change, GrantTarget, Permission, Strategy};
+
+    let mut db = TestDb::create("emitgrant").await;
+    let role = least_privilege_role(&mut db, "emitgrant").await;
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.customer (id integer)",
+        "CREATE VIEW app.recent AS SELECT 1 AS id",
+        "CREATE FUNCTION app.solo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'",
+        "CREATE FUNCTION app.f(integer, text) RETURNS integer LANGUAGE sql AS 'SELECT $1'",
+        "CREATE PROCEDURE app.archive(integer) LANGUAGE sql AS 'SELECT 1'",
+    ] {
+        db.conn.execute(sql).await.expect(sql);
+    }
+
+    let pg = Postgres::new();
+    let cases: [(&str, &[Permission]); 7] = [
+        (
+            "app.customer",
+            &[
+                Permission::Select,
+                Permission::Insert,
+                Permission::Update,
+                Permission::Delete,
+                Permission::References,
+                Permission::Truncate,
+                Permission::Trigger,
+                Permission::Maintain,
+            ],
+        ),
+        ("app.recent", &[Permission::Select]),
+        ("app.solo", &[Permission::Execute]),
+        ("app.f(integer,text)", &[Permission::Execute]),
+        ("app.archive(integer)", &[Permission::Execute]),
+        // A **procedure** by bare name, which is the case `ON FUNCTION` gets
+        // wrong: measured, `GRANT EXECUTE ON FUNCTION app.archive(integer)` is
+        // `app.archive(integer) is not a function`, and only `ON ROUTINE`
+        // takes both kinds.
+        ("app.archive", &[Permission::Execute]),
+        ("schema::app", &[Permission::Usage, Permission::Create]),
+    ];
+    for (spelled, permissions) in cases {
+        let target: GrantTarget = spelled.parse().expect("a grant target parses");
+        let permissions: std::collections::BTreeSet<Permission> =
+            permissions.iter().copied().collect();
+        for change in [
+            Change::Grant {
+                role: role.clone(),
+                target: target.clone(),
+                permissions: permissions.clone(),
+            },
+            Change::Revoke {
+                role: role.clone(),
+                target: target.clone(),
+                permissions: permissions.clone(),
+            },
+        ] {
+            for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+                db.conn
+                    .execute(&stmt.sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+            }
+        }
+    }
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// A name in **both** namespaces, which this engine allows: relations and
+/// routines live in separate catalogs, and `co.f` may be a table and a
+/// function at once.
+///
+/// Measured here: the emitter's `GRANT SELECT ON TABLE app.f` lands in
+/// `pg_class.relacl` and its `GRANT EXECUTE ON ROUTINE app.f` lands in
+/// `pg_proc.proacl` — two objects under one name, each reached by the word the
+/// permission set picked. `validate::role` reads the namespace the same way,
+/// so neither declaration is refused before the plan exists.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name() {
+    use pbps_model::{Change, GrantTarget, Module, ModuleKind, Permission, Role, Strategy, Table};
+
+    let mut db = TestDb::create("bothns").await;
+    let role = least_privilege_role(&mut db, "bothns").await;
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.f (id integer)",
+        "CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'",
+    ] {
+        db.conn.execute(sql).await.expect(sql);
+    }
+
+    // The declarations the two grants come from. One role cannot hold both:
+    // `app.f` is one key in the grant map, and a set with `execute` and
+    // `select` in it is the mixed one `validate::role` refuses.
+    //
+    // The two are spelled differently on purpose. The relation takes the bare
+    // name — that is its identity — and the routine takes its signature,
+    // because the bare spelling is not one the catalog can give back
+    // (DECISIONS 381); the last assertion here is that refusal, and what makes
+    // it the *routine's* refusal rather than `execute does not apply to a
+    // table` is the namespace the permissions chose.
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert("app.f".parse().expect("a table name"), Table::default());
+    declared.modules.insert(
+        "app.f(integer)".parse().expect("a module id"),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "SELECT $1".to_owned(),
+        },
+    );
+    let pg = Postgres::new();
+    let granting = |spelled: &str, permission: Permission| {
+        let mut role = Role::default();
+        role.grants.insert(
+            "schema::app".parse().expect("a grant target"),
+            [Permission::Usage].into_iter().collect(),
+        );
+        role.grants.insert(
+            spelled.parse().expect("a grant target"),
+            [permission].into_iter().collect(),
+        );
+        role
+    };
+    for (spelled, permission) in [
+        ("app.f", Permission::Select),
+        ("app.f(integer)", Permission::Execute),
+    ] {
+        let problems = pg.validate_role(&role, &granting(spelled, permission), &declared);
+        assert!(problems.is_empty(), "{spelled}: {problems:?}");
+        let change = Change::Grant {
+            role: role.clone(),
+            target: spelled.parse::<GrantTarget>().expect("a grant target"),
+            permissions: [permission].into_iter().collect(),
+        };
+        for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+            db.conn
+                .execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+    // The bare name with `execute` on it: refused, and refused as the routine
+    // it chose rather than as the table of the same name.
+    let problems = pg.validate_role(&role, &granting("app.f", Permission::Execute), &declared);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].to_string().contains("app.f(integer)"),
+        "{}",
+        problems[0]
+    );
+
+    // Each landed on its own object, and on neither the other.
+    let relacl = text(
+        &mut db.conn,
+        "SELECT COALESCE(relacl::text, '') FROM pg_class WHERE oid = 'app.f'::regclass",
+    )
+    .await;
+    let proacl = text(
+        &mut db.conn,
+        "SELECT COALESCE(proacl::text, '') FROM pg_proc WHERE oid = \
+         'app.f(integer)'::regprocedure",
+    )
+    .await;
+    assert!(relacl.contains(&format!("{role}=r/")), "{relacl}");
+    assert!(!relacl.contains(&format!("{role}=X/")), "{relacl}");
+    assert!(proacl.contains(&format!("{role}=X/")), "{proacl}");
+    assert!(!proacl.contains(&format!("{role}=r/")), "{proacl}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The ledger is two **tables**, so the grants query hides those two names only
+/// where they are a table.
+///
+/// `modules_query` keeps a view whatever it is called, so a project may declare
+/// `app.__pbps_state` as a view; measured here, the grant on it is pulled while
+/// the grant on a *table* of that name is not. Hidden by name alone, the view
+/// came back without its grant, the apply's own read-back would refuse the plan
+/// for not having achieved its postcondition, and every plan after it would
+/// propose the same `GRANT` again.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_ledger_names_are_hidden_where_they_are_a_table_and_not_where_they_are_a_view() {
+    let mut db = TestDb::create("ledgername").await;
+    let role = least_privilege_role(&mut db, "ledgername").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        // A view of the ledger's name, which the module reader keeps.
+        "CREATE VIEW app.__pbps_state AS SELECT 1 AS id".to_owned(),
+        // And a table of it, which it does not.
+        "CREATE TABLE app.__pbps_lock (id integer)".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.__pbps_state TO {role}"),
+        format!("GRANT SELECT ON app.__pbps_lock TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert!(
+        pulled
+            .schema
+            .modules
+            .contains_key(&"app.__pbps_state".parse().expect("a module id")),
+        "the view is pulled: {:?}",
+        pulled.schema.modules.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !pulled
+            .schema
+            .tables
+            .contains_key(&"app.__pbps_lock".parse().expect("a table name")),
+        "a table of the ledger's name is not"
+    );
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["app.__pbps_state", "schema::app"],
+        "the view's grant is read and the table's is not"
+    );
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The reader's schema filter and the validator's, put to the engine.
+///
+/// `NOT_A_PROJECTS_SCHEMA` is SQL and `catalog::a_projects_schema` is Rust, and
+/// a declaration may name a schema directly — `schema::x` is a grant target —
+/// so the two disagreeing is a grant the engine takes and the pull never sees:
+/// the apply's own read-back refuses it and every plan after it proposes the
+/// same `GRANT` again. Measured against every schema the cluster actually has,
+/// not against a list written here.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name() {
+    use pbps_model::{Permission, Role};
+
+    let mut db = TestDb::create("skipschema").await;
+    db.conn
+        .execute("CREATE SCHEMA pga")
+        .await
+        .expect("a schema whose name merely starts with `p`");
+
+    // Every schema this cluster has, and the reader's own answer for each.
+    let rows = db
+        .conn
+        .query(
+            "SELECT n.nspname,
+                    (n.nspname NOT IN ('pg_catalog', 'information_schema')
+                     AND pg_catalog.left(n.nspname, 3) <> 'pg_')::text AS kept
+               FROM pg_catalog.pg_namespace n
+              ORDER BY 1",
+        )
+        .await
+        .expect("read the schemas");
+    assert!(rows.len() >= 4, "{} schemas", rows.len());
+
+    let pg = Postgres::new();
+    let mut kept = 0;
+    for row in &rows {
+        let name = row
+            .try_get::<&str>("nspname")
+            .expect("a name column")
+            .expect("not null")
+            .to_owned();
+        let sql_keeps = row
+            .try_get::<&str>("kept")
+            .expect("a flag column")
+            .expect("not null")
+            == "true";
+        if sql_keeps {
+            kept += 1;
+        }
+        // The validator's answer, read off a declaration naming that schema.
+        let mut role = Role::default();
+        role.grants.insert(
+            format!("schema::{name}").parse().expect("a grant target"),
+            [Permission::Usage].into_iter().collect(),
+        );
+        let problems = pg.validate_role("app_reader", &role, &Schema::default());
+        assert_eq!(
+            problems.is_empty(),
+            sql_keeps,
+            "`{name}`: the pull {} it and the validator {} a grant on it",
+            if sql_keeps { "reads" } else { "skips" },
+            if problems.is_empty() {
+                "accepts"
+            } else {
+                "refuses"
+            }
+        );
+    }
+    assert!(kept >= 2, "`public` and `pga` are both a project's");
+
+    db.drop().await;
+}
+
+/// The schema PostgreSQL puts everything in by default, and the grant that
+/// reaches through it without a schema grant of its own.
+///
+/// Measured here: a role holding `SELECT` on `public.pubt` and nothing else
+/// reads the table, because `initdb` grants `USAGE` on `public` to PUBLIC in
+/// every database (`nspacl` is
+/// `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`). PUBLIC is
+/// not a role a project can declare, so no `schema::public: [usage]` line
+/// could ever appear in the pull — and §1's rule, applied there, refused the
+/// project `pull` had just written.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant() {
+    let mut db = TestDb::create("pubschema").await;
+    let role = least_privilege_role(&mut db, "pubschema").await;
+    for sql in [
+        "CREATE TABLE public.pubt (id integer)".to_owned(),
+        "INSERT INTO public.pubt VALUES (1)".to_owned(),
+        format!("GRANT CONNECT ON DATABASE {} TO {role}", db.name),
+        format!("GRANT SELECT ON public.pubt TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT nspacl::text FROM pg_namespace WHERE nspname = 'public'",
+        )
+        .await,
+        "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
+        "PUBLIC holds USAGE on it, and nobody in this test granted that"
+    );
+
+    // The role reads it, with no grant on the schema at all.
+    let mut as_role = connect_as(&role, &db.name).await;
+    assert_eq!(
+        text(&mut as_role, "SELECT count(*)::text FROM public.pubt").await,
+        "1"
+    );
+    std::mem::drop(as_role);
+
+    // So the project the pull writes has to pass this dialect's own check.
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let pulled_role = pulled
+        .schema
+        .roles
+        .get(&role)
+        .expect("its own role is in the pull");
+    assert_eq!(
+        pulled_role
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["public.pubt"],
+        "no `schema::public` grant exists to be pulled — PUBLIC holds it"
+    );
+    let problems = Postgres::new().validate_role(&role, pulled_role, &pulled.schema);
+    assert!(problems.is_empty(), "{problems:?}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The bare spelling this engine accepts and this catalog cannot give back.
+///
+/// Measured here, both halves: `GRANT EXECUTE ON ROUTINE app.solo` runs where
+/// the name is not overloaded, and the pull reads that same grant back as
+/// `app.solo(integer)` — `pg_proc` holds the arguments and nothing remembers
+/// which spelling the statement used. A declaration spelling it `app.solo`
+/// would therefore differ from the database on every comparison, and each plan
+/// would revoke the signature and grant the bare name again for ever.
+///
+/// So `validate_role` refuses the bare form with the signature to write, the
+/// mirror of the refusal on the other engine, where nothing overloads and a
+/// signature is the spelling *its* catalog cannot produce.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_grant_is_read_back_by_signature_whatever_spelling_granted_it() {
+    use pbps_model::{Module, ModuleKind, Permission, Role};
+
+    let mut db = TestDb::create("barename").await;
+    let role = least_privilege_role(&mut db, "barename").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE FUNCTION app.solo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        // The bare spelling, which this engine takes because the name is not
+        // overloaded.
+        format!("GRANT EXECUTE ON ROUTINE app.solo TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["app.solo(integer)", "schema::app"],
+        "the catalog has the signature and only the signature"
+    );
+
+    // And the declaration that spells it the way the statement did is refused
+    // offline, naming what the pull will write.
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        "app.solo(integer)".parse().expect("a module id"),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "SELECT $1".to_owned(),
+        },
+    );
+    let mut bare = Role::default();
+    bare.grants.insert(
+        "schema::app".parse().expect("a grant target"),
+        [Permission::Usage].into_iter().collect(),
+    );
+    bare.grants.insert(
+        "app.solo".parse().expect("a grant target"),
+        [Permission::Execute].into_iter().collect(),
+    );
+    let problems = Postgres::new().validate_role(&role, &bare, &declared);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].to_string().contains("app.solo(integer)"),
+        "{}",
+        problems[0]
+    );
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The zero point on the catalogs whose targets no declaration can name
+/// (DECISIONS 371). Every one of those ACLs is NULL until somebody touches it,
+/// and **measured**, `REVOKE USAGE ON TYPE app.money_kind FROM PUBLIC` turns a
+/// NULL `typacl` into `{owner=U/owner}` — the owner's own inherent `USAGE`,
+/// written by the engine and granted by nobody.
+///
+/// Read as a grant it says a managed role holds something unnameable, which
+/// refuses every plan connected to that role. The read still has to work,
+/// though: the second half grants the same `USAGE` to another role and that
+/// one is reported.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_owners_own_entry_in_a_touched_acl_is_not_read_as_an_unnameable_grant() {
+    let mut db = TestDb::create("ownertype").await;
+    let owner = least_privilege_role(&mut db, "ownertype").await;
+    let other = least_privilege_role(&mut db, "ownertypeb").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TYPE app.money_kind AS ENUM ('a', 'b')".to_owned(),
+        format!("ALTER TYPE app.money_kind OWNER TO {owner}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT (typacl IS NULL)::text FROM pg_type WHERE typname = 'money_kind'",
+        )
+        .await,
+        "true",
+        "nothing has been granted on it"
+    );
+    db.conn
+        .execute("REVOKE USAGE ON TYPE app.money_kind FROM PUBLIC")
+        .await
+        .expect("revoke from public");
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT typacl::text FROM pg_type WHERE typname = 'money_kind'",
+        )
+        .await,
+        format!("{{{owner}=U/{owner}}}"),
+        "the owner's inherent entry, and it is all there is"
+    );
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert!(
+        pulled.unexpressible.iter().all(|u| u.role != owner),
+        "{:?}",
+        pulled.unexpressible
+    );
+
+    // And a grant somebody really made is still reported.
+    db.conn
+        .execute(&format!("GRANT USAGE ON TYPE app.money_kind TO {other}"))
+        .await
+        .expect("grant to the other role");
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let mine: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| u.role == other)
+        .map(|u| u.what.as_str())
+        .collect();
+    assert_eq!(mine.len(), 1, "{mine:?}");
+    assert!(mine[0].contains("a type"), "{}", mine[0]);
+    assert!(mine[0].contains("app.money_kind"), "{}", mine[0]);
+    assert!(
+        pulled.unexpressible.iter().all(|u| u.role != owner),
+        "{:?}",
+        pulled.unexpressible
+    );
+
+    cleanup_role(&mut db, &other).await;
+    cleanup_role(&mut db, &owner).await;
+    db.drop().await;
+}
+
+/// Two grants a role really holds on two objects the pull cannot carry into
+/// the declarations, each reported rather than written into the role.
+///
+/// The first object is left out of the pull entirely — a `bit(3)` column is a
+/// spelling this catalogue stores opaque and reads back as a different type
+/// (issue #130) — and a grant recorded on it would name a target the project
+/// does not declare, which `pbps_model::role::check` refuses: `pull` would
+/// write a project its own `validate` rejects.
+///
+/// The second is in the pull and its *target* is what cannot be written: a `(`
+/// opens a routine signature in the string form a snapshot carries, so
+/// `app."sales(archive)"` reloads as a grant on a routine (DECISIONS 205, the
+/// same shape measured on the other engine).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded() {
+    let mut db = TestDb::create("leftout").await;
+    let role = least_privilege_role(&mut db, "leftout").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TABLE app.bits (b bit(3))".to_owned(),
+        "CREATE TABLE app.\"sales(archive)\" (id integer)".to_owned(),
+        // A hidden relation with a *routine* of the same name beside it: the
+        // two are different objects here, so the routine does not answer for
+        // the table that was left out.
+        "CREATE TABLE app.f (b bit(3))".to_owned(),
+        "CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.bits TO {role}"),
+        format!("GRANT SELECT ON app.\"sales(archive)\" TO {role}"),
+        format!("GRANT SELECT ON app.f TO {role}"),
+        format!("GRANT EXECUTE ON ROUTINE app.f(integer) TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let tables: Vec<String> = pulled
+        .schema
+        .tables
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        tables,
+        ["app.sales(archive)"],
+        "both `bit(3)` tables are left out of the pull and the other one is not"
+    );
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["app.f(integer)", "schema::app"],
+        "the routine stands; no grant on an object the pull left out does"
+    );
+    let mine: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| u.role == role)
+        .map(|u| u.what.as_str())
+        .collect();
+    assert_eq!(mine.len(), 3, "{mine:?}");
+    assert!(
+        mine.iter().any(|w| w.contains("did not record")),
+        "{mine:?}"
+    );
+    assert!(mine.iter().any(|w| w.contains("parenthesis")), "{mine:?}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// ADR-0010 §5. A NULL ACL is the engine's default and not an empty set, and
+/// the default for a routine hands `EXECUTE` to PUBLIC — measured here by a
+/// role that holds nothing but `USAGE` calling the function.
+///
+/// The pull says so as *context*, and puts nothing in any role's grants: the
+/// zero point compared as a grant would have the next plan revoke what the
+/// apply before it produced.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_null_acl_is_the_engines_default_and_is_reported_rather_than_compared() {
+    let mut db = TestDb::create("nullacl").await;
+    let role = least_privilege_role(&mut db, "nullacl").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE FUNCTION app.fresh(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'".to_owned(),
+        format!("GRANT CONNECT ON DATABASE {} TO {role}", db.name),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT (proacl IS NULL)::text FROM pg_proc WHERE proname = 'fresh'",
+        )
+        .await,
+        "true",
+        "nothing has been granted on it"
+    );
+
+    // Nothing granted, and a role with only `USAGE` executes it.
+    let mut as_role = connect_as(&role, &db.name).await;
+    assert_eq!(text(&mut as_role, "SELECT app.fresh(7)::text").await, "7");
+    std::mem::drop(as_role);
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let said = pulled.warnings.join("\n");
+    assert!(said.contains("PUBLIC can execute"), "{said}");
+    assert!(said.contains("app.fresh(integer)"), "{said}");
+    // The zero point is never a grant: reported as one, the very next plan
+    // would try to revoke `EXECUTE` from a role that was never given it. What
+    // this role holds is the `USAGE` this test granted it, and nothing else —
+    // in particular no `EXECUTE`, though it can execute the function.
+    let grants: Vec<String> = pulled
+        .schema
+        .roles
+        .get(&role)
+        .expect("its own role is in the pull")
+        .grants
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(grants, ["schema::app"]);
+    assert!(
+        pulled.schema.roles.values().all(|r| !r
+            .grants
+            .contains_key(&"app.fresh(integer)".parse().expect("a grant target parses"))),
+        "{:?}",
+        pulled.schema.roles
+    );
+
+    // The other half, and it is the absence of a row rather than a row.
+    db.conn
+        .execute("REVOKE EXECUTE ON FUNCTION app.fresh(integer) FROM PUBLIC")
+        .await
+        .expect("revoke from public");
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let said = pulled.warnings.join("\n");
+    assert!(said.contains("revoked from PUBLIC"), "{said}");
+    assert!(said.contains("app.fresh(integer)"), "{said}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// ADR-0010 §2. `ALTER DEFAULT PRIVILEGES` is scoped to the role that creates
+/// the object, so two declarations that read identically mean different
+/// things and the difference is who runs the plan — which is why a `schema::`
+/// grant of a table permission is refused rather than translated into this.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn default_privileges_cover_only_the_objects_the_named_role_creates() {
+    let mut db = TestDb::create("defacl").await;
+    let owner_a = least_privilege_role(&mut db, "defacl_a").await;
+    let owner_b = least_privilege_role(&mut db, "defacl_b").await;
+    let reader = least_privilege_role(&mut db, "defacl_r").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        format!("GRANT CONNECT ON DATABASE {} TO {reader}", db.name),
+        format!("GRANT USAGE, CREATE ON SCHEMA app TO {owner_a}, {owner_b}"),
+        format!("GRANT USAGE ON SCHEMA app TO {reader}"),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {owner_a} IN SCHEMA app \
+             GRANT SELECT ON TABLES TO {reader}"
+        ),
+        format!("SET ROLE {owner_a}"),
+        "CREATE TABLE app.by_a (id integer)".to_owned(),
+        "RESET ROLE".to_owned(),
+        format!("SET ROLE {owner_b}"),
+        "CREATE TABLE app.by_b (id integer)".to_owned(),
+        "RESET ROLE".to_owned(),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let mut as_reader = connect_as(&reader, &db.name).await;
+    assert_eq!(
+        text(&mut as_reader, "SELECT count(*)::text FROM app.by_a").await,
+        "0",
+        "the table the named role created arrived granted"
+    );
+    assert_eq!(
+        refused(&mut as_reader, "SELECT count(*) FROM app.by_b").await,
+        INSUFFICIENT_PRIVILEGE,
+        "the same instruction covers nothing another role creates"
+    );
+    std::mem::drop(as_reader);
+
+    // And the pull says so, naming the role whose creations it covers.
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let said = pulled.warnings.join("\n");
+    assert!(said.contains(&format!("FOR ROLE {owner_a}")), "{said}");
+    assert!(said.contains("who creates an object"), "{said}");
+
+    for role in [&owner_a, &owner_b, &reader] {
+        cleanup_role(&mut db, role).await;
+    }
+    db.drop().await;
+}
+
+/// ADR-0010 §4. What stops a `DROP ROLE` is broader than ownership and broader
+/// than this database — so a report built from one database's catalog would
+/// say "nothing is stopping it" and be wrong.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_drop_role_blocked_from_another_database_is_reported_with_that_database_named() {
+    let mut here = TestDb::create("blockhere").await;
+    let elsewhere = TestDb::create("blockthere").await;
+    let role = least_privilege_role(&mut here, "block").await;
+
+    // A grant in *the other* database, and nothing at all in this one.
+    let mut there = Conn::connect(Driver::Postgres, &conn_str_for(&elsewhere.name))
+        .await
+        .expect("connect to the other database");
+    for sql in [
+        "CREATE SCHEMA other".to_owned(),
+        "CREATE TABLE other.t (id integer)".to_owned(),
+        format!("GRANT SELECT ON other.t TO {role}"),
+    ] {
+        there.execute(&sql).await.expect(&sql);
+    }
+
+    let blockers = pbps_pg::roles::drop_blockers(&mut here.conn, &role)
+        .await
+        .expect("read the blockers");
+    let named: Vec<String> = blockers
+        .iter()
+        .map(|b| b.rendered(Some(&here.name)))
+        .collect();
+    assert!(
+        named.iter().any(|b| b.contains(&elsewhere.name)),
+        "the other database has to be named: {named:?}"
+    );
+    assert!(
+        named.iter().any(|b| b.contains("cannot read")),
+        "and the report has to say it cannot look inside it: {named:?}"
+    );
+
+    // The engine agrees, which is what makes the report a report and not a
+    // guess — and it refuses from a database whose catalog holds nothing at
+    // all about this role.
+    assert_eq!(
+        refused(&mut here.conn, &format!("DROP ROLE {role}")).await,
+        DEPENDENT_OBJECTS_STILL_EXIST
+    );
+
+    // And `pull` says it, which is where a reader meets it: everything else a
+    // pull reports about a role is what *this* database holds, and a reader
+    // who took that for the whole of it would plan a drop the cluster refuses.
+    let said = pbps_pg::catalog::introspect(&mut here.conn)
+        .await
+        .expect("introspect")
+        .warnings
+        .join("\n");
+    assert!(said.contains(&elsewhere.name), "{said}");
+    assert!(said.contains(&role), "{said}");
+    assert!(said.contains("REVOKE"), "{said}");
+
+    std::mem::drop(there);
+    let mut there = Conn::connect(Driver::Postgres, &conn_str_for(&elsewhere.name))
+        .await
+        .expect("reconnect to the other database");
+    there
+        .execute(&format!("REVOKE ALL ON other.t FROM {role}"))
+        .await
+        .expect("revoke");
+    std::mem::drop(there);
+    assert!(
+        pbps_pg::roles::drop_blockers(&mut here.conn, &role)
+            .await
+            .expect("read the blockers again")
+            .is_empty(),
+        "with the other database's grant gone there is nothing left"
+    );
+    here.conn
+        .execute(&format!("DROP ROLE {role}"))
+        .await
+        .expect("and now the engine takes the drop");
+
+    elsewhere.drop().await;
+    here.drop().await;
+}
+
+/// ADR-0010 §6, amendment: `maintain` is gated on the **server**, and the
+/// model has no server version — so this is two servers, and no single one can
+/// show both halves.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn maintain_is_taken_at_seventeen_and_up_and_refused_below_it() {
+    use pbps_model::{GrantTarget, Permission, Role};
+
+    let mut role_with_maintain = Role::default();
+    role_with_maintain.grants.insert(
+        "app.customer".parse::<GrantTarget>().expect("a target"),
+        [Permission::Maintain].into_iter().collect(),
+    );
+
+    // This server, which the suite pins at 18.6.
+    let mut db = TestDb::create("maintain").await;
+    let role = least_privilege_role(&mut db, "maintain").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TABLE app.customer (id integer)".to_owned(),
+        format!("GRANT MAINTAIN ON app.customer TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+    let here = pbps_pg::roles::server_version_num(&mut db.conn)
+        .await
+        .expect("read the server version");
+    assert!(here >= pbps_pg::roles::MAINTAIN_ARRIVED_IN, "{here}");
+    assert!(
+        pbps_pg::roles::unsupported_permissions(here, "app_reader", &role_with_maintain).is_empty(),
+        "the gate has to agree with the engine that just took the grant"
+    );
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+
+    // And a server below 17, where the same word is not a permission at all.
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect(
+        "PBPS_TEST_PG_OLD_DB is not set: this rule needs a PostgreSQL below 17 as well as the \
+         pinned one, and `scripts/live-tests-pg.sh` starts both",
+    );
+    let mut old_conn = Conn::connect(Driver::Postgres, &old)
+        .await
+        .expect("connect to the pre-17 server");
+    let then = pbps_pg::roles::server_version_num(&mut old_conn)
+        .await
+        .expect("read the old server's version");
+    assert!(
+        then < pbps_pg::roles::MAINTAIN_ARRIVED_IN,
+        "PBPS_TEST_PG_OLD_DB has to point at a server below 17, and this one is {then}"
+    );
+    old_conn
+        .execute("CREATE TABLE IF NOT EXISTS maintain_probe (id integer)")
+        .await
+        .expect("a table to try the grant on");
+    assert_eq!(
+        refused(&mut old_conn, "GRANT MAINTAIN ON maintain_probe TO PUBLIC").await,
+        SYNTAX_ERROR,
+        "`unrecognized privilege type \"maintain\"`: the parser stops at the word"
+    );
+    let refusals = pbps_pg::roles::unsupported_permissions(then, "app_reader", &role_with_maintain);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].to_string().contains("PostgreSQL 17"),
+        "{}",
+        refusals[0]
+    );
+    let _ = old_conn.execute("DROP TABLE maintain_probe").await;
+}
+
+/// The connected half of `manages_roles` being `false`: a declared role the
+/// cluster does not have is refused with the `CREATE ROLE` to run by hand, and
+/// one it does have is not.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_declared_role_the_cluster_lacks_is_named_with_the_create_role_to_run() {
+    let mut db = TestDb::create("missingrole").await;
+    let present = least_privilege_role(&mut db, "present").await;
+    let absent = format!("pbps_absent_{}", std::process::id());
+
+    let declared: std::collections::BTreeSet<&str> =
+        [present.as_str(), absent.as_str()].into_iter().collect();
+    let missing = pbps_pg::roles::missing_roles(&mut db.conn, &declared)
+        .await
+        .expect("ask the cluster");
+    assert_eq!(missing, vec![absent.clone()]);
+    let refusal = pbps_pg::roles::refuse_missing(&absent).to_string();
+    assert!(
+        refusal.contains(&format!("CREATE ROLE \"{absent}\";")),
+        "{refusal}"
+    );
+
+    cleanup_role(&mut db, &present).await;
+    db.drop().await;
+}
+
+/// ADR-0010 §3, and the half `missing_roles` cannot answer. A rename is
+/// elided by the differ on this dialect, and that elision is sound only where
+/// the cluster really performed the rename — which "the new name exists" does
+/// not establish, because the new name may be somebody else.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster() {
+    use pbps_pg::roles::RenameEvidence;
+
+    let mut db = TestDb::create("renameev").await;
+    let from = least_privilege_role(&mut db, "renamefrom").await;
+    let to = format!("pbps_renameto_{}", std::process::id());
+    let _ = db.conn.execute(&format!("DROP ROLE IF EXISTS {to}")).await;
+
+    // Only the old name: the rename has not been run.
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::NotRunYet
+    );
+
+    // Both names: `to` is a different principal, and this is the case a
+    // check that only asked whether `to` exists would wave through — leaving
+    // `from` holding everything pbps manages and recording `to` as holding it.
+    db.conn
+        .execute(&format!("CREATE ROLE {to} LOGIN PASSWORD 'live-test'"))
+        .await
+        .expect("a second, unrelated role");
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::BothPresent
+    );
+    let refusal = pbps_pg::roles::refuse_rename(&from, &to, RenameEvidence::BothPresent)
+        .expect("two principals")
+        .to_string();
+    assert!(refusal.contains("different principal"), "{refusal}");
+
+    // The rename actually performed: the old name is gone, and the role's oid
+    // is unchanged — which is why nothing has to be re-granted.
+    cleanup_role(&mut db, &to).await;
+    let oid_before = text(
+        &mut db.conn,
+        &format!("SELECT oid::text FROM pg_catalog.pg_roles WHERE rolname = '{from}'"),
+    )
+    .await;
+    db.conn
+        .execute(&format!("ALTER ROLE {from} RENAME TO {to}"))
+        .await
+        .expect("rename the role");
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::Done
+    );
+    assert!(pbps_pg::roles::refuse_rename(&from, &to, RenameEvidence::Done).is_none());
+    assert_eq!(
+        text(
+            &mut db.conn,
+            &format!("SELECT oid::text FROM pg_catalog.pg_roles WHERE rolname = '{to}'"),
+        )
+        .await,
+        oid_before,
+        "the grants follow the oid, which is why the rename needs no re-granting"
+    );
+
+    // And with neither there, there is nothing to rename and nothing to grant.
+    cleanup_role(&mut db, &to).await;
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::NeitherPresent
+    );
+
+    db.drop().await;
+}
+
+/// The pull runs as the least-privileged account there is, because that is the
+/// account a deployment uses — and a read that needs a superuser is a read
+/// that will fail in the one environment that matters.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_least_privilege_role_can_read_the_roles_the_acls_and_the_drop_blockers() {
+    let mut db = TestDb::create("lprread").await;
+    let role = least_privilege_role(&mut db, "lprread").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TABLE app.customer (id integer)".to_owned(),
+        "CREATE PROCEDURE app.archive(a integer) LANGUAGE sql AS 'SELECT 1'".to_owned(),
+        format!("GRANT CONNECT ON DATABASE {} TO {role}", db.name),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.customer TO {role}"),
+        format!("GRANT EXECUTE ON ROUTINE app.archive(integer) TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let mut as_role = connect_as(&role, &db.name).await;
+    let pulled = pbps_pg::catalog::introspect(&mut as_role)
+        .await
+        .expect("a least-privilege pull");
+    let grants = pulled
+        .schema
+        .roles
+        .get(&role)
+        .expect("its own role is in the pull")
+        .grants
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    // `app.archive(integer)`, and the argument list is the identity the module
+    // pull writes — not `IN integer`, which is what
+    // `pg_get_function_identity_arguments` renders for a procedure and what
+    // would make every grant on one read as a grant on an object the
+    // declarations do not have.
+    assert_eq!(
+        grants,
+        ["app.customer", "app.archive(integer)", "schema::app"]
+    );
+    let modules: Vec<String> = pulled
+        .schema
+        .modules
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        modules.contains(&"app.archive(integer)".to_owned()),
+        "the grant target has to be spelled the way the module pull spells the identity: \
+         {modules:?}"
+    );
+    assert!(
+        pbps_pg::roles::server_version_num(&mut as_role)
+            .await
+            .expect("the version")
+            > 0
+    );
+    assert!(
+        !pbps_pg::roles::drop_blockers(&mut as_role, &role)
+            .await
+            .expect("the blockers")
+            .is_empty(),
+        "it holds grants here, which is a blocker `pg_shdepend` shows to anyone"
+    );
+    std::mem::drop(as_role);
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The catalogs that hold an `aclitem[]`, enumerated **from the engine** and
+/// compared with what this crate reads.
+///
+/// The same shape as `every_catalog_keyed_by_an_object_is_read`, and for the
+/// same reason: a fifteenth column arriving in a later release is a grant a
+/// role holds and this reader never looks at, and a role that gained one out
+/// of band would compare equal on everything else and be called clean
+/// (DECISIONS 105). Enumerated rather than remembered, so the release that
+/// adds one fails here.
+///
+/// Three are deliberately not read as grants, and each says why.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn every_catalog_that_holds_a_grant_is_read() {
+    /// Read as a grant on a target a declaration can name.
+    const AS_A_TARGET: [&str; 3] = ["pg_class.relacl", "pg_namespace.nspacl", "pg_proc.proacl"];
+    /// Read and reported, because the model can name no part of the target.
+    const AS_A_REPORT: [&str; 8] = [
+        "pg_attribute.attacl",
+        "pg_database.datacl",
+        "pg_foreign_data_wrapper.fdwacl",
+        "pg_foreign_server.srvacl",
+        "pg_language.lanacl",
+        "pg_largeobject_metadata.lomacl",
+        "pg_parameter_acl.paracl",
+        "pg_type.typacl",
+    ];
+    /// Read by another query, or not a live grant at all.
+    const ELSEWHERE: [&str; 3] = [
+        // Not a grant on anything that exists: a standing instruction
+        // (ADR-0010 §2), read by its own query and reported as such.
+        "pg_default_acl.defaclacl",
+        // What an extension's objects had at *install*. A record of the past,
+        // not a permission anyone holds now.
+        "pg_init_privs.initprivs",
+        // A tablespace is a cluster object, not this database's; what holds a
+        // role across the cluster is `pg_shdepend`'s question (ADR-0010 §4).
+        "pg_tablespace.spcacl",
+    ];
+
+    let mut conn = connect().await;
+    let found = text(
+        &mut conn,
+        "SELECT string_agg(c.relname || '.' || a.attname, ',' ORDER BY 1)
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+          WHERE c.relnamespace = 'pg_catalog'::regnamespace
+            AND c.relkind = 'r'
+            AND a.atttypid = 'aclitem[]'::regtype",
+    )
+    .await;
+    let found: std::collections::BTreeSet<&str> = found.split(',').collect();
+    let known: std::collections::BTreeSet<&str> = AS_A_TARGET
+        .iter()
+        .chain(AS_A_REPORT.iter())
+        .chain(ELSEWHERE.iter())
+        .copied()
+        .collect();
+    let unread: Vec<&&str> = found.difference(&known).collect();
+    assert!(
+        unread.is_empty(),
+        "this release has an ACL column no part of this crate reads: {unread:?}"
+    );
+    let gone: Vec<&&str> = known.difference(&found).collect();
+    assert!(
+        gone.is_empty(),
+        "this reader names a column the engine does not have: {gone:?}"
+    );
+}
+
+/// The kinds this model does not declare hold real grants, and the pull says
+/// so rather than reporting the role as holding nothing on them.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost() {
+    let mut db = TestDb::create("unnameable").await;
+    let role = least_privilege_role(&mut db, "unnameable").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a".to_owned(),
+        "CREATE TABLE app.parent (id integer, at date) PARTITION BY RANGE (at)".to_owned(),
+        // A procedure of the *same name*, which relations and routines may
+        // have: `relkind` `p` is a partitioned table and `prokind` `p` is a
+        // procedure, so a reader that took the letter without the catalog
+        // would file the table's grant under `app.parent(integer)` — a target
+        // the declarations may well have, and therefore one the next plan
+        // would compare and revoke.
+        "CREATE PROCEDURE app.parent(a integer) LANGUAGE sql AS 'SELECT 1'".to_owned(),
+        "CREATE TYPE app.money_amount AS (whole integer, part integer)".to_owned(),
+        "CREATE SEQUENCE app.counter".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.mv TO {role}"),
+        format!("GRANT SELECT ON app.parent TO {role}"),
+        "REVOKE EXECUTE ON ROUTINE app.parent(integer) FROM PUBLIC".to_owned(),
+        format!("GRANT USAGE ON TYPE app.money_amount TO {role}"),
+        format!("GRANT USAGE ON SEQUENCE app.counter TO {role}"),
+        format!("GRANT USAGE ON LANGUAGE plpgsql TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    // Only the schema grant is a grant: everything else is on a target no
+    // declaration can name.
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["schema::app"]
+    );
+    let what: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| u.role == role)
+        .map(|u| u.what.as_str())
+        .collect();
+    for named in [
+        "a materialized view",
+        "a partitioned table",
+        "a type",
+        "a procedural language",
+        "sequence",
+    ] {
+        assert!(what.iter().any(|w| w.contains(named)), "{named}: {what:?}");
+    }
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// Takes a role's grants back so the cluster will let go of it.
+///
+/// A role is a cluster object and outlives the throwaway database (§3): left
+/// behind, it accumulates until a later run's `CREATE ROLE` collides with it.
+/// `DROP OWNED BY` is what removes a role's grants *and* what it owns in one
+/// database, which is the remedy `DropBlocker` names.
+async fn cleanup_role(db: &mut TestDb, role: &str) {
+    let _ = db
+        .conn
+        .execute(&format!("DROP OWNED BY {role} CASCADE"))
+        .await;
+    let _ = db
+        .conn
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
 }
