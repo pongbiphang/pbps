@@ -481,7 +481,7 @@ string as the engine does (357), a comment in a default being whitespace (358), 
 number a number in every base (360); a typed NULL default is refused only where
 the engine erases it, a NULL of the column's own unmodified type (361), read past
 any comment inside the type (362), a line comment ending at either newline and a
-comment standing as the gap around `AS` (363), a string, a `)` or a quoted identifier closing its own token before `AS` and a `pg_catalog.` qualification or quotes on the cast type read as the grammar reads them (364), and a sign read through the trivia, groupings and casts before its operand (365), and an inserted parent row meeting an arriving child under the referenced column's collation (366), and a typed literal read as the constant it is (367), with only an interval qualifier admitted after its string (368).
+comment standing as the gap around `AS` (363), a string, a `)` or a quoted identifier closing its own token before `AS` and a `pg_catalog.` qualification or quotes on the cast type read as the grammar reads them (364), and a sign read through the trivia, groupings and casts before its operand (365), and an inserted parent row meeting an arriving child under the referenced column's collation (366), and a typed literal read as the constant it is (367), with only an interval qualifier admitted after its string (368), and a Unicode-escaped type name read as the name it spells (369).
 
 The key-collision check is the engine's, asked under the key column's own
 collation — measured, `collisdeterministic` says nothing about case, so a rule

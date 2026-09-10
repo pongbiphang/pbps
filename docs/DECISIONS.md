@@ -7938,3 +7938,20 @@ SPEC is in sync with all of these.
     joined by `TO`, with one `(n)` after a trailing `SECOND` — and nothing
     else. A qualifier the grammar refuses by combination, `MINUTE TO DAY`,
     is left to the engine, as every declaration it refuses by name is.
+
+369. **A Unicode-escaped type name is the name it spells.** The cast readers
+    of 355–368 admitted a quoted type name and a qualified one, and the
+    validator of 361 read them as the grammar does (364); a Unicode-escaped
+    identifier, `U&"te\0078t"`, failed the type test on its `&` and `\`, so
+    `NULL::U&"te\0078t"` on a `text` column was no cast to the reader, the
+    NULL of the column's own type went unrefused, and the erased default was
+    set on every plan. **Measured** on 18.6: `NULL::U&"te\0078t"`,
+    `CAST(NULL AS U&"te\0078t")`, `NULL::U&"te!0078t" UESCAPE '!'`,
+    `NULL::U&"pg_catalog".U&"text"`, `NULL::u&"text"` and
+    `NULL::U&"te\+000078t"` each leave a `text` column with no default, as
+    `NULL::text` does. The type text is now read with every Unicode-escaped
+    identifier replaced by the plain quoted identifier it decodes to, through
+    the decoder the module identity already uses (`pbps_model::module::
+    decode_unicode_escapes`), its `UESCAPE` clause honoured by the rule the
+    emitter reads one by; an escape that does not decode, or a clause
+    spelled wrong, is no type, and is left to the engine to refuse by name.

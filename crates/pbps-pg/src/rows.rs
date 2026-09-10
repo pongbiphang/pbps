@@ -900,7 +900,63 @@ fn type_text(raw: &str) -> Option<String> {
             }
         }
     }
-    Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
+    plain_identifiers(&out.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// `text` with every Unicode-escaped identifier, `U&"te\0078t"` and
+/// `U&"te!0078t" UESCAPE '!'`, replaced by the plain quoted identifier it
+/// spells, `"text"` — or `None` where one does not decode, which the engine
+/// refuses by name. **Measured** on 18.6: `NULL::U&"te\0078t"`,
+/// `NULL::U&"te\+000078t"`, `NULL::u&"text"`, `NULL::U&"pg_catalog".U&"text"`
+/// and the `UESCAPE` spelling each leave a `text` column with no default,
+/// as `NULL::text` does (DECISIONS 369).
+fn plain_identifiers(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        let opens = bytes[i].eq_ignore_ascii_case(&b'u')
+            && bytes.get(i + 1) == Some(&b'&')
+            && bytes.get(i + 2) == Some(&b'"')
+            && !(i >= 1 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+        if !opens {
+            i += 1;
+            continue;
+        }
+        let close = identifier_end(text, i + 2)?;
+        let inner = text[i + 3..close - 1].replace("\"\"", "\"");
+        let mut end = close;
+        let mut escape = '\\';
+        // A `UESCAPE 'x'` clause is the identifier's: any one character but
+        // a quote, a hex digit, `+` or whitespace.
+        let after = text[close..].trim_start();
+        if after.len() >= 7
+            && after.is_char_boundary(7)
+            && after[..7].eq_ignore_ascii_case("uescape")
+        {
+            let rest = after[7..].trim_start();
+            let mut chars = rest.chars();
+            let (Some('\''), Some(e), Some('\'')) = (chars.next(), chars.next(), chars.next())
+            else {
+                return None;
+            };
+            if e == '\'' || e == '+' || e.is_ascii_hexdigit() || e.is_whitespace() {
+                return None;
+            }
+            escape = e;
+            end = text.len() - rest.len() + 2 + e.len_utf8();
+        }
+        let decoded = pbps_model::module::decode_unicode_escapes(&inner, escape)?;
+        out.push_str(&text[copied..i]);
+        out.push('"');
+        out.push_str(&decoded.replace('"', "\"\""));
+        out.push('"');
+        copied = end;
+        i = end;
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
 }
 
 /// One cell's text as a model value.
@@ -1694,6 +1750,15 @@ mod tests {
             "CAST(NULL AS pg_catalog/**/./**/text)",
             "NULL::\"text\"",
             "NULL::PG_CATALOG.INT4",
+            // A Unicode-escaped type name in each of its spellings
+            // (DECISIONS 369).
+            "NULL::U&\"te\\0078t\"",
+            "CAST(NULL AS U&\"te\\0078t\")",
+            "NULL::U&\"te!0078t\" UESCAPE '!'",
+            "CAST(NULL AS U&\"te!0078t\" UESCAPE '!')",
+            "NULL::U&\"pg_catalog\".U&\"text\"",
+            "NULL::u&\"text\"",
+            "NULL::U&\"te\\+000078t\"",
             // A sign with a gap, a comment, a grouping or another sign
             // between it and its operand, and the catalog's own deparsing
             // of a signed default (DECISIONS 365).
@@ -1856,6 +1921,12 @@ mod tests {
             "CAST(1AS text)",
             "CAST(NULL AS(text))",
             "CAST(NULL AS \"unclosed)",
+            // A Unicode escape that does not decode, and a clause spelled
+            // wrong (DECISIONS 369).
+            "NULL::U&\"te\\00zzt\"",
+            "NULL::U&\"te!0078t\" UESCAPE '+'",
+            "NULL::U&\"te!0078t\" UESCAPE",
+            "NULL::U&\"unclosed",
             "CAST(NULL AS text -- ) unterminated",
             "E'a\\'::text",
             "$$open::text",

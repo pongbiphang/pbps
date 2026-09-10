@@ -966,6 +966,20 @@ mod tests {
                 "NULL::pg_catalog.timestamptz",
             ),
             ("glued_quote", "text", "CAST(NULL AS\"text\")"),
+            // A Unicode-escaped type name is the name it spells
+            // (DECISIONS 369).
+            ("unicode", "text", "NULL::U&\"te\\0078t\""),
+            ("unicode_call", "text", "CAST(NULL AS U&\"te\\0078t\")"),
+            (
+                "unicode_uescape",
+                "text",
+                "NULL::U&\"te!0078t\" UESCAPE '!'",
+            ),
+            (
+                "unicode_qualified",
+                "integer",
+                "NULL::U&\"pg_catalog\".u&\"int\\0034\"",
+            ),
         ];
         let kept = [
             ("other_type", "text", "NULL::varchar"),
@@ -993,6 +1007,8 @@ mod tests {
             ("quoted_grammar", "text", "CAST(NULL AS \"TEXT\")"),
             ("internal_char", "character", "NULL::\"char\""),
             ("catalog_char", "character", "NULL::pg_catalog.bpchar"),
+            ("unicode_other", "text", "NULL::U&\"varch\\0061r\""),
+            ("unicode_broken", "text", "NULL::U&\"te\\00zzt\""),
             ("value", "text", "'x'"),
             ("expression", "text", "NULLIF('a', 'a')"),
         ];

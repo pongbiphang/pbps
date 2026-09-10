@@ -13928,7 +13928,8 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
              a text DEFAULT 'x', b text, c text DEFAULT 'y', d text DEFAULT 'z',
              e text DEFAULT 'w', kept text DEFAULT 'k',
              z timestamptz, i integer DEFAULT 7, p float8 DEFAULT 1.5,
-             q text DEFAULT 'q', r text DEFAULT 'r', u integer DEFAULT 8);"
+             q text DEFAULT 'q', r text DEFAULT 'r', u integer DEFAULT 8,
+             v text DEFAULT 'v', w integer DEFAULT 9);"
     ))
     .await
     .expect("the fixture");
@@ -13957,10 +13958,13 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
         // still its own type (DECISIONS 364).
         ("r", "CAST(NULL AS \"pg_catalog\" . \"text\")"),
         ("u", "NULL::PG_CATALOG.INT4"),
+        // A Unicode-escaped type name is the name it spells (DECISIONS 369).
+        ("v", "NULL::U&\"te!0078t\" UESCAPE '!'"),
+        ("w", "CAST(NULL AS U&\"int\\0034\")"),
     ] {
         let mut c = Column::new(ty(match column {
             "z" => "timestamptz",
-            "i" | "u" => "integer",
+            "i" | "u" | "w" => "integer",
             "p" => "double precision",
             _ => "text",
         }));
@@ -13984,7 +13988,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
     refused.sort();
     assert_eq!(
         refused,
-        ["a", "b", "c", "d", "e", "i", "p", "q", "r", "u"],
+        ["a", "b", "c", "d", "e", "i", "p", "q", "r", "u", "v", "w"],
         "each erased spelling, and only those"
     );
 
@@ -14013,13 +14017,13 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
         .collect();
     assert_eq!(
         set.len(),
-        11,
-        "the ten erased NULL defaults and the kept one are set: {cs:#?}"
+        13,
+        "the twelve erased NULL defaults and the kept one are set: {cs:#?}"
     );
     apply(&mut conn, &pg, &cs).await;
     let base = connected_base(&mut conn, &declared, &s).await;
     let after = base.tables.get(&name).expect("the table");
-    for column in ["a", "b", "c", "d", "e", "i", "p", "q", "r", "u"] {
+    for column in ["a", "b", "c", "d", "e", "i", "p", "q", "r", "u", "v", "w"] {
         assert_eq!(
             after.columns[column].default, None,
             "`{column}` reads back with no default at all"
@@ -14042,7 +14046,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
             .iter()
             .filter(|c| matches!(c.change, pbps_model::Change::AlterColumnDefault { .. }))
             .count(),
-        10,
+        12,
         "and the next plan sets the erased ones again, and only those: {again:#?}"
     );
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
