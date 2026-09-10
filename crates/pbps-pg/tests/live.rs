@@ -15151,6 +15151,72 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
     db.drop().await;
 }
 
+/// The schema PostgreSQL puts everything in by default, and the grant that
+/// reaches through it without a schema grant of its own.
+///
+/// Measured here: a role holding `SELECT` on `public.pubt` and nothing else
+/// reads the table, because `initdb` grants `USAGE` on `public` to PUBLIC in
+/// every database (`nspacl` is
+/// `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`). PUBLIC is
+/// not a role a project can declare, so no `schema::public: [usage]` line
+/// could ever appear in the pull — and §1's rule, applied there, refused the
+/// project `pull` had just written.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant() {
+    let mut db = TestDb::create("pubschema").await;
+    let role = least_privilege_role(&mut db, "pubschema").await;
+    for sql in [
+        "CREATE TABLE public.pubt (id integer)".to_owned(),
+        "INSERT INTO public.pubt VALUES (1)".to_owned(),
+        format!("GRANT CONNECT ON DATABASE {} TO {role}", db.name),
+        format!("GRANT SELECT ON public.pubt TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT nspacl::text FROM pg_namespace WHERE nspname = 'public'",
+        )
+        .await,
+        "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
+        "PUBLIC holds USAGE on it, and nobody in this test granted that"
+    );
+
+    // The role reads it, with no grant on the schema at all.
+    let mut as_role = connect_as(&role, &db.name).await;
+    assert_eq!(
+        text(&mut as_role, "SELECT count(*)::text FROM public.pubt").await,
+        "1"
+    );
+    std::mem::drop(as_role);
+
+    // So the project the pull writes has to pass this dialect's own check.
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let pulled_role = pulled
+        .schema
+        .roles
+        .get(&role)
+        .expect("its own role is in the pull");
+    assert_eq!(
+        pulled_role
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["public.pubt"],
+        "no `schema::public` grant exists to be pulled — PUBLIC holds it"
+    );
+    let problems = Postgres::new().validate_role(&role, pulled_role, &pulled.schema);
+    assert!(problems.is_empty(), "{problems:?}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
 /// The bare spelling this engine accepts and this catalog cannot give back.
 ///
 /// Measured here, both halves: `GRANT EXECUTE ON ROUTINE app.solo` runs where

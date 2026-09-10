@@ -8209,3 +8209,38 @@ SPEC is in sync with all of these.
     the relation namespace, finds nothing, and refuses the schema `pull` had
     just written. An `Object` comes from a relation row and nothing else, so it
     is answered for by a recorded table or view alone.
+
+383. **The `public` schema is reachable without a grant on it, so §1 does not
+    apply there.** `initdb` grants `USAGE` on `public` to PUBLIC in every
+    database it makes: measured on 18.6, its `nspacl` is
+    `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}` — the
+    second entry is PUBLIC's, and it is not `acldefault`'s doing
+    (`acldefault('n', ...)` is `{owner=UC/owner}` alone). A role holding only
+    `SELECT` on `public.pubt` reads it, measured.
+
+    PUBLIC is not a role a project can declare (ADR-0010 §5), so no
+    `schema::public: [usage]` line could appear in a pull — and requiring one
+    refused every project whose tables live where PostgreSQL puts them,
+    including the one `pull` writes from such a database. A DBA who revokes
+    that `USAGE` makes the check silent where it would have had something to
+    say; that limit is already the check's, because `USAGE` also arrives
+    through a membership, which is never declared, compared or touched
+    (ADR-0005). What it catches is the ordinary mistake — a project's own
+    schema with no `usage` line.
+
+384. **The managed-set cut reads a grant target's namespace too.** `scope`
+    kept a grant on `Object(app.f)` because *some* managed module answered to
+    the name `app.f`, and on this engine a routine `app.f(integer)` is not the
+    table `app.f` (379). A project managing the routine therefore had a grant
+    on an unmanaged table compared, and the differ built a `REVOKE ... ON TABLE
+    app.f` against an object outside the ids file — the one thing this cut
+    exists to prevent.
+
+    The filter is the id's own shape and needs no dialect: an id carrying a
+    signature is a routine on an engine that overloads, and an engine that
+    overloads cannot be keeping those objects where a relation's name is
+    unique. On SQL Server every kind shares `sys.objects`, a routine grant
+    arrives as `Object(dbo.f)`, and its ids are `Named` — a declared signature
+    is refused there — so nothing is filtered out. `unexpressible_permissions`
+    asks the same question of the limitation beside the grant and gets the same
+    answer (176).

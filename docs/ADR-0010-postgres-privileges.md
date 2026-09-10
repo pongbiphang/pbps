@@ -507,6 +507,11 @@ had them.
   nothing remembers the statement — so a declaration using it would differ from
   the database on every plan. Refused offline, the mirror of the signature
   refusal on the engine where nothing overloads.
+- **§1 has one exception, and it is the schema everything lands in by
+  default** (DECISIONS 383). `initdb` grants `USAGE` on `public` to PUBLIC in
+  every database, measured — and PUBLIC is not a role a project can declare
+  (§5), so no `schema::public: [usage]` line could appear in a pull. Requiring
+  one refused every project whose tables live where PostgreSQL puts them.
 - **`maintain` needs two servers to test at all** (DECISIONS 374). The
   amendment above set the rule and this is what obeying it costs: the live
   suite and the `live-pg` CI job now start a pinned PostgreSQL 16 beside the

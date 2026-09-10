@@ -90,6 +90,31 @@ const SCHEMA_PERMISSIONS: [Permission; 2] = [Permission::Usage, Permission::Crea
 /// in the ACL as `Public=d/postgres`.
 const PUBLIC: &str = "public";
 
+/// The schema every principal can enter without holding a grant on it.
+///
+/// It is the same word, and for a related reason: `initdb` grants `USAGE` on
+/// the schema `public` to PUBLIC in every database it makes. **Measured on
+/// 18.6**, `pg_namespace.nspacl` for it is
+/// `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}` — the second
+/// entry is PUBLIC's `USAGE`, and it is not `acldefault`'s doing
+/// (`acldefault('n', ...)` is `{owner=UC/owner}` alone) but the state every
+/// database starts in. A role holding only `SELECT` on `public.pubt` reads it
+/// with no schema grant at all, measured.
+///
+/// So §1's rule — a grant in a schema the role cannot enter reaches nothing —
+/// does not hold here, and applying it refused every project whose tables live
+/// where PostgreSQL puts them by default, including the one `pull` writes from
+/// such a database.
+///
+/// A DBA who revokes that `USAGE` makes this check say nothing where it would
+/// have had something to say. That is the limit this check already has: `USAGE`
+/// can also arrive through a membership, which is never declared, compared or
+/// touched (ADR-0005), so what it catches is the ordinary mistake — a project's
+/// own schema with no `usage` line — and not every unreachable grant there is.
+/// What PUBLIC holds on a schema is reported by `pull` as context (ADR-0010
+/// §5, DECISIONS 383).
+const REACHABLE_WITHOUT_A_GRANT: &str = "public";
+
 /// What a grant target is, among the kinds this model can declare.
 ///
 /// A trigger is missing on purpose: measured, `GRANT SELECT ON gr.gr_trg` is
@@ -352,7 +377,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 // §1, and it is checked once per target rather than once per
                 // permission: a grant with three permissions on a schema the
                 // role cannot enter is one mistake.
-                if !usable.contains(schema_of) {
+                if !usable.contains(schema_of) && schema_of != REACHABLE_WITHOUT_A_GRANT {
                     errs.push(invalid(format!(
                         "role `{name}`: `{target}` is granted in schema `{schema_of}`, which this \
                          role has no `usage` on — PostgreSQL checks the schema before the object, \
@@ -517,6 +542,45 @@ mod tests {
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("app.both(integer)"), "{}", problems[0]);
+    }
+
+    /// The one schema §1 does not apply to. **Measured on 18.6**: a role
+    /// holding `SELECT` on `public.pubt` and nothing else reads it, because
+    /// `initdb` grants `USAGE` on `public` to PUBLIC in every database
+    /// (`nspacl` is `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`).
+    /// Requiring the usage line there refused every project whose tables live
+    /// where PostgreSQL puts them, and refused the project `pull` writes from
+    /// such a database — which no `schema::public: [usage]` grant would appear
+    /// in, because PUBLIC is not a role that can be declared.
+    #[test]
+    fn the_public_schema_needs_no_usage_line_to_be_reachable() {
+        let mut schema = declarations();
+        schema.tables.insert(
+            "public.pubt".parse().expect("a table name parses"),
+            Table::default(),
+        );
+        let mut role = Role::default();
+        role.grants.insert(
+            "public.pubt".parse().expect("a grant target parses"),
+            [Permission::Select].into_iter().collect(),
+        );
+        let problems: Vec<String> = super::role("app_reader", &role, &schema)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(problems.is_empty(), "{problems:?}");
+        // And a schema that is not `public` still needs it.
+        let mut role = Role::default();
+        role.grants.insert(
+            "app.customer".parse().expect("a grant target parses"),
+            [Permission::Select].into_iter().collect(),
+        );
+        let problems: Vec<String> = super::role("app_reader", &role, &schema)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`usage`"), "{}", problems[0]);
     }
 
     /// §1, and it is a refusal because the plan applies cleanly and the role
