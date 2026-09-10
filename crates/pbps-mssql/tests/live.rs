@@ -49,6 +49,529 @@ fn conn_str() -> String {
     )
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn signed_defaults_are_comparable_before_and_after_catalog_folding() {
+    let mut db = TestDb::create("signed_defaults").await;
+    for (index, (default, stored, value)) in [
+        ("- 1", "((-1))", "-1"),
+        ("+ 1", "((1))", "1"),
+        ("-(-1)", "((1))", "1"),
+        ("- /* c */ 1", "((-1))", "-1"),
+        ("(-CAST('1' AS int))", "( -CONVERT([int],'1'))", "-1"),
+        ("(-CAST('1'\tAS\tint))", "( -CONVERT([int],'1'))", "-1"),
+        ("(-CAST('1'\nAS\nint))", "( -CONVERT([int],'1'))", "-1"),
+        ("(-CONVERT(int,'1'))", "( -CONVERT([int],'1'))", "-1"),
+        (
+            "(-CAST('1.25' AS decimal(10,2)))",
+            "( -CONVERT([decimal](10,2),'1.25'))",
+            "-1.25",
+        ),
+        (
+            "(-CONVERT(numeric(10,2),'1.25'))",
+            "( -CONVERT([numeric](10,2),'1.25'))",
+            "-1.25",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let column_type = if value == "-1.25" {
+            "decimal(10,2)"
+        } else {
+            "int"
+        };
+        db.conn.execute(&format!("CREATE TABLE dbo.t{index} (n {column_type} DEFAULT {default}); INSERT dbo.t{index} DEFAULT VALUES;")).await.unwrap();
+        let rows = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{index}')")).await.unwrap();
+        assert_eq!(rows[0].try_get::<&str>("definition").unwrap(), Some(stored));
+        assert!(pbps_mssql::rows::is_constant(default), "declared {default}");
+        assert!(pbps_mssql::rows::is_constant(stored), "stored {stored}");
+        let rows = db
+            .conn
+            .query(&format!(
+                "SELECT CONVERT(varchar(20),n) AS n FROM dbo.t{index} WHERE n=({default})"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<&str>("n").unwrap(), Some(value));
+    }
+    // Keys travel as quoted data, so comments and groupings are not SQL
+    // trivia here. Even tab/LF differ from the ASCII spaces after a sign.
+    for (key, accepted) in [
+        ("- 1", true),
+        ("+  1", true),
+        ("-\t1", false),
+        ("-\n1", false),
+        ("- /* c */ 1", false),
+        ("-(-1)", false),
+        ("- -1", false),
+    ] {
+        let rows = db.conn.query(&format!("SELECT CONVERT(varchar(30),TRY_CONVERT(int,N'{key}')) AS i, CONVERT(varchar(30),TRY_CONVERT(decimal(10,2),N'{key}')) AS d")).await.unwrap();
+        for column in ["i", "d"] {
+            assert_eq!(
+                rows[0].try_get::<&str>(column).unwrap().is_some(),
+                accepted,
+                "{key:?} as {column}"
+            );
+        }
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn throwing_signed_defaults_do_not_break_explicit_row_reads() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("signed_cast_safety").await;
+    for (i, (default, safe)) in [
+        ("-CAST('abc' AS int)", false),
+        ("-CAST('256' AS tinyint)", false),
+        ("-CAST('255' AS tinyint)", true),
+        ("-CAST('-32768' AS smallint)", false),
+        ("+CAST('-32768' AS smallint)", true),
+        ("-CAST('-9223372036854775808' AS bigint)", false),
+        ("+CAST('-9223372036854775808' AS bigint)", true),
+        ("-CAST(1.25 AS int)", true),
+        ("-CAST('1.25' AS int)", false),
+        ("-CAST(CAST(1.5 AS money) AS int)", true),
+        ("-CAST('9.995' AS decimal(3,2))", false),
+        ("-CAST('9.994' AS decimal(3,2))", true),
+        ("-CAST('922337203685477.5807' AS money)", true),
+        ("-CAST('922337203685477.5808' AS money)", false),
+        ("-CAST('-922337203685477.5808' AS money)", false),
+        ("+CAST('-922337203685477.5808' AS money)", true),
+        ("-CAST('214748.3647' AS smallmoney)", true),
+        ("-CAST('214748.3648' AS smallmoney)", false),
+        ("-CAST('214748.36475' AS smallmoney)", false),
+        ("-CAST('-214748.3648' AS smallmoney)", false),
+        ("+CAST('-214748.3648' AS smallmoney)", true),
+        ("-CAST('-0.00005' AS money)", true),
+        ("-CAST('+ 1' AS float)", false),
+        ("-CAST('+-1' AS float)", false),
+        ("-CAST('--1' AS real)", false),
+        ("-CAST('1e38' AS real)", true),
+        ("-CAST('1e39' AS real)", false),
+        ("-CAST('1e308' AS float)", true),
+        ("-CAST('1e309' AS float)", false),
+        ("-CAST('1e-400' AS float)", true),
+        ("-CAST('1e-100' AS real)", true),
+        // Valid engine conversions outside the proof's grammar stay unknown.
+        ("-CAST(CAST('1.25' AS float) AS int)", false),
+        ("-CAST('$1' AS money)", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = TableName::new("dbo", format!("t{i}"));
+        let approximate = default.contains("float") || default.contains("real");
+        let column_type = if approximate {
+            "float"
+        } else {
+            "decimal(38,10)"
+        };
+        db.conn.execute(&format!("CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {column_type} DEFAULT ({default})); INSERT dbo.t{i}(id,n) VALUES(1,1);")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        let mut column = Column::new(column_type.parse().unwrap());
+        // The catalog deparse is the spelling that broke actual row reads.
+        let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
+        column.default = Some(
+            defaults[0]
+                .try_get::<&str>("definition")
+                .unwrap()
+                .unwrap()
+                .to_owned(),
+        );
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let read = |key| {
+            pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let query = read("1");
+        let rows = db
+            .conn
+            .query(&query.sql)
+            .await
+            .unwrap_or_else(|e| panic!("explicit row with {default}: {e}"));
+        let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+        assert_eq!(
+            pbps_mssql::rows::confirms_default(&table.columns["n"]),
+            safe,
+            "{default}"
+        );
+        assert_eq!(observed.unknown.contains("n"), !safe, "{default}");
+        if safe {
+            db.conn
+                .execute(&format!("INSERT dbo.t{i}(id) VALUES(2);"))
+                .await
+                .unwrap_or_else(|e| panic!("proved default {default}: {e}"));
+            // The cast proof concerns evaluation, not float-to-text style 3.
+            // Ask directly for approximate values: that existing formatter
+            // can itself throw for an otherwise valid stored float.
+            if approximate {
+                let rows = db
+                    .conn
+                    .query(&format!(
+                        "SELECT COUNT(*) AS n FROM dbo.t{i} WHERE id=2 AND n=({default})"
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1), "{default}");
+                continue;
+            }
+            let query = read("2");
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("default row with {default}: {e}; {}", query.sql));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert!(observed.at_default.contains("n"), "{default}");
+        }
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn signed_defaults_are_compared_as_the_column_stores_them() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("signed_cast_assignment").await;
+    for (i, (ty, default, explicit)) in [
+        ("varchar(10)", "-CAST('1' AS int)", "'abc'"),
+        ("nvarchar(10)", "- /* c */ 1", "N'abc'"),
+        ("char(10)", "+CAST('1' AS int)", "'abc'"),
+        ("int", "-CAST('1.25' AS decimal(8,2))", "2"),
+        ("decimal(8,1)", "-CAST('1.25' AS decimal(8,2))", "2"),
+        ("varchar(10)", "NULL", "'abc'"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = TableName::new("dbo", format!("t{i}"));
+        db.conn.execute(&format!("CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {ty} DEFAULT ({default})); INSERT dbo.t{i}(id,n) VALUES(1,{explicit}),(3,NULL); INSERT dbo.t{i}(id) VALUES(2);")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        let mut column = Column::new(ty.parse().unwrap());
+        let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
+        column.default = Some(
+            defaults[0]
+                .try_get::<&str>("definition")
+                .unwrap()
+                .unwrap()
+                .to_owned(),
+        );
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for (key, at_default) in [("1", false), ("2", true), ("3", default == "NULL")] {
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{ty} default {default}, row {key}: {e}"));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert_eq!(
+                observed.at_default.contains("n"),
+                at_default,
+                "{ty} {default} row {key}"
+            );
+            assert!(!observed.unknown.contains("n"));
+        }
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn an_unassignable_signed_default_is_unknown_not_null() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("signed_target_safety").await;
+    for (i, (ty, default, explicit, safe)) in [
+        ("tinyint", "-CAST('255' AS tinyint)", "1", false),
+        ("tinyint", "+CAST('255' AS tinyint)", "1", true),
+        ("decimal(3,2)", "-CAST('9.995' AS decimal(5,3))", "1", false),
+        ("decimal(3,2)", "-CAST('9.994' AS decimal(5,3))", "1", true),
+        (
+            "smallmoney",
+            "+CAST('214748.3648' AS decimal(12,4))",
+            "1",
+            false,
+        ),
+        (
+            "smallmoney",
+            "-CAST('214748.3648' AS decimal(12,4))",
+            "1",
+            true,
+        ),
+        (
+            "money",
+            "+CAST('922337203685477.5808' AS decimal(20,4))",
+            "1",
+            false,
+        ),
+        ("nvarchar(1)", "-CAST('255' AS tinyint)", "N'a'", false),
+        ("nchar(1)", "-CAST('255' AS tinyint)", "N'a'", false),
+        // SQL Server emits '*' for the narrow non-Unicode conversion;
+        // assignment and readback must agree rather than guess a width.
+        ("varchar(1)", "-CAST('255' AS tinyint)", "'a'", true),
+        ("char(1)", "-CAST('255' AS tinyint)", "'a'", true),
+        ("nvarchar(4)", "-CAST('255' AS tinyint)", "N'a'", true),
+        ("binary(1)", "-CAST('255' AS tinyint)", "0x02", true),
+        ("varbinary(1)", "-CAST('255' AS tinyint)", "0x02", true),
+        ("bit", "-CAST('255' AS tinyint)", "0", true),
+        ("datetime", "-CAST('255' AS tinyint)", "'2026-01-01'", true),
+        (
+            "smalldatetime",
+            "-CAST('255' AS tinyint)",
+            "'2026-01-01'",
+            false,
+        ),
+        ("sql_variant", "-CAST('255' AS tinyint)", "'abc'", true),
+        ("real", "-CAST('1e39' AS float)", "1", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = TableName::new("dbo", format!("t{i}"));
+        db.conn.execute(&format!("CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {ty} DEFAULT ({default})); INSERT dbo.t{i}(id,n) VALUES(1,{explicit}),(2,NULL);")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        let mut column = Column::new(ty.parse().unwrap());
+        let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
+        column.default = Some(
+            defaults[0]
+                .try_get::<&str>("definition")
+                .unwrap()
+                .unwrap()
+                .to_owned(),
+        );
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for key in ["1", "2"] {
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{ty} default {default}, row {key}: {e}"));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert!(!observed.at_default.contains("n"), "{ty} row {key}");
+            assert_eq!(observed.unknown.contains("n"), !safe, "{ty} row {key}");
+        }
+        if safe {
+            db.conn
+                .execute(&format!("INSERT dbo.t{i}(id) VALUES(3);"))
+                .await
+                .unwrap();
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from("3")].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db.conn.query(&query.sql).await.unwrap();
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert!(observed.at_default.contains("n"), "{ty}");
+            assert!(!observed.unknown.contains("n"), "{ty}");
+        }
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
+    use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
+    let mut db = TestDb::create("signed_fk_assignment").await;
+    for (i, (kind, default, old, next)) in [
+        ("varchar(10)", "-CAST('01' AS int)", "-01", "-1"),
+        ("nvarchar(10)", "-CAST('01' AS int)", "-01", "-1"),
+        (
+            "decimal(4,1)",
+            "-CAST('1.25' AS decimal(4,2))",
+            "-1.2",
+            "-1.3",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = TableName::new("dbo", format!("p{i}"));
+        let child = TableName::new("dbo", format!("c{i}"));
+        db.conn.execute(&format!("CREATE TABLE dbo.p{i}(k {kind} PRIMARY KEY); CREATE TABLE dbo.c{i}(id int PRIMARY KEY, k {kind} DEFAULT({default}) REFERENCES dbo.p{i}(k)); INSERT dbo.p{i} VALUES('{old}'),('{next}'); INSERT dbo.c{i} VALUES(1,'{old}');")).await.unwrap();
+        let delete = |key: &str| Change::DeleteRow {
+            table: parent.clone(),
+            key_column: "k".into(),
+            key: RowKey::from(key),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        for legacy in [true, false] {
+            let types = if legacy {
+                Default::default()
+            } else {
+                [("k".to_owned(), kind.parse().unwrap())]
+                    .into_iter()
+                    .collect()
+            };
+            let update = Change::UpdateRow {
+                table: child.clone(),
+                key_column: "id".into(),
+                key: RowKey::from("1"),
+                columns: [(
+                    "k".to_owned(),
+                    (
+                        Cell::Value(Value::Text(old.into())),
+                        Cell::Default(default.into()),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                unchanged: Default::default(),
+                types,
+                after_types: Default::default(),
+            };
+            for (deleted, count) in [(old, 0), (next, 1)] {
+                let cs = ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(update.clone()),
+                        PlannedChange::new(delete(deleted)),
+                    ],
+                };
+                let probes = Mssql.preflight(&cs);
+                assert_eq!(probes.len(), 1);
+                let rows = db.conn.query(&probes[0].sql).await.unwrap();
+                assert_eq!(
+                    rows[0].try_get_at::<i32>(0).unwrap(),
+                    Some(count),
+                    "update {kind} legacy={legacy}, delete {deleted}"
+                );
+            }
+        }
+        // The engine actually stores the distinct target key and accepts
+        // the delete which the old raw numeric comparison refused.
+        db.conn.execute(&format!("BEGIN TRANSACTION; UPDATE dbo.c{i} SET k=DEFAULT; DELETE dbo.p{i} WHERE k='{old}'; ROLLBACK;")).await.unwrap();
+        db.conn.execute(&format!("DELETE dbo.c{i};")).await.unwrap();
+        for legacy in [true, false] {
+            let types = if legacy {
+                Default::default()
+            } else {
+                [("k".to_owned(), kind.parse().unwrap())]
+                    .into_iter()
+                    .collect()
+            };
+            let insert = Change::InsertRow {
+                table: child.clone(),
+                key_column: "id".into(),
+                key: RowKey::from("1"),
+                identity_key: false,
+                row: Default::default(),
+                defaults: [("k".to_owned(), default.to_owned())].into_iter().collect(),
+                types,
+            };
+            for (deleted, count) in [(old, 0), (next, 1)] {
+                let cs = ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(insert.clone()),
+                        PlannedChange::new(delete(deleted)),
+                    ],
+                };
+                let probes = Mssql.preflight(&cs);
+                assert_eq!(probes.len(), 1);
+                let rows = db.conn.query(&probes[0].sql).await.unwrap();
+                assert_eq!(
+                    rows[0].try_get_at::<i32>(0).unwrap(),
+                    Some(count),
+                    "insert {kind} legacy={legacy}, delete {deleted}"
+                );
+            }
+        }
+        db.conn.execute(&format!("BEGIN TRANSACTION; INSERT dbo.c{i}(id) VALUES(1); DELETE dbo.p{i} WHERE k='{old}'; ROLLBACK;")).await.unwrap();
+        // Backfill uses the same assignment before a new FK is probed.
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.b{i}(id int PRIMARY KEY); INSERT dbo.b{i} VALUES(1);"
+            ))
+            .await
+            .unwrap();
+        for (expression, count) in [(default, 0), ("-CAST('99' AS int)", 1)] {
+            let mut column = Column::new(kind.parse().unwrap()).not_null();
+            column.default = Some(expression.into());
+            let cs = ChangeSet {
+                changes: vec![
+                    PlannedChange::new(Change::AddColumn {
+                        uid: "c_aaaaaa".parse().unwrap(),
+                        table: TableName::new("dbo", format!("b{i}")),
+                        name: "k".into(),
+                        column: Box::new(column),
+                    }),
+                    PlannedChange::new(Change::AddForeignKey {
+                        table: TableName::new("dbo", format!("b{i}")),
+                        name: format!("fk_b{i}"),
+                        constraint: Box::new(ForeignKey {
+                            columns: vec!["k".into()],
+                            references_table: parent.clone(),
+                            references_columns: vec!["k".into()],
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
+                        }),
+                    }),
+                ],
+            };
+            let probes = Mssql.preflight(&cs);
+            let probe = probes
+                .iter()
+                .find(|p| p.sql.contains("NOT EXISTS"))
+                .unwrap();
+            let rows = db.conn.query(&probe.sql).await.unwrap();
+            assert_eq!(
+                rows[0].try_get_at::<i32>(0).unwrap(),
+                Some(count),
+                "backfill {kind} {expression}"
+            );
+        }
+    }
+    db.drop().await;
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,

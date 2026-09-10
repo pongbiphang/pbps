@@ -195,6 +195,9 @@ struct Moved {
     /// `types` fails there rather than quietly turning identity columns back
     /// into NULLs here.
     typed: BTreeMap<RowKey, BTreeSet<String>>,
+    /// Defaults in legacy plans without destination type metadata. The live
+    /// FK supplies that missing assignment type in the delete probe.
+    untyped_defaults: BTreeMap<RowKey, BTreeSet<String>>,
 }
 
 /// A foreign key this plan removes before its deletes run: the constraint,
@@ -224,6 +227,16 @@ fn written(value: &Value) -> Option<String> {
 fn constant_default(default: &str) -> Option<&str> {
     let d = unwrapped(default);
     (crate::rows::is_constant(d) && !d.eq_ignore_ascii_case("null")).then_some(d)
+}
+
+fn assigned_default(default: &str, ty: Option<&ColumnType>) -> String {
+    match ty {
+        Some(ty) => format!(
+            "CONVERT({}, ({default}))",
+            types::normalize(ty).unwrap_or_else(|_| ty.clone())
+        ),
+        None => format!("({default})"),
+    }
 }
 
 /// `NULL` under any number of parentheses: a default that references no
@@ -273,7 +286,7 @@ impl AsStored {
                         Added::Null
                     } else {
                         match column.default.as_deref().and_then(constant_default) {
-                            Some(e) => Added::Backfilled(format!("({e})")),
+                            Some(e) => Added::Backfilled(assigned_default(e, Some(&column.ty))),
                             None => Added::Unspellable,
                         }
                     };
@@ -302,6 +315,8 @@ impl AsStored {
                     key_column,
                     key,
                     columns,
+                    types,
+                    after_types,
                     ..
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
@@ -319,7 +334,11 @@ impl AsStored {
                                         .or_default()
                                         .insert(key.clone());
                                 }
-                                constant.map(|e| format!("({e})"))
+                                let ty = after_types.get(column).or_else(|| types.get(column));
+                                if constant.is_some() && ty.is_none() {
+                                    moved.untyped_defaults.entry(key.clone()).or_default().insert(column.clone());
+                                }
+                                constant.map(|e| assigned_default(e, ty))
                             }
                         };
                         updated.insert(column.clone(), sql);
@@ -345,7 +364,11 @@ impl AsStored {
                     inserted.insert(key_column.clone(), literal(key.as_str()));
                     for (column, default) in defaults {
                         if let Some(expr) = constant_default(default) {
-                            inserted.insert(column.clone(), format!("({expr})"));
+                            let ty = types.get(column);
+                            if ty.is_none() {
+                                moved.untyped_defaults.entry(key.clone()).or_default().insert(column.clone());
+                            }
+                            inserted.insert(column.clone(), assigned_default(expr, ty));
                         } else if !is_null_default(default) {
                             moved
                                 .unprobeable
@@ -955,7 +978,14 @@ fn delete_probe(
             // the deleted row's — so `01` and `1` are one key — and counted
             // for a key the update sets a cell of to something the probe
             // cannot compare, which is the direction to be wrong in.
-            let after = side(&comparable);
+            let untyped = moved
+                .untyped_defaults
+                .get(row_key)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| stored_name(c))
+                .collect();
+            let after = side(&comparable, &untyped);
             let row = literal(row_key.as_str());
             let excluded = format!(
                 "{} + {} + {}",
@@ -985,7 +1015,7 @@ fn delete_probe(
             );
             terms.push(guarded(&uncomparable, &comparable, &arrived));
         }
-        for columns in moved.inserted.values() {
+        for (row_key, columns) in &moved.inserted {
             let known: BTreeMap<String, String> = columns
                 .iter()
                 .filter_map(|(column, sql)| stored_name(column).map(|name| (name, sql.clone())))
@@ -997,10 +1027,17 @@ fn delete_probe(
             // the deleted row or it is not. A key spanning a column the
             // insert leaves to NULL, or to a default that is not a literal,
             // is not one the probe can ask about (117).
+            let untyped = moved
+                .untyped_defaults
+                .get(row_key)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| stored_name(c))
+                .collect();
             let arrived = format!(
                 "{} + {} + {}",
                 literal(&format!(" + (CASE WHEN EXISTS ({parent_row}")),
-                tuple(&side(&known)),
+                tuple(&side(&known, &untyped)),
                 literal(") THEN 1 ELSE 0 END)")
             );
             terms.push(format!(
@@ -1214,10 +1251,24 @@ fn tuple(child_side: &str) -> String {
 /// A row's tuple as the plan writes it: the value written in each column
 /// the plan spells, the stored cell in any other. Spelled for the engine as
 /// a `CASE` over the key's columns.
-fn side(values: &BTreeMap<String, String>) -> String {
+fn side(values: &BTreeMap<String, String>, untyped_defaults: &BTreeSet<String>) -> String {
     let whens: Vec<String> = values
         .iter()
-        .map(|(name, sql)| format!("WHEN {} THEN {}", literal(name), literal(sql)))
+        .map(|(name, sql)| {
+            let value = if !untyped_defaults.contains(name) {
+                literal(sql)
+            } else {
+                // The catalog supplies the destination type for old plans
+                // without row type metadata. A raw numeric default must not
+                // coerce the parent text key by SQL type precedence.
+                format!("N'CONVERT(' + QUOTENAME(TYPE_NAME(c.system_type_id)) + \
+                    CASE WHEN TYPE_NAME(c.system_type_id) IN (N'varchar',N'char',N'varbinary',N'binary',N'nvarchar',N'nchar') \
+                    THEN N'(' + CASE WHEN c.max_length = -1 THEN N'max' ELSE CONVERT(nvarchar(10), c.max_length / CASE WHEN TYPE_NAME(c.system_type_id) IN (N'nvarchar',N'nchar') THEN 2 ELSE 1 END) END + N')' \
+                    WHEN TYPE_NAME(c.system_type_id) IN (N'decimal',N'numeric') THEN N'(' + CONVERT(nvarchar(10),c.precision) + N',' + CONVERT(nvarchar(10),c.scale) + N')' \
+                    WHEN TYPE_NAME(c.system_type_id) IN (N'time',N'datetime2',N'datetimeoffset') THEN N'(' + CONVERT(nvarchar(10),c.scale) + N')' ELSE N'' END + {}", literal(&format!(", {sql})")))
+            };
+            format!("WHEN {} THEN {value}", literal(name))
+        })
         .collect();
     format!("CASE c.name {} ELSE {STORED} END", whens.join(" "))
 }
@@ -3101,7 +3152,7 @@ mod tests {
         let s = sql(added(false, Some("N'eu'")));
         let child = s.iter().find(|s| s.contains("k0")).expect("a probe");
         assert!(
-            child.contains("TRY_CONVERT(varchar(10), (N'eu')) AS k0 FROM [dbo].[customer]"),
+            child.contains("TRY_CONVERT(varchar(10), CONVERT(varchar(10), (N'eu'))) AS k0 FROM [dbo].[customer]"),
             "{child}"
         );
 
@@ -3357,14 +3408,32 @@ mod tests {
 
         let sql = sql_of(&plan(vec![insert("('old')"), delete.clone()]));
         assert!(
-            sql.contains("WHEN N'status_code' THEN N'(''old'')'")
+            sql.contains("WHEN N'status_code' THEN N'CONVERT('")
+                && sql.contains("N', (''old''))'")
                 && sql.contains(") THEN 1 ELSE 0 END)'"),
             "the literal default is what the engine compares: {sql}"
         );
+        for default in [
+            "-CAST(1.25 AS int)",
+            "-CAST('9.994' AS decimal(3,2))",
+            "CONVERT([smallint],'-32768')",
+        ] {
+            let p = probes(&plan(vec![insert(default), delete.clone()]));
+            assert_eq!(
+                p.len(),
+                1,
+                "a safe numeric conversion must not add an unprobeable refusal: {default}: {p:?}"
+            );
+            assert!(p[0].sql.contains("N'status_code'"), "{default}: {p:?}");
+        }
         // Not a literal: nothing to compare before it runs. NULL: no row.
         // The key is still written, so a key spanning it is asked about,
         // and one spanning `status_code` is not.
-        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 1))", "(NULL)"] {
+        for default in [
+            "(NEXT VALUE FOR [dbo].[s])",
+            "(CONVERT(int, 'abc'))",
+            "(NULL)",
+        ] {
             let sql = sql_of(&plan(vec![insert(default), delete.clone()]));
             assert!(!sql.contains("N'status_code'"), "{default}: {sql}");
             assert!(
@@ -3376,7 +3445,7 @@ mod tests {
         // where a foreign key to the table spans the column the write is
         // refused, by a second probe that counts such columns (124). `NULL`
         // names no row and needs none.
-        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 1))"] {
+        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 'abc'))"] {
             let p = probes(&plan(vec![insert(default), delete.clone()]));
             assert_eq!(p.len(), 2, "{default}: {p:?}");
             assert!(
@@ -3424,7 +3493,7 @@ mod tests {
         };
         let sql = sql_of(&plan(vec![update, delete]));
         assert!(
-            sql.contains("WHEN N'status_code' THEN N'(''old'')'"),
+            sql.contains("WHEN N'status_code' THEN N'CONVERT('") && sql.contains("N', (''old''))'"),
             "{sql}"
         );
         assert!(
@@ -3433,6 +3502,41 @@ mod tests {
             ),
             "an update may already be counted: {sql}"
         );
+    }
+
+    #[test]
+    fn default_assignment_types_do_not_claim_a_schema_type_change() {
+        let table = tname("dbo.child");
+        let key = RowKey::from("1");
+        let update = Change::UpdateRow {
+            table: table.clone(),
+            key_column: "id".into(),
+            key: key.clone(),
+            columns: [(
+                "k".to_owned(),
+                (
+                    Cell::Value(Value::Null),
+                    Cell::Default("-CAST('01' AS int)".into()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: [("k".to_owned(), ty("integer"))].into_iter().collect(),
+            after_types: [("k".to_owned(), ty("varchar(10)"))].into_iter().collect(),
+        };
+        let names = AsStored::of(&plan(vec![update]));
+        assert!(names.types.is_empty());
+        assert_eq!(
+            names.moved[&table].updated[&key]["k"].as_deref(),
+            Some("CONVERT(varchar(10), (-CAST('01' AS int)))")
+        );
+        assert!(names.moved[&table].untyped_defaults.is_empty());
+        assert_eq!(
+            assigned_default("1.25", Some(&ty("numeric(8,2)"))),
+            "CONVERT(decimal(8, 2), (1.25))"
+        );
+        assert_eq!(assigned_default("1.25", None), "(1.25)");
     }
 
     /// A foreign key is a tuple: an update that sets two of its columns is

@@ -126,7 +126,9 @@ pub struct Slot {
     /// Position of the value in the result row.
     pub value_at: usize,
     /// Position of the "equals the default" flag, for a column whose default
-    /// is a literal the engine can compare without running anything.
+    /// is a literal the engine can compare without running anything. The
+    /// query returns -1 when assignment conversion fails, 0 for different,
+    /// and 1 for equal; -1 decodes into the existing unknown set.
     pub default_at: Option<usize>,
     /// Whether the column has a default at all — which decides what a NULL
     /// means (see the module docs).
@@ -221,10 +223,16 @@ pub fn query(
         let asked = confirms_default(spec);
         let default_at = match &spec.default {
             Some(default) if asked => {
+                // Compare what assignment stores, as the emitter's
+                // defaulted_cell does. Type precedence must not convert a
+                // text cell to the numeric type of its default expression.
+                let ty = crate::types::normalize(&spec.ty)?;
                 select.push(format!(
-                    // Both halves, because `=` is UNKNOWN for a NULL on either
-                    // side and `DEFAULT NULL` is a real declaration.
-                    "CASE WHEN {quoted} = ({default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
+                    // A failed assignment is unknown, not a NULL default.
+                    // Keep that third answer local to this query/decode wire
+                    // format; TRY_CONVERT preserves the engine's rounding.
+                    "CASE WHEN ({default}) IS NOT NULL AND TRY_CONVERT({ty}, {default}) IS NULL THEN -1 \
+                     WHEN {quoted} = TRY_CONVERT({ty}, {default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
                      THEN 1 ELSE 0 END"
                 ));
                 Some(select.len() - 1)
@@ -638,12 +646,327 @@ pub fn confirms_default(spec: &pbps_model::Column) -> bool {
 /// module docs say why those are never put in the query. Conservative on
 /// purpose: a literal read as "not a literal" only costs the comparison.
 pub fn is_constant(default: &str) -> bool {
+    let Some(clean) = constant_trivia(default) else {
+        return false;
+    };
+    constant_operand(&clean, 0)
+}
+
+// Preserve token boundaries: removing a comment must not turn `1/*c*/2`
+// into a number, or `-/*c*/-1` into a line comment.
+fn constant_trivia(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' || c == '[' {
+            let close = if c == '[' { ']' } else { '\'' };
+            out.push(c);
+            loop {
+                let next = chars.next()?;
+                out.push(next);
+                if next == close {
+                    if chars.peek() != Some(&close) {
+                        break;
+                    }
+                    out.push(chars.next()?);
+                }
+            }
+        } else if c == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for next in chars.by_ref() {
+                if matches!(next, '\r' | '\n') {
+                    break;
+                }
+            }
+            out.push(' ');
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut depth = 1;
+            while depth != 0 {
+                let next = chars.next()?;
+                if next == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    depth += 1;
+                } else if next == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    depth -= 1;
+                }
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn numeric_cast(s: &str) -> Option<(&str, ColumnType)> {
+    let lower = s.to_ascii_lowercase();
+    let cast = lower.strip_prefix("cast").and_then(|rest| {
+        let start = s.len() - rest.len();
+        let body = s[start..].trim().strip_prefix('(')?.strip_suffix(')')?;
+        // AS is a token: tabs/newlines separate it just as spaces do.
+        // Comments have already become whitespace, and the target's type
+        // parser still refuses a suffix that is not a numeric type.
+        let (at, _) = body
+            .to_ascii_lowercase()
+            .rmatch_indices("as")
+            .find(|(at, _)| {
+                body[..*at].ends_with(char::is_whitespace)
+                    && body[*at + 2..].starts_with(char::is_whitespace)
+            })?;
+        Some((&body[..at], body[at + 2..].trim()))
+    });
+    let convert = lower.strip_prefix("convert").and_then(|rest| {
+        let start = s.len() - rest.len();
+        let body = s[start..].trim().strip_prefix('(')?.strip_suffix(')')?;
+        let mut parens = 0usize;
+        let separator = body.char_indices().find_map(|(at, c)| {
+            match c {
+                '(' => parens += 1,
+                ')' => parens = parens.saturating_sub(1),
+                ',' if parens == 0 => return Some(at),
+                _ => {}
+            }
+            None
+        })?;
+        Some((&body[separator + 1..], body[..separator].trim()))
+    });
+    let (operand, ty) = cast.or(convert)?;
+    let ty = ty.replace(['[', ']'], "").parse::<ColumnType>().ok()?;
+    Some((operand, crate::types::normalize(&ty).ok()?))
+}
+
+// This is a bounded safety proof, not a replacement SQL evaluator: its value
+// never enters a query or the model. The original SQL still supplies the value.
+// Exact decimal syntax has at most 38 digits; numeric strings use that syntax
+// (scientific notation also reaches float/real). Approximate-to-exact casts,
+// currency-formatted strings, arbitrary expressions and user types stay unknown.
+enum Numeric {
+    Exact(ExactNumeric),
+    Approximate(f64),
+    Text(String),
+    Null,
+}
+
+struct ExactNumeric {
+    coefficient: i128,
+    scale: u32,
+    bounds: (i128, i128),
+    tiny: bool,
+    money: bool,
+}
+
+fn decimal_number(text: &str) -> Option<ExactNumeric> {
+    let text = text.trim_matches(' ');
+    let negative = text.starts_with('-');
+    let text = text
+        .strip_prefix(['-', '+'])
+        .unwrap_or(text)
+        .trim_start_matches(' ');
+    let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if integer.is_empty() && fraction.is_empty()
+        || !integer
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+        || fraction.len() > 38
+    {
+        return None;
+    }
+    let digits = format!("{integer}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.len() > 38 {
+        return None;
+    }
+    let coefficient = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<i128>().ok()?
+    };
+    let limit = 10i128.pow(38) - 1;
+    Some(ExactNumeric {
+        coefficient: if negative { -coefficient } else { coefficient },
+        scale: fraction.len() as u32,
+        bounds: (-limit, limit),
+        tiny: false,
+        money: false,
+    })
+}
+
+fn rescale(coefficient: i128, from: u32, to: u32, round: bool) -> Option<i128> {
+    if to >= from {
+        coefficient.checked_mul(10i128.checked_pow(to - from)?)
+    } else {
+        let divisor = 10i128.checked_pow(from - to)?;
+        let truncated = coefficient / divisor;
+        if round && (coefficient % divisor).abs() >= divisor / 2 {
+            truncated.checked_add(coefficient.signum())
+        } else {
+            Some(truncated)
+        }
+    }
+}
+
+fn numeric_conversion(value: Numeric, ty: &ColumnType) -> Option<Numeric> {
+    let base = ty.base.as_str();
+    if !matches!(
+        base,
+        "tinyint"
+            | "smallint"
+            | "int"
+            | "bigint"
+            | "decimal"
+            | "money"
+            | "smallmoney"
+            | "real"
+            | "float"
+    ) {
+        return None;
+    }
+    if matches!(value, Numeric::Null) {
+        return Some(Numeric::Null);
+    }
+    if matches!(base, "real" | "float") {
+        let value = match value {
+            Numeric::Exact(n) => n.coefficient as f64 / 10f64.powi(n.scale as i32),
+            Numeric::Approximate(n) => n,
+            // Approximate conversions reject the sign gap that exact
+            // numeric string conversions accept; retain it for this parser.
+            Numeric::Text(s) => s.trim_matches(' ').parse::<f64>().ok()?,
+            Numeric::Null => unreachable!(),
+        };
+        let value = if base == "real" {
+            f64::from(value as f32)
+        } else {
+            value
+        };
+        return value.is_finite().then_some(Numeric::Approximate(value));
+    }
+    let integer_target = matches!(base, "tinyint" | "smallint" | "int" | "bigint");
+    let value = match value {
+        Numeric::Exact(n) => n,
+        Numeric::Text(s) => {
+            // Unlike a numeric operand, the string '1.25' does not convert
+            // to int at all. Fractional money operands instead round to int.
+            if integer_target && s.contains('.') {
+                return None;
+            }
+            decimal_number(&s)?
+        }
+        Numeric::Approximate(_) | Numeric::Null => return None,
+    };
+    let (scale, bounds) = match base {
+        "tinyint" => (0, (0, 255)),
+        "smallint" => (0, (i128::from(i16::MIN), i128::from(i16::MAX))),
+        "int" => (0, (i128::from(i32::MIN), i128::from(i32::MAX))),
+        "bigint" => (0, (i128::from(i64::MIN), i128::from(i64::MAX))),
+        "money" => (4, (i128::from(i64::MIN), i128::from(i64::MAX))),
+        "smallmoney" => (4, (i128::from(i32::MIN), i128::from(i32::MAX))),
+        "decimal" => {
+            let [
+                pbps_model::TypeArg::Int(precision),
+                pbps_model::TypeArg::Int(scale),
+            ] = ty.args.as_slice()
+            else {
+                return None;
+            };
+            let limit = 10i128.checked_pow((*precision).try_into().ok()?)? - 1;
+            ((*scale).try_into().ok()?, (-limit, limit))
+        }
+        _ => return None,
+    };
+    let coefficient = rescale(
+        value.coefficient,
+        value.scale,
+        scale,
+        !integer_target || value.money,
+    )?;
+    if !(bounds.0..=bounds.1).contains(&coefficient) {
+        return None;
+    }
+    Some(Numeric::Exact(ExactNumeric {
+        coefficient,
+        scale,
+        bounds,
+        tiny: base == "tinyint",
+        money: matches!(base, "money" | "smallmoney"),
+    }))
+}
+
+fn numeric_value(text: &str, depth: usize) -> Option<Numeric> {
+    if depth > 64 {
+        return None;
+    }
+    let mut s = text.trim();
+    while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if let Some(operand) = s.strip_prefix(['-', '+']) {
+        let mut value = numeric_value(operand, depth + 1)?;
+        if matches!(value, Numeric::Text(_)) {
+            return None;
+        }
+        if s.starts_with('-') {
+            match &mut value {
+                Numeric::Exact(n) => {
+                    // Measured: unary minus promotes tinyint to smallint,
+                    // but the other bounded types retain their own bounds.
+                    if n.tiny {
+                        n.bounds = (i128::from(i16::MIN), i128::from(i16::MAX));
+                        n.tiny = false;
+                    }
+                    n.coefficient = n.coefficient.checked_neg()?;
+                    if !(n.bounds.0..=n.bounds.1).contains(&n.coefficient) {
+                        return None;
+                    }
+                }
+                Numeric::Approximate(n) => *n = -*n,
+                Numeric::Text(_) | Numeric::Null => {}
+            }
+        }
+        return Some(value);
+    }
+    if let Some((operand, ty)) = numeric_cast(s) {
+        return numeric_conversion(numeric_value(operand, depth + 1)?, &ty);
+    }
+    if s.eq_ignore_ascii_case("null") {
+        return Some(Numeric::Null);
+    }
+    let quoted = s
+        .strip_prefix(['N', 'n'])
+        .filter(|rest| rest.starts_with('\''))
+        .unwrap_or(s);
+    if let Some(value) = quoted
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return (!value.contains('\'')).then(|| Numeric::Text(value.to_owned()));
+    }
+    if s.contains(['e', 'E']) {
+        let value = s.parse::<f64>().ok()?;
+        return value.is_finite().then_some(Numeric::Approximate(value));
+    }
+    decimal_number(s).map(Numeric::Exact)
+}
+
+fn constant_operand(default: &str, depth: usize) -> bool {
+    // Declarations are untrusted input; nested signs/casts must not exhaust
+    // the reader's stack. An unusually deep constant can remain unconfirmed.
+    if depth > 64 {
+        return false;
+    }
     let mut s = default.trim();
     while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
         s = s[1..s.len() - 1].trim();
     }
     if s.is_empty() {
         return false;
+    }
+    // Unary plus is erased from a CAST's catalog deparse, so the proven
+    // numeric CONVERT spelling must be recognized without a remaining sign.
+    if s.starts_with(['-', '+']) || numeric_cast(s).is_some() {
+        return numeric_value(s, depth).is_some();
     }
     if s.eq_ignore_ascii_case("null") {
         return true;
@@ -741,25 +1064,24 @@ pub fn decode(
     for slot in &query.columns {
         let text: Option<&str> = row.try_get_at(slot.value_at).map_err(|e| read(name, e))?;
         // Three answers, not two: the engine said it is the default, the
-        // engine said it is not, or the engine was never asked (a default it
-        // would have had to run). The third is not the first: a `NEWID()`
+        // engine said it is not, or no comparison was possible (a default it
+        // would have had to run, or an assignment conversion that failed).
+        // The third is not the first: a `NEWID()`
         // key or a `GETDATE()` stamp holds a value nobody can tell from its
         // default, and `pull` has to write that value, not drop it.
-        let confirmed = match slot.default_at {
-            Some(at) => {
-                row.try_get_at::<i32>(at)
-                    .map_err(|e| read(name, e))?
-                    .unwrap_or(0)
-                    == 1
-            }
-            None => false,
+        let default_answer = match slot.default_at {
+            Some(at) => row
+                .try_get_at::<i32>(at)
+                .map_err(|e| read(name, e))?
+                .unwrap_or(0),
+            None => 0,
         };
         match canonical(slot, text) {
             Ok(Some(v)) => {
                 cells.insert(slot.column.clone(), v);
-                if confirmed {
+                if default_answer == 1 {
                     at_default.insert(slot.column.clone());
-                } else if slot.assume_default {
+                } else if slot.assume_default || default_answer == -1 {
                     unknown.insert(slot.column.clone());
                 }
             }
@@ -841,12 +1163,70 @@ mod tests {
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         assert!(
             q.sql.contains(
-                "CASE WHEN [label] = ('Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
+                "WHEN [label] = TRY_CONVERT(nvarchar(50), 'Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
             ),
             "{}",
             q.sql
         );
         assert!(q.sql.trim_end().ends_with(';'), "{}", q.sql);
+    }
+
+    #[test]
+    fn default_comparisons_use_the_normalized_column_type() {
+        for (ty, expected) in [
+            ("varchar(10)", "varchar(10)"),
+            ("nvarchar(max)", "nvarchar(max)"),
+            ("numeric(8,2)", "decimal(8, 2)"),
+            ("integer", "int"),
+        ] {
+            let t = table(
+                Some(vec!["id"]),
+                &[
+                    ("id", "int", None),
+                    ("n]ame", ty, Some("-CAST('1' AS int)")),
+                ],
+            );
+            let q = query(
+                &name(),
+                &t,
+                &RowScope::Every {
+                    known: Default::default(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                q.sql.contains(&format!(
+                    "[n]]ame] = TRY_CONVERT({expected}, -CAST('1' AS int))"
+                )),
+                "{}",
+                q.sql
+            );
+            assert!(q.sql.contains(&format!(
+                "(-CAST('1' AS int)) IS NOT NULL AND TRY_CONVERT({expected}, -CAST('1' AS int)) IS NULL THEN -1"
+            )), "{}", q.sql);
+        }
+        for (ty, default) in [
+            ("text", "-CAST('1' AS int)"),
+            ("varchar(10)", "NEWID()"),
+            ("int", "-CAST('abc' AS int)"),
+        ] {
+            let t = table(
+                Some(vec!["id"]),
+                &[("id", "int", None), ("n", ty, Some(default))],
+            );
+            let q = query(
+                &name(),
+                &t,
+                &RowScope::Every {
+                    known: Default::default(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!q.sql.contains("CASE WHEN"), "{}", q.sql);
+            assert!(q.columns[0].assume_default);
+        }
     }
 
     /// The engine's column, not the declaration's: never selected, so it never
@@ -1053,11 +1433,70 @@ mod tests {
     /// `CASE` over `NEXT VALUE FOR` is refused by the engine, and one over
     /// `NEWID()` runs it once per row. Only a literal is compared.
     #[test]
+    fn signed_numeric_casts_are_confirmed_only_when_evaluation_cannot_throw() {
+        for (default, safe) in [
+            ("-CAST('abc' AS int)", false),
+            ("-CAST('256' AS tinyint)", false),
+            ("-CAST('255' AS tinyint)", true),
+            ("-CAST('-32768' AS smallint)", false),
+            ("+CAST('-32768' AS smallint)", true),
+            ("-CAST('-9223372036854775808' AS bigint)", false),
+            ("+CAST('-9223372036854775808' AS bigint)", true),
+            ("-CAST(1.25 AS int)", true),
+            ("-CAST('1.25' AS int)", false),
+            ("-CAST(CAST(1.5 AS money) AS int)", true),
+            ("-CAST('9.995' AS decimal(3,2))", false),
+            ("-CAST('9.994' AS decimal(3,2))", true),
+            ("-CAST('922337203685477.5807' AS money)", true),
+            ("-CAST('922337203685477.5808' AS money)", false),
+            ("-CAST('-922337203685477.5808' AS money)", false),
+            ("+CAST('-922337203685477.5808' AS money)", true),
+            ("-CAST('214748.3647' AS smallmoney)", true),
+            ("-CAST('214748.3648' AS smallmoney)", false),
+            ("-CAST('214748.36475' AS smallmoney)", false),
+            ("-CAST('-214748.3648' AS smallmoney)", false),
+            ("+CAST('-214748.3648' AS smallmoney)", true),
+            ("-CAST('-0.00005' AS money)", true),
+            ("-CAST('+ 1' AS float)", false),
+            ("-CAST('+-1' AS float)", false),
+            ("-CAST('--1' AS real)", false),
+            ("-CAST('1e38' AS real)", true),
+            ("-CAST('1e39' AS real)", false),
+            ("-CAST('1e308' AS float)", true),
+            ("-CAST('1e309' AS float)", false),
+            ("-CAST('1e-400' AS float)", true),
+            ("-CAST('1e-100' AS real)", true),
+            ("-CAST('$1' AS money)", false),
+            // Approximate-to-exact conversion and strings beyond the exact
+            // engine's 38-digit grammar remain unknown, never SQL NULL.
+            ("-CAST(CAST('1.25' AS float) AS int)", false),
+            (
+                "-CAST('123456789012345678901234567890123456789' AS decimal(38,0))",
+                false,
+            ),
+        ] {
+            assert_eq!(is_constant(default), safe, "{default}");
+        }
+    }
+
+    #[test]
     fn a_default_the_engine_would_have_to_run_is_never_evaluated() {
         for literal in [
             "0",
             "((0))",
             "(-1)",
+            "- 1",
+            "+ 1",
+            "-(-1)",
+            "- /* c */ 1",
+            "- /* a /* b */ c */ ( + 1)",
+            "- -- c\n1",
+            "-CAST('1' AS int)",
+            "-CAST('1'\tAS\tint)",
+            "-CAST('1'\nAS\nint)",
+            "( -CONVERT([int],'1'))",
+            "-CAST('1.25' AS decimal(10,2))",
+            "( -CONVERT([numeric](10,2),'1.25'))",
             "1.5",
             ".5",
             "1e3",
@@ -1086,6 +1525,18 @@ mod tests {
             "0x1G",
             "1.2.3",
             "--1",
+            "- /* unfinished",
+            "- 1 + 2",
+            "- abs(1)",
+            "- CAST(NEWID() AS int)",
+            "- CAST(NEWID()\tAS\tint)",
+            "- CAST(1\nASint)",
+            "- CONVERT(int, NEXT VALUE FOR dbo.seq)",
+            "- CAST('1' AS dbo.custom)",
+            "- CAST('01/02/2026' AS datetime)",
+            "- CONVERT(decimal(10,2), RAND())",
+            "- CONVERT(decimal(10,2), '1', 0)",
+            "1/* c */2",
             "'unterminated",
         ] {
             assert!(!is_constant(expression), "{expression}");

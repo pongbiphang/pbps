@@ -173,7 +173,13 @@ fn key_shape(base: &str, text: &str) -> Option<&'static str> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let fits = match base {
         "decimal" | "numeric" | "money" | "smallmoney" | "float" | "real" => {
-            let n = text.strip_prefix(['-', '+']).unwrap_or(text);
+            let n = text.strip_prefix(['-', '+']).map_or(text, |s| {
+                if matches!(base, "float" | "real") {
+                    s
+                } else {
+                    s.trim_start_matches(' ')
+                }
+            });
             let (mantissa, exponent) = match n.split_once(['e', 'E']) {
                 Some((m, e)) => (m, Some(e)),
                 None => (n, None),
@@ -574,16 +580,23 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 let text = key.as_str().trim();
                 let fits = match kind {
                     ValueKind::Int => {
-                        let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+                        // SQL Server accepts ASCII spaces after a sign in
+                        // quoted numeric keys, but rejects tabs and newlines.
+                        let digits = text
+                            .strip_prefix(['-', '+'])
+                            .map_or(text, |s| s.trim_start_matches(' '));
                         let shaped =
                             !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
                         // And within the type: `300` is an integer no `tinyint`
                         // holds, and the engine refuses the insert the same way.
                         shaped
-                            && text.parse::<i128>().is_ok_and(|n| {
-                                int_range(&base).is_none_or(|(lo, hi)| (lo..=hi).contains(&n))
-                                    && (i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&n)
-                            })
+                            && format!("{}{digits}", if text.starts_with('-') { "-" } else { "" })
+                                .parse::<i128>()
+                                .is_ok_and(|n| {
+                                    int_range(&base).is_none_or(|(lo, hi)| (lo..=hi).contains(&n))
+                                        && (i128::from(i64::MIN)..=i128::from(i64::MAX))
+                                            .contains(&n)
+                                })
                     }
                     ValueKind::Bool => {
                         matches!(text, "0" | "1")
@@ -1037,6 +1050,41 @@ mod tests {
         assert!(msg.contains("row key `300` cannot be a `tinyint`"), "{msg}");
         assert!(msg.contains("row key `-1` cannot be a `tinyint`"), "{msg}");
         assert!(!msg.contains("row key `255`"), "{msg}");
+    }
+
+    #[test]
+    fn signed_numeric_keys_allow_spaces_but_not_sql_expressions() {
+        use pbps_model::{DataMode, Row, RowKey, TableData};
+        for base in ["float", "real"] {
+            assert!(key_shape(base, "- 1").is_some());
+            assert!(key_shape(base, "+1").is_none());
+        }
+        for base in ["int", "decimal(10,2)"] {
+            let (name, mut t) = base_table();
+            t.columns
+                .insert("k".into(), Column::new(ty(base)).not_null());
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["k".into()],
+            });
+            for (key, accepted) in [
+                ("- 1", true),
+                ("+  1", true),
+                ("-\t1", false),
+                ("-\n1", false),
+                ("- /* c */ 1", false),
+                ("-(-1)", false),
+                ("- -1", false),
+                ("- 2147483649", base != "int"),
+            ] {
+                t.data = Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: [(RowKey::from(key), Row::default())].into_iter().collect(),
+                });
+                let msg = messages(&table(&name, &t));
+                assert_eq!(!msg.contains("row key"), accepted, "{base} {key:?}: {msg}");
+            }
+        }
     }
 
     /// The key is a literal like any cell, and a table this plan creates has
