@@ -74,6 +74,10 @@ pub enum Blocker {
         /// one, and always of one kind.
         intents: Vec<Intent>,
     },
+    /// A rename's target is already occupied by a name that remains in the
+    /// declarations. The source is left available so a companion drop intent
+    /// can still account for it, instead of making the rename look absorbed.
+    RenameTargetExists { target: String },
 }
 
 /// The half of a rename that two intents fought over.
@@ -208,36 +212,52 @@ struct Claim<'a, T> {
 /// `Err`, so the order-dependent decision goes nowhere — while skipping the
 /// loop leaves every *other* intent of that kind unmatched, and the sweep then
 /// reports each of those as a likely typo too.
-fn contested_rename_claims<T: Ord + std::fmt::Display>(claims: &[Claim<'_, T>]) -> Vec<Blocker> {
+fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
+    claims: &[Claim<'_, T>],
+) -> (Vec<Blocker>, BTreeSet<String>) {
     let mut out = Vec::new();
-    let pass =
-        |side: RenameSide, pick: for<'a> fn(&'a Claim<'_, T>) -> &'a T, out: &mut Vec<Blocker>| {
-            let mut grouped: BTreeMap<&T, Vec<&Claim<'_, T>>> = BTreeMap::new();
-            for c in claims {
-                grouped.entry(pick(c)).or_default().push(c);
-            }
-            for (name, group) in grouped {
-                // One statement written twice is still one statement, so the
-                // repeats are collapsed before the claimants are counted.
-                let mut distinct: Vec<&Intent> = Vec::new();
-                for c in group {
-                    if !distinct.contains(&c.intent) {
-                        distinct.push(c.intent);
-                    }
+    let mut conflicting_sources = BTreeSet::new();
+    let pass = |side: RenameSide,
+                pick: for<'a> fn(&'a Claim<'_, T>) -> &'a T,
+                out: &mut Vec<Blocker>,
+                conflicting_sources: &mut BTreeSet<String>| {
+        let mut grouped: BTreeMap<&T, Vec<&Claim<'_, T>>> = BTreeMap::new();
+        for c in claims {
+            grouped.entry(pick(c)).or_default().push(c);
+        }
+        for (name, group) in grouped {
+            // One statement written twice is still one statement, so the
+            // repeats are collapsed before the claimants are counted.
+            let mut distinct: Vec<&Intent> = Vec::new();
+            for c in &group {
+                if !distinct.contains(&c.intent) {
+                    distinct.push(c.intent);
                 }
-                if distinct.len() < 2 {
-                    continue;
-                }
-                out.push(Blocker::ConflictingRenameIntents {
-                    side,
-                    name: name.to_string(),
-                    intents: distinct.into_iter().cloned().collect(),
-                });
             }
-        };
-    pass(RenameSide::Source, |c| &c.source, &mut out);
-    pass(RenameSide::Target, |c| &c.target, &mut out);
-    out
+            if distinct.len() < 2 {
+                continue;
+            }
+            conflicting_sources.extend(group.iter().map(|c| c.source.to_string()));
+            out.push(Blocker::ConflictingRenameIntents {
+                side,
+                name: name.to_string(),
+                intents: distinct.into_iter().cloned().collect(),
+            });
+        }
+    };
+    pass(
+        RenameSide::Source,
+        |c| &c.source,
+        &mut out,
+        &mut conflicting_sources,
+    );
+    pass(
+        RenameSide::Target,
+        |c| &c.target,
+        &mut out,
+        &mut conflicting_sources,
+    );
+    (out, conflicting_sources)
 }
 
 /// Whether this intent has already taken effect — its fact is in the ids file.
@@ -315,6 +335,35 @@ fn resolve_roles(
             })
         })
         .collect();
+    let (rename_blockers, conflicting_sources) = contested_rename_claims(&claims);
+    blockers.extend(rename_blockers);
+
+    // A target that is already known and still declared is not in `appeared`,
+    // so this rename cannot match. Report that specific collision before the
+    // matching loop and leave `from` in `disappeared`; a companion drop intent
+    // must still be able to account for the source. A source with another
+    // matchable claim is an idempotent/stale annotation instead, so it is not a
+    // collision. Mark the intent accounted for so the final sweep does not
+    // mislabel this well-formed rename as a typo. Deduplicate by target so two
+    // statements against one occupied name describe one collision rather than
+    // repeating the same diagnosis.
+    let mut occupied_targets = BTreeSet::new();
+    for (i, intent) in intents.iter().enumerate() {
+        let Intent::RenameRole { from, to } = intent else {
+            continue;
+        };
+        if disappeared.contains(from)
+            && !claims.iter().any(|claim| claim.source == from)
+            && declared_names.contains(&to)
+            && known.contains_key(to)
+        {
+            if occupied_targets.insert(to.clone()) {
+                blockers.push(Blocker::RenameTargetExists { target: to.clone() });
+            }
+            used.insert(i);
+        }
+    }
+
     // Raised, and then everything below runs as it always did. Returning here
     // was the obvious move and the wrong one: the loop's decision is discarded
     // anyway — `resolve` throws `r` away when it returns `Err` — while
@@ -322,13 +371,13 @@ fn resolve_roles(
     // the sweep at the end then calls a perfectly good annotation a likely
     // typo. The contenders are already marked used, which is what the sweep
     // has to be told; the bystanders match their way to the same place.
-    blockers.extend(contested_rename_claims(&claims));
-
     for (i, intent) in intents.iter().enumerate() {
         if let Intent::RenameRole { from, to } = intent
-            && disappeared.remove(from)
-            && appeared.remove(to)
+            && disappeared.contains(from)
+            && appeared.contains(to)
         {
+            disappeared.remove(from);
+            appeared.remove(to);
             let uid = known[from].clone();
             r.ids.roles.insert(uid.clone(), to.clone());
             r.renamed_roles.push((uid, from.clone(), to.clone()));
@@ -365,7 +414,9 @@ fn resolve_roles(
     }
 
     for role in disappeared {
-        blockers.push(Blocker::DropRoleNeedsReason { role });
+        if !conflicting_sources.contains(&role) {
+            blockers.push(Blocker::DropRoleNeedsReason { role });
+        }
     }
 
     for name in appeared {
@@ -416,15 +467,44 @@ fn resolve_tables(
             })
         })
         .collect();
-    blockers.extend(contested_rename_claims(&claims));
+    let (rename_blockers, conflicting_sources) = contested_rename_claims(&claims);
+    blockers.extend(rename_blockers);
+
+    // Check both sets before the matching loop mutates either one. If the
+    // target is a known name that remains declared, it is an occupied target,
+    // not an unused rename; keep the source in `disappeared` for a companion
+    // drop intent and account for the rename in the final sweep. A source with
+    // another matchable claim is an idempotent/stale annotation instead, so it
+    // is not a collision. Deduplicate by target so two statements against one
+    // occupied name describe one collision rather than repeating the diagnosis.
+    let mut occupied_targets = BTreeSet::new();
+    for (i, intent) in intents.iter().enumerate() {
+        let Intent::RenameTable { from, to } = intent else {
+            continue;
+        };
+        if disappeared.contains(from)
+            && !claims.iter().any(|claim| claim.source == from)
+            && declared_names.contains(&to)
+            && known.contains_key(to)
+        {
+            if occupied_targets.insert(to.clone()) {
+                blockers.push(Blocker::RenameTargetExists {
+                    target: to.clone().to_string(),
+                });
+            }
+            used.insert(i);
+        }
+    }
 
     // Rename wins over drop: if both intents are given for one table, rename is
     // the more specific statement.
     for (i, intent) in intents.iter().enumerate() {
         if let Intent::RenameTable { from, to } = intent
-            && disappeared.remove(from)
-            && appeared.remove(to)
+            && disappeared.contains(from)
+            && appeared.contains(to)
         {
+            disappeared.remove(from);
+            appeared.remove(to);
             let uid = known[from].clone();
             rename_table_in_ids(&mut r.ids, &uid, from, to);
             r.renamed_tables.push((uid, from.clone(), to.clone()));
@@ -452,7 +532,9 @@ fn resolve_tables(
     }
 
     for table in disappeared {
-        blockers.push(Blocker::DropTableNeedsReason { table });
+        if !conflicting_sources.contains(&table.to_string()) {
+            blockers.push(Blocker::DropTableNeedsReason { table });
+        }
     }
 
     for name in appeared {
@@ -511,14 +593,43 @@ fn resolve_columns(
                 )
             })
             .collect();
-        blockers.extend(contested_rename_claims(&claims));
+        let (rename_blockers, conflicting_sources) = contested_rename_claims(&claims);
+        blockers.extend(rename_blockers);
+
+        // The target must be checked while both sets still describe the
+        // baseline. In particular, do not consume `from` when `to` is already
+        // occupied by a declared column: a companion drop intent still needs
+        // to see that source in `disappeared`. A source with another matchable
+        // claim is an idempotent/stale annotation instead, so it is not a
+        // collision. Deduplicate by target to keep one diagnosis per name.
+        let mut occupied_targets = BTreeSet::new();
+        for (i, intent) in intents.iter().enumerate() {
+            let Intent::RenameColumn { table, from, to } = intent else {
+                continue;
+            };
+            if table == table_name
+                && disappeared.contains(from)
+                && !claims.iter().any(|claim| claim.source.name == *from)
+                && declared_cols.contains(&to)
+                && known.contains_key(to)
+            {
+                if occupied_targets.insert(to.clone()) {
+                    blockers.push(Blocker::RenameTargetExists {
+                        target: table_name.column(to).to_string(),
+                    });
+                }
+                used.insert(i);
+            }
+        }
 
         for (i, intent) in intents.iter().enumerate() {
             if let Intent::RenameColumn { table, from, to } = intent
                 && table == table_name
-                && disappeared.remove(from)
-                && appeared.remove(to)
+                && disappeared.contains(from)
+                && appeared.contains(to)
             {
+                disappeared.remove(from);
+                appeared.remove(to);
                 let uid = known[from].clone();
                 let old = table_name.column(from);
                 let new = table_name.column(to);
@@ -559,9 +670,11 @@ fn resolve_columns(
         }
 
         for name in disappeared {
-            blockers.push(Blocker::DropColumnNeedsReason {
-                column: table_name.column(name),
-            });
+            if !conflicting_sources.contains(&table_name.column(&name).to_string()) {
+                blockers.push(Blocker::DropColumnNeedsReason {
+                    column: table_name.column(name),
+                });
+            }
         }
 
         for name in appeared {

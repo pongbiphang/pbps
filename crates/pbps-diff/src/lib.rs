@@ -325,6 +325,130 @@ mod tests {
         );
     }
 
+    /// A rename cannot take the name of a table that remains declared. The
+    /// source must stay available so a companion drop intent can account for
+    /// it, and the rename itself must be reported as a target collision rather
+    /// than as an unused intent.
+    #[test]
+    fn a_rename_onto_a_declared_table_reports_its_target_collision() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.new", &["id"])]);
+        let s = schema(&[("dbo.new", &["id"])]);
+        let rename = Intent::RenameTable {
+            from: t("dbo.old"),
+            to: t("dbo.new"),
+        };
+        let drop = Intent::DropTable {
+            table: t("dbo.old"),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the target collision is the only blocker: {errs:?}"
+        );
+        assert!(
+            matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "dbo.new"),
+            "the blocker must name the occupied target: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::UnusedIntent { .. })),
+            "neither supplied intent is unused: {errs:?}"
+        );
+    }
+
+    /// The same target-collision guard applies to columns, whose target must
+    /// be rendered with its table so equal column names in different tables do
+    /// not become one diagnostic.
+    #[test]
+    fn a_rename_onto_a_declared_column_reports_its_target_collision() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "new"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let rename = Intent::RenameColumn {
+            table: t("dbo.t"),
+            from: "old".into(),
+            to: "new".into(),
+        };
+        let drop = Intent::DropColumn {
+            column: "dbo.t.old".parse().unwrap(),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the target collision is the only blocker: {errs:?}"
+        );
+        assert!(
+            matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "dbo.t.new"),
+            "the blocker must name the occupied target: {errs:?}"
+        );
+    }
+
+    /// Roles use the same identity rule even though their names are unqualified.
+    #[test]
+    fn a_rename_onto_a_declared_role_reports_its_target_collision() {
+        let ids = resolve(
+            &with_roles(&[("dbo.t", &["id"])], &["old", "new"]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["new"]);
+        let rename = Intent::RenameRole {
+            from: "old".into(),
+            to: "new".into(),
+        };
+        let drop = Intent::DropRole {
+            role: "old".into(),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the target collision is the only blocker: {errs:?}"
+        );
+        assert!(
+            matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "new"),
+            "the blocker must name the occupied target: {errs:?}"
+        );
+    }
+
+    /// A target that is neither declared nor known is still a misspelling, not
+    /// an occupied-target collision.
+    #[test]
+    fn a_rename_to_an_unknown_target_remains_an_unused_intent() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"])]);
+        let s = Schema::default();
+        let rename = Intent::RenameTable {
+            from: t("dbo.old"),
+            to: t("dbo.missing"),
+        };
+        let drop = Intent::DropTable {
+            table: t("dbo.old"),
+            reason: "retired".into(),
+        };
+        let errs = resolve(&s, &ids, &[rename, drop], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter()
+                .any(|b| matches!(b, Blocker::UnusedIntent { .. })),
+            "the unknown target remains an unused intent: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::RenameTargetExists { .. })),
+            "an unknown target is not an occupied target: {errs:?}"
+        );
+    }
+
     /// Intents must be idempotent: after a successful rename, the renamed_from
     /// annotation still sitting in the file must not fail the next run.
     #[test]
