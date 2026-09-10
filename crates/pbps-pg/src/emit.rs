@@ -1660,6 +1660,20 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     if let Err(e) = quote(id.schema()).and_then(|_| quote(id.name())) {
         found.push(e);
     }
+    // And the schema the reader excludes, which is DECISIONS 273's rule for
+    // the other half of the managed set. **Measured**: `CREATE FUNCTION
+    // information_schema.f()` is accepted and identified as
+    // `information_schema.f()`, and `CREATE VIEW pg_temp.v` leaves
+    // `pg_temp_4.v` with `relpersistence = 't'` — a session-local view under
+    // a name the declaration never wrote. Either way the pull never reads it
+    // back, so every plan creates it again and the engine refuses the second
+    // one for already existing.
+    let schema = id.schema();
+    if schema == "information_schema" || schema.starts_with("pg_") {
+        found.push(invalid(format!(
+            "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again — and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
+        )));
+    }
     match module.kind {
         ModuleKind::Function | ModuleKind::Procedure => match id.args() {
             // `signature` is the one that says what a routine without an
@@ -2292,6 +2306,53 @@ mod tests {
                 "`{key}` with `{definition}` was accepted, and the engine would create another \
                  object under this key"
             );
+        }
+    }
+
+    /// The reader's excluded set is the module gate's too (DECISIONS 273):
+    /// measured, a routine in `information_schema` is created and identified
+    /// there, and a view in `pg_temp` is created in the session's temporary
+    /// schema instead. Both are invisible to the next pull.
+    #[test]
+    fn a_module_in_a_schema_the_pull_would_never_read_is_refused() {
+        for (key, kind) in [
+            ("pg_catalog.v", ModuleKind::View),
+            ("information_schema.v", ModuleKind::View),
+            ("pg_temp.v", ModuleKind::View),
+            ("pg_toast.v", ModuleKind::View),
+            ("information_schema.f(integer)", ModuleKind::Function),
+        ] {
+            let definition = if kind == ModuleKind::View {
+                "SELECT 1 AS x".to_owned()
+            } else {
+                "(a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$".to_owned()
+            };
+            let found = Postgres::new().validate_module(&id(key), &module(kind, &definition));
+            assert!(
+                found.iter().any(|e| e.to_string().contains("never reads")),
+                "`{key}` was accepted: {found:?}"
+            );
+        }
+        // A trigger is keyed by the table it is on, and that schema is the
+        // one the rule reads.
+        let found = Postgres::new().validate_module(
+            &id("pg_temp.t.audit"),
+            &module(
+                ModuleKind::Trigger,
+                "AFTER INSERT ON pg_temp.t EXECUTE FUNCTION app.f()",
+            ),
+        );
+        assert!(
+            found.iter().any(|e| e.to_string().contains("never reads")),
+            "{found:?}"
+        );
+        // The negative case, and it is the one that matters: the reader
+        // compares the first three characters, so `pga` is a project's schema
+        // and a gate that refused it would refuse a module the pull reads.
+        for key in ["pga.v", "app.v", "public.v", "pg.v"] {
+            let found =
+                Postgres::new().validate_module(&id(key), &module(ModuleKind::View, "SELECT 1"));
+            assert!(found.is_empty(), "`{key}` is a project's own: {found:?}");
         }
     }
 

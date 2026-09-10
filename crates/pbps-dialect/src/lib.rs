@@ -623,8 +623,11 @@ impl Lexicon {
             Code,
             /// Inside `'…'`: a doubled quote is the first closing and the
             /// second opening again, and everything between is blanked either
-            /// way.
-            Literal,
+            /// way. `unicode` marks a `U&'…'`, which may carry a `UESCAPE
+            /// 'x'` after its closing quote.
+            Literal {
+                unicode: bool,
+            },
             /// Inside `E'…'`: a backslash speaks for the character after it.
             Escape {
                 after_backslash: bool,
@@ -651,11 +654,21 @@ impl Lexicon {
             }
             let next = bytes.get(i + ch.len_utf8()).copied();
             match at {
-                At::Literal => {
+                At::Literal { unicode } => {
+                    blank(&mut out, ch);
                     if ch == '\'' {
                         at = At::Code;
+                        // The clause belongs to the literal it follows —
+                        // measured, `U&'d!0061ta' UESCAPE '!'` is the string
+                        // `data` — and left as code the word matched a module
+                        // named `uescape` and drew an edge that was not there.
+                        if unicode && let Some(n) = uescape_clause_len(&definition[i + 1..]) {
+                            for c in definition[i + 1..i + 1 + n].chars() {
+                                blank(&mut out, c);
+                            }
+                            consumed_to = i + 1 + n;
+                        }
                     }
-                    blank(&mut out, ch);
                 }
                 At::Escape { after_backslash } => {
                     at = if after_backslash {
@@ -756,13 +769,15 @@ impl Lexicon {
                             blank(&mut out, ch);
                         }
                         ('\'', _) => {
-                            self.blank_string_prefix(&mut out);
+                            let prefix = self.blank_string_prefix(&mut out);
                             at = if self.escape_strings && opens_escape_string(definition, i) {
                                 At::Escape {
                                     after_backslash: false,
                                 }
                             } else {
-                                At::Literal
+                                At::Literal {
+                                    unicode: prefix.is_some_and(|p| p.eq_ignore_ascii_case("u&")),
+                                }
                             };
                             blank(&mut out, ch);
                         }
@@ -968,7 +983,7 @@ impl Lexicon {
     /// something else — measured, `note'x'` is the type `note` applied to a
     /// string, and `áE'a\'` that name applied to `a\` (see
     /// [`continues_ident`]).
-    fn blank_string_prefix(&self, out: &mut String) {
+    fn blank_string_prefix(&self, out: &mut String) -> Option<&'static str> {
         for prefix in self.string_prefixes {
             let n = prefix.len();
             if out.len() < n || !out.is_char_boundary(out.len() - n) {
@@ -985,10 +1000,44 @@ impl Lexicon {
                 for _ in 0..n {
                     out.push(' ');
                 }
-                return;
+                return Some(prefix);
             }
         }
+        None
     }
+}
+
+/// The length in bytes of the `UESCAPE 'x'` clause at the front of `text`,
+/// leading whitespace included, or `None` where there is not one.
+///
+/// The clause is part of the token it follows — a `U&'…'` literal or a
+/// `U&"…"` name — and the escape may be almost any punctuation: measured, the
+/// engine takes `,`, `(`, `)`, `[`, `]` and `.`, and refuses a quote, a `+`, a
+/// hex digit and whitespace (DECISIONS 301). What the escape *is* does not
+/// matter to a literal whose contents are blanked either way; that the clause
+/// is not code does.
+fn uescape_clause_len(text: &str) -> Option<usize> {
+    let after_gap = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if after_gap.len() < 8
+        || !after_gap.is_char_boundary(7)
+        || !after_gap[..7].eq_ignore_ascii_case("uescape")
+    {
+        return None;
+    }
+    // A word of its own: `uescapes` is a name, and so is `uescape2`.
+    let tail = &after_gap[7..];
+    if !tail.starts_with(|c: char| c.is_ascii_whitespace() || c == '\'') {
+        return None;
+    }
+    let clause = tail.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let mut chars = clause.chars();
+    let (Some('\''), Some(escape), Some('\'')) = (chars.next(), chars.next(), chars.next()) else {
+        return None;
+    };
+    if escape == '\'' || escape == '+' || escape.is_ascii_hexdigit() || escape.is_whitespace() {
+        return None;
+    }
+    Some(text.len() - clause.len() + 2 + escape.len_utf8())
 }
 
 /// The length in bytes of the `$tag$` that `s` opens with, if it opens with one.
@@ -2361,6 +2410,58 @@ mod code_only_tests {
         // SQL Server has the national prefix and nothing else.
         let tsql = "SELECT N'x', E'y'";
         assert_eq!(MSSQL.code_only(tsql), blanked(tsql, &["N'x'", "'y'"]));
+    }
+
+    /// A `UESCAPE 'x'` belongs to the `U&'…'` it follows: measured,
+    /// `U&'d!0061ta' UESCAPE '!'` is the string `data`. Left as code the word
+    /// matched a module named `uescape`, drew an edge that was not there, and
+    /// with the real edge the other way a cycle put the dependent first.
+    #[test]
+    fn a_uescape_clause_is_part_of_the_literal_it_follows() {
+        let text = "SELECT U&'d!0061ta' UESCAPE '!' AS s FROM es.z";
+        assert_eq!(
+            PG.code_only(text),
+            blanked(text, &["U&'d!0061ta' UESCAPE '!'"])
+        );
+        // The keyword is the engine's, in any case: measured, a lower-cased
+        // `uescape` is the same clause — and that is the spelling a module
+        // named `uescape` collides with at every case pass.
+        let lower = "SELECT U&'d!0061ta' uescape '!' AS s";
+        assert_eq!(
+            PG.code_only(lower),
+            blanked(lower, &["U&'d!0061ta' uescape '!'"])
+        );
+        // The clause may be on the next line, and the break survives.
+        let wrapped = "SELECT U&'x'
+UESCAPE '!' AS s";
+        assert_eq!(
+            PG.code_only(wrapped),
+            blanked(wrapped, &["U&'x'", "UESCAPE '!'"])
+        );
+        // Only after a Unicode string: a plain literal is followed by code,
+        // and a name that merely starts with the word is a name.
+        let plain = "SELECT 'x' UESCAPE FROM es.uescape";
+        assert_eq!(PG.code_only(plain), blanked(plain, &["'x'"]));
+        let longer = "SELECT U&'x' uescapes FROM t";
+        assert_eq!(PG.code_only(longer), blanked(longer, &["U&'x'"]));
+        // An escape the engine refuses is no clause: measured, a quote, a
+        // `+`, a hex digit and whitespace are all refused. The word then
+        // stays code and what follows it is read as the ordinary literal it
+        // lexically is — the statement is one the engine refuses either way.
+        for quoted in ["'+'", "'a'", "''''"] {
+            let text = format!("SELECT U&'x' UESCAPE {quoted}");
+            assert_eq!(
+                PG.code_only(&text),
+                blanked(&text, &["U&'x'", quoted]),
+                "{text}"
+            );
+        }
+        // A doubled quote inside the literal does not open the lookahead.
+        let doubled = "SELECT U&'a''b' AS s";
+        assert_eq!(PG.code_only(doubled), blanked(doubled, &["U&'a''b'"]));
+        // SQL Server has no such literal, so the word stays code.
+        let tsql = "SELECT N'x' UESCAPE";
+        assert_eq!(MSSQL.code_only(tsql), blanked(tsql, &["N'x'"]));
     }
 
     #[test]

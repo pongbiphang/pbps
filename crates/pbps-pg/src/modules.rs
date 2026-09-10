@@ -2173,6 +2173,21 @@ mod tests {
             ),
             vec![id("app.z()"), id("app.$a$")]
         );
+        // A `UESCAPE` clause belongs to the literal before it: measured,
+        // `U&'d!0061ta' uescape '!'` is the string `data`, so the view
+        // holding it mentions no module named `uescape`. Written in the case
+        // the name is written in, no case pass can break the cycle it made.
+        let mut views = BTreeMap::new();
+        views.insert(id("app.uescape"), module("SELECT * FROM app.z"));
+        views.insert(id("app.z"), module("SELECT U&'d!0061ta' uescape '!' AS s"));
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &views,
+                &pbps_model::ModuleDeps::default(),
+                &LEXIS
+            ),
+            vec![id("app.z"), id("app.uescape")]
+        );
         // A Unicode-escaped identifier is the name it spells: measured,
         // `FROM app.U&"\007a"` selects from `app.z`.
         let mut views = BTreeMap::new();

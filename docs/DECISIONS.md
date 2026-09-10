@@ -5033,6 +5033,17 @@ SPEC is in sync with all of these.
     perfectly well (the same trap `catalog.rs` avoids by not writing the filter
     as a `LIKE` pattern, DECISIONS 254).
 
+    **Amended: modules are refused by the same rule.** The module gate checked
+    only that the names could be quoted. Measured, `CREATE FUNCTION
+    information_schema.f()` is accepted and identified as
+    `information_schema.f()`, and `CREATE VIEW pg_temp.v` leaves `pg_temp_4.v`
+    with `relpersistence = 't'` — the same two failures one namespace over, and
+    `validate_module` now says so offline. A trigger is keyed by the table it
+    is on, so the table's schema is the one the rule reads. (`pg_catalog`
+    itself the engine refuses — "system catalog modifications are currently
+    disallowed" — and the gate refuses it a statement earlier, which is where
+    the offline command exists to speak.)
+
 
 274. **The two table names this tool owns are refused in every schema.** The
     reader hides `__pbps_state` and `__pbps_lock` wherever they appear
@@ -6522,6 +6533,15 @@ SPEC is in sync with all of these.
     it. The model's `Lexis` carries both the dialect's `code_only` and its
     identifier rule; the differ and the emitter's name scans hand it the
     dialect's, and the shared scanner keeps SQL Server's as its own.
+
+    **Amended: a `UESCAPE` clause goes with the literal it follows.** Measured,
+    `U&'d!0061ta' UESCAPE '!'` is the string `data`, and the clause is part of
+    that token. The scan blanked the literal and left the word `UESCAPE` as
+    code, where it matched a module named `uescape`; with that module selecting
+    from the view holding the literal, the invented edge closed a cycle and the
+    dependent was created first. `code_only` remembers that a literal opened
+    with the `u&` prefix and blanks the clause with it — the escape character
+    itself changes nothing, because the contents are blanked either way.
 
     **Amended: a Unicode-escaped identifier is read as the name it spells.**
     Measured, `SELECT * FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a"
