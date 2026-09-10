@@ -414,6 +414,164 @@ async fn an_unassignable_signed_default_is_unknown_not_null() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
+    use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
+    let mut db = TestDb::create("signed_fk_assignment").await;
+    for (i, (kind, default, old, next)) in [
+        ("varchar(10)", "-CAST('01' AS int)", "-01", "-1"),
+        ("nvarchar(10)", "-CAST('01' AS int)", "-01", "-1"),
+        (
+            "decimal(4,1)",
+            "-CAST('1.25' AS decimal(4,2))",
+            "-1.2",
+            "-1.3",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = TableName::new("dbo", format!("p{i}"));
+        let child = TableName::new("dbo", format!("c{i}"));
+        db.conn.execute(&format!("CREATE TABLE dbo.p{i}(k {kind} PRIMARY KEY); CREATE TABLE dbo.c{i}(id int PRIMARY KEY, k {kind} DEFAULT({default}) REFERENCES dbo.p{i}(k)); INSERT dbo.p{i} VALUES('{old}'),('{next}'); INSERT dbo.c{i} VALUES(1,'{old}');")).await.unwrap();
+        let delete = |key: &str| Change::DeleteRow {
+            table: parent.clone(),
+            key_column: "k".into(),
+            key: RowKey::from(key),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        for legacy in [true, false] {
+            let types = if legacy {
+                Default::default()
+            } else {
+                [("k".to_owned(), kind.parse().unwrap())]
+                    .into_iter()
+                    .collect()
+            };
+            let update = Change::UpdateRow {
+                table: child.clone(),
+                key_column: "id".into(),
+                key: RowKey::from("1"),
+                columns: [(
+                    "k".to_owned(),
+                    (
+                        Cell::Value(Value::Text(old.into())),
+                        Cell::Default(default.into()),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                unchanged: Default::default(),
+                types,
+                after_types: Default::default(),
+            };
+            for (deleted, count) in [(old, 0), (next, 1)] {
+                let cs = ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(update.clone()),
+                        PlannedChange::new(delete(deleted)),
+                    ],
+                };
+                let probes = Mssql.preflight(&cs);
+                assert_eq!(probes.len(), 1);
+                let rows = db.conn.query(&probes[0].sql).await.unwrap();
+                assert_eq!(
+                    rows[0].try_get_at::<i32>(0).unwrap(),
+                    Some(count),
+                    "update {kind} legacy={legacy}, delete {deleted}"
+                );
+            }
+        }
+        // The engine actually stores the distinct target key and accepts
+        // the delete which the old raw numeric comparison refused.
+        db.conn.execute(&format!("BEGIN TRANSACTION; UPDATE dbo.c{i} SET k=DEFAULT; DELETE dbo.p{i} WHERE k='{old}'; ROLLBACK;")).await.unwrap();
+        db.conn.execute(&format!("DELETE dbo.c{i};")).await.unwrap();
+        for legacy in [true, false] {
+            let types = if legacy {
+                Default::default()
+            } else {
+                [("k".to_owned(), kind.parse().unwrap())]
+                    .into_iter()
+                    .collect()
+            };
+            let insert = Change::InsertRow {
+                table: child.clone(),
+                key_column: "id".into(),
+                key: RowKey::from("1"),
+                identity_key: false,
+                row: Default::default(),
+                defaults: [("k".to_owned(), default.to_owned())].into_iter().collect(),
+                types,
+            };
+            for (deleted, count) in [(old, 0), (next, 1)] {
+                let cs = ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(insert.clone()),
+                        PlannedChange::new(delete(deleted)),
+                    ],
+                };
+                let probes = Mssql.preflight(&cs);
+                assert_eq!(probes.len(), 1);
+                let rows = db.conn.query(&probes[0].sql).await.unwrap();
+                assert_eq!(
+                    rows[0].try_get_at::<i32>(0).unwrap(),
+                    Some(count),
+                    "insert {kind} legacy={legacy}, delete {deleted}"
+                );
+            }
+        }
+        db.conn.execute(&format!("BEGIN TRANSACTION; INSERT dbo.c{i}(id) VALUES(1); DELETE dbo.p{i} WHERE k='{old}'; ROLLBACK;")).await.unwrap();
+        // Backfill uses the same assignment before a new FK is probed.
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.b{i}(id int PRIMARY KEY); INSERT dbo.b{i} VALUES(1);"
+            ))
+            .await
+            .unwrap();
+        for (expression, count) in [(default, 0), ("-CAST('99' AS int)", 1)] {
+            let mut column = Column::new(kind.parse().unwrap()).not_null();
+            column.default = Some(expression.into());
+            let cs = ChangeSet {
+                changes: vec![
+                    PlannedChange::new(Change::AddColumn {
+                        uid: "c_aaaaaa".parse().unwrap(),
+                        table: TableName::new("dbo", format!("b{i}")),
+                        name: "k".into(),
+                        column: Box::new(column),
+                    }),
+                    PlannedChange::new(Change::AddForeignKey {
+                        table: TableName::new("dbo", format!("b{i}")),
+                        name: format!("fk_b{i}"),
+                        constraint: Box::new(ForeignKey {
+                            columns: vec!["k".into()],
+                            references_table: parent.clone(),
+                            references_columns: vec!["k".into()],
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
+                        }),
+                    }),
+                ],
+            };
+            let probes = Mssql.preflight(&cs);
+            let probe = probes
+                .iter()
+                .find(|p| p.sql.contains("NOT EXISTS"))
+                .unwrap();
+            let rows = db.conn.query(&probe.sql).await.unwrap();
+            assert_eq!(
+                rows[0].try_get_at::<i32>(0).unwrap(),
+                Some(count),
+                "backfill {kind} {expression}"
+            );
+        }
+    }
+    db.drop().await;
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,
