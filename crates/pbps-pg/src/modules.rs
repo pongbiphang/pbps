@@ -2153,6 +2153,22 @@ mod tests {
             ),
             vec![id("app.z"), id("app.select")]
         );
+        // A body's tags are delimiters and not a mention of a module named
+        // like them: `app.$a$` selecting from `app.z()` is the only edge.
+        let mut mixed = BTreeMap::new();
+        mixed.insert(id("app.$a$"), module("SELECT app.z() AS v"));
+        mixed.insert(
+            id("app.z()"),
+            module("() RETURNS int LANGUAGE sql AS $a$ SELECT 1 $a$"),
+        );
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &mixed,
+                &pbps_model::ModuleDeps::default(),
+                &LEXIS
+            ),
+            vec![id("app.z()"), id("app.$a$")]
+        );
         // A Unicode-escaped identifier is the name it spells: measured,
         // `FROM app.U&"\007a"` selects from `app.z`.
         let mut views = BTreeMap::new();

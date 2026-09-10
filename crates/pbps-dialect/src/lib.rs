@@ -876,7 +876,9 @@ impl Lexicon {
     /// dollar-quoted string after `AS` in a definition the engine accepts can
     /// only be a body. The body is lexed as code by the same rules: its own
     /// literals and comments are blanked, an `E'…'` by the escape rule, and a
-    /// dollar-quoted datum inside it by this one.
+    /// dollar-quoted datum inside it by this one. Its tags are blanked too:
+    /// a delimiter is not a name, and one that read as code matched a module
+    /// named `$a$`.
     fn dollar_quoted_string(
         &self,
         definition: &str,
@@ -893,9 +895,16 @@ impl Lexicon {
             None => (definition.len(), definition.len()),
         };
         if follows_the_word_as(out, self.identifier_continues) {
-            out.push_str(tag);
+            // The tags are delimiters, not code: `$a$` is never a name, and
+            // kept, it matched a module named `$a$` and drew an edge from
+            // every routine delimited by it.
+            for ch in tag.chars() {
+                blank(out, ch);
+            }
             out.push_str(&self.code_only(&definition[inner_start..inner_end]));
-            out.push_str(&definition[inner_end..end]);
+            for ch in definition[inner_end..end].chars() {
+                blank(out, ch);
+            }
         } else {
             for ch in definition[at..end].chars() {
                 blank(out, ch);
@@ -2234,7 +2243,13 @@ mod code_only_tests {
     #[test]
     fn a_dollar_quoted_string_is_a_body_after_the_word_as_and_a_datum_elsewhere() {
         let body = "() RETURNS int LANGUAGE sql AS $$ SELECT app.f('x', E'y\\'z') $$";
-        assert_eq!(PG.code_only(body), blanked(body, &["'x'", "E'y\\'z'"]));
+        // The tags go with the literals: a delimiter is not a name.
+        assert_eq!(
+            PG.code_only(body),
+            blanked(body, &["$$", "'x'", "E'y\\'z'"])
+        );
+        let tagged = "AS $a$ SELECT app.f(1) $a$";
+        assert_eq!(PG.code_only(tagged), blanked(tagged, &["$a$"]));
         let datum = "SELECT $$ es.a $$ AS t, $x$es.a$x$ AS u";
         assert_eq!(
             PG.code_only(datum),
@@ -2246,7 +2261,7 @@ mod code_only_tests {
         let routine = "(a text DEFAULT $x$es.a$x$) RETURNS int AS /* c */ $$ SELECT es.b('q') $$";
         assert_eq!(
             PG.code_only(routine),
-            blanked(routine, &["$x$es.a$x$", "/* c */", "'q'"])
+            blanked(routine, &["$x$es.a$x$", "/* c */", "'q'", "$$"])
         );
         let has = "SELECT * FROM es.has $$ es.a $$";
         assert_eq!(PG.code_only(has), blanked(has, &["$$ es.a $$"]));
@@ -2257,7 +2272,10 @@ mod code_only_tests {
         assert_eq!(PG.code_only(nbsp), blanked(nbsp, &["$$ es.a $$"]));
         // And a datum inside the body is a datum.
         let nested = "AS $b$ SELECT $$ es.a $$ $b$";
-        assert_eq!(PG.code_only(nested), blanked(nested, &["$$ es.a $$"]));
+        assert_eq!(
+            PG.code_only(nested),
+            blanked(nested, &["$$ es.a $$", "$b$"])
+        );
         // `$` inside an identifier is a name byte on either engine, and a
         // `$` that opens no tag is code.
         assert_eq!(PG.code_only("SELECT a$b$c FROM t"), "SELECT a$b$c FROM t");

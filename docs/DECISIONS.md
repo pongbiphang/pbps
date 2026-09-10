@@ -6501,7 +6501,10 @@ SPEC is in sync with all of these.
     `AS` can only be a body. The body is lexed by the same rules, its own
     literals, comments and dollar-quoted data blanked. A comment between the
     keyword and the body is already blank by the time the question is asked:
-    measured, `AS /* c */ $$ SELECT 1 $$` is a body. And the gap before the
+    measured, `AS /* c */ $$ SELECT 1 $$` is a body. The body's tags are
+    blanked with the literals: a delimiter is not a name, and one read as
+    code was a mention of a module named `$a$` from inside every routine it
+    delimited. And the gap before the
     string is the dialect's: a type named `as\u{a0}` applied to a string —
     measured, `SELECT as\u{a0} $$app.a$$` is a valid view — is not the
     keyword, and the trim that looks for it discards only whitespace the

@@ -7834,6 +7834,58 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// A body's dollar tags are delimiters: a view named `$a$` over a routine
+/// whose body is delimited by `$a$` is created after it. Read as code, the
+/// tags mentioned the view from inside the routine, the cycle was broken by
+/// name order, and `$` sorts before `z`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_bodys_dollar_tags_are_not_the_name_of_a_module() {
+    let s = emit_schema("tag_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.$a$").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT {s}.z() AS v"),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.z()").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql AS $a$ SELECT 1 $a$",
+        ),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.z()"), format!("{s}.$a$")],
+        "the routine the view calls comes first, whatever delimits its body"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT v::text FROM {s}.\"$a$\"")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
 /// Measured: `FROM dq.U&"\007a"` selects from `dq.z`. The scan that read
 /// the spelling on the page found no `z` in it, and with `a` sorting first,
 /// created `a` over a view that did not exist yet.
