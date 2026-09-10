@@ -384,6 +384,9 @@ fn module_kind(code: &str) -> &str {
 /// name, and both have to match. Bare matching is bounded by the characters
 /// around it so that `amount` does not match `amount_paid`.
 fn mentions(definition: &str, column: &str) -> bool {
+    let Some(first) = column.chars().next() else {
+        return false;
+    };
     if definition.contains(&format!("[{column}]")) {
         return true;
     }
@@ -397,7 +400,7 @@ fn mentions(definition: &str, column: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        from = start + first.len_utf8();
     }
     false
 }
@@ -553,6 +556,23 @@ mod tests {
         assert!(!mentions("amount_paid >= 0", "amount"));
         assert!(!mentions("net_amount >= 0", "amount"));
         assert!(!mentions("@amount >= 0", "amount"));
+    }
+
+    #[test]
+    fn multibyte_names_advance_at_character_boundaries() {
+        assert!(!mentions("SELECT xä FROM t", "ä"));
+        assert!(!mentions("SELECT äx FROM t", "ä"));
+        assert!(mentions("SELECT ä FROM t", "ä"));
+        assert!(mentions("SELECT xä, ä FROM t", "ä"));
+        assert!(!mentions("SELECT x FROM t", "ä"));
+        assert!(!mentions("", "ä"));
+    }
+
+    #[test]
+    fn an_empty_column_is_not_a_reference() {
+        assert!(!mentions("", ""));
+        assert!(!mentions("SELECT [] FROM t", ""));
+        assert!(!mentions("SELECT ä FROM t", ""));
     }
 
     /// The two traps a live run found: one row per referenced column made a
