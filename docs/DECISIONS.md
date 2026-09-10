@@ -8277,3 +8277,217 @@ SPEC is in sync with all of these.
     names. `validate_table` refuses a declared *table* of either name
     (DECISIONS 274), which is why the table half needs no second thought and
     the view half needed this one.
+
+370. **A cast is not the assignment the `ALTER` performs, so the conversion
+    probe measures the value.** The obvious probe for a narrowing type change
+    is "count the rows a cast rejects", and on this engine it reports a table
+    clean that the statement then refuses. **Measured** on 18.6:
+    `SELECT 'abcde'::varchar(4)` is `'abcd'` and
+    `ALTER TABLE t ALTER COLUMN v TYPE varchar(4)` over the same value is
+    `value too long for type character varying(4)` — the cast is an *explicit*
+    conversion, which truncates, and the `ALTER` is an *assignment*, which
+    does not. So `types::cannot_become` returns a predicate over the value and
+    never a cast: for a bounded string target,
+    `length(rtrim(v, ' ')) > n`. **Trailing spaces only**, because that is the
+    engine's own exception — `'abc  '` into `varchar(3)` is `'abc'` and
+    `E'abc\t'` into the same is refused — and `length` rather than
+    `octet_length`, because the bound is characters: `'王小明'` is three of
+    them and nine bytes and fits `varchar(3)`.
+
+371. **A `NaN` and an infinity sort greatest here rather than outside the
+    order, so a range test finds them and a target that accepts one has to
+    take it back out.** **Measured**: `'NaN'::numeric > 1e131071` is true, and
+    `'NaN'::float8 = 'NaN'::float8` is true where C says neither. So the
+    integer-target predicate is a plain range test and catches all three
+    failures the engine names (`integer out of range`, `cannot convert NaN to
+    bigint`, `cannot convert infinity to bigint`). But `numeric(10,2)` **keeps**
+    a `NaN` and refuses an infinity — measured, `'NaN'::float8` into it is
+    `NaN` and `'Infinity'::numeric` into it is `numeric field overflow` — so
+    the bounded-`numeric` predicate excludes `NaN` by name, and the binary
+    float predicate excludes `NaN` and both infinities, which pass through
+    unchanged. Left in, each would have counted a row the engine keeps and
+    refused a change it makes.
+
+372. **The engine tests the value it would store, so the probe rounds first —
+    the way that target rounds.** **Measured**: `2147483647.4::numeric` into
+    `integer` is accepted and `2147483647.6` is `integer out of range`; a
+    `numeric(10,2)` holding `999999.995` is already `1000000.00` and fails
+    into `numeric(10,4)`, whose message names the test — "must round to an
+    absolute value less than 10^6". And the two families round differently:
+    measured, `round()` on a `numeric` is half-away-from-zero while a float
+    into an integer is half-to-even (`0.5`, `1.5` and `2.5` become `0`, `2`
+    and `2`). So the float boundary is written out asymmetrically rather than
+    derived — `>= 2147483647.5` fails and `< -2147483648.5` fails, because
+    measured, `-2147483648.5::float8` into `integer` is `-2147483648`, which
+    fits. Reading it as a symmetric bound counted a row the engine keeps.
+
+373. **A float target overflows at the midpoint above its largest value, and
+    the threshold is written as the engine's own arithmetic.** **Measured** by
+    bisection: the largest `double precision` that becomes a `real` is
+    `3.4028235677973362e38` and the smallest that overflows is exactly
+    `2^128 - 2^103`; the same construction one exponent range up is the
+    `double precision` bound, and the value just below `2^1024 - 2^970`
+    converts while the value at it does not. Written as
+    `2::numeric^128 - 2::numeric^103` rather than as a decimal literal, which
+    for the second is three hundred digits long. The largest finite value is
+    the wrong bound: `3.4028235e38` is above it and converts, so a probe using
+    it refuses a change the engine makes.
+
+374. **`NULLS DISTINCT` is this engine's rule and `GROUP BY`'s is the
+    opposite, so the duplicate count excludes a key holding any NULL.**
+    **Measured** on 18.6: two rows holding NULL are accepted under
+    `UNIQUE (a)`, and two rows holding `(1, NULL)` are accepted under
+    `UNIQUE (a, b)`; `GROUP BY` over those very rows reports two duplicates.
+    The SQL Server probe one crate away groups without excluding them and is
+    right to — there a `UNIQUE` treats two NULLs as one value — and ported
+    across it counted a collision the engine would never produce and refused a
+    plan the engine accepts, which is the worse of the two directions
+    (PITFALLS #5).
+
+375. **A probe over a key spanning a column this plan narrows is not built.**
+    Projecting a stored value through the new type means a `CAST` that can
+    raise, and a probe that raises is reported as *unchecked* while the apply
+    proceeds — the silence, arriving through the fix for something else. A
+    widening cannot raise, by `TypeChangeRisk::Safe`'s own criterion, so it is
+    written out and a narrowing is not. The row that would raise cannot
+    survive the `ALTER COLUMN … TYPE` either, and that change's own conversion
+    probe (370) is what counts it and names the column.
+
+376. **The orphan count compares under the referenced column's collation,
+    spliced in from the catalog at the comparison site.** **Measured**, two
+    stored columns collated differently cannot be compared at all —
+    `q.k0 = r.k0` between a `"C"` column and an `"en_US"` one is `could not
+    determine which collation to use for string hashing` — so the probe never
+    answered on the plan shape it exists for. The clause has to be *at the
+    comparison*: measured, a `COLLATE` inside the derived table's select list
+    does not survive into the join and the same error comes back. Only the
+    catalog can spell it, so the body carries the mark of DECISIONS 353 and
+    the count is assembled by the engine, which is the machinery the
+    pre-delete probe already had.
+
+377. **What a rename breaks on this engine is invisible to the dependency
+    graph, and what the graph holds is what survives.** The SQL Server module
+    of the same name reads `sys.sql_expression_dependencies` and reports what
+    it finds, because that engine stores module text. **Measured on 18.6, this
+    engine is the exact inverse**: `pg_depend` holds one edge from a
+    `BEGIN ATOMIC` SQL function to the table it reads and **zero** from a
+    `plpgsql` function to the same table. After
+    `ALTER TABLE customer RENAME COLUMN email TO contact_email` the view reads
+    `contact_email AS email`, the atomic body reads
+    `customer.contact_email AS email`, the check reads `total >= 0`, the
+    generated column reads `upper(ident)` and the row-level policy reads
+    `contact_email <> 'blocked'` — while the `plpgsql` body still reads
+    `email` and fails the next time anybody calls it, `column "email" does not
+    exist`. A report that queried `pg_depend` and stopped would list every
+    object that is fine and no object that is broken, which is worse than no
+    report because it looks like one. So the advisory list is a **name scan
+    over the bodies the engine never parsed**, found by `prosqlbody IS NULL` —
+    the engine's own record of which bodies it parsed, and not a language
+    list, because measured, `sql` appears on both sides of that line.
+
+378. **The objects a rename is carried into are reported, as their own list.**
+    Three answers need three lists: what breaks, what the engine refuses, and
+    what follows the rename and keeps working. The third is half of "what does
+    this rename affect", it is the half this engine is better at, and an
+    operator who cannot see it has to assume the worst about every view in the
+    database. One item of it is worth saying out loud — **measured**, a view
+    keeps its *old output column name* as an alias, so the view's own consumers
+    see no change at all. Putting those objects in `advisory` instead was ruled
+    out: advisory means "this will break", and a report that flags what is fine
+    is one people learn to override.
+
+379. **Nothing blocks a rename on this engine, and the empty list says so.**
+    **Measured**: a column a view depends on renames without complaint, while
+    `DROP COLUMN` on the same column is `cannot drop column ident of table t
+    because other objects depend on it`. `ImpactReport::blocking` is kept
+    because the abstraction has it and the drop side is real, and the module
+    documentation says why nothing fills it — an empty field a reader has to
+    guess about is a query that might have failed.
+
+380. **A module drop is not asked about here.** A module rename reaches the
+    plan as a drop plus a create (ADR-0002), and what the catalog holds against
+    a module about to be dropped is `crate::modules`' question, answered there
+    in full — every reverse `pg_depend` edge, the classes with no rule, the
+    cycle, and what a rebuild cannot carry (DECISIONS 306). Asking it a second
+    time in `impact` would be a second implementation of one question, and the
+    two would disagree the first time either was fixed. `RenameTarget` has two
+    arms here where the SQL Server one has three.
+
+381. **A column the catalog does not have is an error, not an empty report.**
+    An unknown column would otherwise produce a report with nothing in it,
+    which reads as "nothing breaks" — the one answer that must never arrive by
+    accident. And the lookup excludes `attisdropped`: a dropped column keeps
+    its slot with a placeholder name (ADR-0012 §6), so the slot is not a column
+    anybody can rename and must not answer as one.
+
+382. **The estimate is a separate axis and carries no risk class.** ADR-0012 §3
+    decides it and this is where it is built: `integer -> bigint` is `Safe` and
+    rewrites a million-row table under a lock that blocks readers, and folding
+    that into `Narrowing` would lie about what the class means and break the
+    class's data-independent criterion. Nothing in `estimate.rs` reads or
+    produces a `TypeChangeRisk` or a `RiskClass`, and a test asserts it over
+    the module's own source, because the pressure to connect the two axes is
+    highest exactly when somebody is looking at a large table.
+
+383. **A rewrite is avoided only where the target constrains no byte already
+    stored.** **Measured**: every ordered pair of the catalogue's spellings,
+    263 of them accepted by the engine, with `pg_class.relfilenode` either side
+    of the statement. Ten pairs of distinct types rewrite nothing —
+    `character varying(5)` into a wider one, into an unbounded one and into
+    `text`; `text` into an unbounded `character varying`; `numeric(10,2)` into
+    `numeric` and into `numeric(12,2)`; and `timestamp` against `timestamptz`
+    both ways, which the session decides. Everything else rebuilds, including
+    `integer -> bigint`, `real -> double precision`, `character(5) ->
+    character(10)` — the padding is in every row — and `numeric(10,2) ->
+    numeric(10,4)`, where widening the *precision* is free and widening the
+    *scale* is not. Nothing about the declaration's shape suggests that
+    asymmetry, which is the argument for measuring the whole table rather than
+    reasoning about it. The live suite re-measures the matrix and holds the
+    dialect to every accepted pair.
+
+384. **Whether the table is rebuilt and whether every row is read are two
+    facts, because one is invisible to the other.** ADR-0012's Limits state it
+    and this is the measurement: on a hundred thousand rows,
+    `ALTER COLUMN v SET NOT NULL` rebuilds nothing and reads **all** of them,
+    while `ALTER COLUMN w TYPE varchar(20)` from `varchar(10)` rebuilds nothing
+    and reads **none**. Carried as one fact those two changes are the same
+    change, and one of them is free. `ADD CHECK`, `ADD UNIQUE` and
+    `SET PRIMARY KEY` each rebuild nothing and read every row; `ADD COLUMN`,
+    `DROP COLUMN`, `SET DEFAULT` and both renames read nothing.
+
+385. **A foreign key locks the table nobody named.** **Measured** from inside
+    the statement's own transaction: `ADD CONSTRAINT … FOREIGN KEY` takes
+    `ShareRowExclusiveLock` on the **referenced** table as well as on the one
+    the constraint is written on, and takes no `AccessExclusiveLock` at all —
+    so it blocks writes to a parent that may be enormous and blocks no reader
+    anywhere. Every other `ALTER TABLE` subcommand measured here takes
+    `AccessExclusiveLock`, a non-concurrent `CREATE INDEX` takes `ShareLock`,
+    and a concurrent one takes `ShareUpdateExclusiveLock` — measured from a
+    second session, because it cannot run in a transaction. `Estimate` carries
+    the referenced table in `also_locks` for that reason: it is a cost on an
+    object the change does not mention.
+
+386. **An unparsed default expression is `unknown`, never free.** **Measured**,
+    `ADD COLUMN d integer DEFAULT 7` rebuilds nothing and reads nothing, and
+    `ADD COLUMN d uuid DEFAULT gen_random_uuid()` rebuilds every row. Both are
+    one `AddColumn` carrying a default and only the expression tells them
+    apart, which this tool does not parse (SPEC §8.2). ADR-0012 §4 rules out
+    the guess by name, and the constant test the row reader already owns
+    (`rows::is_constant`) is what decides which side a default falls on.
+
+387. **A shape the measurements never covered takes the answer back to
+    `unknown`, whatever the static half said.** ADR-0012's Limits name three —
+    a partitioned table, an inheritance parent, and `ALTER TYPE` on an indexed
+    column — and `estimate::against` reads `relkind`, `relhassubclass` and
+    `pg_index` and returns each with its reason. An estimate measured on
+    ordinary tables and quoted about a partitioned one is worse than no
+    estimate, because the number carries the authority of a measurement it did
+    not come from. A table the database does not have is `unknown` too, and
+    not a table with no rows in it.
+
+388. **`reltuples = -1` is "nobody has looked", not "no rows".** **Measured**,
+    a table holding a thousand rows that has never been analyzed reads
+    `reltuples = -1` and `relpages = 0`, and reads `1000` and `5` straight
+    after `ANALYZE`. Read as a count it says the change is free on the largest
+    table in the database, so `Rows` has an arm of its own for it and no
+    caller can spell it as zero.

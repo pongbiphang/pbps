@@ -495,7 +495,6 @@ Not in this step: the CLI still refuses the `postgres` dialect outright
 binary until step 10 wires it. Everything above is covered by the dialect's own
 live suite instead. Composite keys remain deferred, as in ADR-0004.
 
-What remains is steps 6, 9 and 10: roles, probes, and the suite in full.
 **Step 6 is in**: roles and privileges (issue #81, DECISIONS 370–375). The
 principal is the *cluster's*, so `manages_roles` answers `false` and the differ
 builds no `CreateRole`, `DropRole` or `RenameRole` at all on such a dialect — a
@@ -546,8 +545,68 @@ every test in that section acts through a `LOGIN` role, because a superuser
 does not consult an ACL at all. None of it is reached by a command yet — the
 CLI still refuses the dialect.
 
-What remains is steps 7, 9 and 10: reference data, probes, and the suite in
-full.
+Step 9 of ten (issue #84) is **pre-flight, rename impact and the estimate**,
+and each of the three found the same thing in a different place: the construct
+that looks like the answer here answers a different question.
+
+The probes are derived from the plan and count rows (SPEC §7.5) — a `NOT NULL`
+tightening, a narrowing conversion, a unique constraint, a primary key, a check
+and a foreign key. Two of them cannot be written the way the SQL Server crate
+writes them. A conversion probe shaped as a cast reports a table **clean** that
+the statement then refuses: measured, `'abcde'::varchar(4)` is `'abcd'` and the
+`ALTER` over the same value is `value too long`, because a cast is an explicit
+conversion and the `ALTER` is an assignment (DECISIONS 370). And a duplicate
+count has to exclude a key holding any NULL, because `UNIQUE` here is `NULLS
+DISTINCT` and `GROUP BY` is not — ported across unchanged it refused a plan the
+engine accepts (374). The rest is the boundary arithmetic each target really
+performs: the rounded value, the asymmetric float boundary, `NaN` and infinity
+sorting greatest, and a float overflow threshold written as the engine's own
+`2^128 - 2^103` (371–373). Every probe counts the rows the statement will
+**meet** rather than the rows standing now, so the ordinary flow — declare the
+parent rows, declare the key that references them — is not refused for a
+violation the plan itself removes; and the orphan count compares under the
+referenced column's collation, spliced in from the catalog, because two columns
+collated differently cannot be compared at all (376).
+
+Rename impact (§7.4) is the inverse of the other engine's, measured:
+`pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a
+`plpgsql` one, so the catalog lists exactly the objects a rename does *not*
+break. Views, parsed bodies, checks, generated columns, policies and index
+definitions are all carried into the new name — a view even keeps its old output
+column name as an alias — while a body the engine stored as text still spells
+the old name and fails the next time anybody calls it. So the advisory list is a
+name scan over the bodies `prosqlbody IS NULL` identifies, the carried objects
+are reported as their own list rather than buried or dropped, and nothing blocks
+a rename on this engine (377–381). What points at a module about to be dropped
+stays `modules`' question, answered there in full.
+
+The estimate is ADR-0012 §3's boundary, built: **cost is not risk**, and nothing
+in the module reads or produces a risk class — a test asserts it over the
+module's own source, because the pressure to connect the two axes is highest
+exactly when somebody is looking at a large table (382). Its dataset is the
+whole catalogue rather than §3's eleven hand-measured rows: every ordered pair,
+263 accepted by the engine, judged by `relfilenode`, and the live suite
+re-measures it and holds the dialect to all of them (383, ADR-0012 Amendment 2).
+Whether the table is rebuilt and whether every row is read are kept as two
+facts, because `SET NOT NULL` rewrites nothing and reads all hundred thousand
+rows while `varchar(10) -> varchar(20)` rewrites nothing and reads none (384). A
+foreign key is the one statement that locks a table nobody named — measured,
+`ShareRowExclusiveLock` on the referenced table too, and no exclusive lock
+anywhere (385). And where the answer is not a function of the declaration the
+estimate says so rather than guessing cheap: an unparsed default expression, a
+partitioned table, an inheritance parent, an indexed column being retyped, and
+`reltuples = -1`, which is "nobody has looked" and not "no rows" (386–388).
+
+**No SQL Server cost measurements were taken here either.** Whether
+`int -> bigint` is metadata-only there is still the open question ADR-0012's
+Limits record, and this step did not answer it.
+
+Not in this step: the CLI still refuses the `postgres` dialect, so none of the
+three is reached by a command yet — the probes run through `Dialect::preflight`
+and the other two are free functions the live suite exercises. Wiring them into
+`plan --db` and `apply` is step 10.
+
+What remains is step 10: the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI
@@ -563,7 +622,6 @@ in [ADR-0015](ADR-0015-local-ui-implementation.md): the UI runs the `pbps`
 binary as a subprocess and links none of the crates, serves a page embedded in
 the binary with no build step, refuses any request without its per-launch
 token, reads no credential itself, and commits through the user's own `git`.
-What remains is steps 6, 9 and 10: roles, probes, and the suite in full.
 
 The steps are in issue #64. Step 1 is that ADR. Step 2 froze what the page
 reads: the envelope's schema is published and checked against real output, and

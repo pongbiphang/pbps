@@ -1,7 +1,9 @@
 # ADR-0012: The PostgreSQL type catalogue — and why "safe" and "cheap" are different axes
 
-- Status: proposed. Phase 5 design; nothing is built.
-- Date: 2026-09-05
+- Status: accepted and built. The catalogue landed with Phase 5 step 2
+  (Amendment 1) and §3's estimate with step 9 (Amendment 2); the PostgreSQL
+  live suite re-measures both.
+- Date: 2026-09-05, amended 2026-09-10
 - Related: docs/SPEC.md §7.2, §11.2, §12, 14.1 (the P1 estimate row);
   [ADR-0003](ADR-0003-execution-strategy.md);
   [ADR-0009](ADR-0009-postgres-modules.md);
@@ -322,8 +324,12 @@ replacement is a declared transformation with its own ADR, not a flag.
   free.
 - **Partitioned tables, inheritance and `ALTER TYPE … USING` on indexed columns
   were not measured**, and each can change the answer.
-- **Everything here is proposed**, and falsifiable by the PostgreSQL live suite,
-  which is Phase 5's first deliverable.
+- **Everything here was proposed when it was written**, and falsifiable by the
+  PostgreSQL live suite. Amendments 1 and 2 record what building it changed;
+  the two limits above are the two Amendment 2 measured rather than removed —
+  the scan `relfilenode` cannot see is now a fact the estimate carries in its
+  own right, and the three unmeasured shapes take the answer back to `unknown`
+  rather than being answered from measurements that never covered them.
 
 ## Amendment 1: what building it added to §1
 
@@ -356,6 +362,107 @@ pinned image. Nothing below contradicts §1; each is a row it did not have.
 - **`numeric(10,2)` → `numeric(10,4)` can fail** — `numeric field overflow` —
   though §3 lists the same change among the rewrites. The two axes really are
   different questions, in both directions.
+
+## Amendment 2: the estimate, built — and §3's dataset in full
+
+Written when the pre-flight, the rename impact and the estimate landed (Phase 5
+step 9, issue #84), against the same pinned image on 2026-09-10. Nothing below
+contradicts §3 or §4; §3's eleven rows are eleven of these.
+
+### The whole matrix, not eleven rows of it
+
+**Measured**: every ordered pair of the catalogue's spellings plus the three
+`numeric` shapes that separate a precision from a scale — 676 pairs, of which
+the engine accepts 263 — with `pg_class.relfilenode` either side of the
+statement. An empty table is enough, and that is measured rather than assumed:
+the same change on an empty table and on a hundred-row one gives the same
+verdict, because the rewrite is a property of the statement.
+
+**Ten pairs of distinct types rewrite nothing.** That is the whole list:
+
+| From | To | |
+|---|---|---|
+| `character varying(5)` | `character varying(10)` | the bound only widens |
+| `character varying(5)` | `character varying` | the bound goes away |
+| `character varying(5)` | `text` | as above |
+| `character varying` | `text` | the same type twice |
+| `text` | `character varying` | unbounded both ways |
+| `numeric(10,2)` | `numeric` | the bound goes away |
+| `numeric(10,2)` | `numeric(12,2)` | the precision only widens |
+| `timestamp` | `timestamptz` | **the session decides** — §4 |
+| `timestamptz` | `timestamp` | as above |
+
+**Everything else rebuilds**, including four that look free and are not:
+`integer -> bigint`, `real -> double precision`, `character(5) ->
+character(10)` — the blank padding is in every row — and `numeric(10,2) ->
+numeric(10,4)`, where widening the *precision* is free and widening the *scale*
+is not.
+
+So the rule §3 was reaching for, and the one the dialect implements: **a rewrite
+is avoided only where the target imposes no new constraint on the bytes already
+stored.** The live suite re-measures the matrix and holds the dialect to every
+accepted pair, so this table cannot go stale without a red build.
+
+### The limit §3 states, measured
+
+`relfilenode` is exact about the rebuild and says nothing about a scan, and the
+gap is not small. **Measured** on 100,000 rows through `pg_stat_user_tables`:
+
+| Statement | Rebuilt | Rows read |
+|---|---|---|
+| `ALTER COLUMN v SET NOT NULL` | no | **100,000** |
+| `ALTER COLUMN w TYPE varchar(20)` (from `varchar(10)`) | no | **0** |
+| `ADD CONSTRAINT … CHECK` | no | 100,000 |
+| `ADD CONSTRAINT … UNIQUE` / `PRIMARY KEY` | no | 100,000 |
+| `ADD CONSTRAINT … FOREIGN KEY` | no | 100,000 |
+| `ADD COLUMN`, with or without a literal default | no | 0 |
+| `DROP COLUMN` | no | 0 |
+
+Carried as one fact the first two rows are the same change, and one of them is
+free. So the estimate holds them apart, and `SET NOT NULL` — the example the
+Limits section names — is the row that proves it has to.
+
+### The locks, measured rather than recalled
+
+Read from `pg_locks` inside each statement's own transaction, and for the
+concurrent build from a second session, because it cannot be in one:
+
+| Statement | Lock | Blocks |
+|---|---|---|
+| `ALTER TABLE … ALTER COLUMN …` (type, nullability, default) | `AccessExclusiveLock` | reads and writes |
+| `ADD COLUMN`, `DROP COLUMN`, `RENAME` | `AccessExclusiveLock` | reads and writes |
+| `ADD CONSTRAINT … CHECK` / `UNIQUE` / `PRIMARY KEY` | `AccessExclusiveLock` | reads and writes |
+| `ADD CONSTRAINT … FOREIGN KEY` | `ShareRowExclusiveLock` | writes |
+| `CREATE INDEX` | `ShareLock` | writes |
+| `CREATE INDEX CONCURRENTLY` | `ShareUpdateExclusiveLock` | neither |
+
+**The foreign key takes its lock on the referenced table too**, and takes no
+exclusive lock anywhere. That is a cost on a table the change does not mention —
+a key added to a small child blocks every write to a parent that may be
+enormous — so `Estimate` carries the referenced table by name.
+
+### §4 confirmed, and where `unknown` is the answer
+
+The three cases §4 measured are unchanged, and each is a place the estimate
+declines rather than guesses: the session's `TimeZone` (re-measured — no rewrite
+under `UTC`, a rebuild under `America/New_York`), the default's volatility
+(`DEFAULT 7` free, `DEFAULT gen_random_uuid()` a rebuild), and precision against
+scale. The dialect answers `unknown` with the reason for each, and for the three
+shapes this document's Limits record as unmeasured — a partitioned table, an
+inheritance parent, and `ALTER TYPE` on an indexed column — whatever the static
+table said. A number quoted about a shape it was not measured on carries the
+authority of a measurement it did not come from.
+
+One more, which is not a cost but is read like one: **`reltuples = -1` means
+nobody has analyzed the table**, measured, with a thousand rows in it and
+`relpages` still `0`. Read as a row count it says the change is free on the
+largest table in the database.
+
+### What is still open
+
+**No SQL Server cost measurements were taken here either.** Whether
+`int -> bigint` is metadata-only there remains the open question the Limits
+section records; this step measured one engine and says so.
 
 ## Placement
 

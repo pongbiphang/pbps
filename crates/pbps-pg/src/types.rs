@@ -1084,6 +1084,153 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     }
 }
 
+/// What a stored value must satisfy for `ALTER COLUMN … TYPE` to **fail** on
+/// it — the predicate a pre-flight probe counts (SPEC §7.5), over `value`.
+///
+/// `None` where no count exists, which is not the same as "nothing can go
+/// wrong": a change may lose data without ever failing, and those are listed
+/// in [`crate::preflight`]'s own documentation rather than answered here with
+/// a zero. Reducing a `numeric`'s scale rounds (measured, `1.55` into
+/// `numeric(10,1)` is `1.6`), a float into an integer rounds (`1.5` is `2`),
+/// a shorter `interval` rounds, `json` into `jsonb` drops duplicate keys and
+/// whitespace, and `double precision` into `real` drops precision. Not one of
+/// them raises, so there is no row to point at; the `narrowing` class is what
+/// stops them at the gate.
+///
+/// # Why this is a predicate and not a cast
+///
+/// The obvious probe — "count the rows a cast rejects" — cannot be written on
+/// this engine, and writing it anyway is worse than having no probe.
+/// **Measured on 18.6**: an explicit `CAST` to a bounded string *truncates*
+/// where the `ALTER` *refuses*.
+///
+/// ```text
+/// SELECT 'abcde'::varchar(4);                     -- 'abcd'
+/// ALTER TABLE t ALTER COLUMN v TYPE varchar(4);   -- ERROR: value too long
+/// ```
+///
+/// So a cast-based probe over a table holding `'abcde'` counts **zero** and
+/// reports the change safe, and the statement it cleared then fails. That is
+/// the shape [`crate::preflight`] exists to prevent, arriving through the one
+/// construct that looks like the answer. The cast is an *explicit* conversion
+/// and the `ALTER` is an *assignment*, and only the second is what runs.
+///
+/// Both types must already be normalized, as everywhere else here.
+pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> Option<String> {
+    // Nothing to count where the engine will not attempt the change at all:
+    // `emit` refuses it by name with the `USING` clause spelled out
+    // (ADR-0012 §5), and a probe beside that refusal would only argue with it.
+    if change_risk(from, to) != TypeChangeRisk::Narrowing {
+        return None;
+    }
+    // `NaN` and both infinities sort **greatest** here rather than outside the
+    // order — measured, `'NaN'::numeric > 1e131071` is true, and so is
+    // `'NaN'::float8 = 'NaN'::float8`, where C would say neither. So a plain
+    // range test catches them, and where the target *accepts* one of them it
+    // has to be taken back out by name or the probe refuses a change the
+    // engine makes (measured: `'NaN'::float8` into `numeric(10,2)` is `NaN`).
+    let exact = format!("({value})::numeric");
+    let not_nan = format!("{exact} <> 'NaN'::numeric");
+    let finite =
+        format!("{not_nan} AND {exact} <> 'Infinity'::numeric AND {exact} <> '-Infinity'::numeric");
+    match (family(from), family(to)) {
+        // A bounded string target, from anything. The value is measured after
+        // its **trailing spaces** are taken off and nothing else: measured,
+        // `'abc  '` into `varchar(3)` is `'abc'` and `E'abc\t'` into the same
+        // is `value too long`. `length`, not `octet_length` — the bound is in
+        // characters, measured, `'王小明'` is three of them and nine bytes and
+        // fits `varchar(3)`.
+        (
+            _,
+            Family::Text {
+                len: Len::Bounded(n),
+                ..
+            },
+        ) => Some(format!("length(rtrim(({value})::text, ' ')) > {n}")),
+
+        // An integer target. The engine tests the value it would *store*, so
+        // the test is on the rounded one: measured, `2147483647.4` into
+        // `integer` is accepted and `2147483647.6` is `integer out of range`.
+        (Family::Exact(Exact::Numeric { .. }), Family::Exact(Exact::Integer { max })) => {
+            let min = -max - 1;
+            Some(format!("round({exact}) > {max} OR round({exact}) < {min}"))
+        }
+        // The same question from a float, and **not** through `round`, which
+        // rounds the other way. Measured, this engine rounds a float to an
+        // integer half-to-even and a `numeric` half-away-from-zero: `0.5`,
+        // `1.5` and `2.5` become `0`, `2` and `2`. So the boundary is
+        // asymmetric and is written out rather than derived — measured,
+        // `2147483647.5::float8` into `integer` is out of range and
+        // `-2147483648.5::float8` is `-2147483648`, which fits.
+        (Family::Approx { .. }, Family::Exact(Exact::Integer { max })) => {
+            let min = -max - 1;
+            Some(format!("{exact} >= {max}.5 OR {exact} < {min}.5"))
+        }
+
+        // A bounded `numeric` target. Measured, the engine's own message says
+        // which value it tests — "a field with precision 10, scale 4 must
+        // round to an absolute value less than 10^6" — so the test is on the
+        // value rounded to the target's scale, and `999999.995` stored as
+        // `numeric(10,2)` fails into `numeric(10,4)` because it is already
+        // `1000000.00`. An infinity is refused (`cannot hold an infinite
+        // value`) and a `NaN` is **kept**, so only the first is counted.
+        (
+            Family::Exact(..) | Family::Approx { .. },
+            Family::Exact(Exact::Numeric {
+                int_digits: Some(digits),
+                scale,
+            }),
+        ) => {
+            let scale = scale.unwrap_or(0);
+            Some(format!(
+                "{not_nan} AND abs(round({exact}, {scale})) >= 10::numeric^{digits}"
+            ))
+        }
+
+        // A binary float target, which overflows rather than saturating:
+        // measured, `3.5e38` into `real` is `value out of range: overflow`.
+        // The threshold is the midpoint above the largest value the target
+        // holds, and it is written as the engine's own arithmetic rather than
+        // as a decimal literal three hundred digits long. **Measured** by
+        // bisection: the largest `double precision` that becomes a `real` is
+        // `3.4028235677973362e38` and the smallest that overflows is
+        // `2^128 - 2^103` exactly; the same construction one exponent range up
+        // is the `double precision` bound, and the value just below it
+        // converts while the value at it does not.
+        //
+        // An infinity passes straight through (measured, `'Infinity'::float8`
+        // into `real` is `Infinity`) and so does a `NaN`, so both leave the
+        // count.
+        (_, Family::Approx { max_exact_int }) => {
+            let (base, mantissa) = if max_exact_int <= 1 << 24 {
+                (128, 103)
+            } else {
+                (1024, 970)
+            };
+            Some(format!(
+                "{finite} AND abs({exact}) >= (2::numeric^{base} - 2::numeric^{mantissa})"
+            ))
+        }
+
+        // A date the target's calendar cannot reach. Measured,
+        // `'294276-12-31'::date` is the last one that becomes a `timestamp`
+        // and `'294277-01-01'` is `date out of range for timestamp`.
+        (
+            Family::Temporal {
+                last_year: Some(_), ..
+            },
+            Family::Temporal {
+                last_year: Some(last),
+                ..
+            },
+        ) => Some(format!("{value} > '{last}-12-31'::date")),
+
+        // Everything else narrows without a row to point at; the list is in
+        // this function's own documentation.
+        _ => None,
+    }
+}
+
 /// The spelling this engine puts in a routine's identity, from a declared one
 /// (ADR-0009 §1, DECISIONS 301 and 303).
 ///

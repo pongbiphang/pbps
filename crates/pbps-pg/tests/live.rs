@@ -16216,3 +16216,1273 @@ async fn cleanup_role(db: &mut TestDb, role: &str) {
         .execute(&format!("DROP ROLE IF EXISTS {role}"))
         .await;
 }
+
+/// A schema for the pre-flight probes of Phase 5 step 9.
+fn probe_schema_9(test: &str) -> String {
+    format!("pbps_probe_{}_{test}", std::process::id())
+}
+
+/// Every probe of a plan, as `(description, count)`.
+///
+/// A probe the engine *rejects* fails the test rather than being skipped. The
+/// runner tolerates one, and tolerating it here would let a probe that never
+/// runs pass for a probe that counts nothing — which is the whole failure this
+/// suite exists to catch.
+async fn counts(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Vec<(String, i64)> {
+    let pg = Postgres::new();
+    let mut out = Vec::new();
+    for probe in pg.preflight(cs) {
+        let n = counted(conn, &probe.sql).await;
+        out.push((probe.description, n));
+    }
+    out
+}
+
+/// The count of the one probe whose description names `needle`.
+fn one(counts: &[(String, i64)], needle: &str) -> i64 {
+    let found: Vec<&(String, i64)> = counts.iter().filter(|(d, _)| d.contains(needle)).collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one probe should mention `{needle}`: {counts:#?}"
+    );
+    found[0].1
+}
+
+/// SPEC §7.5: the probes have to count what the engine would actually refuse.
+///
+/// Their whole value is the number they report, so each count here is asserted
+/// against a real table **and** against the engine's own verdict on the very
+/// statement the probe is about: the violating fixture is refused, the rows are
+/// repaired, the same probe counts nothing, and the same statement runs. A
+/// probe that passed for the wrong reason would have to survive both halves.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("counts");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.region (region_id integer PRIMARY KEY);
+         CREATE TABLE {s}.customer (
+             id integer NOT NULL,
+             email text,
+             region_id integer,
+             label text,
+             amount numeric(10,2) NOT NULL
+         );
+         INSERT INTO {s}.region VALUES (1);
+         INSERT INTO {s}.customer VALUES
+             (1, 'a@example.com', 1,  'short',      10.00),
+             (2, NULL,            1,  'far too long', -5.00),
+             (3, NULL,            99, 'short',      20.00),
+             (1, 'a@example.com', 1,  'short',      30.00);"
+    ))
+    .await
+    .expect("the fixture");
+
+    let table = TableName::new(&s, "customer");
+    let changes = vec![
+        Change::AlterColumnNullability {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: table.column("email"),
+            ty: ty("text"),
+            to_nullable: false,
+        },
+        Change::AddCheck {
+            table: table.clone(),
+            name: "ck_customer_amount".into(),
+            constraint: CheckConstraint {
+                expression: "amount >= 0".into(),
+            },
+        },
+        Change::AddForeignKey {
+            table: table.clone(),
+            name: "fk_customer_region".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec!["region_id".into()],
+                references_table: TableName::new(&s, "region"),
+                references_columns: vec!["region_id".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        },
+        Change::AddUnique {
+            table: table.clone(),
+            name: "uq_customer_id".into(),
+            constraint: UniqueConstraint {
+                columns: vec!["id".into()],
+            },
+        },
+        Change::AlterColumnType {
+            uid: "c_bbbbbb".parse().expect("a uid"),
+            column: table.column("label"),
+            from: ty("text"),
+            to: ty("varchar(5)"),
+            from_nullable: true,
+            to_nullable: true,
+        },
+    ];
+    let cs = ChangeSet {
+        changes: changes.iter().cloned().map(PlannedChange::new).collect(),
+    };
+
+    let measured = counts(&mut conn, &cs).await;
+    assert_eq!(one(&measured, "NULLs in"), 2, "{measured:#?}");
+    assert_eq!(one(&measured, "violate the new check"), 1, "{measured:#?}");
+    assert_eq!(one(&measured, "no matching parent"), 1, "{measured:#?}");
+    assert_eq!(
+        one(&measured, "collide under the new unique constraint"),
+        2,
+        "two rows share id 1, and the count is of rows and not of groups: {measured:#?}"
+    );
+    assert_eq!(one(&measured, "cannot become"), 1, "{measured:#?}");
+
+    // The other half: the engine refuses every one of those statements, so the
+    // numbers are about something real.
+    let pg = Postgres::new();
+    for change in &changes {
+        let statements = pg.emit(change, Strategy::default()).expect("emit");
+        let mut refused = None;
+        for stmt in &statements {
+            if let Err(e) = conn.execute(&stmt.sql).await {
+                refused = Some(e);
+                break;
+            }
+        }
+        let e = refused.unwrap_or_else(|| panic!("the engine accepted {change:?}"));
+        assert!(
+            ["23502", "23514", "23503", "23505", "22001"].contains(&sqlstate(&e)),
+            "{change:?} was refused for an unexpected reason: {e:?}"
+        );
+    }
+
+    // Repair exactly the rows each probe named, and every count goes to zero.
+    conn.execute(&format!(
+        "UPDATE {s}.customer SET email = 'filled@example.com' WHERE email IS NULL;
+         UPDATE {s}.customer SET amount = 0 WHERE amount < 0;
+         UPDATE {s}.customer SET region_id = 1 WHERE region_id = 99;
+         UPDATE {s}.customer SET label = 'short' WHERE length(label) > 5;
+         DELETE FROM {s}.customer WHERE ctid = (SELECT max(ctid) FROM {s}.customer WHERE id = 1);"
+    ))
+    .await
+    .expect("repair");
+
+    let measured = counts(&mut conn, &cs).await;
+    for (description, n) in &measured {
+        assert_eq!(*n, 0, "{description} still counts {n}: {measured:#?}");
+    }
+    // And now every statement runs, which is what makes a zero mean something.
+    for change in &changes {
+        for stmt in pg.emit(change, Strategy::default()).expect("emit") {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// This engine's `UNIQUE` holds NULLs apart, and `GROUP BY` puts them
+/// together — so the duplicate count has to take them out by hand.
+///
+/// The SQL Server probe one crate away groups without excluding them, and it is
+/// right to: there a `UNIQUE` treats two NULLs as one value. Ported across, it
+/// counted a collision the engine would never produce and **refused a plan the
+/// engine accepts**, which is the worse of the two ways to be wrong. Both
+/// halves are asserted here — the probe counts nothing and the engine takes the
+/// constraint — because the first alone would pass with the exclusion removed
+/// if the engine agreed with `GROUP BY`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("nulls");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer, a integer, b integer);
+         INSERT INTO {s}.t VALUES (1, NULL, NULL), (2, NULL, NULL), (3, 1, NULL), (4, 2, NULL);"
+    ))
+    .await
+    .expect("the fixture");
+
+    // What `GROUP BY` alone would say about those rows: four, in two groups.
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT COALESCE(sum(c), 0)::int FROM \
+                 (SELECT count(*) AS c FROM {s}.t GROUP BY a, b HAVING count(*) > 1) d"
+            )
+        )
+        .await,
+        2,
+        "the probe this one replaces would have counted the two all-NULL rows"
+    );
+
+    let table = TableName::new(&s, "t");
+    let single = Change::AddUnique {
+        table: table.clone(),
+        name: "uq_a".into(),
+        constraint: UniqueConstraint {
+            columns: vec!["a".into()],
+        },
+    };
+    let composite = Change::AddUnique {
+        table: table.clone(),
+        name: "uq_ab".into(),
+        constraint: UniqueConstraint {
+            columns: vec!["a".into(), "b".into()],
+        },
+    };
+    let cs = ChangeSet {
+        changes: vec![
+            PlannedChange::new(single.clone()),
+            PlannedChange::new(composite.clone()),
+        ],
+    };
+    let measured = counts(&mut conn, &cs).await;
+    for (description, n) in &measured {
+        assert_eq!(
+            *n, 0,
+            "no collision: two NULLs are two values here, and so are two \
+             `(1, NULL)` tuples — {description} counted {n}"
+        );
+    }
+
+    // And the engine agrees, which is the half that makes the zero mean
+    // something: a partly-NULL tuple is not a duplicate of another one.
+    let pg = Postgres::new();
+    for change in [&single, &composite] {
+        for stmt in pg.emit(change, Strategy::default()).expect("emit") {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A bounded string target: the probe measures the value, because measuring
+/// the **cast** answers a different question.
+///
+/// Measured on 18.6, an explicit `CAST` truncates where the assignment the
+/// `ALTER` performs refuses:
+///
+/// ```text
+/// SELECT 'abcde'::varchar(4);                     -- 'abcd'
+/// ALTER TABLE t ALTER COLUMN v TYPE varchar(4);   -- ERROR: value too long
+/// ```
+///
+/// So the obvious probe — count the rows a cast rejects — counts **zero** here
+/// and clears a statement the engine then refuses. That is the silence
+/// pre-flight exists to prevent, arriving through the one construct that looks
+/// like the answer, and this test pins both sides of it.
+///
+/// Trailing **spaces** are the exception the engine makes and the probe makes
+/// with it: `'abc  '` into `varchar(3)` is `'abc'`, and a trailing tab in the
+/// same place is `value too long`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("truncate");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (v text); INSERT INTO {s}.t VALUES ('abcde');"
+    ))
+    .await
+    .expect("the fixture");
+
+    // The probe that looks right and is not.
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM {s}.t WHERE v IS NOT NULL AND v::varchar(4) IS NULL"
+            )
+        )
+        .await,
+        0,
+        "a cast-shaped probe reports this table clean"
+    );
+
+    let narrow = |to: &str| Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().expect("a uid"),
+        column: TableName::new(&s, "t").column("v"),
+        from: ty("text"),
+        to: ty(to),
+        from_nullable: true,
+        to_nullable: true,
+    };
+    let cs = ChangeSet {
+        changes: vec![PlannedChange::new(narrow("varchar(4)"))],
+    };
+    assert_eq!(
+        one(&counts(&mut conn, &cs).await, "cannot become"),
+        1,
+        "the probe that measures the value finds the row"
+    );
+    let refusal = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.t ALTER COLUMN v TYPE character varying(4)"
+        ))
+        .await
+        .expect_err("the engine refuses the assignment the cast would have truncated");
+    assert_eq!(sqlstate(&refusal), "22001", "{refusal:?}");
+
+    // Trailing spaces are not length, here or in the probe. A tab is.
+    conn.execute(&format!(
+        "DELETE FROM {s}.t; INSERT INTO {s}.t VALUES ('abc  ');"
+    ))
+    .await
+    .expect("spaces");
+    assert_eq!(
+        one(&counts(&mut conn, &cs).await, "cannot become"),
+        0,
+        "trailing spaces are trimmed by the engine, so they are not too long"
+    );
+    conn.execute(&format!(
+        "ALTER TABLE {s}.t ALTER COLUMN v TYPE character varying(4)"
+    ))
+    .await
+    .expect("the engine trims the spaces and takes the change");
+
+    conn.execute(&format!(
+        "DROP TABLE {s}.t; CREATE TABLE {s}.t (v text); INSERT INTO {s}.t VALUES (E'abcd\\t');"
+    ))
+    .await
+    .expect("a tab");
+    assert_eq!(
+        one(&counts(&mut conn, &cs).await, "cannot become"),
+        1,
+        "a trailing tab is a character like any other"
+    );
+    let refusal = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.t ALTER COLUMN v TYPE character varying(4)"
+        ))
+        .await
+        .expect_err("and the engine refuses it");
+    assert_eq!(sqlstate(&refusal), "22001", "{refusal:?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A foreign key sorts after every row change, so the probe has to count the
+/// rows the statement will meet and not the rows standing now.
+///
+/// This is the ordinary ADR-0004 flow — declare the parent rows, declare the
+/// key that references them — and a probe built from what is stored calls the
+/// child an orphan and refuses it. Asserted against the engine both ways: the
+/// same key alone is refused over the same data, and the plan that supplies the
+/// row runs in its own order and leaves the key in place.
+///
+/// The plan comes from the differ rather than by hand, because what the probe
+/// has to be right about is the plan a user's declarations actually produce.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absence() {
+    use pbps_model::{Change, ChangeSet, DataMode, Value};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("arrives");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.region (code text NOT NULL PRIMARY KEY, label text);
+         CREATE TABLE {s}.customer (id integer NOT NULL PRIMARY KEY, region text);
+         INSERT INTO {s}.region VALUES ('north', 'North');
+         INSERT INTO {s}.customer VALUES (1, 'north'), (2, 'south');"
+    ))
+    .await
+    .expect("the fixture");
+
+    let region_name = TableName::new(&s, "region");
+    let customer_name = TableName::new(&s, "customer");
+    let mut region = Table::default();
+    region
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    region
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    region.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    let mut customer = Table::default();
+    customer
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    customer
+        .columns
+        .insert("region".into(), Column::new(ty("text")));
+    customer.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    customer.foreign_keys.insert(
+        "fk_customer_region".into(),
+        ForeignKey {
+            columns: vec!["region".into()],
+            references_table: region_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(region_name.clone(), region);
+    declared.tables.insert(customer_name.clone(), customer);
+    with_data(
+        declared.tables.get_mut(&region_name).expect("the table"),
+        DataMode::Ensure,
+        &[
+            ("north", row(&[("label", Value::Text("North".into()))])),
+            ("south", row(&[("label", Value::Text("South".into()))])),
+        ],
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+
+    let inserts = cs
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, Change::InsertRow { .. }))
+        .count();
+    let keys = cs
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, Change::AddForeignKey { .. }))
+        .count();
+    assert_eq!((inserts, keys), (1, 1), "{cs:#?}");
+
+    // The key on its own, over the data as it stands: `south` has no parent.
+    let alone = ChangeSet {
+        changes: cs
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, Change::AddForeignKey { .. }))
+            .cloned()
+            .collect(),
+    };
+    assert_eq!(
+        one(&counts(&mut conn, &alone).await, "no matching parent"),
+        1,
+        "the child row referencing `south` is an orphan today"
+    );
+    let pg = Postgres::new();
+    let key = &alone.changes[0];
+    let refusal = conn
+        .execute(&pg.emit(&key.change, key.strategy).expect("emit")[0].sql)
+        .await
+        .expect_err("and the engine refuses the key");
+    assert_eq!(sqlstate(&refusal), "23503", "{refusal:?}");
+
+    // The whole plan, which supplies the parent row before adding the key.
+    assert_eq!(
+        one(&counts(&mut conn, &cs).await, "no matching parent"),
+        0,
+        "the plan writes the parent row first, and the probe counts what the \
+         statement will meet"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_constraint \
+                 WHERE conname = 'fk_customer_region' AND connamespace = '{s}'::regnamespace"
+            )
+        )
+        .await,
+        1,
+        "the key the stored-rows count would have refused is there once the plan runs"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// Two columns collated differently cannot be compared without saying which
+/// collation to use, and only the catalog can spell the one the engine's own
+/// referential check uses.
+///
+/// **Measured**: `q.k0 = r.k0` between a `"C"` column and an `"en_US"` one is
+/// `could not determine which collation to use for string hashing`, which the
+/// runner reports as *unchecked* — a probe that never answers, on the plan
+/// shape it exists for. With the referenced column's collation spliced in from
+/// `pg_attribute`, the count is the engine's own: the rows it names are exactly
+/// the rows that have to go before the key can be created.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("collated");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.p (code text COLLATE \"C\" PRIMARY KEY);
+         CREATE TABLE {s}.c (id integer PRIMARY KEY, ref text COLLATE \"en_US\");
+         INSERT INTO {s}.p VALUES ('a'), ('b');
+         INSERT INTO {s}.c VALUES (1, 'a'), (2, 'zzz');"
+    ))
+    .await
+    .expect("the fixture");
+
+    // The comparison the probe would make without the catalog's answer.
+    assert!(
+        conn.query(&format!(
+            "SELECT count(*) FROM {s}.c r WHERE NOT EXISTS \
+             (SELECT 1 FROM {s}.p q WHERE q.code = r.ref)"
+        ))
+        .await
+        .is_err(),
+        "a bare comparison across the two collations must be the error this splice avoids"
+    );
+
+    let key = Change::AddForeignKey {
+        table: TableName::new(&s, "c"),
+        name: "fk_c_p".into(),
+        constraint: Box::new(ForeignKey {
+            columns: vec!["ref".into()],
+            references_table: TableName::new(&s, "p"),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        }),
+    };
+    let cs = ChangeSet {
+        changes: vec![PlannedChange::new(key.clone())],
+    };
+    assert_eq!(
+        one(&counts(&mut conn, &cs).await, "no matching parent"),
+        1,
+        "`zzz` has no parent; `a` does, under either collation"
+    );
+
+    let pg = Postgres::new();
+    let refusal = conn
+        .execute(&pg.emit(&key, Strategy::default()).expect("emit")[0].sql)
+        .await
+        .expect_err("the engine refuses the key over that row");
+    assert_eq!(sqlstate(&refusal), "23503", "{refusal:?}");
+
+    // Exactly the row the probe counted, and the key goes on.
+    conn.execute(&format!("DELETE FROM {s}.c WHERE ref = 'zzz'"))
+        .await
+        .expect("delete the orphan");
+    assert_eq!(one(&counts(&mut conn, &cs).await, "no matching parent"), 0);
+    conn.execute(&pg.emit(&key, Strategy::default()).expect("emit")[0].sql)
+        .await
+        .expect("the engine takes the key once the row the probe named is gone");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// SPEC §7.4 on this engine: the catalog lists what a rename does **not**
+/// break, and what it does break is invisible to it.
+///
+/// The whole report is asserted against a real dependency graph, and then the
+/// rename is actually performed and the two halves checked against the engine:
+/// the carried objects still read the table, and the routine the report calls
+/// advisory fails with `column "email" does not exist`. A report that had the
+/// two lists the wrong way round would pass the first half of this test and
+/// fail the second.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_body() {
+    use pbps_pg::impact::{RenameTarget, rename_impact};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("impact");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.customer (
+             id integer PRIMARY KEY,
+             email text,
+             amount numeric(10,2) CHECK (amount >= 0));
+         CREATE VIEW {s}.v_plain AS SELECT id, email FROM {s}.customer;
+         CREATE FUNCTION {s}.f_atomic() RETURNS text LANGUAGE sql
+             BEGIN ATOMIC SELECT email FROM {s}.customer LIMIT 1; END;
+         CREATE FUNCTION {s}.f_plpgsql() RETURNS text LANGUAGE plpgsql AS
+             $f$ BEGIN RETURN (SELECT email FROM {s}.customer LIMIT 1); END $f$;
+         CREATE FUNCTION {s}.f_other() RETURNS text LANGUAGE plpgsql AS
+             $f$ BEGIN RETURN (SELECT email_address FROM {s}.customer LIMIT 1); END $f$;
+         CREATE INDEX ix_customer_email ON {s}.customer (email);
+         CREATE POLICY p_email ON {s}.customer USING (email <> 'blocked');"
+    ))
+    .await
+    .expect("the fixture");
+
+    let target = RenameTarget::Column(TableName::new(&s, "customer").column("email"));
+    let report = rename_impact(&mut conn, &target)
+        .await
+        .expect("the impact report");
+
+    let advisory: Vec<&str> = report.advisory.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        advisory.iter().any(|n| n.contains("f_plpgsql")),
+        "the body this engine never parsed is what breaks: {report:#?}"
+    );
+    assert!(
+        !advisory.iter().any(|n| n.contains("f_atomic")),
+        "a BEGIN ATOMIC body is parsed and carried, so it is not advisory: {report:#?}"
+    );
+    assert!(
+        !advisory.iter().any(|n| n.contains("f_other")),
+        "`email_address` is a longer name and not this column: {report:#?}"
+    );
+    assert!(
+        advisory.contains(&"ix_customer_email"),
+        "an index whose name embeds the column is naming drift: {report:#?}"
+    );
+
+    let carried: Vec<&str> = report.carried.iter().map(|r| r.name.as_str()).collect();
+    for expected in ["view", "function", "index", "policy"] {
+        assert!(
+            carried.iter().any(|c| c.contains(expected)),
+            "the catalog holds an edge for the {expected} and the rename is carried into it: \
+             {report:#?}"
+        );
+    }
+    assert!(
+        report.blocking.is_empty(),
+        "measured: nothing blocks a rename on this engine — {report:#?}"
+    );
+
+    // Now do it, and let the engine settle which list was which.
+    conn.execute(&format!(
+        "ALTER TABLE {s}.customer RENAME COLUMN email TO contact_email"
+    ))
+    .await
+    .expect("the rename");
+
+    // The carried half still works, and the view keeps its old output name.
+    assert!(
+        text(
+            &mut conn,
+            &format!("SELECT pg_get_viewdef('{s}.v_plain'::regclass, true)")
+        )
+        .await
+        .contains("contact_email AS email"),
+        "the view reads the new column and keeps the old output name"
+    );
+    assert!(
+        conn.query(&format!("SELECT * FROM {s}.v_plain"))
+            .await
+            .is_ok(),
+        "the view still runs"
+    );
+    assert!(
+        conn.query(&format!("SELECT {s}.f_atomic()")).await.is_ok(),
+        "the parsed body still runs"
+    );
+
+    // The advisory half does not, and the failure lands only when it is called.
+    let broken = match conn.query(&format!("SELECT {s}.f_plpgsql()")).await {
+        Ok(_) => panic!("the text body still spells the old name and must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(sqlstate(&broken), "42703", "{broken:?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A column the report cannot find is a question that could not be asked, and
+/// never an empty report.
+///
+/// Absent, empty and unreadable are three different things, and only one of
+/// them is good news: an empty `advisory` here would read as "nothing breaks".
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing() {
+    use pbps_pg::impact::{ImpactError, RenameTarget, rename_impact};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("absent");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TABLE {s}.t (id integer)"))
+        .await
+        .expect("the fixture");
+
+    let missing = RenameTarget::Column(TableName::new(&s, "t").column("no_such_column"));
+    let e = rename_impact(&mut conn, &missing)
+        .await
+        .expect_err("a column that is not there cannot be reported on");
+    assert!(matches!(e, ImpactError::Name(_)), "{e:?}");
+
+    // And a dropped column keeps its slot, so the reader has to exclude it by
+    // name rather than trust the position (ADR-0012 §6).
+    conn.execute(&format!(
+        "ALTER TABLE {s}.t ADD COLUMN gone text; ALTER TABLE {s}.t DROP COLUMN gone;"
+    ))
+    .await
+    .expect("drop a column");
+    let dropped = RenameTarget::Column(TableName::new(&s, "t").column("gone"));
+    assert!(
+        rename_impact(&mut conn, &dropped).await.is_err(),
+        "the slot the catalog keeps is not a column anybody can rename"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0012 §3's dataset, re-measured in full: for every ordered pair of the
+/// catalogue's spellings, does `ALTER COLUMN … TYPE` rebuild the table, and does
+/// the dialect say the same?
+///
+/// The engine's own answer is `pg_class.relfilenode` either side of the
+/// statement, which is what "was this table rebuilt" means rather than a proxy
+/// for it. §3 measured eleven rows by hand; this measures every pair the engine
+/// accepts and holds the estimate to all of them, which is the difference
+/// between a table somebody wrote down and one that cannot go stale without a
+/// red build.
+///
+/// An empty table is enough, and that is measured too rather than assumed: the
+/// same change on an empty table and on a hundred-row one gives the same
+/// verdict, because the rewrite is a property of the statement.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
+    use pbps_model::{Change, PlannedChange};
+    use pbps_pg::estimate::{Rewrite, estimate};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("rewrite");
+    fresh(&mut conn, &s).await;
+
+    // The catalogue's spellings, plus the three `numeric` shapes that separate
+    // widening a precision from widening a scale.
+    let declared = [
+        "smallint",
+        "integer",
+        "bigint",
+        "numeric(10,2)",
+        "numeric(12,2)",
+        "numeric(10,4)",
+        "numeric",
+        "real",
+        "double precision",
+        "boolean",
+        "character(5)",
+        "character(10)",
+        "character varying(5)",
+        "character varying(10)",
+        "character varying",
+        "text",
+        "bytea",
+        "date",
+        "time",
+        "time with time zone",
+        "timestamp",
+        "timestamp with time zone",
+        "interval",
+        "uuid",
+        "json",
+        "jsonb",
+    ];
+
+    // The whole matrix in one round trip: the engine creates, alters, and
+    // records its own verdict, and a refusal is recorded rather than fatal.
+    let list = declared
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(&format!(
+        "CREATE TABLE {s}.verdict (src text, dst text, rebuilt boolean);
+         DO $do$
+         DECLARE a text; b text; before oid; after oid;
+         BEGIN
+           FOREACH a IN ARRAY ARRAY[{list}] LOOP
+             FOREACH b IN ARRAY ARRAY[{list}] LOOP
+               EXECUTE 'DROP TABLE IF EXISTS {s}.m';
+               EXECUTE format('CREATE TABLE {s}.m (c %s)', a);
+               SELECT relfilenode INTO before FROM pg_class WHERE oid = '{s}.m'::regclass;
+               BEGIN
+                 EXECUTE format('ALTER TABLE {s}.m ALTER COLUMN c TYPE %s', b);
+                 SELECT relfilenode INTO after FROM pg_class WHERE oid = '{s}.m'::regclass;
+                 INSERT INTO {s}.verdict VALUES (a, b, before <> after);
+               EXCEPTION WHEN others THEN
+                 INSERT INTO {s}.verdict VALUES (a, b, NULL);
+               END;
+             END LOOP;
+           END LOOP;
+         END $do$;"
+    ))
+    .await
+    .expect("measure the matrix");
+
+    let rows = conn
+        .query(&format!(
+            "SELECT src, dst, rebuilt FROM {s}.verdict WHERE rebuilt IS NOT NULL ORDER BY src, dst"
+        ))
+        .await
+        .expect("read the matrix");
+    assert!(
+        rows.len() > 200,
+        "the engine should accept most of the matrix, not {}",
+        rows.len()
+    );
+
+    let mut disagreed = Vec::new();
+    let mut rebuilt = 0;
+    for row in &rows {
+        let src: &str = row.try_get("src").expect("src").expect("not null");
+        let dst: &str = row.try_get("dst").expect("dst").expect("not null");
+        let engine: bool = row.try_get("rebuilt").expect("rebuilt").expect("not null");
+        if engine {
+            rebuilt += 1;
+        }
+        let change = Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: TableName::new(&s, "m").column("c"),
+            from: ty(src),
+            to: ty(dst),
+            from_nullable: true,
+            to_nullable: true,
+        };
+        let ours = estimate(&change)
+            .expect("every column change has an estimate")
+            .rewrite;
+        let agrees = match &ours {
+            Rewrite::Yes => engine,
+            Rewrite::No => !engine,
+            // The session decides this one, so the engine's answer under this
+            // session is not the answer. Measured separately below.
+            Rewrite::Unknown(_) => true,
+        };
+        if !agrees {
+            disagreed.push(format!(
+                "{src} -> {dst}: engine rebuilt={engine}, dialect={ours:?}"
+            ));
+        }
+    }
+    assert!(
+        disagreed.is_empty(),
+        "the estimate and the engine part company on {} of {} pairs:\n  {}",
+        disagreed.len(),
+        rows.len(),
+        disagreed.join("\n  ")
+    );
+    // The shape of the answer, so that a table which quietly became "everything
+    // rewrites" would fail here rather than pass by agreeing with itself.
+    assert!(
+        rebuilt > 0 && rebuilt < rows.len(),
+        "both answers have to occur: {rebuilt} rebuilt of {}",
+        rows.len()
+    );
+
+    // And the one pair whose cost the session decides, measured both ways —
+    // which is why the dialect refuses to answer it at all.
+    for (zone, expected) in [("UTC", false), ("America/New_York", true)] {
+        conn.execute(&format!(
+            "SET TimeZone = '{zone}';
+             DROP TABLE IF EXISTS {s}.z;
+             CREATE TABLE {s}.z (c timestamp);"
+        ))
+        .await
+        .expect("a timestamp column");
+        let before = number(
+            &mut conn,
+            &format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{s}.z'::regclass"),
+        )
+        .await;
+        conn.execute(&format!(
+            "ALTER TABLE {s}.z ALTER COLUMN c TYPE timestamptz"
+        ))
+        .await
+        .expect("the change");
+        let after = number(
+            &mut conn,
+            &format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{s}.z'::regclass"),
+        )
+        .await;
+        assert_eq!(
+            (before != after),
+            expected,
+            "under {zone} the same declared change is a different cost"
+        );
+    }
+    conn.execute("RESET TimeZone").await.expect("reset");
+    let change = Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().expect("a uid"),
+        column: TableName::new(&s, "z").column("c"),
+        from: ty("timestamp"),
+        to: ty("timestamptz"),
+        from_nullable: true,
+        to_nullable: true,
+    };
+    assert!(
+        matches!(
+            estimate(&change).expect("an estimate").rewrite,
+            Rewrite::Unknown(_)
+        ),
+        "an estimate that answered this from the declaration would be wrong for \
+         half the operators who ran it"
+    );
+    let _ = PlannedChange::new(change);
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// `relfilenode` is exact about the rebuild and says nothing about a scan, and
+/// the estimate keeps those apart because one of them is invisible to the other.
+///
+/// Measured here on a hundred thousand rows, through the engine's own
+/// `seq_tup_read`: `SET NOT NULL` rebuilds nothing and reads every one of them,
+/// while `varchar(10) -> varchar(20)` rebuilds nothing and reads none. An
+/// estimate carrying one fact would call those two changes the same, and one of
+/// them is free.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Reads, Rewrite, estimate};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("scan");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer, v integer, w varchar(10));
+         INSERT INTO {s}.t SELECT g, g, g::text FROM generate_series(1, 100000) g;"
+    ))
+    .await
+    .expect("the fixture");
+    // Its own statement: `VACUUM` cannot run inside a transaction block, and a
+    // multi-statement simple query is one — measured, `25001`.
+    conn.execute(&format!("VACUUM ANALYZE {s}.t"))
+        .await
+        .expect("settle the statistics");
+
+    let column = TableName::new(&s, "t");
+    let tighten = Change::AlterColumnNullability {
+        uid: "c_aaaaaa".parse().expect("a uid"),
+        column: column.column("v"),
+        ty: ty("integer"),
+        to_nullable: false,
+    };
+    let widen = Change::AlterColumnType {
+        uid: "c_bbbbbb".parse().expect("a uid"),
+        column: column.column("w"),
+        from: ty("varchar(10)"),
+        to: ty("varchar(20)"),
+        from_nullable: true,
+        to_nullable: true,
+    };
+
+    for (change, expected_reads, sql) in [
+        (
+            &tighten,
+            Reads::EveryRow,
+            format!("ALTER TABLE {s}.t ALTER COLUMN v SET NOT NULL"),
+        ),
+        (
+            &widen,
+            Reads::Nothing,
+            format!("ALTER TABLE {s}.t ALTER COLUMN w TYPE character varying(20)"),
+        ),
+    ] {
+        let ours = estimate(change).expect("an estimate");
+        assert_eq!(ours.rewrite, Rewrite::No, "{ours:#?}");
+        assert_eq!(ours.reads, expected_reads, "{ours:#?}");
+
+        conn.execute("SELECT pg_stat_force_next_flush()")
+            .await
+            .expect("flush");
+        let before = number(
+            &mut conn,
+            &format!(
+                "SELECT seq_tup_read::int FROM pg_stat_user_tables WHERE relid = '{s}.t'::regclass"
+            ),
+        )
+        .await;
+        let node_before = number(
+            &mut conn,
+            &format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{s}.t'::regclass"),
+        )
+        .await;
+        conn.execute(&sql).await.expect("the change");
+        conn.execute("SELECT pg_stat_force_next_flush()")
+            .await
+            .expect("flush");
+        let read = number(
+            &mut conn,
+            &format!(
+                "SELECT seq_tup_read::int FROM pg_stat_user_tables WHERE relid = '{s}.t'::regclass"
+            ),
+        )
+        .await
+            - before;
+        let node_after = number(
+            &mut conn,
+            &format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{s}.t'::regclass"),
+        )
+        .await;
+
+        assert_eq!(node_before, node_after, "neither change rebuilds: {sql}");
+        match expected_reads {
+            Reads::EveryRow => assert_eq!(read, 100000, "{sql}"),
+            Reads::Nothing => assert_eq!(read, 0, "{sql}"),
+            Reads::Unknown(_) => unreachable!(),
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The locks one statement holds on one relation, read from inside the
+/// statement's own transaction — which is the only place they are still there —
+/// and rolled back afterwards so the next statement starts from the same
+/// fixture.
+async fn locks_held(conn: &mut Conn, schema: &str, sql: &str, relation: &str) -> String {
+    conn.execute(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE;
+         CREATE SCHEMA {schema};
+         CREATE TABLE {schema}.p (id integer PRIMARY KEY);
+         CREATE TABLE {schema}.t (id integer NOT NULL, v integer NOT NULL, w text);
+         INSERT INTO {schema}.p SELECT g FROM generate_series(1, 50) g;
+         INSERT INTO {schema}.t SELECT g, g, g::text FROM generate_series(1, 50) g;"
+    ))
+    .await
+    .expect("the fixture");
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let modes = text(
+        conn,
+        &format!(
+            "SELECT COALESCE(string_agg(DISTINCT l.mode, ','), '') FROM pg_locks l \
+             JOIN pg_class c ON c.oid = l.relation \
+             WHERE l.locktype = 'relation' AND l.pid = pg_backend_pid() \
+               AND c.relnamespace = '{schema}'::regnamespace AND c.relname = '{relation}'"
+        ),
+    )
+    .await;
+    conn.execute("ROLLBACK").await.expect("rollback");
+    modes
+}
+
+/// The lock each statement takes, measured from inside its own transaction —
+/// and the one that locks a table nobody named.
+///
+/// A foreign key takes `ShareRowExclusiveLock` on the **referenced** table as
+/// well as on the one the constraint is written on, so a key added to a small
+/// child table blocks every write to a parent that may be enormous. That is a
+/// fact about a table the change does not mention, and an estimate that did not
+/// carry it would be quietly incomplete in the direction that surprises an
+/// operator at 3am.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Lock, estimate};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("locks");
+
+    let table = TableName::new(&s, "t");
+    let cases: Vec<(Change, String)> = vec![
+        (
+            Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: table.column("v"),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: false,
+                to_nullable: false,
+            },
+            format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE bigint"),
+        ),
+        (
+            Change::AddCheck {
+                table: table.clone(),
+                name: "ck".into(),
+                constraint: CheckConstraint {
+                    expression: "v > 0".into(),
+                },
+            },
+            format!("ALTER TABLE {s}.t ADD CONSTRAINT ck CHECK (v > 0)"),
+        ),
+        (
+            Change::AddIndex {
+                table: table.clone(),
+                name: "ix".into(),
+                index: Box::new(Index {
+                    columns: vec![IndexColumn {
+                        name: "v".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: Some("v > 0".into()),
+                }),
+            },
+            format!("CREATE INDEX ix ON {s}.t (v) WHERE v > 0"),
+        ),
+    ];
+    for (change, sql) in cases {
+        let ours = estimate(&change).expect("an estimate");
+        let modes = locks_held(&mut conn, &s, &sql, "t").await;
+        assert!(
+            modes.split(',').any(|m| m == ours.lock.to_string()),
+            "{sql}\n  estimate says {}, the engine held {modes}",
+            ours.lock
+        );
+    }
+
+    // The foreign key, and the table it locks that nobody named.
+    let key = Change::AddForeignKey {
+        table: table.clone(),
+        name: "fk".into(),
+        constraint: Box::new(ForeignKey {
+            columns: vec!["v".into()],
+            references_table: TableName::new(&s, "p"),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        }),
+    };
+    let ours = estimate(&key).expect("an estimate");
+    assert_eq!(ours.lock, Lock::ShareRowExclusive);
+    assert_eq!(ours.also_locks, [TableName::new(&s, "p")]);
+    let sql = format!("ALTER TABLE {s}.t ADD CONSTRAINT fk FOREIGN KEY (v) REFERENCES {s}.p(id)");
+    for relation in ["t", "p"] {
+        let modes = locks_held(&mut conn, &s, &sql, relation).await;
+        assert!(
+            modes.split(',').any(|m| m == "ShareRowExclusiveLock"),
+            "the key locks {relation} too, and the engine held {modes}"
+        );
+    }
+    // And it is not the exclusive lock every other ALTER takes, which is the
+    // half that makes naming it worth anything.
+    let modes = locks_held(&mut conn, &s, &sql, "t").await;
+    assert!(
+        !modes.split(',').any(|m| m == "AccessExclusiveLock"),
+        "a foreign key does not block readers: {modes}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A shape ADR-0012 records as unmeasured takes the answer back to `unknown`,
+/// whatever the static half said — and a table nobody has analyzed is not a
+/// table with no rows in it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Rewrite, Rows, against, estimate};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("shapes");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parted (id integer, v integer) PARTITION BY RANGE (id);
+         CREATE TABLE {s}.base (id integer, v integer);
+         CREATE TABLE {s}.child () INHERITS ({s}.base);
+         CREATE TABLE {s}.plain (id integer, v integer);
+         CREATE TABLE {s}.indexed (id integer, v integer);
+         CREATE INDEX ix_indexed_v ON {s}.indexed (v);
+         INSERT INTO {s}.plain SELECT g, g FROM generate_series(1, 1000) g;"
+    ))
+    .await
+    .expect("the fixture");
+
+    let widen = |table: &str| Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().expect("a uid"),
+        column: TableName::new(&s, table).column("v"),
+        from: ty("integer"),
+        to: ty("bigint"),
+        from_nullable: true,
+        to_nullable: true,
+    };
+
+    // The static answer is the same for all of them, and the table decides
+    // whether it survives.
+    for table in ["parted", "base", "plain", "indexed"] {
+        assert_eq!(
+            estimate(&widen(table)).expect("an estimate").rewrite,
+            Rewrite::Yes,
+            "integer -> bigint rebuilds, before the table is looked at"
+        );
+    }
+
+    for (table, still_known) in [
+        ("parted", false),
+        ("base", false),
+        ("indexed", false),
+        ("plain", true),
+    ] {
+        let mut e = estimate(&widen(table)).expect("an estimate");
+        against(&mut conn, &mut e, Some("v"))
+            .await
+            .expect("read the table's shape");
+        assert_eq!(
+            e.rewrite == Rewrite::Yes,
+            still_known,
+            "{table}: {:?}",
+            e.rewrite
+        );
+    }
+
+    // A table nobody has analyzed answers `-1`, and reading that as a row
+    // count says the change is free on the largest table in the database.
+    let mut e = estimate(&widen("indexed")).expect("an estimate");
+    against(&mut conn, &mut e, None)
+        .await
+        .expect("read the shape");
+    assert_eq!(e.rows, Some(Rows::NeverAnalyzed), "{e:#?}");
+
+    conn.execute(&format!("ANALYZE {s}.plain"))
+        .await
+        .expect("analyze");
+    let mut e = estimate(&widen("plain")).expect("an estimate");
+    against(&mut conn, &mut e, None)
+        .await
+        .expect("read the shape");
+    assert_eq!(e.rows, Some(Rows::Estimated(1000)), "{e:#?}");
+
+    // A table this plan is about to create is not a table with no rows either.
+    let mut e = estimate(&widen("not_there")).expect("an estimate");
+    against(&mut conn, &mut e, None)
+        .await
+        .expect("read the shape");
+    assert!(matches!(e.rewrite, Rewrite::Unknown(_)), "{e:#?}");
+    assert_eq!(e.rows, None, "{e:#?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}

@@ -54,6 +54,8 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     reserved: types::is_reserved,
     unicode_identifiers: true,
 };
+pub mod estimate;
+pub mod impact;
 pub mod introspect;
 pub mod modules;
 mod preflight;
@@ -72,15 +74,14 @@ pub mod validate;
 ///
 /// **No `emit` arm reads it any more.** Roles (step 6) and reference data
 /// (step 7) were the last two, and each is now a statement or a refusal that
-/// names its own rule. What is left are the two parts a *connected* path
-/// raises: the read-back the CLI has yet to call, and the preflight that
-/// `Dialect::preflight` answers only for reference data. The type stays, with
-/// its wording, because the day one of those paths has to say "not built" is
-/// the day it must say it in these words rather than invent its own.
+/// names its own rule. With the probes of step 9 in as well, **one** part is
+/// left: the read-back the CLI has yet to call. The type stays a list rather
+/// than collapsing into that one message, because the day another path has to
+/// say "not built" is the day it must say it in these words rather than invent
+/// its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
     Introspection,
-    Probes,
 }
 
 impl Unbuilt {
@@ -88,7 +89,6 @@ impl Unbuilt {
     pub const fn step(self) -> &'static str {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
-            Unbuilt::Probes => "preflight probes (Phase 5 step 9)",
         }
     }
 
@@ -864,12 +864,13 @@ impl Dialect for Postgres {
         emit::emit(self, change, strategy)
     }
 
-    /// The reference-data probes, and no others yet: the rest of this
-    /// dialect's preflight arrives with Phase 5 step 9. A probe list is not a
-    /// promise that everything was checked — [`Unbuilt::Probes`] is what says
-    /// the step is missing, and the connected paths are what read it. `emit`
-    /// no longer refuses anything through [`Unbuilt`]: every change it is
-    /// given is a statement or a refusal that names its own rule.
+    /// What this plan implies about the data, asked before its first
+    /// statement (SPEC §7.5).
+    ///
+    /// A probe list is never a promise that everything was checked: the cases
+    /// with no probe are named in [`preflight`]'s own documentation, and the
+    /// caller reports how many could not be checked rather than counting them
+    /// as passes.
     fn preflight(&self, changes: &ChangeSet) -> Vec<pbps_dialect::Probe> {
         preflight::probes(changes)
     }
@@ -928,7 +929,7 @@ mod tests {
     /// nothing to do".
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
-        for part in [Unbuilt::Introspection, Unbuilt::Probes] {
+        for part in [Unbuilt::Introspection] {
             let message = part.refuse().to_string();
             assert!(message.contains("Phase 5 step"), "{message}");
             // "does not implement ... yet", never "does not support": the

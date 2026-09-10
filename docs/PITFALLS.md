@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Twenty-two instances so far. **Absent, empty and unreadable are three different
+Twenty-three instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -59,6 +59,10 @@ things, and only one of them is good news.**
   `apply` reported its own error and left `__pbps_lock` held with no word about
   it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`
   and `bootstrap`; the success path had been fixed one round earlier.
+- A conversion probe written as a cast counting **zero** on a table the `ALTER`
+  then refuses. `SELECT 'abcde'::varchar(4)` is `'abcd'`, so nothing is
+  rejected and nothing is counted — the emptiness is the good news, and the
+  statement it cleared fails (DECISIONS 370). See below.
 
 ### 2. Failures escaping the one-envelope contract
 
@@ -805,6 +809,41 @@ mistake, written down and reviewed and kept — `(/* ) */ '01/02/2026')` is one
 When a comment argues that a guard is *allowed* to be wrong in one direction,
 check that direction against what the guard's answer does, not against how the
 sentence sounds. Both of these read as caution and both were permits.
+
+## The construct that looks like the answer answers another question
+
+`ALTER COLUMN … TYPE varchar(4)` refuses a row holding `'abcde'`, and the
+obvious probe for it is "count the rows a cast rejects". **Measured on
+PostgreSQL 18.6**, that probe counts zero:
+
+```text
+SELECT 'abcde'::varchar(4);                     -- 'abcd'
+ALTER TABLE t ALTER COLUMN v TYPE varchar(4);   -- ERROR: value too long
+```
+
+An explicit cast **truncates** and an assignment **refuses**, and the `ALTER`
+performs an assignment. So the probe answers a real question accurately and it
+is not the question the statement asks, and everything downstream reads its
+zero as "no rows violate this" — the one answer a gate must never give by
+accident. The fix is to measure the value instead
+(`length(rtrim(v, ' ')) > 4`), and the test that pins it asserts **both** sides:
+the cast-shaped probe reporting clean, and the engine refusing.
+
+This is the shape, not the instance. Three of them turned up in one step:
+
+- the cast above;
+- `GROUP BY` standing in for `UNIQUE`, which is right on SQL Server and wrong
+  here, because this engine's `UNIQUE` is `NULLS DISTINCT` and `GROUP BY` never
+  is — measured, it reports two duplicates among rows the engine accepts, so
+  the probe refused a valid plan (DECISIONS 374);
+- `pg_depend` standing in for "what does this rename break", which lists
+  precisely the objects that **survive** a rename here and holds no edge at all
+  for the `plpgsql` bodies that break (DECISIONS 377).
+
+**Ask what the statement does, not what the nearest construct does.** Each of
+these was found by running the statement beside the probe and comparing, which
+is the only way any of them could have been found: all three are green,
+plausible and self-consistent on their own.
 
 ## A guard built twice is a guard that fires early
 
