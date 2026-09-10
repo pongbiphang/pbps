@@ -1656,13 +1656,23 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
             // `signature` is the one that says what a routine without an
             // argument list costs, and it errs exactly here.
             None => found.extend(signature(id).err()),
-            // An empty definition is already refused above; running the
-            // parameter scan on it would say the same thing twice, in worse
-            // words.
-            Some(args) if !ascii_trim(&module.definition).is_empty() => {
-                found.extend(the_body_declares_the_identity(id, &module.definition, args));
+            Some(args) => {
+                // A name the engine would truncate: the routine is created
+                // under the truncated identity and never found under this key
+                // (see `overlong_name`).
+                found.extend(args.iter().filter_map(types::overlong_name).map(|name| {
+                    invalid(format!(
+                        "module `{id}` names `{name}` in an argument type, and that name is                          over {} bytes. The engine truncates a longer identifier with a NOTICE                          nothing reads and creates the routine under the truncated identity,                          which is not this key: the next plan cannot find it, and the `CREATE`                          it emits again is refused as already existing",
+                        crate::MAX_IDENT_BYTES
+                    ))
+                }));
+                // An empty definition is already refused above; running the
+                // parameter scan on it would say the same thing twice, in
+                // worse words.
+                if !ascii_trim(&module.definition).is_empty() {
+                    found.extend(the_body_declares_the_identity(id, &module.definition, args));
+                }
             }
-            Some(_) => {}
         },
         ModuleKind::Trigger => match attached_to(id) {
             Err(e) => found.push(e),
@@ -2274,6 +2284,49 @@ mod tests {
                  object under this key"
             );
         }
+    }
+
+    /// A type name over the engine's byte limit in the argument list is
+    /// refused offline: measured, the engine truncates it, creates the routine
+    /// under the truncated identity, and refuses the same `CREATE` the next
+    /// time — so a plan that was applied once is refused ever after. A name
+    /// at the limit passes.
+    #[test]
+    fn an_argument_type_the_engine_would_truncate_is_refused_before_it_is_created() {
+        let at = "t".repeat(crate::MAX_IDENT_BYTES);
+        let over = format!("{at}x");
+        for (key, definition) in [
+            (
+                format!("app.f(app.{over})"),
+                format!("(a app.{over}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            ),
+            (
+                format!("app.p(app.\"{over}\"[])"),
+                format!("(a app.\"{over}\"[]) LANGUAGE sql AS $$ SELECT 1 $$"),
+            ),
+        ] {
+            let kind = if key.starts_with("app.p") {
+                ModuleKind::Procedure
+            } else {
+                ModuleKind::Function
+            };
+            let found = Postgres::new().validate_module(&id(&key), &module(kind, &definition));
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.to_string().contains("over 63 bytes")),
+                "`{key}` was accepted, and the engine would truncate it: {found:?}"
+            );
+        }
+        let key = format!("app.f(app.{at})");
+        let found = Postgres::new().validate_module(
+            &id(&key),
+            &module(
+                ModuleKind::Function,
+                &format!("(a app.{at}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            ),
+        );
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The other half, which is the one that decides whether the gate is

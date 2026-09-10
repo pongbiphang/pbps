@@ -3584,6 +3584,18 @@ SPEC is in sync with all of these.
       been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
       been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
 
+    **Amended: the limit holds for the names a routine argument spells.** The
+    module gate refused a routine's own name over 63 bytes and let a type
+    name in its argument list through. Measured, with a type `dq.t…t` of 63
+    bytes, `CREATE FUNCTION dq.f(a dq.t…tx)` spelling one byte more is
+    accepted with a `NOTICE`, the routine is identified as `dq.f(dq.t…t)`,
+    and the same statement run again is refused as already existing. The
+    declared key is the untruncated spelling, so `module_oid` finds nothing
+    under it, the routine is planned as absent on every plan, and the
+    `CREATE` it emits is the one the engine refuses — a plan applied once and
+    refused ever after. `validate_module` refuses an argument holding a name
+    over the limit, quoted or bare, before anything connects.
+
 231. **`target_session_attrs` is reproduced at the seam, not refused and not
     dropped.** `Config::connect` runs a `SHOW transaction_read_only` probe
     *after* the handshake; this seam calls `connect_raw` — which is what keeps

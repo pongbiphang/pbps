@@ -1017,6 +1017,48 @@ pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
     spelled.parse().unwrap_or_else(|_| arg.clone())
 }
 
+/// The first name in `arg` that is over the engine's identifier limit, if
+/// there is one — quoted or bare, with a doubled quote counted once.
+///
+/// The limit is enforced here because the engine does not enforce it, which
+/// is the rule of DECISIONS 230 one layer down: **measured**, with a type
+/// `dq.t…t` of 63 bytes, `CREATE FUNCTION dq.f(a dq.t…tx)` spelling one byte
+/// more is accepted with a `NOTICE` nothing reads, the routine is identified
+/// as `dq.f(dq.t…t)`, and the same statement run again is refused as already
+/// existing. Declared, the key is the untruncated spelling; `module_oid` finds
+/// nothing under it, the routine is planned as absent every time, and the
+/// `CREATE` the plan emits is the one the engine refuses.
+///
+/// Every part that is not a name is short — a keyword, a modifier, a
+/// dimension — so a run of identifier bytes over the limit is a name over
+/// it, whatever it is a name of.
+pub(crate) fn overlong_name(arg: &RoutineArg) -> Option<String> {
+    let mut rest = arg.as_str();
+    while !rest.is_empty() {
+        if rest.starts_with('"') {
+            let Some(end) = quoted_len(rest) else {
+                break;
+            };
+            let inner = rest[1..end - 1].replace("\"\"", "\"");
+            if inner.len() > crate::MAX_IDENT_BYTES {
+                return Some(inner);
+            }
+            rest = &rest[end..];
+            continue;
+        }
+        let len = rest
+            .find(|c: char| !pbps_dialect::continues_ident(c))
+            .unwrap_or(rest.len());
+        if len > crate::MAX_IDENT_BYTES {
+            return Some(rest[..len].to_owned());
+        }
+        // Step over the run and the byte that ended it.
+        let step = rest[len..].chars().next().map_or(0, char::len_utf8);
+        rest = &rest[len + step..];
+    }
+    None
+}
+
 /// Whether this catalogue knows the spelling — with or without a modifier.
 ///
 /// Not the same question as [`routine_arg`], which is total and hands an
@@ -1535,6 +1577,45 @@ mod tests {
     fn arg(s: &str) -> String {
         let declared: pbps_model::RoutineArg = s.parse().expect("a routine argument parses");
         routine_arg(&declared).as_str().to_owned()
+    }
+
+    /// A name over the engine's byte limit is found wherever it is in the
+    /// argument — bare, qualified, quoted with a doubled quote counted once,
+    /// under a modifier or an array — and a name at the limit is not.
+    #[test]
+    fn a_name_over_the_byte_limit_is_found_wherever_the_argument_holds_it() {
+        let at = "t".repeat(crate::MAX_IDENT_BYTES);
+        let over = format!("{at}x");
+        for spelled in [
+            over.clone(),
+            format!("app.{over}"),
+            format!("{over}.t"),
+            format!("app.\"{over}\""),
+            format!("{over}(10)"),
+            format!("app.{over}[]"),
+            // Sixty-two bytes and a doubled quote, which is one byte to the
+            // engine: at the limit. With `ä` in it the count is bytes.
+            format!("\"{}\"\"x\"", "t".repeat(62)),
+            format!("app.{}", "ä".repeat(32)),
+        ] {
+            let arg: RoutineArg = spelled.parse().expect("an argument");
+            assert!(
+                overlong_name(&arg).is_some(),
+                "`{spelled}` holds a name over the limit"
+            );
+        }
+        for spelled in [
+            at.clone(),
+            format!("app.{at}"),
+            format!("app.\"{at}\""),
+            format!("\"{}\"\"\"", "t".repeat(62)),
+            format!("app.{}", "ä".repeat(31)),
+            "character varying(10)".to_owned(),
+            "timestamp with time zone[]".to_owned(),
+        ] {
+            let arg: RoutineArg = spelled.parse().expect("an argument");
+            assert_eq!(overlong_name(&arg), None, "`{spelled}` is within the limit");
+        }
     }
 
     /// Measured on 18.6: one function's twelve parameters, declared one way

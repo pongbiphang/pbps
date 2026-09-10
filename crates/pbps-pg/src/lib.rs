@@ -104,7 +104,7 @@ impl Unbuilt {
 /// - two names differing only after byte 63 **collide** — the second
 ///   `CREATE TABLE` fails with `relation "aaa…" already exists`, naming a
 ///   table the declarations do not contain.
-const MAX_IDENT_BYTES: usize = 63;
+pub(crate) const MAX_IDENT_BYTES: usize = 63;
 
 /// What this engine refuses about an `identity:`, each measured on 18.6.
 ///
