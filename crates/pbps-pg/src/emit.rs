@@ -39,10 +39,13 @@
 //! Roles and reference data, each of which is its own Phase 5 step and refuses
 //! by name through [`crate::Unbuilt`] until it arrives.
 
+use std::collections::BTreeMap;
+
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Change, Column, ColumnType, ForeignKey, Index, Module, ModuleId, ModuleKind, PrimaryKey,
-    ReferentialAction, RoutineArg, Strategy, Table, TableName, UniqueConstraint,
+    Cell, Change, Column, ColumnType, ForeignKey, Index, Module, ModuleId, ModuleKind, PrimaryKey,
+    ReferentialAction, RoutineArg, Row, RowKey, Strategy, Table, TableName, UniqueConstraint,
+    Value,
 };
 
 use crate::types::DIALECT;
@@ -58,7 +61,7 @@ fn invalid(message: String) -> DialectError {
 }
 
 /// `"schema"."name"`, quoted on both halves.
-fn qualified(t: &TableName) -> Result<String, DialectError> {
+pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
     Ok(format!("{}.{}", quote(&t.schema)?, quote(&t.name)?))
 }
 
@@ -111,9 +114,10 @@ const SETTING_SENSITIVE: &[&str] = &[
 /// `'…'` alone would have let `E'01/02/2026'` and `$$01/02/2026$$` through on a
 /// `date` column — the same text, the same session-decided value, and a
 /// spelling a person copying from somewhere else would write. `U&'…' UESCAPE
-/// '!'` is the one form left over: it is two literals with a keyword between
-/// them, it answers `false`, and it is named here so that the gap is a recorded
-/// one rather than a spelling nobody thought of.
+/// '!'` was the one form left over — two literals with a keyword between
+/// them, answering `false` as a recorded gap — until the same reader began
+/// deciding whether a default is a constant the probes can compare, where
+/// `false` refuses a valid plan; it is one literal now (DECISIONS 356).
 /// The same expression with any number of grouping parentheses taken off.
 ///
 /// `DEFAULT ('01/02/2026')` is the same declaration as `DEFAULT '01/02/2026'`
@@ -290,7 +294,7 @@ fn skip_datum(rest: &str) -> Option<usize> {
     None
 }
 
-fn is_a_bare_literal(expression: &str) -> bool {
+pub(crate) fn is_a_bare_literal(expression: &str) -> bool {
     // A comment is whitespace to this engine, at either end of an expression
     // as much as between two pieces of a continued one, and either can wrap a
     // grouping that wraps another comment. All three strippers hand back a
@@ -309,6 +313,7 @@ fn is_a_bare_literal(expression: &str) -> bool {
     // `E'…'` is the only one of these in which a backslash escapes; `U&'…'`
     // gives the backslash a meaning of its own (a Unicode escape) that does not
     // change where the literal *ends*, which is the only thing asked here.
+    let unicode = e.starts_with("U&'") || e.starts_with("u&'");
     let (escapes, rest) = if let Some(r) = e.strip_prefix("E'").or_else(|| e.strip_prefix("e'")) {
         (true, r)
     } else if let Some(r) = e.strip_prefix("U&'").or_else(|| e.strip_prefix("u&'")) {
@@ -350,6 +355,35 @@ fn is_a_bare_literal(expression: &str) -> bool {
         if after_gap.is_empty() {
             return true;
         }
+        // `U&'…' UESCAPE '!'`: the escape character named after the pieces,
+        // and the end of the literal — **measured**, nothing continues it
+        // past the character, a continuation before it is still one
+        // literal, the character may be spelled `'!'` or `E'!'` with any
+        // trivia or none before it, and two characters, none, a hex digit,
+        // `+`, a quote or a space are each refused by the engine
+        // (DECISIONS 356).
+        if unicode && let Some(rest) = strip_keyword(after_gap, "uescape") {
+            let (lit, _) = after_the_gap(rest);
+            let body = match lit.strip_prefix("E'").or_else(|| lit.strip_prefix("e'")) {
+                Some(b) => b,
+                None => match lit.strip_prefix('\'') {
+                    Some(b) => b,
+                    None => return false,
+                },
+            };
+            let mut chars = body.chars();
+            let Some(escape) = chars.next() else {
+                return false;
+            };
+            if escape.is_ascii_hexdigit()
+                || escape.is_whitespace()
+                || matches!(escape, '+' | '\'' | '"')
+                || chars.next() != Some('\'')
+            {
+                return false;
+            }
+            return after_the_gap(chars.as_str()).0.is_empty();
+        }
         if !continues {
             return false;
         }
@@ -362,6 +396,24 @@ fn is_a_bare_literal(expression: &str) -> bool {
         tail = &next[end..];
     }
     true
+}
+
+/// `text` past a leading `keyword`, matched without regard to case and only
+/// as a whole word: `UESCAPEX` is an identifier, not the keyword.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let head = text.get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &text[keyword.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Past the whitespace and comments that follow one piece of a string
@@ -386,7 +438,7 @@ fn is_a_bare_literal(expression: &str) -> bool {
 /// are scanned rather than skipped together: the engine's `{whitespace}` rule
 /// counts a `--` comment among the things a continuation may be written
 /// across, and does not count a `/* … */` one (DECISIONS 278).
-fn after_the_gap(tail: &str) -> (&str, bool) {
+pub(crate) fn after_the_gap(tail: &str) -> (&str, bool) {
     let mut rest = tail;
     let mut newline = false;
     let mut blocked = false;
@@ -437,7 +489,7 @@ fn after_the_gap(tail: &str) -> (&str, bool) {
 ///
 /// Nothing is unwrapped, the literal scan answers `false`, and the guard
 /// permits it (DECISIONS 282).
-fn without_trailing_trivia(e: &str) -> &str {
+pub(crate) fn without_trailing_trivia(e: &str) -> &str {
     let mut end = 0usize;
     let mut consumed_to = 0usize;
     for (i, ch) in e.char_indices() {
@@ -504,7 +556,7 @@ fn ascii_trim_end(text: &str) -> &str {
 /// The repo has met this before, in the module scanner: a comment ends at a
 /// carriage return, and a rule written for `\n` alone reads the rest of the
 /// file as commented (PITFALLS, "A comment ends at a carriage return").
-const NEWLINE: [char; 2] = ['\n', '\r'];
+pub(crate) const NEWLINE: [char; 2] = ['\n', '\r'];
 
 /// The text after the `*/` closing the block comment whose `/*` was just
 /// consumed, or `None` when nothing closes it.
@@ -512,7 +564,7 @@ const NEWLINE: [char; 2] = ['\n', '\r'];
 /// These nest — measured, `/* /* x */ */` is one comment — so a `/*` inside
 /// one opens another, and a `--` inside one is comment text rather than a
 /// comment.
-fn end_of_block_comment(after: &str) -> Option<&str> {
+pub(crate) fn end_of_block_comment(after: &str) -> Option<&str> {
     let bytes = after.as_bytes();
     let mut depth = 1usize;
     let mut i = 0;
@@ -573,7 +625,7 @@ fn end_of_literal(rest: &str, escapes: bool) -> Option<usize> {
 /// is one dollar-quoted literal to the engine; `is_alphanumeric` says the mark
 /// is neither letter nor digit, so this read the expression as *not* a bare
 /// literal and the default guard never looked at it.
-fn dollar_delimiter(rest: &str) -> Option<&str> {
+pub(crate) fn dollar_delimiter(rest: &str) -> Option<&str> {
     let after = rest.strip_prefix('$')?;
     let at = after.find('$')?;
     let tag = &after[..at];
@@ -892,6 +944,35 @@ fn dollar_tag(body: &str) -> String {
 /// assumes (ADR-0011 Amendment 2).
 fn literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A **value** pbps renders, as a literal no session setting can reinterpret.
+///
+/// [`literal`] above is for pbps's own text — a catalog name, a message —
+/// and it is correct only because the transaction framing pins
+/// `standard_conforming_strings` on. A declared value is not covered by that
+/// argument, and ADR-0013 §3 says why: the dependency is in **pbps's own
+/// rendering**, not in the declaration, so a refusal list cannot cover it.
+/// **Measured on 18.6**, the same `INSERT` under the two settings:
+///
+/// ```text
+/// 'a\nb'  under on:   length 4      under off:  length 3
+/// E'a\\nb' under either:  length 4
+/// '\x0102'::bytea under off:  accepted, storing 3 bytes
+/// ```
+///
+/// The `bytea` line is the one that matters — no error, no refusal, a
+/// different value in the table — and it is why the answer is an encoding
+/// rule rather than a settings one. An `E'…'` takes backslash escapes under
+/// either setting, so doubling every backslash makes the rendering mean one
+/// thing everywhere (DECISIONS 319).
+///
+/// It stays `unknown` to the type system, exactly as a plain literal does
+/// (measured, `pg_typeof(E'1')` is `unknown`), so the engine converts it to
+/// the column's type and `"id" = E'1'` on an `integer` column is an integer
+/// comparison.
+pub(crate) fn value_literal(s: &str) -> String {
+    format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// The write `search_path` for an object in `schema`.
@@ -2106,9 +2187,73 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. } => Err(Unbuilt::Roles.refuse()),
-        Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. } => {
-            Err(Unbuilt::ReferenceData.refuse())
-        }
+        // Reference data (ADR-0004). Each row change is one statement — a `DO`
+        // block carrying the write and the checks that hold it to what the
+        // plan reviewed — under the table's own write path, because the
+        // defaults those checks compare against are the user's verbatim
+        // expressions.
+        Change::InsertRow {
+            table,
+            key_column,
+            identity_key,
+            key,
+            row,
+            defaults,
+            types,
+        } => one(
+            pg,
+            table,
+            atomically(&insert_row(
+                table,
+                key_column,
+                *identity_key,
+                key,
+                row,
+                defaults,
+                types,
+            )?),
+        ),
+        Change::UpdateRow {
+            table,
+            key_column,
+            key,
+            columns,
+            unchanged,
+            types,
+            after_types,
+        } => one(
+            pg,
+            table,
+            atomically(&update_row(
+                table,
+                key_column,
+                key,
+                columns,
+                unchanged,
+                types,
+                after_types,
+            )?),
+        ),
+        Change::DeleteRow {
+            table,
+            key_column,
+            key,
+            row,
+            types,
+            after_types,
+            ..
+        } => one(
+            pg,
+            table,
+            atomically(&delete_row(
+                table,
+                key_column,
+                key,
+                row,
+                types,
+                after_types,
+            )?),
+        ),
     }
 }
 
@@ -2229,6 +2374,600 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
         )?);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Reference data (ADR-0004, ADR-0013 §1–§3)
+// ---------------------------------------------------------------------------
+
+/// One row statement and the checks it holds itself to, as one statement of
+/// its own.
+///
+/// A staged apply runs each statement outside a transaction (SPEC §7.5), so a
+/// check that merely raised would leave the write it rejected committed. A
+/// `DO` block is what this engine offers instead of `BEGIN TRY`: **measured**,
+/// a block that writes and then raises leaves the table as it was, run with no
+/// transaction open at all —
+///
+/// ```text
+/// DO $pbps$ BEGIN UPDATE m3.t SET label='two' WHERE id=1;
+///                 RAISE EXCEPTION 'refused after the write'; END $pbps$;
+///   -> ERROR, and the row still reads 'one'
+/// ```
+///
+/// — and inside the transactional apply it nests, where the outer transaction
+/// still decides everything. There is no `CATCH`: this engine's failure is the
+/// whole block's, so nothing is left half-done for a later statement to find.
+///
+/// The tag is chosen against the body for the reason [`dollar_tag`] gives
+/// (DECISIONS 328).
+fn atomically(body: &str) -> String {
+    let tag = dollar_tag(body);
+    format!("DO {tag}\n{body}\n{tag};")
+}
+
+/// A refusal from inside a `DO` block.
+///
+/// `USING MESSAGE`, not `RAISE EXCEPTION '<text>'`: the second form's first
+/// argument is a *format string*, so a `%` anywhere in a table name, a key or
+/// a value would be read as a placeholder — measured, `RAISE EXCEPTION USING
+/// MESSAGE = E'a message with a % and a \ in it'` reports those characters
+/// untouched. One less thing to escape is one less thing to escape wrongly
+/// (DECISIONS 328).
+pub(crate) fn refuse(message: &str) -> String {
+    format!(
+        "RAISE EXCEPTION USING MESSAGE = {};",
+        value_literal(message)
+    )
+}
+
+/// A row key as a literal the engine converts to the key column's type.
+///
+/// Always a string literal, because [`RowKey`] is always text (it is a map
+/// key, and JSON has no others). An `integer` primary key therefore gets
+/// `= E'7'`, which stays `unknown` and resolves to the integer comparison —
+/// and at reference-data size the lost index scan is not a cost anyone can
+/// measure.
+fn row_key(key: &RowKey) -> String {
+    value_literal(key.as_str())
+}
+
+/// One declared cell as SQL.
+///
+/// The literal is rendered from what was *written* and from the column's type
+/// where the plan carries one — never parsed. Two things the type decides:
+///
+/// * a `bytea` cell is written `decode(E'…', 'hex')`, which carries no
+///   backslash at all (ADR-0013 §3). Its declared text is the read-back's own
+///   spelling, `\x0102`, so the prefix comes off and the rest is the hex.
+/// * everything else is an untyped literal the engine converts. Never a bare
+///   `5` for an integer or `true` for a boolean: this engine has no implicit
+///   cast from `integer` to `text`, so a bare `5` into a `text` column is
+///   refused outright, where `E'5'` is `unknown` and lands in either.
+fn cell_sql(v: &Value, ty: Option<&ColumnType>) -> Result<String, DialectError> {
+    let bytea = ty.is_some_and(|t| normalized(t).base == "bytea");
+    Ok(match v {
+        Value::Null => "NULL".to_owned(),
+        Value::Bool(b) => value_literal(if *b { "true" } else { "false" }),
+        Value::Int(i) => value_literal(&i.to_string()),
+        Value::Text(t) if bytea => {
+            let hex = t.strip_prefix("\\x").ok_or_else(|| {
+                invalid(format!(
+                    "the value {t:?} is declared for a `bytea` column and is not in the spelling \
+                     this engine reads a `bytea` back in: `\\x` followed by hex digits, which is \
+                     what `pull --data` writes"
+                ))
+            })?;
+            // No emptiness test: `\x` is this engine's canonical spelling of
+            // the empty `bytea` and `decode('', 'hex')` is valid — measured,
+            // it yields a zero-length value that reads back as `\x`. Refusing
+            // it here while `rows::not_a_bytea` accepted it made a declaration
+            // that validated cleanly fail at emit, which is a valid plan
+            // refused (DECISIONS 329).
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid(format!(
+                    "the value {t:?} is declared for a `bytea` column and `{hex}` is not hex \
+                     digits"
+                )));
+            }
+            format!("pg_catalog.decode({}, 'hex')", value_literal(hex))
+        }
+        Value::Text(t) => value_literal(t),
+    })
+}
+
+/// A type spelled the way this dialect spells it, falling back to the spelling
+/// the plan carries. A type the dialect cannot parse has already stopped the
+/// plan elsewhere; here it would only cost the comparison.
+fn normalized(ty: &ColumnType) -> ColumnType {
+    types::normalize(ty).unwrap_or_else(|_| ty.clone())
+}
+
+/// The two types one recorded cell is measured by: `read` is the type whose
+/// rendering produced the recorded text, and `now` the type the column has
+/// when the statement runs. They are the same for every column this plan
+/// leaves alone, and differ only where it retypes one — whose
+/// `AlterColumnType` sorts before every row change (DECISIONS 149).
+///
+/// A pair rather than two arguments because the two are the same type and
+/// transposing them compiles: `read` and `now` the wrong way round would hold
+/// a row to the conversion run backwards, which fails on exactly the rows that
+/// are *not* stale.
+#[derive(Clone, Copy)]
+struct Held<'a> {
+    read: &'a ColumnType,
+    now: Option<&'a ColumnType>,
+}
+
+impl<'a> Held<'a> {
+    /// Recorded and held by one type: nothing about the column changes here.
+    fn same(ty: &'a ColumnType) -> Self {
+        Held {
+            read: ty,
+            now: None,
+        }
+    }
+
+    /// Recorded by `read`, held by `now` where this plan gives it a different
+    /// one. `None` is not "no type" — it is "the same one".
+    fn of(read: Option<&'a ColumnType>, now: Option<&'a ColumnType>) -> Option<Self> {
+        let read = read?;
+        Some(Held {
+            read,
+            now: now.filter(|n| *n != read),
+        })
+    }
+
+    fn read(self) -> ColumnType {
+        normalized(self.read)
+    }
+
+    fn now(self) -> ColumnType {
+        normalized(self.now.unwrap_or(self.read))
+    }
+
+    /// `value`, an expression of the type the cell was recorded in, as the
+    /// column holds it now.
+    ///
+    /// For everything this plan leaves alone that is `value` itself. For a
+    /// column it retypes it is the conversion the `AlterColumnType` already
+    /// ran, asked of the engine rather than computed here: the tool has no
+    /// business knowing that a `numeric(5,2)` holding `1.50` becomes `1`.
+    fn converted(self, value: &str) -> String {
+        match self.now {
+            None => value.to_owned(),
+            Some(_) => format!("CAST({value} AS {})", self.now()),
+        }
+    }
+
+    /// The recorded text as the column stores it now, rendered the way the
+    /// read-back renders that column — the right-hand side of the predicate.
+    ///
+    /// Where nothing was retyped this is the recorded text itself: the text
+    /// *is* what the rendering produced. Where the column was retyped, the
+    /// text goes back through the old type and then through the new one,
+    /// which is the conversion the `ALTER` already ran — asked of the engine
+    /// rather than computed here, because the tool has no business knowing
+    /// that a `numeric(5,2)` holding `1.50` becomes `1`.
+    ///
+    /// This engine has no `TRY_CAST`, so a recorded text the new type cannot
+    /// hold raises inside the write's own `DO` block rather than reading as
+    /// "not what the plan recorded". Both stop the apply and roll it back;
+    /// the difference is which message the operator sees, and the engine's
+    /// conversion error names the value.
+    fn as_stored(self, recorded: &str) -> String {
+        if self.now.is_none() {
+            return recorded.to_owned();
+        }
+        self.converted(&format!("CAST({recorded} AS {})", self.read()))
+    }
+}
+
+/// One cell as a predicate holding the row to it, by the rendering that read
+/// it back (DECISIONS 122): a NULL as `IS NULL`, a value compared as text
+/// under the `C` collation so a change of case alone is a change — the
+/// read-back compares the recorded text the same way — and a default as
+/// [`defaulted_cell`] holds it.
+///
+/// `COLLATE "C"` is this engine's binary collation, and it is the point of
+/// comparing as text at all: the column's own collation may be
+/// case-insensitive, or nondeterministic, and would then call `New` and `new`
+/// one value — so a trigger that rewrote the case would be read back and
+/// recorded as this plan's own result (DECISIONS 137).
+///
+/// A column whose type the caller does not supply holds nothing, NULL
+/// included. That is the *precondition*'s case for a column the base state
+/// lacks: its `before` is what this plan's `AddColumn` left there, not a
+/// recorded cell.
+fn recorded_cell(
+    column: &str,
+    cell: &Cell,
+    ty: Option<Held<'_>>,
+) -> Result<Option<String>, DialectError> {
+    let quoted = quote(column)?;
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    Ok(match cell {
+        // A NULL converts to a NULL whatever the two types are, so the one
+        // predicate covers a retyped column as it covers any other.
+        Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
+        Cell::Value(v) => {
+            let recorded = cell_sql(v, Some(&ty.read()))?;
+            let expected = ty.as_stored(&recorded);
+            Some(format!(
+                "{} = {}",
+                binary(&crate::rows::read_expr(&quoted)),
+                binary(&crate::rows::read_expr(&expected))
+            ))
+        }
+        Cell::Default(d) => defaulted_cell(column, d, Some(ty))?,
+    })
+}
+
+/// A text expression compared byte for byte.
+pub(crate) fn binary(rendered: &str) -> String {
+    format!("({rendered}) COLLATE \"C\"")
+}
+
+/// A column left to a default, as a predicate holding it to that default — or
+/// nothing, where there is no answer the engine can give without running
+/// something.
+///
+/// The type decides whether the comparison exists at all, and the default
+/// decides whether it may be asked: a literal is compared, an expression the
+/// engine would have to run is not (`rows::is_constant`, which reads through
+/// the cast this engine welds on).
+///
+/// Both sides are rendered as the read-back renders the column and compared
+/// under `"C"`, so a `'2026-01-01'` default on a `date` column renders as the
+/// stored value does and `New` against `new` is a difference the column's own
+/// collation would have hidden (DECISIONS 137).
+fn defaulted_cell(
+    column: &str,
+    default: &str,
+    ty: Option<Held<'_>>,
+) -> Result<Option<String>, DialectError> {
+    let quoted = quote(column)?;
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    if !crate::rows::is_constant(default) {
+        return Ok(None);
+    }
+    // The expression is the user's text and the emitter's syntax follows it on
+    // the same line, so a trailing line comment would swallow the rest
+    // (DECISIONS 281).
+    let expr = format!("({})", verbatim(default));
+    // **Through the column's type first, and this is not decoration.** Both
+    // sides are compared as text, and the stored side went through the
+    // column's type on the way in while the declared expression did not.
+    // **Measured**, `numeric(5,2) DEFAULT 1`:
+    //
+    // ```text
+    // the stored cell as text:            1.00
+    // the default expression as text:     1
+    // ```
+    //
+    // — so the insert's postcondition rejected a row the engine had just
+    // written correctly, and the update's and the delete's preconditions
+    // would call an untouched row stale. The cast is the same one the
+    // engine made, asked of the engine (DECISIONS 329).
+    let typed = format!("CAST({expr} AS {})", ty.read());
+    Ok(Some(format!(
+        "({} = {} OR ({quoted} IS NULL AND {expr} IS NULL))",
+        binary(&crate::rows::read_expr(&quoted)),
+        binary(&crate::rows::read_expr(&ty.converted(&typed))),
+    )))
+}
+
+/// What a row write holds itself to once it has run: the row is there, and it
+/// holds what the plan wrote.
+///
+/// The engine reporting a successful `INSERT` or `UPDATE` is not the same as
+/// the row being what the plan says. An `AFTER` trigger runs inside the
+/// statement and may delete the row again or rewrite what it holds, and the
+/// apply would then read the result back, record it, and report success —
+/// leaving `verify` clean against a state nobody declared and the next
+/// connected plan proposing the same change for ever. Checked here, inside the
+/// write's own block, so the plan rolls back instead (DECISIONS 132).
+///
+/// **The key is held byte for byte, like every other cell** — it is one, and
+/// the only reason it is not in `cells` is that a [`pbps_model::Row`] carries
+/// it as the map's key. The column's own `=` is the wrong question here:
+/// **measured on 18.6**, with a `text` key under `und-u-ks-level2` and an
+/// `AFTER INSERT` trigger that lowercases what was written,
+///
+/// ```text
+/// INSERT ... VALUES ('New', 'a');   the trigger leaves:  new
+/// the postcondition with the column's `=`:               passes
+/// the same as text under COLLATE "C":                    fails
+/// ```
+///
+/// — so the apply recorded a key nobody declared, and the alias read then
+/// mapped the declaration's `New` onto the stored `new` and called it clean
+/// for ever after (DECISIONS 332).
+///
+/// The literal needs no cast through the key column's type: `plan --db`
+/// refuses a declared key the engine would spell differently before anything
+/// is written (DECISIONS 101), so by the time this runs the key *is* the
+/// engine's own spelling — measured, `CAST("id" AS text)` against `E'1'` for
+/// an `integer` key and `E'1.50'` for a `numeric(5,2)` one both hold. It is
+/// the same coupling [`recorded_cell`] already relies on for values.
+///
+/// [`gone_row`] keeps the column's `=` deliberately, and so do the `WHERE`
+/// clauses of the update and the delete: those ask "which row does this
+/// engine call this key", which is the engine's question to answer
+/// (ADR-0013 §5), and for the delete's aftermath the looser comparison is the
+/// safer one — a trigger reinserting `Old` under a case-insensitive collation
+/// must still be caught.
+fn wrote_the_row(
+    table: &TableName,
+    key: &RowKey,
+    key_column: &str,
+    cells: &[String],
+) -> Result<String, DialectError> {
+    let mut predicate = vec![format!(
+        "{} = {}",
+        binary(&crate::rows::read_expr(&quote(key_column)?)),
+        binary(&crate::rows::read_expr(&row_key(key)))
+    )];
+    predicate.extend(cells.iter().cloned());
+    Ok(format!(
+        "IF NOT EXISTS (SELECT 1 FROM {} WHERE {}) THEN\n    {}\nEND IF;",
+        qualified(table)?,
+        predicate.join("\n       AND "),
+        refuse(&format!(
+            "{table} row `{key}` is not what this plan wrote once the statement had run — a \
+             trigger on the table, another writer inside it, or a value the engine stores \
+             differently from the way it is declared. Nothing was applied; `pbps plan --db` \
+             says which."
+        ))
+    ))
+}
+
+/// The check after a row's `DELETE`: it is still gone once the statement has
+/// run. A trigger that reinserted it would otherwise be read back and recorded
+/// as this plan's own result (DECISIONS 132).
+fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String, DialectError> {
+    Ok(format!(
+        "IF EXISTS (SELECT 1 FROM {} WHERE {} = {}) THEN\n    {}\nEND IF;",
+        qualified(table)?,
+        quote(key_column)?,
+        row_key(key),
+        refuse(&format!(
+            "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
+             or another writer inside it. Nothing was applied."
+        ))
+    ))
+}
+
+/// The row count the last statement reached, and the refusal when it is not
+/// one.
+///
+/// `GET DIAGNOSTICS` and not `FOUND`: `FOUND` is a boolean and says nothing
+/// about *two* rows, and a predicate that matched two would otherwise pass.
+fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
+    format!(
+        "GET DIAGNOSTICS pbps_rows = ROW_COUNT;\nIF pbps_rows <> 1 THEN\n    {}\nEND IF;",
+        refuse(&format!(
+            "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
+             plan was made. Plan again."
+        ))
+    )
+}
+
+/// One `INSERT`, naming the key column explicitly.
+///
+/// The column list is always written out. An `INSERT` without one depends on
+/// the table's column order, which is exactly what a later `AddColumn` changes
+/// — a plan saved today would then insert into the wrong columns.
+///
+/// **An identity key is refused, not pinned** (ADR-0013 §2). SQL Server's
+/// `SET IDENTITY_INSERT` leaves the seed at least as high as the value
+/// written; this engine's `OVERRIDING SYSTEM VALUE` does not — measured, two
+/// pinned rows leave the sequence at 0 and the application's next insert fails
+/// on the primary key, in someone else's code, after the deployment. `validate`
+/// refuses the declaration; this is the second lock on the same door, for a
+/// plan that arrived some other way.
+fn insert_row(
+    table: &TableName,
+    key_column: &str,
+    identity_key: bool,
+    key: &RowKey,
+    row: &Row,
+    defaults: &BTreeMap<String, String>,
+    types: &BTreeMap<String, ColumnType>,
+) -> Result<String, DialectError> {
+    if identity_key {
+        return Err(invalid(format!(
+            "`{table}` keys its declared rows by `{key_column}`, an identity column. This engine \
+             writes a pinned key with `OVERRIDING SYSTEM VALUE` and leaves the sequence behind: \
+             the apply succeeds, the plan verifies clean, and the next insert from anywhere else \
+             fails on the primary key (ADR-0013 §2). Declare the rows by a natural key, or place \
+             them outside pbps and adopt them with `pbps baseline`."
+        )));
+    }
+    let mut columns = vec![quote(key_column)?];
+    let mut values = vec![row_key(key)];
+    for (column, v) in row.columns() {
+        columns.push(quote(column)?);
+        values.push(cell_sql(v, types.get(column))?);
+    }
+    // What the row must hold afterwards: a trigger that deleted it again, or
+    // wrote something else, would otherwise be read back and recorded as the
+    // plan's own result (`wrote_the_row`).
+    let mut cells = Vec::new();
+    for (column, v) in row.columns() {
+        let held = recorded_cell(
+            column,
+            &Cell::Value(v.clone()),
+            types.get(column).map(Held::same),
+        )?;
+        cells.push(match (held, v) {
+            (Some(held), _) => held,
+            (None, Value::Null) => format!("{} IS NULL", quote(column)?),
+            (None, v) => format!("{} = {}", quote(column)?, cell_sql(v, types.get(column))?),
+        });
+    }
+    // And the columns the row left to the table: a trigger rewriting one of
+    // those is the same silence, so a *constant* default is compared against
+    // itself, and a column the table gives no default is held to the NULL the
+    // insert left there (DECISIONS 133, 136). Anything the engine would have
+    // to run to answer — `now()`, `nextval()` — is not asked: it has no value
+    // before it runs, and asking would consume a sequence value.
+    for (column, ty) in types {
+        if row.get(column).is_some() {
+            continue;
+        }
+        cells.extend(match defaults.get(column) {
+            Some(default) => defaulted_cell(column, default, Some(Held::same(ty)))?,
+            None => Some(format!("{} IS NULL", quote(column)?)),
+        });
+    }
+    Ok(format!(
+        "BEGIN\nINSERT INTO {} ({})\nVALUES ({});\n{}\nEND",
+        qualified(table)?,
+        columns.join(", "),
+        values.join(", "),
+        wrote_the_row(table, key, key_column, &cells)?
+    ))
+}
+
+/// One `UPDATE`, holding the row to what the plan recorded.
+///
+/// The plan was reviewed against a recorded state, and the checksum pins that
+/// state up to the moment `apply` reads it — not to the moment this statement
+/// runs. A row changed or deleted in between would be overwritten, or missed
+/// with the statement still counting as success, and the read-back would
+/// record the result as if the reviewed plan had done it. So each `before`
+/// cell the base holds goes into the predicate, compared by the very rendering
+/// that read it, and the statement raises unless exactly one row was updated
+/// (DECISIONS 122).
+///
+/// The cells the plan leaves alone are held the same way, before and after:
+/// the declaration claims them as much as the changed ones, and an `UPDATE`
+/// that checked only what it set would let a trigger rewrite the rest of the
+/// row — or a hand edit since the plan was made stand — and have the result
+/// read back as the plan's own (DECISIONS 136). They are never restated in
+/// `SET`, for the reason `UpdateRow` gives.
+///
+/// The two checks read a cell by two types, not one. The precondition asks
+/// what the *recorded* state holds, so a column that state lacks is held to
+/// nothing. The postcondition asks what the row holds once the statement has
+/// run, by which time this plan's `AddColumn` and `AlterColumnType` have
+/// already run — so every declared cell is held, the added column included
+/// (DECISIONS 140).
+fn update_row(
+    table: &TableName,
+    key_column: &str,
+    key: &RowKey,
+    columns: &BTreeMap<String, (Cell, Cell)>,
+    unchanged: &BTreeMap<String, Cell>,
+    types: &BTreeMap<String, ColumnType>,
+    after_types: &BTreeMap<String, ColumnType>,
+) -> Result<String, DialectError> {
+    let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
+    let after_ty = |column: &String| {
+        after_types
+            .get(column)
+            .or_else(|| types.get(column))
+            .map(Held::same)
+    };
+    let mut sets = Vec::with_capacity(columns.len());
+    let mut recorded = Vec::new();
+    for (column, (from, to)) in columns {
+        let quoted = quote(column)?;
+        // `DEFAULT` is the keyword: it asks the engine to evaluate the
+        // column's default, which is the one thing a literal cannot say.
+        let rhs = match to {
+            Cell::Value(v) => cell_sql(v, after_ty(column).map(|h| h.now()).as_ref())?,
+            Cell::Default(_) => "DEFAULT".to_owned(),
+        };
+        sets.push(format!("{quoted} = {rhs}"));
+        recorded.extend(recorded_cell(column, from, before_ty(column))?);
+    }
+    for (column, held) in unchanged {
+        recorded.extend(recorded_cell(column, held, before_ty(column))?);
+    }
+    // An empty `SET` is not valid SQL, and the differ never produces one — it
+    // emits an `UpdateRow` only for columns that differ. Refusing rather than
+    // writing `UPDATE t SET WHERE ...` keeps that guarantee checkable.
+    if sets.is_empty() {
+        return Err(invalid(format!(
+            "{table}: a row update with no changed column"
+        )));
+    }
+    let mut sql = format!(
+        "UPDATE {} SET {}\n WHERE {} = {}",
+        qualified(table)?,
+        sets.join(", "),
+        quote(key_column)?,
+        row_key(key)
+    );
+    for r in &recorded {
+        sql.push_str("\n   AND ");
+        sql.push_str(r);
+    }
+    sql.push_str(";\n");
+    sql.push_str(&exactly_one_row(table, key));
+    // And what the row holds afterwards: each cell the plan spells and each it
+    // leaves alone, compared by the rendering that read it, so a trigger that
+    // rewrote the row — or took it away — rolls this statement back instead of
+    // being read back as the plan's own result.
+    let mut cells = Vec::new();
+    for (column, (_, to)) in columns {
+        cells.extend(recorded_cell(column, to, after_ty(column))?);
+    }
+    for (column, held) in unchanged {
+        cells.extend(recorded_cell(column, held, after_ty(column))?);
+    }
+    sql.push('\n');
+    sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
+    Ok(format!("DECLARE\n    pbps_rows bigint;\nBEGIN\n{sql}\nEND"))
+}
+
+/// One `DELETE`, keyed *and* held to the row the plan recorded.
+///
+/// The checksum pins the state only up to the moment `apply` reads it, so a
+/// key-only `DELETE` removes whatever an application session left under that
+/// key in between and a row count of one calls the loss a success. Each
+/// recorded cell is compared the way the read-back rendered it, exactly as an
+/// update's precondition does; a cell whose type has no comparison is carried
+/// and not held (DECISIONS 143).
+fn delete_row(
+    table: &TableName,
+    key_column: &str,
+    key: &RowKey,
+    row: &BTreeMap<String, Cell>,
+    types: &BTreeMap<String, ColumnType>,
+    after_types: &BTreeMap<String, ColumnType>,
+) -> Result<String, DialectError> {
+    let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    for (column, cell) in row {
+        predicates.extend(recorded_cell(
+            column,
+            cell,
+            Held::of(types.get(column), after_types.get(column)),
+        )?);
+    }
+    Ok(format!(
+        // The guard, the delete and the checks after it are one block: the row
+        // lock the guard takes has to be held through the delete it protects,
+        // and a staged apply runs each statement outside a transaction.
+        "DECLARE\n    pbps_rows bigint;\n    pbps_referencing bigint;\nBEGIN\n\
+         {}\n\
+         DELETE FROM {}\n WHERE {};\n\
+         {}\n\
+         {}\nEND",
+        crate::preflight::still_referenced(table, key_column, key)?,
+        qualified(table)?,
+        predicates.join("\n   AND "),
+        exactly_one_row(table, key),
+        // And the row stayed gone: a trigger that put it back would otherwise
+        // be read back and recorded as this plan's result.
+        gone_row(table, key, key_column)?,
+    ))
 }
 
 #[cfg(test)]
@@ -3233,6 +3972,15 @@ mod tests {
             "  ( ( '01/02/2026' ) )  ",
             "($$01/02/2026$$)",
             "U&'2026-01-02'",
+            // `UESCAPE`, in every shape the engine accepts (DECISIONS 356).
+            "U&'a' UESCAPE '!'",
+            "u&'a' uescape '!'",
+            "U&'a'UESCAPE'!'",
+            "U&'a' /* c */ UESCAPE /* d */ '!'",
+            "U&'a' UESCAPE E'!'",
+            "U&'a'\n'b' UESCAPE '!'",
+            "U&'a' UESCAPE '!' -- note",
+            "(U&'a' UESCAPE '!')",
             // A comment is whitespace, and these are the forms in which it is
             // — measured, each of these is the same one constant to the engine
             // as the same text without the comment.
@@ -3319,8 +4067,21 @@ mod tests {
             "('(') || (b)",
             // The same, with the parenthesis hidden in a comment instead.
             "(/* ( */ 'a') || ('b')",
-            // The recorded gap: two literals with a keyword between them.
-            "U&'a' UESCAPE '!'",
+            // `UESCAPE` ends the literal: nothing continues it after the
+            // escape character, and the character is one and not a hex
+            // digit — measured, each of these is refused by the engine
+            // (DECISIONS 356).
+            "U&'a' UESCAPE '!'\n'b'",
+            "U&'a' UESCAPE '!!'",
+            "U&'a' UESCAPE ''",
+            "U&'a' UESCAPE 'a'",
+            "U&'a' UESCAPE '+'",
+            "U&'a' UESCAPE ' '",
+            "U&'a' UESCAPE",
+            "U&'a' UESCAPEX '!'",
+            "'a' UESCAPE '!'",
+            "E'a' UESCAPE '!'",
+            "$$a$$ UESCAPE '!'",
             // A block comment is whitespace too, but not the kind a
             // continuation may be written across: measured, each of these is a
             // syntax error whether the newline stands before the comment or
@@ -3672,5 +4433,202 @@ mod tests {
             )
             .expect_err("no columns");
         assert!(refusal.to_string().contains("app.empty"), "{refusal}");
+    }
+
+    /// The whole of ADR-0013 §3's rendering rule, in one assertion each: a
+    /// value pbps writes means one thing under either `standard_conforming_strings`.
+    #[test]
+    fn a_value_pbps_renders_cannot_be_reinterpreted_by_a_session_setting() {
+        // A backslash is doubled and the form is `E'…'`, which takes backslash
+        // escapes under either setting — measured, `'a\nb'` is four
+        // characters under `on` and three under `off`, and `E'a\\nb'` is four
+        // under either.
+        assert_eq!(value_literal("a\\nb"), "E'a\\\\nb'");
+        assert_eq!(value_literal("it's"), "E'it''s'");
+        assert_eq!(value_literal(""), "E''");
+    }
+
+    /// The `bytea` half of the same rule, which is the one that fails
+    /// silently: measured, `'\x0102'::bytea` under `standard_conforming_strings
+    /// = off` is *accepted* and stores three bytes where two were meant.
+    /// `decode` carries no backslash at all.
+    #[test]
+    fn a_bytea_cell_is_written_as_decode_and_carries_no_backslash() {
+        let bytea = "bytea".parse::<ColumnType>().expect("a type");
+        let sql = cell_sql(&Value::Text("\\x0102".into()), Some(&bytea)).expect("rendered");
+        assert_eq!(sql, "pg_catalog.decode(E'0102', 'hex')");
+        assert!(!sql.contains('\\'), "{sql}");
+        // The same text on a column that is not `bytea` is an ordinary value.
+        let text = "text".parse::<ColumnType>().expect("a type");
+        assert_eq!(
+            cell_sql(&Value::Text("\\x0102".into()), Some(&text)).expect("rendered"),
+            "E'\\\\x0102'"
+        );
+        // And a spelling this engine would not read back that way is refused
+        // rather than written as something else.
+        cell_sql(&Value::Text("0102".into()), Some(&bytea)).expect_err("not the engine's spelling");
+    }
+
+    /// Never a bare `5` or a bare `true`: this engine has no implicit cast
+    /// from `integer` to `text`, so a bare integer into a `text` column is
+    /// refused outright — where an untyped literal lands in either.
+    #[test]
+    fn every_declared_cell_goes_out_as_a_literal_the_engine_converts() {
+        for (value, expected) in [
+            (Value::Int(5), "E'5'"),
+            (Value::Bool(true), "E'true'"),
+            (Value::Bool(false), "E'false'"),
+            (Value::Null, "NULL"),
+        ] {
+            assert_eq!(cell_sql(&value, None).expect("rendered"), expected);
+        }
+    }
+
+    /// The `INSERT`, and the check that holds the row to what the plan wrote.
+    #[test]
+    fn an_insert_names_its_columns_and_holds_the_row_it_wrote() {
+        let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
+        let mut row = Row::default();
+        row.0.insert("label".into(), Value::Text("One".into()));
+        let change = Change::InsertRow {
+            table: "app.status".parse().expect("a table name"),
+            key_column: "code".to_owned(),
+            identity_key: false,
+            key: RowKey::from("a"),
+            row,
+            defaults: [("rank".to_owned(), "(0)".to_owned())]
+                .into_iter()
+                .collect(),
+            types: [
+                ("label".to_owned(), ty("text")),
+                ("rank".to_owned(), ty("integer")),
+                ("note".to_owned(), ty("text")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let sql = sql_of(&Postgres::new(), &change).join("\n");
+        assert!(
+            sql.contains("INSERT INTO \"app\".\"status\" (\"code\", \"label\")"),
+            "{sql}"
+        );
+        assert!(sql.contains("VALUES (E'a', E'One')"), "{sql}");
+        // Held afterwards: the cell it spelled, the cell it left to a literal
+        // default, and the column the table gives no default at all.
+        assert!(
+            sql.contains("CAST(\"label\" AS text)) COLLATE \"C\""),
+            "{sql}"
+        );
+        assert!(sql.contains("OR (\"rank\" IS NULL AND"), "{sql}");
+        assert!(sql.contains("\"note\" IS NULL"), "{sql}");
+        assert!(sql.contains("RAISE EXCEPTION USING MESSAGE"), "{sql}");
+        // And it is one statement, so a staged apply cannot commit the write
+        // and then fail the check.
+        assert!(sql.contains("DO $pbps$"), "{sql}");
+    }
+
+    /// ADR-0013 §2. `validate` refuses the declaration; this is the second
+    /// lock on the same door, for a plan that arrived some other way.
+    #[test]
+    fn an_identity_keyed_insert_is_refused_by_the_emitter_too() {
+        let change = Change::InsertRow {
+            table: "app.status".parse().expect("a table name"),
+            key_column: "id".to_owned(),
+            identity_key: true,
+            key: RowKey::from("1"),
+            row: Row::default(),
+            defaults: BTreeMap::new(),
+            types: BTreeMap::new(),
+        };
+        let e = Postgres::new()
+            .emit(&change, Strategy::default())
+            .expect_err("an identity key is refused on this engine");
+        assert!(e.to_string().contains("OVERRIDING SYSTEM VALUE"), "{e}");
+        assert!(e.to_string().contains("pbps baseline"), "{e}");
+    }
+
+    /// An update holds the row to what the plan recorded, before and after,
+    /// and never restates a column it did not change.
+    #[test]
+    fn an_update_holds_the_row_before_and_after_without_restating_it() {
+        let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
+        let change = Change::UpdateRow {
+            table: "app.status".parse().expect("a table name"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [(
+                "label".to_owned(),
+                (
+                    Cell::Value(Value::Text("Old".into())),
+                    Cell::Value(Value::Text("New".into())),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: [("rank".to_owned(), Cell::Value(Value::Int(3)))]
+                .into_iter()
+                .collect(),
+            types: [
+                ("label".to_owned(), ty("text")),
+                ("rank".to_owned(), ty("integer")),
+            ]
+            .into_iter()
+            .collect(),
+            after_types: BTreeMap::new(),
+        };
+        let sql = sql_of(&Postgres::new(), &change).join("\n");
+        assert!(sql.contains("SET \"label\" = E'New'"), "{sql}");
+        assert!(!sql.contains("SET \"label\" = E'New', \"rank\""), "{sql}");
+        // The `before` of the changed cell and the untouched cell both bound
+        // the update, and the case is part of the comparison.
+        assert!(sql.contains("E'Old'"), "{sql}");
+        assert!(sql.contains("E'3'"), "{sql}");
+        assert!(sql.contains("COLLATE \"C\""), "{sql}");
+        assert!(
+            sql.contains("GET DIAGNOSTICS pbps_rows = ROW_COUNT"),
+            "{sql}"
+        );
+        assert!(sql.contains("IF pbps_rows <> 1 THEN"), "{sql}");
+    }
+
+    /// A delete is keyed *and* held to the recorded row, and it asks whether
+    /// anything still references the row before it runs.
+    #[test]
+    fn a_delete_holds_the_recorded_row_and_locks_the_parent_first() {
+        let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
+        let change = Change::DeleteRow {
+            table: "app.status".parse().expect("a table name"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: [
+                ("label".to_owned(), Cell::Value(Value::Text("Old".into()))),
+                ("rank".to_owned(), Cell::Value(Value::Null)),
+                // No type carried, so nothing to compare it by: held to
+                // nothing rather than to a guess.
+                ("doc".to_owned(), Cell::Value(Value::Text("{}".into()))),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("label".to_owned(), ty("text")),
+                ("rank".to_owned(), ty("integer")),
+            ]
+            .into_iter()
+            .collect(),
+            after_types: BTreeMap::new(),
+        };
+        let sql = sql_of(&Postgres::new(), &change).join("\n");
+        assert!(sql.contains("FOR UPDATE;"), "{sql}");
+        assert!(sql.contains("DELETE FROM \"app\".\"status\""), "{sql}");
+        assert!(sql.contains("\"code\" = E'old'"), "{sql}");
+        assert!(sql.contains("E'Old'"), "{sql}");
+        assert!(sql.contains("\"rank\" IS NULL"), "{sql}");
+        assert!(
+            !sql.contains("E'{}'"),
+            "an untyped cell is held to nothing: {sql}"
+        );
+        // And the row stayed gone.
+        assert!(sql.contains("is back after this plan deleted it"), "{sql}");
     }
 }

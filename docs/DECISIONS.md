@@ -6650,3 +6650,1308 @@ SPEC is in sync with all of these.
     created `a.p` first. `Dialect::bare_name_rank` gives the position on the
     path, and among the declared modules sharing a bare name only the
     best-placed one takes the bare form.
+319. **A declared value is rendered as an `E'…'` with its backslashes doubled,
+    and a `bytea` as `decode('…','hex')` — an encoding rule, not a settings
+    rule.** ADR-0013 §3. A write takes no settings scope of its own (the scope
+    would also be a scope over every trigger the write fires), so
+    `standard_conforming_strings` reaches the literals pbps renders.
+    **Measured on 18.6**, the same statement under the two settings:
+
+    ```text
+    'a\nb'  under on: length 4      under off: length 3
+    E'a\\nb' under either:           length 4
+    '\x0102'::bytea under off:  accepted, storing 3 bytes
+    decode('0102','hex') under off:  accepted, storing 2 bytes
+    ```
+
+    The `bytea` line is why a refusal list cannot cover this: no error, no
+    refusal, a different value in the table. The dependency is in **pbps's own
+    rendering**, not in the declaration, so the fix belongs in the renderer. An
+    `E'…'` takes backslash escapes under either setting, and `decode` carries
+    no backslash at all.
+
+    The form stays `unknown` to the type system — measured, `pg_typeof(E'1')`
+    is `unknown`, exactly as for a plain literal — so `"id" = E'1'` on an
+    `integer` column is still the integer comparison, and a value never has to
+    carry a type the plan may not have.
+
+320. **The pre-delete probe counts every foreign key, and `convalidated` is
+    never read.** ADR-0013 §1. The SQL Server probe skips a key whose
+    `is_disabled` is set, because `NOCHECK CONSTRAINT` leaves it in the catalog
+    and stops the engine enforcing it (144). `pg_constraint.convalidated` has
+    the same shape and **the opposite meaning**: measured, a `NOT VALID` key
+    reads `convalidated = f` and still refuses both a violating insert and the
+    parent's delete. Copying the rule would make the probe count zero for a row
+    the engine will not let go — the live test asserts both halves, so the
+    mistake fails rather than being argued about.
+
+    This is the second time this design pass has met the shape (ADR-0011
+    Amendment 2 was the first): **two engines expose a similarly-named flag
+    whose meanings are opposites, and the dangerous direction is the one where
+    the shared-looking code compiles.**
+
+321. **An identity-keyed `data:` block is refused on PostgreSQL, by `validate`
+    and again by the emitter.** ADR-0013 §2. `SET IDENTITY_INSERT` keeps SQL
+    Server's seed at least as high as the value written; **measured**, this
+    engine's `OVERRIDING SYSTEM VALUE` does not — two pinned rows leave the
+    sequence at its start and the *application's* next insert fails on the
+    primary key, after a deployment that verified clean. ADR-0013 §2 takes six
+    measured obstacles to close that by advancing the sequence and closes none
+    of them: `nextval` walks past any lock, a sequence cannot be locked at all,
+    an allocation already handed out cannot be recalled, the advance survives
+    the rollback of a failed apply, and a `CYCLE` sequence makes it
+    non-terminating. Refusing removes all six at once, which is the house
+    preference — make the failure unrepresentable rather than handled.
+
+    The message names the sequence (`<table>_<column>_seq`, which is the name
+    this engine derives) and both ways forward: a natural key, or `pbps
+    baseline` over rows kept outside pbps.
+
+322. **The row read-back renders every column with one expression, `CAST(… AS
+    text)`, and the canonical settings are what fix the spelling.** The SQL
+    Server reader pins a `CONVERT` style per type family; this engine has no
+    per-expression style and a handful of session settings that decide every
+    value of a type at once. So the read runs inside the same canonical scope
+    the pull uses (`catalog::read_rows` opens its own transaction for it,
+    because the scope is `set_config(…, is_local)`), and a second mechanism on
+    top of it would be a second thing to keep true. Measured under those
+    settings: `numeric(5,2)` renders `1.50`, `bytea` `\x0102`, `interval`
+    `P1DT2H`, and a `character(5)` holding `'ab'` renders `ab` — the padding
+    dropped, which is what the engine itself ignores when it compares.
+
+323. **A literal default is recognised through the cast the catalog welds on.**
+    ADR-0013 §4. This engine hands a default back deparsed and typed:
+    `'unnamed'` comes back `'unnamed'::text` and `'x'` on a `varchar(9)` comes
+    back `'x'::character varying`. A reader that did not look through the cast
+    would call every string default an expression, never ask the engine whether
+    a cell equals it, and read every such cell back as "cannot be told from its
+    default" — so a declaration that omits the column and one that spells it
+    would stop comparing equal. The strip is conservative in the other
+    direction on purpose: it removes only a trailing `::type` at the top level,
+    so `'a'::text || 'b'` is not a literal, and `nextval('s'::regclass)` — which
+    ends in a cast and would consume a sequence value if asked about — is not
+    either.
+
+324. **The spelling queries are fenced with `OFFSET 0`, and the fence is
+    load-bearing for exactly the types that fold.** The check asks the engine
+    what it makes of each declared literal, guarding the cast with
+    `pg_input_is_valid` inside a `CASE`. **Measured**, the `CASE` protects the
+    cast with two rows in the `VALUES` and does not with one: the planner folds
+    a single-row list into a `Result` node and evaluates the cast while
+    planning, so the query raises `invalid input syntax` instead of reporting
+    the value it exists to report. Which types it can fold is the type's own:
+    `numeric`, `integer` and `uuid` read their text through an immutable input
+    function and fold; `date` and `character varying` do not.
+
+    That second sentence is why the live test declares a `numeric` cell. The
+    first version of it used a `date`, passed with the fence removed, and
+    proved nothing — a guard that holds for two rows and not for one, pinned by
+    a test that could not tell.
+
+325. **The pre-delete probe's dynamic SQL runs through `query_to_xml`.** A
+    [`Probe`] is one `SELECT` returning one integer, and this driver sends one
+    statement through the extended protocol — so the SQL Server shape,
+    `DECLARE …; EXEC sp_executesql …; SELECT @n;`, has no counterpart here: a
+    `DO` block returns nothing at all. `query_to_xml` is this engine's only way
+    to run generated SQL from inside a `SELECT`, and the count comes back
+    through `xpath`. Nothing user-written reaches the generated text: names come
+    from the catalog through `quote_ident` and the key through 319's renderer.
+
+    The key columns are joined with `generate_subscripts` and array subscripts
+    rather than `unnest(conkey, confkey)`: the two-array form of `unnest` is
+    grammar, legal only in a `FROM` clause and impossible to schema-qualify —
+    measured, `pg_catalog.unnest(smallint[], smallint[]) does not exist` — and
+    every name in this file is qualified, because the read scope pins an empty
+    `search_path`.
+
+326. **The delete's own guard locks the parent row, where SQL Server's locks a
+    range of the child.** The guard re-counts the referencing rows inside the
+    delete's own statement, so a child committed between the probe and the
+    apply cannot be cascaded away unseen (129); that count is only worth
+    something if nothing can arrive after it. SQL Server takes serializable
+    range locks over the child scan. This engine's own foreign-key machinery
+    supplies something narrower and exact — **measured**, an `INSERT` into the
+    child reports the statement it blocked in:
+
+    ```text
+    while another session holds SELECT … FROM parent WHERE id = 5 FOR UPDATE:
+    INSERT INTO child VALUES (99, 5);
+      ERROR: canceling statement due to lock timeout
+      CONTEXT: while locking tuple (0,3) in relation "parent"
+      SQL statement "SELECT 1 FROM ONLY "m4"."parent" x WHERE "id" = $1 FOR KEY SHARE OF x"
+    ```
+
+    So the guard takes `FOR UPDATE` on the one parent row, and a row arriving on
+    it waits for the delete instead of racing it.
+
+327. **Offline `validate` says it did not judge the row keys, rather than
+    reporting clean.** ADR-0013 §5. Whether two declared keys are one row is the
+    engine's question — by the type's conversion, and for a character type by
+    the live column's collation, which this ADR keeps out of `pbps-model`.
+    **Measured**, the flag that looks like the answer is not one: under one
+    nondeterministic collation `'New'` and `'new'` are one key and the second
+    insert fails, and under another they are two valid keys, so reading
+    `collisdeterministic` would refuse a perfectly good declaration. The
+    connected check asks the engine about the actual keys, under the column's
+    own collation, through a `COLLATE` clause written only where the type takes
+    one — measured, `COLLATE` on a `numeric` is an error, not a no-op.
+
+    That leaves offline `validate` with a question it cannot ask, and "no
+    findings" would be the wrong answer to it. `Dialect::declaration_notes` is
+    a third channel beside errors and warnings: not a problem with the
+    declarations, a statement about what this run could not check. Empty by
+    default, so a dialect whose offline checks are complete says nothing.
+
+328. **A row statement is a `DO` block, and its refusals are `RAISE EXCEPTION
+    USING MESSAGE`.** The write and the checks that hold it to what the plan
+    reviewed have to be one statement: a staged apply runs each statement
+    outside a transaction (SPEC §7.5), so a check that merely raised would
+    leave the write it rejected committed. **Measured**, a `DO` block that
+    writes and then raises leaves the table as it was with no transaction open
+    at all, and inside the transactional apply it nests, where the outer
+    transaction still decides everything. There is no `CATCH`: this engine's
+    failure is the whole block's, so nothing is left half-done for a later
+    statement to find.
+
+    `USING MESSAGE` rather than `RAISE EXCEPTION '<text>'`, because the second
+    form's first argument is a format string and a `%` in a table name, a key
+    or a value would be read as a placeholder. Measured, `USING MESSAGE`
+    reports a `%` and a `\` untouched. One less thing to escape is one less
+    thing to escape wrongly.
+
+329. **Every side of a comparison the engine will make goes through the
+    engine's own type first, and every value a plan writes is one the probe can
+    compare.** Five refusals of valid plans, all of the same shape: something
+    pbps knew about a value was compared with something the engine knew, and
+    the two were not the same thing. Each was measured on 18.6.
+
+    * **A default is compared as the column stores it.** `numeric(5,2) DEFAULT
+      1` stores `1.00` and `pg_get_expr` deparses it as `1`, so a text
+      comparison of the stored cell against the declared expression was false
+      for a row the engine had just written correctly — the insert's own
+      postcondition rejected it. The declared side is now cast to the column's
+      type before it is read as text, which is the same conversion the engine
+      made on the way in, asked of the engine.
+    * **A bare `true` is a literal.** This engine deparses `boolean DEFAULT
+      true` as the one word, and a predicate that admitted NULL, quoted strings
+      and numbers called it an expression. The cell was then read back as one
+      nobody can tell from its default, so a hand edit that flipped it was
+      projected as an omission and no plan proposed to put it back — drift the
+      tool reported as convergence.
+    * **A count filtered by a policy is not a count.** Row-level security
+      filters a `SELECT`; this engine's referential actions ignore it.
+      Measured, a session the policy filters sees `count(*) = 0` on a child
+      table, deletes the parent, and the `ON DELETE CASCADE` destroys the
+      hidden row — the exact silent loss the pre-delete probe exists to
+      prevent. The probe now asks `row_security_active` about every referencing
+      table and refuses rather than trusting a count it cannot complete. Not
+      `relrowsecurity`: that is true for a table under a policy even in the
+      session that owns it and sees every row, and refusing there would refuse
+      a plan that is safe.
+    * **An explicit NULL is a value the probe can compare.** A plan that
+      unpicks a child's reference before deleting its parent writes `NULL` into
+      the child, and the probe excludes rows this plan has already moved.
+      Mapping `Value::Null` to "cannot compare" made the whole updated row
+      uncomparable, generated no exclusion for it, counted its *stored*
+      reference and refused the ordinary shape. `p.code = NULL` is UNKNOWN,
+      measured, so a NULL tuple simply never matches the parent — which is the
+      right answer, written down.
+    * **`\x` is a `bytea`, not an empty string.** It is this engine's spelling
+      of the zero-length value and what `pull --data` writes for one, and
+      `decode('', 'hex')` is valid. An emptiness test in the emitter refused a
+      declaration that `validate` had passed cleanly.
+
+    The generated per-child statement is `SELECT (SELECT count(*) FROM …
+    WHERE …) <arrivals> AS n`, and the parentheses are load-bearing: the
+    arrival terms are added to the count, and written after the `WHERE` clause
+    of an unparenthesised `count(*)` they are a syntax error. No test saw it
+    until the NULL fix above, because every live probe until then had a plan
+    that moved no child row, and the unit test that inspects the SQL does not
+    run it.
+
+330. **The read of a defaulted cell asks the same question the write does, and
+    the delete's own guard knows the row it is about to remove.** Two more of
+    329's shape, one on each side of it.
+
+    **The read-back's `at_default` was the column's comparison, not pbps's.**
+    `emit::defaulted_cell` holds a cell to its default as text, byte for byte
+    under `COLLATE "C"`, and through the column's type; `rows::query` asked the
+    same question with a native `=` on the raw column. A collation makes those
+    two different questions. **Measured on 18.6**, a `text` column under
+    `und-u-ks-level2` holding `New` beside `DEFAULT 'new'`:
+
+    ```text
+    label = ('new')                      ->  t
+    the same, as text under COLLATE "C"  ->  f
+    ```
+
+    The first answer marks the cell at its default, so `ObservedRow::as_seen_by`
+    leaves it out of the read-back, the drift is not in the observed state at
+    all, and neither a connected plan nor `verify` ever proposes to put the
+    value back. 329 fixed the write half of exactly this and did not sweep the
+    read half — which is `CLAUDE.md`'s own rule about sweeping every call site,
+    failed on the very next call site.
+
+    **A row that references itself is not a child that survives its own
+    delete.** The delete's guard counts the rows still referencing the parent
+    and runs before the `DELETE` in the same block, so a self-referencing row
+    still points at itself when it is counted. **Measured**, the engine takes
+    that delete without complaint, because the one statement removes both sides
+    of the reference:
+
+    ```text
+    INSERT INTO t VALUES (5, 5);          -- t.parent REFERENCES t.id
+    the guard's count before the delete:  1
+    DELETE FROM t WHERE id = 5;           succeeded
+    ```
+
+    So the guard refused a plan the engine accepts. The exclusion is written
+    into the generated per-child statement under `con.conrelid =
+    con.confrelid` — the count already filters on `confrelid`, so that
+    equality *is* the self-reference — and it takes out exactly one key, the
+    one being deleted. Another row pointing at the doomed one through the same
+    self-reference is a real child and is still counted; the probe already drew
+    the line in the same place.
+
+331. **A guard for a native `=` outlived every native `=` it guarded, and the
+    probe this dialect ported kept only half of what 124 asks for.** Two more
+    of 329's and 330's shape.
+
+    **`json` is compared like everything else.** `rows::comparable` answered
+    "does this type have `=`?" and was asked in three places, because the
+    comparisons those places wrote were native ones. 329 and 330 made every one
+    of them a comparison of *text* — `CAST(… AS text)` on both sides, under
+    `COLLATE "C"`, through the column's type — and the guard stayed. It is the
+    shape `CLAUDE.md` calls "a guard whose reason has gone is a filter nobody
+    re-reads", and the filter cost the read-back a whole type: a `json` cell
+    with a literal default was never asked about, so it was read back as one
+    nobody can tell from its default, `ObservedRow::as_seen_by` dropped it, and
+    a hand-edited document was drift no plan proposed to settle.
+
+    **Measured on 18.6**, both halves of why removing it is safe:
+
+    ```text
+    '{"a":1}'::json = '{"a":1}'::json   ->  ERROR: operator does not exist
+    the read-back's comparison, as text ->  t for the default, f for an edit
+    CREATE TABLE t (d json PRIMARY KEY) ->  ERROR: no default operator class
+    ```
+
+    The last line is what makes the sweep complete rather than hopeful. The
+    native `=` this dialect still writes is on key and foreign-key columns —
+    `WHERE "key" = E'…'`, the probe's tuple — and `json` cannot be one of
+    those: with no default `btree` operator class it can carry neither a
+    primary key nor a unique constraint, so nothing can reference it either.
+    There is no type left for the guard to protect, and `Held::as_stored` no
+    longer returns an `Option`.
+
+    **A write to a default the probe cannot evaluate is refused here too.** 124
+    established the rule and `pbps-mssql` implements it; this dialect's port of
+    the pre-delete probe counted such a write as absent and stopped there. The
+    hazard is 124's, one staged apply later: the insert or update runs first,
+    commits for good, and the delete's own guard is the first thing to see the
+    reference — so the deployment is half applied and the plan it was applying
+    can no longer be resumed. The refusal is a second probe that *counts* the
+    foreign-key columns in the catalog, for 124's reason: a probe that errors
+    reads as "unchecked" to `apply`, which then proceeds.
+
+    Two differences from the SQL Server statement, both already documented in
+    this module. There is no `convalidated` filter, because a `NOT VALID` key
+    here enforces the delete action in full and is not this engine's
+    `NOCHECK`. And the key's columns are reached through
+    `generate_subscripts(con.conkey, 1)` rather than a two-array `unnest`,
+    which is grammar rather than a function and cannot be schema-qualified.
+
+332. **The key a write puts there is a cell, and is held to its exact spelling
+    like every other one.** The only reason it was not among the cells
+    `wrote_the_row` compares is that a `Row` carries it as the map's key, and
+    that is a fact about a Rust type, not about the database.
+
+    The postcondition used the key column's own `=`. **Measured on 18.6**, with
+    a `text` key under `und-u-ks-level2` and an `AFTER INSERT` trigger that
+    lowercases what was written:
+
+    ```text
+    INSERT ... VALUES ('New', 'a');   the trigger leaves:  new
+    the postcondition with the column's `=`:               passes
+    the same, as text under COLLATE "C":                   fails
+    ```
+
+    So the write reported success, `apply` recorded a key nobody declared, and
+    the alias read then mapped the declaration's `New` onto the stored `new`
+    and agreed with it for ever after — DECISIONS 132's hazard, reaching the
+    one cell 132's own check did not cover.
+
+    The literal needs no cast through the key column's type. `plan --db`
+    refuses a declared key the engine would spell differently before anything
+    is written (DECISIONS 101), so by the time the statement runs the key is
+    the engine's own spelling — measured, the text comparison holds for an
+    `integer` key written `E'1'` and a `numeric(5,2)` one written `E'1.50'`.
+    It is the same coupling `recorded_cell` already relies on for values.
+
+    **Three sibling comparisons keep the column's `=`, deliberately.** The
+    `WHERE` clauses of the update and the delete ask "which row does this
+    engine call this key", which is the engine's question to answer
+    (ADR-0013 §5) — comparing those as text would refuse a plan built from the
+    engine's own answer. And `gone_row` asks whether anything the engine calls
+    the deleted row is back; there the looser comparison is the safer one,
+    because a trigger reinserting `Old` under a case-insensitive collation must
+    still be caught. Same operator, three different questions, and only one of
+    them was wrong.
+
+333. **The probe refuses an incomplete count too, and not only the delete's own
+    guard.** 329 established that a count row-level security has filtered is
+    not a count, and put the refusal in the statement's guard. The probe next
+    to it — documented in the same module as *the same count* — kept answering
+    `0`.
+
+    `0` there means "nothing references this row" and the session meant "I
+    cannot see what references this row": absent and unreadable, read as one
+    answer, in the one place this project has a rule about it. A human then
+    approves the plan on that number. In a staged apply every insert and update
+    of the plan commits for good before the delete is reached, so the guard's
+    refusal arrives after the deployment is half done and the plan can no
+    longer be resumed — the refusal, too late to be the refusal.
+
+    **A second probe, not a term in the count.** DECISIONS 124's reason: the
+    count is a number a reader is meant to understand, and inflating it to
+    force a refusal makes it a number about something else. This one counts
+    referencing *tables* whose rows this session cannot see in full, so a
+    reader meets the rows first and the reason second.
+
+    `row_security_active`, not `relrowsecurity`, for 329's measured reason: the
+    switch is on for the owner too, and the owner's count is complete. The live
+    test asserts both halves from the two sessions — `relrowsecurity` true for
+    both, the probe counting one for the filtered role and nothing for the
+    owner.
+
+    This is the fifth finding of one shape on this branch and the second of
+    this one specifically: a rule applied at the site that motivated it and not
+    at its sibling. PITFALLS carries the lesson.
+
+334. **A relation is counted the way its foreign key covers it, and a key is
+    asked about as the tuple it is.** Two ways the pre-delete probe counted
+    something the engine does not.
+
+    **`ONLY` for an ordinary table, in full for a partitioned one, and never
+    the catalog's copies of one key.** A foreign key is not inherited.
+    **Measured on 18.6**, a row in an inheritance child holding the deleted key
+    is bound by nothing, the parent deletes, and an unqualified `FROM
+    schema.table` scanned that child and counted it — refusing a delete the
+    engine performs. The same measurement found a second thing nobody had
+    looked for: a partitioned referencing table carries the key **twice** in
+    `pg_constraint`, once on the partitioned table and once on each partition,
+    so one referencing row was counted twice.
+
+    ```text
+    ordinary parent with an inheritance child, one row in the child:
+      FROM ref        -> 1        FROM ONLY ref -> 0        the delete: succeeds
+    partitioned referencing table, one row:
+      pg_constraint rows into the parent: 2 (relkind p, conparentid = 0
+                                            relkind r, conparentid <> 0)
+    ```
+
+    One rule covers all three: read only the constraints that are nobody's copy
+    (`con.conparentid = 0`), and scan `ONLY` the relation unless it is
+    partitioned (`cl.relkind = 'p'`), where the key does reach every partition
+    and the relation itself stores nothing.
+
+    The *arrival* terms keep their unqualified scan deliberately: they count
+    rows this plan writes, the plan writes them to the table it names, and a
+    non-`ONLY` scan finds them whether that table is partitioned or an
+    inheritance parent. `ONLY` there would under-count an arrival, which is the
+    direction that loses a row.
+
+    **A NULL anywhere in a key answers the whole tuple.** `MATCH SIMPLE` is
+    this engine's default, so a composite foreign key with a NULL in any of its
+    columns is not checked at all — measured, the child is accepted against a
+    parent row that does not exist and the parent then deletes with that child
+    sitting there. DECISIONS 124's refusal looked at the unprobeable column
+    alone and refused a plan the engine accepts however the default evaluates.
+    It now asks per row: refuse where the key spans a column this row writes to
+    an unevaluable default **and** spans no column this row writes to NULL.
+
+    The shape is only reachable through DECISIONS 116 — a foreign key
+    referencing some unique key rather than the primary key — because rows are
+    keyed by one column (ADR-0004), so a table with a composite primary key
+    carries no `data:` block and can never be a `DeleteRow`'s parent. The live
+    test says so, since a reader will otherwise try to build the fixture the
+    obvious way and find it refused.
+
+335. **The pre-delete probe sees every key the delete will meet: the catalog's,
+    the ones this session cannot count through, and the ones this plan adds.**
+    Three ways the probe answered `0` for a delete the engine — or the plan's
+    own next statement — would refuse. Each measured on 18.6.
+
+    **A referencing table the session cannot read is not one with no rows.** A
+    role with `DELETE` on the parent and no `SELECT` on the child gets
+    `permission denied` from the count, which the probe runner reports as
+    *unchecked* and `apply` walks past — while the engine's own key still sees
+    the child and refuses the delete. Unreadable, read as absent, in the one
+    place this project has a rule about it. 333's refusal over
+    `row_security_active` now also asks `has_table_privilege(cl.oid,
+    'SELECT')`: the two are one question — can this session count that table
+    — and one probe.
+
+    **A `DEFAULT` whose default is NULL is a NULL the probe compares.**
+    `constant_default` excluded it — "it references no row", which is true and
+    is 329's wrong conclusion over again: `None` there means *cannot compare*,
+    so a child sent back to a NULL default kept its stored reference in the
+    count and the ordinary update-then-delete plan was refused, while the same
+    plan spelled `null:` was allowed. `p.col = (NULL)` is UNKNOWN and the row
+    leaves the count. `is_null_default` went with it, its two callers having
+    become dead the moment a NULL default was a literal.
+
+    **A foreign key this plan adds is a constraint row, not a special case.**
+    `DeleteRow` runs at rank 12 and `AddForeignKey` at 13, so the delete runs
+    against a catalog that does not hold the key, the probe counted nothing,
+    and the `ALTER` that follows validates every stored child row and fails on
+    the one the delete just orphaned:
+
+    ```text
+    DELETE FROM parent WHERE code = 'old';                       -- succeeds
+    ALTER TABLE child ADD FOREIGN KEY (parent) REFERENCES parent; -- 23503
+    ```
+
+    In a staged apply the delete has committed by then. The planned key is
+    built as a synthetic `pg_constraint` row — `conrelid`, `confrelid`, the
+    key arrays resolved through `pg_attribute`, `contype = 'f'`,
+    `conparentid = 0` — and `UNION ALL`ed beside the stored rows in every probe
+    that reads them. So every rule written for a catalog row reaches it with no
+    second copy: `ONLY` by `relkind` (334), the exclusions and arrivals, the
+    hidden-children and unprobeable refusals. The live test's negative half is
+    exactly that: the same plan with the child row undeclared, where the
+    exclusion for rows the plan deletes takes it out of the count through the
+    planned key as it would through a stored one.
+
+    Two things vanish on purpose. A key on a column this plan adds (rank 8)
+    resolves no attnum and the row disappears — a column the database does not
+    have cannot hold a stored reference, the same rule the arrivals use. And a
+    key on a child this plan creates has a NULL `to_regclass` and disappears
+    too; such a child has no stored rows, and its inserted ones meet the
+    engine's own key, created with the table at rank 7, before the delete —
+    the guard refuses there. The synthetic row's `conname` is one no user could
+    write, so a replaced key's new shape cannot be filtered out by `gone_keys`
+    as the old one it drops.
+
+    The delete's own guard keeps reading the catalog alone. The planned key is
+    not there when the guard runs either, but the probe has already refused the
+    plan for it before the first statement, which is the only place a staged
+    apply can still be stopped; in the guard it would be one more reason to
+    abort after the plan is half applied.
+
+336. **A key this plan adds on a column it also adds is counted through the
+    value the column is added with, and a NULL the plan writes decides the
+    tuple before an unevaluable default does.** Two ways the pre-delete probe
+    and its guard disagreed with the engine, both measured on 18.6.
+
+    **The column the database does not have holds a reference the moment it
+    exists.** 335 let a planned key on a planned column vanish — "a column the
+    database does not have cannot hold a stored reference" — and that is true
+    of the catalog and false of the plan: `ADD COLUMN … DEFAULT 'old'`
+    backfills every stored row, and the plan runs it at rank 8, the delete at
+    12, the key at 13:
+
+    ```text
+    ALTER TABLE child ADD COLUMN parent text DEFAULT 'old';
+    SELECT parent FROM child;                      -- 'old', every row
+    DELETE FROM parent WHERE code = 'old';         -- succeeds
+    ALTER TABLE child ADD FOREIGN KEY (parent) REFERENCES parent(code);
+      ERROR 23503: Key (parent)=(old) is not present in table "parent"
+    ```
+
+    In a staged apply the delete has committed by then. The synthetic
+    constraint row cannot carry such a key — it is built from `pg_attribute`,
+    and there is nothing to build from — so the question is asked from the
+    plan alone, in `planned_key_probes`: the count of stored child rows whose
+    tuple, with the planned column as the default it is added with and every
+    other column as the stored cell, is the deleted row's. `DEFAULT NULL` and
+    no default at all are a NULL in the tuple and the engine says it
+    references nothing (`p.code = (NULL)` is UNKNOWN, 334, 335); no branch
+    here repeats it. The rows the plan itself deletes, updates and inserts in
+    that child get the same exclusions and arrivals the catalog keys get,
+    spelled statically because the key's columns are known. A default the
+    probe cannot evaluate — backfilled, or written by one of the plan's rows
+    to a column of the key — is refused as 124 asks, counted as the rows it
+    reaches; and the hidden-children refusal (333, 335) names such a child
+    outright, since no constraint row, stored or synthetic, would find it.
+    `ONLY` by `relkind`, still, through the same `query_to_xml` assembly.
+
+    **A NULL anywhere in the key decides it.** 334 made the *refusal* over
+    unevaluable defaults ask per row whether the same key holds a NULL the
+    same row writes. The *count's* exclusion did not: its guard gave up on the
+    unevaluable column first, so a stored child row this plan updates to a
+    NULL in one column of the key and to an unevaluable default in another
+    stayed counted with its stored tuple, and the ordinary update-then-delete
+    plan was refused for a row the engine will not check at all (`MATCH
+    SIMPLE`). The arm for a written NULL now comes first in `guarded`, for the
+    exclusion and the arrival alike. The reachable shape is a default changed
+    to an expression in the same plan, with the declared row omitting that
+    cell: the update writes `DEFAULT`, which the probe cannot compare, beside
+    the NULL, which it can.
+
+337. **A planned key is backfilled on the referenced side as well, and a NULL
+    the probe already holds is a NULL however it was spelled.** Three ways
+    336's answer was one column, or one spelling, short. Measured on 18.6.
+
+    **The parent's new column is backfilled too.** 336 asked about a key this
+    plan adds on a column it adds to the *child*. A key into a column it adds
+    to the *parent* is the same hazard from the other side: the deleted row
+    holds the default in the new column — as does every other parent row —
+    and a child holding that value references the deleted row and every
+    survivor alike:
+
+    ```text
+    ALTER TABLE parent ADD COLUMN alt text DEFAULT 'x';
+    DELETE FROM parent;                                   -- every row
+    ALTER TABLE parent ADD CONSTRAINT parent_alt UNIQUE (alt);
+    ALTER TABLE child ADD FOREIGN KEY (ref) REFERENCES parent(alt);
+      ERROR 23503: Key (ref)=(x) is not present in table "parent"
+    -- and with one parent row left in place: the key is added
+    ```
+
+    So `planned_key_probes` spells the parent side of each column the same
+    way it spells the child side — the stored cell, or the backfill — and
+    subtracts the child rows a parent row this plan does not delete still
+    satisfies, because the engine counts those as referencing the survivor.
+    The unique key the planned foreign key needs there is not the probe's to
+    check: an `ADD UNIQUE` over two survivors fails loudly, inside the
+    transaction. `spans_a_planned_column` asks about both sides, and it is
+    the one predicate the synthetic rows, the hidden-children refusal and the
+    planned-key probes share, so the next side cannot be forgotten by one of
+    them alone.
+
+    **A column an insert omits and the table gives no default is a NULL the
+    probe knows.** The plan carries every such column in the insert's `types`
+    (136), and `pbps-mssql` reads them as arriving at NULL (117). This
+    dialect recorded only the cells the row spells and the defaults it takes,
+    so an omitted no-default column of a key was invisible to the exclusion,
+    the arrival and the refusal over unevaluable defaults — which then
+    refused an insert leaving a sibling column of the same key to such a
+    default, for a tuple `MATCH SIMPLE` never checks. Recorded as `NULL`, the
+    value the engine puts there.
+
+    **`NULL::text` is NULL.** The backfill of a planned column declared
+    `DEFAULT NULL::text` reached the probe as `(NULL::text)`, and the test
+    for "this side is a NULL" compared the string to `NULL`. `rows::unwrapped`
+    is the one place a spelling is reduced to its value, and every such test
+    in the probe now goes through it — the third time a NULL was compared by
+    its spelling in this file (329, 334).
+
+338. **A surviving parent row is the row this plan leaves there.** 337's
+    survivor check read the parent rows as they stand — the stored cells and
+    the backfill — and the plan writes to them before the delete runs
+    (`order_key`: updates and inserts at rank 11, the delete at 12). An update
+    that moves the surviving row off the backfilled value leaves the child
+    referencing no row, and the key fails on it after the delete has
+    committed; a parent row the plan inserts with that value is a survivor the
+    engine accepts, and a check that could not see it refused a valid plan.
+    Both by the plan's own apply, which is the measurement.
+
+    So the survivor's side of each referenced column is spelled as the plan
+    leaves it — `CASE q.<key> WHEN <row> THEN <after> … ELSE <stored or
+    backfill> END` for the rows an update sets it in — and the rows the plan
+    inserts on the parent are constant tuples `OR`ed beside the stored
+    survivors, where every referenced column is one the insert spells, leaves
+    to a known default, or the plan backfills. An inserted row whose
+    referenced column the probe cannot spell is not a survivor it can see,
+    and an update to an unevaluable default reads as NULL there: both are the
+    over-counting direction, a refusal the engine would not have made, and
+    the deleted row's own updates do not outlive it. The child side already
+    saw its own updates and inserts (336); this is the same rule on the other
+    table.
+
+339. **A backfilled literal is compared through its column's type, and an
+    identity column is a backfill no probe can evaluate.** Two more things a
+    column this plan adds holds once the `ADD COLUMN` has run, both measured
+    on 18.6.
+
+    **Through the type.** 336 spelled a planned column's backfill as the
+    literal in parentheses, which is right against a stored column — the
+    engine coerces the unknown literal to the column's type — and wrong
+    against another planned column: two unknown literals compare as text, so
+    `'2026-01-02' = '01/02/2026'` is false while the two are one `date`, and
+    a child added with the second spelling was reported as referencing
+    nothing. `CAST((literal) AS <normalized type>)`, the cast this crate
+    makes everywhere else a default is compared (323, 329). A NULL stays
+    bare, so that it reads as one (337). This is the fifth instance of the
+    PITFALLS shape "both sides compared as text, only one of them through
+    the engine", and it arrived in code written *after* the shape was
+    recorded.
+
+    **The identity.** A column added `GENERATED … AS IDENTITY` has no
+    default and was read as backfilled NULL. The engine hands every stored
+    row a value from the sequence during the `ADD COLUMN` — `1`, `2`, … —
+    and a key from it into a parent whose row `1` this plan deletes fails
+    after the delete (23503). Recorded as `identity` on the added column and
+    treated as a backfill the probe cannot evaluate: refused as 124 asks,
+    named as "its identity, assigned to every stored row" rather than "its
+    default", because the remedy differs — there is no value to spell.
+
+340. **A planned key on a column this plan retypes compares the converted
+    values, and a session that can read the columns the count reads can
+    count.** Two more from review; both measured on 18.6.
+
+    **The retype runs first.** `ALTER COLUMN … TYPE` is rank 9, the delete
+    12, the key 13. A child `numeric(5,2)` holding `1.04` and the doomed
+    parent's `1.00`, both narrowed to `numeric(5,1)` by the plan, are one
+    value `1.0` when the key is validated — and the key fails on it — while
+    as stored they are two, and the synthetic constraint row compared the
+    stored ones. `AsStored` now records the columns the plan retypes with
+    their destination type, `spans_a_planned_column` routes a planned key
+    over one of them to `planned_key_probes` beside the added columns, and
+    each such side is spelled `CAST(<cell> AS <normalized type>)`, on the
+    child and the parent alike. Nothing is done for a *stored* key over a
+    retyped column: the engine revalidates it in the `ALTER` itself, which
+    fails loudly inside the transaction, before the delete.
+
+    **Column grants count.** The hidden-children refusal (335) asked
+    `has_table_privilege(cl.oid, 'SELECT')`, and refused a deploying role
+    granted `SELECT` on the key's columns alone — whose count runs and
+    answers, measured, because the generated statement reads only those
+    columns and the row key of a child whose rows the plan names. The
+    refusal now asks exactly that: table-level `SELECT`, or column-level
+    `SELECT` on every column of the key (`has_column_privilege` over
+    `conkey`) and on the row key where the plan deletes or updates rows of
+    that child. The planned-key children are asked the same question over
+    the columns their static count reads. A role with neither is still
+    refused, and a `count(*)` that reads a column it may not is still
+    `42501`, which the runner reports as unchecked — the question the
+    refusal answers is whether that will happen.
+
+341. **The survivors of a retyped referenced column are asked too, and every
+    literal the probe compares to another literal goes through the column's
+    type.** Two more from review, both a valid plan refused.
+
+    **Retyped survivors.** 340 converted the doomed row's side of a planned
+    key over a retyped column and 338 asked the survivors only where the
+    referenced column was *added*. Two parent rows `1.04` and `1.00` both
+    narrow to `1.0`; the plan deletes the first and adds the unique key and
+    the foreign key after — the child's converted `1.0` references the
+    survivor and the engine takes the plan whole, while the probe attributed
+    the child to the doomed row. The survivor check now runs where the
+    referenced column is added *or* retyped, and its side is spelled through
+    `converted` like the doomed row's.
+
+    **Literal against literal.** A parent row this plan inserts and a child
+    row it inserts, or an update's after-value, reach the survivor check and
+    the arrivals as the literals the plan carries, and two unknown literals
+    compare as text (339). The engine's own answer is by the column's type:
+    `1.00` and `1.0` are one `numeric`, both read back as written, and a key
+    from the second into the first holds. `AsStored` now keeps the type every
+    row change carries for a column (`InsertRow::types`, `UpdateRow` and
+    `DeleteRow`'s `types` and `after_types`), `final_type` answers with the
+    retype, the added column's type, or that, and `typed` wraps a literal in
+    `CAST(… AS <normalized type>)` wherever the other side may also be a
+    literal. A NULL stays bare (337). What no row change types — the row key
+    — stays a bare literal, which the engine coerces against a column and
+    compares as text against another bare literal; a planned key from one
+    inserted row's key column to another's is the residue, and its two
+    spellings of one value would have to both read back as written, which
+    for a key column is what ADR-0004's spelling rules already forbid.
+
+    The `date` version of this the review proposed — `'2026-01-02'` beside
+    `'01/02/2026'` — is not a plan this tool can carry: the row's
+    postcondition refuses a value the engine stores in another spelling
+    (137), so it cannot have been the test. `numeric` without a typmod is,
+    because both spellings survive the round trip.
+
+342. **A probe answers in `int4`, the width the runner reads; and a table the
+    session may not reach through its schema is one it cannot count.** Two
+    more from review, measured on 18.6.
+
+    **`int4`.** `deploy::preflight` reads every probe's count with
+    `try_get_at::<i32>`, and the driver does not widen: an `int8` column is
+    an error deserializing, which the runner reports as *unchecked* and walks
+    past. Every probe of this dialect answered `count(*)::bigint`. The CLI
+    does not route this dialect yet (step 10), so no plan has met the runner
+    — but the probe is this step's deliverable and the runner its only
+    reader, and a contract that holds only until it is first used is not
+    one. Every probe now casts its whole answer `::int`, the type SQL
+    Server's `COUNT(*)` already has, and the live suite's `counted` reads an
+    `i32` so that every probe in it is checked at the runner's width; the
+    cast has to wrap the whole `a + b` — `a + b::int` casts `b`. A count
+    above `int4` is a count of more than two billion referencing rows, and
+    an error there is the right answer.
+
+    **Schema `USAGE`.** 335 and 340 asked `has_table_privilege` and
+    `has_column_privilege`, by oid — and by oid the answer is `true` for a
+    role that cannot name the table at all: `has_table_privilege` says
+    nothing about the schema, and `SELECT count(*) FROM other.child` is
+    `permission denied for schema` for a role granted `SELECT` on the table
+    and no `USAGE` on the schema. Measured; the by-name form of the same
+    function fails the same way, which is why the catalog form was in use.
+    `has_schema_privilege(cl.relnamespace, 'USAGE')` is now the first term of
+    "can this session count that table", for the catalog's children and the
+    planned ones alike. Unreadable, once more, was about to read as absent.
+
+343. **A child this plan creates is a child whose arrivals are counted; a key
+    column an insert leaves to the engine is refused; and a probe's answer is
+    clamped before it is narrowed.** Three more from review, measured on 18.6.
+
+    **The created child.** 335 let a key on a child this plan creates vanish
+    with the reasoning that "its inserted rows meet the engine's own key,
+    created with the table at rank 7, before the delete". That is not how the
+    differ plans it: a new table's foreign keys are split out of the `CREATE`
+    into `AddForeignKey`, which sorts after the deletes (rank 13), and its
+    rows into `InsertRow`, which sorts before them (rank 11). Measured in
+    that order, the table is created, the row inserted, the parent row
+    deleted, and the key then fails on the orphan. 335's sentence is
+    corrected here, not there: the created child now takes the planned-key
+    path, named as the plan names it, with a stored count of `0` and the
+    arrivals of its inserted rows counted like any child's.
+
+    **The identity the insert leaves alone.** `InsertRow::types` leaves
+    identity columns out on purpose — the engine owns them (94, 117) — and
+    337 recorded a NULL for what is in `types` and omitted, so an identity
+    column of a key was neither a value the probe compared nor a default it
+    refused, and a key reaching it was not asked about at all. The sequence
+    hands the row a value that may be the deleted row's key. So a column of
+    a key that an inserted row neither spells nor leaves to a default the
+    plan carries is refused as a write the probe cannot evaluate: in the
+    catalog path, by asking the catalog whether a key reaches beyond every
+    column the plan recorded for that row; in the planned-key path, by
+    asking the same of the key's columns in Rust. Named "left to the engine
+    to assign", because there is no value to spell — the remedy is a NULL
+    in another column of the key, or a different key.
+
+    **`LEAST(…, 2147483647)`.** 342 narrowed every answer to `int4`, and an
+    answer past `int4` is an out-of-range error at the cast — which the
+    runner reads as *unchecked* and walks past, the one thing 342 was
+    fixing. The answer is clamped first: two billion referencing rows and
+    two billion and one are the same refusal.
+
+344. **A foreign key whose delete action will not run in this session is not
+    one the delete meets.** A foreign key on this engine is triggers, and
+    `ALTER TABLE parent DISABLE TRIGGER ALL` stops them while `pg_constraint`
+    goes on saying validated and enforced — **measured on 18.6**, the parent
+    row then deletes with its child sitting there; the same under
+    `session_replication_role = replica`, where `O`-mode triggers do not
+    fire. It is the parent-side trigger for the *delete* (`tgrelid =
+    confrelid`, `tgtype & 8`) that decides: with only the update-action
+    trigger off the delete is still refused, and with the child's own
+    triggers off it is too. Introspection already leaves such a key out of
+    the model as one whose checks are not running, and the SQL Server probe
+    skips `is_disabled` keys (151); this dialect's probe and guard counted
+    through it and refused a delete the engine takes.
+
+    Every read of the catalog's keys — the count and the guard, the
+    hidden-children refusal and its RLS twin in the guard, the unevaluable-
+    default refusal — now asks `DELETE_ACTION_FIRES`: no parent-side delete
+    trigger of the constraint that this session will not run, spelled from
+    `tgenabled` and `current_setting('session_replication_role')` the way
+    the engine decides it. The synthetic rows for planned keys carry `oid =
+    0` and have no triggers, so the same predicate passes them; `oid` joined
+    `CONSTRAINT_COLUMNS` for this. `convalidated` stays out (320): a `NOT
+    VALID` key's triggers run.
+
+    The child left behind is the operator's: a key with its delete action
+    off is a key the operator switched off, and the engine's answer to the
+    delete is the one this tool relays.
+
+345. **Every key this plan adds is asked about from the plan; the synthetic
+    constraint row is gone.** Two more from review, and the end of a line.
+
+    335 made a planned key a synthetic `pg_constraint` row beside the stored
+    ones, so that every rule for a catalog row would reach it without a
+    second copy. Five rounds then found what a catalog row cannot say: a
+    column this plan adds (336), one it adds to the parent (337), the parent
+    rows the plan writes before the delete (338), a column it retypes (340),
+    a child it creates (343) — and each was routed to `planned_key_probes`,
+    the static path that spells the key from the plan, until this round's
+    P2: a planned key on columns the plan leaves alone, where two parent rows
+    share the referenced value today, the plan deletes one and adds the
+    unique key and the foreign key after, and the survivor still holds the
+    child's value. The engine takes that plan; the synthetic row could only
+    say "this child's value is the deleted row's". The survivor check (338,
+    341) is what the catalog path lacked, and putting it there would have
+    meant the second copy 335 was avoiding. So every planned key now takes
+    the static path, the survivor check runs for every one of them — cheap
+    against a key the engine keeps unique, decisive where it does not yet —
+    and `AsStored::constraints`, `CONSTRAINT_COLUMNS` and the synthetic row
+    are removed; every catalog read is of `pg_catalog.pg_constraint` alone.
+    What the static path has that the catalog path had — `ONLY` by
+    `relkind`, the exclusions and arrivals, the hidden-children refusal by
+    name and the columns its count reads, the unevaluable-default refusals —
+    is what the rounds above put there.
+
+    **And a row arriving against a backfill the probe cannot evaluate.** 339
+    refused the stored rows a parent-side identity or expression backfill
+    reaches, and the child row the plan *inserts* was counted nowhere: its
+    tuple against the parent's backfill is a NULL placeholder in the count,
+    and it was not among the refused. If the sequence hands the deleted
+    parent row the value the child spells, the key fails after the delete.
+    Such a row now joins the refusal, unless it writes a NULL to a column of
+    the key, which references nothing however the backfill evaluates (334).
+
+346. **The delete's guard asks about the referencing relations, not the
+    catalog's copies of their keys.** 334 filtered `con.conparentid = 0` out
+    of the count and the hidden-children probe: a partitioned child holds one
+    constraint row per partition beside its own, the count scans the
+    partitioned relation once, and a partition's policy does not apply to a
+    scan of its parent — **measured on 18.6**, a role the leaf's policy hides
+    every row from still counts the row through the parent, while
+    `row_security_active` is true for the leaf. The guard's own RLS check
+    (`a_hidden_child`, 329) was written before 334 and never got the filter,
+    so it asked every row, met the leaf's copy, and refused a delete whose
+    count was complete — after the plan's earlier statements had run. The
+    same filter, in the one place it was missing: the guard and the probe
+    are the same question, and this is the sweep 333 asked for, a round
+    late.
+
+347. **Whether a written row's tuple holds a NULL is decided from that row,
+    not from the table.** 336 decided "this key references nothing" once per
+    planned key, from the backfills: a column the plan adds with `DEFAULT
+    NULL` on either side made every stored row's tuple a NULL, and it is.
+    A row the plan *writes* is not every stored row: it may spell a value
+    into that column, and its tuple then holds no NULL. Against a parent
+    backfill the probe cannot evaluate — an identity, an expression — such
+    a row may be arriving on the deleted row, and it was let through on the
+    stored rows' answer; in a staged apply the insert and the delete commit
+    before the key says so.
+
+    `tuple_null` now answers per row: the cell the row spells, or the
+    backfill where it spells none, over every column of the key, with a
+    NULL backfill on the *parent* side still deciding for every row — the
+    deleted row's own tuple holds it. It replaces the written-NULL test in
+    the update and insert loops, so a row that spells nothing into a
+    NULL-backfilled column is still a NULL there; and a stored row the plan
+    updates to a value there, against a parent backfill the probe cannot
+    evaluate, joins the refusal beside the arriving ones — 345 had only the
+    arrivals. The stored rows the plan leaves alone keep the table-wide
+    answer, because for them it is the row's answer.
+
+348. **A stored row's tuple is read from the row, too.** 347 left the stored
+    rows the plan does not write on the table-wide answer, "because for
+    them it is the row's answer" — and it is not. A stored column of the
+    key can hold NULL in one row and a value in the next; under
+    `MATCH SIMPLE` the first references nothing, whatever backfill the
+    parent side gets. **Measured**: the parent gains an identity column,
+    every child `ref` is NULL, the parent row is deleted, the key is added,
+    and the engine accepts it. The refusal over "every surviving stored
+    row" refused that valid plan.
+
+    The refusal's stored-row term now reaches only rows whose stored
+    columns of the key `IS NOT NULL` — the row's own tuple, as 347 reads a
+    written one — and leaves out the rows the plan rewrites in a column of
+    the key, which are counted as written (refused, arriving, or narrowed)
+    and were being counted twice. A backfilled column stays table-wide: its
+    value is one value for every row, and 336's `backfill_null` already
+    answers it.
+
+349. **A cell an update leaves alone is part of the tuple the update writes.**
+    347 and 348 read a row's NULL from the row — the cells the update
+    spells, or the stored columns — and `UpdateRow.unchanged` was read by
+    neither: the declared cells the row already holds, which the statement
+    holds the row to before and after it runs (136). A composite key with
+    one column left alone at NULL and another written to a default no probe
+    can evaluate is a tuple with a NULL in it, and under `MATCH SIMPLE` it
+    references nothing however the default evaluates. **Measured**: the
+    update to the default, the delete, and the key are all accepted with
+    that NULL sitting there; the refusal over unevaluable defaults, and the
+    planned key's own per-row refusal, both refused the valid plan.
+
+    `Moved::held_null` records, per updated row, the unchanged cells that
+    are NULL — declared NULL, or left to a default that is NULL — and both
+    decisions read it: `nulls_of` beside the NULLs the row writes, and the
+    planned key's `tuple_null` between the written cell and the column's
+    backfill. Only NULLs are carried: a value left alone is a stored cell
+    the count reads from the table, and the refusal has nothing to learn
+    from it.
+
+350. **A default spelled `CAST(x AS type)` is read through the cast, as
+    `x::type` is.** The reader of defaults looks through the cast the
+    catalog welds on (ADR-0013 §4), and the catalog spells every cast
+    `…::type` — so that was the only spelling it knew. The SQL-standard form
+    never comes out of the catalog; it comes out of a declaration, which
+    keeps the user's text verbatim, and **measured**, `DEFAULT CAST(NULL AS
+    text)` the engine does not even store: `pg_attrdef` holds no row for
+    it. Left to that default, a row was read as written to an expression no
+    probe can evaluate, and the plan that unpicks a reference before
+    deleting its parent was refused for a NULL.
+
+    `unwrapped` now takes off an enclosing `CAST(… AS type)` too, on the
+    same terms as `::type`: the `AS` is the last one at the top level
+    outside a string, the closing parenthesis is the opening one's, and what
+    follows the `AS` is a type name and nothing else. `CAST(now() AS text)`
+    unwraps to `now()` and stays an expression; `CAST('a' AS text) ||
+    CAST('b' AS text)` does not unwrap at all. Every reader of a default —
+    the read-back's constant test, the emitter's postcondition, the probes'
+    NULL test and the planned key's backfill — goes through it.
+
+351. **A default that is NULL is refused at the declaration, because this
+    engine does not keep one.** **Measured** on 18.6: `DEFAULT NULL`,
+    `DEFAULT (NULL)`, `DEFAULT NULL::text` and `DEFAULT CAST(NULL AS text)`
+    are all accepted, and every one leaves the column with no `pg_attrdef`
+    row at all — to this engine a column with no default *is* a column
+    whose default is NULL. The pull therefore reads the column back with no
+    default, the next connected plan sets it again, and the deploy's check
+    of what the apply left behind, which compares whether a default is
+    there at all (185, 186), refuses the column the plan just wrote: a
+    declaration that can never converge, on the pattern 227 refused
+    `serial` for. SQL Server keeps `(NULL)` as a default constraint of its
+    own, so the rule is this dialect's.
+
+    `validate_table` refuses such a column, in every spelling `unwrapped`
+    reads as NULL (350), and names what to declare instead: no default.
+    Refused rather than folded to none, because the loader hands the
+    dialect the declaration to check and not to rewrite, and a silent
+    rewrite is what 266 wrote this class of rule against. Every command
+    that hands statements to a database runs these checks (141), so the
+    change is never planned.
+
+352. **A stored key is compared as the engine's own check compares it: under
+    the referenced column's collation, through the operator the constraint
+    records.** The count over the referencing tables spelled every column of
+    a key `p.<referenced> = <child side>`, and `=` between two columns is the
+    parser's to resolve. **Measured**: a child column collated explicitly and
+    differently from the column it references — the parent `"C"`, the child
+    `"en_US.utf8"` — is a key the engine accepts and enforces, the delete
+    refused; and the plain comparison between them fails the moment a row is
+    compared, `could not determine which collation to use`, which the probe
+    runner reads as unchecked (342) — a delete guard that walks past the one
+    child it was written for. A default-collated side takes the other's
+    collation and never conflicts, so it takes a managed parent collated
+    itself, which the pull notes (introspect) and still manages.
+
+    The parent side of each column is now spelled with `COLLATE` the
+    referenced column's collation when it has one — the collation the
+    engine's referential check uses, and an explicit one wins over the
+    child's implicit one — and compared through `OPERATOR(<schema>.<op>)`
+    from `conpfeqop`, so that the comparison is the constraint's and not
+    whatever `=` resolves to between the two types. Both are read from the
+    catalog inside the probe, as the rest of the key is. The planned keys
+    (345) keep the plain spelling: their columns are this plan's, in a model
+    that holds no collation.
+
+353. **A planned key compares two stored columns under the referenced
+    column's collation, spliced in by the engine.** 352 spelled the stored
+    keys' comparisons from the catalog, and left the planned keys (345) on
+    the plain `=`, "their columns being this plan's, in a model that holds
+    no collation". The columns are this plan's; their collations may not
+    be: a column collated outside this tool is one the pull notes and still
+    manages, and **measured**, `ADD CONSTRAINT … FOREIGN KEY` between a
+    parent `"C"` and a child `"en_US.utf8"` is accepted, while the plain
+    comparison between them fails the moment a row is compared — the
+    planned key's count read as unchecked, and under a staged apply the
+    delete committed before the key failed on its orphan.
+
+    The planned key's count over stored rows was already assembled by the
+    engine, for `relkind`; it now assembles the collation too. Where a
+    stored parent column meets a stored child column, the parent side
+    carries a mark, and the assembled body replaces it with `COLLATE
+    <schema>.<collation>` read from `pg_attribute` — the referenced
+    column's own, which is what the engine's check will use, and explicit
+    on one side is enough. A column this plan retypes carries the clause
+    only where the new type has a collation. The arrivals of updated rows,
+    the one static count that compared two stored columns, now run through
+    the same assembly; a literal takes the column's collation on its own
+    and needs nothing. A mark that reaches a probe as text is refused
+    before the probe is returned, because as text it is a syntax error
+    the runner would read as unchecked.
+
+354. **The parent's own readability is asked before the children are
+    counted.** The refusal over children the session cannot count (329,
+    342) asked about the referencing relations and never about the table
+    the row is deleted from — and every count reads that table: the
+    deleted row by its key column, and the referenced columns of every
+    key, which may not be the key column at all (116). `DELETE` grants
+    none of those reads. **Measured**: with `DELETE` and `SELECT` on the
+    key column alone, the count of children through a key into another
+    column fails `permission denied for table`, the delete runs, and `ON
+    DELETE CASCADE` takes the child the count never saw.
+
+    The refusal now carries a parent-side term: schema `USAGE`, and table
+    `SELECT` or column `SELECT` on the key column, on every referenced
+    column of every stored key the delete meets (read from `confkey`), and
+    on every stored column a planned key references; a row-security policy
+    on the parent refuses on the same terms as one on a child, because a
+    `SELECT` policy and a `DELETE` policy need not agree on the row.
+
+355. **A default is a literal in every spelling this engine reads one.** The
+    reader of defaults admitted a string only as `'…'`, which is the one
+    spelling the catalog deparses every string to — `E'…'`, `U&'…'`,
+    `N'…'` and `$tag$…$tag$` all come back `'…'::text`, measured — so the
+    other spellings reach the plan only from a declaration, verbatim, and
+    there they were read as an expression no probe can evaluate: a row left
+    to `DEFAULT E'old'` was refused, and with it the plan that unpicks a
+    reference before deleting its parent (the shape of 350, one spelling
+    further along).
+
+    `is_constant` now hands a string in any of those spellings to the
+    emitter's own reader, `is_a_bare_literal`, which already knows where
+    each one ends — an escape in `E'…'`, a tag in `$tag$…$tag$`, a literal
+    continued across a newline — and that `E'a' || 'b'` is not one. One
+    reader for both questions, because the emitter's postcondition and the
+    probes' comparison are the same question about the same text.
+
+356. **`U&'…' UESCAPE '…'` is one literal.** The reader of string literals
+    left it as a recorded gap — two literals with a keyword between them,
+    answering "not a bare literal" — and could afford to, because the
+    guard it served refuses when it says *yes*; the gap only let a
+    session-decided date through in one more spelling. 355 made the same
+    reader the one that decides whether a default is a constant the probes
+    can compare, and there "no" refuses a valid plan: a row left to
+    `DEFAULT U&'keep' UESCAPE '!'` was refused as an expression.
+
+    **Measured** on 18.6: the keyword ends the literal — nothing continues
+    it past the escape character, while a plain continuation before it is
+    still one literal; the character may be spelled `'!'` or `E'!'`, with
+    any trivia or none before the keyword and between it and the
+    character; and two characters, none, a hex digit, `+`, a quote or a
+    space are each refused by the engine. The reader now admits exactly
+    that shape, in the one place both questions are asked. The guard over
+    session-decided defaults refuses one more spelling as a result, which
+    is the direction it is allowed to move in.
+
+357. **The cast scanners read a string the way the engine does, and the
+    prefix test reads bytes.** Two readers of a default's text were written
+    around the quote character alone. `without_a_cast` and
+    `without_a_cast_call` toggled "inside a string" on every `'`, so
+    `E'it\'s'::text` ended its string at the apostrophe and kept its cast,
+    and `$$it's$$::text` never closed one; read as expressions, a row left
+    to either was refused. And `is_constant` looked at its first character
+    through a one-byte slice, which is not a character boundary when the
+    character is `é` — a default `é()` is an expression like any other,
+    and the reader panicked on it while classifying a row.
+
+    One `string_end` now serves both scanners: a `'` opened by an `E` that
+    is not the tail of an identifier takes backslash escapes, a doubled
+    `''` is one quote in any string, and a `$tag$` string ends at its own
+    tag with nothing inside it — a quote or a `::` — read as structure. The
+    prefix test compares bytes. Both were second instances of a known
+    shape: the literal reader (355, 356) already knew every one of these
+    rules, and these two readers were asked the same question about the
+    same text.
+
+358. **A comment in a default is whitespace to the reader of defaults, as it
+    is to the engine.** `unwrapped` took off parentheses and casts and left
+    a comment where it stood, so `NULL /* note */::text` unwrapped to `NULL
+    /* note */`, which is not `NULL` to a string comparison — and 351's
+    refusal let the declaration through. **Measured**: `NULL /* note
+    */::text`, `CAST(NULL /* note */ AS text)`, `/* lead */ NULL` and a
+    parenthesised `NULL -- line` all leave the column with no default at
+    all, as a bare `NULL` does, so the declaration is the one 351 refuses
+    for never converging; a commented value default, `'x' /* c */::text`,
+    is kept as `'x'::text`.
+
+    `unwrapped` now strips a comment at either end of the text on every
+    pass, through the emitter's own readers of trivia — which already know
+    that a line comment runs to its newline, that a block comment ends at
+    its close, and that an unterminated one is not trivia but text the
+    engine refuses by name (266). One more reader asked the literal
+    reader's question about the same text, and answered it the literal
+    reader's way (355–357).
+
+359. **The cast scanners read a comment as a gap, wherever it stands.** 358
+    stripped a comment from either end of the text and left the scanners
+    themselves reading `/` and `-` as characters of a type name or a
+    structure: `CAST(NULL AS text /* note */)` handed `text /* note */` to
+    the type test, which refused it; `CAST /* c */ (…)` found no
+    parenthesis; and a comment holding a parenthesis, `CAST(NULL AS text
+    /* ) */)`, counted it. **Measured**: every one of those, a comment
+    between `AS` and the type, one inside the parentheses at either end,
+    a nested block comment and a line comment before the close, leaves the
+    column with no default at all — the declaration 351 refuses — and a
+    commented value default is kept.
+
+    Both scanners now step over a comment as they step over a string,
+    through the emitter's block-comment reader, which counts nesting; an
+    unterminated one is not a gap and the text is left to the engine to
+    refuse by name (266). The type after `::` or `AS`, and the text after
+    `CAST`, are read past their trivia. The same shape as 357, one token
+    further along.
+
+360. **A default is a number in every spelling this engine reads one.** The
+    reader admitted decimal digits, a point and an exponent, and nothing
+    else: `2_55` and `0xFF` were expressions, a row left to either was
+    refused as unevaluable, and the plan that moves a child to `255` before
+    deleting `1` was refused with it. **Measured** on 18.6: an underscore
+    stands between two digits of the integer part, the fraction or the
+    exponent, and right after a base prefix, never at either end or
+    doubled; `0x`, `0o` and `0b` open an integer with no fraction and no
+    exponent, and `e` after `0x` is a digit. The reader admits exactly
+    that, and refuses `1_`, `_1`, `1__0`, `1._5`, `0xFF.5`, `0x` and `1e_5`
+    as the engine does.
+
+361. **A typed NULL default is refused only where the engine erases it: a
+    NULL of the column's own unmodified type.** 351 said every spelling of
+    a NULL default leaves no `pg_attrdef` row, from four measurements that
+    happened to cast to the column's own type. **Measured** wider: the
+    engine erases the default when, coerced to the column, it is a bare
+    null constant — `NULL`, `NULL::text` on `text`, `NULL::int` on
+    `integer`, `NULL::timestamp with time zone` on `timestamptz` — and
+    keeps it whenever the coercion leaves a step behind: a NULL of another
+    type (`NULL::varchar` on `text`, `NULL::bigint` on `integer`), of the
+    column's type with a modifier the column lacks (`NULL::timestamp(3)
+    with time zone` on `timestamptz`), or of any type where the column
+    itself carries a modifier (`NULL::varchar(10)` on `varchar(10)`,
+    `NULL::numeric(5,2)` on `numeric(5,2)`). A kept default reads back
+    under the catalog's spelling, and declared that way it converges.
+
+    The refusal now reads the type of the outermost cast taken off the
+    default (`unwrapped_with_type`) and refuses only a bare NULL, or one
+    whose cast type normalizes to the column's own with no argument on the
+    column; a cast type the model cannot spell — `timestamp(3) with time
+    zone`, which puts its argument in the middle — is a type the column's
+    is not, and the default is left alone. The type test behind both cast
+    scanners admits what the engine casts to: words after a modifier
+    (`timestamp(3) with time zone`, `interval day to second(3)`) and array
+    markers in every spelling, which is the finding that opened this
+    entry — `CAST(NULL AS timestamp(3) with time zone)` was neither
+    unwrapped to NULL for the probes nor, as it turns out, erased.
+
+362. **A comment inside a type's text is the whitespace it is to the
+    engine.** 359 read a comment as a gap at either end of a type and
+    between the tokens of a cast, and left one between the *words* of a
+    type — `double /* note */ precision` — to the type test, which refused
+    the slash. **Measured**: `CAST(NULL AS double /* note */ precision)` on
+    `double precision`, `NULL::double -- c ⏎ precision`, `timestamp /* c */
+    with time zone` and `text /* c */ []` are each erased as the bare NULL
+    of the column's own type is (361); `numeric(5, /* c */ 2)` on
+    `numeric(5,2)` is kept, as the modified column's is. The type text
+    behind both scanners is now read with every comment replaced by one
+    space and runs of whitespace by one, before it is tested as a type or
+    parsed as the model's, so that the validator compares the type and not
+    the trivia; an unterminated block comment is still not a type, and is
+    left to the engine to refuse by name. The last of the readers written
+    around a character instead of the engine's lexical rules (355–361).
+
+363. **The cast scanners end a line comment where the engine does, and read
+    a comment as the gap around `AS`.** Two more places the scanners of
+    359–362 were written around a character: their line comment ran to
+    `\n` alone, so `CAST(NULL -- note ⏎(CR) AS text)` read the rest of the
+    expression as commented — the shape PITFALLS already records for the
+    module scanner, and `emit::NEWLINE` already ends one at either
+    character; and the keyword `AS` was recognised only between two
+    whitespace bytes, so `CAST(NULL/**/AS/**/text)`, whose separators are
+    comments, was no cast. **Measured**: both are erased on a `text`
+    column as the bare NULL is, and a value with a carriage-return comment
+    is kept. The scanners now end a line comment at `emit::NEWLINE`, and
+    read `AS` as the keyword when what stands before it is whitespace or a
+    comment just skipped and what follows is whitespace or a comment
+    opening. Nothing in these readers is left that looks at a byte where
+    the engine looks at a token.
+
+364. **The cast scanner ends a token where the lexer does, and the
+    validator reads a cast type as the grammar spells it.** Two last shapes
+    of 355–363. The keyword `AS` was read only after a gap, so `CAST('keep'AS
+    text)`, `CAST($$x$$AS text)` and `CAST((NULL)AS text)` — each a
+    literal the engine accepts, since a string, a `)` and a quoted
+    identifier close their own token — were no cast, and an update to such
+    a default was refused as an expression the count cannot evaluate;
+    `CAST(NULL AS"text")` was no cast either. And the validator's rule of
+    361 parsed the cast type as the model's, which has no `.` or `"`, so
+    `NULL::pg_catalog.text` on a `text` column was not the column's own
+    type and the erased default was left to be set on every plan. **Measured**
+    on 18.6: `1AS` is "trailing junk after numeric literal" and `NULLAS` one
+    word, so a bare word or number still needs the gap; `AS(text)` is a
+    syntax error, so `(` opens nothing; `NULL::pg_catalog.text`,
+    `NULL::"text"`, `"pg_catalog" . "text"`, `pg_catalog/**/./**/text`,
+    `PG_CATALOG.INT4` on `integer`, `"bool"` on `boolean` and
+    `pg_catalog.timestamptz` on `timestamptz` are each erased as the bare
+    NULL is; `pg_catalog.integer`, `"integer"` and `"TEXT"` are no type at
+    all; `NULL::app.text` over a domain in another schema, `NULL::bpchar` on
+    `character` (the modifier is not the column's) and `NULL::"char"` (the
+    engine's one-byte type, not `character`) are kept. The scanner now reads
+    `AS` after a string, a quoted identifier or a `)` as after a gap, and
+    before a `"` as before one; the validator takes a `pg_catalog.`
+    qualification and quotes off the type first, and only for the names the
+    catalog has under that spelling — the grammar words `integer`, `boolean`,
+    `character varying` and `double precision` resolve to nothing quoted or
+    qualified — so that another schema's type, a domain among them, stays
+    another type. Not a general name resolver: `search_path` is not
+    consulted, and a type the catalog has under a spelling this dialect
+    does not know is left to the engine.
+
+365. **A sign is read through the trivia, groupings and casts between it and
+    its operand.** The constant test of 360 took one leading `-` or `+` off
+    the text and read what followed as the number, so `- 1`, `+ 1`, `- /*
+    c */ 1` and `- - 1` were expressions no probe can evaluate, and an update
+    that left a child to such a default while a parent went was refused;
+    worse, the catalog itself deparses a declared `+1` as `(+ 1)` and `+-1`
+    as `(+ '-1'::integer)`, so every read-back positive default was one.
+    **Measured** on 18.6: each of those spellings, and `-(-1)`, `-(+ 1)`,
+    `-'1'::integer` and `-NULL::integer`, is accepted and folded or kept as
+    `(- 1)`, `(- (+ 1))`, `(- NULL::integer)`; a sign before a bare string,
+    `NULL` or a boolean is refused by name (`operator is not unique: -
+    unknown`), so what the signs stand before is a number, or a cast the
+    engine already resolved. The test now takes off each sign and, after it,
+    the trivia, parentheses and casts the readers of 358–364 already take
+    off, and asks the same question of what is left; a sign before nothing,
+    or before an expression, is still no constant.
+
+366. **A parent row this plan inserts meets an arriving child under the
+    referenced column's collation.** 353 spliced the referenced column's
+    collation into the planned key's count where a stored parent column met
+    a stored child column, and left a literal to take the column's
+    collation on its own — which it does against a column, and not against
+    another literal: the survivor check of 338 compares the tuple a parent
+    insert spells with the tuple a child insert spells, two literals, under
+    the database's collation. **Measured** on 18.6: with both columns under
+    one nondeterministic case-insensitive collation, a child `'A'` inserted
+    beside a parent `'a'` references it and the key is added once the
+    stored `'A'` parent is gone, while `'a'::text = 'A'::text` on its own is
+    false — so a valid plan was refused, the arriving child attributed to
+    the doomed row and to no survivor. (345's refusal of a key between
+    *different* collations, one nondeterministic, stands; here both are
+    one.) The inserted-survivor comparison now carries the mark whenever
+    the referenced column is a stored one, and the child-insert term of the
+    count, which stood outside the engine-assembled body, is assembled the
+    same way — only where it carries a mark, so that a probe with no
+    collation to ask about keeps its plain text. Against a stored child
+    column the literal already took a collation, the child's; where the two
+    columns' collations differ the engine accepts the key only when both are
+    deterministic, under which equality is one answer, so nothing changes
+    there.
+
+367. **A typed literal is the constant it is.** The constant test of 355–365
+    read a string in every spelling the lexer has and a number in every
+    base, and let the SQL-standard `DATE '2026-02-01'` — a type name and a
+    string — fall through to the number test, so an update that returned a
+    child to such a default while its former parent went was refused as one
+    no probe can evaluate. **Measured** on 18.6: `DATE '2026-02-01'`,
+    `TIMESTAMP(0) '…'`, `NUMERIC(5,2) '1.5'`, `INTERVAL '1' HOUR TO MINUTE`,
+    `pg_catalog.date E'…'`, `"text" $$…$$`, `VARCHAR(10) U&'…' UESCAPE '!'`
+    and `date'…'` with no gap are each accepted and stored as the cast
+    literal the catalog deparses, `'2026-02-01'::date`, so the spelling
+    reaches the reader only from a declaration; `DATE ('…')` and `TEXT[]
+    '{a}'` are syntax errors, `foo 'x'` and `lower 'x'` are refused by name,
+    and `TEXT 'a' || 'b'` is an expression. The test now reads a type name —
+    as the cast readers admit one, arrays aside — followed by one string in
+    any of its spellings, with an interval's field words and nothing else
+    after it, as a constant. Not the emitter's bare-literal rule, which
+    keeps `DATE '01/02/2026'` outside on purpose: that a spelling is
+    session-decided is a question about its value, and this one is about
+    whether a probe can compare it.
+
+368. **What follows a typed literal's string is an interval qualifier or
+    nothing.** 367 admitted any words after the string so that `INTERVAL '1'
+    HOUR TO MINUTE` would read as the constant it is, and the whitelist of
+    letters and parentheses let `(BOOLEAN 'false' OR flip())` — a valid
+    default once parenthesised, a bare `DEFAULT x OR y` being a syntax error
+    — pass as a literal, so the read-back would have evaluated a volatile
+    expression a second time and refused a correct row write, or run a side
+    effect twice. **Measured** on 18.6: `DAY`, `HOUR TO MINUTE`, `SECOND(3)`,
+    `DAY TO SECOND (2)`, `YEAR TO MONTH` and a qualifier with comments
+    around it are each accepted; `DAYS` and `TO DAY` are syntax errors. The
+    reader now takes, after the string, one of the six field words, or two
+    joined by `TO`, with one `(n)` after a trailing `SECOND` — and nothing
+    else. A qualifier the grammar refuses by combination, `MINUTE TO DAY`,
+    is left to the engine, as every declaration it refuses by name is.
+
+369. **A Unicode-escaped type name is the name it spells.** The cast readers
+    of 355–368 admitted a quoted type name and a qualified one, and the
+    validator of 361 read them as the grammar does (364); a Unicode-escaped
+    identifier, `U&"te\0078t"`, failed the type test on its `&` and `\`, so
+    `NULL::U&"te\0078t"` on a `text` column was no cast to the reader, the
+    NULL of the column's own type went unrefused, and the erased default was
+    set on every plan. **Measured** on 18.6: `NULL::U&"te\0078t"`,
+    `CAST(NULL AS U&"te\0078t")`, `NULL::U&"te!0078t" UESCAPE '!'`,
+    `NULL::U&"pg_catalog".U&"text"`, `NULL::u&"text"` and
+    `NULL::U&"te\+000078t"` each leave a `text` column with no default, as
+    `NULL::text` does. The type text is now read with every Unicode-escaped
+    identifier replaced by the plain quoted identifier it decodes to, through
+    the decoder the module identity already uses (`pbps_model::module::
+    decode_unicode_escapes`), its `UESCAPE` clause honoured by the rule the
+    emitter reads one by; an escape that does not decode, or a clause
+    spelled wrong, is no type, and is left to the engine to refuse by name.

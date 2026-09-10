@@ -32,7 +32,8 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ColumnType, Module, ModuleId, ModuleKind, RoutineArg, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, RoutineArg, Schema, Strategy,
+    Table, TableName,
 };
 
 pub mod catalog;
@@ -55,6 +56,8 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
 };
 pub mod introspect;
 pub mod modules;
+mod preflight;
+pub mod rows;
 pub mod state;
 mod types;
 
@@ -68,7 +71,6 @@ mod types;
 pub enum Unbuilt {
     Introspection,
     Roles,
-    ReferenceData,
     Probes,
 }
 
@@ -77,7 +79,6 @@ impl Unbuilt {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
             Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
-            Unbuilt::ReferenceData => "reference data (Phase 5 step 7)",
             Unbuilt::Probes => "preflight probes (Phase 5 step 9)",
         }
     }
@@ -650,8 +651,59 @@ impl Dialect for Postgres {
             {
                 found.push(e);
             }
+            // A default that is a NULL of the column's own type. **Measured**
+            // on 18.6: `DEFAULT NULL`, `DEFAULT (NULL)` and `DEFAULT NULL::text`
+            // on a `text` column leave the column with no `pg_attrdef` row at
+            // all — to this engine a column with no default *is* a column
+            // whose default is NULL — so the pull reads the column back with
+            // none, every connected plan sets the default again, and the
+            // deploy's check of what came back, which compares whether a
+            // default is there (DECISIONS 185, 186), refuses the column the
+            // plan just wrote. Refused where the user is looking at the
+            // declaration, naming what to declare instead, as `serial` is
+            // (DECISIONS 227, 351). A NULL cast to any *other* type, or to
+            // the column's type where the column carries a modifier —
+            // `NULL::varchar` on `text`, `NULL::varchar(10)` on
+            // `varchar(10)` — is a default the engine keeps and reads back,
+            // and is left alone (DECISIONS 361). The type is the one the
+            // grammar sees, so `NULL::pg_catalog.text` and `NULL::"text"`
+            // are `NULL::text` (DECISIONS 364). SQL Server keeps `(NULL)` as
+            // a default constraint of its own, which is why this rule is this
+            // dialect's.
+            if let Some(expr) = &column.default {
+                let (core, cast) = rows::unwrapped_with_type(expr);
+                let erased = core.eq_ignore_ascii_case("null")
+                    && match cast {
+                        None => true,
+                        Some(ty) => {
+                            column.ty.args.is_empty()
+                                && types::as_the_grammar_spells(&ty)
+                                    .and_then(|t| t.parse::<ColumnType>().ok())
+                                    .and_then(|t| types::normalize(&t).ok())
+                                    .is_some_and(|t| t == normalized)
+                        }
+                    };
+                if erased {
+                    found.push(DialectError::Invalid {
+                        dialect: types::DIALECT,
+                        message: format!(
+                            "column `{column_name}` declares `default: {expr}`, which this engine \
+                             does not keep: a NULL of the column's own type, bare, cast or in \
+                             parentheses, leaves no default in the catalog at all, and the \
+                             column reads back with none. Every plan would set it again and the \
+                             check of what the apply left behind would refuse the column. A \
+                             column with no default already defaults to NULL here: declare no \
+                             default."
+                        ),
+                    });
+                }
+            }
             found.extend(identity_problems(column_name, column));
         }
+        // Reference data: the rules whose answer is this engine's, ADR-0013 §2
+        // among them. The model's own rules — a row's key is its identity in
+        // every dialect — are `pbps_model::data::check`'s.
+        found.extend(rows::data_problems(name, table));
         found
     }
 
@@ -777,6 +829,26 @@ impl Dialect for Postgres {
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(self, change, strategy)
     }
+
+    /// The reference-data probes, and no others yet: the rest of this
+    /// dialect's preflight arrives with Phase 5 step 9. A probe list is not a
+    /// promise that everything was checked — [`Unbuilt::Probes`] is what says
+    /// the step is missing, and it is what `emit` still refuses for the
+    /// changes that need those probes.
+    fn preflight(&self, changes: &ChangeSet) -> Vec<pbps_dialect::Probe> {
+        preflight::probes(changes)
+    }
+
+    /// Whether an omitted cell in the read-back *means* at-default for this
+    /// column — the same question the row reader asks when it builds the
+    /// query, asked once so the two cannot drift (DECISIONS 191).
+    fn reads_back_at_default(&self, column: &pbps_model::Column) -> bool {
+        rows::confirms_default(column)
+    }
+
+    fn declaration_notes(&self, schema: &Schema) -> Vec<String> {
+        rows::not_checked_offline(schema)
+    }
 }
 
 #[cfg(test)]
@@ -812,12 +884,7 @@ mod tests {
     /// nothing to do".
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
-        for part in [
-            Unbuilt::Introspection,
-            Unbuilt::Roles,
-            Unbuilt::ReferenceData,
-            Unbuilt::Probes,
-        ] {
+        for part in [Unbuilt::Introspection, Unbuilt::Roles, Unbuilt::Probes] {
             let message = part.refuse().to_string();
             assert!(message.contains("Phase 5 step"), "{message}");
             // "does not implement ... yet", never "does not support": the
@@ -834,33 +901,141 @@ mod tests {
     /// name their own step.
     #[test]
     fn a_change_from_an_unbuilt_part_is_an_error_and_not_an_empty_plan() {
-        let unbuilt = [
-            (
-                Change::CreateRole {
-                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
-                    name: "analyst".to_owned(),
-                },
-                "Phase 5 step 6",
-            ),
-            (
-                Change::DeleteRow {
-                    table: "app.t".parse().expect("a table name parses"),
-                    key_column: "code".to_owned(),
-                    key: pbps_model::RowKey::from("a"),
-                    cause: pbps_model::change::DeleteCause::Undeclared,
-                    row: std::collections::BTreeMap::new(),
-                    types: std::collections::BTreeMap::new(),
-                    after_types: std::collections::BTreeMap::new(),
-                },
-                "Phase 5 step 7",
-            ),
-        ];
+        let unbuilt = [(
+            Change::CreateRole {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
+                name: "analyst".to_owned(),
+            },
+            "Phase 5 step 6",
+        )];
         for (change, step) in unbuilt {
             let refusal = Postgres::new()
                 .emit(&change, Strategy::default())
                 .expect_err("this part is not built");
             assert!(refusal.to_string().contains(step), "{refusal}");
         }
+    }
+
+    /// A default that is NULL is one this engine erases, so the declaration
+    /// is refused before any plan restates it forever (DECISIONS 351).
+    #[test]
+    fn a_null_default_is_refused_in_every_spelling_the_engine_erases() {
+        let mut table = Table::default();
+        // (column, its type, its default): the first group the engine erases
+        // — a NULL of the column's own unmodified type, however spelled —
+        // and the second it keeps (DECISIONS 351, 361).
+        let erased = [
+            ("bare", "text", "NULL"),
+            ("parens", "text", "(null)"),
+            ("cast", "text", "NULL::text"),
+            ("standard", "text", "CAST(NULL AS text)"),
+            ("commented", "text", "NULL /* note */::text"),
+            ("cast_commented", "text", "CAST(NULL /* note */ AS text)"),
+            ("led", "text", "/* lead */ NULL"),
+            ("typed_comment", "text", "CAST(NULL AS text /* note */)"),
+            ("alias", "integer", "NULL::int"),
+            (
+                "worded",
+                "timestamptz",
+                "CAST(NULL AS timestamp with time zone)",
+            ),
+            ("twice", "text", "NULL::varchar::text"),
+            (
+                "worded_comment",
+                "double precision",
+                "CAST(NULL AS double /* note */ precision)",
+            ),
+            ("cr_comment", "text", "CAST(NULL -- note\r AS text)"),
+            ("glued", "text", "CAST(NULL/**/AS/**/text)"),
+            // The type as the grammar sees it: qualified, quoted, spaced,
+            // folded (DECISIONS 364).
+            ("qualified", "text", "NULL::pg_catalog.text"),
+            ("qualified_call", "text", "CAST(NULL AS pg_catalog.text)"),
+            ("quoted", "text", "NULL::\"text\""),
+            (
+                "quoted_both",
+                "text",
+                "CAST(NULL AS \"pg_catalog\" . \"text\")",
+            ),
+            ("spaced", "text", "CAST(NULL AS pg_catalog/**/./**/text)"),
+            ("folded", "integer", "NULL::PG_CATALOG.INT4"),
+            ("quoted_alias", "boolean", "NULL::\"bool\""),
+            (
+                "qualified_time",
+                "timestamptz",
+                "NULL::pg_catalog.timestamptz",
+            ),
+            ("glued_quote", "text", "CAST(NULL AS\"text\")"),
+            // A Unicode-escaped type name is the name it spells
+            // (DECISIONS 369).
+            ("unicode", "text", "NULL::U&\"te\\0078t\""),
+            ("unicode_call", "text", "CAST(NULL AS U&\"te\\0078t\")"),
+            (
+                "unicode_uescape",
+                "text",
+                "NULL::U&\"te!0078t\" UESCAPE '!'",
+            ),
+            (
+                "unicode_qualified",
+                "integer",
+                "NULL::U&\"pg_catalog\".u&\"int\\0034\"",
+            ),
+        ];
+        let kept = [
+            ("other_type", "text", "NULL::varchar"),
+            ("modified_column", "varchar(10)", "NULL::varchar(10)"),
+            (
+                "modified_cast",
+                "timestamptz",
+                "NULL::timestamp(3) with time zone",
+            ),
+            (
+                "modified_numeric",
+                "numeric(5,2)",
+                "CAST(NULL AS numeric(5,2))",
+            ),
+            (
+                "modified_comment",
+                "numeric(5,2)",
+                "CAST(NULL AS numeric(5, /* c */ 2))",
+            ),
+            ("wider", "integer", "NULL::bigint"),
+            // Another schema's type is another type, a grammar word is no
+            // catalog name, and `"char"` is not `character` (DECISIONS 364).
+            ("other_schema", "text", "NULL::app.text"),
+            ("no_such_type", "integer", "NULL::pg_catalog.integer"),
+            ("quoted_grammar", "text", "CAST(NULL AS \"TEXT\")"),
+            ("internal_char", "character", "NULL::\"char\""),
+            ("catalog_char", "character", "NULL::pg_catalog.bpchar"),
+            ("unicode_other", "text", "NULL::U&\"varch\\0061r\""),
+            ("unicode_broken", "text", "NULL::U&\"te\\00zzt\""),
+            ("value", "text", "'x'"),
+            ("expression", "text", "NULLIF('a', 'a')"),
+        ];
+        for (name, ty, default) in erased.iter().chain(&kept) {
+            let mut c = pbps_model::Column::new(ty.parse().expect("a type"));
+            c.default = Some((*default).into());
+            table.columns.insert((*name).into(), c);
+        }
+        table.columns.insert(
+            "none".into(),
+            pbps_model::Column::new("text".parse().expect("a type")),
+        );
+
+        let problems =
+            Postgres::new().validate_table(&"app.t".parse().expect("a table name parses"), &table);
+        let mut named: Vec<String> = problems
+            .iter()
+            .map(|e| {
+                let m = e.to_string();
+                assert!(m.contains("declare no default"), "{m}");
+                m.split('`').nth(1).expect("a column name").to_owned()
+            })
+            .collect();
+        named.sort();
+        let mut expected: Vec<&str> = erased.iter().map(|(n, _, _)| *n).collect();
+        expected.sort_unstable();
+        assert_eq!(named, expected, "{problems:?}");
     }
 
     /// The one rule the emitter cannot enforce on every path, enforced where it

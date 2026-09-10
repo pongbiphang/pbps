@@ -409,8 +409,93 @@ included; and a tolerated `42P07` is verified against the catalog rather than
 believed, because it names *a* relation the DDL would create and not the
 ledger.
 
-What remains is steps 6, 7, 9 and 10: roles, reference data, probes, and the
-suite in full.
+Step 7 of ten (issue #82) is **reference data**, the connected half of ADR-0004
+on this engine. Two of ADR-0013's findings are places where following the SQL
+Server rule produces a tool that is confidently wrong. The pre-delete probe
+counts **every** foreign key and never reads `convalidated`: it looks exactly
+like the `is_disabled` flag the other probe skips a key by, and measured, it
+means the opposite — a `NOT VALID` key still refuses both a violating insert and
+the parent's delete (DECISIONS 320). And an identity-keyed `data:` block is
+**refused** rather than pinned: measured, `OVERRIDING SYSTEM VALUE` leaves the
+sequence behind, so the deployment verifies clean and the application's next
+insert fails on the primary key (DECISIONS 321).
+
+What pbps renders is setting-independent by construction rather than by scope —
+`E'…'` with backslashes doubled, `decode('…','hex')` for a `bytea` — because a
+write takes no settings scope and canonical hex under
+`standard_conforming_strings = off` is *accepted* while storing different bytes
+(DECISIONS 319). The read-back renders every column with one expression and
+lets the canonical scope fix the spelling, which is where this engine differs
+from the other's per-type `CONVERT` styles (DECISIONS 322), and it recognises a
+literal default through the cast this engine welds on, or a declaration that
+omits a column and one that spells it would stop comparing equal
+(DECISIONS 323). Each row statement is a `DO` block, so the write and the
+checks that hold it to what the plan reviewed are one statement even under a
+staged apply (DECISIONS 328), and the delete's guard locks the parent row —
+this engine's own foreign-key machinery takes a `FOR KEY SHARE` there, so a
+child arriving after the probe waits for the delete instead of racing it
+(DECISIONS 326). The probe's dynamic SQL runs through `query_to_xml`, which is
+this engine's only way to run generated SQL from inside the one `SELECT` a
+probe is (DECISIONS 325).
+
+Every comparison this step makes is a comparison of *text* — both sides through
+the column's type, byte for byte under `COLLATE "C"` — on the read path and the
+write path alike, so a column whose collation calls two spellings equal cannot
+hide a hand edit, and a `json` cell is compared like any other despite the type
+having no `=` at all (DECISIONS 329, 330, 331). The delete's guard leaves out
+the one row it is about to remove, so a self-referencing row can be deleted
+(330), and refuses rather than trusting a count row-level security has filtered,
+because this engine's referential actions are not filtered by it (329). A write
+left to a default the probe cannot evaluate, on a column a live foreign key into
+the deleted row's table spans, is refused before the first statement, as
+DECISIONS 124 asks (331). The probe reads every key the delete will meet: a
+relation only where its key reaches it, `ONLY` for an inheritance parent and
+in full for a partitioned one (334); a table the session cannot count through,
+filtered by a policy or unreadable outright, as a refusal rather than a zero
+(333, 335); and every key this plan itself adds, asked about from the plan
+alone — the synthetic catalog row of 335 gave way to it (345) — counted
+through the value a column it adds is backfilled with, against the parent rows
+the plan leaves there, through the column's type and the type the plan gives
+it (336–341, 345); and a session is refused for what its grants leave it unable to
+count — the schema first, then the table or its columns — not for lacking a
+grant on the whole table (340, 342). Every probe answers in `int4`, the width
+the runner reads, clamped rather than overflowing (342, 343); a child the plan
+creates is counted for the rows it inserts before its key exists, and a key
+column an insert leaves to an identity is refused (343); a key whose delete
+action this session will not run — triggers disabled, or the replica role —
+is not one the delete meets (344); and the guard's own policy check asks
+about the referencing relations, not the catalog's per-partition copies of
+their keys (346); and whether a row the plan writes holds a NULL in a key is
+decided from that row, not from what the table is backfilled with (347),
+and a stored row's from its own stored columns, so a NULL there is never
+refused for a backfill it cannot meet (348); a NULL an update leaves alone
+is a NULL of the tuple it writes (349), and a default spelled `CAST(NULL AS
+type)` is that NULL (350) — and, this engine keeping no NULL default at all, a
+column declaring one is refused at the declaration (351). A stored key is
+compared under the referenced column's collation and through the operator the
+constraint records (352), a planned key under the referenced column's collation
+spliced in by the engine (353), and the parent's own readability is asked before
+its children are counted (354); a default is a literal in every spelling this
+engine reads one (355), `UESCAPE` included (356), and the cast scanners read a
+string as the engine does (357), a comment in a default being whitespace (358), inside a cast too (359), and a
+number a number in every base (360); a typed NULL default is refused only where
+the engine erases it, a NULL of the column's own unmodified type (361), read past
+any comment inside the type (362), a line comment ending at either newline and a
+comment standing as the gap around `AS` (363), a string, a `)` or a quoted identifier closing its own token before `AS` and a `pg_catalog.` qualification or quotes on the cast type read as the grammar reads them (364), and a sign read through the trivia, groupings and casts before its operand (365), and an inserted parent row meeting an arriving child under the referenced column's collation (366), and a typed literal read as the constant it is (367), with only an interval qualifier admitted after its string (368), and a Unicode-escaped type name read as the name it spells (369).
+
+The key-collision check is the engine's, asked under the key column's own
+collation — measured, `collisdeterministic` says nothing about case, so a rule
+reading it would refuse a valid declaration — and offline `validate` therefore
+**says it did not check** rather than reporting clean, through a new
+`Dialect::declaration_notes` (DECISIONS 327).
+
+Not in this step: the CLI still refuses the `postgres` dialect outright
+(`main.rs`'s `dialect()`), so the end-to-end path through `bootstrap`,
+`verify`, `plan --db`, `apply` and `pull --data` cannot be exercised through the
+binary until step 10 wires it. Everything above is covered by the dialect's own
+live suite instead. Composite keys remain deferred, as in ADR-0004.
+
+What remains is steps 6, 9 and 10: roles, probes, and the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI
@@ -426,6 +511,8 @@ in [ADR-0015](ADR-0015-local-ui-implementation.md): the UI runs the `pbps`
 binary as a subprocess and links none of the crates, serves a page embedded in
 the binary with no build step, refuses any request without its per-launch
 token, reads no credential itself, and commits through the user's own `git`.
+What remains is steps 6, 9 and 10: roles, probes, and the suite in full.
+
 The steps are in issue #64. Step 1 is that ADR. Step 2 froze what the page
 reads: the envelope's schema is published and checked against real output, and
 `state list` gives the ledger timeline `status`'s newest-entry row cannot
