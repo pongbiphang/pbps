@@ -6638,3 +6638,15 @@ SPEC is in sync with all of these.
     can add an edge and never has to remove one. The shared scanner, and the
     emitter's mention scans (ADR-0013 §3), keep reading a bare name
     everywhere: a report and a rebind check are over-inclusive by design.
+
+    **Amended: the path is ordered, so the answer is a rank and not a yes.**
+    The engine resolves a bare name in the *first* entry of the path that
+    holds one. Measured, with `z.p` and `a.p` both present, a bare `p` binds
+    `z.p` under `SET search_path = "z", "a"` and `a.p` under `"a", "z"`; on
+    SQL Server 2022, with `dbo.p` and `a.p` both present, `CREATE VIEW a.x AS
+    SELECT * FROM p` reads `a.p`, so the own schema outranks `dbo`. Read as
+    two candidates, a bare `p` in `z.x` drew an edge to `a.p` as well as to
+    `z.p`; with `a.p` selecting from `z.x` that closed a cycle, and name order
+    created `a.p` first. `Dialect::bare_name_rank` gives the position on the
+    path, and among the declared modules sharing a bare name only the
+    best-placed one takes the bare form.

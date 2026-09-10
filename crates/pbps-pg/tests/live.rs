@@ -7881,6 +7881,73 @@ async fn a_type_name_ending_in_a_prefix_letter_is_not_a_literals_prefix() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// A bare name resolves in the *first* schema of the write path that holds
+/// it: measured, with `z.p` and `a.p` both present, a bare `p` under `SET
+/// search_path = "z", "a"` binds `z.p`. Counting `a.p` as a candidate too
+/// invented an edge that closed a cycle with the real one, and name order
+/// then created `a.p` before the view it selects from.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_bare_name_means_the_first_schema_of_the_path_that_has_it() {
+    let base = emit_schema("path_precedence");
+    // The extra sorts first, so a scan that invents the edge orders the plan
+    // the wrong way round rather than getting it right by accident.
+    let own = format!("{base}_z");
+    let extra = format!("{base}_a");
+    let mut conn = connect().await;
+    fresh(&mut conn, &own).await;
+    fresh(&mut conn, &extra).await;
+    let pg = Postgres::with_write_path_extras(vec![extra.clone()]);
+    let mut declared = Schema::default();
+    for (id, definition) in [
+        (format!("{own}.x"), "SELECT * FROM p".to_owned()),
+        (format!("{own}.p"), "SELECT 1 AS v".to_owned()),
+        (format!("{extra}.p"), format!("SELECT * FROM {own}.x")),
+    ] {
+        declared.modules.insert(
+            id.parse().expect("a module id"),
+            module(pbps_model::ModuleKind::View, &definition),
+        );
+    }
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &Schema::default(),
+            ids: &IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        &pg,
+        &pbps_model::Hints::default(),
+    )
+    .expect("diff");
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{own}.p"), format!("{own}.x"), format!("{extra}.p")],
+        "the bare `p` means the nearer one, and only that edge is real"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT v::text FROM {own}.x")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &extra).await;
+    drop_schema(&mut conn, &own).await;
+}
+
 /// A quote doubled inside a name is one character of the name: measured,
 /// `s."z""q"` names the view `z"q`, and a view over it is written `FROM
 /// s."z""q"`. Read as two delimiters the scan found no edge at all, and with

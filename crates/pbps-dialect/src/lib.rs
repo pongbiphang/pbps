@@ -1243,16 +1243,21 @@ pub trait Dialect {
         false
     }
 
-    /// Whether a bare name in a definition that lives in `from` can resolve
-    /// to an object in `to` on this engine — the schemas a bare name is
-    /// looked up in, for the scan that reads a bare word as a possible
-    /// reference (DECISIONS 317).
+    /// Where `to` sits on the path a bare name in a definition in `from` is
+    /// looked up along, or `None` where it is not on that path at all
+    /// (DECISIONS 317).
     ///
-    /// The default is "anywhere", which is the honest answer from a dialect
-    /// that has not measured its engine's rule: an edge too many, in the
-    /// direction the scan has always erred, and never an edge too few.
-    fn resolves_bare_name(&self, _from: &str, _to: &str) -> bool {
-        true
+    /// A rank rather than a yes, because the engine resolves a bare name in
+    /// the **first** schema of the path that holds one: two declared modules
+    /// of the same bare name are not two candidates, and an edge to the
+    /// worse-placed one is invented.
+    ///
+    /// The default is `Some(0)` everywhere, which is the honest answer from a
+    /// dialect that has not measured its engine's rule: every schema on an
+    /// equal footing, an edge too many in the direction the scan has always
+    /// erred, and never an edge too few.
+    fn bare_name_rank(&self, _from: &str, _to: &str) -> Option<usize> {
+        Some(0)
     }
 
     /// This argument type as the engine spells it *in a routine's identity*.

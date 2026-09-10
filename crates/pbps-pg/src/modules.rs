@@ -1722,7 +1722,7 @@ const LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
     // These scans ask whether a definition *mentions* a name, for a report
     // and a rebind check that are over-inclusive by design (ADR-0013 §3):
     // a bare name is read wherever it is.
-    bare_scope: &pbps_model::module::every_schema,
+    bare_rank: &pbps_model::module::every_schema,
 };
 
 #[must_use]

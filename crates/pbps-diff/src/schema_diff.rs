@@ -274,12 +274,12 @@ pub fn diff_partial(
     // edge read out of a literal the engine had not closed put a view before
     // the one it selects from (DECISIONS 315).
     let lex = |definition: &str| dialect.code_only(definition);
-    let scope = |from: &str, to: &str| dialect.resolves_bare_name(from, to);
+    let rank = |from: &str, to: &str| dialect.bare_name_rank(from, to);
     let lexis = pbps_model::module::Lexis {
         code_only: &lex,
         continues_ident: dialect.lexicon().identifier_continues,
         reserved: dialect.lexicon().reserved,
-        bare_scope: &scope,
+        bare_rank: &rank,
     };
     let create_rank = rank_of(&pbps_model::module::creation_order_with(
         &declared.schema.modules,

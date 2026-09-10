@@ -701,15 +701,23 @@ impl Dialect for Postgres {
         }
     }
 
-    /// The write path: the object's own schema and the configured extras,
-    /// which is the `search_path` every statement of this dialect runs under
-    /// (DECISIONS 276). A bare name in a definition resolves through it and
-    /// nowhere else, so a same-named module in another schema is not what
-    /// the name means: measured, with no extras, `a.x AS SELECT * FROM b.z`
-    /// over `b.z AS SELECT 1 AS x` is a valid plan, and the alias `x` read
-    /// as a mention of `a.x` closed a cycle that put `a.x` first (317).
-    fn resolves_bare_name(&self, from: &str, to: &str) -> bool {
-        from == to || self.write_path_extras.iter().any(|extra| extra == to)
+    /// The write path: the object's own schema first, then the configured
+    /// extras in order, which is the `search_path` every statement of this
+    /// dialect runs under (DECISIONS 276). A bare name resolves through it
+    /// and nowhere else, and to the *first* entry that holds one: measured,
+    /// with `z.p` and `a.p` both present, a bare `p` under `SET search_path =
+    /// "z", "a"` binds `z.p`, and under `"a", "z"` binds `a.p`. With no
+    /// extras, `a.x AS SELECT * FROM b.z` over `b.z AS SELECT 1 AS x` is a
+    /// valid plan, and the alias `x` read as a mention of `a.x` closed a
+    /// cycle that put `a.x` first (317).
+    fn bare_name_rank(&self, from: &str, to: &str) -> Option<usize> {
+        if from == to {
+            return Some(0);
+        }
+        self.write_path_extras
+            .iter()
+            .position(|extra| extra == to)
+            .map(|at| at + 1)
     }
 
     /// The spelling this engine puts in a routine's identity (ADR-0009 §1).
@@ -775,23 +783,28 @@ impl Dialect for Postgres {
 mod tests {
     use super::*;
 
-    /// A bare name resolves through the write path: the object's own schema
-    /// and the configured extras, in either order, and nowhere else.
+    /// A bare name resolves through the write path — the object's own schema
+    /// first, then the extras in the order they were configured — and
+    /// nowhere else. The rank is the order, because the first entry holding
+    /// the name is the one it means.
     #[test]
-    fn a_bare_name_resolves_in_the_own_schema_and_the_extras_only() {
-        let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
-        assert!(Dialect::resolves_bare_name(&pg, "app", "app"));
-        assert!(Dialect::resolves_bare_name(&pg, "app", "shared"));
-        assert!(!Dialect::resolves_bare_name(&pg, "app", "other"));
-        assert!(
-            !Dialect::resolves_bare_name(&pg, "app", "App"),
+    fn a_bare_name_ranks_the_own_schema_first_and_then_the_extras() {
+        let pg = Postgres::with_write_path_extras(vec!["shared".into(), "public".into()]);
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "app"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "shared"), Some(1));
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "public"), Some(2));
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "other"), None);
+        assert_eq!(
+            Dialect::bare_name_rank(&pg, "app", "App"),
+            None,
             "names are exact"
         );
-        assert!(!Dialect::resolves_bare_name(
-            &Postgres::new(),
-            "app",
-            "shared"
-        ));
+        // An extra that is also the object's own schema is still first.
+        assert_eq!(Dialect::bare_name_rank(&pg, "shared", "shared"), Some(0));
+        assert_eq!(
+            Dialect::bare_name_rank(&Postgres::new(), "app", "shared"),
+            None
+        );
     }
 
     /// A refusal is output like any other, so what it says is tested: each

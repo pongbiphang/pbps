@@ -70,13 +70,20 @@ impl Dialect for Mssql {
 
     /// The module's own schema, then `dbo`. **Measured** on SQL Server 2022:
     /// with `b.z` and `dbo.z` both present, `CREATE VIEW a.x AS SELECT *
-    /// FROM z` reads `dbo.z`; with `a.z` present it reads `a.z`; with only
-    /// `b.z` it is refused (`Invalid object name 'z'`). The second step is
-    /// the caller's default schema, which is `dbo` for every login that has
-    /// not been given another; a deployer with another default schema says
-    /// the edge with `depends_on:` (DECISIONS 317).
-    fn resolves_bare_name(&self, from: &str, to: &str) -> bool {
-        from.eq_ignore_ascii_case(to) || to.eq_ignore_ascii_case("dbo")
+    /// FROM z` reads `dbo.z`; with `a.p` and `dbo.p` both present it reads
+    /// `a.p`; with only `b.z` it is refused (`Invalid object name 'z'`). So
+    /// the own schema outranks `dbo`, and nothing else is on the path. The
+    /// second step is the caller's default schema, which is `dbo` for every
+    /// login that has not been given another; a deployer with another default
+    /// schema says the edge with `depends_on:` (DECISIONS 317).
+    fn bare_name_rank(&self, from: &str, to: &str) -> Option<usize> {
+        if from.eq_ignore_ascii_case(to) {
+            Some(0)
+        } else if to.eq_ignore_ascii_case("dbo") {
+            Some(1)
+        } else {
+            None
+        }
     }
 
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
@@ -185,15 +192,15 @@ impl Dialect for Mssql {
 mod tests {
     use super::*;
 
-    /// A bare name resolves in the module's own schema and then in `dbo`,
-    /// compared the way this engine compares names, and nowhere else.
+    /// A bare name resolves in the module's own schema first and then in
+    /// `dbo`, compared the way this engine compares names, and nowhere else.
     #[test]
-    fn a_bare_name_resolves_in_the_own_schema_and_dbo_only() {
-        assert!(Dialect::resolves_bare_name(&Mssql, "app", "app"));
-        assert!(Dialect::resolves_bare_name(&Mssql, "app", "APP"));
-        assert!(Dialect::resolves_bare_name(&Mssql, "app", "dbo"));
-        assert!(Dialect::resolves_bare_name(&Mssql, "dbo", "dbo"));
-        assert!(!Dialect::resolves_bare_name(&Mssql, "app", "other"));
+    fn a_bare_name_ranks_the_own_schema_ahead_of_dbo() {
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "app"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "APP"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "dbo"), Some(1));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "dbo", "dbo"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "other"), None);
     }
 
     /// The framing moved here from `pbps-db` unchanged (ADR-0014 §2). The two

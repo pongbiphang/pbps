@@ -823,9 +823,10 @@ pub struct Lexis<'a> {
     pub continues_ident: fn(char) -> bool,
     /// Whether a lower-cased word can never stand unquoted as a name.
     pub reserved: fn(&str) -> bool,
-    /// Whether a bare name in a definition in the first schema can resolve
-    /// to an object in the second — the engine's lookup path (DECISIONS 317).
-    pub bare_scope: &'a dyn Fn(&str, &str) -> bool,
+    /// Where the second schema sits on the path a bare name in a definition
+    /// in the first is looked up along, or `None` where it is not on it — the
+    /// engine's lookup order (DECISIONS 317).
+    pub bare_rank: &'a dyn Fn(&str, &str) -> Option<usize>,
 }
 
 /// The answer of a lexis that reserves nothing: every bare word may be a
@@ -834,10 +835,10 @@ pub fn never_reserved(_: &str) -> bool {
     false
 }
 
-/// The answer of a lexis that looks a bare name up everywhere: an edge too
-/// many, never one too few.
-pub fn every_schema(_: &str, _: &str) -> bool {
-    true
+/// The answer of a lexis that looks a bare name up everywhere, every schema
+/// on an equal footing: an edge too many, never one too few.
+pub fn every_schema(_: &str, _: &str) -> Option<usize> {
+    Some(0)
 }
 
 /// The shared scanner's own lexis: SQL Server's identifier rule, which is
@@ -848,7 +849,7 @@ pub const SHARED: Lexis<'static> = Lexis {
     code_only: &code_only,
     continues_ident: is_regular_identifier_continue,
     reserved: never_reserved,
-    bare_scope: &every_schema,
+    bare_rank: &every_schema,
 };
 
 /// [`references`], with the definition read by `lexis` rather than by the
@@ -1324,7 +1325,7 @@ pub fn creation_order_with(
         .collect();
     let continues = lexis.continues_ident;
     let reserved = lexis.reserved;
-    let bare_scope = lexis.bare_scope;
+    let bare_rank = lexis.bare_rank;
 
     // The edges for one comparison. Only the scanned ones move with it:
     // `depends_on:` and a trigger's target are identities, not text.
@@ -1332,6 +1333,25 @@ pub fn creation_order_with(
         let mut needs: BTreeMap<ModuleId, BTreeSet<ModuleId>> = BTreeMap::new();
         for name in pending {
             let code = &lexed[name];
+            // A bare word resolves in the *first* schema of the lookup path
+            // that holds the name, so among the candidates sharing one only
+            // the best-placed is what the word can mean; an edge to another
+            // is invented, and one such edge closed a cycle that emitted a
+            // view before the one it selects from (DECISIONS 317).
+            let mut nearest: BTreeMap<String, usize> = BTreeMap::new();
+            for other in pending {
+                if other == name {
+                    continue;
+                }
+                if let Some(referenced) = other.referenced_name()
+                    && let Some(rank) = bare_rank(name.schema(), other.schema())
+                {
+                    nearest
+                        .entry(cased(&referenced.name, case))
+                        .and_modify(|best| *best = (*best).min(rank))
+                        .or_insert(rank);
+                }
+            }
             let mut set: BTreeSet<ModuleId> = BTreeSet::new();
             for other in pending {
                 if other == name {
@@ -1362,14 +1382,9 @@ pub fn creation_order_with(
                     && other.referenced_name() == name.referenced_name();
                 let referenced = !sibling
                     && other.referenced_name().is_some_and(|n| {
-                        references_in(
-                            code,
-                            &n,
-                            case,
-                            continues,
-                            reserved,
-                            bare_scope(name.schema(), other.schema()),
-                        )
+                        let bare = bare_rank(name.schema(), other.schema())
+                            .is_some_and(|rank| nearest.get(&cased(&n.name, case)) == Some(&rank));
+                        references_in(code, &n, case, continues, reserved, bare)
                     });
                 if declared || attached || referenced {
                     set.insert(other.clone());
@@ -1687,7 +1702,7 @@ mod tests {
             code_only: &engine_reads_an_escape_string,
             continues_ident: is_regular_identifier_continue,
             reserved: never_reserved,
-            bare_scope: &every_schema,
+            bare_rank: &every_schema,
         };
         assert_eq!(
             creation_order_with(&m, &ModuleDeps::default(), &lexis),
@@ -1717,7 +1732,7 @@ mod tests {
             code_only: &code_only,
             continues_ident: every_non_ascii_byte_is_a_name_byte,
             reserved: never_reserved,
-            bare_scope: &every_schema,
+            bare_rank: &every_schema,
         };
         let text = "SELECT 1 AS x\u{a0}y FROM app.z";
         assert!(!references_with(text, &n("app.y"), &lexis));
@@ -1772,12 +1787,12 @@ mod tests {
     /// a cycle with the real edge, and put `a.x` first.
     #[test]
     fn a_bare_name_is_a_reference_only_where_the_engine_would_look_it_up() {
-        let own_schema_only = |from: &str, to: &str| from == to;
+        let own_schema_only = |from: &str, to: &str| (from == to).then_some(0);
         let lexis = Lexis {
             code_only: &code_only,
             continues_ident: is_regular_identifier_continue,
             reserved: never_reserved,
-            bare_scope: &own_schema_only,
+            bare_rank: &own_schema_only,
         };
         let m = modules(&[("a.x", "SELECT * FROM b.z"), ("b.z", "SELECT 1 AS x")]);
         assert_eq!(
@@ -1807,6 +1822,41 @@ mod tests {
             vec![id("a.x"), id("b.z")],
             "off the path, a bare name is no edge, and name order decides"
         );
+        // And the *first* entry of the path that holds the name is the one
+        // the word means: measured, with `z.p` and `a.p` both present, a bare
+        // `p` under `search_path = "z", "a"` binds `z.p`. Counting `a.p` as a
+        // candidate too invented an edge that closed a cycle with the real
+        // one, and name order then put `a.p` before the view it selects from.
+        let z_then_a = |from: &str, to: &str| {
+            if from == to {
+                Some(0)
+            } else if to == "a" {
+                Some(1)
+            } else {
+                None
+            }
+        };
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
+            bare_rank: &z_then_a,
+        };
+        let m = modules(&[
+            ("a.p", "SELECT * FROM z.x"),
+            ("z.p", "SELECT 1 AS v"),
+            ("z.x", "SELECT * FROM p"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("z.p"), id("z.x"), id("a.p")]
+        );
+        // With the nearer one gone, the word means the one that is left.
+        let m = modules(&[("a.p", "SELECT 1 AS v"), ("z.x", "SELECT * FROM p")]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("a.p"), id("z.x")]
+        );
     }
 
     /// A reserved word is a name only where it is quoted: measured, `FROM
@@ -1823,7 +1873,7 @@ mod tests {
             code_only: &code_only,
             continues_ident: is_regular_identifier_continue,
             reserved: select_is_reserved,
-            bare_scope: &every_schema,
+            bare_rank: &every_schema,
         };
         let select = n("app.select");
         assert!(!references_with("select 1 AS x", &select, &lexis));
