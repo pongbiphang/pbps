@@ -823,12 +823,21 @@ pub struct Lexis<'a> {
     pub continues_ident: fn(char) -> bool,
     /// Whether a lower-cased word can never stand unquoted as a name.
     pub reserved: fn(&str) -> bool,
+    /// Whether a bare name in a definition in the first schema can resolve
+    /// to an object in the second — the engine's lookup path (DECISIONS 317).
+    pub bare_scope: &'a dyn Fn(&str, &str) -> bool,
 }
 
 /// The answer of a lexis that reserves nothing: every bare word may be a
 /// name.
 pub fn never_reserved(_: &str) -> bool {
     false
+}
+
+/// The answer of a lexis that looks a bare name up everywhere: an edge too
+/// many, never one too few.
+pub fn every_schema(_: &str, _: &str) -> bool {
+    true
 }
 
 /// The shared scanner's own lexis: SQL Server's identifier rule, which is
@@ -839,6 +848,7 @@ pub const SHARED: Lexis<'static> = Lexis {
     code_only: &code_only,
     continues_ident: is_regular_identifier_continue,
     reserved: never_reserved,
+    bare_scope: &every_schema,
 };
 
 /// [`references`], with the definition read by `lexis` rather than by the
@@ -850,6 +860,7 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
         Case::Folded,
         lexis.continues_ident,
         lexis.reserved,
+        true,
     )
 }
 
@@ -894,18 +905,21 @@ fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
         case,
         is_regular_identifier_continue,
         never_reserved,
+        true,
     )
 }
 
 /// Whether `code` — a definition already lexed to code — mentions `name`,
-/// with words ending where `continues` says they do and a bare word that
-/// `reserved` names counting only where it is quoted.
+/// with words ending where `continues` says they do, a bare word that
+/// `reserved` names counting only where it is quoted, and the bare form
+/// counting at all only where `bare` says the engine would look there.
 fn references_in(
     code: &str,
     name: &ObjectName,
     case: Case,
     continues: fn(char) -> bool,
     reserved: fn(&str) -> bool,
+    bare: bool,
 ) -> bool {
     let haystack = scannable_code(code, case, continues, false);
 
@@ -913,6 +927,12 @@ fn references_in(
     // is: measured, `FROM app.select` is accepted on PostgreSQL.
     if contains_word(&haystack, &qualified(name, case), continues) {
         return true;
+    }
+    // A bare name resolves through the engine's lookup path and nowhere
+    // else, so a same-named module in a schema off that path is not what
+    // the word means (DECISIONS 317).
+    if !bare {
+        return false;
     }
     // Then the bare one — a definition written inside its own schema very
     // often omits the qualifier. A reserved word is a name only where it is
@@ -1290,6 +1310,7 @@ pub fn creation_order_with(
         .collect();
     let continues = lexis.continues_ident;
     let reserved = lexis.reserved;
+    let bare_scope = lexis.bare_scope;
 
     // The edges for one comparison. Only the scanned ones move with it:
     // `depends_on:` and a trigger's target are identities, not text.
@@ -1326,9 +1347,16 @@ pub fn creation_order_with(
                 let sibling = matches!(name, ModuleId::Routine(_))
                     && other.referenced_name() == name.referenced_name();
                 let referenced = !sibling
-                    && other
-                        .referenced_name()
-                        .is_some_and(|n| references_in(code, &n, case, continues, reserved));
+                    && other.referenced_name().is_some_and(|n| {
+                        references_in(
+                            code,
+                            &n,
+                            case,
+                            continues,
+                            reserved,
+                            bare_scope(name.schema(), other.schema()),
+                        )
+                    });
                 if declared || attached || referenced {
                     set.insert(other.clone());
                 }
@@ -1645,6 +1673,7 @@ mod tests {
             code_only: &engine_reads_an_escape_string,
             continues_ident: is_regular_identifier_continue,
             reserved: never_reserved,
+            bare_scope: &every_schema,
         };
         assert_eq!(
             creation_order_with(&m, &ModuleDeps::default(), &lexis),
@@ -1674,6 +1703,7 @@ mod tests {
             code_only: &code_only,
             continues_ident: every_non_ascii_byte_is_a_name_byte,
             reserved: never_reserved,
+            bare_scope: &every_schema,
         };
         let text = "SELECT 1 AS x\u{a0}y FROM app.z";
         assert!(!references_with(text, &n("app.y"), &lexis));
@@ -1692,6 +1722,50 @@ mod tests {
         );
     }
 
+    /// A bare name resolves through the engine's lookup path: measured, on
+    /// PostgreSQL with no extras a bare `x` in `b.z` cannot mean `a.x`, and
+    /// on SQL Server a bare `z` in `a.x` reads `a.z` or `dbo.z` and never
+    /// `b.z`. Read everywhere, the alias `x` in `b.z` mentioned `a.x`, closed
+    /// a cycle with the real edge, and put `a.x` first.
+    #[test]
+    fn a_bare_name_is_a_reference_only_where_the_engine_would_look_it_up() {
+        let own_schema_only = |from: &str, to: &str| from == to;
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
+            bare_scope: &own_schema_only,
+        };
+        let m = modules(&[("a.x", "SELECT * FROM b.z"), ("b.z", "SELECT 1 AS x")]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("b.z"), id("a.x")]
+        );
+        // The shared scanner looks everywhere, and keeps its reading: a
+        // cycle, broken by name order.
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("a.x"), id("b.z")]
+        );
+        // A bare name inside the path is still an edge; the qualified form
+        // is one wherever it points.
+        let m = modules(&[
+            ("a.x", "SELECT * FROM z"),
+            ("a.z", "SELECT 1 AS y"),
+            ("b.w", "SELECT * FROM a.x"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("a.z"), id("a.x"), id("b.w")]
+        );
+        let m = modules(&[("a.x", "SELECT * FROM z"), ("b.z", "SELECT 1 AS y")]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("a.x"), id("b.z")],
+            "off the path, a bare name is no edge, and name order decides"
+        );
+    }
+
     /// A reserved word is a name only where it is quoted: measured, `FROM
     /// select` is a syntax error on both engines and `FROM "select"` names
     /// the view, so a bare `select` mentions no view named `select`. Read as
@@ -1706,6 +1780,7 @@ mod tests {
             code_only: &code_only,
             continues_ident: is_regular_identifier_continue,
             reserved: select_is_reserved,
+            bare_scope: &every_schema,
         };
         let select = n("app.select");
         assert!(!references_with("select 1 AS x", &select, &lexis));

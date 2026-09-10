@@ -701,6 +701,17 @@ impl Dialect for Postgres {
         }
     }
 
+    /// The write path: the object's own schema and the configured extras,
+    /// which is the `search_path` every statement of this dialect runs under
+    /// (DECISIONS 276). A bare name in a definition resolves through it and
+    /// nowhere else, so a same-named module in another schema is not what
+    /// the name means: measured, with no extras, `a.x AS SELECT * FROM b.z`
+    /// over `b.z AS SELECT 1 AS x` is a valid plan, and the alias `x` read
+    /// as a mention of `a.x` closed a cycle that put `a.x` first (317).
+    fn resolves_bare_name(&self, from: &str, to: &str) -> bool {
+        from == to || self.write_path_extras.iter().any(|extra| extra == to)
+    }
+
     /// The spelling this engine puts in a routine's identity (ADR-0009 §1).
     ///
     /// The canonical form is what `format_type` prints **under the empty
@@ -763,6 +774,25 @@ impl Dialect for Postgres {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare name resolves through the write path: the object's own schema
+    /// and the configured extras, in either order, and nowhere else.
+    #[test]
+    fn a_bare_name_resolves_in_the_own_schema_and_the_extras_only() {
+        let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+        assert!(Dialect::resolves_bare_name(&pg, "app", "app"));
+        assert!(Dialect::resolves_bare_name(&pg, "app", "shared"));
+        assert!(!Dialect::resolves_bare_name(&pg, "app", "other"));
+        assert!(
+            !Dialect::resolves_bare_name(&pg, "app", "App"),
+            "names are exact"
+        );
+        assert!(!Dialect::resolves_bare_name(
+            &Postgres::new(),
+            "app",
+            "shared"
+        ));
+    }
 
     /// A refusal is output like any other, so what it says is tested: each
     /// names the step that supplies it, and none of them reads as "there is

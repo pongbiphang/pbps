@@ -1186,6 +1186,18 @@ pub trait Dialect {
         false
     }
 
+    /// Whether a bare name in a definition that lives in `from` can resolve
+    /// to an object in `to` on this engine — the schemas a bare name is
+    /// looked up in, for the scan that reads a bare word as a possible
+    /// reference (DECISIONS 317).
+    ///
+    /// The default is "anywhere", which is the honest answer from a dialect
+    /// that has not measured its engine's rule: an edge too many, in the
+    /// direction the scan has always erred, and never an edge too few.
+    fn resolves_bare_name(&self, _from: &str, _to: &str) -> bool {
+        true
+    }
+
     /// This argument type as the engine spells it *in a routine's identity*.
     ///
     /// Deliberately not [`Dialect::normalize_type`], and deliberately not over

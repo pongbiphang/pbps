@@ -7834,6 +7834,59 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// A bare name resolves through the write path — the view's own schema and
+/// the configured extras — and nowhere else. Measured: with no extras,
+/// `a.x AS SELECT * FROM b.z` over `b.z AS SELECT 1 AS x` is a valid plan,
+/// and the alias `x` read as a mention of `a.x` closed a cycle that created
+/// `a.x` over a view that did not exist yet.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_bare_name_in_another_schema_is_not_an_edge() {
+    let s = emit_schema("path_order");
+    let other = format!("{s}_b");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &other).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.x").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT * FROM {other}.z"),
+        ),
+    );
+    declared.modules.insert(
+        format!("{other}.z").parse().expect("a module id"),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS x"),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{other}.z"), format!("{s}.x")],
+        "the view that is selected from comes first, whatever its columns are called"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT x::text FROM {s}.x")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &other).await;
+    drop_schema(&mut conn, &s).await;
+}
+
 /// A body's dollar tags are delimiters: a view named `$a$` over a routine
 /// whose body is delimited by `$a$` is created after it. Read as code, the
 /// tags mentioned the view from inside the routine, the cycle was broken by

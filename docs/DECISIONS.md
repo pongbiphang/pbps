@@ -6563,3 +6563,26 @@ SPEC is in sync with all of these.
     table is read from the engine, not from memory, and a word a later engine
     reserves is a bare mention the scan still reads — an edge too many, in the
     direction the scan has always erred.
+
+317. **A bare name is a reference only where the engine would look it up.**
+    The scan read a bare word as a mention of a same-named module in *any*
+    schema. With no extras, `a.x AS SELECT * FROM b.z` over `b.z AS SELECT 1
+    AS x` is a valid plan, and the alias `x` in `b.z` was read as a mention
+    of `a.x`: a cycle with the real edge, broken by name order, which
+    created `a.x` over a view that did not exist yet.
+
+    **Measured.** On PostgreSQL a bare name in a definition resolves through
+    the write path every statement runs under — the object's own schema and
+    the configured extras (276) — and nowhere else. On SQL Server 2022, with
+    `b.z` and `dbo.z` both present, `CREATE VIEW a.x AS SELECT * FROM z`
+    reads `dbo.z`; with `a.z` present it reads `a.z`; with only `b.z` it is
+    refused. So `Dialect::resolves_bare_name` says which schemas a bare name
+    in a definition in a given schema may resolve in — PostgreSQL's own and
+    extras, SQL Server's own and `dbo` — and `creation_order_with` reads the
+    bare form only for a candidate in one of them; the qualified form is an
+    edge wherever it points. SQL Server's second step is the caller's default
+    schema, which is `dbo` for a login given no other; a deployer whose
+    default schema is another one says the edge with `depends_on:`, which
+    can add an edge and never has to remove one. The shared scanner, and the
+    emitter's mention scans (ADR-0013 §3), keep reading a bare name
+    everywhere: a report and a rebind check are over-inclusive by design.

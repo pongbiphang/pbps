@@ -68,6 +68,17 @@ impl Dialect for Mssql {
         }
     }
 
+    /// The module's own schema, then `dbo`. **Measured** on SQL Server 2022:
+    /// with `b.z` and `dbo.z` both present, `CREATE VIEW a.x AS SELECT *
+    /// FROM z` reads `dbo.z`; with `a.z` present it reads `a.z`; with only
+    /// `b.z` it is refused (`Invalid object name 'z'`). The second step is
+    /// the caller's default schema, which is `dbo` for every login that has
+    /// not been given another; a deployer with another default schema says
+    /// the edge with `depends_on:` (DECISIONS 317).
+    fn resolves_bare_name(&self, from: &str, to: &str) -> bool {
+        from.eq_ignore_ascii_case(to) || to.eq_ignore_ascii_case("dbo")
+    }
+
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         types::normalize(ty)
     }
@@ -173,6 +184,17 @@ impl Dialect for Mssql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare name resolves in the module's own schema and then in `dbo`,
+    /// compared the way this engine compares names, and nowhere else.
+    #[test]
+    fn a_bare_name_resolves_in_the_own_schema_and_dbo_only() {
+        assert!(Dialect::resolves_bare_name(&Mssql, "app", "app"));
+        assert!(Dialect::resolves_bare_name(&Mssql, "app", "APP"));
+        assert!(Dialect::resolves_bare_name(&Mssql, "app", "dbo"));
+        assert!(Dialect::resolves_bare_name(&Mssql, "dbo", "dbo"));
+        assert!(!Dialect::resolves_bare_name(&Mssql, "app", "other"));
+    }
 
     /// The framing moved here from `pbps-db` unchanged (ADR-0014 §2). The two
     /// properties the live rollback test depends on are pinned where the text
