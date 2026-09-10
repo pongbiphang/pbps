@@ -21,16 +21,23 @@
 //! would put "the application lost access" behind a line of output nobody reads
 //! at 3am.
 //!
-//! # Why every carried item refuses today, and what changes that
+//! # Why every carried item still refuses, and what changes that
 //!
 //! ADR-0009 §3 decides that a grant **to a declared role** comes back, by the
-//! machinery ADR-0005 built — and roles and grants are Phase 5 step 6 (#81), so
-//! on this dialect there is no declared grant for anything to come back from.
-//! Until that step lands, an object carrying anything at all is one this
-//! dialect cannot rebuild, and it says so by name. The step that adds grants
-//! narrows this to what the declarations still cannot reproduce; it does not
-//! remove it, because ADR-0010 §5 records that pbps cannot express "revoked
-//! from `PUBLIC`" and therefore must not take it away (DECISIONS 306).
+//! machinery ADR-0005 built. Step 6 (#81) landed the half that makes such a
+//! grant expressible at all: the declarations hold it, `pull` reads it back,
+//! and the differ compares it. The other half has not landed — "comes back"
+//! means the rebuild re-emitting the declared grants *after* the `CREATE`, in
+//! the same plan, and `Change::AlterModule` carries the module and no role, so
+//! the statement list has to be built where the declared roles are visible
+//! (#248). Until then an object carrying anything at all is one this dialect
+//! cannot rebuild, and it says so by name.
+//!
+//! That narrowing will not remove the refusal, only shrink it: ADR-0010 §5
+//! records that pbps cannot express "revoked from `PUBLIC`" — the state is the
+//! *absence* of the engine's default rather than a row — and a rebuild
+//! restores the default, so that case stays on the refusing side for good
+//! (DECISIONS 306).
 //!
 //! # Nothing here is called by a command yet
 //!

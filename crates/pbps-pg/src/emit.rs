@@ -34,22 +34,26 @@
 //! `check_function_bodies`. They are pinned by the transaction framing, which
 //! is the earlier batch every connection runs.
 //!
-//! # What is not here
+//! # What is only half here
 //!
-//! Roles and reference data, each of which is its own Phase 5 step and refuses
-//! by name through [`crate::Unbuilt`] until it arrives.
+//! Roles. On this engine the *principal* is a cluster object and not the
+//! tool's to create, rename or drop (ADR-0010 §3), so `GRANT` and `REVOKE` are
+//! rendered and the other three arms refuse with the statement a human runs
+//! instead. Nothing in this file reaches [`crate::Unbuilt`] any more: with
+//! reference data in (step 7), every [`Change`] is either a statement or a
+//! refusal that names a rule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Cell, Change, Column, ColumnType, ForeignKey, Index, Module, ModuleId, ModuleKind, PrimaryKey,
-    ReferentialAction, RoutineArg, Row, RowKey, Strategy, Table, TableName, UniqueConstraint,
-    Value,
+    Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
+    Permission, PrimaryKey, ReferentialAction, RoutineArg, Row, RowKey, Strategy, Table, TableName,
+    UniqueConstraint, Value,
 };
 
 use crate::types::DIALECT;
-use crate::{Postgres, Unbuilt, quote, types};
+use crate::{Postgres, quote, types};
 
 type Sql = Result<Vec<Statement>, DialectError>;
 
@@ -1209,6 +1213,129 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
     })
 }
 
+/// A change this dialect will not perform, with the statement a human runs
+/// instead.
+///
+/// The statement is spelled out rather than described. "Create the role first"
+/// sends whoever is holding the plan to the manual; the `CREATE ROLE` they can
+/// paste is the difference between a refusal that blocks and one that unblocks.
+fn by_hand(why: String, statement: String) -> DialectError {
+    invalid(format!(
+        "{why}. Run it by hand, then plan again:\n\n    {statement}"
+    ))
+}
+
+/// A grant target as PostgreSQL spells a securable, with the object class
+/// written out.
+///
+/// The class is not decoration here, and picking the wrong word is not a style
+/// error. **Measured on 18.6**:
+///
+/// ```text
+/// GRANT EXECUTE ON FUNCTION gr.p(integer)  ->  ERROR: gr.p(integer) is not a function
+/// GRANT EXECUTE ON ROUTINE  gr.p(integer)  ->  GRANT
+/// GRANT SELECT  ON TABLE    gr.v           ->  GRANT      (a view)
+/// ```
+///
+/// So `ROUTINE` is the one word that covers what this model calls a routine —
+/// `FUNCTION` refuses a procedure — and `TABLE` covers a table and a view.
+///
+/// Which of the two a bare [`GrantTarget::Object`] means is read off the
+/// permissions, and [`crate::validate::role`] is what makes that sound: no kind
+/// on this engine takes `EXECUTE` and any of the table words, measured word by
+/// word against kind, so a set containing `EXECUTE` is a routine's and a set
+/// without one is a table's. A declaration that mixed them is refused before a
+/// plan exists.
+fn securable(
+    target: &GrantTarget,
+    permissions: &BTreeSet<Permission>,
+) -> Result<String, DialectError> {
+    Ok(match target {
+        GrantTarget::Object(o) if permissions.contains(&Permission::Execute) => {
+            // Bare, with no signature — which the engine accepts only while
+            // the name is unique. Measured, `GRANT EXECUTE ON ROUTINE gr.f` on
+            // an overloaded name is `routine name "gr.f" is not unique`, and
+            // `validate::role` refuses that declaration naming the signatures
+            // to write instead (ADR-0009 §1).
+            format!("ROUTINE {}", qualified(o)?)
+        }
+        GrantTarget::Object(o) => format!("TABLE {}", qualified(o)?),
+        GrantTarget::Routine(r) => format!(
+            "ROUTINE {}({})",
+            qualified(&r.name)?,
+            r.args
+                .iter()
+                .map(RoutineArg::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        GrantTarget::Schema(s) => format!("SCHEMA {}", quote(s)?),
+    })
+}
+
+/// The permission names as the engine spells them, in the model's order.
+///
+/// An empty set is refused rather than rendered: `GRANT  ON TABLE t TO r` is a
+/// syntax error, and a change carrying no permission is a change that claims a
+/// widening it does not make. The differ never builds one — it compares the
+/// two sets and pushes only a non-empty difference — so this is the guard for
+/// a plan that arrived some other way.
+fn permission_list(
+    permissions: &BTreeSet<Permission>,
+    target: &GrantTarget,
+) -> Result<String, DialectError> {
+    if permissions.is_empty() {
+        return Err(invalid(format!(
+            "a grant on `{target}` names no permission, and `GRANT ON {target}` with nothing to \
+             grant is a syntax error"
+        )));
+    }
+    Ok(permissions
+        .iter()
+        .map(|p| permission_sql(*p))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", "))
+}
+
+/// The engine's spelling of `p`, or `Unsupported` for a word the model holds
+/// for the other engine (ADR-0010 §6).
+///
+/// `validate::role` refuses those first; this is the second lock on the same
+/// door, so that a statement the engine's parser would stop at — measured,
+/// `GRANT ALTER` is `unrecognized privilege type "alter"` — is never rendered
+/// and therefore cannot be the statement that fails halfway through an apply.
+///
+/// `MAINTAIN` is spelled here without a version test on purpose: whether the
+/// server has it is a fact about the server, which this file has no connection
+/// to ask. The gate is [`crate::roles::unsupported_permissions`], on the connected
+/// path (ADR-0010 amendment).
+pub(crate) fn permission_sql(p: Permission) -> Result<&'static str, DialectError> {
+    Ok(match p {
+        Permission::Select => "SELECT",
+        Permission::Insert => "INSERT",
+        Permission::Update => "UPDATE",
+        Permission::Delete => "DELETE",
+        Permission::References => "REFERENCES",
+        Permission::Execute => "EXECUTE",
+        Permission::Usage => "USAGE",
+        Permission::Create => "CREATE",
+        Permission::Truncate => "TRUNCATE",
+        Permission::Trigger => "TRIGGER",
+        Permission::Maintain => "MAINTAIN",
+        Permission::Alter | Permission::ViewDefinition => {
+            return Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "the `{}` permission, which is SQL Server's (ADR-0010 §6); this engine takes \
+                     {}",
+                    p.as_str(),
+                    crate::validate::permission_words()
+                ),
+            });
+        }
+    })
+}
+
 /// The table a `CREATE TRIGGER` body says it is on.
 ///
 /// **Not `references`.** A scan for the name anywhere in the text answers yes
@@ -2182,11 +2309,65 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         ]),
 
         Change::DropModule { id, kind } => Ok(vec![drop_module(pg, id, *kind)?]),
-        Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. } => Err(Unbuilt::Roles.refuse()),
+
+        // Roles (ADR-0005, ADR-0010 §3). The principal is a **cluster** object
+        // here, not a database one, so `Dialect::manages_roles` is `false` and
+        // the differ builds none of these three on this dialect: a declared
+        // role the cluster lacks is refused by a connected check with the
+        // `CREATE ROLE` to run, and a dropped role's grants are revoked while
+        // the role itself is left standing.
+        //
+        // Each arm is therefore the second lock on the same door — a plan that
+        // arrived some other way names the statement a human has to run,
+        // rather than becoming SQL that widens or narrows the whole cluster's
+        // idea of who a principal is.
+        Change::CreateRole { name, .. } => Err(by_hand(
+            format!(
+                "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 §3)"
+            ),
+            format!("CREATE ROLE {};", quote(name)?),
+        )),
+        Change::DropRole { name, .. } => Err(by_hand(
+            format!(
+                "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 §3, §4)"
+            ),
+            format!("DROP ROLE {};", quote(name)?),
+        )),
+        Change::RenameRole { from, to, .. } => Err(by_hand(
+            format!(
+                "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 §3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards"
+            ),
+            format!("ALTER ROLE {} RENAME TO {};", quote(from)?, quote(to)?),
+        )),
+        Change::Grant {
+            role,
+            target,
+            permissions,
+        } => Ok(vec![scoped(
+            pg,
+            target.schema(),
+            &format!(
+                "GRANT {} ON {} TO {};",
+                permission_list(permissions, target)?,
+                securable(target, permissions)?,
+                quote(role)?
+            ),
+        )?]),
+        Change::Revoke {
+            role,
+            target,
+            permissions,
+        } => Ok(vec![scoped(
+            pg,
+            target.schema(),
+            &format!(
+                "REVOKE {} ON {} FROM {};",
+                permission_list(permissions, target)?,
+                securable(target, permissions)?,
+                quote(role)?
+            ),
+        )?]),
+
         // Reference data (ADR-0004). Each row change is one statement — a `DO`
         // block carrying the write and the checks that hold it to what the
         // plan reviewed — under the table's own write path, because the
@@ -3002,6 +3183,169 @@ mod tests {
 
     fn id(s: &str) -> ModuleId {
         s.parse().expect("a module id parses")
+    }
+
+    fn target(s: &str) -> GrantTarget {
+        s.parse().expect("a grant target parses")
+    }
+
+    fn permissions(list: &[Permission]) -> BTreeSet<Permission> {
+        list.iter().copied().collect()
+    }
+
+    /// The class is written out, and which one it is comes off the
+    /// permissions: measured, `ON FUNCTION` refuses a procedure and `ON TABLE`
+    /// takes a view.
+    #[test]
+    fn a_grant_names_the_object_class_the_engine_needs_for_that_target() {
+        let pg = Postgres::new();
+        let cases = [
+            (
+                "app.customer",
+                vec![Permission::Select, Permission::Insert],
+                "GRANT SELECT, INSERT ON TABLE \"app\".\"customer\" TO \"app_reader\";",
+            ),
+            (
+                "app.solo",
+                vec![Permission::Execute],
+                "GRANT EXECUTE ON ROUTINE \"app\".\"solo\" TO \"app_reader\";",
+            ),
+            (
+                "app.f(integer, text)",
+                vec![Permission::Execute],
+                "GRANT EXECUTE ON ROUTINE \"app\".\"f\"(integer, text) TO \"app_reader\";",
+            ),
+            (
+                "app.zero()",
+                vec![Permission::Execute],
+                "GRANT EXECUTE ON ROUTINE \"app\".\"zero\"() TO \"app_reader\";",
+            ),
+            (
+                "schema::app",
+                vec![Permission::Usage, Permission::Create],
+                "GRANT USAGE, CREATE ON SCHEMA \"app\" TO \"app_reader\";",
+            ),
+        ];
+        for (spelled, list, expected) in cases {
+            let change = Change::Grant {
+                role: "app_reader".to_owned(),
+                target: target(spelled),
+                permissions: permissions(&list),
+            };
+            let sql = sql_of(&pg, &change);
+            assert_eq!(sql.len(), 1, "{spelled}");
+            assert!(sql[0].contains(expected), "{spelled}: {}", sql[0]);
+            // Under the write path like every other statement this emitter
+            // produces: a routine's argument type can be a project's own.
+            assert!(
+                sql[0].starts_with("SET search_path = \"app\";"),
+                "{spelled}: {}",
+                sql[0]
+            );
+        }
+    }
+
+    /// A revoke is the same statement backwards, and it has to be: the two are
+    /// how a plan widens and narrows the same target, and a spelling that
+    /// differed between them would refuse one direction of an ordinary change.
+    #[test]
+    fn a_revoke_names_the_same_securable_the_grant_does() {
+        let pg = Postgres::new();
+        let sql = sql_of(
+            &pg,
+            &Change::Revoke {
+                role: "app_reader".to_owned(),
+                target: target("app.recent"),
+                permissions: permissions(&[Permission::Select]),
+            },
+        );
+        assert!(
+            sql[0].contains("REVOKE SELECT ON TABLE \"app\".\"recent\" FROM \"app_reader\";"),
+            "{}",
+            sql[0]
+        );
+    }
+
+    /// ADR-0010 §3. The principal is the cluster's, so each of the three
+    /// identity changes refuses — and the refusal carries the statement to
+    /// paste, not a description of it.
+    #[test]
+    fn the_three_role_identity_changes_refuse_with_the_statement_to_run_by_hand() {
+        let pg = Postgres::new();
+        let cases = [
+            (
+                Change::CreateRole {
+                    uid: Uid::generate(UidKind::Role),
+                    name: "analyst".to_owned(),
+                },
+                "CREATE ROLE \"analyst\";",
+            ),
+            (
+                Change::DropRole {
+                    uid: Uid::generate(UidKind::Role),
+                    name: "analyst".to_owned(),
+                    members: Vec::new(),
+                },
+                "DROP ROLE \"analyst\";",
+            ),
+            (
+                Change::RenameRole {
+                    uid: Uid::generate(UidKind::Role),
+                    from: "analyst".to_owned(),
+                    to: "reader".to_owned(),
+                },
+                "ALTER ROLE \"analyst\" RENAME TO \"reader\";",
+            ),
+        ];
+        for (change, statement) in cases {
+            let refusal = pg
+                .emit(&change, Strategy::default())
+                .expect_err("the principal is not this tool's")
+                .to_string();
+            assert!(refusal.contains(statement), "{refusal}");
+            assert!(refusal.contains("ADR-0010"), "{refusal}");
+        }
+    }
+
+    /// The second lock (ADR-0010 §6): a word this engine does not have never
+    /// becomes a statement, so it cannot be the statement that fails halfway
+    /// through an apply.
+    #[test]
+    fn a_permission_this_engine_lacks_is_never_rendered() {
+        let pg = Postgres::new();
+        for permission in [Permission::Alter, Permission::ViewDefinition] {
+            let refusal = pg
+                .emit(
+                    &Change::Grant {
+                        role: "app_reader".to_owned(),
+                        target: target("app.customer"),
+                        permissions: permissions(&[permission]),
+                    },
+                    Strategy::default(),
+                )
+                .expect_err("this engine has no such word")
+                .to_string();
+            assert!(refusal.contains(permission.as_str()), "{refusal}");
+            assert!(refusal.contains("SQL Server's"), "{refusal}");
+        }
+    }
+
+    /// `GRANT  ON TABLE t TO r` is a syntax error, and a change that names no
+    /// permission claims a widening it does not make.
+    #[test]
+    fn a_grant_with_no_permission_is_refused_rather_than_rendered_empty() {
+        let refusal = Postgres::new()
+            .emit(
+                &Change::Grant {
+                    role: "app_reader".to_owned(),
+                    target: target("app.customer"),
+                    permissions: BTreeSet::new(),
+                },
+                Strategy::default(),
+            )
+            .expect_err("nothing to grant")
+            .to_string();
+        assert!(refusal.contains("names no permission"), "{refusal}");
     }
 
     /// The routine half of the same rule the trigger's `ON` check enforces:

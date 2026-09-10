@@ -32,8 +32,8 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, RoutineArg, Schema, Strategy,
-    Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, Role, RoutineArg, Schema,
+    Strategy, Table, TableName,
 };
 
 pub mod catalog;
@@ -57,9 +57,11 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
 pub mod introspect;
 pub mod modules;
 mod preflight;
+pub mod roles;
 pub mod rows;
 pub mod state;
 mod types;
+pub mod validate;
 
 /// A part of the dialect that Phase 5 has not built yet.
 ///
@@ -67,23 +69,31 @@ mod types;
 /// that every refusal names the step that supplies it. The message is written
 /// for whoever runs the command, not for whoever writes the crate: it says what
 /// pbps cannot do, and it does not pretend the answer is "nothing to do".
+///
+/// **No `emit` arm reads it any more.** Roles (step 6) and reference data
+/// (step 7) were the last two, and each is now a statement or a refusal that
+/// names its own rule. What is left are the two parts a *connected* path
+/// raises: the read-back the CLI has yet to call, and the preflight that
+/// `Dialect::preflight` answers only for reference data. The type stays, with
+/// its wording, because the day one of those paths has to say "not built" is
+/// the day it must say it in these words rather than invent its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
     Introspection,
-    Roles,
     Probes,
 }
 
 impl Unbuilt {
-    const fn step(self) -> &'static str {
+    #[must_use]
+    pub const fn step(self) -> &'static str {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
-            Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
             Unbuilt::Probes => "preflight probes (Phase 5 step 9)",
         }
     }
 
-    fn refuse(self) -> DialectError {
+    #[must_use]
+    pub fn refuse(self) -> DialectError {
         DialectError::NotBuilt {
             dialect: "postgres",
             part: self.step().to_owned(),
@@ -826,6 +836,30 @@ impl Dialect for Postgres {
         emit::validate_module(id, module)
     }
 
+    /// **No.** A PostgreSQL role is a cluster object: `pg_authid` is shared,
+    /// the role is visible from every database of the cluster and granted in
+    /// each, and a `DROP ROLE` is refused by a dependency in a database this
+    /// connection cannot see — measured, with every grant this database holds
+    /// revoked, `DROP ROLE gr_reader` is still
+    /// `role "gr_reader" cannot be dropped because some objects depend on it`
+    /// / `DETAIL: 1 object in database otherdb`.
+    ///
+    /// A tool whose blast radius is one database must not own an object whose
+    /// blast radius is the cluster (ADR-0010 §3, DECISIONS 211). So a declared
+    /// role the cluster lacks is refused with the `CREATE ROLE` to run by
+    /// hand, and a dropped role has its declared grants revoked and is left
+    /// standing for a human. What the role *holds in this database* is managed
+    /// either way: this answer is about the principal, not about its grants.
+    fn manages_roles(&self) -> bool {
+        false
+    }
+
+    /// Every problem with a role, before anything connects (ADR-0010 §1, §2
+    /// and §6). See [`validate::role`].
+    fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+        validate::role(name, role, schema)
+    }
+
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(self, change, strategy)
     }
@@ -833,8 +867,9 @@ impl Dialect for Postgres {
     /// The reference-data probes, and no others yet: the rest of this
     /// dialect's preflight arrives with Phase 5 step 9. A probe list is not a
     /// promise that everything was checked — [`Unbuilt::Probes`] is what says
-    /// the step is missing, and it is what `emit` still refuses for the
-    /// changes that need those probes.
+    /// the step is missing, and the connected paths are what read it. `emit`
+    /// no longer refuses anything through [`Unbuilt`]: every change it is
+    /// given is a statement or a refusal that names its own rule.
     fn preflight(&self, changes: &ChangeSet) -> Vec<pbps_dialect::Probe> {
         preflight::probes(changes)
     }
@@ -879,12 +914,21 @@ mod tests {
         );
     }
 
+    /// ADR-0010 §3, DECISIONS 211: the principal is the *cluster's*. This
+    /// crate's answer is what every role path reads — the differ builds no
+    /// `CreateRole`, `DropRole` or `RenameRole` on a dialect that says `false`
+    /// — so the answer itself is worth a test of its own.
+    #[test]
+    fn a_role_is_not_this_tools_to_create_rename_or_drop_on_this_engine() {
+        assert!(!Postgres::new().manages_roles());
+    }
+
     /// A refusal is output like any other, so what it says is tested: each
     /// names the step that supplies it, and none of them reads as "there is
     /// nothing to do".
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
-        for part in [Unbuilt::Introspection, Unbuilt::Roles, Unbuilt::Probes] {
+        for part in [Unbuilt::Introspection, Unbuilt::Probes] {
             let message = part.refuse().to_string();
             assert!(message.contains("Phase 5 step"), "{message}");
             // "does not implement ... yet", never "does not support": the
@@ -895,24 +939,54 @@ mod tests {
     }
 
     /// `emit` returning an empty statement list would be a plan that applies
-    /// cleanly and changes nothing — the silent wrong answer. A part this
-    /// crate has not built has to be an error, and the type is what makes that
-    /// so. The structural half is built (step 4); the three that are not each
-    /// name their own step.
+    /// cleanly and changes nothing — the silent wrong answer, and the reason
+    /// every part this crate has not built is an *error*.
+    ///
+    /// With roles (step 6) and reference data (step 7) in, **no [`Change`]
+    /// reaches [`Unbuilt`] at all**: the two parts that remain are read from
+    /// the connected paths rather than from `emit`. What is left to pin is
+    /// therefore the other direction — the one change that empties on purpose,
+    /// and the fact that nothing else joins it.
     #[test]
-    fn a_change_from_an_unbuilt_part_is_an_error_and_not_an_empty_plan() {
-        let unbuilt = [(
+    fn the_only_change_that_emits_nothing_is_the_one_with_nothing_to_run() {
+        let pg = Postgres::new();
+        // The mode is a property of the declaration: it decides what *future*
+        // plans do about undeclared rows, and the row changes it implies are
+        // separate entries in this same plan.
+        assert!(
+            pg.emit(
+                &Change::SetDataMode {
+                    table: "app.t".parse().expect("a table name parses"),
+                    from: None,
+                    to: Some(pbps_model::DataMode::Exact),
+                },
+                Strategy::default(),
+            )
+            .expect("the mode is built")
+            .is_empty()
+        );
+        // And the three this dialect will not perform refuse rather than
+        // emitting nothing, which is what keeps "pbps does not own the
+        // principal" from reading as "there was nothing to do" (ADR-0010 §3).
+        let uid = pbps_model::Uid::generate(pbps_model::UidKind::Role);
+        for change in [
             Change::CreateRole {
-                uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
+                uid: uid.clone(),
                 name: "analyst".to_owned(),
             },
-            "Phase 5 step 6",
-        )];
-        for (change, step) in unbuilt {
-            let refusal = Postgres::new()
-                .emit(&change, Strategy::default())
-                .expect_err("this part is not built");
-            assert!(refusal.to_string().contains(step), "{refusal}");
+            Change::DropRole {
+                uid: uid.clone(),
+                name: "analyst".to_owned(),
+                members: Vec::new(),
+            },
+            Change::RenameRole {
+                uid,
+                from: "analyst".to_owned(),
+                to: "reader".to_owned(),
+            },
+        ] {
+            pg.emit(&change, Strategy::default())
+                .expect_err("the principal is the cluster's");
         }
     }
 

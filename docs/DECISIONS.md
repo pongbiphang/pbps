@@ -7956,3 +7956,115 @@ SPEC is in sync with all of these.
     decode_unicode_escapes`), its `UESCAPE` clause honoured by the rule the
     emitter reads one by; an escape that does not decode, or a clause
     spelled wrong, is no type, and is left to the engine to refuse by name.
+
+370. **PostgreSQL answers `manages_roles` with `false`, and the differ builds
+    no `CreateRole`, `DropRole` or `RenameRole` on such a dialect.** ADR-0010
+    §3 and DECISIONS 211 said the answer; this is the reading of it, which
+    211 deferred to "the dialect that first answers `false`".
+
+    The three identity changes are conditional and every `Grant` and `Revoke`
+    is not: what a role holds in *this* database is the tool's business either
+    way, and only the principal is the cluster's.
+
+    - **A declared role with no base entry is granted, not created.** Emitting
+      a `CreateRole` and refusing it would refuse the only way a role ever
+      comes under management on this engine — a DBA creates it in the cluster
+      and the project then declares it. Whether the cluster actually has it is
+      a connected question, asked by `pbps_pg::roles::missing_roles` and
+      answered with the `CREATE ROLE` to run by hand.
+    - **A dropped role has its declared grants revoked and is left standing.**
+      A plan that said "drop role" and ran nothing would leave a principal
+      holding every permission pbps was managing; one that really dropped it
+      would reach every other database in the cluster. The revokes skip a
+      target this same plan drops, the rule the per-target comparison already
+      applies.
+    - **A rename emits nothing.** On this engine an ACL entry holds the role's
+      oid, not its name, so a rename performed in the cluster carried every
+      grant with it and there is nothing to re-grant. The grant comparison
+      then runs against the new name, which is right because the two names are
+      one principal.
+
+    The emitter keeps all five arms: `Grant` and `Revoke` render SQL, and the
+    other three refuse with the exact statement a human runs — the second lock,
+    for a plan that arrived some other way (measured refusal texts in
+    ADR-0010 §3, §4).
+
+371. **The engine's default ACL is the zero point: expanded, reported, and
+    never compared as a grant.** ADR-0010 §5 measured this for `PUBLIC` and
+    refused to route it down the unexpressible path, because every function
+    pbps creates arrives with `EXECUTE` to `PUBLIC` and the very next
+    `plan --db` would have refused. The same argument settles the **owner**,
+    whom that section does not name: every table pbps creates arrives owned by
+    the deploying account with the owner's whole set, so comparing that set
+    would have the plan after a successful apply revoke what the apply had
+    just produced.
+
+    So the read expands a NULL ACL with the engine's own
+    `acldefault(kind, owner)` — never a table of defaults written into this
+    crate, which would have been wrong on one of the two servers the suite now
+    runs: measured, the owner's default relation ACL is `arwdDxt` on 16.15 and
+    `arwdDxtm` on 18.6 — and then draws the line at *who put the entry there*.
+    An entry out of `acldefault`, and an entry whose grantee is the object's
+    owner, are the zero point; `PUBLIC` is context (§5); everything else is a
+    grant, compared for a managed role.
+
+    Nothing is dropped. A revocation on this engine is the **absence** of an
+    entry rather than a row — measured, `REVOKE EXECUTE … FROM PUBLIC` leaves
+    `{postgres=X/postgres}` — so the pull reports both halves as context: the
+    routines `PUBLIC` can execute, and the routines it can no longer execute,
+    which is the one act that leaves no trace to list.
+
+372. **`GRANT … ON ROUTINE` is the only word that covers what this model calls
+    a routine, and which word a bare object target takes is read off the
+    permissions.** Measured on 18.6: `GRANT EXECUTE ON FUNCTION gr.p(integer)`
+    on a *procedure* is `gr.p(integer) is not a function`, while `ON ROUTINE`
+    takes a function and a procedure alike; `ON TABLE` takes a table and a
+    view.
+
+    `Change::Grant` carries no schema, so the emitter cannot look the target's
+    kind up. It reads the permission set instead — a set containing `execute`
+    is a routine's, one without is a table's — and `validate_role` is what
+    makes that sound: measured word by word against kind, no kind on this
+    engine takes `EXECUTE` and any of the table words, so a declaration that
+    mixed them is refused before a plan exists.
+
+373. **A grant's routine signature is spelled with `unnest(proargtypes)`, not
+    with `pg_get_function_identity_arguments`.** The obvious call is the wrong
+    one: measured, it renders a procedure's argument as `IN integer`, mode and
+    all, while the module pull renders the same routine's identity as
+    `integer`. The managed-set filter compares a `GrantTarget::Routine`
+    against a `ModuleId::Routine`, so two spellings of one signature would
+    have every grant on a procedure read as a grant on an object the
+    declarations do not have — and be revoked by the next plan.
+
+374. **`maintain` is gated on the connected server, and the live suite
+    therefore runs two PostgreSQLs.** ADR-0010's amendment set the rule: the
+    model holds no server version, so `validate_role` cannot ask. The reading
+    is `pbps_pg::roles::unsupported_permissions`, called on the connected path
+    the way `plan --db` gates on SQL Server's edition.
+
+    "This engine refuses the word" and "this engine takes it" are two
+    different servers, and no single one can show both, so
+    `scripts/live-tests-pg.sh` and the `live-pg` CI job start a pinned
+    PostgreSQL 16 beside the pinned 18. Measured on it: `server_version_num`
+    160015, `GRANT MAINTAIN ON t TO r` is `unrecognized privilege type
+    "maintain"` (SQLSTATE 42601, the parser stopping at the word), and the
+    owner's default relation ACL has no `m`. A bump of that pin must stay
+    below 17, or the test asserting the refusal passes for no reason.
+
+375. **A live permission test that runs as a superuser measures nothing.** The
+    SQL Server suite learned it with `sa`, which holds `CONTROL` and
+    short-circuits the whole permission list — how three permission bugs
+    survived that suite's first run. On PostgreSQL it is worse: a superuser
+    does not consult an ACL at all. So every test in the roles section of
+    `pbps-pg/tests/live.rs` acts through a `LOGIN` role created for it, and
+    the pull is exercised as that role too — a read that needs a superuser is
+    a read that fails in the one environment that matters. `pg_roles` rather
+    than `pg_authid` for the same reason: the second holds the password hashes
+    and is superuser-only.
+
+    Those tests assert on the **SQLSTATE**, not on the message.
+    `tokio_postgres::Error` renders as `db error` and keeps the server's text
+    in a source the seam deliberately does not carry (ADR-0014 §1), so a test
+    matching on prose would pass on any failure at all — including the wrong
+    one.

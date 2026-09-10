@@ -161,8 +161,32 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      # A second PostgreSQL, older than 17, because `MAINTAIN` arrived in 17:
+      # "this engine refuses the word" and "this engine takes it" are two
+      # different servers, and no single one can show both (ADR-0010 §6).
+      # Measured on this digest: PostgreSQL 16.15, `server_version_num` 160015,
+      # `GRANT MAINTAIN` is `unrecognized privilege type "maintain"`. Bump it
+      # only to another release **below 17** — past that, the test asserting
+      # the refusal would pass for no reason.
+      #
+      # A second engine on one runner is the pressure the startup crashes in
+      # docs/PITFALLS.md warn about; a second *PostgreSQL* is the cheap version
+      # of that, and it is the only way this rule can be measured at all.
+      postgres-old:
+        image: postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8
+        env:
+          POSTGRES_PASSWORD: "Pbps!Ci12345"
+          POSTGRES_DB: pbps_test
+        ports:
+          - 54321:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pbps_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test"
+      PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
