@@ -1145,11 +1145,13 @@ fn renders_alike_under_the_pins(t: &ColumnType) -> bool {
 /// them raises, so there is no row to point at; the `narrowing` class is what
 /// stops them at the gate.
 ///
-/// `None` also where the count would be **measured wrong**: a length taken over
-/// a rendering the session settings move is not the length the `ALTER` takes,
-/// so a `bytea`, an `interval`, a date-and-time type or a binary float into a
-/// bounded string gets no probe at all. `renders_alike_under_the_pins` holds that
-/// list and the measurements behind it.
+/// `None` also where the count would be **measured wrong**: a length is the
+/// length of a *rendering*, and a rendering nothing pins is not the one the
+/// `ALTER` will take. Since `run_probes` pins the session before it asks
+/// anything (DECISIONS 415), that leaves only what the nine settings do not
+/// reach — `money`, through `lc_monetary`, and any other type outside
+/// `CATALOGUE`. `renders_alike_under_the_pins` holds the rule and the
+/// measurements behind it, including the nine sources it *does* now admit.
 ///
 /// # Why this is a predicate and not a cast
 ///
@@ -1213,8 +1215,8 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
          {binary} <> '-Infinity'::float8"
     );
     match (family(from), family(to)) {
-        // A bounded string target, from a source whose rendering every session
-        // agrees on. The value is measured after its **trailing spaces** are
+        // A bounded string target, from a source whose rendering the pins
+        // decide. The value is measured after its **trailing spaces** are
         // taken off and nothing else: measured, `'abc  '` into `varchar(3)` is
         // `'abc'` and `E'abc\t'` into the same is `value too long`. `length`,
         // not `octet_length` — the bound is in characters, measured, `'王小明'`
