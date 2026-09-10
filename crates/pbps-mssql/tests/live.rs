@@ -6311,6 +6311,153 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
     db.drop().await;
 }
 
+/// The MAX style-3 conversion path can overflow even for -255. Canonical
+/// text comes from the engine, and must preserve each stored binary value.
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn finite_floats_render_round_trip_and_keep_row_guards_effective() {
+    use pbps_model::{DataMode, Row, RowKey, RowScope, TableData, Value};
+
+    let mut db = TestDb::create("float_render").await;
+    for base in ["real", "float"] {
+        let name = TableName::new("dbo", base);
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.[{base}] (id int PRIMARY KEY, n {base} NULL);"
+            ))
+            .await
+            .unwrap();
+        let mut values = vec![
+            "-255",
+            "255",
+            "-1",
+            "1",
+            "0",
+            "-0",
+            "0.1",
+            "-0.1",
+            "16777215",
+            "16777216",
+            "16777217",
+            "1.000000059604644775390625",
+            "1.00000011920928955078125",
+        ];
+        values.extend(if base == "float" {
+            vec![
+                "1.7976931348623157e308",
+                "-1.7976931348623157e308",
+                "2.2250738585072014e-308",
+                "-2.2250738585072014e-308",
+                "9007199254740991",
+                "9007199254740992",
+                "9007199254740993",
+                "1.0000000000000002",
+            ]
+        } else {
+            vec![
+                "3.4028234663852886e38",
+                "-3.4028234663852886e38",
+                "1.1754943508222875e-38",
+                "-1.1754943508222875e-38",
+            ]
+        });
+        for (id, value) in values.iter().enumerate() {
+            db.conn
+                .execute(&format!(
+                    "INSERT dbo.[{base}] VALUES ({id}, CONVERT({base}, '{value}'));"
+                ))
+                .await
+                .unwrap();
+        }
+        db.conn
+            .execute(&format!(
+                "INSERT dbo.[{base}] VALUES ({}, NULL);",
+                values.len()
+            ))
+            .await
+            .unwrap();
+        let engine = db.conn.query(&format!("SELECT CONVERT(nvarchar(99), id) AS id, CONVERT(nvarchar(99), n, 3) AS n, CASE WHEN n = CONVERT({base}, CONVERT(varchar(99), n, 3)) OR n IS NULL THEN 1 ELSE 0 END AS same FROM dbo.[{base}];")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        table.columns.insert("n".into(), Column::new(ty(base)));
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        table.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: engine
+                .iter()
+                .map(|row| {
+                    assert_eq!(row.try_get::<i32>("same").unwrap(), Some(1));
+                    let value = row
+                        .try_get::<&str>("n")
+                        .unwrap()
+                        .map(|s| ("n".into(), Value::Text(s.into())));
+                    (
+                        RowKey::from(row.try_get::<&str>("id").unwrap().unwrap()),
+                        value.into_iter().collect::<Row>(),
+                    )
+                })
+                .collect(),
+        });
+        let mut declared = Schema::default();
+        declared.tables.insert(name.clone(), table);
+        let scopes = declared.data_scopes();
+        let read = [(
+            name.clone(),
+            RowScope::Every {
+                known: Default::default(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &declared, &read)
+            .await
+            .expect("all finite values render");
+        let back = declared
+            .clone()
+            .with_observed_rows(&observed, &scopes, &declared)
+            .unwrap();
+        assert_eq!(back.tables[&name].data, declared.tables[&name].data);
+        assert!(
+            pbps_mssql::catalog::misspelt(&mut db.conn, &declared, &Default::default())
+                .await
+                .unwrap()
+                .misspelt
+                .is_empty()
+        );
+
+        let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+        let mut target = declared.clone();
+        target
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .remove(&RowKey::from("0"));
+        let changes = plan(&declared, &ids, &target, &ids);
+        // A changed stored value must still fail the deletion's stale guard.
+        db.conn
+            .execute(&format!("UPDATE dbo.[{base}] SET n=256 WHERE id=0;"))
+            .await
+            .unwrap();
+        let error = try_apply(&mut db.conn, &changes).await.unwrap_err();
+        assert!(error.contains("changed or deleted"), "{error}");
+        db.conn
+            .execute(&format!("UPDATE dbo.[{base}] SET n=-255 WHERE id=0;"))
+            .await
+            .unwrap();
+        apply(&mut db.conn, &changes).await;
+    }
+    db.drop().await;
+}
+
 /// `money` and `smallmoney` hold four decimal places, and the default
 /// conversion style renders two. Read that way, `1.0001` came back `1.00`:
 /// `pull` wrote a declaration for a value the table does not hold, and
