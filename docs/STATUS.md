@@ -590,7 +590,13 @@ while an exact source keeps the exact domain — which is the domain its own
 range probe excludes the sentinels its target accepts, and the temporal arm was
 the one that did not — measured, a `date` holding `infinity` becomes a
 `timestamp` holding `infinity`, so the count refused a plan this engine takes,
-while `'294277-01-01'` is still counted and still `22008` (412).
+while `'294277-01-01'` is still counted and still `22008` (412). A key between
+two tables the *plan* creates was compared as text for the same reason one
+level down: `InsertRow` types every non-key column and the row key is what a
+foreign key points at, so a parent spelling its key `1.0` and a child spelling
+its `1.00` counted an orphan the engine did not have. The types are in
+`Change::CreateTable` already, and the other dialect had been reading them
+there all along (413).
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a

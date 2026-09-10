@@ -17985,3 +17985,100 @@ async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
         .await
         .expect("drop");
 }
+
+/// A key between two tables this plan creates is compared as the engine
+/// compares it, not as text.
+///
+/// `InsertRow` carries the type of every **non-key** column and no more, so
+/// before the fix the one column a foreign key most often points at was the
+/// one with no type at all. Two unknown literals resolve to `text` in a
+/// select list, and `1.0` and `1.00` are two different strings and one
+/// `numeric` — each of them the engine's own rendering for its own column,
+/// which is what the spelling check requires the declaration to use.
+///
+/// Both halves are here: the plan the engine takes must not be refused, and a
+/// child that really has no parent must still be counted.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_between_two_created_tables_is_compared_as_the_engine_compares_it() {
+    let mut conn = connect().await;
+
+    for (child_key, orphans) in [("1.00", 0), ("2.00", 1)] {
+        let s = data_schema(if orphans == 0 { "fkmade" } else { "fkorphan" });
+        fresh(&mut conn, &s).await;
+        let parent = TableName::new(&s, "parent");
+        let child = TableName::new(&s, "child");
+
+        // The key columns differ in scale, which is what makes the two
+        // renderings differ while the values stay one `numeric`.
+        let mut p = Table::default();
+        p.columns
+            .insert("id".into(), Column::new(ty("numeric(5,1)")).not_null());
+        p.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        with_data(&mut p, DataMode::Exact, &[("1.0", row(&[]))]);
+
+        let mut c = Table::default();
+        c.columns
+            .insert("id".into(), Column::new(ty("numeric(5,2)")).not_null());
+        c.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        c.foreign_keys.insert(
+            "fk_child".into(),
+            ForeignKey {
+                columns: vec!["id".into()],
+                references_table: parent.clone(),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        with_data(&mut c, DataMode::Exact, &[(child_key, row(&[]))]);
+
+        let mut declared = Schema::default();
+        declared.tables.insert(parent.clone(), p);
+        declared.tables.insert(child.clone(), c);
+        let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+        let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+
+        let measured = counts(&mut conn, &cs).await;
+        assert_eq!(
+            one(&measured, "no matching parent"),
+            orphans,
+            "child key {child_key}: {measured:#?}"
+        );
+
+        // And the engine's own verdict on the very plan the probe judged.
+        let mut refused = None;
+        for change in &cs.changes {
+            for stmt in Postgres::new()
+                .emit(&change.change, change.strategy)
+                .expect("emit")
+            {
+                if let Err(e) = conn.execute(&stmt.sql).await {
+                    refused = Some(e);
+                    break;
+                }
+            }
+            if refused.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            refused.is_some(),
+            orphans == 1,
+            "child key {child_key}: the engine said {refused:?}"
+        );
+        if let Some(e) = refused {
+            assert_eq!(sqlstate(&e), "23503", "child key {child_key}: {e}");
+        }
+
+        conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+            .await
+            .expect("drop");
+    }
+}

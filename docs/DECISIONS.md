@@ -8643,3 +8643,26 @@ SPEC is in sync with all of these.
     `Family::Temporal` carrying no `first_year`. This is the third instance of
     a shape this file already names twice; the sweep that found it is the rule
     in AGENTS.md, not a lucky read.
+
+413. **A created table's columns are remembered from the plan, because its key
+    is the one column no row change types.** `InsertRow` carries "the type of
+    every non-key column the table has" and no more, by its own documentation
+    — and the row key is exactly what a foreign key points at. For a table
+    that already exists the catalog answers; for one this plan creates there is
+    no catalog row, so both sides of such a key reached the probe as unknown
+    literals, which the engine resolves to `text` in a select list.
+
+    **Measured on 18.6**, through the differ rather than a hand-built plan: a
+    parent declaring its `numeric(5,1)` key `1.0` and a child declaring its
+    `numeric(5,2)` one `1.00` — each of them the engine's own rendering, which
+    is what the spelling check requires a declaration to use — produced
+    `NOT EXISTS (... WHERE q.k0 = r.k0)` over `E'1.0'` and `E'1.00'`, counted
+    **one orphan**, and the engine then took the very same plan. The count and
+    the verdict disagreed, and the count was the one that was wrong.
+
+    The types are in the plan already: `Change::CreateTable` carries the whole
+    `Table`. `crates/pbps-mssql` has remembered them at that arm all along, so
+    this is the pg crate catching up rather than a new idea, and it is the
+    reasoning of DECISIONS 339 and 341 — two unknown literals compare as text,
+    and `'2026-01-02'` and `'01/02/2026'` are one `date` — arriving at the one
+    column those entries could not reach.

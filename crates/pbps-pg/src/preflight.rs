@@ -554,8 +554,26 @@ impl AsStored {
                 } => {
                     this.columns.insert(table.column(to), from.clone());
                 }
-                Change::CreateTable { name, .. } => {
+                Change::CreateTable { name, table, .. } => {
                     this.created.insert(name.clone());
+                    // A created table's columns are entirely in the plan, so
+                    // its **key** has a type here where a stored table's has
+                    // none: `InsertRow` carries the type of every non-key
+                    // column and no more, and the row key is what a foreign
+                    // key most often points at. Without this the two sides of
+                    // a key between two created tables are unknown literals,
+                    // which the engine resolves to `text` and compares as
+                    // text — measured, a parent spelling its `numeric(5,1)`
+                    // key `1.0` and a child spelling its `numeric(5,2)` one
+                    // `1.00` (each the engine's own rendering, which is what
+                    // the spelling check requires) counted one orphan, and
+                    // the engine took the plan. The same reasoning as
+                    // DECISIONS 339 and 341, arriving at the column the row
+                    // changes cannot describe.
+                    for (column, declared) in &table.columns {
+                        this.column_types
+                            .insert(name.column(column), declared.ty.clone());
+                    }
                 }
                 // Both run before the deletes (`order_key`), so a child
                 // counted through either would refuse a delete that will be
