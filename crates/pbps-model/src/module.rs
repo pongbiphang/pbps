@@ -634,7 +634,16 @@ impl FromStr for ModuleId {
                 .parse()
                 .map_err(|_| ModuleIdError::Shape(s.to_owned()))?;
             let mut types = Vec::new();
-            if !args.trim().is_empty() {
+            // ASCII whitespace, as `RoutineArg` trims it: to PostgreSQL a
+            // non-breaking space is an identifier — measured, `CREATE TYPE
+            // ar." "` (one U+00A0) and `CREATE FUNCTION ar.g(a \u{a0})` are
+            // accepted, with the identity `g(" ")` — so `f(\u{a0})` is a
+            // routine of one argument, and a trim that took Unicode's word
+            // for it read the key as `f()` and refused the body for its count.
+            if !args
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .is_empty()
+            {
                 for arg in
                     split_top_level(args).ok_or_else(|| ModuleIdError::Shape(s.to_owned()))?
                 {
@@ -2351,6 +2360,18 @@ mod tests {
         for malformed in ["app.f(a'b)", "app.f('x')", "app.f(app.U&\"x\" UESCAPE ',)"] {
             assert!(malformed.parse::<ModuleId>().is_err(), "{malformed}");
         }
+    }
+
+    /// An argument list that is one non-ASCII byte is a list of one: to
+    /// PostgreSQL the byte is a name (measured, `g(\u{a0})` is `g(" ")`),
+    /// and only ASCII whitespace makes the list empty.
+    #[test]
+    fn an_argument_list_of_one_non_ascii_byte_is_not_empty() {
+        let one: ModuleId = "app.f(\u{a0})".parse().expect("a module id");
+        assert_eq!(one.args().map(<[RoutineArg]>::len), Some(1));
+        assert_eq!(one.to_string(), "app.f(\u{a0})");
+        let none: ModuleId = "app.f( \t )".parse().expect("a module id");
+        assert_eq!(none.args().map(<[RoutineArg]>::len), Some(0));
     }
 
     #[test]

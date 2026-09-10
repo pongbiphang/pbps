@@ -5952,7 +5952,12 @@ SPEC is in sync with all of these.
     normalizer for what this table does not know. And a built-in written with
     its schema is the built-in: measured, `pg_catalog.int4`, `PG_CATALOG.INT4`,
     `"pg_catalog".int4` and `pg_catalog."int4"` are all `integer`, so the
-    qualifier is dropped before the name is folded.
+    qualifier is dropped before the name is folded. So is the catalog's own
+    name for a built-in's array: measured, `_int4`, `_varbit` and
+    `_numeric(10,2)` are `integer[]`, `bit varying[]` and `numeric[]`. Built-ins
+    only — `ar._my_type` is `ar.my_type[]` but `ar._solo` is `ar._solo`, and
+    which of the two a user's name is cannot be decided offline, so it passes
+    through as written and the engine decides.
 
 304. **A module whose deparsed statement this reader cannot cut is named and
     left out, never recorded with an empty body.** The declaration holds
@@ -6408,7 +6413,10 @@ SPEC is in sync with all of these.
     trim of a module body: measured, `CREATE VIEW v AS SELECT 1 AS x\u{a0}`
     names the column `x\u{a0}`, and `str::trim` had taken the byte off the
     end of the body before the `CREATE`, so the view the plan made had a
-    column the declaration does not name.
+    column the declaration does not name. And the identity's own test for an
+    empty argument list: measured, a type may be named by one non-breaking
+    space and `g(\u{a0})` is a routine of one argument, which a Unicode trim
+    read as `g()`.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three

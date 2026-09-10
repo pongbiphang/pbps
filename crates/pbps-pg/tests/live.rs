@@ -7082,6 +7082,11 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "pg_catalog.int4",
         "pg_catalog.varbit(4)",
         "pg_catalog.timestamptz(3)",
+        // The catalog's own name for a built-in's array type.
+        "_int4",
+        "pg_catalog._int4",
+        "_varbit",
+        "_numeric(10,2)",
         // Aliases the engine identifies as something else and the column
         // catalogue does not carry.
         "varbit(4)",

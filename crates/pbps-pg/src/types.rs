@@ -1112,12 +1112,36 @@ fn identity_element(element: &str) -> String {
     // the identity `format_type` writes.
     let element = as_the_engine_spells(element);
     let element = element.strip_prefix("pg_catalog.").unwrap_or(&element);
+    if let Some(identity) = built_in(element) {
+        return identity;
+    }
+    // The catalog's own name for a built-in's array type: **measured**,
+    // `_int4`, `pg_catalog._int4`, `"_int4"`, `_varbit`, `_numeric(10,2)` and
+    // `_bpchar` are identified as `integer[]`, `integer[]`, `integer[]`,
+    // `bit varying[]`, `numeric[]` and `character[]`. Built-ins only: a user
+    // type's array is spelled the same way (`ar._my_type` is `ar.my_type[]`)
+    // but so is a user type that merely starts with an underscore (`ar._solo`
+    // is `ar._solo`), and which of the two a name is cannot be decided
+    // offline — the engine is the normalizer for what this table does not
+    // know (303).
+    if let Some(rest) = element.strip_prefix('_')
+        && let Some(base) = built_in(rest)
+    {
+        return format!("{base}[]");
+    }
+    quoted_where_the_engine_quotes(&without_modifier(element))
+}
+
+/// The identity of a built-in spelling — the column catalogue's, the
+/// modifier discarded, the field qualifier discarded, or an alias the
+/// catalogue lacks — or `None` where the spelling is not a built-in.
+fn built_in(element: &str) -> Option<String> {
     if let Some(folded) = folded(element) {
-        return folded.base;
+        return Some(folded.base);
     }
     let bare = without_modifier(element);
     if let Some(folded) = folded(&bare) {
-        return folded.base;
+        return Some(folded.base);
     }
     // The one type this engine's grammar follows with words rather than a
     // parenthesis. **Measured**, a parameter declared
@@ -1126,12 +1150,12 @@ fn identity_element(element: &str) -> String {
     if let Some(rest) = bare.strip_prefix("interval")
         && rest.starts_with(|c: char| c.is_ascii_whitespace())
     {
-        return "interval".to_owned();
+        return Some("interval".to_owned());
     }
-    if let Some((_, identity)) = ROUTINE_ALIASES.iter().find(|(alias, _)| *alias == bare) {
-        return (*identity).to_owned();
-    }
-    quoted_where_the_engine_quotes(&bare)
+    ROUTINE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == bare)
+        .map(|(_, identity)| (*identity).to_owned())
 }
 
 /// An unquoted name spelled the way the engine spells it in an identity:
@@ -1592,6 +1616,15 @@ mod tests {
             ("s.my_type", "s.my_type"),
             ("S.MyType", "s.mytype"),
             ("s.Ätype[]", "s.\"Ätype\"[]"),
+            // The catalog's own name for a built-in's array type, measured.
+            ("_int4", "integer[]"),
+            ("pg_catalog._int4", "integer[]"),
+            ("\"_int4\"", "integer[]"),
+            ("_INT4", "integer[]"),
+            ("_varbit", "bit varying[]"),
+            ("_text", "text[]"),
+            ("_numeric(10,2)", "numeric[]"),
+            ("_bpchar", "character[]"),
             ("bpchar(3)", "character"),
             ("nchar(2)", "character"),
             ("national character varying(5)", "character varying"),
@@ -1647,6 +1680,11 @@ mod tests {
             // A pseudo-type, which no column may ever be.
             "anyelement",
             "record",
+            // A user type whose name starts with an underscore is left as
+            // written: measured, `ar._my_type` is `ar.my_type[]` and
+            // `ar._solo` is `ar._solo`, and only the engine can tell which.
+            "ar._my_type",
+            "ar._solo",
             // Types this catalogue does not carry, spelled as the engine
             // spells them.
             "bit varying",
