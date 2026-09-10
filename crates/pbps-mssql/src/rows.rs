@@ -126,7 +126,9 @@ pub struct Slot {
     /// Position of the value in the result row.
     pub value_at: usize,
     /// Position of the "equals the default" flag, for a column whose default
-    /// is a literal the engine can compare without running anything.
+    /// is a literal the engine can compare without running anything. The
+    /// query returns -1 when assignment conversion fails, 0 for different,
+    /// and 1 for equal; -1 decodes into the existing unknown set.
     pub default_at: Option<usize>,
     /// Whether the column has a default at all — which decides what a NULL
     /// means (see the module docs).
@@ -226,9 +228,11 @@ pub fn query(
                 // text cell to the numeric type of its default expression.
                 let ty = crate::types::normalize(&spec.ty)?;
                 select.push(format!(
-                    // Both halves, because `=` is UNKNOWN for a NULL on either
-                    // side and `DEFAULT NULL` is a real declaration.
-                    "CASE WHEN {quoted} = CONVERT({ty}, {default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
+                    // A failed assignment is unknown, not a NULL default.
+                    // Keep that third answer local to this query/decode wire
+                    // format; TRY_CONVERT preserves the engine's rounding.
+                    "CASE WHEN ({default}) IS NOT NULL AND TRY_CONVERT({ty}, {default}) IS NULL THEN -1 \
+                     WHEN {quoted} = TRY_CONVERT({ty}, {default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
                      THEN 1 ELSE 0 END"
                 ));
                 Some(select.len() - 1)
@@ -1060,25 +1064,24 @@ pub fn decode(
     for slot in &query.columns {
         let text: Option<&str> = row.try_get_at(slot.value_at).map_err(|e| read(name, e))?;
         // Three answers, not two: the engine said it is the default, the
-        // engine said it is not, or the engine was never asked (a default it
-        // would have had to run). The third is not the first: a `NEWID()`
+        // engine said it is not, or no comparison was possible (a default it
+        // would have had to run, or an assignment conversion that failed).
+        // The third is not the first: a `NEWID()`
         // key or a `GETDATE()` stamp holds a value nobody can tell from its
         // default, and `pull` has to write that value, not drop it.
-        let confirmed = match slot.default_at {
-            Some(at) => {
-                row.try_get_at::<i32>(at)
-                    .map_err(|e| read(name, e))?
-                    .unwrap_or(0)
-                    == 1
-            }
-            None => false,
+        let default_answer = match slot.default_at {
+            Some(at) => row
+                .try_get_at::<i32>(at)
+                .map_err(|e| read(name, e))?
+                .unwrap_or(0),
+            None => 0,
         };
         match canonical(slot, text) {
             Ok(Some(v)) => {
                 cells.insert(slot.column.clone(), v);
-                if confirmed {
+                if default_answer == 1 {
                     at_default.insert(slot.column.clone());
-                } else if slot.assume_default {
+                } else if slot.assume_default || default_answer == -1 {
                     unknown.insert(slot.column.clone());
                 }
             }
@@ -1160,7 +1163,7 @@ mod tests {
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         assert!(
             q.sql.contains(
-                "CASE WHEN [label] = CONVERT(nvarchar(50), 'Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
+                "WHEN [label] = TRY_CONVERT(nvarchar(50), 'Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
             ),
             "{}",
             q.sql
@@ -1194,11 +1197,14 @@ mod tests {
             .unwrap();
             assert!(
                 q.sql.contains(&format!(
-                    "[n]]ame] = CONVERT({expected}, -CAST('1' AS int))"
+                    "[n]]ame] = TRY_CONVERT({expected}, -CAST('1' AS int))"
                 )),
                 "{}",
                 q.sql
             );
+            assert!(q.sql.contains(&format!(
+                "(-CAST('1' AS int)) IS NOT NULL AND TRY_CONVERT({expected}, -CAST('1' AS int)) IS NULL THEN -1"
+            )), "{}", q.sql);
         }
         for (ty, default) in [
             ("text", "-CAST('1' AS int)"),

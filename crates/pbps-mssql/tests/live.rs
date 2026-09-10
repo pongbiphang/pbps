@@ -305,6 +305,115 @@ async fn signed_defaults_are_compared_as_the_column_stores_them() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn an_unassignable_signed_default_is_unknown_not_null() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("signed_target_safety").await;
+    for (i, (ty, default, explicit, safe)) in [
+        ("tinyint", "-CAST('255' AS tinyint)", "1", false),
+        ("tinyint", "+CAST('255' AS tinyint)", "1", true),
+        ("decimal(3,2)", "-CAST('9.995' AS decimal(5,3))", "1", false),
+        ("decimal(3,2)", "-CAST('9.994' AS decimal(5,3))", "1", true),
+        (
+            "smallmoney",
+            "+CAST('214748.3648' AS decimal(12,4))",
+            "1",
+            false,
+        ),
+        (
+            "smallmoney",
+            "-CAST('214748.3648' AS decimal(12,4))",
+            "1",
+            true,
+        ),
+        (
+            "money",
+            "+CAST('922337203685477.5808' AS decimal(20,4))",
+            "1",
+            false,
+        ),
+        ("nvarchar(1)", "-CAST('255' AS tinyint)", "N'a'", false),
+        ("nchar(1)", "-CAST('255' AS tinyint)", "N'a'", false),
+        // SQL Server emits '*' for the narrow non-Unicode conversion;
+        // assignment and readback must agree rather than guess a width.
+        ("varchar(1)", "-CAST('255' AS tinyint)", "'a'", true),
+        ("char(1)", "-CAST('255' AS tinyint)", "'a'", true),
+        ("nvarchar(4)", "-CAST('255' AS tinyint)", "N'a'", true),
+        ("binary(1)", "-CAST('255' AS tinyint)", "0x02", true),
+        ("varbinary(1)", "-CAST('255' AS tinyint)", "0x02", true),
+        ("bit", "-CAST('255' AS tinyint)", "0", true),
+        ("datetime", "-CAST('255' AS tinyint)", "'2026-01-01'", true),
+        (
+            "smalldatetime",
+            "-CAST('255' AS tinyint)",
+            "'2026-01-01'",
+            false,
+        ),
+        ("sql_variant", "-CAST('255' AS tinyint)", "'abc'", true),
+        ("real", "-CAST('1e39' AS float)", "1", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = TableName::new("dbo", format!("t{i}"));
+        db.conn.execute(&format!("CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {ty} DEFAULT ({default})); INSERT dbo.t{i}(id,n) VALUES(1,{explicit}),(2,NULL);")).await.unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        let mut column = Column::new(ty.parse().unwrap());
+        let defaults = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{i}')")).await.unwrap();
+        column.default = Some(
+            defaults[0]
+                .try_get::<&str>("definition")
+                .unwrap()
+                .unwrap()
+                .to_owned(),
+        );
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for key in ["1", "2"] {
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{ty} default {default}, row {key}: {e}"));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert!(!observed.at_default.contains("n"), "{ty} row {key}");
+            assert_eq!(observed.unknown.contains("n"), !safe, "{ty} row {key}");
+        }
+        if safe {
+            db.conn
+                .execute(&format!("INSERT dbo.t{i}(id) VALUES(3);"))
+                .await
+                .unwrap();
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from("3")].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db.conn.query(&query.sql).await.unwrap();
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert!(observed.at_default.contains("n"), "{ty}");
+            assert!(!observed.unknown.contains("n"), "{ty}");
+        }
+    }
+    db.drop().await;
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,
