@@ -54,7 +54,7 @@
 //! A plan is what [`estimates`] takes, never a single change, and that is
 //! deliberate: a table this plan renames is described by its new name and has
 //! to be *measured* under the one the catalog still has, and only something
-//! holding the whole plan can know the difference (DECISIONS 392).
+//! holding the whole plan can know the difference (DECISIONS 409).
 
 use std::collections::BTreeMap;
 
@@ -149,7 +149,7 @@ pub struct Estimate {
     /// The same table as the **catalog** has it *now*, which is the only name
     /// [`against`] can ask about — a plan that renames the table describes one
     /// the database does not have yet, and the query would find nothing and
-    /// report a rename as "no such table" (DECISIONS 392).
+    /// report a rename as "no such table" (DECISIONS 409).
     ///
     /// Private, and the reason is the whole design: `Estimate` has no public
     /// constructor, so the only way to hold one is through [`estimates`], which
@@ -291,7 +291,7 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 /// column rename a class of its own after the table renames for the same
 /// reason). Asked about that name, [`against`] finds no row and reports "this
 /// database has no table by that name to measure" — a rename read as an absence,
-/// which is the failure this repo has a rule about (DECISIONS 392).
+/// which is the failure this repo has a rule about (DECISIONS 409).
 ///
 /// Changes with no estimate are dropped rather than carried as `None`: a
 /// module, a role, a grant and a row change are not about a table's stored
@@ -657,7 +657,7 @@ mod tests {
         s.parse().expect("a table name")
     }
 
-    /// DECISIONS 392: a table this plan renames is described by its new name
+    /// DECISIONS 409: a table this plan renames is described by its new name
     /// and measured under the one the catalog still has.
     ///
     /// The two names have to be right independently — the operator reads the

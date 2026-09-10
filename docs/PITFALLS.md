@@ -62,7 +62,7 @@ things, and only one of them is good news.**
 - A conversion probe written as a cast counting **zero** on a table the `ALTER`
   then refuses. `SELECT 'abcde'::varchar(4)` is `'abcd'`, so nothing is
   rejected and nothing is counted — the emptiness is the good news, and the
-  statement it cleared fails (DECISIONS 370). See below.
+  statement it cleared fails (DECISIONS 387). See below.
 
 ### 2. Failures escaping the one-envelope contract
 
@@ -621,7 +621,7 @@ is parsed under the operator's `DateStyle` too, so `CAST('01/02/2026' AS date)`
 inside a probe is 2 January where the statement writes 1 February.
 
 The narrow answer is an allow-list — measure a length only over a rendering no
-pinned setting moves (DECISIONS 389). The real answer is to establish the pins
+pinned setting moves (DECISIONS 406). The real answer is to establish the pins
 before the probes, which is issue #257, a fourth path for #174. Until then, the
 rule to carry is: **before writing a probe, ask which session decides the value
 it reads.** A probe and the statement it clears are not the same session, and
@@ -875,10 +875,10 @@ This is the shape, not the instance. Three of them turned up in one step:
 - `GROUP BY` standing in for `UNIQUE`, which is right on SQL Server and wrong
   here, because this engine's `UNIQUE` is `NULLS DISTINCT` and `GROUP BY` never
   is — measured, it reports two duplicates among rows the engine accepts, so
-  the probe refused a valid plan (DECISIONS 374);
+  the probe refused a valid plan (DECISIONS 391);
 - `pg_depend` standing in for "what does this rename break", which lists
   precisely the objects that **survive** a rename here and holds no edge at all
-  for the `plpgsql` bodies that break (DECISIONS 377).
+  for the `plpgsql` bodies that break (DECISIONS 394).
 
 **Ask what the statement does, not what the nearest construct does.** Each of
 these was found by running the statement beside the probe and comparing, which

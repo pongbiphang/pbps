@@ -42,7 +42,7 @@
 //!   `interval`, a `timestamp` and a `double precision` all print to different
 //!   lengths under the two, in both directions: a length probe over one of them
 //!   would refuse a plan this engine accepts, or clear one it refuses. Those
-//!   sources get no length probe (DECISIONS 389).
+//!   sources get no length probe (DECISIONS 406).
 //! - **Drops and renames.** Every row of a dropped column is "affected", and a
 //!   count of them would always look alarming and never decide anything. A
 //!   rename carries a dependency risk rather than a data one, and
@@ -50,7 +50,7 @@
 //! - **A value this plan writes that no probe can evaluate** — a default that is
 //!   not a literal, which has no value until it runs (DECISIONS 124), and a key
 //!   spanning a column this plan *narrows*, whose projection would be a `CAST`
-//!   that can raise (DECISIONS 375).
+//!   that can raise (DECISIONS 392).
 //! - **A check on a table this plan retypes a column of.** The conversion runs
 //!   at rank 9 and the check is added at rank 13, so the engine tests the
 //!   converted value while a probe tests the stored one. Measured, a
@@ -59,7 +59,7 @@
 //!   violation by a probe over the stored value — a valid plan refused. The
 //!   predicate is arbitrary SQL that names its own columns, so supplying
 //!   converted values would mean rewriting that text by substitution, which
-//!   this module refuses; the answer is no probe (DECISIONS 393).
+//!   this module refuses; the answer is no probe (DECISIONS 410).
 //! - **A check whose expression the probe cannot evaluate here.** The text is
 //!   never rewritten for a rename — rewriting SQL by substitution is how a tool
 //!   that promised not to parse SQL starts parsing it badly — and an
@@ -750,7 +750,7 @@ impl AsStored {
     /// One spelling, because two probes ask it and they must not drift apart:
     /// a retype is the one plan change that leaves a probe *able* to run and
     /// wrong, so whichever probe forgets to ask this is the one that refuses a
-    /// valid plan (DECISIONS 393).
+    /// valid plan (DECISIONS 410).
     fn retypes_in(&self, table: &TableName) -> bool {
         self.retyped.keys().any(|c| c.table == *table)
     }
@@ -2817,7 +2817,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // rename and added-column cases are handled two comments down:
             // those make the probe *fail to run*, and the runner says so by
             // name. A retype leaves the probe able to run and quietly wrong,
-            // which is the one outcome no report can catch (DECISIONS 393).
+            // which is the one outcome no report can catch (DECISIONS 410).
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
                 || names.retypes_in(table)
             {
@@ -3175,7 +3175,7 @@ mod tests {
         );
     }
 
-    /// DECISIONS 393: a check on a table this plan retypes a column of gets no
+    /// DECISIONS 410: a check on a table this plan retypes a column of gets no
     /// probe, because the probe would read the value the conversion is about to
     /// replace.
     ///

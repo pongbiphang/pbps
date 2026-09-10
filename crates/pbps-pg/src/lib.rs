@@ -929,6 +929,13 @@ mod tests {
     /// nothing to do".
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
+        // A list of one, deliberately: roles (step 6) and the probes (step 9)
+        // each left it as they landed, and the day a part is added back it is
+        // this array that grows rather than a second test being written.
+        #[expect(
+            clippy::single_element_loop,
+            reason = "the shape is the point: every variant is walked"
+        )]
         for part in [Unbuilt::Introspection] {
             let message = part.refuse().to_string();
             assert!(message.contains("Phase 5 step"), "{message}");

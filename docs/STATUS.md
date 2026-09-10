@@ -555,42 +555,42 @@ and a foreign key. Two of them cannot be written the way the SQL Server crate
 writes them. A conversion probe shaped as a cast reports a table **clean** that
 the statement then refuses: measured, `'abcde'::varchar(4)` is `'abcd'` and the
 `ALTER` over the same value is `value too long`, because a cast is an explicit
-conversion and the `ALTER` is an assignment (DECISIONS 370). And a duplicate
+conversion and the `ALTER` is an assignment (DECISIONS 387). And a duplicate
 count has to exclude a key holding any NULL, because `UNIQUE` here is `NULLS
 DISTINCT` and `GROUP BY` is not — ported across unchanged it refused a plan the
-engine accepts (374). The rest is the boundary arithmetic each target really
+engine accepts (391). The rest is the boundary arithmetic each target really
 performs: the rounded value, the asymmetric float boundary, `NaN` and infinity
 sorting greatest, and a float overflow threshold written as the engine's own
-`2^128 - 2^103` (371–373). Every probe counts the rows the statement will
+`2^128 - 2^103` (388–390). Every probe counts the rows the statement will
 **meet** rather than the rows standing now, so the ordinary flow — declare the
 parent rows, declare the key that references them — is not refused for a
 violation the plan itself removes; and the orphan count compares under the
 referenced column's collation, spliced in from the catalog, because two columns
-collated differently cannot be compared at all (376). What a probe may
+collated differently cannot be compared at all (393). What a probe may
 **measure** is bounded too: probes run before the deployment's framing pins the
 session, so a length taken over a rendering any pinned setting moves is not the
 length the statement takes — measured, a `bytea` prints longer under the
 operator's session and an `interval` prints shorter, so the same probe would
 refuse a valid plan in one case and clear a doomed statement in the other. Only
-sources every session prints alike are measured (389); the ordering itself is
+sources every session prints alike are measured (406); the ordering itself is
 issue #257, a fourth path for #174. And a check on a table this plan retypes a
 column of is not probed at all: the conversion runs at rank 9 and the check is
 added at rank 13, so measured, a `numeric(10,2)` holding `1.50` converted to
 `numeric(10,0)` and then given `CHECK (v = round(v))` is accepted by the engine
 and counted as a violation by a probe over the stored value. A retype is the one
 plan change that leaves a probe able to run and quietly wrong, where a rename or
-an added column makes it fail loudly and the runner says so (393). A binary
+an added column makes it fail loudly and the runner says so (410). A binary
 float is measured in its own domain and never through `numeric`: measured,
 `(-9223372036854775808::float8)::numeric` is `-9223372036854780000`, so the
 conversion probe called `-2^63` out of range for a `bigint` that stores it
 exactly, and the same rounding put the largest `double precision` that becomes
 a `real` past the overflow threshold. Both boundaries now compare as `float8`,
 while an exact source keeps the exact domain — which is the domain its own
-`ALTER` converts in (394). The same rule reached the calendar test last: a
+`ALTER` converts in (411). The same rule reached the calendar test last: a
 range probe excludes the sentinels its target accepts, and the temporal arm was
 the one that did not — measured, a `date` holding `infinity` becomes a
 `timestamp` holding `infinity`, so the count refused a plan this engine takes,
-while `'294277-01-01'` is still counted and still `22008` (395).
+while `'294277-01-01'` is still counted and still `22008` (412).
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a
@@ -601,36 +601,36 @@ column name as an alias — while a body the engine stored as text still spells
 the old name and fails the next time anybody calls it. So the advisory list is a
 name scan over the bodies `prosqlbody IS NULL` identifies, the carried objects
 are reported as their own list rather than buried or dropped, and nothing blocks
-a rename on this engine (377–381). What points at a module about to be dropped
+a rename on this engine (394–398). What points at a module about to be dropped
 stays `modules`' question, answered there in full. Both halves of a renamed
 column's name are taken back to the catalog's spelling, because a `RenameColumn`
 carries the declared, post-rename *table* and asking about it would refuse a
-valid plan (390); and the body scan steps by a character rather than a byte,
+valid plan (407); and the body scan steps by a character rather than a byte,
 because identifiers here are not ASCII and slicing a string off a character
-boundary panics (391). SQL Server has both defects in its own copy of this
+boundary panics (408). SQL Server has both defects in its own copy of this
 module, where the first makes the report come back empty rather than erroring:
 issues #256 and #262.
 
 The estimate is ADR-0012 §3's boundary, built: **cost is not risk**, and nothing
 in the module reads or produces a risk class — a test asserts it over the
 module's own source, because the pressure to connect the two axes is highest
-exactly when somebody is looking at a large table (382). Its dataset is the
+exactly when somebody is looking at a large table (399). Its dataset is the
 whole catalogue rather than §3's eleven hand-measured rows: every ordered pair,
 263 accepted by the engine, judged by `relfilenode`, and the live suite
-re-measures it and holds the dialect to all of them (383, ADR-0012 Amendment 2).
+re-measures it and holds the dialect to all of them (400, ADR-0012 Amendment 2).
 Whether the table is rebuilt and whether every row is read are kept as two
 facts, because `SET NOT NULL` rewrites nothing and reads all hundred thousand
-rows while `varchar(10) -> varchar(20)` rewrites nothing and reads none (384). A
+rows while `varchar(10) -> varchar(20)` rewrites nothing and reads none (401). A
 foreign key is the one statement that locks a table nobody named — measured,
 `ShareRowExclusiveLock` on the referenced table too, and no exclusive lock
-anywhere (385). And where the answer is not a function of the declaration the
+anywhere (402). And where the answer is not a function of the declaration the
 estimate says so rather than guessing cheap: an unparsed default expression, a
 partitioned table, an inheritance parent, an indexed column being retyped, and
-`reltuples = -1`, which is "nobody has looked" and not "no rows" (386–388). An
+`reltuples = -1`, which is "nobody has looked" and not "no rows" (403–405). An
 estimate names its table twice — as the plan has it, which the operator reads,
 and as the catalog has it, which is the only name the measurement may use — and
 the second is private with no public constructor beside it, so a caller cannot
-build the estimate that cannot be measured (392).
+build the estimate that cannot be measured (409).
 
 **No SQL Server cost measurements were taken here either.** Whether
 `int -> bigint` is metadata-only there is still the open question ADR-0012's

@@ -1198,7 +1198,7 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
     // 18.6**, `(-9223372036854775808::float8)::numeric` is
     // `-9223372036854780000`, four thousand million out. Both boundary tests
     // below sit exactly where that error is biggest, and both got it wrong in
-    // the direction that refuses a valid plan (DECISIONS 394):
+    // the direction that refuses a valid plan (DECISIONS 411):
     //
     // ```text
     // -9223372036854775808::float8 -> bigint   engine: stored exactly
@@ -1227,7 +1227,7 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
         // The guard is the whole difference between a length this engine will
         // measure and one only the operator's session would:
         // `renders_alike_everywhere` carries the measurements and the reason
-        // (DECISIONS 389).
+        // (DECISIONS 406).
         (
             _,
             Family::Text {
@@ -2315,7 +2315,7 @@ mod tests {
             .to_string()
     }
 
-    /// DECISIONS 394: a float's boundary is tested as a float.
+    /// DECISIONS 411: a float's boundary is tested as a float.
     ///
     /// The two predicates a float source reaches must not mention `numeric` at
     /// all. `float8::numeric` rounds through the shortest decimal, and both of
@@ -2393,7 +2393,7 @@ mod tests {
     }
 
     /// A length probe is taken only over a rendering every session prints
-    /// alike (DECISIONS 389).
+    /// alike (DECISIONS 406).
     ///
     /// The probe runs before the deployment pins its settings and the `ALTER`
     /// runs after, so a source whose `::text` moves with `bytea_output`,

@@ -16259,7 +16259,7 @@ fn one(counts: &[(String, i64)], needle: &str) -> i64 {
 ///
 /// The conversion sits on a **table of its own**, and that is the rule and not
 /// tidiness: a plan that retypes a column of a table gets no check probe on
-/// that table at all (DECISIONS 393), so putting the retype on `customer` would
+/// that table at all (DECISIONS 410), so putting the retype on `customer` would
 /// silently delete the check probe from this test rather than measure it.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
@@ -16968,7 +16968,7 @@ async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing(
 /// The estimate of a plan holding this one change.
 ///
 /// `estimate::estimates` takes a whole `ChangeSet` because it is the only thing
-/// that can name a renamed table as the catalog still has it (DECISIONS 392),
+/// that can name a renamed table as the catalog still has it (DECISIONS 409),
 /// and the single-change entry point is not public for that reason. These tests
 /// are about one statement at a time, so they wrap it here rather than each
 /// building a plan of one.
@@ -17550,7 +17550,7 @@ async fn printed(conn: &mut Conn, set: &str, schema: &str, table: &str) -> i64 {
     .await
 }
 
-/// DECISIONS 389: a length probe is taken only over a rendering every session
+/// DECISIONS 406: a length probe is taken only over a rendering every session
 /// prints alike.
 ///
 /// A probe is issued before the deployment's transaction framing is established
@@ -17658,7 +17658,7 @@ async fn a_length_only_the_operators_own_session_would_measure_is_never_probed()
         .expect("drop");
 }
 
-/// DECISIONS 392: an estimate for a table this plan also renames is measured
+/// DECISIONS 409: an estimate for a table this plan also renames is measured
 /// against the table the catalog still has.
 ///
 /// The offline half asserts the two names. This is the half that says what the
@@ -17729,7 +17729,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
         .expect("drop");
 }
 
-/// DECISIONS 393: a check on a table this plan retypes a column of is not
+/// DECISIONS 410: a check on a table this plan retypes a column of is not
 /// probed, because the probe would read the value the conversion replaces.
 ///
 /// The offline half asserts the absence. This is the half that says what the
@@ -17909,7 +17909,7 @@ async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
         .expect("drop");
 }
 
-/// DECISIONS 394: a float's boundary is tested as a float, because
+/// DECISIONS 411: a float's boundary is tested as a float, because
 /// `float8::numeric` rounds through the shortest decimal.
 ///
 /// Every row here sits on a boundary, which is the only place the bug shows.

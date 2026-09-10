@@ -119,7 +119,7 @@ impl RenameTarget {
     /// has executed. Read literally that is `ImpactError::Name` on a plan the
     /// engine would accept, which is the refusal
     /// `preflight::AsStored` exists to prevent one rank further on
-    /// (DECISIONS 390).
+    /// (DECISIONS 407).
     pub fn from_changes(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
         use pbps_model::Change;
         // The plan's name for a table, to the catalog's. Built first and over
@@ -488,7 +488,7 @@ fn text(row: &Row, column: &str) -> Result<String, DbError> {
 /// byte 2 — the middle of the two bytes `ä` occupies. Identifiers here are not
 /// ASCII-only, deliberately: `is_ident_byte` counts every non-ASCII byte as
 /// part of a name, and the quoting rule admits any character a `"…"` can hold
-/// (DECISIONS 391).
+/// (DECISIONS 408).
 fn mentions(body: &str, name: &str) -> bool {
     // No name is no scan. `find("")` matches at every position, so an empty
     // needle would report that every body in the database mentions it — and
@@ -535,7 +535,7 @@ mod tests {
     /// **Both halves of the column's name**, which is the case this fixture
     /// carries: the plan renames the table too, so the `RenameColumn`'s own
     /// `table` is the declared `app.customer` and the catalog still has
-    /// `app.client` (DECISIONS 390).
+    /// `app.client` (DECISIONS 407).
     #[test]
     fn targets_are_taken_from_the_old_names() {
         let cs = ChangeSet {
@@ -637,7 +637,7 @@ mod tests {
         // A name whose first character is multibyte, embedded in a longer
         // identifier. The scan has to step over the rejected match by that
         // character's width: a one-byte step lands inside it and slicing the
-        // body there panics (DECISIONS 391). Each of these is a body that once
+        // body there panics (DECISIONS 408). Each of these is a body that once
         // took the process with it.
         assert!(!mentions("SELECT xä FROM t", "ä"));
         assert!(!mentions("SELECT äx FROM t", "ä"));

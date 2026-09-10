@@ -8278,7 +8278,7 @@ SPEC is in sync with all of these.
     (DECISIONS 274), which is why the table half needs no second thought and
     the view half needed this one.
 
-370. **A cast is not the assignment the `ALTER` performs, so the conversion
+387. **A cast is not the assignment the `ALTER` performs, so the conversion
     probe measures the value.** The obvious probe for a narrowing type change
     is "count the rows a cast rejects", and on this engine it reports a table
     clean that the statement then refuses. **Measured** on 18.6:
@@ -8294,7 +8294,7 @@ SPEC is in sync with all of these.
     `octet_length`, because the bound is characters: `'王小明'` is three of
     them and nine bytes and fits `varchar(3)`.
 
-371. **A `NaN` and an infinity sort greatest here rather than outside the
+388. **A `NaN` and an infinity sort greatest here rather than outside the
     order, so a range test finds them and a target that accepts one has to
     take it back out.** **Measured**: `'NaN'::numeric > 1e131071` is true, and
     `'NaN'::float8 = 'NaN'::float8` is true where C says neither. So the
@@ -8308,7 +8308,7 @@ SPEC is in sync with all of these.
     unchanged. Left in, each would have counted a row the engine keeps and
     refused a change it makes.
 
-372. **The engine tests the value it would store, so the probe rounds first —
+389. **The engine tests the value it would store, so the probe rounds first —
     the way that target rounds.** **Measured**: `2147483647.4::numeric` into
     `integer` is accepted and `2147483647.6` is `integer out of range`; a
     `numeric(10,2)` holding `999999.995` is already `1000000.00` and fails
@@ -8321,7 +8321,7 @@ SPEC is in sync with all of these.
     measured, `-2147483648.5::float8` into `integer` is `-2147483648`, which
     fits. Reading it as a symmetric bound counted a row the engine keeps.
 
-373. **A float target overflows at the midpoint above its largest value, and
+390. **A float target overflows at the midpoint above its largest value, and
     the threshold is written as the engine's own arithmetic.** **Measured** by
     bisection: the largest `double precision` that becomes a `real` is
     `3.4028235677973362e38` and the smallest that overflows is exactly
@@ -8333,7 +8333,7 @@ SPEC is in sync with all of these.
     the wrong bound: `3.4028235e38` is above it and converts, so a probe using
     it refuses a change the engine makes.
 
-374. **`NULLS DISTINCT` is this engine's rule and `GROUP BY`'s is the
+391. **`NULLS DISTINCT` is this engine's rule and `GROUP BY`'s is the
     opposite, so the duplicate count excludes a key holding any NULL.**
     **Measured** on 18.6: two rows holding NULL are accepted under
     `UNIQUE (a)`, and two rows holding `(1, NULL)` are accepted under
@@ -8344,16 +8344,16 @@ SPEC is in sync with all of these.
     plan the engine accepts, which is the worse of the two directions
     (PITFALLS #5).
 
-375. **A probe over a key spanning a column this plan narrows is not built.**
+392. **A probe over a key spanning a column this plan narrows is not built.**
     Projecting a stored value through the new type means a `CAST` that can
     raise, and a probe that raises is reported as *unchecked* while the apply
     proceeds — the silence, arriving through the fix for something else. A
     widening cannot raise, by `TypeChangeRisk::Safe`'s own criterion, so it is
     written out and a narrowing is not. The row that would raise cannot
     survive the `ALTER COLUMN … TYPE` either, and that change's own conversion
-    probe (370) is what counts it and names the column.
+    probe (387) is what counts it and names the column.
 
-376. **The orphan count compares under the referenced column's collation,
+393. **The orphan count compares under the referenced column's collation,
     spliced in from the catalog at the comparison site.** **Measured**, two
     stored columns collated differently cannot be compared at all —
     `q.k0 = r.k0` between a `"C"` column and an `"en_US"` one is `could not
@@ -8365,7 +8365,7 @@ SPEC is in sync with all of these.
     the count is assembled by the engine, which is the machinery the
     pre-delete probe already had.
 
-377. **What a rename breaks on this engine is invisible to the dependency
+394. **What a rename breaks on this engine is invisible to the dependency
     graph, and what the graph holds is what survives.** The SQL Server module
     of the same name reads `sys.sql_expression_dependencies` and reports what
     it finds, because that engine stores module text. **Measured on 18.6, this
@@ -8385,7 +8385,7 @@ SPEC is in sync with all of these.
     the engine's own record of which bodies it parsed, and not a language
     list, because measured, `sql` appears on both sides of that line.
 
-378. **The objects a rename is carried into are reported, as their own list.**
+395. **The objects a rename is carried into are reported, as their own list.**
     Three answers need three lists: what breaks, what the engine refuses, and
     what follows the rename and keeps working. The third is half of "what does
     this rename affect", it is the half this engine is better at, and an
@@ -8396,7 +8396,7 @@ SPEC is in sync with all of these.
     out: advisory means "this will break", and a report that flags what is fine
     is one people learn to override.
 
-379. **Nothing blocks a rename on this engine, and the empty list says so.**
+396. **Nothing blocks a rename on this engine, and the empty list says so.**
     **Measured**: a column a view depends on renames without complaint, while
     `DROP COLUMN` on the same column is `cannot drop column ident of table t
     because other objects depend on it`. `ImpactReport::blocking` is kept
@@ -8404,7 +8404,7 @@ SPEC is in sync with all of these.
     documentation says why nothing fills it — an empty field a reader has to
     guess about is a query that might have failed.
 
-380. **A module drop is not asked about here.** A module rename reaches the
+397. **A module drop is not asked about here.** A module rename reaches the
     plan as a drop plus a create (ADR-0002), and what the catalog holds against
     a module about to be dropped is `crate::modules`' question, answered there
     in full — every reverse `pg_depend` edge, the classes with no rule, the
@@ -8413,14 +8413,14 @@ SPEC is in sync with all of these.
     two would disagree the first time either was fixed. `RenameTarget` has two
     arms here where the SQL Server one has three.
 
-381. **A column the catalog does not have is an error, not an empty report.**
+398. **A column the catalog does not have is an error, not an empty report.**
     An unknown column would otherwise produce a report with nothing in it,
     which reads as "nothing breaks" — the one answer that must never arrive by
     accident. And the lookup excludes `attisdropped`: a dropped column keeps
     its slot with a placeholder name (ADR-0012 §6), so the slot is not a column
     anybody can rename and must not answer as one.
 
-382. **The estimate is a separate axis and carries no risk class.** ADR-0012 §3
+399. **The estimate is a separate axis and carries no risk class.** ADR-0012 §3
     decides it and this is where it is built: `integer -> bigint` is `Safe` and
     rewrites a million-row table under a lock that blocks readers, and folding
     that into `Narrowing` would lie about what the class means and break the
@@ -8429,7 +8429,7 @@ SPEC is in sync with all of these.
     the module's own source, because the pressure to connect the two axes is
     highest exactly when somebody is looking at a large table.
 
-383. **A rewrite is avoided only where the target constrains no byte already
+400. **A rewrite is avoided only where the target constrains no byte already
     stored.** **Measured**: every ordered pair of the catalogue's spellings,
     263 of them accepted by the engine, with `pg_class.relfilenode` either side
     of the statement. Ten pairs of distinct types rewrite nothing —
@@ -8445,7 +8445,7 @@ SPEC is in sync with all of these.
     reasoning about it. The live suite re-measures the matrix and holds the
     dialect to every accepted pair.
 
-384. **Whether the table is rebuilt and whether every row is read are two
+401. **Whether the table is rebuilt and whether every row is read are two
     facts, because one is invisible to the other.** ADR-0012's Limits state it
     and this is the measurement: on a hundred thousand rows,
     `ALTER COLUMN v SET NOT NULL` rebuilds nothing and reads **all** of them,
@@ -8455,7 +8455,7 @@ SPEC is in sync with all of these.
     `SET PRIMARY KEY` each rebuild nothing and read every row; `ADD COLUMN`,
     `DROP COLUMN`, `SET DEFAULT` and both renames read nothing.
 
-385. **A foreign key locks the table nobody named.** **Measured** from inside
+402. **A foreign key locks the table nobody named.** **Measured** from inside
     the statement's own transaction: `ADD CONSTRAINT … FOREIGN KEY` takes
     `ShareRowExclusiveLock` on the **referenced** table as well as on the one
     the constraint is written on, and takes no `AccessExclusiveLock` at all —
@@ -8467,7 +8467,7 @@ SPEC is in sync with all of these.
     the referenced table in `also_locks` for that reason: it is a cost on an
     object the change does not mention.
 
-386. **An unparsed default expression is `unknown`, never free.** **Measured**,
+403. **An unparsed default expression is `unknown`, never free.** **Measured**,
     `ADD COLUMN d integer DEFAULT 7` rebuilds nothing and reads nothing, and
     `ADD COLUMN d uuid DEFAULT gen_random_uuid()` rebuilds every row. Both are
     one `AddColumn` carrying a default and only the expression tells them
@@ -8475,7 +8475,7 @@ SPEC is in sync with all of these.
     the guess by name, and the constant test the row reader already owns
     (`rows::is_constant`) is what decides which side a default falls on.
 
-387. **A shape the measurements never covered takes the answer back to
+404. **A shape the measurements never covered takes the answer back to
     `unknown`, whatever the static half said.** ADR-0012's Limits name three —
     a partitioned table, an inheritance parent, and `ALTER TYPE` on an indexed
     column — and `estimate::against` reads `relkind`, `relhassubclass` and
@@ -8485,14 +8485,14 @@ SPEC is in sync with all of these.
     not come from. A table the database does not have is `unknown` too, and
     not a table with no rows in it.
 
-388. **`reltuples = -1` is "nobody has looked", not "no rows".** **Measured**,
+405. **`reltuples = -1` is "nobody has looked", not "no rows".** **Measured**,
     a table holding a thousand rows that has never been analyzed reads
     `reltuples = -1` and `relpages = 0`, and reads `1000` and `5` straight
     after `ANALYZE`. Read as a count it says the change is free on the largest
     table in the database, so `Rows` has an arm of its own for it and no
     caller can spell it as zero.
 
-389. **A probe may only measure a rendering that every session renders alike.**
+406. **A probe may only measure a rendering that every session renders alike.**
     A probe is issued *before* the deployment's transaction framing is
     established, so it runs under the operator's own settings while the
     statement it clears runs under the ones the framing pins (DECISIONS 267).
@@ -8521,7 +8521,7 @@ SPEC is in sync with all of these.
     catalogue, and is filed as its own issue rather than answered here; if it
     is ever reversed, this gate is what may be lifted.
 
-390. **A column a plan renames is named to the catalog with *both* halves taken
+407. **A column a plan renames is named to the catalog with *both* halves taken
     back.** A `RenameColumn` carries the declared, post-rename **table**:
     `pbps-diff`'s `order_key` gives it a class of its own after the table
     renames precisely because the statement it becomes names the table and must
@@ -8536,7 +8536,7 @@ SPEC is in sync with all of these.
     because the order that puts the table rename first is `order_key`'s
     guarantee and not this list's to lean on.
 
-391. **A scan for an identifier steps by a character, not a byte.** `mentions`
+408. **A scan for an identifier steps by a character, not a byte.** `mentions`
     walks a routine body looking for the renamed name bounded by non-identifier
     characters, and stepped past a rejected match by one byte. Identifiers here
     are not ASCII: `is_ident_byte` counts every non-ASCII byte as part of a
@@ -8547,8 +8547,8 @@ SPEC is in sync with all of these.
     the width of the name's first character, and an empty name returns `false`
     before the loop rather than matching at every position.
 
-392. **An estimate names its table twice: as the plan has it, and as the
-    catalog does.** The same translation as DECISIONS 390, one module over. A
+409. **An estimate names its table twice: as the plan has it, and as the
+    catalog does.** The same translation as DECISIONS 407, one module over. A
     plan may rename a table and then alter one of its columns, and the
     `AlterColumnType` and `RenameColumn` both carry the *declared*,
     post-rename table. `estimate::against` reads `relkind`, `relhassubclass`
@@ -8565,7 +8565,7 @@ SPEC is in sync with all of these.
     single-change form over a change set would rebuild exactly the estimate
     that cannot be measured, and now cannot write it.
 
-393. **A retype is the one plan change that leaves a probe able to run and
+410. **A retype is the one plan change that leaves a probe able to run and
     wrong, so a probe over a retyped table is skipped rather than allowed to
     answer.** `AlterColumnType` runs at rank 9 and `AddCheck` at rank 13, so
     the engine tests a check against the *converted* value while a probe built
@@ -8597,7 +8597,7 @@ SPEC is in sync with all of these.
     knowingly: a plan that retypes any column of a table gets no check probe on
     that table, even for a check over a column it does not touch.
 
-394. **A binary float is measured in its own domain, never through `numeric`.**
+411. **A binary float is measured in its own domain, never through `numeric`.**
     `float8::numeric` on this engine goes by way of the float's shortest
     round-tripping decimal rather than its exact value, so it is a *rounding*,
     and the rounding is largest exactly where a conversion probe's boundary
@@ -8620,12 +8620,12 @@ SPEC is in sync with all of these.
     `ALTER` from `numeric` or an integer type to a float converts the exact
     value, so the exact domain is the one the engine is working in. The rule is
     not "prefer floats", it is "measure in the domain the statement measures
-    in" — the same rule DECISIONS 370 draws between a cast and an assignment,
+    in" — the same rule DECISIONS 387 draws between a cast and an assignment,
     one level down.
 
-395. **The calendar probe takes `infinity` out by name, because the target
+412. **The calendar probe takes `infinity` out by name, because the target
     keeps it.** Every other range test in `cannot_become` already excludes the
-    sentinels its target accepts — 394's float arms, and the bounded-`numeric`
+    sentinels its target accepts — 411's float arms, and the bounded-`numeric`
     arm which counts an infinity and spares a `NaN`, each measured. The
     temporal arm was written as a bare `value > 'last-12-31'::date` and did
     not, so the one value that sorts after every finite date was counted as a
