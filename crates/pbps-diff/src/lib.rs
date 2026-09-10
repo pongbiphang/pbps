@@ -532,6 +532,86 @@ mod tests {
         ));
     }
 
+    /// A matchable retained annotation must not lend its success to a different
+    /// current command that tries to reuse the same source at an occupied name.
+    #[test]
+    fn an_occupied_table_command_is_rejected_beside_a_matchable_annotation() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.occupied", &["id"])]);
+        let s = schema(&[("dbo.fresh", &["id"]), ("dbo.occupied", &["id"])]);
+        let intents = [
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.fresh"),
+            },
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.occupied"),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 1, &ctx()).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [Blocker::RenameTargetExists { target }] if target == "dbo.occupied"
+        ));
+    }
+
+    /// Columns have the same provenance boundary, scoped to their table.
+    #[test]
+    fn an_occupied_column_command_is_rejected_beside_a_matchable_annotation() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "occupied"])]);
+        let s = schema(&[("dbo.t", &["id", "fresh", "occupied"])]);
+        let intents = [
+            Intent::RenameColumn {
+                table: t("dbo.t"),
+                from: "old".into(),
+                to: "fresh".into(),
+            },
+            Intent::RenameColumn {
+                table: t("dbo.t"),
+                from: "old".into(),
+                to: "occupied".into(),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 1, &ctx()).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [Blocker::RenameTargetExists { target }] if target == "dbo.t.occupied"
+        ));
+    }
+
+    /// Role commands are also appended after retained annotations and cannot
+    /// borrow an annotation's match to record a different identity decision.
+    #[test]
+    fn an_occupied_role_command_is_rejected_beside_a_matchable_annotation() {
+        let ids = resolve(
+            &with_roles(&[("dbo.t", &["id"])], &["old", "occupied"]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["fresh", "occupied"]);
+        let intents = [
+            Intent::RenameRole {
+                from: "old".into(),
+                to: "fresh".into(),
+            },
+            Intent::RenameRole {
+                from: "old".into(),
+                to: "occupied".into(),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 1, &ctx()).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [Blocker::RenameTargetExists { target }] if target == "occupied"
+        ));
+    }
+
     /// A target that is neither declared nor known is still a misspelling, not
     /// an occupied-target collision.
     #[test]

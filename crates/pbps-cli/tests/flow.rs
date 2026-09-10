@@ -341,6 +341,32 @@ fn dropping_a_reused_source_absorbs_its_stale_annotation_through_the_cli() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// A current command is a new human decision, not retained provenance. Even
+/// when a loaded annotation can rename the same source elsewhere, an occupied
+/// command target must be refused without writing that other identity result.
+#[test]
+fn an_occupied_rename_command_cannot_borrow_a_loaded_annotations_match() {
+    let d = Demo::new("occupied-command-beside-annotation");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  old: {type: int}\n  occupied: {type: int}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  fresh: {type: int, renamed_from: old}\n  occupied: {type: int}\n",
+    );
+    let o = d.run(&["rename", "dbo.t.old", "occupied"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("dbo.t.occupied"), "{}", stderr(&o));
+    assert_eq!(
+        std::fs::read_to_string(d.ids_path()).unwrap(),
+        before,
+        "a refused command must not record the annotation's different rename"
+    );
+}
+
 #[test]
 fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
     let d = Demo::new("drop");

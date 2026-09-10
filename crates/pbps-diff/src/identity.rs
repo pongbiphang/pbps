@@ -124,16 +124,15 @@ pub fn resolve(
     intents: &[Intent],
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
-    resolve_with_annotations(declared, ids, intents, 0, ctx)
+    resolve_with_provenance(declared, ids, intents, None, ctx)
 }
 
 /// Resolve intents while preserving which leading entries came from declaration
 /// annotations. `pbps` appends CLI and prompt decisions after the annotations;
 /// only an annotation that is now absorbed by a matching drop may be ignored
 /// when its reused source name is removed. Explicit decisions must still report
-/// an occupied target. Keeping the ordinary [`resolve`] entry point at zero
-/// preserves its semantics for callers that already have decisions rather than
-/// loader provenance.
+/// an occupied target. The ordinary [`resolve`] entry point retains the legacy
+/// unknown-provenance behavior used by dialect tests and library consumers.
 pub fn resolve_with_annotations(
     declared: &Schema,
     ids: &IdsFile,
@@ -145,6 +144,16 @@ pub fn resolve_with_annotations(
         annotation_count <= intents.len(),
         "annotation count cannot exceed the intent count"
     );
+    resolve_with_provenance(declared, ids, intents, Some(annotation_count), ctx)
+}
+
+fn resolve_with_provenance(
+    declared: &Schema,
+    ids: &IdsFile,
+    intents: &[Intent],
+    annotation_count: Option<usize>,
+    ctx: &Context,
+) -> Result<Resolution, Vec<Blocker>> {
     let mut r = Resolution {
         ids: ids.clone(),
         ..Default::default()
@@ -343,7 +352,7 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile) -> bool {
 fn resolve_roles(
     declared: &Schema,
     intents: &[Intent],
-    annotation_count: usize,
+    annotation_count: Option<usize>,
     ctx: &Context,
     r: &mut Resolution,
     blockers: &mut Vec<Blocker>,
@@ -387,24 +396,26 @@ fn resolve_roles(
     // A target that is already known and still declared is not in `appeared`,
     // so this rename cannot match. Report that specific collision before the
     // matching loop and leave `from` in `disappeared`; a companion drop intent
-    // must still be able to account for the source. A source with another
-    // matchable claim is an explicit conflict instead, so it is not an occupied
-    // target. A leading annotation paired with a drop is stale provenance: the
-    // drop consumes the reused source, after which the final sweep recognizes
-    // the annotation as absorbed. Deduplicate by target so two statements
-    // against one occupied name describe one collision rather than repeating
-    // the same diagnosis.
+    // must still be able to account for the source. Only a leading annotation
+    // may defer to another matchable claim for that source; an appended current
+    // decision must be judged on its own, or the annotation's match can make a
+    // different command report success. A leading annotation paired with a
+    // drop is stale provenance: the drop consumes the reused source, after
+    // which the final sweep recognizes the annotation as absorbed. Deduplicate
+    // by target so two statements against one occupied name describe one
+    // collision rather than repeating the same diagnosis.
     let mut occupied_targets = BTreeSet::new();
     for (i, intent) in intents.iter().enumerate() {
         let Intent::RenameRole { from, to } = intent else {
             continue;
         };
-        let stale_annotation = i < annotation_count
+        let current_decision = annotation_count.is_some_and(|count| i >= count);
+        let stale_annotation = annotation_count.is_some_and(|count| i < count)
             && intents.iter().any(
                 |candidate| matches!(candidate, Intent::DropRole { role, .. } if role == from),
             );
         if disappeared.contains(from)
-            && !claims.iter().any(|claim| claim.source == from)
+            && (current_decision || !claims.iter().any(|claim| claim.source == from))
             && declared_names.contains(&to)
             && known.contains_key(to)
             && !stale_annotation
@@ -481,7 +492,7 @@ fn resolve_roles(
 fn resolve_tables(
     declared: &Schema,
     intents: &[Intent],
-    annotation_count: usize,
+    annotation_count: Option<usize>,
     ctx: &Context,
     r: &mut Resolution,
     blockers: &mut Vec<Blocker>,
@@ -526,24 +537,26 @@ fn resolve_tables(
     // Check both sets before the matching loop mutates either one. If the
     // target is a known name that remains declared, it is an occupied target,
     // not an unused rename; keep the source in `disappeared` for a companion
-    // drop intent and account for the rename in the final sweep. A source with
-    // another matchable claim is an explicit conflict instead, so it is not an
-    // occupied target. A leading annotation paired with a drop is stale
-    // provenance: the drop consumes the reused source, after which the final
-    // sweep recognizes the annotation as absorbed. Deduplicate by target so
-    // two statements against one occupied name describe one collision rather
-    // than repeating the diagnosis.
+    // drop intent and account for the rename in the final sweep. Only a leading
+    // annotation may defer to another matchable claim for that source; an
+    // appended current decision must be judged on its own, or the annotation's
+    // match can make a different command report success. A leading annotation
+    // paired with a drop is stale provenance: the drop consumes the reused
+    // source, after which the final sweep recognizes the annotation as
+    // absorbed. Deduplicate by target so two statements against one occupied
+    // name describe one collision rather than repeating the diagnosis.
     let mut occupied_targets = BTreeSet::new();
     for (i, intent) in intents.iter().enumerate() {
         let Intent::RenameTable { from, to } = intent else {
             continue;
         };
-        let stale_annotation = i < annotation_count
+        let current_decision = annotation_count.is_some_and(|count| i >= count);
+        let stale_annotation = annotation_count.is_some_and(|count| i < count)
             && intents.iter().any(
                 |candidate| matches!(candidate, Intent::DropTable { table, .. } if table == from),
             );
         if disappeared.contains(from)
-            && !claims.iter().any(|claim| claim.source == from)
+            && (current_decision || !claims.iter().any(|claim| claim.source == from))
             && declared_names.contains(&to)
             && known.contains_key(to)
             && !stale_annotation
@@ -608,7 +621,7 @@ fn resolve_tables(
 fn resolve_columns(
     declared: &Schema,
     intents: &[Intent],
-    annotation_count: usize,
+    annotation_count: Option<usize>,
     ctx: &Context,
     r: &mut Resolution,
     blockers: &mut Vec<Blocker>,
@@ -661,25 +674,27 @@ fn resolve_columns(
         // The target must be checked while both sets still describe the
         // baseline. In particular, do not consume `from` when `to` is already
         // occupied by a declared column: a companion drop intent still needs
-        // to see that source in `disappeared`. A source with another matchable
-        // claim is an explicit conflict instead, so it is not an occupied
-        // target. A leading annotation paired with a drop is stale provenance:
-        // the drop consumes the reused source, after which the final sweep
-        // recognizes the annotation as absorbed. Deduplicate by target to keep
-        // one diagnosis per name.
+        // to see that source in `disappeared`. Only a leading annotation may
+        // defer to another matchable claim for that source; an appended current
+        // decision must be judged on its own, or the annotation's match can
+        // make a different command report success. A leading annotation paired
+        // with a drop is stale provenance: the drop consumes the reused source,
+        // after which the final sweep recognizes the annotation as absorbed.
+        // Deduplicate by target to keep one diagnosis per name.
         let mut occupied_targets = BTreeSet::new();
         for (i, intent) in intents.iter().enumerate() {
             let Intent::RenameColumn { table, from, to } = intent else {
                 continue;
             };
-            let stale_annotation = i < annotation_count
+            let current_decision = annotation_count.is_some_and(|count| i >= count);
+            let stale_annotation = annotation_count.is_some_and(|count| i < count)
                 && intents.iter().any(|candidate| {
                     matches!(candidate, Intent::DropColumn { column, .. }
                         if &column.table == table_name && column.name == *from)
                 });
             if table == table_name
                 && disappeared.contains(from)
-                && !claims.iter().any(|claim| claim.source.name == *from)
+                && (current_decision || !claims.iter().any(|claim| claim.source.name == *from))
                 && declared_cols.contains(&to)
                 && known.contains_key(to)
                 && !stale_annotation
