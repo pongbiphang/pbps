@@ -7735,6 +7735,56 @@ async fn a_bodys_trailing_non_ascii_byte_reaches_the_engine() {
 /// dependency scan is the one that orders the two, and it read `[` as the
 /// quote it is on the other engine — dropped it, glued `ARRAY[ao.z` into one
 /// word, and saw no edge (DECISIONS 239).
+/// Measured: `FROM select` is a syntax error and `FROM "select"` names the
+/// view, so the keyword that opens every view mentions no view named
+/// `select`. Read as a mention, it drew an edge from `z` to `select`; with
+/// `select` selecting from `z`, a cycle, and `select` was created first —
+/// over a view that did not exist yet.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_from() {
+    let s = emit_schema("reserved_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.select").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT * FROM {s}.z"),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.z").parse().expect("a module id"),
+        module(pbps_model::ModuleKind::View, "select 1 AS x"),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.z"), format!("{s}.select")],
+        "the view that is selected from comes first, whatever its keywords spell"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT x::text FROM {s}.\"select\"")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {

@@ -50,6 +50,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     // literals; `note'x'` is the type `note` applied to a string.
     string_prefixes: &["u&", "e", "n", "b", "x"],
     identifier_continues: pbps_dialect::continues_ident,
+    reserved: types::is_reserved,
 };
 pub mod introspect;
 pub mod modules;

@@ -1718,6 +1718,7 @@ fn code_only(definition: &str) -> String {
 const LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
     code_only: &code_only,
     continues_ident: pbps_dialect::continues_ident,
+    reserved: crate::types::is_reserved,
 };
 
 #[must_use]
@@ -2137,6 +2138,20 @@ mod tests {
                 &LEXIS
             ),
             vec![id("app.z"), id("app.e"), id("app.y")]
+        );
+        // A reserved word is a name only where it is quoted: measured, `FROM
+        // select` is a syntax error and `FROM "select"` names the view. The
+        // keyword that opens every view mentions no view named `select`.
+        let mut views = BTreeMap::new();
+        views.insert(id("app.select"), module("SELECT * FROM app.z"));
+        views.insert(id("app.z"), module("select 1 AS x"));
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &views,
+                &pbps_model::ModuleDeps::default(),
+                &LEXIS
+            ),
+            vec![id("app.z"), id("app.select")]
         );
         // A dollar-quoted datum is a literal too — only a routine's body,
         // after `AS`, is code — so the name inside it draws no edge, and the

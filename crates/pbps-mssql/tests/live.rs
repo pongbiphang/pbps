@@ -652,6 +652,57 @@ async fn pull_reads_every_kind_of_module_back() {
 /// The round trip modules stand on (ADR-0002): what the emitter sends, the
 /// engine stores, and introspection reads back must be the definition that was
 /// declared — or every apply would be followed by drift, for ever.
+/// Measured: `FROM select` is refused and `FROM [select]` names the view, so
+/// the keyword that opens every view mentions no view named `select`. Read
+/// as a mention, it drew an edge from `z` to `select`; with `select`
+/// selecting from `z`, a cycle, and `select` was created first — over a view
+/// that did not exist yet.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_from() {
+    let mut db = TestDb::create("reserved_order").await;
+    let mut declared = Schema::default();
+    for (name, definition) in [
+        ("dbo.select", "SELECT * FROM dbo.z"),
+        ("dbo.z", "select 1 AS x"),
+    ] {
+        declared.modules.insert(
+            pbps_model::ModuleId::Named(name.parse().unwrap()),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: definition.to_owned(),
+            },
+        );
+    }
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec!["dbo.z".to_owned(), "dbo.select".to_owned()],
+        "the view that is selected from comes first, whatever its keywords spell"
+    );
+    apply(&mut db.conn, &cs).await;
+    let rows = db
+        .conn
+        .query("SELECT x FROM dbo.[select]")
+        .await
+        .expect("the view over the view");
+    assert_eq!(rows.len(), 1);
+    db.drop().await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_module_applied_then_read_back_equals_what_was_declared() {

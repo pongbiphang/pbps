@@ -277,6 +277,7 @@ pub fn diff_partial(
     let lexis = pbps_model::module::Lexis {
         code_only: &lex,
         continues_ident: dialect.lexicon().identifier_continues,
+        reserved: dialect.lexicon().reserved,
     };
     let create_rank = rank_of(&pbps_model::module::creation_order_with(
         &declared.schema.modules,

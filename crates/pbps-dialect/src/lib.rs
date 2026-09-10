@@ -320,11 +320,32 @@ pub struct Lexicon {
     /// is a name byte and `x\u{a0}y` one alias; SQL Server's is Unicode's
     /// alphanumerics plus four symbols (DECISIONS 313, 315).
     pub identifier_continues: fn(char) -> bool,
+
+    /// Whether a lower-cased word can **never** stand unquoted as a name on
+    /// this engine — a reserved keyword, in the engine's own sense of the
+    /// word, which is narrower than "keyword".
+    ///
+    /// The name scans read a bare word as a possible reference to a module of
+    /// that name; a word the engine refuses as a bare name is not one, and
+    /// reading it as one drew an edge from every view to a view named
+    /// `select`. **Measured** (DECISIONS 316): on PostgreSQL `FROM select`
+    /// is a syntax error while `FROM "select"`, `FROM app.select` and `FROM
+    /// user` are accepted, so the word is reserved only where no bare
+    /// position takes it; on SQL Server none of the documented reserved words
+    /// stands unbracketed.
+    pub reserved: fn(&str) -> bool,
 }
 
 /// Standard SQL's identifier rule: letters, digits and `_`.
 fn ansi_identifier_continues(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// The answer of a lexis that reserves nothing: every bare word may be a
+/// name. The shared scanner's rule, and the honest one for a dialect that has
+/// not measured its engine's.
+pub fn never_reserved(_: &str) -> bool {
+    false
 }
 
 impl Lexicon {
@@ -337,6 +358,7 @@ impl Lexicon {
         dollar_quoted_strings: false,
         string_prefixes: &["n"],
         identifier_continues: ansi_identifier_continues,
+        reserved: never_reserved,
     };
 
     /// The comparison form of a module definition, for the dialect this
@@ -1461,6 +1483,7 @@ mod tests {
         dollar_quoted_strings: false,
         string_prefixes: &["n"],
         identifier_continues: pbps_model::module::is_regular_identifier_continue,
+        reserved: never_reserved,
     };
 
     /// PostgreSQL's, as `pbps-pg` states it.
@@ -1470,6 +1493,7 @@ mod tests {
         dollar_quoted_strings: true,
         string_prefixes: &["u&", "e", "n", "b", "x"],
         identifier_continues: continues_ident,
+        reserved: never_reserved,
     };
 
     /// The row of ADR-0011 Amendment 2's table that points the other way from
@@ -2056,6 +2080,7 @@ mod code_only_tests {
         dollar_quoted_strings: true,
         string_prefixes: &["u&", "e", "n", "b", "x"],
         identifier_continues: continues_ident,
+        reserved: never_reserved,
     };
     const MSSQL: Lexicon = Lexicon {
         quoted_identifiers: &[('[', ']'), ('"', '"')],
@@ -2063,6 +2088,7 @@ mod code_only_tests {
         dollar_quoted_strings: false,
         string_prefixes: &["n"],
         identifier_continues: pbps_model::module::is_regular_identifier_continue,
+        reserved: never_reserved,
     };
 
     /// `text` with each of `regions` replaced by spaces, character for

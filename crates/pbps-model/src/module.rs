@@ -806,24 +806,39 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
 }
 
 /// What the name scans need of an engine's lexis: how a definition is
-/// reduced to code, and which characters continue an identifier.
+/// reduced to code, which characters continue an identifier, and which words
+/// can never be a bare name.
 ///
-/// Both are the engine's rules, and the second decides where a word ends —
+/// All three are the engine's rules. The second decides where a word ends —
 /// on PostgreSQL every non-ASCII byte continues a name, so `x\u{a0}y` is one
 /// alias and not `x` beside `y`; on SQL Server a non-breaking space is
-/// whitespace (DECISIONS 315).
+/// whitespace (DECISIONS 315). The third decides whether a bare word can be
+/// a reference at all: `select 1` mentions no view named `select`, because
+/// a view of that name is only ever written quoted (DECISIONS 316).
 #[derive(Clone, Copy)]
 pub struct Lexis<'a> {
     /// The definition with everything that is not code blanked out.
     pub code_only: &'a dyn Fn(&str) -> String,
     /// Whether a character continues an unquoted identifier.
     pub continues_ident: fn(char) -> bool,
+    /// Whether a lower-cased word can never stand unquoted as a name.
+    pub reserved: fn(&str) -> bool,
 }
 
-/// The shared scanner's own lexis: SQL Server's, which is where it came from.
+/// The answer of a lexis that reserves nothing: every bare word may be a
+/// name.
+pub fn never_reserved(_: &str) -> bool {
+    false
+}
+
+/// The shared scanner's own lexis: SQL Server's identifier rule, which is
+/// where it came from, and no reserved words — the loader has no engine to
+/// ask, and a bare word it reads as a reference is an edge the differ, which
+/// has one, does not draw.
 pub const SHARED: Lexis<'static> = Lexis {
     code_only: &code_only,
     continues_ident: is_regular_identifier_continue,
+    reserved: never_reserved,
 };
 
 /// [`references`], with the definition read by `lexis` rather than by the
@@ -834,6 +849,7 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
         name,
         Case::Folded,
         lexis.continues_ident,
+        lexis.reserved,
     )
 }
 
@@ -877,18 +893,40 @@ fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
         name,
         case,
         is_regular_identifier_continue,
+        never_reserved,
     )
 }
 
 /// Whether `code` — a definition already lexed to code — mentions `name`,
-/// with words ending where `continues` says they do.
-fn references_in(code: &str, name: &ObjectName, case: Case, continues: fn(char) -> bool) -> bool {
-    let haystack = scannable_code(code, case, continues);
+/// with words ending where `continues` says they do and a bare word that
+/// `reserved` names counting only where it is quoted.
+fn references_in(
+    code: &str,
+    name: &ObjectName,
+    case: Case,
+    continues: fn(char) -> bool,
+    reserved: fn(&str) -> bool,
+) -> bool {
+    let haystack = scannable_code(code, case, continues, false);
 
-    // The qualified form, and the bare one — a definition written inside its
-    // own schema very often omits the qualifier.
-    contains_word(&haystack, &qualified(name, case), continues)
-        || contains_word(&haystack, &cased(&name.name, case), continues)
+    // The qualified form first — a word after a dot is a name whatever it
+    // is: measured, `FROM app.select` is accepted on PostgreSQL.
+    if contains_word(&haystack, &qualified(name, case), continues) {
+        return true;
+    }
+    // Then the bare one — a definition written inside its own schema very
+    // often omits the qualifier. A reserved word is a name only where it is
+    // quoted: measured, `FROM select` is a syntax error on both engines and
+    // `FROM "select"` names the view, so a bare `select` mentions nothing —
+    // and read as a mention, it drew an edge from every view to the one of
+    // that name (DECISIONS 316).
+    let bare = cased(&name.name, case);
+    if reserved(&name.name.to_ascii_lowercase()) {
+        let quoted = scannable_code(code, case, continues, true);
+        contains_word(&quoted, &format!("\"{bare}\""), continues)
+    } else {
+        contains_word(&haystack, &bare, continues)
+    }
 }
 
 /// The definition with everything that is not code blanked out.
@@ -1105,7 +1143,12 @@ fn folded(s: &str) -> String {
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 #[cfg(test)]
 fn scannable(definition: &str, case: Case) -> String {
-    scannable_code(&code_only(definition), case, is_regular_identifier_continue)
+    scannable_code(
+        &code_only(definition),
+        case,
+        is_regular_identifier_continue,
+        false,
+    )
 }
 
 /// Whitespace to the scan: what Unicode calls whitespace **and the engine
@@ -1116,7 +1159,12 @@ fn is_a_gap(ch: char, continues: fn(char) -> bool) -> bool {
     ch.is_whitespace() && !continues(ch)
 }
 
-fn scannable_code(code: &str, case: Case, continues: fn(char) -> bool) -> String {
+fn scannable_code(
+    code: &str,
+    case: Case,
+    continues: fn(char) -> bool,
+    keep_quotes: bool,
+) -> String {
     let lowered = cased(code, case);
     // A quoting character goes; a bracket that stood between two identifier
     // characters leaves a space behind. On PostgreSQL `[` is a subscript and
@@ -1125,9 +1173,14 @@ fn scannable_code(code: &str, case: Case, continues: fn(char) -> bool) -> String
     // the bracket outright glued `ARRAY[app.z` into `arrayapp.z`, where no word
     // boundary was left for the needle to match. The space is only put where
     // the glue would form, so `[dbo].[v]` still folds to `dbo.v` (239).
+    //
+    // With `keep_quotes`, every quoting character becomes `"` instead, for
+    // the one needle that has to see them: a reserved word, which is a name
+    // only where it is quoted (316).
     let mut unquoted = String::with_capacity(lowered.len());
     for (i, ch) in lowered.char_indices() {
         match ch {
+            '"' | '`' | '[' | ']' if keep_quotes => unquoted.push('"'),
             '"' | '`' => {}
             '[' | ']' => {
                 let glued = unquoted.chars().next_back().is_some_and(continues)
@@ -1236,6 +1289,7 @@ pub fn creation_order_with(
         .map(|(name, module)| (name, (lexis.code_only)(&module.definition)))
         .collect();
     let continues = lexis.continues_ident;
+    let reserved = lexis.reserved;
 
     // The edges for one comparison. Only the scanned ones move with it:
     // `depends_on:` and a trigger's target are identities, not text.
@@ -1274,7 +1328,7 @@ pub fn creation_order_with(
                 let referenced = !sibling
                     && other
                         .referenced_name()
-                        .is_some_and(|n| references_in(code, &n, case, continues));
+                        .is_some_and(|n| references_in(code, &n, case, continues, reserved));
                 if declared || attached || referenced {
                     set.insert(other.clone());
                 }
@@ -1590,6 +1644,7 @@ mod tests {
         let lexis = Lexis {
             code_only: &engine_reads_an_escape_string,
             continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
         };
         assert_eq!(
             creation_order_with(&m, &ModuleDeps::default(), &lexis),
@@ -1618,6 +1673,7 @@ mod tests {
         let lexis = Lexis {
             code_only: &code_only,
             continues_ident: every_non_ascii_byte_is_a_name_byte,
+            reserved: never_reserved,
         };
         let text = "SELECT 1 AS x\u{a0}y FROM app.z";
         assert!(!references_with(text, &n("app.y"), &lexis));
@@ -1633,6 +1689,54 @@ mod tests {
         assert_eq!(
             creation_order_with(&m, &ModuleDeps::default(), &lexis),
             vec![id("app.z"), id("app.y")]
+        );
+    }
+
+    /// A reserved word is a name only where it is quoted: measured, `FROM
+    /// select` is a syntax error on both engines and `FROM "select"` names
+    /// the view, so a bare `select` mentions no view named `select`. Read as
+    /// a mention, it drew an edge from every view to that one; with the real
+    /// edge the other way, a cycle, and the dependent was created first.
+    #[test]
+    fn a_reserved_word_is_a_reference_only_where_it_is_quoted() {
+        fn select_is_reserved(word: &str) -> bool {
+            word == "select"
+        }
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: is_regular_identifier_continue,
+            reserved: select_is_reserved,
+        };
+        let select = n("app.select");
+        assert!(!references_with("select 1 AS x", &select, &lexis));
+        assert!(!references_with("SELECT * FROM app.z", &select, &lexis));
+        for quoted in [
+            "SELECT * FROM \"select\"",
+            "SELECT * FROM [select]",
+            "SELECT * FROM \"SELECT\"",
+            "SELECT * FROM app.\"select\"",
+            // After a dot the word is a name whatever it is: measured, `FROM
+            // app.select` is accepted on PostgreSQL.
+            "SELECT * FROM app.select",
+        ] {
+            assert!(references_with(quoted, &select, &lexis), "{quoted}");
+        }
+        // A word that is not reserved is a mention bare, as before.
+        assert!(references_with("SELECT * FROM z", &n("app.z"), &lexis));
+        let m = modules(&[
+            ("app.select", "SELECT * FROM app.z"),
+            ("app.z", "select 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("app.z"), id("app.select")]
+        );
+        // The shared scanner reserves nothing, and keeps its reading: a
+        // cycle, broken by name order, which puts `select` first.
+        assert!(references("select 1 AS x", &select));
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.select"), id("app.z")]
         );
     }
 

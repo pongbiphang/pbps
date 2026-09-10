@@ -6511,3 +6511,34 @@ SPEC is in sync with all of these.
     it. The model's `Lexis` carries both the dialect's `code_only` and its
     identifier rule; the differ and the emitter's name scans hand it the
     dialect's, and the shared scanner keeps SQL Server's as its own.
+
+316. **A bare reserved word is not a reference.** The name scans read a bare
+    word as a possible mention of a module of that name, because a
+    definition written inside its own schema very often omits the qualifier.
+    A view named `select` made every other view mention it: `select 1` drew
+    an edge from `z` to `select`, `select` selecting from `z` drew the real
+    one back, and the cycle was broken by name order, which created `select`
+    over a view that did not exist yet — a valid plan refused, with no
+    `depends_on:` able to remove an edge.
+
+    A word the engine refuses as a bare name cannot be one. **Measured** on
+    PostgreSQL 18.6, with a table, a function and a type of each name: every
+    word of `pg_get_keywords() WHERE catcode = 'R'` is refused as `FROM word`,
+    `word(1)` and `::word`, except `current_catalog`, `current_date`,
+    `current_role`, `current_time`, `current_timestamp`, `current_user`,
+    `localtime`, `localtimestamp`, `session_user`, `system_user` and `user`,
+    which `FROM word` accepts; the type-or-function-name category is not
+    reserved in this sense (`FROM between`, `FROM join` are accepted); and
+    after a dot any word is a name (`FROM app.select` is accepted). On SQL
+    Server 2022, every documented reserved keyword is refused as `FROM word`,
+    and as `FROM dbo.word` all but `disk`, `dump`, `load`, `precision` and
+    `securityaudit`.
+
+    So `Lexicon` carries `reserved`, each dialect's measured table, and the
+    scan matches a reserved name only in its quoted spelling — `"select"`,
+    `[select]` — or qualified, which is a name whatever the word. The shared
+    scanner reserves nothing: the loader has no engine to ask, and an edge it
+    draws too many of is one the differ, which has one, does not draw. The
+    table is read from the engine, not from memory, and a word a later engine
+    reserves is a bare mention the scan still reads — an edge too many, in the
+    direction the scan has always erred.

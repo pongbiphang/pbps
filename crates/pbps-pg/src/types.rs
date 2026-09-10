@@ -1309,6 +1309,96 @@ fn bare_to_the_engine(name: &str) -> bool {
         && QUOTED_KEYWORDS.binary_search(&name).is_err()
 }
 
+/// Whether a lower-cased word can never stand unquoted as a name — for the
+/// name scans, which read a bare word as a possible reference (DECISIONS
+/// 316).
+///
+/// The engine's reserved category, less the words that *can* be a bare name
+/// somewhere: **measured** on 18.6, with a table, a function and a type of
+/// each name, every word of `pg_get_keywords() WHERE catcode = 'R'` is
+/// refused as `FROM word`, as `word(1)` and as `::word`, except
+/// `current_catalog`, `current_date`, `current_role`, `current_time`,
+/// `current_timestamp`, `current_user`, `localtime`, `localtimestamp`,
+/// `session_user`, `system_user` and `user`, which `FROM word` accepts. The
+/// type-or-function-name category is not reserved in this sense: `FROM
+/// between` and `FROM join` are accepted too. And after a dot any word is a
+/// name — `FROM app.select` is accepted — so this is asked only of the bare
+/// form.
+pub(crate) fn is_reserved(word: &str) -> bool {
+    RESERVED.binary_search(&word).is_ok()
+}
+
+/// The words `is_reserved` names, sorted for the search.
+const RESERVED: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "column",
+    "constraint",
+    "create",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "group",
+    "having",
+    "in",
+    "initially",
+    "intersect",
+    "into",
+    "lateral",
+    "leading",
+    "limit",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "select",
+    "some",
+    "symmetric",
+    "table",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "using",
+    "variadic",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
 /// Every keyword the engine quotes when it is used as a name: the reserved,
 /// type-or-function-name and column-name categories, which are the ones
 /// `quote_identifier` does not let stand bare. The unreserved category is
@@ -1616,6 +1706,30 @@ mod tests {
             let arg: RoutineArg = spelled.parse().expect("an argument");
             assert_eq!(overlong_name(&arg), None, "`{spelled}` is within the limit");
         }
+    }
+
+    /// Measured: a bare `select` is refused in every position and `user` in
+    /// none; `zone` and `int` are keywords the engine lets stand as names.
+    #[test]
+    fn a_reserved_word_is_one_no_bare_position_takes() {
+        for word in ["select", "from", "table", "with", "array", "false"] {
+            assert!(is_reserved(word), "{word}");
+        }
+        for word in [
+            "user",
+            "current_date",
+            "between",
+            "join",
+            "zone",
+            "int",
+            "customer",
+        ] {
+            assert!(!is_reserved(word), "{word}");
+        }
+        assert!(
+            RESERVED.windows(2).all(|w| w[0] < w[1]),
+            "sorted, for the search"
+        );
     }
 
     /// Measured on 18.6: one function's twelve parameters, declared one way
