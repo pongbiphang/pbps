@@ -118,7 +118,7 @@ impl RenameTarget {
     /// the catalog will not have until a statement this report runs *before*
     /// has executed. Read literally that is `ImpactError::Name` on a plan the
     /// engine would accept, which is the refusal
-    /// [`crate::preflight::AsStored`] exists to prevent one rank further on
+    /// `preflight::AsStored` exists to prevent one rank further on
     /// (DECISIONS 390).
     pub fn from_changes(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
         use pbps_model::Change;

@@ -282,7 +282,8 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 /// Every estimate a plan carries, each table named twice: as the plan names it
 /// and as the catalog has it now.
 ///
-/// The plan-level entry point, and the **only** one — [`estimate`] is not
+/// The plan-level entry point, and the **only** one — `estimate`, the
+/// single-change form, is not
 /// public, because a caller mapping it over a change set would be building
 /// exactly the estimate that cannot be measured. A plan may rename a table and
 /// then alter one of its columns, and the `AlterColumnType` carries the
@@ -294,7 +295,7 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 ///
 /// Changes with no estimate are dropped rather than carried as `None`: a
 /// module, a role, a grant and a row change are not about a table's stored
-/// rows, and [`estimate`] says which.
+/// rows, and `estimate` says which.
 pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
     // Built over the whole plan before anything is estimated, because the
     // order that puts a table rename ahead of what follows it is `order_key`'s
