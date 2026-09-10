@@ -17628,6 +17628,123 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         .expect("drop");
 }
 
+/// A table absent from the catalog because this plan creates it is not a table
+/// the database has unexpectedly lost.
+///
+/// The differ splits a new table's foreign keys out of `CreateTable`, so the
+/// connected estimate sees the key before the plan has run and finds no catalog
+/// row. The plan itself supplies that provenance: keep the static cost answer,
+/// leave the unmeasured row count empty, and name the create. The negative half
+/// asks about the same key without a create and must still report a real absence.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_table_this_plan_creates_is_not_reported_as_missing() {
+    use pbps_model::{
+        Change, ChangeSet, Column, ForeignKey, IdsFile, PlannedChange, PrimaryKey,
+        ReferentialAction, Schema, Table,
+    };
+    use pbps_pg::estimate::{Lock, Reads, Rewrite, against, estimates};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("created_estimate");
+    fresh(&mut conn, &s).await;
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    child
+        .columns
+        .insert("parent_id".into(), Column::new(ty("integer")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    child.foreign_keys.insert(
+        "child_parent".into(),
+        ForeignKey {
+            columns: vec!["parent_id".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name, parent);
+    declared.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|p| matches!(&p.change, Change::CreateTable { name, .. } if name == &child_name)),
+        "the plan creates the table whose key is estimated: {cs:#?}"
+    );
+
+    let mut es = estimates(&cs, Strategy::default());
+    let key = es
+        .iter_mut()
+        .find(|e| e.about == "adding the foreign key child_parent")
+        .expect("the split-out foreign key has an estimate");
+    against(&mut conn, key, None)
+        .await
+        .expect("the absent catalog row has plan provenance");
+    assert_eq!(key.rewrite, Rewrite::No, "{key:#?}");
+    assert_eq!(key.reads, Reads::EveryRow, "{key:#?}");
+    assert_eq!(key.lock, Lock::ShareRowExclusive, "{key:#?}");
+    assert_eq!(key.rows, None, "the plan may insert rows later: {key:#?}");
+    assert_eq!(
+        key.rows_unknown.as_deref(),
+        Some("this plan creates this table, so the database has no row count for it yet"),
+        "{key:#?}"
+    );
+
+    let missing = ChangeSet {
+        changes: vec![PlannedChange::new(Change::AddForeignKey {
+            table: child_name,
+            name: "child_parent".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec!["parent_id".into()],
+                references_table: TableName::new(&s, "parent"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        })],
+    };
+    let mut absent = estimates(&missing, Strategy::default())
+        .pop()
+        .expect("the key has an estimate");
+    against(&mut conn, &mut absent, None)
+        .await
+        .expect("absence is an estimate answer, not a query error");
+    assert!(
+        matches!(&absent.rewrite, Rewrite::Unknown(why) if why == "this database has no table by that name to measure"),
+        "{absent:#?}"
+    );
+    assert!(
+        matches!(&absent.reads, Reads::Unknown(why) if why == "this database has no table by that name to measure"),
+        "{absent:#?}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// The rendered length of the one row of `schema.table`, under `set`.
 ///
 /// A free function rather than a closure: it borrows the connection across an
