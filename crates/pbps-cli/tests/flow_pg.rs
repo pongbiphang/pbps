@@ -181,6 +181,48 @@ const TWO_COLUMNS: &str = "table: app.t\ncolumns:\n  id: {type: bigint, nullable
                            label: {type: varchar(50)}\n\
                            primary_key: {name: pk_t, columns: [id]}\n";
 
+/// An unavailable rehearsal is not evidence that the PostgreSQL plan is
+/// invalid, and must be refused before SQL Server setup sees either backend.
+#[test]
+fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
+    let d = Demo::new("unsupported-dev");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    for backend in ["not-a-connection", "docker://not-an-image"] {
+        let o = d.run(&["plan", "--dev", backend, "--format", "json"]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert_eq!(v["findings"][0]["id"], "rehearsal.unavailable", "{v}");
+        assert!(
+            stdout(&o).contains("dev rehearsal is not supported for dialect `postgres`"),
+            "{v}"
+        );
+    }
+
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\ndev: {url_env: PBPS_UNSUPPORTED_DEV_TEST}\n",
+    )
+    .unwrap();
+    let o = d.run_with_env(
+        &["plan"],
+        &[("PBPS_UNSUPPORTED_DEV_TEST", "not-a-connection")],
+    );
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("dev rehearsal is not supported for dialect `postgres`"),
+        "{}",
+        stderr(&o)
+    );
+
+    // The configured backend must not prevent the existing read-only check.
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// The deployment loop, end to end, on PostgreSQL: an empty database is
 /// bootstrapped, verified clean, planned against, applied to, verified clean
 /// again, and its ledger listed. Every connected command the loop touches

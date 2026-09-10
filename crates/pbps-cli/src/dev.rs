@@ -120,6 +120,16 @@ pub fn rehearse(
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
+    // The scratch-database lifecycle and container setup below are SQL
+    // Server-specific (SPEC §9.3). Dispatching catalog reads by connection
+    // cannot make that lifecycle safe for another dialect.
+    if dialect.name() != "mssql" {
+        bail!(
+            "dev rehearsal is not supported for dialect `{}`; it currently requires SQL Server. \
+             Remove --dev and the dev block in pbps.yml to generate an offline preview.",
+            dialect.name()
+        );
+    }
     // Building the baseline is the same operation as `bootstrap`: the plan from
     // nothing. Reusing the differ rather than a second code path is what keeps
     // the rehearsal a rehearsal of the real thing.
