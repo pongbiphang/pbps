@@ -17822,3 +17822,80 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
         .await
         .expect("drop");
 }
+
+/// DECISIONS 394: a float's boundary is tested as a float, because
+/// `float8::numeric` rounds through the shortest decimal.
+///
+/// Every row here sits on a boundary, which is the only place the bug shows.
+/// Each is asserted twice — the probe's count, and the engine's own verdict on
+/// the very `ALTER` the probe is about — so a probe that agreed for the wrong
+/// reason would have to survive both.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("floatbound");
+    fresh(&mut conn, &s).await;
+
+    // `-2^63` is exactly a `double precision`, and through `numeric` it reads
+    // as `-9223372036854780000` — four thousand million past itself.
+    for (value, to, violates) in [
+        ("-9223372036854775808", "bigint", false),
+        ("9223372036854775808", "bigint", true),
+        ("2147483647.4", "integer", false),
+        ("2147483647.6", "integer", true),
+        // Half-to-even, which is why the boundary is not symmetric.
+        ("-2147483648.5", "integer", false),
+        ("2147483647.5", "integer", true),
+        // The largest `double precision` that becomes a `real`, and the
+        // smallest that does not: `2^128 - 2^103` exactly.
+        ("3.4028235677973362e38", "real", false),
+        ("340282356779733661637539395458142568448", "real", true),
+    ] {
+        conn.execute(&format!(
+            "DROP TABLE IF EXISTS {s}.t;
+             CREATE TABLE {s}.t (v double precision);
+             INSERT INTO {s}.t VALUES ({value}::float8);"
+        ))
+        .await
+        .expect("the fixture");
+
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: TableName::new(&s, "t").column("v"),
+                from: ty("double precision"),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+            })],
+        };
+        let measured = counts(&mut conn, &cs).await;
+        let counted = one(&measured, "cannot become");
+        assert_eq!(
+            counted,
+            i64::from(violates),
+            "{value} -> {to}: the probe counted {counted}"
+        );
+
+        // And what this engine does with the same value and the same target.
+        let refused = conn
+            .execute(&format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE {to}"))
+            .await
+            .err();
+        assert_eq!(
+            refused.is_some(),
+            violates,
+            "{value} -> {to}: the engine said {refused:?}"
+        );
+        if let Some(e) = refused {
+            assert_eq!(sqlstate(&e), "22003", "{value} -> {to}: {e}");
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}

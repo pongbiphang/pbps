@@ -8596,3 +8596,29 @@ SPEC is in sync with all of these.
     partial-index probe beside it already does. The cost is real and is paid
     knowingly: a plan that retypes any column of a table gets no check probe on
     that table, even for a check over a column it does not touch.
+
+394. **A binary float is measured in its own domain, never through `numeric`.**
+    `float8::numeric` on this engine goes by way of the float's shortest
+    round-tripping decimal rather than its exact value, so it is a *rounding*,
+    and the rounding is largest exactly where a conversion probe's boundary
+    tests sit. **Measured on 18.6**: `(-9223372036854775808::float8)::numeric`
+    is `-9223372036854780000`, four thousand million past the value, so the
+    probe for `double precision -> bigint` counted `-2^63` — a value the engine
+    stores exactly — as out of range and refused a valid plan. The same root
+    cause reached the `real` target: `3.4028235677973362e38`, the largest
+    `double precision` that converts, reads as
+    `340282356779734000000000000000000000000` in `numeric` and clears the
+    threshold `340282356779733661637539395458142568448`, while in the float
+    domain it does not and the engine takes it. Both tests now compare as
+    `float8`. Every threshold either needs is exactly representable there: the
+    integer bounds by construction, and `2^128 - 2^103` because it asks for 25
+    of the 53 mantissa bits. Only the `real` target is reachable from a float
+    source — `real -> double precision` is a widening `change_risk` has already
+    called `Safe` — so `2^1024` never has to be written as a `float8`.
+
+    The `numeric` route stays for an **exact** source, and not by omission: an
+    `ALTER` from `numeric` or an integer type to a float converts the exact
+    value, so the exact domain is the one the engine is working in. The rule is
+    not "prefer floats", it is "measure in the domain the statement measures
+    in" — the same rule DECISIONS 370 draws between a cast and an assignment,
+    one level down.

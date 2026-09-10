@@ -579,7 +579,14 @@ added at rank 13, so measured, a `numeric(10,2)` holding `1.50` converted to
 `numeric(10,0)` and then given `CHECK (v = round(v))` is accepted by the engine
 and counted as a violation by a probe over the stored value. A retype is the one
 plan change that leaves a probe able to run and quietly wrong, where a rename or
-an added column makes it fail loudly and the runner says so (393).
+an added column makes it fail loudly and the runner says so (393). A binary
+float is measured in its own domain and never through `numeric`: measured,
+`(-9223372036854775808::float8)::numeric` is `-9223372036854780000`, so the
+conversion probe called `-2^63` out of range for a `bigint` that stores it
+exactly, and the same rounding put the largest `double precision` that becomes
+a `real` past the overflow threshold. Both boundaries now compare as `float8`,
+while an exact source keeps the exact domain — which is the domain its own
+`ALTER` converts in (394).
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a

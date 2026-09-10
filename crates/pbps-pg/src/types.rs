@@ -1191,6 +1191,31 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
     let not_nan = format!("{exact} <> 'NaN'::numeric");
     let finite =
         format!("{not_nan} AND {exact} <> 'Infinity'::numeric AND {exact} <> '-Infinity'::numeric");
+    // A binary float is measured in **its own domain**, never through
+    // `numeric`. `float8::numeric` on this engine goes by way of the float's
+    // shortest round-tripping decimal, not its exact value, so it is a
+    // *rounding* and the rounding is large where the value is: **measured on
+    // 18.6**, `(-9223372036854775808::float8)::numeric` is
+    // `-9223372036854780000`, four thousand million out. Both boundary tests
+    // below sit exactly where that error is biggest, and both got it wrong in
+    // the direction that refuses a valid plan (DECISIONS 394):
+    //
+    // ```text
+    // -9223372036854775808::float8 -> bigint   engine: stored exactly
+    //                                          numeric domain: violation
+    //  3.4028235677973362e38       -> real     engine: stored as 3.4028235e+38
+    //                                          numeric domain: violation
+    // ```
+    //
+    // The comparisons are the same numbers; only the domain changes. Every
+    // threshold either arm needs is exactly representable as a `float8` — the
+    // integer bounds by construction, and `2^128 - 2^103` because it asks for
+    // 25 mantissa bits out of 53.
+    let binary = format!("({value})::float8");
+    let binary_finite = format!(
+        "{binary} <> 'NaN'::float8 AND {binary} <> 'Infinity'::float8 AND \
+         {binary} <> '-Infinity'::float8"
+    );
     match (family(from), family(to)) {
         // A bounded string target, from a source whose rendering every session
         // agrees on. The value is measured after its **trailing spaces** are
@@ -1229,7 +1254,15 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
         // `-2147483648.5::float8` is `-2147483648`, which fits.
         (Family::Approx { .. }, Family::Exact(Exact::Integer { max })) => {
             let min = -max - 1;
-            Some(format!("{exact} >= {max}.5 OR {exact} < {min}.5"))
+            // No guard for `NaN` or an infinity: this engine orders `NaN`
+            // greatest among floats and `Infinity` next, so both fall out of
+            // the upper test and `-Infinity` out of the lower — and the engine
+            // refuses all three into an integer, measured (`cannot convert
+            // NaN to integer`). Counting them is the right answer, not an
+            // accident of the ordering.
+            Some(format!(
+                "{binary} >= {max}.5::float8 OR {binary} < {min}.5::float8"
+            ))
         }
 
         // A bounded `numeric` target. Measured, the engine's own message says
@@ -1266,6 +1299,23 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
         // An infinity passes straight through (measured, `'Infinity'::float8`
         // into `real` is `Infinity`) and so does a `NaN`, so both leave the
         // count.
+        // The same question from a float, in the float's own domain. Only the
+        // `real` target reaches here: `real -> double precision` is a widening
+        // and `change_risk` has already answered `Safe`, so the threshold is
+        // always `2^128 - 2^103` and always representable. Were the other one
+        // ever reachable, `2::float8^1024` is `Infinity` and the guard above
+        // has already taken every infinity out, so it would report no
+        // violation rather than a wrong one.
+        (Family::Approx { .. }, Family::Approx { max_exact_int }) => {
+            let (base, mantissa) = if max_exact_int <= 1 << 24 {
+                (128, 103)
+            } else {
+                (1024, 970)
+            };
+            Some(format!(
+                "{binary_finite} AND abs({binary}) >= (2::float8^{base} - 2::float8^{mantissa})"
+            ))
+        }
         (_, Family::Approx { max_exact_int }) => {
             let (base, mantissa) = if max_exact_int <= 1 << 24 {
                 (128, 103)
@@ -2245,6 +2295,52 @@ mod tests {
         normalize(&ty(s))
             .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
             .to_string()
+    }
+
+    /// DECISIONS 394: a float's boundary is tested as a float.
+    ///
+    /// The two predicates a float source reaches must not mention `numeric` at
+    /// all. `float8::numeric` rounds through the shortest decimal, and both of
+    /// these sit exactly where that rounding is largest, so a `numeric` in
+    /// either is the bug itself rather than a detail of it. Asserted on the
+    /// text because the failure is invisible in the answer until a row sits on
+    /// the boundary, and the live suite is what puts one there.
+    #[test]
+    fn a_float_source_is_measured_without_a_numeric_in_sight() {
+        let predicate = |from: &str, to: &str| {
+            let from = normalize(&ty(from)).expect("a source type normalizes");
+            let to = normalize(&ty(to)).expect("a target type normalizes");
+            cannot_become(&from, &to, "\"v\"")
+                .unwrap_or_else(|| panic!("`{from}` -> `{to}` should have a predicate to count"))
+        };
+        for (from, to) in [
+            ("double precision", "bigint"),
+            ("double precision", "integer"),
+            ("double precision", "smallint"),
+            ("real", "integer"),
+            ("double precision", "real"),
+        ] {
+            let got = predicate(from, to);
+            assert!(
+                !got.contains("numeric"),
+                "`{from}` -> `{to}` measures a float through `numeric`: {got}"
+            );
+            assert!(got.contains("float8"), "{got}");
+        }
+
+        // And the other half: an exact source keeps the exact domain, because
+        // that is the domain the `ALTER` itself converts in.
+        for (from, to) in [
+            ("numeric(30,0)", "bigint"),
+            ("numeric", "real"),
+            ("bigint", "real"),
+        ] {
+            let got = predicate(from, to);
+            assert!(
+                got.contains("numeric"),
+                "`{from}` -> `{to}` is exact and must stay exact: {got}"
+            );
+        }
     }
 
     /// A length probe is taken only over a rendering every session prints
