@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
-    Schema, Strategy, Table, TableName,
+    RoutineArg, Schema, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -279,7 +279,7 @@ impl Probe {
 /// both answered the same — `SELECT /* a /* b */ c */ 1` returns `1` on either.
 /// A field no implementation varies is a field nobody maintains, and the
 /// abstraction worth having is the one two implementations draw (ADR-0014).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Lexicon {
     /// Every opener of a quoted identifier, with the character that closes it.
     ///
@@ -301,6 +301,60 @@ pub struct Lexicon {
     /// Whether `$tag$…$tag$` is a string literal — closed only by its own tag,
     /// with no escape sequences inside it at all.
     pub dollar_quoted_strings: bool,
+
+    /// The prefixes a string literal may carry, lower-cased and longest
+    /// first: part of the literal's token, not a name before it.
+    ///
+    /// **Measured** on PostgreSQL 18.6, `N'x'`, `B'101'`, `X'1F'`,
+    /// `U&'d\0061ta'` and `E'y'` are all literals, while `note'x'` is the
+    /// type `note` applied to a string — so only these spellings are blanked
+    /// with the literal, and only where nothing continues an identifier
+    /// before them. Left as code, the `E` of an escape string matched a
+    /// module named `e` and drew an edge that was not there (DECISIONS 315).
+    pub string_prefixes: &'static [&'static str],
+
+    /// Whether a character continues an unquoted identifier once one has
+    /// started — where a word ends, for every scan that looks for one.
+    ///
+    /// PostgreSQL's rule admits every non-ASCII byte, so a non-breaking space
+    /// is a name byte and `x\u{a0}y` one alias; SQL Server's is Unicode's
+    /// alphanumerics plus four symbols (DECISIONS 313, 315).
+    pub identifier_continues: fn(char) -> bool,
+
+    /// Whether a lower-cased word can **never** stand unquoted as a name on
+    /// this engine — a reserved keyword, in the engine's own sense of the
+    /// word, which is narrower than "keyword".
+    ///
+    /// The name scans read a bare word as a possible reference to a module of
+    /// that name; a word the engine refuses as a bare name is not one, and
+    /// reading it as one drew an edge from every view to a view named
+    /// `select`. **Measured** (DECISIONS 316): on PostgreSQL `FROM select`
+    /// is a syntax error while `FROM "select"`, `FROM app.select` and `FROM
+    /// user` are accepted, so the word is reserved only where no bare
+    /// position takes it; on SQL Server none of the documented reserved words
+    /// stands unbracketed.
+    pub reserved: fn(&str) -> bool,
+
+    /// Whether `U&"…"`, with an optional `UESCAPE 'x'` after it, is a
+    /// Unicode-escaped identifier — a spelling of the name it decodes to,
+    /// which is what the name scans have to see. **Measured** on PostgreSQL
+    /// 18.6, `SELECT * FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a" UESCAPE
+    /// '!'` both select from `dq.z`; read as the spelling on the page, the
+    /// scan found no `z` in either and created the view first (DECISIONS
+    /// 315).
+    pub unicode_identifiers: bool,
+}
+
+/// Standard SQL's identifier rule: letters, digits and `_`.
+fn ansi_identifier_continues(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The answer of a lexis that reserves nothing: every bare word may be a
+/// name. The shared scanner's rule, and the honest one for a dialect that has
+/// not measured its engine's.
+pub fn never_reserved(_: &str) -> bool {
+    false
 }
 
 impl Lexicon {
@@ -311,6 +365,10 @@ impl Lexicon {
         quoted_identifiers: &[('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
+        string_prefixes: &["n"],
+        identifier_continues: ansi_identifier_continues,
+        reserved: never_reserved,
+        unicode_identifiers: true,
     };
 
     /// The comparison form of a module definition, for the dialect this
@@ -536,6 +594,460 @@ impl Lexicon {
     }
 }
 
+impl Lexicon {
+    /// The definition with everything that is not code blanked out, by this
+    /// engine's lexis.
+    ///
+    /// String literals and both comment forms are replaced by spaces,
+    /// character for character, so line structure and offsets survive; a
+    /// quoted identifier is passed through, because it is a name and a name
+    /// is what the callers look for. The reader is the dependency scan
+    /// (`creation_order`), and it used to lex every engine with one engine's
+    /// rules: **measured**, `CREATE VIEW es.b AS SELECT E'x\' , es.a' AS s`
+    /// is one literal to PostgreSQL, and the shared scanner closed it at the
+    /// `\'`, read `, es.a` as code, and invented an edge from `b` to `a`.
+    /// With `a` selecting from `b`, that edge closed a cycle, the two were
+    /// emitted in name order, and `CREATE VIEW es.a` failed inside the plan's
+    /// own transaction (DECISIONS 315).
+    ///
+    /// A dollar-quoted string is a literal, blanked — except a routine's
+    /// body, which is one on the engine that has them, and which the name
+    /// scans exist to read: the string after the word `AS` is lexed as code
+    /// by these same rules, and every other one is a datum (see
+    /// `dollar_quoted_string`). This is the one place this scan and
+    /// [`normalize_definition`] part company on purpose.
+    ///
+    /// [`normalize_definition`]: Lexicon::normalize_definition
+    pub fn code_only(&self, definition: &str) -> String {
+        enum At {
+            Code,
+            /// Inside `'…'`: a doubled quote is a quote *inside* the
+            /// literal, and the literal it resumes is the same one.
+            /// `unicode` marks a `U&'…'`, which may carry a `UESCAPE 'x'`
+            /// after its closing quote — and which a doubled quote must not
+            /// cost it: measured, `U&'a''b' uescape '!'` is the string
+            /// `a'b`, clause and all.
+            Literal {
+                unicode: bool,
+            },
+            /// Inside `E'…'`: a backslash speaks for the character after it.
+            Escape {
+                after_backslash: bool,
+            },
+            /// Inside a quoted identifier: kept. The flag marks the second
+            /// delimiter of an escaped pair so it cannot also close the name.
+            Ident {
+                close: char,
+                escaped: bool,
+            },
+            Line,
+            Block {
+                depth: usize,
+                seen: usize,
+            },
+        }
+        let mut out = String::with_capacity(definition.len());
+        let bytes = definition.as_bytes();
+        let mut at = At::Code;
+        let mut consumed_to = 0usize;
+        for (i, ch) in definition.char_indices() {
+            if i < consumed_to {
+                continue;
+            }
+            let next = bytes.get(i + ch.len_utf8()).copied();
+            match at {
+                At::Literal { unicode } => {
+                    blank(&mut out, ch);
+                    if ch == '\'' && next == Some(b'\'') {
+                        // A quote inside the literal, not the end of it: the
+                        // prefix it opened with is still the prefix, and its
+                        // clause still follows the real closing quote.
+                        blank(&mut out, '\'');
+                        consumed_to = i + 2;
+                    } else if ch == '\'' {
+                        at = At::Code;
+                        // The clause belongs to the literal it follows —
+                        // measured, `U&'d!0061ta' UESCAPE '!'` is the string
+                        // `data` — and left as code the word matched a module
+                        // named `uescape` and drew an edge that was not there.
+                        if unicode && let Some(n) = uescape_clause_len(&definition[i + 1..]) {
+                            for c in definition[i + 1..i + 1 + n].chars() {
+                                blank(&mut out, c);
+                            }
+                            consumed_to = i + 1 + n;
+                        }
+                    }
+                }
+                At::Escape { after_backslash } => {
+                    at = if after_backslash {
+                        At::Escape {
+                            after_backslash: false,
+                        }
+                    } else if ch == '\\' {
+                        At::Escape {
+                            after_backslash: true,
+                        }
+                    } else if ch == '\'' {
+                        if next == Some(b'\'') {
+                            blank(&mut out, '\'');
+                            consumed_to = i + 2;
+                            At::Escape {
+                                after_backslash: false,
+                            }
+                        } else {
+                            At::Code
+                        }
+                    } else {
+                        At::Escape {
+                            after_backslash: false,
+                        }
+                    };
+                    blank(&mut out, ch);
+                }
+                At::Ident { close, escaped } => {
+                    at = if escaped {
+                        At::Ident {
+                            close,
+                            escaped: false,
+                        }
+                    } else if ch == close {
+                        if next == Some(close as u8) {
+                            At::Ident {
+                                close,
+                                escaped: true,
+                            }
+                        } else {
+                            At::Code
+                        }
+                    } else {
+                        At::Ident {
+                            close,
+                            escaped: false,
+                        }
+                    };
+                    out.push(ch);
+                }
+                At::Line => {
+                    if matches!(ch, '\n' | '\r') {
+                        at = At::Code;
+                    }
+                    blank(&mut out, ch);
+                }
+                At::Block { depth, seen } => {
+                    at = if ch == '/' && seen >= 2 && bytes[i - 1] == b'*' {
+                        if depth == 1 {
+                            At::Code
+                        } else {
+                            At::Block {
+                                depth: depth - 1,
+                                seen: 2,
+                            }
+                        }
+                    } else if ch == '/' && next == Some(b'*') {
+                        At::Block {
+                            depth: depth + 1,
+                            seen: 0,
+                        }
+                    } else {
+                        At::Block {
+                            depth,
+                            seen: seen + 1,
+                        }
+                    };
+                    blank(&mut out, ch);
+                }
+                At::Code => {
+                    // A `$` opens a string only where it opens a tag: `a$b$c`
+                    // is one name, and `$1.00` is code (see `dollar_tag`).
+                    if self.dollar_quoted_strings
+                        && ch == '$'
+                        && !continues_identifier(definition, i)
+                        && let Some(len) = dollar_tag(&definition[i..])
+                    {
+                        consumed_to = self.dollar_quoted_string(definition, i, len, &mut out);
+                        continue;
+                    }
+                    match (ch, next) {
+                        ('-', Some(b'-')) => {
+                            at = At::Line;
+                            blank(&mut out, ch);
+                        }
+                        ('/', Some(b'*')) => {
+                            at = At::Block { depth: 1, seen: 0 };
+                            blank(&mut out, ch);
+                        }
+                        ('\'', _) => {
+                            let prefix = self.blank_string_prefix(&mut out);
+                            at = if self.escape_strings && opens_escape_string(definition, i) {
+                                At::Escape {
+                                    after_backslash: false,
+                                }
+                            } else {
+                                At::Literal {
+                                    unicode: prefix.is_some_and(|p| p.eq_ignore_ascii_case("u&")),
+                                }
+                            };
+                            blank(&mut out, ch);
+                        }
+                        _ => {
+                            if ch == '"'
+                                && self.unicode_identifiers
+                                && let Some(end) =
+                                    self.decode_unicode_identifier(definition, i, &mut out)
+                            {
+                                consumed_to = end;
+                                continue;
+                            }
+                            if let Some(&(_, close)) = self
+                                .quoted_identifiers
+                                .iter()
+                                .find(|&&(open, _)| open == ch)
+                            {
+                                at = At::Ident {
+                                    close,
+                                    escaped: false,
+                                };
+                            }
+                            out.push(ch);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Where the quote at `at` closes a `U&"…"` — the `U&` already in `out`
+    /// as code, as a string prefix would be — replaces the spelling with the
+    /// quoted name it decodes to and returns the offset the code after it,
+    /// and after its `UESCAPE 'x'` if it has one, resumes at. `None` where
+    /// the quote is not that, or the text does not decode: the quote then
+    /// opens an ordinary identifier, spelled as it is.
+    ///
+    /// The decoded name is never longer than its spelling, so the difference
+    /// is padded and offsets survive; a line break inside the span is kept.
+    fn decode_unicode_identifier(
+        &self,
+        definition: &str,
+        at: usize,
+        out: &mut String,
+    ) -> Option<usize> {
+        let n = out.len();
+        if n < 2
+            || !out.is_char_boundary(n - 2)
+            || !out[n - 2..].eq_ignore_ascii_case("u&")
+            || out[..n - 2]
+                .chars()
+                .next_back()
+                .is_some_and(self.identifier_continues)
+        {
+            return None;
+        }
+        let close = quoted_identifier_len(&definition[at..])?;
+        let inner = definition[at + 1..at + close - 1].replace("\"\"", "\"");
+        let mut end = at + close;
+        let mut escape = '\\';
+        // `UESCAPE 'x'`, after ASCII whitespace: the engine's whitespace.
+        let after = definition[end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if after.len() > 7
+            && after.is_char_boundary(7)
+            && after[..7].eq_ignore_ascii_case("uescape")
+            && after[7..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_whitespace() || c == '\'')
+        {
+            let clause = after[7..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let mut chars = clause.chars();
+            if let (Some('\''), Some(e), Some('\'')) = (chars.next(), chars.next(), chars.next())
+                && e != '\''
+                && e != '+'
+                && !e.is_ascii_hexdigit()
+                && !e.is_whitespace()
+            {
+                escape = e;
+                end = definition.len() - clause.len() + 2 + e.len_utf8();
+            }
+        }
+        let decoded = pbps_model::module::decode_unicode_escapes(&inner, escape)?;
+        out.truncate(n - 2);
+        let spelled = format!("\"{}\"", decoded.replace('"', "\"\""));
+        let span = end - at + 2;
+        out.push_str(&spelled);
+        let breaks = definition[at..end].matches('\n').count();
+        for _ in spelled.len() + breaks..span {
+            out.push(' ');
+        }
+        for _ in 0..breaks {
+            out.push('\n');
+        }
+        Some(end)
+    }
+
+    /// Reads the dollar-quoted string that opens at `at` with a tag of `len`
+    /// bytes, and returns the offset the code after it resumes at.
+    ///
+    /// A routine's body is a dollar-quoted string on this engine, and the
+    /// name scans exist to read what the body says — blanked, every routine
+    /// would call nothing and depend on nothing. A dollar-quoted *datum* in a
+    /// view is a literal like any other, and a name inside one drew an edge
+    /// to a view that the datum never depends on; with the other direction
+    /// real, that edge closed a cycle and the dependent was created first
+    /// (DECISIONS 315). The two are told apart by what precedes the string:
+    /// a body follows the word `AS`, and a datum never does — measured, `AS
+    /// $x$` where a view's alias would go is a syntax error, so a
+    /// dollar-quoted string after `AS` in a definition the engine accepts can
+    /// only be a body. The body is lexed as code by the same rules: its own
+    /// literals and comments are blanked, an `E'…'` by the escape rule, and a
+    /// dollar-quoted datum inside it by this one. Its tags are blanked too:
+    /// a delimiter is not a name, and one that read as code matched a module
+    /// named `$a$`.
+    fn dollar_quoted_string(
+        &self,
+        definition: &str,
+        at: usize,
+        len: usize,
+        out: &mut String,
+    ) -> usize {
+        let tag = &definition[at..at + len];
+        let inner_start = at + len;
+        let (inner_end, end) = match definition[inner_start..].find(tag) {
+            Some(j) => (inner_start + j, inner_start + j + len),
+            // Nothing closes it. The engine would refuse the definition; the
+            // scan reads it the way the engine's lexer would have, to its end.
+            None => (definition.len(), definition.len()),
+        };
+        if follows_the_word_as(out, self.identifier_continues) {
+            // The tags are delimiters, not code: `$a$` is never a name, and
+            // kept, it matched a module named `$a$` and drew an edge from
+            // every routine delimited by it.
+            for ch in tag.chars() {
+                blank(out, ch);
+            }
+            out.push_str(&self.code_only(&definition[inner_start..inner_end]));
+            for ch in definition[inner_end..end].chars() {
+                blank(out, ch);
+            }
+        } else {
+            for ch in definition[at..end].chars() {
+                blank(out, ch);
+            }
+        }
+        end
+    }
+}
+
+/// The length of the `"…"` at the front of `text`, a doubled quote being a
+/// quote inside the name; `None` where it never closes.
+fn quoted_identifier_len(text: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// Blanks `ch` in `out`, keeping a line break so that line structure and
+/// positions survive.
+fn blank(out: &mut String, ch: char) {
+    if matches!(ch, '\n' | '\r') {
+        out.push(ch);
+    } else {
+        for _ in 0..ch.len_utf8() {
+            out.push(' ');
+        }
+    }
+}
+
+/// Whether the code lexed so far ends with the keyword `AS` as a word of its
+/// own — `has` does not end with it, and neither does `x$as`, nor
+/// `as\u{a0}`: the gap before the string is whitespace the dialect does
+/// not count as a name byte, and a Unicode trim took the non-breaking space
+/// off a type named `as\u{a0}` and read a datum it was applied to as a body.
+/// Measured, `SELECT as\u{a0} $$app.a$$` is that type applied to a string,
+/// and a valid view.
+///
+/// It is asked of the *lexed* text, so a comment between the keyword and the
+/// string it introduces is already a run of blanks: measured, `AS /* c */ $$
+/// SELECT 1 $$` is accepted as a body.
+fn follows_the_word_as(code: &str, continues: fn(char) -> bool) -> bool {
+    let code = code.trim_end_matches(|c: char| c.is_whitespace() && !continues(c));
+    let Some(start) = code.len().checked_sub(2) else {
+        return false;
+    };
+    code.is_char_boundary(start)
+        && code[start..].eq_ignore_ascii_case("as")
+        && !code[..start].chars().next_back().is_some_and(continues)
+}
+
+impl Lexicon {
+    /// Blanks a string prefix that `out` ends with, where it is one: a
+    /// prefix is part of the literal's token, and a name before a literal is
+    /// something else — measured, `note'x'` is the type `note` applied to a
+    /// string, and `áE'a\'` that name applied to `a\` (see
+    /// [`continues_ident`]).
+    fn blank_string_prefix(&self, out: &mut String) -> Option<&'static str> {
+        for prefix in self.string_prefixes {
+            let n = prefix.len();
+            if out.len() < n || !out.is_char_boundary(out.len() - n) {
+                continue;
+            }
+            let start = out.len() - n;
+            if out[start..].eq_ignore_ascii_case(prefix)
+                && !out[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(self.identifier_continues)
+            {
+                out.truncate(start);
+                for _ in 0..n {
+                    out.push(' ');
+                }
+                return Some(prefix);
+            }
+        }
+        None
+    }
+}
+
+/// The length in bytes of the `UESCAPE 'x'` clause at the front of `text`,
+/// leading whitespace included, or `None` where there is not one.
+///
+/// The clause is part of the token it follows — a `U&'…'` literal or a
+/// `U&"…"` name — and the escape may be almost any punctuation: measured, the
+/// engine takes `,`, `(`, `)`, `[`, `]` and `.`, and refuses a quote, a `+`, a
+/// hex digit and whitespace (DECISIONS 301). What the escape *is* does not
+/// matter to a literal whose contents are blanked either way; that the clause
+/// is not code does.
+fn uescape_clause_len(text: &str) -> Option<usize> {
+    let after_gap = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if after_gap.len() < 8
+        || !after_gap.is_char_boundary(7)
+        || !after_gap[..7].eq_ignore_ascii_case("uescape")
+    {
+        return None;
+    }
+    // A word of its own: `uescapes` is a name, and so is `uescape2`.
+    let tail = &after_gap[7..];
+    if !tail.starts_with(|c: char| c.is_ascii_whitespace() || c == '\'') {
+        return None;
+    }
+    let clause = tail.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let mut chars = clause.chars();
+    let (Some('\''), Some(escape), Some('\'')) = (chars.next(), chars.next(), chars.next()) else {
+        return None;
+    };
+    if escape == '\'' || escape == '+' || escape.is_ascii_hexdigit() || escape.is_whitespace() {
+        return None;
+    }
+    Some(text.len() - clause.len() + 2 + escape.len_utf8())
+}
+
 /// The length in bytes of the `$tag$` that `s` opens with, if it opens with one.
 ///
 /// The tag follows the rules of an unquoted identifier and may not contain a
@@ -693,6 +1205,12 @@ pub trait Dialect {
         self.lexicon().normalize_definition(definition)
     }
 
+    /// The definition with everything that is not code blanked out, by this
+    /// engine's lexis: the text the dependency scan reads (DECISIONS 315).
+    fn code_only(&self, definition: &str) -> String {
+        self.lexicon().code_only(definition)
+    }
+
     /// Checks whether this dialect supports the features the module uses.
     ///
     /// The default is "no objection", which is the honest answer from a dialect
@@ -725,20 +1243,59 @@ pub trait Dialect {
         false
     }
 
-    /// This type as the engine spells it *for routine identity*.
+    /// Where `to` sits on the path a bare name in a definition in `from` is
+    /// looked up along, or `None` where it is not on that path at all
+    /// (DECISIONS 317).
     ///
-    /// Deliberately not [`Dialect::normalize_type`]. Measured on PostgreSQL 18
-    /// (ADR-0009 §1), `f(varchar(10))` and `f(varchar(20))` are one function,
-    /// identified as `f(character varying)`: the engine discards type
-    /// modifiers when it identifies a routine, and keeps them when it types a
-    /// column. Reusing the column normalizer would key one engine object as
-    /// two modules, and every `DROP` and `GRANT` the plan emitted would name a
-    /// signature the engine resolves to something else.
+    /// A rank rather than a yes, because the engine resolves a bare name in
+    /// the **first** schema of the path that holds one: two declared modules
+    /// of the same bare name are not two candidates, and an edge to the
+    /// worse-placed one is invented.
     ///
-    /// The default defers to the column spelling, which is right for any
-    /// dialect where nothing overloads: nothing calls it there.
-    fn normalize_routine_arg(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
-        self.normalize_type(ty)
+    /// The default is `Some(0)` everywhere, which is the honest answer from a
+    /// dialect that has not measured its engine's rule: every schema on an
+    /// equal footing, an edge too many in the direction the scan has always
+    /// erred, and never an edge too few.
+    fn bare_name_rank(&self, _from: &str, _to: &str) -> Option<usize> {
+        Some(0)
+    }
+
+    /// This argument type as the engine spells it *in a routine's identity*.
+    ///
+    /// Deliberately not [`Dialect::normalize_type`], and deliberately not over
+    /// a [`ColumnType`] at all. Measured on PostgreSQL 18.6 (ADR-0009 §1):
+    ///
+    /// - `f(varchar(10))` and `f(varchar(20))` are one function, identified as
+    ///   `f(character varying)` — the engine discards type modifiers when it
+    ///   identifies a routine and keeps them when it types a column, so reusing
+    ///   the column normalizer would key one engine object as two modules and
+    ///   every `DROP` and `GRANT` the plan emitted would name a signature the
+    ///   engine resolves to something else; and
+    /// - an identity holds spellings a column type cannot — `"char"`,
+    ///   `integer[]`, a schema-qualified domain — which is why
+    ///   [`pbps_model::RoutineArg`] carries text and this returns text.
+    ///
+    /// The default reads the argument as a column type and spells it that way
+    /// where it can, and leaves it alone where it cannot. That is right for a
+    /// dialect whose routine arguments *are* column types — SQL Server's are,
+    /// and `dbo.f(int)` declared against `dbo.f(integer)` read back is one
+    /// routine there, which is the case this default exists to keep — and it
+    /// cannot damage the spellings a column type has no room for, because
+    /// those do not parse as one and come back unchanged.
+    ///
+    /// A dialect whose identities are not column types overrides it.
+    fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
+        let Ok(ty) = arg.as_str().parse::<ColumnType>() else {
+            return Ok(arg.clone());
+        };
+        let spelled = self.normalize_type(&ty)?;
+        spelled
+            .to_string()
+            .parse()
+            .map_err(|_| DialectError::Unsupported {
+                dialect: self.name(),
+                feature: format!("`{spelled}` as a routine argument type"),
+            })
     }
 
     /// Whether this engine's roles are the tool's to create, rename and drop
@@ -1107,6 +1664,10 @@ mod tests {
         quoted_identifiers: &[('[', ']'), ('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
+        string_prefixes: &["n"],
+        identifier_continues: pbps_model::module::is_regular_identifier_continue,
+        reserved: never_reserved,
+        unicode_identifiers: false,
     };
 
     /// PostgreSQL's, as `pbps-pg` states it.
@@ -1114,6 +1675,10 @@ mod tests {
         quoted_identifiers: &[('"', '"')],
         escape_strings: true,
         dollar_quoted_strings: true,
+        string_prefixes: &["u&", "e", "n", "b", "x"],
+        identifier_continues: continues_ident,
+        reserved: never_reserved,
+        unicode_identifiers: true,
     };
 
     /// The row of ADR-0011 Amendment 2's table that points the other way from
@@ -1420,10 +1985,16 @@ mod tests {
             matches!(kind, ModuleKind::Function | ModuleKind::Procedure)
         }
         /// The modifiers a column keeps: `varchar(10)` and `varchar(20)` are
-        /// one function to this engine, and `f(character varying)` is what it
-        /// calls both.
-        fn normalize_routine_arg(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
-            Ok(ColumnType::simple(&ty.base))
+        /// one function to this engine, and `f(varchar)` is what it calls
+        /// both. Text in, text out — the argument of a routine identity is not
+        /// a column type (ADR-0009 §1).
+        fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
+            let s = arg.as_str();
+            let base = s.split('(').next().unwrap_or(s).trim();
+            base.parse().map_err(|_| DialectError::Unsupported {
+                dialect: "overloading",
+                feature: format!("`{s}` as a routine argument"),
+            })
         }
     }
 
@@ -1567,17 +2138,18 @@ mod tests {
 
     /// Routine identity is not column identity: the modifiers `normalize_type`
     /// keeps are the ones the engine discards when it identifies a routine
-    /// (ADR-0009 §1, measured). The default defers to the column spelling,
-    /// which is only ever right where nothing overloads.
+    /// (ADR-0009 §1, measured). The default leaves the argument alone, which is
+    /// only ever asked where nothing overloads.
     #[test]
     fn routine_argument_normalization_is_not_column_normalization() {
+        let arg: RoutineArg = "varchar(10)".parse().unwrap();
         let ty: ColumnType = "varchar(10)".parse().unwrap();
         assert_eq!(
-            OverloadingDialect.normalize_routine_arg(&ty).unwrap(),
-            ColumnType::simple("varchar")
+            OverloadingDialect.normalize_routine_arg(&arg).unwrap(),
+            "varchar".parse::<RoutineArg>().unwrap()
         );
         assert_eq!(OverloadingDialect.normalize_type(&ty).unwrap(), ty);
-        assert_eq!(MinimalDialect.normalize_routine_arg(&ty).unwrap(), ty);
+        assert_eq!(MinimalDialect.normalize_routine_arg(&arg).unwrap(), arg);
     }
 }
 
@@ -1680,5 +2252,250 @@ impl Dialect for MinimalDialect {
             dialect: "minimal",
             feature: "SQL generation (the real emitter arrives in Phase 2)".to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod code_only_tests {
+    use super::*;
+
+    const PG: Lexicon = Lexicon {
+        quoted_identifiers: &[('"', '"')],
+        escape_strings: true,
+        dollar_quoted_strings: true,
+        string_prefixes: &["u&", "e", "n", "b", "x"],
+        identifier_continues: continues_ident,
+        reserved: never_reserved,
+        unicode_identifiers: true,
+    };
+    const MSSQL: Lexicon = Lexicon {
+        quoted_identifiers: &[('[', ']'), ('"', '"')],
+        escape_strings: false,
+        dollar_quoted_strings: false,
+        string_prefixes: &["n"],
+        identifier_continues: pbps_model::module::is_regular_identifier_continue,
+        reserved: never_reserved,
+        unicode_identifiers: false,
+    };
+
+    /// `text` with each of `regions` replaced by spaces, character for
+    /// character — what the blanking of exactly those regions looks like.
+    fn blanked(text: &str, regions: &[&str]) -> String {
+        regions.iter().fold(text.to_owned(), |out, region| {
+            out.replace(region, &" ".repeat(region.chars().count()))
+        })
+    }
+
+    /// Measured: `SELECT E'x\' , es.a'` is one literal to PostgreSQL. Read
+    /// with the other engine's rules it closed at the `\'`, the name after
+    /// it was code, and the quote before `AS` opened a literal that ran to
+    /// the end.
+    #[test]
+    fn an_escape_string_is_one_literal_where_the_engine_has_them() {
+        let text = "SELECT E'x\\' , es.a' AS s";
+        assert_eq!(PG.code_only(text), blanked(text, &["E'x\\' , es.a'"]));
+        assert_eq!(MSSQL.code_only(text), blanked(text, &["'x\\'", "' AS s"]));
+        // A doubled quote inside one does not close it either.
+        assert_eq!(
+            PG.code_only("E'a''b' x"),
+            blanked("E'a''b' x", &["E'a''b'"])
+        );
+        // And the prefix has to be a token of its own: `note'x'` is a name
+        // followed by a plain literal, whose backslash is a character.
+        assert_eq!(
+            PG.code_only("note'x\\' y"),
+            blanked("note'x\\' y", &["'x\\'"])
+        );
+    }
+
+    /// A routine's body is a dollar-quoted string on this engine, and the
+    /// scans are about what it says; so the one after `AS` is code, and what
+    /// is inside it is lexed as code — its own literals blanked, an escape
+    /// string by the escape rule. Every other dollar-quoted string is a
+    /// datum, and a datum is blanked: measured, a view may not write `AS $x$`
+    /// where an alias goes, so the word tells the two apart.
+    #[test]
+    fn a_dollar_quoted_string_is_a_body_after_the_word_as_and_a_datum_elsewhere() {
+        let body = "() RETURNS int LANGUAGE sql AS $$ SELECT app.f('x', E'y\\'z') $$";
+        // The tags go with the literals: a delimiter is not a name.
+        assert_eq!(
+            PG.code_only(body),
+            blanked(body, &["$$", "'x'", "E'y\\'z'"])
+        );
+        let tagged = "AS $a$ SELECT app.f(1) $a$";
+        assert_eq!(PG.code_only(tagged), blanked(tagged, &["$a$"]));
+        let datum = "SELECT $$ es.a $$ AS t, $x$es.a$x$ AS u";
+        assert_eq!(
+            PG.code_only(datum),
+            blanked(datum, &["$$ es.a $$", "$x$es.a$x$"])
+        );
+        // A default in the argument list is a datum, and the body after it is
+        // still the body; a comment between `AS` and the body is no
+        // objection, and `has` is not the word.
+        let routine = "(a text DEFAULT $x$es.a$x$) RETURNS int AS /* c */ $$ SELECT es.b('q') $$";
+        assert_eq!(
+            PG.code_only(routine),
+            blanked(routine, &["$x$es.a$x$", "/* c */", "'q'", "$$"])
+        );
+        let has = "SELECT * FROM es.has $$ es.a $$";
+        assert_eq!(PG.code_only(has), blanked(has, &["$$ es.a $$"]));
+        // Nor is a type named `as\u{a0}` applied to a string: the gap before
+        // the string is ASCII whitespace, and the non-breaking space is a
+        // name byte (measured, a valid view).
+        let nbsp = "SELECT as\u{a0} $$ es.a $$ AS t";
+        assert_eq!(PG.code_only(nbsp), blanked(nbsp, &["$$ es.a $$"]));
+        // And a datum inside the body is a datum.
+        let nested = "AS $b$ SELECT $$ es.a $$ $b$";
+        assert_eq!(
+            PG.code_only(nested),
+            blanked(nested, &["$$ es.a $$", "$b$"])
+        );
+        // `$` inside an identifier is a name byte on either engine, and a
+        // `$` that opens no tag is code.
+        assert_eq!(PG.code_only("SELECT a$b$c FROM t"), "SELECT a$b$c FROM t");
+        assert_eq!(PG.code_only("SELECT $1.00 FROM t"), "SELECT $1.00 FROM t");
+        // SQL Server has no dollar quoting: the text is code.
+        assert_eq!(MSSQL.code_only(datum), datum);
+    }
+
+    #[test]
+    fn a_quoted_identifier_is_kept_and_a_bracket_is_only_a_quote_where_it_quotes() {
+        let text = "SELECT (ARRAY['a]b'])[1], \"es\".\"a\"";
+        assert_eq!(PG.code_only(text), blanked(text, &["'a]b'"]));
+        let bracketed = "SELECT [dbo].[a]]b], 'x'";
+        assert_eq!(MSSQL.code_only(bracketed), blanked(bracketed, &["'x'"]));
+    }
+
+    /// Measured: `FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a" UESCAPE '!'`
+    /// select from `dq.z`, so the scan sees the name and not its spelling —
+    /// at the same offsets, the difference padded. A spelling that does not
+    /// decode, and a `u&` that continues a name, are left as they are; and
+    /// SQL Server has no such form.
+    #[test]
+    fn a_unicode_escaped_identifier_is_read_as_the_name_it_spells() {
+        assert_eq!(
+            PG.code_only("SELECT * FROM app.U&\"\\007a\" WHERE 1"),
+            "SELECT * FROM app.\"z\"       WHERE 1"
+        );
+        assert_eq!(
+            PG.code_only("FROM u&\"app\".U&\"!007a\" UESCAPE '!' x"),
+            "FROM \"app\"  .\"z\"                   x"
+        );
+        // A doubled quote inside, and an escape that spells a quote: both
+        // are one quote in the name, spelled doubled again.
+        assert_eq!(PG.code_only("U&\"a\"\"\\0022b\""), "\"a\"\"\"\"b\"     ");
+        // A line break in the span survives, at the end of it.
+        assert_eq!(
+            PG.code_only("U&\"!007a\"\nUESCAPE '!' x"),
+            "\"z\"                 \n x"
+        );
+        // Not a Unicode-escaped identifier: a name that ends in `u&` is an
+        // operator's operand, and a `\` that spells nothing does not decode.
+        assert_eq!(PG.code_only("xu&\"a\""), "xu&\"a\"");
+        assert_eq!(PG.code_only("U&\"\\00G1\""), "U&\"\\00G1\"");
+        assert_eq!(
+            MSSQL.code_only("SELECT * FROM U&\"\\007a\""),
+            "SELECT * FROM U&\"\\007a\""
+        );
+    }
+
+    /// Measured: `N'x'`, `B'101'`, `X'1F'`, `U&'d\0061ta'` and `E'y'` are
+    /// literals, and `note'x'` is the type `note` applied to a string. The
+    /// prefix goes with its literal; a name before a literal stays.
+    #[test]
+    fn a_literals_prefix_is_blanked_with_it_and_a_name_before_one_is_not() {
+        let text = "SELECT N'x', b'101', X'1F', u&'d\\0061ta', E'y', note'x', áE'a', e";
+        assert_eq!(
+            PG.code_only(text),
+            blanked(
+                text,
+                &[
+                    "N'x'",
+                    "b'101'",
+                    "X'1F'",
+                    "u&'d\\0061ta'",
+                    "E'y'",
+                    "'x'",
+                    "'a'"
+                ]
+            )
+        );
+        // SQL Server has the national prefix and nothing else.
+        let tsql = "SELECT N'x', E'y'";
+        assert_eq!(MSSQL.code_only(tsql), blanked(tsql, &["N'x'", "'y'"]));
+    }
+
+    /// A `UESCAPE 'x'` belongs to the `U&'…'` it follows: measured,
+    /// `U&'d!0061ta' UESCAPE '!'` is the string `data`. Left as code the word
+    /// matched a module named `uescape`, drew an edge that was not there, and
+    /// with the real edge the other way a cycle put the dependent first.
+    #[test]
+    fn a_uescape_clause_is_part_of_the_literal_it_follows() {
+        let text = "SELECT U&'d!0061ta' UESCAPE '!' AS s FROM es.z";
+        assert_eq!(
+            PG.code_only(text),
+            blanked(text, &["U&'d!0061ta' UESCAPE '!'"])
+        );
+        // The keyword is the engine's, in any case: measured, a lower-cased
+        // `uescape` is the same clause — and that is the spelling a module
+        // named `uescape` collides with at every case pass.
+        let lower = "SELECT U&'d!0061ta' uescape '!' AS s";
+        assert_eq!(
+            PG.code_only(lower),
+            blanked(lower, &["U&'d!0061ta' uescape '!'"])
+        );
+        // The clause may be on the next line, and the break survives.
+        let wrapped = "SELECT U&'x'
+UESCAPE '!' AS s";
+        assert_eq!(
+            PG.code_only(wrapped),
+            blanked(wrapped, &["U&'x'", "UESCAPE '!'"])
+        );
+        // Only after a Unicode string: a plain literal is followed by code,
+        // and a name that merely starts with the word is a name.
+        let plain = "SELECT 'x' UESCAPE FROM es.uescape";
+        assert_eq!(PG.code_only(plain), blanked(plain, &["'x'"]));
+        let longer = "SELECT U&'x' uescapes FROM t";
+        assert_eq!(PG.code_only(longer), blanked(longer, &["U&'x'"]));
+        // An escape the engine refuses is no clause: measured, a quote, a
+        // `+`, a hex digit and whitespace are all refused. The word then
+        // stays code and what follows it is read as the ordinary literal it
+        // lexically is — the statement is one the engine refuses either way.
+        for quoted in ["'+'", "'a'", "''''"] {
+            let text = format!("SELECT U&'x' UESCAPE {quoted}");
+            assert_eq!(
+                PG.code_only(&text),
+                blanked(&text, &["U&'x'", quoted]),
+                "{text}"
+            );
+        }
+        // A doubled quote inside the literal is a quote of its own, and the
+        // clause still follows the real closing quote: measured,
+        // `U&'a''b' uescape '!'` is the string `a'b`.
+        let doubled = "SELECT U&'a''b' AS s";
+        assert_eq!(PG.code_only(doubled), blanked(doubled, &["U&'a''b'"]));
+        let both = "SELECT U&'a''b' uescape '!' AS s FROM es.z";
+        assert_eq!(PG.code_only(both), blanked(both, &["U&'a''b' uescape '!'"]));
+        // And a plain literal's doubled quote opens no lookahead at all.
+        let plain_doubled = "SELECT 'a''b' uescape '!' AS s";
+        assert_eq!(
+            PG.code_only(plain_doubled),
+            blanked(plain_doubled, &["'a''b'", "'!'"])
+        );
+        // SQL Server has no such literal, so the word stays code.
+        let tsql = "SELECT N'x' UESCAPE";
+        assert_eq!(MSSQL.code_only(tsql), blanked(tsql, &["N'x'"]));
+    }
+
+    #[test]
+    fn comments_are_blanked_and_line_structure_survives() {
+        let text = "SELECT 1 -- es.a\nFROM /* a /* es.a */ c */ es.b";
+        assert_eq!(
+            PG.code_only(text),
+            blanked(text, &["-- es.a", "/* a /* es.a */ c */"])
+        );
+        for open in ["'unterminated", "E'x\\'", "/* open", "\"open"] {
+            assert_eq!(PG.code_only(open).len(), open.len(), "{open}");
+        }
     }
 }

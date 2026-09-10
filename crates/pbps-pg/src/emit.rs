@@ -36,13 +36,13 @@
 //!
 //! # What is not here
 //!
-//! Modules, roles and reference data, each of which is its own Phase 5 step and
-//! refuses by name through [`crate::Unbuilt`] until it arrives.
+//! Roles and reference data, each of which is its own Phase 5 step and refuses
+//! by name through [`crate::Unbuilt`] until it arrives.
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Change, Column, ColumnType, ForeignKey, Index, PrimaryKey, ReferentialAction, Strategy, Table,
-    TableName, UniqueConstraint,
+    Change, Column, ColumnType, ForeignKey, Index, Module, ModuleId, ModuleKind, PrimaryKey,
+    ReferentialAction, RoutineArg, Strategy, Table, TableName, UniqueConstraint,
 };
 
 use crate::types::DIALECT;
@@ -149,7 +149,7 @@ const SETTING_SENSITIVE: &[&str] = &[
 /// outside the guard on purpose (DECISIONS 174 and 279: this tool does not
 /// parse expressions), covered instead by the settings the framing pins.
 fn without_grouping(expression: &str) -> &str {
-    let mut e = expression.trim();
+    let mut e = ascii_trim(expression);
     loop {
         let bytes = e.as_bytes();
         if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
@@ -164,7 +164,7 @@ fn without_grouping(expression: &str) -> &str {
             if i < consumed_to {
                 continue;
             }
-            if let Some(len) = skip_datum(&e[i..]) {
+            if let Some(len) = skip_datum_at(e, i) {
                 consumed_to = i + len;
                 continue;
             }
@@ -188,7 +188,7 @@ fn without_grouping(expression: &str) -> &str {
         if !paired || depth != 0 {
             return e;
         }
-        e = e[1..e.len() - 1].trim();
+        e = ascii_trim(&e[1..e.len() - 1]);
     }
 }
 
@@ -204,6 +204,54 @@ fn without_grouping(expression: &str) -> &str {
 /// than answering `None`. Nothing after it is code — the engine refuses the
 /// whole expression by name — and a scan that resumed there would count
 /// parentheses that are inside the run-on literal.
+/// [`skip_datum`] for the text at `at`, which knows what came before it.
+///
+/// A `$` after an identifier byte is a byte of that identifier, not the
+/// opener of a dollar-quoted literal: `$` continues a name on this engine
+/// (`continues_ident`), and **measured**, `CREATE FUNCTION dq.f(foo$tag$
+/// integer)` is accepted with the identity `dq.f(integer)` and the name
+/// `"foo$tag$"`. Read from the `$` alone, `$tag$` opened a literal nothing
+/// closed, the scan consumed the rest of the definition, and the gate refused
+/// a routine the engine creates under exactly the declared key. Every scan
+/// that walks per character asks this rather than [`skip_datum`] directly,
+/// so that there is one place the rule is spelled.
+fn skip_datum_at(text: &str, at: usize) -> Option<usize> {
+    let rest = &text[at..];
+    if text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(pbps_dialect::continues_ident)
+        && (rest.starts_with('$')
+            || LITERAL_PREFIXES
+                .iter()
+                .any(|prefix| starts_with_ignoring_ascii_case(rest, prefix)))
+    {
+        return None;
+    }
+    skip_datum(rest)
+}
+
+/// The prefixes [`skip_datum`] reads, each of which is also a byte that
+/// continues an identifier — which is what [`skip_datum_at`] has to rule out.
+///
+/// A prefix is part of a literal's token only where a name does not end
+/// there: **measured**, with a domain `dq.code`, `CREATE FUNCTION dq.f(a
+/// dq.code DEFAULT dq.code'x\', b integer DEFAULT 1)` is accepted and its
+/// default reads back as `'x\'::text`, the type applied to the plain string
+/// `x\`. Read from the `e'` alone it was an escape string, the `\'` did not
+/// close it, the scan swallowed the rest of the declaration, and the gate
+/// refused a routine the engine creates under exactly the declared key. The
+/// quote itself still opens a plain literal there, which is the engine's own
+/// reading (DECISIONS 315).
+const LITERAL_PREFIXES: &[&str] = &["e'", "u&'", "n'"];
+
+/// Whether `text` begins with `prefix`, letter case aside.
+fn starts_with_ignoring_ascii_case(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.is_char_boundary(prefix.len())
+        && text[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
 fn skip_datum(rest: &str) -> Option<usize> {
     // Longest opener first: `E'` and `U&'` are openers of their own, not a
     // name followed by a literal.
@@ -343,7 +391,7 @@ fn after_the_gap(tail: &str) -> (&str, bool) {
     let mut newline = false;
     let mut blocked = false;
     loop {
-        let trimmed = rest.trim_start();
+        let trimmed = ascii_trim_start(rest);
         newline |= rest[..rest.len() - trimmed.len()].contains(NEWLINE);
         rest = trimmed;
         if let Some(after) = rest.strip_prefix("--") {
@@ -407,7 +455,7 @@ fn without_trailing_trivia(e: &str) -> &str {
             consumed_to = e.len() - tail.len();
             continue;
         }
-        if let Some(len) = skip_datum(rest) {
+        if let Some(len) = skip_datum_at(e, i) {
             // A literal, which is code. An *unterminated* block comment reaches
             // here too, because the branch above wanted a closed one: it stays
             // code, so the expression reaches the engine as written and is
@@ -417,11 +465,30 @@ fn without_trailing_trivia(e: &str) -> &str {
             end = consumed_to;
             continue;
         }
-        if !ch.is_whitespace() {
+        if !ch.is_ascii_whitespace() {
             end = i + ch.len_utf8();
         }
     }
     &e[..end]
+}
+
+/// Whitespace is ASCII wherever these scans look for it: to this engine a
+/// non-ASCII byte is an identifier byte, a non-breaking space included.
+/// Measured, `CREATE FUNCTION r10.f(a r10.x\u{a0}, b int)` has the identity
+/// `r10.f(r10."x\u{a0}",integer)` — the byte is the end of the type's name,
+/// and a scan that trimmed it read a type that does not exist and refused a
+/// valid declaration. `str::trim` is Unicode's answer, and the wrong one here
+/// (DECISIONS 313).
+fn ascii_trim(text: &str) -> &str {
+    ascii_trim_end(ascii_trim_start(text))
+}
+
+fn ascii_trim_start(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn ascii_trim_end(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c.is_ascii_whitespace())
 }
 
 /// The characters this engine ends a line with, either of them alone.
@@ -924,6 +991,772 @@ fn one(pg: &Postgres, table: &TableName, body: String) -> Sql {
     Ok(vec![on(pg, table, &body)?])
 }
 
+/// The engine's keyword for a module kind.
+const fn keyword(kind: ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::View => "VIEW",
+        ModuleKind::Procedure => "PROCEDURE",
+        ModuleKind::Function => "FUNCTION",
+        ModuleKind::Trigger => "TRIGGER",
+    }
+}
+
+/// The whole `CREATE` statement for a module, under its schema's write path.
+///
+/// The emitter composes the prefix and the declaration holds the body, so the
+/// SQL still appears exactly once (ADR-0002). Where the prefix ends is the
+/// engine's grammar, not a convention:
+///
+/// | Kind | Emitted prefix | So `definition:` starts at |
+/// |---|---|---|
+/// | view | `CREATE VIEW <name> AS` | the `SELECT` |
+/// | function, procedure | `CREATE FUNCTION <name>` | the parameter list |
+/// | trigger | `CREATE TRIGGER <name>` | `AFTER INSERT ON <table> …` |
+///
+/// **A trigger is the one that differs from the SQL Server side, and it is the
+/// grammar that decides it.** T-SQL writes `CREATE TRIGGER x ON t AFTER
+/// INSERT`, so the emitter can supply the table; PostgreSQL writes
+/// `CREATE TRIGGER x AFTER INSERT ON t`, where the table comes *after* text
+/// only the declaration holds. Splitting the prefix there would mean finding
+/// the end of the event list, which is parsing SQL (§8.2). So the table is in
+/// the identity **and** in the body, and [`validate_module`] refuses a
+/// declaration where the body does not name the table the identity does —
+/// because nothing else would catch it: **measured**, `CREATE TRIGGER audit
+/// AFTER INSERT ON app.other` under the key `app.t.audit` is accepted by the
+/// engine, and the mismatch only surfaces a plan later when
+/// `DROP TRIGGER audit ON app.t` cannot find it.
+///
+/// And **measured**, a trigger's own name is never schema-qualified:
+///
+/// ```text
+/// CREATE TRIGGER m1.audit AFTER INSERT ON m1.t …   syntax error at or near "."
+/// CREATE TRIGGER audit    AFTER INSERT ON m1.t …   accepted
+/// ```
+///
+/// which is the same fact ADR-0009 §1 records from the other side: the schema
+/// in `ModuleId::Trigger` is the table's, and there is nowhere else for it to
+/// come from (DECISIONS 302).
+fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statement, DialectError> {
+    // ASCII, not Unicode: a non-breaking space is an identifier byte to this
+    // engine (DECISIONS 313), and **measured**, `CREATE VIEW v AS SELECT 1 AS
+    // x\u{a0}` names the column `x\u{a0}` — two characters. `str::trim` took
+    // the byte off the end of the body, and the view the plan created had a
+    // column the declaration does not name.
+    let body = ascii_trim(&module.definition);
+    if body.is_empty() {
+        return Err(empty_definition(id));
+    }
+    let sql = match module.kind {
+        // The `AS` is the emitter's, so a view's definition is just its query —
+        // which is what a reader of the declarations wants to see.
+        ModuleKind::View => format!("CREATE VIEW {} AS\n{body}", qualified(&id.object_name())?),
+        // A parameter list is part of the object's contract and modelling
+        // PostgreSQL's parameter syntax — modes, defaults, `VARIADIC` — would
+        // be parsing SQL. So everything after the name is the user's
+        // (ADR-0009 §1).
+        ModuleKind::Function | ModuleKind::Procedure => format!(
+            "CREATE {} {}\n{body}",
+            keyword(module.kind),
+            qualified(&id.object_name())?
+        ),
+        ModuleKind::Trigger => format!("CREATE TRIGGER {}\n{body}", quote(id.name())?),
+    };
+    // The terminator on a line of its own, because the line before it is the
+    // user's: a definition ending in `-- note` would otherwise swallow it, and
+    // the statement would run on into the `RESET search_path` the scope adds.
+    // The same rule as every other verbatim expression here (DECISIONS 281),
+    // and the whole body is verbatim.
+    scoped(pg, id.schema(), &format!("{sql}\n;"))
+}
+
+/// The `DROP` for a module, under its schema's write path.
+///
+/// **Never `CASCADE`.** It is the shortest path out of every dependency
+/// refusal in ADR-0009 §4 and it destroys objects nobody reviewed; SPEC 14.3's
+/// guardrail is that the plan names every object it drops, or it does not drop.
+/// The dependents are the connected plan's to enumerate and to put in front of
+/// the approver.
+fn drop_module(pg: &Postgres, id: &ModuleId, kind: ModuleKind) -> Result<Statement, DialectError> {
+    let sql = match kind {
+        ModuleKind::View => format!("DROP VIEW {};", qualified(&id.object_name())?),
+        // With the signature, because the name alone is not the object: two
+        // overloads share it, and **measured**, `DROP FUNCTION app.f` is
+        // refused by name where more than one exists.
+        ModuleKind::Function | ModuleKind::Procedure => format!(
+            "DROP {} {}({});",
+            keyword(kind),
+            qualified(&id.object_name())?,
+            signature(id)?
+        ),
+        // `DROP TRIGGER audit` is a syntax error: the name is scoped to the
+        // table (ADR-0009 §1), so the table is not decoration here.
+        ModuleKind::Trigger => format!(
+            "DROP TRIGGER {} ON {};",
+            quote(id.name())?,
+            qualified(attached_to(id)?)?
+        ),
+    };
+    scoped(pg, id.schema(), &sql)
+}
+
+/// The argument types of a routine's identity, as the engine spells them.
+///
+/// Interpolated rather than quoted because they are type names, not
+/// identifiers — and safe to interpolate because [`RoutineArg`] admits only
+/// the characters a type name is written with.
+fn signature(id: &ModuleId) -> Result<String, DialectError> {
+    let args = id.args().ok_or_else(|| {
+        invalid(format!(
+            "`{id}` is a routine without an argument list, and this engine identifies a routine by \
+             its arguments: two overloads share the name, so `DROP FUNCTION` needs the signature \
+             to say which one (ADR-0009 §1)"
+        ))
+    })?;
+    Ok(args
+        .iter()
+        .map(RoutineArg::as_str)
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
+    id.attached_to().ok_or_else(|| {
+        invalid(format!(
+            "trigger `{id}` does not say which table it is on, and on this engine a trigger's \
+             name is scoped to its table rather than to a schema (ADR-0009 §1)"
+        ))
+    })
+}
+
+/// The table a `CREATE TRIGGER` body says it is on.
+///
+/// **Not `references`.** A scan for the name anywhere in the text answers yes
+/// to `AFTER UPDATE OF t ON app.other` under the identity `app.t.audit`,
+/// because the column list mentions `t` — so the check passed and the engine
+/// created the trigger on the wrong table, which is the exact silent mismatch
+/// the check exists to prevent. What decides the outcome is the name after
+/// `ON`, so that is what is read.
+///
+/// This is a lexical scan and not a parse: it steps over literals and comments
+/// with [`skip_datum`], counts parentheses so that an `ON` inside a `WHEN (…)`
+/// is not the clause, and stops at the first bare `on` at depth zero. The
+/// grammar puts nothing else there —
+/// `CREATE TRIGGER name { BEFORE | AFTER | INSTEAD OF } event … ON table` —
+/// and `INSTEAD OF` is `OF`, not `ON`. Where it finds none, the caller refuses
+/// rather than guessing, which is the direction a scan may be wrong in.
+///
+/// **A bare `on` cannot be anything but the keyword, and that is the engine's
+/// rule rather than an assumption.** `ON` is reserved, so a column or schema
+/// of that name must be quoted — measured:
+///
+/// ```text
+/// CREATE TABLE ma.t1 (on int);   syntax error at or near "on"
+/// CREATE SCHEMA on;              syntax error at or near "on"
+/// CREATE TABLE ma.t2 (id int, "on" int);   accepted
+/// ```
+///
+/// and a quoted identifier is stepped over whole here, so
+/// `AFTER UPDATE OF "on" ON app.t` finds the clause and not the column.
+fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < definition.len() {
+        if let Some(skip) = skip_datum_at(definition, at) {
+            at += skip;
+            continue;
+        }
+        let c = definition[at..].chars().next()?;
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if pbps_dialect::continues_ident(c) && c != '"' => {
+                let end = at
+                    + definition[at..]
+                        .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+                        .unwrap_or(definition.len() - at);
+                if depth == 0 && definition[at..end].eq_ignore_ascii_case("on") {
+                    // Through the gap, not past the spaces: measured, `ON /*
+                    // c */ app.t` creates the trigger on `app.t`.
+                    return qualified_name_at(after_the_gap(&definition[end..]).0);
+                }
+                at = end;
+                continue;
+            }
+            // A quoted identifier is never the keyword, and stepping over it
+            // whole is what keeps a `"on"` inside a name from ending the scan.
+            '"' => {
+                let rest = qualified_name_at(&definition[at..])?;
+                at += rest.len();
+                continue;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    None
+}
+
+/// The qualified name at the front of `text`: `t`, `app.t`, `"App"."T"` — and
+/// `app . t`, because the dot is a token of its own to this engine.
+/// **Measured**, `ON app . orders`, and a comment or a line break on either
+/// side of the dot, all create the trigger on `app.orders`; a scan that wanted
+/// the dot glued to the name read `app` as the table and refused a valid
+/// declaration.
+///
+/// Returns the slice the name occupies, the trivia inside it included, so a
+/// caller can both read it and skip it. `None` where the text does not start
+/// with one.
+fn qualified_name_at(text: &str) -> Option<&str> {
+    let mut at = one_ident_len(text)?;
+    loop {
+        // A Unicode-escaped part may carry its `UESCAPE 'x'` right after it,
+        // and that clause is part of the name.
+        if let Some(n) = uescape_len(after_the_gap(&text[at..]).0) {
+            at = text.len() - after_the_gap(&text[at..]).0.len() + n;
+        }
+        let Some(after_dot) = after_the_gap(&text[at..]).0.strip_prefix('.') else {
+            break;
+        };
+        let rest = after_the_gap(after_dot).0;
+        let next = one_ident_len(rest)?;
+        at = text.len() - rest.len() + next;
+    }
+    Some(&text[..at])
+}
+
+/// The length of a `UESCAPE 'x'` clause at the front of `text`, or `None`.
+///
+/// The engine takes any single character but a quote, a hex digit, `+` or
+/// whitespace; a clause spelled otherwise is left to the engine to refuse.
+fn uescape_len(text: &str) -> Option<usize> {
+    let word = one_ident_len(text)?;
+    if !text[..word].eq_ignore_ascii_case("uescape") {
+        return None;
+    }
+    let rest = after_the_gap(&text[word..]).0;
+    let mut chars = rest.chars();
+    let (Some('\''), Some(escape), Some('\'')) = (chars.next(), chars.next(), chars.next()) else {
+        return None;
+    };
+    if escape == '\'' || escape == '+' || escape.is_ascii_hexdigit() || escape.is_whitespace() {
+        return None;
+    }
+    Some(text.len() - rest.len() + 2 + escape.len_utf8())
+}
+
+/// The `"…"` a Unicode-escaped identifier `U&"…"` wraps, or `None` where
+/// `text` does not start with one. The prefix is glued to the quote: measured,
+/// `U & "r11"` is a syntax error, `U&"r11".U&"\0074"`, `u&"r11"."t"` and
+/// `U&"r11".U&"!0074" UESCAPE '!'` all create the trigger on `r11.t`.
+fn unicode_quoted(text: &str) -> Option<&str> {
+    (text.len() > 2
+        && text.is_char_boundary(2)
+        && text[..2].eq_ignore_ascii_case("u&")
+        && text[2..].starts_with('"'))
+    .then(|| &text[2..])
+}
+
+fn one_ident_len(text: &str) -> Option<usize> {
+    if let Some(quoted) = unicode_quoted(text) {
+        return one_ident_len(quoted).map(|n| n + 2);
+    }
+    if !text.starts_with('"') {
+        let end = text
+            .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+            .unwrap_or(text.len());
+        return (end > 0).then_some(end);
+    }
+    // Every index here is into `text`, which is the whole reason this is not
+    // written against the tail after the opening quote: a first version mixed
+    // the two and read `"app"."t"` as one nine-character name.
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        // A doubled quote is a quote inside the name.
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// Whether the name a trigger's body puts after `ON` is the table its identity
+/// names.
+///
+/// A bare name is the module's own schema, because that is what the write
+/// scope puts first on the `search_path` — and the object it would find there
+/// is the very table the identity names. An unquoted part folds to lower case
+/// the way this engine folds one; a quoted part keeps what it holds.
+fn names_the_same_table(named: &str, on: &TableName) -> bool {
+    let mut parts = Vec::new();
+    let mut rest = named;
+    loop {
+        let len = match one_ident_len(rest) {
+            Some(len) => len,
+            None => return false,
+        };
+        let part = &rest[..len];
+        rest = after_the_gap(&rest[len..]).0;
+        // A Unicode-escaped part reads with its own `UESCAPE`, or the default.
+        let escape = match uescape_len(rest) {
+            Some(n) => {
+                // The clause is `UESCAPE 'x'`: the character before the
+                // closing quote.
+                let escape = rest[..n].chars().rev().nth(1).unwrap_or('\\');
+                rest = after_the_gap(&rest[n..]).0;
+                escape
+            }
+            None => '\\',
+        };
+        // A part this reader cannot decode is one it cannot be certain about,
+        // and the gate refuses only what it is certain about: the catalog
+        // assertion after the `CREATE` stands behind the rest.
+        let Some(part) = unquoted(part, escape) else {
+            return true;
+        };
+        parts.push(part);
+        // The same gap `qualified_name_at` stepped through: it is inside the
+        // slice that scan returned, so this reader of it steps through it too.
+        match rest.strip_prefix('.') {
+            Some(after) => rest = after_the_gap(after).0,
+            None => break,
+        }
+    }
+    match parts.as_slice() {
+        [name] => *name == on.name,
+        [schema, name] => *schema == on.schema && *name == on.name,
+        _ => false,
+    }
+}
+
+/// The name an identifier spells: an unquoted one folded the way this engine
+/// folds it, a quoted one as written, a Unicode-escaped one decoded with its
+/// escape character. `None` where an escape does not decode — a lone
+/// surrogate, a digit that is not hex — which the engine refuses by name.
+fn unquoted(ident: &str, escape: char) -> Option<String> {
+    if let Some(quoted) = unicode_quoted(ident) {
+        let inner = quoted
+            .strip_prefix('"')?
+            .strip_suffix('"')?
+            .replace("\"\"", "\"");
+        // The model's decoder: the one `RoutineArg` canonicalizes a key by (313).
+        return pbps_model::module::decode_unicode_escapes(&inner, escape);
+    }
+    Some(
+        ident
+            .strip_prefix('"')
+            .and_then(|i| i.strip_suffix('"'))
+            .map_or_else(
+                || ident.to_ascii_lowercase(),
+                |inner| inner.replace("\"\"", "\""),
+            ),
+    )
+}
+
+/// The parameter list at the front of a routine's definition, without its
+/// parentheses, or `None` where the text does not begin with one.
+///
+/// **Measured**, the list is not optional: `CREATE FUNCTION me.noparens
+/// RETURNS int …` is `syntax error at or near "RETURNS"`. So a definition that
+/// does not start with `(` is one the engine would refuse anyway, and this
+/// answers `None` rather than reading the whole body as a parameter.
+fn parameter_list(definition: &str) -> Option<&str> {
+    // Through the gap, not merely the whitespace: a comment is whitespace to
+    // this engine, so a definition opening with one still begins with its
+    // parameter list.
+    let body = after_the_gap(definition).0;
+    if !body.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < body.len() {
+        if let Some(skip) = skip_datum_at(body, at) {
+            at += skip;
+            continue;
+        }
+        let c = body[at..].chars().next()?;
+        match c {
+            '"' => {
+                at += one_ident_len(&body[at..])?;
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&body[1..at]);
+                }
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    None
+}
+
+/// One slice per parameter, split at the commas the list's own depth zero
+/// puts between them — not at every comma, because `numeric(10, 2)` has one
+/// inside it and `DEFAULT '=,)'` has one inside a literal.
+fn parameters(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut at = 0usize;
+    while at < list.len() {
+        if let Some(skip) = skip_datum_at(list, at) {
+            at += skip;
+            continue;
+        }
+        let Some(c) = list[at..].chars().next() else {
+            break;
+        };
+        match c {
+            '"' => {
+                if let Some(len) = one_ident_len(&list[at..]) {
+                    at += len;
+                    continue;
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(ascii_trim(&list[start..at]));
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    parts.push(ascii_trim(&list[start..]));
+    if parts.len() == 1 && parts[0].is_empty() {
+        return Vec::new();
+    }
+    parts
+}
+
+/// A parameter mode this engine writes, folded.
+fn is_a_mode(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "in" | "out" | "inout" | "variadic"
+    )
+}
+
+/// Whether the identity carries this parameter, and the text after its mode.
+///
+/// The mode may come **before or after the name**, and both are the engine's,
+/// not a guess — measured:
+///
+/// ```text
+/// CREATE FUNCTION mf.a(a out int) …   identity  mf.a()
+/// CREATE FUNCTION me.o(out int) …     identity  me.o()
+/// CREATE FUNCTION mf.c(c inout int) … identity  mf.c(integer)
+/// ```
+///
+/// so `OUT` is the one mode a parameter can carry and stay out of
+/// `proargtypes`, and `VARIADIC text[]` is carried as `text[]` (ADR-0009 §1).
+fn after_the_mode(parameter: &str) -> (bool, &str) {
+    // Through the gap first — and through every gap after it. A comment is
+    // whitespace to this engine, and measured, `CREATE FUNCTION mo.c(/* note
+    // */ OUT value integer)`, `(value /* note */ OUT integer)`, `(OUT /* note
+    // */ value integer)` and a line comment between the name and the mode all
+    // have the identity `mo.c()`. Left in, the mode is invisible, the
+    // parameter counts as one the identity carries, and a correctly keyed
+    // routine is refused for a count that is only wrong to this scan.
+    let parameter = after_the_gap(parameter).0;
+    let Some(first) = one_ident_len(parameter) else {
+        return (true, parameter);
+    };
+    if is_a_mode(&parameter[..first]) {
+        return (
+            !parameter[..first].eq_ignore_ascii_case("out"),
+            after_the_gap(&parameter[first..]).0,
+        );
+    }
+    // `name mode type`: the name is read and thrown away, because what is left
+    // is the type either way. A Unicode-escaped name may carry its `UESCAPE
+    // 'x'` after it, and the clause is part of the name: measured,
+    // `CREATE FUNCTION dq.f(U&"n!0061me" UESCAPE '!' OUT integer)` has the
+    // identity `dq.f()`. Read as the mode's position, the clause hid the
+    // `OUT`, the parameter counted, and a correctly keyed routine was refused.
+    let mut after_name = after_the_gap(&parameter[first..]).0;
+    if unicode_quoted(parameter).is_some()
+        && let Some(clause) = uescape_len(after_name)
+    {
+        after_name = after_the_gap(&after_name[clause..]).0;
+    }
+    if let Some(second) = one_ident_len(after_name)
+        && is_a_mode(&after_name[..second])
+    {
+        return (
+            !after_name[..second].eq_ignore_ascii_case("out"),
+            after_the_gap(&after_name[second..]).0,
+        );
+    }
+    (true, parameter)
+}
+
+/// The text before a parameter's default, which is the type and maybe a name.
+///
+/// `DEFAULT` and `=` are the two spellings, and the scan is the lexical one
+/// again: a `=` inside `DEFAULT '=,)'` is a byte of a literal, not the start
+/// of one.
+fn before_the_default(text: &str) -> &str {
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < text.len() {
+        if let Some(skip) = skip_datum_at(text, at) {
+            at += skip;
+            continue;
+        }
+        let Some(c) = text[at..].chars().next() else {
+            break;
+        };
+        match c {
+            '"' => {
+                if let Some(len) = one_ident_len(&text[at..]) {
+                    at += len;
+                    continue;
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => return ascii_trim_end(&text[..at]),
+            _ if depth == 0 && pbps_dialect::continues_ident(c) && c != '"' => {
+                let end = at
+                    + text[at..]
+                        .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+                        .unwrap_or(text.len() - at);
+                if text[at..end].eq_ignore_ascii_case("default") {
+                    return ascii_trim_end(&text[..at]);
+                }
+                at = end;
+                continue;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    ascii_trim_end(text)
+}
+
+/// Whether a type the body declares is **certainly not** the one the identity
+/// carries.
+///
+/// Certainly, and not merely apparently, because this decides a refusal. Two
+/// readings are tried, since a parameter with its mode off is `type` or
+/// `name type` and the engine's own grammar offers nothing else; a reading
+/// this dialect cannot parse as a type counts as agreement, because a scan
+/// that cannot read a spelling has not learned it is wrong.
+fn certainly_not(parameter: &str, identity: &RoutineArg) -> bool {
+    let rest = without_trailing_trivia(before_the_default(after_the_mode(parameter).1));
+    let whole = rest.parse::<RoutineArg>().ok();
+    // A spelling this catalogue knows is the whole type, and the second
+    // reading is not offered for it. Otherwise `(double precision)` is also
+    // read as a parameter named `double` of type `precision` — and with a user
+    // type of that name the gate accepts a body that creates
+    // `f(double precision)` under the key `f(app.precision)`. Measured, the
+    // engine does not offer that reading either: with `mq.precision` in the
+    // database, `CREATE FUNCTION mq.b(double precision)` still creates
+    // `mq.b(double precision)`.
+    let split = if whole.as_ref().is_some_and(types::catalogued) {
+        None
+    } else {
+        one_ident_len(rest).map(|n| after_the_gap(&rest[n..]).0)
+    };
+    let readings = [Some(rest), split];
+    !readings.into_iter().flatten().any(|reading| {
+        reading
+            .parse::<RoutineArg>()
+            .ok()
+            .is_none_or(|declared| agrees(&declared, identity))
+    })
+}
+
+/// Whether two spellings are the same type, **or could be**.
+fn agrees(declared: &RoutineArg, identity: &RoutineArg) -> bool {
+    let declared = types::routine_arg(declared);
+    let identity = types::routine_arg(identity);
+    if declared == identity {
+        return true;
+    }
+    // A bare spelling in the body and a qualified one in the identity are one
+    // type whenever the write path puts that schema in front of the name, and
+    // this dialect cannot know whether it does: `format_type` under the empty
+    // read path always qualifies a user type (ADR-0013 §3), so the identity is
+    // written `md.my_type` while a hand-written body may say `my_type` and the
+    // engine resolve it to the same thing. Refusing that would refuse a valid
+    // plan, which is the one direction this gate may not be wrong in — and the
+    // catalog assertion after the `CREATE` (ADR-0009 §3) is what covers the
+    // case this cannot decide.
+    let (declared, declared_array) = types::peel_array(declared.as_str());
+    let (identity, identity_array) = types::peel_array(identity.as_str());
+    declared_array == identity_array
+        && !declared.is_empty()
+        && !identity.is_empty()
+        && (identity
+            .strip_suffix(declared)
+            .is_some_and(|schema| schema.ends_with('.'))
+            || declared
+                .strip_suffix(identity)
+                .is_some_and(|schema| schema.ends_with('.')))
+}
+
+/// What the body's parameter list disagrees with the identity about.
+///
+/// The same shape as the trigger's `ON` check above and for the same reason:
+/// the identity holds the argument types **and** the body holds the parameter
+/// list, so the two can disagree and the engine accepts the disagreement
+/// without a word. `CREATE FUNCTION app.f\n(x text) …` under the key
+/// `app.f(integer)` creates `app.f(text)`; the key names an object that does
+/// not exist, and every later plan creates it again and drops nothing.
+///
+/// Only a **certain** disagreement is refused. A count is always certain: an
+/// `OUT` parameter is not in `proargtypes` and every other mode is, so the
+/// number the body carries into the identity is a count this scan can take.
+/// A type is certain only where both spellings are read; where one is a bare
+/// name the write path may qualify, [`agrees`] says so and this says nothing,
+/// and the catalog assertion after the `CREATE` (ADR-0009 §3) is what stands
+/// behind it.
+fn the_body_declares_the_identity(
+    id: &ModuleId,
+    definition: &str,
+    args: &[RoutineArg],
+) -> Vec<DialectError> {
+    let Some(list) = parameter_list(definition) else {
+        return vec![invalid(format!(
+            "routine `{id}` has a definition that does not begin with a parameter list. On this \
+             engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
+             after the name, so the list is the body's — and **measured**, the engine requires \
+             one: `CREATE FUNCTION f RETURNS int …` is a syntax error",
+            id.object_name()
+        ))];
+    };
+    let carried: Vec<&str> = parameters(list)
+        .into_iter()
+        .filter(|p| after_the_mode(p).0)
+        .collect();
+    if carried.len() != args.len() {
+        return vec![invalid(format!(
+            "routine `{id}` is declared with {} argument type(s), and its definition's parameter \
+             list carries {} into the identity. On this engine a routine is its name and its \
+             argument types (ADR-0009 §1), so the engine would create an object this key does not \
+             name — and accept it without a word",
+            args.len(),
+            carried.len()
+        ))];
+    }
+    carried
+        .iter()
+        .zip(args)
+        .enumerate()
+        .filter(|(_, (parameter, arg))| certainly_not(parameter, arg))
+        .map(|(at, (parameter, arg))| {
+            invalid(format!(
+                "routine `{id}` names `{arg}` as argument {}, and its definition declares that \
+                 parameter as `{parameter}`. The identity comes from the parameter list the \
+                 definition holds, so the engine would create a different routine under this key \
+                 and the next plan would not find the one named here",
+                at + 1
+            ))
+        })
+        .collect()
+}
+
+fn empty_definition(id: &ModuleId) -> DialectError {
+    invalid(format!("module `{id}` has an empty definition"))
+}
+
+/// What a module declaration must satisfy before anything connects.
+///
+/// Each of these is a refusal the engine would otherwise make at `CREATE`
+/// time — or, for the trigger's table, one it would **not** make at all.
+pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    if ascii_trim(&module.definition).is_empty() {
+        found.push(empty_definition(id));
+    }
+    // The names first: `quote` refuses an identifier over the engine's byte
+    // limit, so a module this call passed would be one the emitter cannot
+    // spell. `validate` is the command that exists to say so offline.
+    if let Err(e) = quote(id.schema()).and_then(|_| quote(id.name())) {
+        found.push(e);
+    }
+    // And the schema the reader excludes, which is DECISIONS 273's rule for
+    // the other half of the managed set. **Measured**: `CREATE FUNCTION
+    // information_schema.f()` is accepted and identified as
+    // `information_schema.f()`, and `CREATE VIEW pg_temp.v` leaves
+    // `pg_temp_4.v` with `relpersistence = 't'` — a session-local view under
+    // a name the declaration never wrote. Either way the pull never reads it
+    // back, so every plan creates it again and the engine refuses the second
+    // one for already existing.
+    let schema = id.schema();
+    if schema == "information_schema" || schema.starts_with("pg_") {
+        found.push(invalid(format!(
+            "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again — and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
+        )));
+    }
+    match module.kind {
+        ModuleKind::Function | ModuleKind::Procedure => match id.args() {
+            // `signature` is the one that says what a routine without an
+            // argument list costs, and it errs exactly here.
+            None => found.extend(signature(id).err()),
+            Some(args) => {
+                // A name the engine would truncate: the routine is created
+                // under the truncated identity and never found under this key
+                // (see `overlong_name`).
+                found.extend(args.iter().filter_map(types::overlong_name).map(|name| {
+                    invalid(format!(
+                        "module `{id}` names `{name}` in an argument type, and that name is                          over {} bytes. The engine truncates a longer identifier with a NOTICE                          nothing reads and creates the routine under the truncated identity,                          which is not this key: the next plan cannot find it, and the `CREATE`                          it emits again is refused as already existing",
+                        crate::MAX_IDENT_BYTES
+                    ))
+                }));
+                // An empty definition is already refused above; running the
+                // parameter scan on it would say the same thing twice, in
+                // worse words.
+                if !ascii_trim(&module.definition).is_empty() {
+                    found.extend(the_body_declares_the_identity(id, &module.definition, args));
+                }
+            }
+        },
+        ModuleKind::Trigger => match attached_to(id) {
+            Err(e) => found.push(e),
+            Ok(on) => {
+                if let Err(e) = qualified(on) {
+                    found.push(e);
+                }
+                // The body carries the `ON <table>` this engine's grammar puts
+                // after the event list, so the identity and the text can
+                // disagree — and the engine accepts the disagreement without a
+                // word.
+                match the_table_the_body_is_on(&module.definition) {
+                    Some(named) if names_the_same_table(named, on) => {}
+                    Some(named) => found.push(invalid(format!(
+                        "trigger `{id}` is declared on `{on}`, and its definition puts it on \
+                         `{named}`. On this engine the table is part of the statement the \
+                         declaration holds — `CREATE TRIGGER {} AFTER INSERT ON {on} …` — so a \
+                         definition naming another table creates the trigger there, under this \
+                         key, and the next plan cannot find it",
+                        id.name()
+                    ))),
+                    None => found.push(invalid(format!(
+                        "trigger `{id}` has a definition this dialect cannot find an `ON \
+                         <table>` in. That clause is what decides which table the trigger is \
+                         created on, and it has to be the `{on}` this identity names — so a \
+                         definition whose target cannot be read is refused rather than created \
+                         somewhere this key does not point"
+                    ))),
+                }
+            }
+        },
+        ModuleKind::View => {}
+    }
+    found
+}
+
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
         // The first statement is the one that brings the table into being; it
@@ -1249,9 +2082,25 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // it implies are separate entries in this same plan.
         Change::SetDataMode { .. } => Ok(Vec::new()),
 
-        Change::CreateModule { .. } | Change::AlterModule { .. } | Change::DropModule { .. } => {
-            Err(Unbuilt::Modules.refuse())
-        }
+        // A module is created, never replaced. `CREATE OR REPLACE` exists on
+        // this engine and buys nothing: measured, it refuses a changed return
+        // type and a reordered view column, and it drops `reloptions` just as a
+        // rebuild does — so the cheap path is neither cheap nor complete, and
+        // *which* edits it can express is decided by text §8.2 forbids parsing.
+        // One shape, always (ADR-0009 §3).
+        Change::CreateModule { id, module } => Ok(vec![create_module(pg, id, module)?]),
+
+        // Two statements, not one, so that the plan a human approves says
+        // `DROP` where a `DROP` will run. Everything the catalog attached to
+        // the old object goes with it, and carrying that across is the
+        // connected plan's obligation, not the emitter's: only a connection can
+        // see an ACL, an owner or a `reloptions` (ADR-0009 §3).
+        Change::AlterModule { id, module } => Ok(vec![
+            drop_module(pg, id, module.kind)?,
+            create_module(pg, id, module)?,
+        ]),
+
+        Change::DropModule { id, kind } => Ok(vec![drop_module(pg, id, *kind)?]),
         Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }
@@ -1402,6 +2251,714 @@ mod tests {
             .into_iter()
             .map(|s| s.sql)
             .collect()
+    }
+
+    fn module(kind: ModuleKind, definition: &str) -> Module {
+        Module {
+            kind,
+            description: None,
+            definition: definition.to_owned(),
+        }
+    }
+
+    fn id(s: &str) -> ModuleId {
+        s.parse().expect("a module id parses")
+    }
+
+    /// The routine half of the same rule the trigger's `ON` check enforces:
+    /// the identity and the body both carry the argument types, and the engine
+    /// creates whatever the body says under whatever key the declarations use.
+    #[test]
+    fn a_parameter_list_that_creates_another_identity_is_refused_offline() {
+        for (key, definition) in [
+            // The shape the review found: same count, different type.
+            (
+                "app.f(integer)",
+                "(x text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A second parameter the identity does not carry.
+            (
+                "app.f(integer)",
+                "(a integer, b text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // None at all where the identity carries one.
+            (
+                "app.f(integer)",
+                "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // `OUT` is the one mode that keeps a parameter out of the
+            // identity, so this list carries nothing into it.
+            (
+                "app.f(integer)",
+                "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The modifier goes, and `numeric(10,2)` is still not `integer`.
+            (
+                "app.f(integer)",
+                "(a numeric(10, 2)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Two qualified spellings that are both certain and differ.
+            (
+                "app.f(md.my_type)",
+                "(a other.my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A spelling the catalogue knows is the whole type. Split again it
+            // reads as a parameter named `double` of type `precision`, and
+            // with a user type of that name the qualification rule would let
+            // `app.precision` through — while the engine creates
+            // `f(double precision)`. Measured: it does not offer that reading.
+            (
+                "app.f(app.precision)",
+                "(double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The default is cut at the `=` outside the literal, and what is
+            // left is still the wrong type.
+            (
+                "app.f(integer)",
+                "(a text = ')') RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Measured: the engine requires the list, so a body without one is
+            // not a routine this dialect can create under any key.
+            (
+                "app.f(integer)",
+                "RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id(key), &module(ModuleKind::Function, definition));
+            assert!(
+                !found.is_empty(),
+                "`{key}` with `{definition}` was accepted, and the engine would create another \
+                 object under this key"
+            );
+        }
+    }
+
+    /// The reader's excluded set is the module gate's too (DECISIONS 273):
+    /// measured, a routine in `information_schema` is created and identified
+    /// there, and a view in `pg_temp` is created in the session's temporary
+    /// schema instead. Both are invisible to the next pull.
+    #[test]
+    fn a_module_in_a_schema_the_pull_would_never_read_is_refused() {
+        for (key, kind) in [
+            ("pg_catalog.v", ModuleKind::View),
+            ("information_schema.v", ModuleKind::View),
+            ("pg_temp.v", ModuleKind::View),
+            ("pg_toast.v", ModuleKind::View),
+            ("information_schema.f(integer)", ModuleKind::Function),
+        ] {
+            let definition = if kind == ModuleKind::View {
+                "SELECT 1 AS x".to_owned()
+            } else {
+                "(a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$".to_owned()
+            };
+            let found = Postgres::new().validate_module(&id(key), &module(kind, &definition));
+            assert!(
+                found.iter().any(|e| e.to_string().contains("never reads")),
+                "`{key}` was accepted: {found:?}"
+            );
+        }
+        // A trigger is keyed by the table it is on, and that schema is the
+        // one the rule reads.
+        let found = Postgres::new().validate_module(
+            &id("pg_temp.t.audit"),
+            &module(
+                ModuleKind::Trigger,
+                "AFTER INSERT ON pg_temp.t EXECUTE FUNCTION app.f()",
+            ),
+        );
+        assert!(
+            found.iter().any(|e| e.to_string().contains("never reads")),
+            "{found:?}"
+        );
+        // The negative case, and it is the one that matters: the reader
+        // compares the first three characters, so `pga` is a project's schema
+        // and a gate that refused it would refuse a module the pull reads.
+        for key in ["pga.v", "app.v", "public.v", "pg.v"] {
+            let found =
+                Postgres::new().validate_module(&id(key), &module(ModuleKind::View, "SELECT 1"));
+            assert!(found.is_empty(), "`{key}` is a project's own: {found:?}");
+        }
+    }
+
+    /// A type name over the engine's byte limit in the argument list is
+    /// refused offline: measured, the engine truncates it, creates the routine
+    /// under the truncated identity, and refuses the same `CREATE` the next
+    /// time — so a plan that was applied once is refused ever after. A name
+    /// at the limit passes.
+    #[test]
+    fn an_argument_type_the_engine_would_truncate_is_refused_before_it_is_created() {
+        let at = "t".repeat(crate::MAX_IDENT_BYTES);
+        let over = format!("{at}x");
+        for (key, definition) in [
+            (
+                format!("app.f(app.{over})"),
+                format!("(a app.{over}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            ),
+            (
+                format!("app.p(app.\"{over}\"[])"),
+                format!("(a app.\"{over}\"[]) LANGUAGE sql AS $$ SELECT 1 $$"),
+            ),
+        ] {
+            let kind = if key.starts_with("app.p") {
+                ModuleKind::Procedure
+            } else {
+                ModuleKind::Function
+            };
+            let found = Postgres::new().validate_module(&id(&key), &module(kind, &definition));
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.to_string().contains("over 63 bytes")),
+                "`{key}` was accepted, and the engine would truncate it: {found:?}"
+            );
+        }
+        let key = format!("app.f(app.{at})");
+        let found = Postgres::new().validate_module(
+            &id(&key),
+            &module(
+                ModuleKind::Function,
+                &format!("(a app.{at}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            ),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The other half, which is the one that decides whether the gate is
+    /// usable: every spelling the engine accepts for the declared identity
+    /// passes, including the ones a scan could mistake for a disagreement.
+    #[test]
+    fn a_parameter_list_that_creates_the_declared_identity_is_accepted() {
+        for (key, definition) in [
+            (
+                "app.f(integer)",
+                "(x integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // No name at all, which is a parameter list of one type.
+            (
+                "app.f(integer)",
+                "(integer) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+            ),
+            // `$` continues a name: measured, `foo$tag$` is one parameter
+            // name and not `foo` followed by a literal that never closes.
+            (
+                "app.f(integer)",
+                "(foo$tag$ integer) RETURNS int LANGUAGE sql AS $$ SELECT foo$tag$ $$",
+            ),
+            (
+                "app.f(integer, text)",
+                "(a$ integer, b$c$ text DEFAULT $x$a$x$) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A spelling the engine folds to the identity's.
+            (
+                "app.f(integer)",
+                "(a int DEFAULT 3) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The modifier is discarded from every routine argument.
+            (
+                "app.f(numeric)",
+                "(a numeric(10, 2)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(character varying)",
+                "(a character varying(5)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A two-word type with a name in front of it, which the two
+            // readings are there for.
+            (
+                "app.f(double precision)",
+                "(a double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // And without one.
+            (
+                "app.f(double precision)",
+                "(double precision) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+            ),
+            // `OUT` is not in the identity; every other mode is.
+            ("app.f()", "(out x text) LANGUAGE sql AS $$ SELECT 'q' $$"),
+            (
+                "app.f(integer)",
+                "(a integer, out b text) LANGUAGE sql AS $$ SELECT 'q' $$",
+            ),
+            (
+                "app.f(integer)",
+                "(a inout integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(text[])",
+                "(variadic a text[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Measured: the mode may follow the name as well as precede it.
+            ("app.f()", "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$"),
+            // A comment is whitespace to this engine, inside the list as much
+            // as before it: measured, `mo.c(/* note */ OUT value integer)` has
+            // the identity `mo.c()`. Read as code it hides the mode, and a
+            // correctly keyed routine is refused for a count only this scan
+            // gets wrong.
+            (
+                "app.f()",
+                "(/* note */ out value integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(-- which one\n a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // And in every gap after the first one: measured, each of these
+            // has the identity `()` — or `(integer)` for the `IN`.
+            (
+                "app.f()",
+                "(value /* note */ out integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "(out /* note */ value integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "(value out /* note */ integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "(value\n-- line comment\nout integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(in /* note */ x /* note */ int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A non-breaking space is the last byte of the type's name, not
+            // whitespace before the comma: measured, the identity is
+            // `f(md."x\u{a0}",integer)`.
+            (
+                "app.f(md.x\u{a0}, integer)",
+                "(a md.x\u{a0}, b integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(md.x\u{a0})",
+                "(a md.x\u{a0} DEFAULT NULL) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(a integer /* trailing */) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A bare name the write path may qualify to the identity's — this
+            // dialect cannot know whether it does, so it does not refuse.
+            (
+                "app.f(md.my_type)",
+                "(a my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(md.my_type[])",
+                "(a my_type[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A quoted name with a comma in it is one parameter, not two.
+            (
+                "app.f(integer)",
+                "(\"a,b\" integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The comma inside a literal default is not a separator either.
+            (
+                "app.f(integer,text)",
+                "(a integer, b text DEFAULT ',)') RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Nothing on either side.
+            ("app.f()", "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            // A leading comment is not a missing parameter list.
+            (
+                "app.f(integer)",
+                "/* the id */ (a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A type name ending in a literal's prefix letter is a name:
+            // measured, with a domain `app.code`, `(a app.code DEFAULT
+            // app.code'x\', b integer DEFAULT 1)` is accepted and the
+            // default reads back as `'x\'::text`. Read as an escape string,
+            // the `\'` left the literal open and the scan swallowed the rest.
+            (
+                "app.f(app.code,integer)",
+                "(a app.code DEFAULT app.code'x\\', b integer DEFAULT 1) RETURNS int LANGUAGE \
+                 sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(app.done,integer)",
+                "(a app.done DEFAULT app.done'x\\', b integer DEFAULT 1) RETURNS int LANGUAGE \
+                 sql AS $$ SELECT 1 $$",
+            ),
+            // A Unicode-escaped name carries its `UESCAPE` clause, and the
+            // mode may follow the clause: measured, these are `app.f()`,
+            // `app.g(integer)`, `app.f(integer)` and `app.g(integer)`.
+            (
+                "app.f()",
+                "(U&\"n!0061me\" UESCAPE '!' OUT integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.g(integer)",
+                "(U&\"n\\0061me\" OUT integer, b int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(integer)",
+                "(U&\"n!0061me\" UESCAPE '!' integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.g(integer)",
+                "(U&\"n!0061me\" UESCAPE '!' INOUT integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id(key), &module(ModuleKind::Function, definition));
+            assert!(
+                found.is_empty(),
+                "`{key}` with `{definition}` was refused: {:?}",
+                found.iter().map(ToString::to_string).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A scan that cannot read a spelling has not learned that it is wrong,
+    /// and a refusal it makes anyway refuses a plan the engine would accept.
+    #[test]
+    fn a_parameter_this_scan_cannot_read_is_not_read_as_a_disagreement() {
+        for (key, definition) in [
+            // A type spelling `RoutineArg` does not admit, in a body the
+            // engine is perfectly happy with.
+            (
+                "app.f(integer)",
+                "(a t%rowtype) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A quoted type name the catalogue has never heard of.
+            (
+                "app.f(\"odd type\")",
+                "(a \"odd type\") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id(key), &module(ModuleKind::Function, definition));
+            assert!(
+                found.is_empty(),
+                "`{key}` with `{definition}` was refused on a spelling this dialect cannot read: \
+                 {:?}",
+                found.iter().map(ToString::to_string).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Each prefix ends where this engine's grammar puts the declaration's
+    /// first word, and a trigger's is the one that is not the SQL Server
+    /// shape — measured, `CREATE TRIGGER m1.audit` is a syntax error and the
+    /// table comes after the event list.
+    #[test]
+    fn each_kind_is_created_with_the_prefix_its_grammar_allows() {
+        let pg = Postgres::new();
+        let cases = [
+            (
+                id("app.v"),
+                module(ModuleKind::View, "SELECT id FROM app.t"),
+                "CREATE VIEW \"app\".\"v\" AS\nSELECT id FROM app.t",
+            ),
+            // ASCII whitespace is trimmed off the body; a non-breaking space
+            // is an identifier byte and stays — measured, it names the column.
+            (
+                id("app.v"),
+                module(ModuleKind::View, " \n SELECT 1 AS x\u{a0}\n "),
+                "CREATE VIEW \"app\".\"v\" AS\nSELECT 1 AS x\u{a0}",
+            ),
+            (
+                id("app.f(integer)"),
+                module(
+                    ModuleKind::Function,
+                    "(a integer) RETURNS integer AS $$ SELECT a $$",
+                ),
+                "CREATE FUNCTION \"app\".\"f\"\n(a integer) RETURNS integer AS $$ SELECT a $$",
+            ),
+            (
+                id("app.p(integer)"),
+                module(
+                    ModuleKind::Procedure,
+                    "(a integer) LANGUAGE sql AS $$ SELECT 1 $$",
+                ),
+                "CREATE PROCEDURE \"app\".\"p\"\n(a integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                id("app.t.audit"),
+                module(
+                    ModuleKind::Trigger,
+                    "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+                ),
+                "CREATE TRIGGER \"audit\"\nAFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION \
+                 app.trf()",
+            ),
+        ];
+        for (id, m, expected) in cases {
+            let sql = sql_of(
+                &pg,
+                &Change::CreateModule {
+                    id: id.clone(),
+                    module: Box::new(m),
+                },
+            );
+            assert_eq!(
+                sql,
+                vec![format!(
+                    "SET search_path = \"app\";\n{expected}\n;\nRESET search_path;"
+                )],
+                "{id}"
+            );
+        }
+    }
+
+    /// `CREATE OR REPLACE` is never written, so a change is two statements and
+    /// the plan a human approves says `DROP` where a `DROP` will run
+    /// (ADR-0009 §3).
+    #[test]
+    fn a_module_change_is_a_drop_and_a_create_and_never_a_replace() {
+        let pg = Postgres::new();
+        let sql = sql_of(
+            &pg,
+            &Change::AlterModule {
+                id: id("app.f(integer, text)"),
+                module: Box::new(module(
+                    ModuleKind::Function,
+                    "(a integer, b text) RETURNS int",
+                )),
+            },
+        );
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert!(
+            sql[0].contains("DROP FUNCTION \"app\".\"f\"(integer, text);"),
+            "{}",
+            sql[0]
+        );
+        assert!(
+            sql[1].contains("CREATE FUNCTION \"app\".\"f\""),
+            "{}",
+            sql[1]
+        );
+        assert!(
+            !sql.iter().any(|s| s.to_uppercase().contains("OR REPLACE")),
+            "{sql:?}"
+        );
+    }
+
+    /// The name alone is not the object where routines overload — measured,
+    /// `DROP FUNCTION m3.f` is refused as not unique — and a trigger's name is
+    /// not an object at all without its table.
+    #[test]
+    fn a_drop_names_exactly_one_object_on_an_engine_that_overloads() {
+        let pg = Postgres::new();
+        let cases = [
+            (id("app.v"), ModuleKind::View, "DROP VIEW \"app\".\"v\";"),
+            (
+                id("app.f(character varying, integer[])"),
+                ModuleKind::Function,
+                "DROP FUNCTION \"app\".\"f\"(character varying, integer[]);",
+            ),
+            (
+                id("app.f()"),
+                ModuleKind::Procedure,
+                "DROP PROCEDURE \"app\".\"f\"();",
+            ),
+            (
+                id("app.t.audit"),
+                ModuleKind::Trigger,
+                "DROP TRIGGER \"audit\" ON \"app\".\"t\";",
+            ),
+        ];
+        for (id, kind, expected) in cases {
+            let sql = sql_of(
+                &pg,
+                &Change::DropModule {
+                    id: id.clone(),
+                    kind,
+                },
+            );
+            assert_eq!(sql.len(), 1, "{id}");
+            assert!(sql[0].contains(expected), "{id}: {}", sql[0]);
+        }
+    }
+
+    /// SPEC 14.3: the plan names every object it drops, or it does not drop.
+    /// `CASCADE` is the shortest way out of every ADR-0009 §4 refusal and it
+    /// destroys objects nobody reviewed, so no path here writes it.
+    #[test]
+    fn no_module_statement_offers_cascade() {
+        let pg = Postgres::new();
+        let changes = [
+            Change::DropModule {
+                id: id("app.v"),
+                kind: ModuleKind::View,
+            },
+            Change::DropModule {
+                id: id("app.f(integer)"),
+                kind: ModuleKind::Function,
+            },
+            Change::DropModule {
+                id: id("app.t.audit"),
+                kind: ModuleKind::Trigger,
+            },
+            Change::AlterModule {
+                id: id("app.v"),
+                module: Box::new(module(ModuleKind::View, "SELECT 1")),
+            },
+        ];
+        for change in changes {
+            for sql in sql_of(&pg, &change) {
+                assert!(!sql.to_uppercase().contains("CASCADE"), "{sql}");
+            }
+        }
+    }
+
+    /// The table is in the identity *and* in the text this engine's grammar
+    /// requires, and the engine accepts a disagreement between them: a trigger
+    /// created on another table sits under this key until a `DROP` a plan
+    /// later cannot find it.
+    /// The escapes the engine reads a `U&"…"` identifier by, and the ones it
+    /// refuses — which this reader does not decide, so that a name it cannot
+    /// read is left to the engine rather than compared wrongly.
+    #[test]
+    fn a_unicode_escaped_identifier_decodes_the_way_the_engine_reads_it() {
+        for (written, name) in [
+            ("U&\"d\\0061t\\+000061\"", "data"),
+            ("U&\"a\\\\b\"", "a\\b"),
+            ("U&\"\\D83D\\DE00\"", "😀"),
+            ("u&\"a\"\"b\"", "a\"b"),
+            ("U&\"Ätype\"", "Ätype"),
+        ] {
+            assert_eq!(unquoted(written, '\\').as_deref(), Some(name), "{written}");
+        }
+        assert_eq!(unquoted("U&\"!0074\"", '!').as_deref(), Some("t"));
+        for malformed in [
+            "U&\"\\00G1\"",
+            "U&\"\\D83D\"",
+            "U&\"\\DE00\"",
+            "U&\"\\D83Dx\"",
+        ] {
+            assert_eq!(unquoted(malformed, '\\'), None, "{malformed}");
+        }
+        assert_eq!(uescape_len("UESCAPE '!' FOR"), Some(11));
+        assert_eq!(uescape_len("uescape  '!'"), Some(12));
+        for not_one in [
+            "UESCAPE '+'",
+            "UESCAPE 'a'",
+            "UESCAPE ''",
+            "UESCAPED '!'",
+            "ON app.t",
+        ] {
+            assert_eq!(uescape_len(not_one), None, "{not_one}");
+        }
+    }
+
+    #[test]
+    fn a_trigger_whose_body_names_another_table_is_refused_offline() {
+        // What decides the outcome is the name after `ON`, and nothing else.
+        // A scan for the identity's table *anywhere* in the text says yes to
+        // the second of these — the column list mentions `t` — and the engine
+        // then creates the trigger on `app.other` under this key.
+        for body in [
+            "AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER UPDATE OF t ON app.other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON elsewhere.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // Trivia around the dot changes nothing about which table it is.
+            "AFTER INSERT ON app . other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // Nor does spelling the other table with Unicode escapes.
+            "AFTER INSERT ON U&\"app\".U&\"\\006Fther\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body));
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert!(
+                found[0].to_string().contains("app.t"),
+                "{body}: {}",
+                found[0]
+            );
+        }
+
+        // And a definition with no readable `ON` at all is refused rather than
+        // guessed at: the clause decides where the object is created.
+        for body in [
+            "FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // Every `on` here is inside something: a literal, a comment, and
+            // the parenthesised `WHEN`.
+            "AFTER INSERT /* on app.t */ WHEN (new.a = 'on app.t') FOR EACH ROW EXECUTE \
+             FUNCTION app.trf()",
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body));
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert!(
+                found[0].to_string().contains("cannot find an `ON"),
+                "{body}: {}",
+                found[0]
+            );
+        }
+
+        // Qualified or bare, a definition that does name its table passes: a
+        // declaration written inside its own schema very often omits the
+        // qualifier, and refusing that would refuse valid work. Case folds the
+        // way this engine folds an unquoted name, and a quoted one is taken as
+        // it is written.
+        for body in [
+            "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf()",
+            "AFTER INSERT ON APP.T FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON \"app\".\"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER UPDATE OF other ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // A column called `on` has to be quoted — `ON` is reserved, and
+            // the engine refuses the unquoted spelling — so a quoted one is
+            // stepped over whole and the clause after it is the one found.
+            "AFTER UPDATE OF \"on\" ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER UPDATE OF \"a on b\" ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // The dot is a token of its own: measured, the engine takes trivia
+            // on either side of it and creates the trigger on `app.t`.
+            "AFTER INSERT ON app . t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON app /* schema */ .\n  t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON \"app\" . \"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // And the gap after `ON` itself is a gap.
+            "AFTER INSERT ON /* c */ app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON\n-- c\napp.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // A Unicode-escaped identifier is one identifier, read with its
+            // escape: measured, each of these lands on `app.t`.
+            "AFTER INSERT ON U&\"app\".U&\"\\0074\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON u&\"app\".\"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON U&\"app\".U&\"!0074\" UESCAPE '!' FOR EACH ROW EXECUTE FUNCTION \
+             app.trf()",
+            "AFTER INSERT ON U&\"\\0061pp\" UESCAPE '\\'.U&\"\\+000074\" FOR EACH ROW EXECUTE \
+             FUNCTION app.trf()",
+            // The keyword is found past a literal and a comment that both
+            // contain something that looks like one.
+            "AFTER INSERT -- on app.other\nON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON app.t FOR EACH ROW WHEN (new.a = 'on app.other') EXECUTE \
+             FUNCTION app.trf()",
+        ] {
+            assert!(
+                Postgres::new()
+                    .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body))
+                    .is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    /// An empty definition is a module that would emit `CREATE VIEW app.v AS`
+    /// and nothing else. Refused where a user is looking at the declaration,
+    /// and again at emit time, because the emitter is handed a change and not
+    /// a schema.
+    #[test]
+    fn a_module_with_no_definition_is_refused_by_both_gates() {
+        let empty = module(ModuleKind::View, "  \n ");
+        let found = Postgres::new().validate_module(&id("app.v"), &empty);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].to_string().contains("empty definition"),
+            "{}",
+            found[0]
+        );
+        let refused = Postgres::new().emit(
+            &Change::CreateModule {
+                id: id("app.v"),
+                module: Box::new(empty),
+            },
+            Strategy::default(),
+        );
+        assert!(refused.is_err(), "an empty definition emitted a statement");
     }
 
     /// The scope is the object's own schema first and the extras after it, in

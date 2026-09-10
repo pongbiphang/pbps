@@ -36,7 +36,7 @@
 use std::ops::RangeInclusive;
 
 use pbps_dialect::{DialectError, TypeChangeRisk};
-use pbps_model::{ColumnType, TypeArg};
+use pbps_model::{ColumnType, RoutineArg, TypeArg};
 
 pub const DIALECT: &str = "postgres";
 
@@ -995,8 +995,945 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     }
 }
 
+/// The spelling this engine puts in a routine's identity, from a declared one
+/// (ADR-0009 §1, DECISIONS 301 and 303).
+///
+/// The rules and the measurements behind them are on
+/// `Postgres::normalize_routine_arg`, which is the only caller. Total by
+/// design: a spelling this catalogue does not know is the engine's to judge,
+/// and the text goes back unchanged.
+pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
+    let (element, array) = peel_array(arg.as_str());
+    let canonical = identity_element(element);
+    let spelled = if array {
+        format!("{canonical}[]")
+    } else {
+        canonical
+    };
+    // The parse cannot fail for anything this function builds — it folded a
+    // valid argument, and `[]` is not a character `RoutineArg` refuses — but
+    // "cannot fail" is not a reason to unwrap in a normalizer: the declared
+    // text is the safe answer to give back if it ever does.
+    spelled.parse().unwrap_or_else(|_| arg.clone())
+}
+
+/// The first name in `arg` that is over the engine's identifier limit, if
+/// there is one — quoted or bare, with a doubled quote counted once.
+///
+/// The limit is enforced here because the engine does not enforce it, which
+/// is the rule of DECISIONS 230 one layer down: **measured**, with a type
+/// `dq.t…t` of 63 bytes, `CREATE FUNCTION dq.f(a dq.t…tx)` spelling one byte
+/// more is accepted with a `NOTICE` nothing reads, the routine is identified
+/// as `dq.f(dq.t…t)`, and the same statement run again is refused as already
+/// existing. Declared, the key is the untruncated spelling; `module_oid` finds
+/// nothing under it, the routine is planned as absent every time, and the
+/// `CREATE` the plan emits is the one the engine refuses.
+///
+/// Every part that is not a name is short — a keyword, a modifier, a
+/// dimension — so a run of identifier bytes over the limit is a name over
+/// it, whatever it is a name of.
+pub(crate) fn overlong_name(arg: &RoutineArg) -> Option<String> {
+    let mut rest = arg.as_str();
+    while !rest.is_empty() {
+        if rest.starts_with('"') {
+            let Some(end) = quoted_len(rest) else {
+                break;
+            };
+            let inner = rest[1..end - 1].replace("\"\"", "\"");
+            if inner.len() > crate::MAX_IDENT_BYTES {
+                return Some(inner);
+            }
+            rest = &rest[end..];
+            continue;
+        }
+        let len = rest
+            .find(|c: char| !pbps_dialect::continues_ident(c))
+            .unwrap_or(rest.len());
+        if len > crate::MAX_IDENT_BYTES {
+            return Some(rest[..len].to_owned());
+        }
+        // Step over the run and the byte that ended it.
+        let step = rest[len..].chars().next().map_or(0, char::len_utf8);
+        rest = &rest[len + step..];
+    }
+    None
+}
+
+/// Whether this catalogue knows the spelling — with or without a modifier.
+///
+/// Not the same question as [`routine_arg`], which is total and hands an
+/// unknown spelling back unchanged: this one says *whether* it did that. The
+/// caller is the emitter's parameter-list gate, which reads a parameter as
+/// either `type` or `name type` and has to know when the first reading is
+/// already the whole answer. `double precision` is: splitting it again would
+/// read `double` as a name and `precision` as a type, and measured, with a
+/// user type `mq.precision` in the database, `CREATE FUNCTION mq.b(double
+/// precision)` still creates `mq.b(double precision)`. The engine does not
+/// offer that reading, so neither may the gate.
+pub(crate) fn catalogued(arg: &RoutineArg) -> bool {
+    let (element, _) = peel_array(arg.as_str());
+    folded(element).is_some() || folded(&without_modifier(element)).is_some()
+}
+
+/// `double precision[][]` -> `double precision`, and "it is an array".
+///
+/// One `[]` comes back however many went in, and a dimension is not part of
+/// the identity: **measured**, `text[][]` and `text[3]` are both `text[]`.
+///
+/// The standard's spelling is an array too: **measured**, `text ARRAY`,
+/// `text ARRAY[4]`, `int ARRAY [2]` and `character varying array` are
+/// identified as `text[]`, `text[]`, `integer[]` and `character varying[]`,
+/// while `text ARRAY[]` and `text[] ARRAY` are syntax errors — so the word is
+/// peeled once, after the brackets and never before them. Left in, a declared
+/// `text ARRAY` keyed a routine the catalog spells `text[]`, and the routine
+/// the `CREATE` had just made was not found under its own key.
+///
+/// Whitespace is ASCII throughout, here and in the helpers below: to this
+/// engine a non-breaking space is a name byte (DECISIONS 313), so `a\u{a0}array`
+/// is a type name and not `a` with the keyword after it.
+pub(crate) fn peel_array(text: &str) -> (&str, bool) {
+    let mut element = ascii_trim_end(text);
+    let mut array = false;
+    while let Some(without) = element.strip_suffix(']') {
+        let Some(open) = without.rfind('[') else {
+            break;
+        };
+        // A `[` that is not opening a dimension is part of the name.
+        if without[open + 1..].chars().any(|c| !c.is_ascii_digit()) {
+            break;
+        }
+        element = ascii_trim_end(&without[..open]);
+        array = true;
+    }
+    // The word has to be a word of its own: `myarray` is a name, and a quoted
+    // name ends in `"`.
+    let n = element.len();
+    if n > 5
+        && element.is_char_boundary(n - 5)
+        && element[n - 5..].eq_ignore_ascii_case("array")
+        && element[..n - 5].ends_with(|c: char| c.is_ascii_whitespace())
+    {
+        element = ascii_trim_end(&element[..n - 5]);
+        array = true;
+    }
+    (element, array)
+}
+
+fn ascii_trim_end(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn ascii_trim_start(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c.is_ascii_whitespace())
+}
+
+/// One argument's element type as `format_type` prints it.
+///
+/// Total, and in three attempts, because two of the three rules the engine
+/// applies do not need a catalogue at all.
+///
+/// 1. **With the modifier**, because `float(24)` is `real` and `float` is
+///    `double precision`: which type the engine resolves depends on the
+///    argument, so throwing it away before asking would answer for the wrong
+///    one.
+/// 2. **Without it**, for the spellings that carry a modifier *inside* the
+///    name — issue #130's `timestamp(3) with time zone`.
+/// 3. **Without it, and unfolded.** Discarding the modifier is what the engine
+///    does to *every* routine argument, catalogued or not, so a type this
+///    closed catalogue does not carry still loses it. Left in, a declared
+///    `bit varying(4)` never equalled the `bit varying` the catalog reads back,
+///    and the routine was one to create and one to drop on every plan for
+///    ever — the cry-wolf loop ADR-0002 names as the failure to avoid, which
+///    is a different and worse thing from DECISIONS 303's one loud mismatch.
+fn identity_element(element: &str) -> String {
+    // A built-in written with its schema is the built-in: **measured**,
+    // `pg_catalog.int4`, `PG_CATALOG.INT4`, `"pg_catalog".int4` and
+    // `pg_catalog."int4"` are all identified as `integer`, and
+    // `pg_catalog.varbit` as `bit varying` — the qualifier is dropped before
+    // the name is folded, so a routine declared with any of them is keyed on
+    // the identity `format_type` writes.
+    let element = as_the_engine_spells(element);
+    let element = element.strip_prefix("pg_catalog.").unwrap_or(&element);
+    if let Some(identity) = built_in(element) {
+        return identity;
+    }
+    // The catalog's own name for a built-in's array type: **measured**,
+    // `_int4`, `pg_catalog._int4`, `"_int4"`, `_varbit`, `_numeric(10,2)` and
+    // `_bpchar` are identified as `integer[]`, `integer[]`, `integer[]`,
+    // `bit varying[]`, `numeric[]` and `character[]`. Built-ins only: a user
+    // type's array is spelled the same way (`ar._my_type` is `ar.my_type[]`)
+    // but so is a user type that merely starts with an underscore (`ar._solo`
+    // is `ar._solo`), and which of the two a name is cannot be decided
+    // offline — the engine is the normalizer for what this table does not
+    // know (303).
+    if let Some(rest) = element.strip_prefix('_')
+        && let Some(base) = built_in(rest)
+    {
+        return format!("{base}[]");
+    }
+    quoted_where_the_engine_quotes(&without_modifier(element))
+}
+
+/// The identity of a built-in spelling — the column catalogue's, the
+/// modifier discarded, the field qualifier discarded, or an alias the
+/// catalogue lacks — or `None` where the spelling is not a built-in.
+fn built_in(element: &str) -> Option<String> {
+    if let Some(folded) = folded(element) {
+        return Some(folded.base);
+    }
+    let bare = without_modifier(element);
+    if let Some(folded) = folded(&bare) {
+        return Some(folded.base);
+    }
+    // The one type this engine's grammar follows with words rather than a
+    // parenthesis. **Measured**, a parameter declared
+    // `interval hour to minute` is identified as `interval`, so the field
+    // qualifier goes the same way a modifier does.
+    if let Some(rest) = bare.strip_prefix("interval")
+        && rest.starts_with(|c: char| c.is_ascii_whitespace())
+    {
+        return Some("interval".to_owned());
+    }
+    ROUTINE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == bare)
+        .map(|(_, identity)| (*identity).to_owned())
+}
+
+/// An unquoted name spelled the way the engine spells it in an identity:
+/// quoted where its `quote_identifier` would quote it.
+///
+/// The other half of [`as_the_engine_spells`]. **Measured**, `CREATE
+/// FUNCTION f(a s.Ätype)` and `(v r8.a\u{a0}b)` are accepted unquoted and
+/// identified as `f(s."Ätype")` and `f(r8."a\u{a0}b")` — the byte kept and
+/// the name quoted. Kept bare, the key was one `module_oid` compared against
+/// `format_type` and never matched, so the routine the plan had just created
+/// was not in the catalog to the next plan (313). Only a part that is one
+/// unquoted identifier is touched; a spelling with a modifier or a space in
+/// it is not a name this rule reads.
+fn quoted_where_the_engine_quotes(bare: &str) -> String {
+    let mut out = String::with_capacity(bare.len() + 2);
+    let mut rest = bare;
+    while !rest.is_empty() {
+        let len = if rest.starts_with('"') {
+            quoted_len(rest).unwrap_or(rest.len())
+        } else {
+            rest.find('.').unwrap_or(rest.len())
+        };
+        let part = &rest[..len];
+        // The character class alone, not the keyword table: a keyword
+        // written bare is a built-in the grammar admits — `bit(3)` is `bit` —
+        // never a user name, which the engine would not accept unquoted.
+        if !part.starts_with('"')
+            && !part.is_empty()
+            && part.chars().all(pbps_dialect::continues_ident)
+            && !part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            out.push('"');
+            out.push_str(part);
+            out.push('"');
+        } else {
+            out.push_str(part);
+        }
+        rest = &rest[len..];
+        if let Some(after) = rest.strip_prefix('.') {
+            out.push('.');
+            rest = after;
+        }
+    }
+    out
+}
+
+/// A quoted name spelled the way the engine spells it in an identity: bare
+/// where its `quote_identifier` leaves it bare, quoted everywhere else.
+///
+/// **Measured**, `zq."my_type"`, `"zq"."my_type"` and `zq."zone"` are
+/// identified as `zq.my_type` and `zq.zone`, while `zq."select"`, `zq."int"`,
+/// `zq."user"`, `zq."Order"`, `zq."möney"`, `zq."a$b"` and `zq."my""q"` keep
+/// their quotes: the engine writes a name bare only when it is
+/// `[a-z_][a-z0-9_]*` and not a keyword the grammar reserves in some
+/// position. A quoted spelling of a plain name is therefore a second spelling
+/// of the bare one — and a Unicode-escaped name (DECISIONS 313) is decoded to
+/// the quoted form by the model, so without this step `U&"\006dy_type"` was a
+/// key for a routine the catalog spells `my_type`.
+fn as_the_engine_spells(element: &str) -> String {
+    let mut out = String::with_capacity(element.len());
+    let mut rest = element;
+    while !rest.is_empty() {
+        if !rest.starts_with('"') {
+            let len = rest.find('"').unwrap_or(rest.len());
+            out.push_str(&rest[..len]);
+            rest = &rest[len..];
+            continue;
+        }
+        let Some(end) = quoted_len(rest) else {
+            out.push_str(rest);
+            break;
+        };
+        let inner = rest[1..end - 1].replace("\"\"", "\"");
+        if bare_to_the_engine(&inner) {
+            out.push_str(&inner);
+        } else {
+            out.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// The length of the `"…"` at the front of `text`, a doubled quote being a
+/// quote inside the name; `None` where it never closes.
+fn quoted_len(text: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// Whether the engine writes this name without quotes: `quote_identifier`'s
+/// rule, which is the character class above and the keyword table below.
+fn bare_to_the_engine(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && QUOTED_KEYWORDS.binary_search(&name).is_err()
+}
+
+/// Whether a lower-cased word can never stand unquoted as a name — for the
+/// name scans, which read a bare word as a possible reference (DECISIONS
+/// 316).
+///
+/// The engine's reserved category, less the words that *can* be a bare name
+/// somewhere: **measured** on 18.6, with a table, a function and a type of
+/// each name, every word of `pg_get_keywords() WHERE catcode = 'R'` is
+/// refused as `FROM word`, as `word(1)` and as `::word`, except
+/// `current_catalog`, `current_date`, `current_role`, `current_time`,
+/// `current_timestamp`, `current_user`, `localtime`, `localtimestamp`,
+/// `session_user`, `system_user` and `user`, which `FROM word` accepts. The
+/// type-or-function-name category is not reserved in this sense: `FROM
+/// between` and `FROM join` are accepted too. And after a dot any word is a
+/// name — `FROM app.select` is accepted — so this is asked only of the bare
+/// form.
+pub(crate) fn is_reserved(word: &str) -> bool {
+    RESERVED.binary_search(&word).is_ok()
+}
+
+/// The words `is_reserved` names, sorted for the search.
+const RESERVED: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "column",
+    "constraint",
+    "create",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "group",
+    "having",
+    "in",
+    "initially",
+    "intersect",
+    "into",
+    "lateral",
+    "leading",
+    "limit",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "select",
+    "some",
+    "symmetric",
+    "table",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "using",
+    "variadic",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
+/// Every keyword the engine quotes when it is used as a name: the reserved,
+/// type-or-function-name and column-name categories, which are the ones
+/// `quote_identifier` does not let stand bare. The unreserved category is
+/// left out because the engine leaves it out — measured, `zq."zone"` is
+/// `zq.zone`.
+///
+/// Read from the engine, not from memory, and kept sorted for the search:
+///
+/// ```sql
+/// SELECT word FROM pg_get_keywords() WHERE catcode <> 'U' ORDER BY word
+/// ```
+///
+/// PostgreSQL 18.6, 164 rows. A keyword a later engine adds is a name this
+/// table lets stand bare, which the catalog assertion after the `CREATE`
+/// (ADR-0009 §3) reports as a routine not found under its key — loud, not
+/// silent.
+const QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// Spellings the engine accepts for a routine argument and identifies as
+/// something else, that the column catalogue does not carry.
+///
+/// The catalogue is closed on purpose (ADR-0011): a column of `varbit` is a
+/// column this model does not hold. A routine argument is a wider language
+/// (DECISIONS 301), and a spelling the catalogue does not know is passed
+/// through as written (303) — which is right for a domain, and wrong for an
+/// alias: **measured**, `varbit(4)` is identified as `bit varying`, so a
+/// declaration keyed `f(varbit)` named a routine the `CREATE` never made, and
+/// `module_oid` resolved nothing. Every row was measured through
+/// `format_type`; the live suite keys a routine with each and asks the catalog.
+///
+/// Pinned to the catalogue by `a_routine_alias_is_one_the_column_catalogue_lacks`:
+/// a row the catalogue folds already is a second spelling of one rule.
+const ROUTINE_ALIASES: &[(&str, &str)] = &[
+    ("varbit", "bit varying"),
+    ("bpchar", "character"),
+    ("nchar", "character"),
+    ("national character", "character"),
+    ("national char", "character"),
+    ("char varying", "character varying"),
+    ("nchar varying", "character varying"),
+    ("national character varying", "character varying"),
+    ("national char varying", "character varying"),
+];
+
+fn folded(text: &str) -> Option<ColumnType> {
+    normalize(&text.parse::<ColumnType>().ok()?).ok()
+}
+
+/// `timestamp(3) with time zone` -> `timestamp with time zone`.
+///
+/// The parentheses are found **outside quotes**: a type created as
+/// `"odd(name)"` is one this engine will hand back with its parentheses
+/// intact, and cutting there would leave `"odd` — an argument that no longer
+/// balances and no longer names anything.
+fn without_modifier(element: &str) -> String {
+    let (Some(open), Some(close)) = (code_find(element, '('), code_rfind(element, ')')) else {
+        return element.to_owned();
+    };
+    if close < open {
+        return element.to_owned();
+    }
+    let mut out = ascii_trim_end(&element[..open]).to_owned();
+    let rest = ascii_trim_start(&element[close + 1..]);
+    if !rest.is_empty() {
+        out.push(' ');
+        out.push_str(rest);
+    }
+    out
+}
+
+/// The first `c` that is not inside a quoted name, and the last.
+fn code_find(text: &str, c: char) -> Option<usize> {
+    outside_quotes(text)
+        .find(|(_, ch)| *ch == c)
+        .map(|(i, _)| i)
+}
+
+fn code_rfind(text: &str, c: char) -> Option<usize> {
+    outside_quotes(text)
+        .filter(|(_, ch)| *ch == c)
+        .last()
+        .map(|(i, _)| i)
+}
+
+fn outside_quotes(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut quoted = false;
+    text.char_indices().filter(move |(_, ch)| {
+        if *ch == '"' {
+            // A doubled quote reads as two openers here, which lands on the
+            // same state as one closer and one opener: still inside the name.
+            quoted = !quoted;
+            return false;
+        }
+        !quoted
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn arg(s: &str) -> String {
+        let declared: pbps_model::RoutineArg = s.parse().expect("a routine argument parses");
+        routine_arg(&declared).as_str().to_owned()
+    }
+
+    /// A name over the engine's byte limit is found wherever it is in the
+    /// argument — bare, qualified, quoted with a doubled quote counted once,
+    /// under a modifier or an array — and a name at the limit is not.
+    #[test]
+    fn a_name_over_the_byte_limit_is_found_wherever_the_argument_holds_it() {
+        let at = "t".repeat(crate::MAX_IDENT_BYTES);
+        let over = format!("{at}x");
+        for spelled in [
+            over.clone(),
+            format!("app.{over}"),
+            format!("{over}.t"),
+            format!("app.\"{over}\""),
+            format!("{over}(10)"),
+            format!("app.{over}[]"),
+            // Sixty-two bytes and a doubled quote, which is one byte to the
+            // engine: at the limit. With `ä` in it the count is bytes.
+            format!("\"{}\"\"x\"", "t".repeat(62)),
+            format!("app.{}", "ä".repeat(32)),
+        ] {
+            let arg: RoutineArg = spelled.parse().expect("an argument");
+            assert!(
+                overlong_name(&arg).is_some(),
+                "`{spelled}` holds a name over the limit"
+            );
+        }
+        for spelled in [
+            at.clone(),
+            format!("app.{at}"),
+            format!("app.\"{at}\""),
+            format!("\"{}\"\"\"", "t".repeat(62)),
+            format!("app.{}", "ä".repeat(31)),
+            "character varying(10)".to_owned(),
+            "timestamp with time zone[]".to_owned(),
+        ] {
+            let arg: RoutineArg = spelled.parse().expect("an argument");
+            assert_eq!(overlong_name(&arg), None, "`{spelled}` is within the limit");
+        }
+    }
+
+    /// Measured: a bare `select` is refused in every position and `user` in
+    /// none; `zone` and `int` are keywords the engine lets stand as names.
+    #[test]
+    fn a_reserved_word_is_one_no_bare_position_takes() {
+        for word in ["select", "from", "table", "with", "array", "false"] {
+            assert!(is_reserved(word), "{word}");
+        }
+        for word in [
+            "user",
+            "current_date",
+            "between",
+            "join",
+            "zone",
+            "int",
+            "customer",
+        ] {
+            assert!(!is_reserved(word), "{word}");
+        }
+        assert!(
+            RESERVED.windows(2).all(|w| w[0] < w[1]),
+            "sorted, for the search"
+        );
+    }
+
+    /// Measured on 18.6: one function's twelve parameters, declared one way
+    /// and identified another. The left column is what was written, the right
+    /// is what `oid::regprocedure` printed back under the empty search path.
+    #[test]
+    fn a_declared_argument_folds_to_the_spelling_the_identity_carries() {
+        for (declared, identity) in [
+            // A modifier is discarded: `f(varchar(10))` and `f(varchar(20))`
+            // are one function.
+            ("varchar(10)", "character varying"),
+            ("numeric(10,2)", "numeric"),
+            ("char", "character"),
+            ("timestamp(3) with time zone", "timestamp with time zone"),
+            // Aliases fold through the same table a column uses.
+            ("int4", "integer"),
+            ("int", "integer"),
+            ("timestamptz", "timestamp with time zone"),
+            ("bool", "boolean"),
+            // A dimension is not part of the identity, and neither is the
+            // number of them.
+            ("double precision[]", "double precision[]"),
+            ("text[][]", "text[]"),
+            ("int[3]", "integer[]"),
+            // The standard's spelling, which the engine identifies the same
+            // way — measured, with and without a dimension and with the space
+            // the grammar allows before the bracket.
+            ("text ARRAY", "text[]"),
+            ("text ARRAY[4]", "text[]"),
+            ("int ARRAY [2]", "integer[]"),
+            ("character varying array", "character varying[]"),
+            // `float(24)` is `real` and `float` is `double precision`, which is
+            // why the modifier is not thrown away before the catalogue is
+            // asked.
+            ("float(24)", "real"),
+            ("float", "double precision"),
+            // A modifier is discarded whatever the type is, and these are not
+            // in the column catalogue: left on, a declared `bit varying(4)`
+            // never equals the `bit varying` the catalog reads back, and the
+            // routine is one to create and one to drop on every plan for ever.
+            ("bit varying(4)", "bit varying"),
+            ("bit(3)", "bit"),
+            ("m2.money(2)", "m2.money"),
+            // Aliases the engine identifies as something else and the column
+            // catalogue does not carry: measured through `format_type`.
+            ("varbit", "bit varying"),
+            ("varbit(4)", "bit varying"),
+            // A built-in written with its schema is the built-in, measured.
+            ("pg_catalog.int4", "integer"),
+            ("pg_catalog.text", "text"),
+            ("pg_catalog.varbit", "bit varying"),
+            ("pg_catalog.name", "name"),
+            ("\"pg_catalog\".int4", "integer"),
+            ("pg_catalog.\"int4\"", "integer"),
+            ("pg_catalog.timestamptz(3)", "timestamp with time zone"),
+            // A quoted name is bare where the engine's `quote_identifier`
+            // leaves it bare, and quoted where it does not — measured.
+            ("zq.\"my_type\"", "zq.my_type"),
+            ("\"zq\".\"my_type\"", "zq.my_type"),
+            ("zq.\"zone\"", "zq.zone"),
+            ("zq.\"my_type\"[]", "zq.my_type[]"),
+            ("\"int4\"", "integer"),
+            ("zq.\"select\"", "zq.\"select\""),
+            ("zq.\"int\"", "zq.\"int\""),
+            ("zq.\"user\"", "zq.\"user\""),
+            ("zq.\"Order\"", "zq.\"Order\""),
+            ("zq.\"möney\"", "zq.\"möney\""),
+            ("zq.\"a$b\"", "zq.\"a$b\""),
+            // And an unquoted one: measured, `dl.money$type` is identified as
+            // `dl."money$type"`.
+            ("dl.money$type", "dl.\"money$type\""),
+            ("zq.\"my\"\"q\"", "zq.\"my\"\"q\""),
+            ("zq.\"1a\"", "zq.\"1a\""),
+            ("zq.\"a b\"", "zq.\"a b\""),
+            // And an unquoted name is quoted where the engine quotes it —
+            // measured, `s.Ätype` and `r8.a\u{a0}b` are identified as
+            // `s."Ätype"` and `r8."a\u{a0}b"`; a plain one stays bare.
+            ("s.Ätype", "s.\"Ätype\""),
+            ("Ätype", "\"Ätype\""),
+            ("r8.a\u{a0}b", "r8.\"a\u{a0}b\""),
+            ("r8.x\u{a0}", "r8.\"x\u{a0}\""),
+            ("s.my_type", "s.my_type"),
+            ("S.MyType", "s.mytype"),
+            ("s.Ätype[]", "s.\"Ätype\"[]"),
+            // The catalog's own name for a built-in's array type, measured.
+            ("_int4", "integer[]"),
+            ("pg_catalog._int4", "integer[]"),
+            ("\"_int4\"", "integer[]"),
+            ("_INT4", "integer[]"),
+            ("_varbit", "bit varying[]"),
+            ("_text", "text[]"),
+            ("_numeric(10,2)", "numeric[]"),
+            ("_bpchar", "character[]"),
+            ("bpchar(3)", "character"),
+            ("nchar(2)", "character"),
+            ("national character varying(5)", "character varying"),
+            ("char varying(5)", "character varying"),
+            // The one type this grammar follows with words rather than a
+            // parenthesis. Measured: `interval hour to minute` is identified
+            // as `interval`.
+            ("interval hour to minute", "interval"),
+            ("interval second(3)", "interval"),
+        ] {
+            assert_eq!(arg(declared), identity, "{declared}");
+        }
+    }
+
+    /// A row the column catalogue folds already is one rule spelled twice,
+    /// and the second spelling is the one that drifts.
+    #[test]
+    fn a_routine_alias_is_one_the_column_catalogue_lacks() {
+        for (alias, identity) in ROUTINE_ALIASES {
+            assert!(
+                folded(alias).is_none(),
+                "`{alias}` is in the column catalogue already"
+            );
+            assert_eq!(arg(alias), *identity, "{alias}");
+            // And the identity is the engine's spelling, not another alias.
+            assert_eq!(arg(identity), *identity, "{identity}");
+        }
+    }
+
+    /// The engine is the normalizer, so a spelling this catalogue has never
+    /// heard of goes back unchanged rather than being refused: refusing would
+    /// refuse ADR-0009 §1's own example, and the model cannot tell a domain
+    /// from a mistake. A disagreement is caught by the engine, loudly, inside
+    /// the plan's transaction.
+    #[test]
+    fn a_spelling_the_catalogue_does_not_know_is_returned_unchanged() {
+        for text in [
+            // A quoted built-in whose case the engine keeps.
+            "\"char\"",
+            // A quoted name with parentheses of its own, which are part of the
+            // name and not a modifier.
+            "\"odd(name)\"",
+            "m2.\"odd(name)\"",
+            // A domain, an enum, a composite: qualified, because that is what
+            // `format_type` prints under the empty search path.
+            "m2.money_amount",
+            "m2.mood",
+            "m2.money_amount[]",
+            // A name that merely ends in the array keyword's letters, and a
+            // quoted name with the word inside it: neither is an array.
+            "m2.myarray",
+            "m2.\"my array\"",
+            // A pseudo-type, which no column may ever be.
+            "anyelement",
+            "record",
+            // A user type whose name starts with an underscore is left as
+            // written: measured, `ar._my_type` is `ar.my_type[]` and
+            // `ar._solo` is `ar._solo`, and only the engine can tell which.
+            "ar._my_type",
+            "ar._solo",
+            // Types this catalogue does not carry, spelled as the engine
+            // spells them.
+            "bit varying",
+            "inet",
+            "tsvector",
+            "interval",
+        ] {
+            assert_eq!(arg(text), text, "{text}");
+        }
+        // A non-breaking space is a name byte, not the gap before the
+        // keyword, a field qualifier or a modifier — and a name holding one
+        // is quoted, as the engine quotes it.
+        for (text, spelled) in [
+            ("m2.a\u{a0}array", "m2.\"a\u{a0}array\""),
+            ("m2.x\u{a0}", "m2.\"x\u{a0}\""),
+            ("interval\u{a0}hour", "\"interval\u{a0}hour\""),
+        ] {
+            assert_eq!(arg(text), spelled, "{text}");
+        }
+    }
+
+    /// Idempotent, because the identity read back out of the catalog is fed
+    /// through the same fold as the declared one — a normalizer that moved on
+    /// the second pass would report drift on an unchanged routine.
+    #[test]
+    fn folding_an_argument_twice_says_what_folding_it_once_says() {
+        for text in [
+            "varchar(10)",
+            "int4",
+            "text[][]",
+            "\"char\"",
+            "m2.money_amount",
+            "timestamp(3) with time zone",
+            "bit varying(4)",
+            "interval hour to minute",
+            "\"odd(name)\"",
+        ] {
+            assert_eq!(arg(&arg(text)), arg(text), "{text}");
+        }
+    }
+
+    /// `serial` is not a type (ADR-0011 Amendment 3), so the catalogue refuses
+    /// it and the text goes back untouched rather than becoming `integer`:
+    /// a routine argument spelled that way is one the engine will refuse, and
+    /// silently rewriting it would key the declaration as a routine that is
+    /// not the one the `CREATE` would make.
+    #[test]
+    fn a_spelling_that_is_not_a_type_is_not_quietly_made_into_one() {
+        assert_eq!(arg("serial"), "serial");
+        assert_eq!(arg("bigserial"), "bigserial");
+    }
     use super::*;
 
     fn ty(s: &str) -> ColumnType {

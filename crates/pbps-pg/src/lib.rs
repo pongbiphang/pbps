@@ -18,16 +18,43 @@
 //! answer: a dialect that reports "no changes" because its emitter is a stub
 //! would be the silent wrong answer this tool exists to prevent, and *absent,
 //! empty and unreadable are three different things*.
+//!
+//! # Where the connected answers live
+//!
+//! [`catalog`] and [`modules`] are the two places that run SQL, and they ask
+//! different kinds of question. `catalog` reads the whole managed set in one
+//! read-only snapshot and hands rows to [`introspect`]'s pure assembler;
+//! `modules` answers what a plan has to know **before it rebuilds one object**,
+//! inside the caller's own transaction and under that object's lock, because
+//! its answer has to still be true when the `DROP` runs (ADR-0009 §3).
 
 use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
-use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
+use pbps_model::{
+    Change, ColumnType, Module, ModuleId, ModuleKind, RoutineArg, Strategy, Table, TableName,
+};
 
 pub mod catalog;
 pub mod doctor;
 mod emit;
+
+/// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):
+/// `"` quotes an identifier and `[` does not, `E'…'` is an escape string and
+/// `$tag$…$tag$` a literal closed only by its own tag.
+pub(crate) const LEXICON: Lexicon = Lexicon {
+    quoted_identifiers: &[('"', '"')],
+    escape_strings: true,
+    dollar_quoted_strings: true,
+    // Measured: `N'x'`, `B'101'`, `X'1F'`, `U&'d\0061ta'` and `E'y'` are
+    // literals; `note'x'` is the type `note` applied to a string.
+    string_prefixes: &["u&", "e", "n", "b", "x"],
+    identifier_continues: pbps_dialect::continues_ident,
+    reserved: types::is_reserved,
+    unicode_identifiers: true,
+};
 pub mod introspect;
+pub mod modules;
 pub mod state;
 mod types;
 
@@ -40,7 +67,6 @@ mod types;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
     Introspection,
-    Modules,
     Roles,
     ReferenceData,
     Probes,
@@ -50,7 +76,6 @@ impl Unbuilt {
     const fn step(self) -> &'static str {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
-            Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
             Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
             Unbuilt::ReferenceData => "reference data (Phase 5 step 7)",
             Unbuilt::Probes => "preflight probes (Phase 5 step 9)",
@@ -81,7 +106,7 @@ impl Unbuilt {
 /// - two names differing only after byte 63 **collide** — the second
 ///   `CREATE TABLE` fails with `relation "aaa…" already exists`, naming a
 ///   table the declarations do not contain.
-const MAX_IDENT_BYTES: usize = 63;
+pub(crate) const MAX_IDENT_BYTES: usize = 63;
 
 /// What this engine refuses about an `identity:`, each measured on 18.6.
 ///
@@ -256,11 +281,7 @@ impl Dialect for Postgres {
     /// `E'…'`, where `\'` does not close the string, and `$tag$…$tag$`, which
     /// nothing inside it can close early (ADR-0011 Amendment 2).
     fn lexicon(&self) -> Lexicon {
-        Lexicon {
-            quoted_identifiers: &[('"', '"')],
-            escape_strings: true,
-            dollar_quoted_strings: true,
-        }
+        LEXICON
     }
 
     /// PostgreSQL runs DDL inside a transaction, and a failed statement aborts
@@ -634,6 +655,125 @@ impl Dialect for Postgres {
         found
     }
 
+    /// Views share `pg_class` with tables; nothing else does.
+    ///
+    /// **Measured on 18.6**, all four halves of it:
+    ///
+    /// ```text
+    /// CREATE TABLE ns.x (...); CREATE VIEW ns.x AS ...
+    ///     refused: relation "x" already exists
+    /// CREATE TABLE ns.y (...); CREATE FUNCTION ns.y() ...       accepted
+    /// CREATE TABLE ns.z (...); CREATE PROCEDURE ns.z() ...      accepted
+    /// a trigger is named within its table, not within a schema  (ADR-0009 §1)
+    /// ```
+    ///
+    /// A function and a procedure of one identity *do* collide with each other,
+    /// which is not this question: they are two modules, not a module and a
+    /// table, and [`pbps_dialect::check_module_names`] asks about them under
+    /// [`Self::overloads`].
+    fn shares_namespace_with_tables(&self, kind: ModuleKind) -> bool {
+        match kind {
+            ModuleKind::View => true,
+            ModuleKind::Function | ModuleKind::Procedure | ModuleKind::Trigger => false,
+        }
+    }
+
+    /// Routines overload; views and triggers do not.
+    ///
+    /// This is the first `true` any dialect returns here — SQL Server answers
+    /// `false` for every kind — so it is the first time a declaration is
+    /// *required* to carry a signature. **Measured**, both directions:
+    ///
+    /// ```text
+    /// CREATE FUNCTION ov.f(int) ...; CREATE FUNCTION ov.f(text) ...   two objects
+    /// CREATE VIEW ov.v AS ...;       CREATE VIEW ov.v AS ...
+    ///     refused: relation "v" already exists
+    /// two triggers named `audit`, one per table                       two objects
+    /// ```
+    ///
+    /// A trigger is `false` because its overload-looking freedom is already in
+    /// its identity: `ModuleId::Trigger` holds the table, so two `audit`
+    /// triggers on two tables are two keys without anything overloading.
+    fn overloads(&self, kind: ModuleKind) -> bool {
+        match kind {
+            ModuleKind::Function | ModuleKind::Procedure => true,
+            ModuleKind::View | ModuleKind::Trigger => false,
+        }
+    }
+
+    /// The write path: the object's own schema first, then the configured
+    /// extras in order, which is the `search_path` every statement of this
+    /// dialect runs under (DECISIONS 276). A bare name resolves through it
+    /// and nowhere else, and to the *first* entry that holds one: measured,
+    /// with `z.p` and `a.p` both present, a bare `p` under `SET search_path =
+    /// "z", "a"` binds `z.p`, and under `"a", "z"` binds `a.p`. With no
+    /// extras, `a.x AS SELECT * FROM b.z` over `b.z AS SELECT 1 AS x` is a
+    /// valid plan, and the alias `x` read as a mention of `a.x` closed a
+    /// cycle that put `a.x` first (317).
+    fn bare_name_rank(&self, from: &str, to: &str) -> Option<usize> {
+        if from == to {
+            return Some(0);
+        }
+        self.write_path_extras
+            .iter()
+            .position(|extra| extra == to)
+            .map(|at| at + 1)
+    }
+
+    /// The spelling this engine puts in a routine's identity (ADR-0009 §1).
+    ///
+    /// The canonical form is what `format_type` prints **under the empty
+    /// search path**, which is the path every read here pins (DECISIONS 253):
+    /// a built-in bare, a user type schema-qualified. **Measured on 18.6**, one
+    /// function's twelve parameters:
+    ///
+    /// ```text
+    /// declared   m2.money_amount  m2.mood  timestamp(3) with time zone  varchar(10)
+    /// identity   m2.money_amount  m2.mood  timestamp with time zone     character varying
+    ///
+    /// declared   char       numeric(10,2)  int4     bit varying(4)  double precision[]
+    /// identity   character  numeric        integer  bit varying     double precision[]
+    ///
+    /// declared   "char"  text[][]  interval hour to minute
+    /// identity   "char"  text[]    interval
+    /// ```
+    ///
+    /// Three rules come out of that, and they are applied in this order:
+    ///
+    /// 1. **A modifier is discarded.** `f(varchar(10))` and `f(varchar(20))`
+    ///    are one function, so keying them as two modules would name a
+    ///    signature the engine resolves to something else in every `DROP` and
+    ///    every `GRANT`. This is the whole reason the hook is not
+    ///    [`Dialect::normalize_type`], which keeps them on purpose.
+    /// 2. **An array collapses to one `[]`.** `text[][]` is `text[]`;
+    ///    PostgreSQL does not record a dimension count.
+    /// 3. **Everything else is the catalogue's**, so `int4` becomes `integer`
+    ///    and `char` becomes `character` by the same table a column uses.
+    ///
+    /// # What it passes through, and why that is not a gap
+    ///
+    /// A spelling the catalogue does not know — a domain, an enum, `"char"`,
+    /// a pseudo-type — is returned **unchanged**. Refusing it would refuse
+    /// ADR-0009 §1's own example, and the model has no way to tell a user type
+    /// this dialect has never heard of from a mistake. The user writes what
+    /// `pull` showed them, which is the engine's own text; a spelling that
+    /// disagrees produces a `CREATE` the engine refuses or an object the next
+    /// plan reports as one to drop and one to add, and ADR-0009 §1 accepts
+    /// exactly that bargain: *"Both are loud, both are inside the plan's
+    /// transaction, and neither is silent."*
+    fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
+        Ok(types::routine_arg(arg))
+    }
+
+    /// What a module declaration must satisfy before anything connects.
+    ///
+    /// Returns every problem rather than the first, for the reason
+    /// [`Dialect::validate_table`] does: a schema with three unspellable
+    /// modules should need one pass.
+    fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {
+        emit::validate_module(id, module)
+    }
+
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(self, change, strategy)
     }
@@ -643,6 +783,30 @@ impl Dialect for Postgres {
 mod tests {
     use super::*;
 
+    /// A bare name resolves through the write path — the object's own schema
+    /// first, then the extras in the order they were configured — and
+    /// nowhere else. The rank is the order, because the first entry holding
+    /// the name is the one it means.
+    #[test]
+    fn a_bare_name_ranks_the_own_schema_first_and_then_the_extras() {
+        let pg = Postgres::with_write_path_extras(vec!["shared".into(), "public".into()]);
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "app"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "shared"), Some(1));
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "public"), Some(2));
+        assert_eq!(Dialect::bare_name_rank(&pg, "app", "other"), None);
+        assert_eq!(
+            Dialect::bare_name_rank(&pg, "app", "App"),
+            None,
+            "names are exact"
+        );
+        // An extra that is also the object's own schema is still first.
+        assert_eq!(Dialect::bare_name_rank(&pg, "shared", "shared"), Some(0));
+        assert_eq!(
+            Dialect::bare_name_rank(&Postgres::new(), "app", "shared"),
+            None
+        );
+    }
+
     /// A refusal is output like any other, so what it says is tested: each
     /// names the step that supplies it, and none of them reads as "there is
     /// nothing to do".
@@ -650,7 +814,6 @@ mod tests {
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
         for part in [
             Unbuilt::Introspection,
-            Unbuilt::Modules,
             Unbuilt::Roles,
             Unbuilt::ReferenceData,
             Unbuilt::Probes,
@@ -672,13 +835,6 @@ mod tests {
     #[test]
     fn a_change_from_an_unbuilt_part_is_an_error_and_not_an_empty_plan() {
         let unbuilt = [
-            (
-                Change::DropModule {
-                    id: "app.v".parse().expect("a module id parses"),
-                    kind: pbps_model::ModuleKind::View,
-                },
-                "Phase 5 step 5",
-            ),
             (
                 Change::CreateRole {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),

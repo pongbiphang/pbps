@@ -3584,6 +3584,18 @@ SPEC is in sync with all of these.
       been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
       been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
 
+    **Amended: the limit holds for the names a routine argument spells.** The
+    module gate refused a routine's own name over 63 bytes and let a type
+    name in its argument list through. Measured, with a type `dq.t…t` of 63
+    bytes, `CREATE FUNCTION dq.f(a dq.t…tx)` spelling one byte more is
+    accepted with a `NOTICE`, the routine is identified as `dq.f(dq.t…t)`,
+    and the same statement run again is refused as already existing. The
+    declared key is the untruncated spelling, so `module_oid` finds nothing
+    under it, the routine is planned as absent on every plan, and the
+    `CREATE` it emits is the one the engine refuses — a plan applied once and
+    refused ever after. `validate_module` refuses an argument holding a name
+    over the limit, quoted or bare, before anything connects.
+
 231. **`target_session_attrs` is reproduced at the seam, not refused and not
     dropped.** `Config::connect` runs a `SHOW transaction_read_only` probe
     *after* the handshake; this seam calls `connect_raw` — which is what keeps
@@ -3942,6 +3954,15 @@ SPEC is in sync with all of these.
     dropped, however long the run. The tests ask `scannable` directly rather
     than going through `references`, because the bare-name fallback matches a
     half-closed gap too and would hide the difference.
+
+    **Amended: a bracket between two words leaves a space behind.** On
+    PostgreSQL `[` is a subscript and `ARRAY[` an array constructor, not a
+    quote — measured, `CREATE VIEW ao.a AS SELECT (ARRAY[ao.z()])[1]` is
+    refused until `ao.z()` exists. Dropped as a quote, the bracket glued
+    `ARRAY[ao.z` into `arrayao.z`, the needle found no word boundary, no edge
+    ordered the function first, and the plan's `CREATE VIEW` failed. The
+    space is put only where two identifier characters would otherwise touch,
+    so `[dbo].[v]` still folds to `dbo.v`.
 240. **The PostgreSQL catalogue is closed, and every bound in it is the
     engine's own — including the two the engine does not enforce.** A name the
     table does not hold is refused, never passed through. Passed through, a
@@ -5012,6 +5033,17 @@ SPEC is in sync with all of these.
     perfectly well (the same trap `catalog.rs` avoids by not writing the filter
     as a `LIKE` pattern, DECISIONS 254).
 
+    **Amended: modules are refused by the same rule.** The module gate checked
+    only that the names could be quoted. Measured, `CREATE FUNCTION
+    information_schema.f()` is accepted and identified as
+    `information_schema.f()`, and `CREATE VIEW pg_temp.v` leaves `pg_temp_4.v`
+    with `relpersistence = 't'` — the same two failures one namespace over, and
+    `validate_module` now says so offline. A trigger is keyed by the table it
+    is on, so the table's schema is the one the rule reads. (`pg_catalog`
+    itself the engine refuses — "system catalog modifications are currently
+    disallowed" — and the gate refuses it a statement earlier, which is where
+    the offline command exists to speak.)
+
 
 274. **The two table names this tool owns are refused in every schema.** The
     reader hides `__pbps_state` and `__pbps_lock` wherever they appear
@@ -5697,3 +5729,924 @@ SPEC is in sync with all of these.
     structure, independent of which types or callers happen to accept the
     expression today. Both upper- and lower-case openers are accepted, and
     neither gives backslashes escape semantics.
+
+    **Amended by the module emitter (302).** A module's whole `definition` is
+    verbatim text, so the statement's own `;` is on a line of its own too. The
+    write scope puts a `RESET search_path;` after every statement, and a
+    definition ending in `-- note` swallowed the terminator and ran on into it.
+    The rule is not about expressions; it is about where the user's text ends
+    and this tool's begins.
+
+## Phase 5 — modules (step 5, #80)
+
+301. **A routine argument type is its own text type, not a `ColumnType`.**
+    `RoutineId` held `Vec<ColumnType>`, which was right while the only dialect
+    was SQL Server, where a parameter's type is a column's type. PostgreSQL
+    identifies a routine by the types in `proargtypes`, printed through
+    `format_type` — the same text `oid::regprocedure` writes — and that text is
+    a wider language than a column type is.
+
+    Measured on 18.6, from the identity of two functions declared with ordinary
+    parameters:
+
+    ```text
+    id.a  ->  id.a(character varying,"char",integer,numeric,
+                   timestamp with time zone,integer[],text[])
+    id.d  ->  id.d(id.pos,time without time zone,interval,
+                   bit varying,character)
+    ```
+
+    Of those twelve, three parse as a `ColumnType`. The rest are arrays, a
+    quoted name (`"char"` is a real type and is *not* `character`), a
+    schema-qualified domain, and spellings a column type does not model. Making
+    them `ColumnType` would mean either widening `ColumnType` with things no
+    column declaration may hold, or refusing routines this tool must be able to
+    read back.
+
+    **The identity is text, and the text is compared.** `RoutineArg` is a
+    validated string: it must be writable into an identity string and readable
+    back out of one, so it refuses an empty argument, a top-level comma, and
+    unbalanced `()`, `[]` or `"`. It canonicalizes only what every engine
+    agrees on — outside double quotes, case folds down and the whitespace
+    beside `(`, `)`, `[`, `]` and `,` is dropped; inside them nothing is
+    touched, because `"char"` and `"CHAR"` are two types. So `INT` and `int`
+    and `decimal(10, 2)` and `decimal(10,2)` are one key, and the canonical
+    spelling is the one the identity string carries.
+
+    **`normalize_routine_arg` stays the dialect's.** A dialect that does model
+    its parameters as column types parses the text, normalizes it as a column
+    type, and prints it back; text that does not parse as one is left alone.
+    That keeps SQL Server's `INT` -> `int` folding (72) and lets PostgreSQL
+    answer with the catalog's own spelling.
+
+    Not a `ColumnType` extended with a "raw" variant: that variant would be
+    reachable from a column declaration, where none of these spellings is
+    valid, and the loader would have to refuse it there. A type that cannot
+    hold the bad value beats a branch that checks for it.
+
+    Closes the question 59 left open.
+
+    **Amended: the dot is punctuation too.** Measured, the engine accepts a
+    space around a qualified type's dot and never writes one back —
+    `CREATE FUNCTION md.spaced(a md . my_type)` reads back as
+    `md.spaced(md.my_type)`. Left unfolded, the declared key and the catalog
+    key are two keys for one routine, and every plan drops it and creates it
+    again: the cry-wolf loop ADR-0002 names as the failure to avoid. The fold
+    now drops the whitespace beside `.` as well, outside quotes only, so a
+    quoted name keeps whatever it holds.
+
+    **Amended: the standard's array spelling is peeled too.** Measured,
+    `text ARRAY`, `text ARRAY[4]`, `int ARRAY [2]` and `character varying
+    array` are identified as `text[]`, `text[]`, `integer[]` and `character
+    varying[]`, while `text ARRAY[]` and `text[] ARRAY` are syntax errors. So
+    the word is peeled once, after the brackets and never before them. Left
+    in, a declared `text ARRAY` was keyed as a routine the catalog spells
+    `text[]`, and the routine the `CREATE` had just made was not found under
+    its own key — a valid plan refused.
+
+    **Amended: a Unicode-escaped identifier is the plain quoted name it
+    spells.** The engine accepts `U&"…"` wherever an identifier goes, a
+    routine's argument type included — measured, `r12.a(v r12.U&"\006doney")`
+    has the identity `r12.a(r12.money)`, and with `UESCAPE '!'` the escape is
+    the one given. `RoutineArg` decodes the form the way the engine does
+    (`\XXXX`, `\+XXXXXX`, a doubled escape, a surrogate pair) and canonicalizes
+    it to `"…"`, so one spelling of a name is one key; a form that does not
+    decode is refused as text that is not one argument, which is what the
+    engine says of it too. The decoder lives in the model, and the emitter's
+    trigger scan (302) reads it from there. The escape character may itself
+    be the punctuation an identity is split on — measured, `UESCAPE ','` and
+    `UESCAPE ')'` are accepted — so the identity's own split steps over the
+    clause as the three characters it is. The quoted form is then spelled
+    the way the engine spells a quoted name in an identity: bare where its
+    `quote_identifier` leaves it bare — `[a-z_][a-z0-9_]*` and not a keyword
+    the grammar reserves in some position — and quoted everywhere else.
+    Measured, `zq."my_type"` and `zq."zone"` are `zq.my_type` and `zq.zone`,
+    while `zq."select"`, `zq."Order"` and `zq."möney"` keep their quotes; the
+    keyword table is read from `pg_get_keywords()`, not from memory. The
+    same rule runs the other way for an unquoted name: measured, `s.Ätype`
+    and `r8.a\u{a0}b` declared bare are identified as `s."Ätype"` and
+    `r8."a\u{a0}b"`, and the key kept bare was one `module_oid` compared
+    against `format_type` and never matched — so the routine a plan had just
+    created was not in the catalog to the next.
+
+    **Amended: the parameter scan steps over the clause too.** A parameter's
+    mode may follow its name, and a Unicode-escaped name carries its
+    `UESCAPE 'x'` after it: measured, `CREATE FUNCTION dq.f(U&"n!0061me"
+    UESCAPE '!' OUT integer)` has the identity `dq.f()`, and with `INOUT` or
+    a bare type after the clause, `dq.g(integer)` and `dq.f(integer)`. The
+    scan looked for the mode where the clause was, counted the parameter,
+    and refused a correctly keyed routine.
+
+302. **A PostgreSQL trigger's table is in its identity *and* in its
+    definition, and a declaration where the two disagree is refused.**
+    ADR-0002 fixed where a module's `definition:` begins by what the emitter
+    can derive, and for a trigger that was `CREATE OR ALTER TRIGGER <name> ON
+    <table>` — T-SQL's grammar. PostgreSQL's is not the same shape:
+
+    ```text
+    CREATE TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION …
+    ```
+
+    The table comes **after** the event list, which is text only the
+    declaration holds. Splitting the prefix there would mean finding the end of
+    the event list, and that is parsing SQL (§8.2). So the emitted prefix is
+    `CREATE TRIGGER <name>` and the table appears twice.
+
+    Measured, the duplication is not caught by anything else: the engine
+    accepts `CREATE TRIGGER audit AFTER INSERT ON app.other` under the key
+    `app.t.audit` without a word, and the mismatch surfaces a plan later as
+    `DROP TRIGGER audit ON app.t` finding nothing. So `validate_module` refuses
+    a trigger whose definition does not name the table its identity does, by
+    ADR-0002's own best-effort identifier scan.
+
+    **The scan is used in the direction where a miss is loud.** A declaration
+    that does name its table in a spelling the scan cannot see is refused here,
+    and the fix is to qualify the name; the alternative — accepting and
+    discovering it later — creates the trigger somewhere else and leaves the
+    key pointing at nothing.
+
+    Also measured, and the reason the trigger's own name is emitted bare:
+
+    ```text
+    CREATE TRIGGER m1.audit AFTER INSERT ON m1.t …   syntax error at or near "."
+    ```
+
+    A trigger name is not schema-qualified on this engine, which is the same
+    fact ADR-0009 §1 records from the other side — the schema in
+    `ModuleId::Trigger` is the table's, and there is nowhere else for it to
+    come from.
+
+    **Amended in review: the check reads the `ON` clause, not the whole text.**
+    The first version asked ADR-0002's identifier scan whether the definition
+    mentioned the table *anywhere*, and that answers yes to
+
+    ```text
+    AFTER UPDATE OF t ON app.other ...        under the identity app.t.audit
+    ```
+
+    because the column list mentions `t`. Measured, the engine accepts it
+    without a word and creates the trigger on `app.other` — the exact silent
+    mismatch the check exists to prevent, waved through by the check. What
+    decides the outcome is the name after `ON`, so that is what is read: a
+    lexical scan that steps over literals and comments with the emitter's own
+    `skip_datum`, counts parentheses so an `ON` inside a `WHEN (…)` is not the
+    clause, and takes the first bare `on` at depth zero. The grammar puts
+    nothing else there, and `INSTEAD OF` is `OF`.
+
+    A definition with no readable `ON` is refused rather than guessed at, which
+    is the direction a scan may be wrong in: the remedy is to write the clause
+    where the engine expects it.
+
+    **Amended: the dot is a token of its own.** Measured, `ON app . orders`,
+    and a comment or a line break on either side of the dot, all create the
+    trigger on `app.orders`. The scan wanted the dot glued to the name, read
+    `app` as the table, and refused a valid declaration; it now steps through
+    the same gap on both sides of every dot — in the scan that finds the name
+    and in the comparison that reads it, which are two readers of one slice.
+    The gap after `ON` itself is one too: measured, `ON /* c */ app.t` creates
+    the trigger on `app.t`, and the scan steps through it as well.
+
+    **Amended: `U&"…"` is one identifier.** Measured, `ON U&"r11".U&"\0074"`,
+    `u&"r11"."t"` and `U&"r11".U&"!0074" UESCAPE '!'` all create the trigger
+    on `r11.t`, and `U & "r11"` with a space is a syntax error. The scan read
+    `U` as the table and refused a valid declaration. A Unicode-escaped part
+    is read whole now, with its own `UESCAPE` or the default, and decoded the
+    way the engine decodes it — `\XXXX`, `\+XXXXXX`, a doubled escape, a
+    surrogate pair. A part that does not decode is one the gate cannot be
+    certain about, and it refuses only what it is certain about: the engine
+    refuses that spelling by name, and the catalog assertion after the
+    `CREATE` covers the rest.
+
+303. **A routine argument this dialect's catalogue does not know is passed
+    through, not refused.** `Postgres::normalize_type` refuses an unknown
+    column type, and the obvious move was to answer the same way for a
+    routine's arguments. It is wrong here for a reason that does not apply
+    there: a column's type has to be one this tool can spell, and a routine's
+    argument only has to be the text the engine's identity carries.
+
+    Measured, of one function's twelve parameters the catalogue knows three by
+    name, and the rest are a domain, an enum, `"char"`, arrays and spellings a
+    column may not hold. Refusing them would refuse ADR-0009 §1's own example
+    and make the routines of an ordinary database unreadable.
+
+    The bargain is ADR-0009 §1's, stated there and taken here: *"the declared
+    signature is what the emitter writes into `DROP FUNCTION` … and a mismatch
+    produces a `CREATE` the engine refuses or an object the next plan reports
+    as one to drop and one to add. Both are loud, both are inside the plan's
+    transaction, and neither is silent."* The user writes what `pull` showed
+    them, which is the engine's own text.
+
+    What the fold does do is what every engine agrees on and ADR-0009 §1
+    measured: a modifier is discarded (`varchar(10)` is `character varying`),
+    an array collapses to one `[]` (`text[][]` is `text[]`), and everything
+    else goes through the column catalogue's alias table so `int4` is
+    `integer`. `float(24)` is why the modifier is not thrown away *before* the
+    catalogue is asked: it is `real`, and `float` is `double precision`.
+
+    **Amended in review: the modifier goes whether the catalogue knows the type
+    or not.** "Returned unchanged" was written as one rule and turned out to be
+    two. Discarding a modifier is what the engine does to *every* routine
+    argument; consulting a closed catalogue of column types is a different
+    question that only some arguments have an answer to. Tying the first to the
+    second left a declared `bit varying(4)` — a perfectly ordinary parameter,
+    absent from the column catalogue because ADR-0012 §1 has no need of it —
+    permanently unequal to the `bit varying` the catalog reads back, so the
+    routine was one to create and one to drop on **every** connected plan.
+
+    That is not the bargain this entry struck. DECISIONS 303 accepts one loud
+    mismatch that a user fixes by writing what `pull` showed them; it does not
+    accept the cry-wolf loop ADR-0002 names as the failure to avoid. So the
+    fold is three attempts — with the modifier, without it, and without it and
+    unfolded — and only the *fold* is the catalogue's. Measured on 18.6, the
+    identity of one function's five parameters:
+
+    ```text
+    bit varying(4)  bit(3)  interval hour to minute  interval second(3)  m8."odd(name)"
+    bit varying     bit     interval                 interval            m8."odd(name)"
+    ```
+
+    Two more rules fell out of that measurement. `interval` is the one type
+    this grammar follows with words rather than a parenthesis, and its field
+    qualifier goes the way a modifier does. And a quoted name's own parentheses
+    are part of the name — `m8."odd(name)"` keeps them — so the modifier is
+    found outside quotes or not at all.
+
+    **Amended: an alias the engine identifies as something else is not a
+    spelling the catalogue does not know.** Passing `varbit` through as
+    written keyed a routine the `CREATE` never made — measured, `varbit(4)`
+    is identified as `bit varying` — and `module_oid` resolved nothing. The
+    aliases the column catalogue does not carry (`varbit`, `bpchar`, `nchar`,
+    the `national …` spellings, `char varying`) are folded to the identity
+    `format_type` writes, each measured, in a table a test keeps disjoint
+    from the column catalogue so that one rule is not spelled twice. A
+    domain, an enum, a composite still pass through: the engine is still the
+    normalizer for what this table does not know. And a built-in written with
+    its schema is the built-in: measured, `pg_catalog.int4`, `PG_CATALOG.INT4`,
+    `"pg_catalog".int4` and `pg_catalog."int4"` are all `integer`, so the
+    qualifier is dropped before the name is folded. So is the catalog's own
+    name for a built-in's array: measured, `_int4`, `_varbit` and
+    `_numeric(10,2)` are `integer[]`, `bit varying[]` and `numeric[]`. Built-ins
+    only — `ar._my_type` is `ar.my_type[]` but `ar._solo` is `ar._solo`, and
+    which of the two a user's name is cannot be decided offline, so it passes
+    through as written and the engine decides.
+
+304. **A module whose deparsed statement this reader cannot cut is named and
+    left out, never recorded with an empty body.** The declaration holds
+    everything after the object's name, and PostgreSQL hands back the whole
+    statement, so the pull has to cut it. Measured, the three shapes:
+
+    ```text
+    CREATE OR REPLACE FUNCTION m4."odd Name"(a integer)⏎ RETURNS integer …
+    CREATE OR REPLACE PROCEDURE m4.p(a integer)⏎ LANGUAGE sql …
+    CREATE TRIGGER "audit x" AFTER INSERT ON m4.t FOR EACH ROW …
+    ```
+
+    The name is **stepped over**, not searched for: looking for the first `(`
+    finds the wrong one in `"f(x)"."g"`, and rebuilding the name to compare
+    against would mean reproducing the deparser's own quoting rules, which is
+    the deparser's job and not this reader's.
+
+    Where the text is not that shape, the module is left out with a warning
+    naming it. The alternative — an empty `definition` — is the failure mode
+    this project keeps finding: absent, empty and unreadable are three
+    different things, and an empty body is one the next plan writes back over a
+    working object.
+
+    The same round trip the tables are asked for applies to the identity: a
+    view called `f(int)` reads back as a routine with an argument list, so a
+    module id that does not survive `ModuleId::from_str(&id.to_string())` takes
+    its object out of the pull rather than into a schema that will not load.
+
+    **Amended: a trigger is held only where its relation is.** The trigger
+    arm read every user trigger; the table reader does not hold every table.
+    Measured, the engine allows a trigger on a partitioned table and on an
+    `UNLOGGED` one, and read back without its relation the trigger was a
+    module whose `on:` named a table the schema did not have — `check_names`
+    refused the pull whole. The arm now selects by the table reader's own
+    predicate (or a view the view reader holds — measured, a user's `INSTEAD
+    OF` trigger on a view an extension owns is not extension-owned itself),
+    the complement is named as a limitation beside the relation's own, and a
+    test ties the three to one string.
+
+305. **Extension-owned objects are left out of the pull silently, and that is
+    not the "absent, empty and unreadable" failure.** `CREATE EXTENSION …
+    SCHEMA app` puts an extension's functions and views in a project's schema.
+    A reader without the `pg_depend deptype = 'e'` filter reports every one of
+    them as an undeclared module, and the next plan offers to drop objects
+    whose declaration lives in a `.sql` file the extension owns and this
+    project does not have.
+
+    Not reported as a limitation, unlike a materialized view: a limitation is
+    something the *model* cannot hold, and these are somebody else's objects.
+    `DROP EXTENSION` is how one goes away. Reporting them would put a line per
+    extension object in front of every reader, which is how a report stops
+    being read.
+
+    **Amended: the limitation reader is a reader.** The filter was on the
+    module queries and not on the unheld-module query, so an extension's
+    materialized view or aggregate in a project schema came back as a
+    limitation — which is worse than noise, because `managed_limitations`
+    refuses every command for a limitation whose name is in the managed set. A
+    rule the ordinary reader applies and the reader beside it does not is a
+    rule with a hole in it, and the hole is on the path that refuses.
+
+306. **On this dialect every carried attribute refuses the rebuild today,
+    because there is no declared grant for one to come back from.**
+    ADR-0009 §3 decides that a grant to a **declared** role survives a module
+    replacement, by the machinery ADR-0005 built — and roles and grants are
+    Phase 5 step 6. Until that lands, `pbps-pg` has no `Grant` to emit, so an
+    object carrying anything at all is one this dialect cannot rebuild.
+
+    The conservative direction is the only one available, and it is also the
+    right one to start from: warning and proceeding would put "the application
+    lost access" behind a line of output nobody reads at 3am. The step that
+    adds grants narrows this to what the declarations still cannot reproduce;
+    it does not remove it, because ADR-0010 §5 records that pbps cannot express
+    "revoked from `PUBLIC`" and therefore must not take it away.
+
+    What is enumerated is the catalog and not a list — the ADR's own rule,
+    after three review rounds each found the same shape one attribute further
+    out. Measured on this branch, and each a refusal: a grant in `relacl` or
+    `proacl`; a revocation from `PUBLIC`, which is the *absence* of a row and
+    so invisible to a check that compares rows; an owner other than the
+    deploying account, which a `DROP` and `CREATE` silently transfers and which
+    turns a `SECURITY DEFINER` routine into a privileged one; `reloptions`;
+    a view column default in `pg_attrdef`; a trigger's `tgenabled`; and the
+    grants a *new* object would arrive with from `pg_default_acl`, which no
+    comparison against the old object can see.
+
+    **Amended in review, twice, and both are the same sentence proving itself
+    again.** A fifth attribute: a grant on one *column* lives in
+    `pg_attribute.attacl`, and measured, `GRANT SELECT (a) ON v TO r` leaves
+    `pg_class.relacl` **NULL** — so an object-level ACL check reports nothing
+    carried, the rebuild goes ahead, and the column grant is gone. An object
+    with an empty ACL is the easiest case to wave through, for the second time
+    in this entry.
+
+    And the §4 half had the same shape one catalog over: the dependent
+    enumeration had an arm per catalog it had thought of, and measured, a
+    function behind a cast has its reverse edge in `pg_cast` and one behind an
+    operator in `pg_operator`. Neither had an arm, so the edge was dropped
+    entirely, `dependents` reported the rebuild unblocked, and the emitted
+    `DROP FUNCTION` failed at apply — the applyable-and-predictably-fails
+    outcome SPEC §7.5 exists to prevent. There is now a fallback arm, and the
+    class list the arms handle is one constant the fallback excludes, pinned to
+    the arms by a test.
+
+    **A list obeys "enumerate from the catalog, not from memory" only when it
+    has a fallback.** Three enumerations in this design have now been written
+    as the cases somebody thought of, and each was corrected by finding the next
+    one. What ends that sequence is not a longer list.
+
+    **Amended: a comment is a carried attribute, and the list is now closed by
+    measurement rather than by memory.** `COMMENT ON` puts a row in
+    `pg_description`; a `DROP` takes it and a `CREATE` does not bring it back —
+    measured on all three kinds and on a view's column. `Module` has a
+    `description`, but nothing writes it to the database (the `COMMENT ON`
+    round trip is a decision of its own, and `SetColumnDeprecated` says so from
+    the other side), so there is nothing to restore it from and it refuses like
+    the rest.
+
+    That was the second time this enumeration was short — a column ACL was the
+    first — so the other half was measured too: `pg_get_functiondef` writes the
+    volatility, `SECURITY DEFINER`, `LEAKPROOF`, `COST` and every `SET` clause,
+    so a routine's settings come back with its body; a view's column cannot
+    hold `attoptions` at all, since `ALTER VIEW … ALTER COLUMN … SET` is `not
+    supported for views`; and a trigger or a rule attached to a view is a
+    *dependent*, enumerated and refused on its own terms.
+
+    **And that argument was still wrong.** The round after it found a security
+    label, and the round after that would have found something else: a `DROP`
+    takes every row the catalog keys by the object's *address*, and there is no
+    amount of thinking that turns a remembered list of those into a complete
+    one. So the list is now asked of the engine:
+
+    ```sql
+    SELECT c.relname FROM pg_class c
+     WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+       AND EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'classoid')
+       AND EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'objoid');
+    ```
+
+    Five on 18.6 — `pg_description`, `pg_seclabel`, `pg_init_privs`, and the
+    two `pg_sh*` ones — and the reader reads all five, including the two a
+    module can never be in, because "a module cannot be there" is the shape of
+    claim that has been wrong every time. A live test runs that query and
+    compares it with the reader's list, so a sixth catalog in a later release
+    fails a test instead of passing unnoticed.
+
+    Beside them, one thing `pg_depend` keys the other way: `ALTER FUNCTION …
+    DEPENDS ON EXTENSION` writes a `deptype = 'x'` row *from* the routine, and
+    measured, `pg_get_functiondef` does not write the clause — so a rebuild
+    creates a routine that outlives the extension it was tied to. Measured too,
+    the grammar allows it on a routine and a trigger and not on a view; the
+    query runs for all three anyway, for the reason above.
+
+    **A list is closed by a test against the engine, not by an argument about
+    what is on it.** Three arguments were made here and three were wrong.
+
+    **Amended: a fallback covers a missing arm, not a leaky one.** The next
+    case arrived inside a class the list already knew. A domain's check
+    constraint is a `pg_constraint` row with `conrelid = 0` — measured, it
+    names its domain through `contypid` — so the arm's own inner join to
+    `pg_class` threw it away, and the fallback could not see it because
+    `pg_constraint` is on the known list. `NOT tg.tgisinternal` did the same to
+    a trigger the engine owns. **Every arm is now total over its class**: a row
+    an arm cannot represent comes back with a sentence saying so, never as no
+    row at all. A filter inside an arm turns "there is something here this
+    project cannot put back" into "there is nothing there", and the second is
+    what makes a plan applyable and predictably failing.
+
+    **Amended again: an arm can be total and still name the wrong object.** A
+    user rule on a view (`CREATE RULE ins AS ON INSERT TO app.v …`) has its
+    `pg_depend` edges in `pg_rewrite`, whose `ev_class` is the view the rule
+    is on — the view itself. The arm reported the view as its own dependent,
+    and the walk discarded that as the root. Measured, `DROP VIEW` deletes the
+    rule and `CREATE VIEW` does not restore it: the rebuild went ahead and the
+    rule was silently gone. Only the engine's `_RETURN` rule *is* the view;
+    any other now comes back as a dependent this model cannot put back, and
+    refuses. The same silence as the filter's, reached another way — a row
+    that was there, named as something the reader already held.
+
+    **Amended: a view's row type is a reference to the view.** Measured, a
+    routine that takes `v` or `v[]` as an argument, or returns `v`, depends on
+    `type v` or `type v[]` with `deptype` `n`, and the type depends on the
+    view with `i`; `DROP VIEW v` names all three routines. Filtering the
+    internal edge is right — the type is not a dependent anybody drops — but
+    never asking about the type as a *reference* left those routines unseen,
+    and the walk called the rebuild unblocked. The reverse-edge predicate now
+    names the view, its row type and the row type's array type, in one
+    spelling shared by the dependents query and the argument query.
+
+307. **The rebind test is a name and a path, not a position on it.**
+    ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
+    the modules it could capture, in that same plan. The obvious
+    implementation asks which candidate is *earlier* on the write path than the
+    current binding, and it cannot be written: an overload in the same schema
+    captures a call without anything moving, and what an unchanged declaration
+    would bind to today cannot be computed without parsing it (§8.2 forbids) or
+    creating it (planning must not).
+
+    So the test is: this plan brings an object into a schema on that module's
+    effective write path, and the module's text mentions that object's bare
+    name. One rebuild, once. A declaration that qualified the name in full is
+    rebuilt too — deliberately conservative, and the ADR says so.
+
+    Measured, all three states, which is what makes "one plan late" a cost and
+    not a phrase:
+
+    ```text
+    before anything arrives:                    caller() = 'shared'
+    after the shadow arrives, with no rebuild:  caller() = 'shared'
+    after the rebuild:                          caller() = 'app'
+    ```
+
+    The middle line is a whole plan cycle in which the environment means one
+    thing and the declarations mean another, with nothing in the plan that
+    created the shadow having said so.
+
+    **Amended: a trigger arriving is not a shadow.** Nothing calls a trigger
+    by name, so the test asks for the name a body would reference the
+    arriving object by (`ModuleId::referenced_name`), which a trigger does not
+    have. Asked for the object name instead, a trigger `app.orders.audit`
+    rebuilt every caller of `audit()` for a binding that cannot move — and
+    where such a caller has dependents, that rebuild is a refusal of a plan
+    that was valid.
+
+308. **A routine's parameter list is checked against its identity, and only
+    where the disagreement is certain.** The emitter writes
+    `CREATE FUNCTION <name>` and the declaration writes everything after the
+    name (301, ADR-0009 §1), so the identity's argument types live in the key
+    *and* in the body — the same split the trigger's `ON` clause has, and the
+    same silent failure. Measured: `CREATE FUNCTION app.f\n(x text) …` under
+    the key `app.f(integer)` is accepted without a word and creates
+    `app.f(text)`. The key names an object that does not exist, and every later
+    plan creates it again and drops nothing.
+
+    So `validate_module` reads the list. Three facts from the engine make that
+    a scan and not a parse:
+
+    ```text
+    CREATE FUNCTION me.noparens RETURNS int …   syntax error at or near "RETURNS"
+    CREATE FUNCTION me.o(out int) …             identity  me.o()
+    CREATE FUNCTION mf.a(a out int) …           identity  mf.a()
+    ```
+
+    The list is mandatory, `OUT` is the one mode that keeps a parameter out of
+    `proargtypes`, and a mode may be written on either side of the name. With
+    the mode off, a parameter is `type` or `name type` and the grammar offers
+    nothing else, so exactly two readings are tried.
+
+    **Only a certain disagreement refuses.** A count is always certain. A type
+    is not: `format_type` under the empty read path always qualifies a user
+    type (ADR-0013 §3), so a key reading `app.f(md.my_type)` over a body
+    reading `(a my_type)` is one object whenever the write path reaches `md` —
+    and this dialect cannot know whether it does. Refusing that would refuse a
+    valid plan, which is the one direction this gate may not be wrong in. A
+    spelling the dialect cannot parse counts as agreement for the same reason:
+    a scan that cannot read a spelling has not learned that it is wrong.
+
+    What stands behind the cases it cannot decide is the catalog assertion
+    after the `CREATE` (ADR-0009 §3), which is keyed by the identity and fails
+    inside the transaction. An offline gate that decides what it can and a
+    connected assertion that decides the rest is the split; a gate that guessed
+    would be neither.
+
+    **Amended: the second reading is not offered for a spelling the catalogue
+    knows.** Trying both readings unconditionally introduced an ambiguity of
+    its own. `(double precision)` splits into a parameter named `double` of
+    type `precision`, and with a user type of that name the qualification rule
+    above then accepts the body under the key `f(app.precision)` — while the
+    engine creates `f(double precision)`. Measured, with `mq.precision` in the
+    database:
+
+    ```text
+    CREATE FUNCTION mq.b(double precision) …   ->  mq.b(double precision)
+    ```
+
+    The engine does not offer that reading, so neither may the gate: where the
+    whole remainder is a spelling this catalogue knows, that is the type and
+    there is no second reading. A gate is allowed to be undecided; it is not
+    allowed to invent a reading the grammar does not have.
+
+    **Amended: every gap in the parameter is a gap.** The first comment case
+    was fixed at the front of the parameter and nowhere else. Measured,
+    `(value /* note */ OUT integer)`, `(OUT /* note */ value integer)`,
+    `(value OUT /* note */ integer)` and a line comment between the name and
+    the mode all have the identity `()`, and `(IN /* note */ x /* note */
+    int)` has `(integer)`. The scan now steps through the gap on every side of
+    the mode, not only the first; a scan that knew comments were whitespace
+    in one position and not the next was refusing a valid declaration for a
+    count only it got wrong.
+
+    **Amended: the scans' whitespace is ASCII.** The rule of 313, applied to
+    the emitter's own scans: measured, `CREATE FUNCTION r10.f(a r10.x\u{a0}, b
+    int)` has the identity `r10.f(r10."x\u{a0}",integer)`, the non-breaking
+    space being the last byte of the type's name. `str::trim` at a parameter's
+    boundary, before a default and after a gap cut that byte off and compared
+    `r10.x` with a catalog that says `r10."x\u{a0}"`. Every trim in these
+    scans is an ASCII one now.
+
+    **Amended: a `$` after an identifier byte is part of the name.** `$`
+    continues an identifier on this engine, and measured, `CREATE FUNCTION
+    dq.f(foo$tag$ integer)` is accepted with the identity `dq.f(integer)`.
+    The per-character scans asked the literal test from the `$` alone, read
+    `$tag$` as the opener of a dollar-quoted literal nothing closed, and
+    refused the routine. The literal test now knows the byte before it — the
+    rule the dialect's normalizer already applied — in one helper every such
+    scan goes through.
+
+309. **A module the deparse could not find is the catalog moving, not a reader
+    out of step with its query.** The pull reads the catalog in one
+    `REPEATABLE READ READ ONLY` transaction so that it cannot report half of a
+    change as a whole schema, and 267's guard turns the `XX000` a moved catalog
+    raises into a retryable message. The module queries opened a second way for
+    the catalog to move, and it does not raise. Measured:
+
+    ```text
+    pg_get_viewdef(999999, true)  ->  NULL
+    pg_get_functiondef(999999)    ->  NULL
+    ```
+
+    A deparser resolves its oid through the syscache against a *fresh*
+    snapshot, so an object dropped between the scan and the deparse comes back
+    as a row with a name and no definition. Read through the ordinary
+    `missing` helper that said "the query and this code have gone out of step",
+    which is the one diagnosis that is certainly wrong — nothing is out of
+    step, and a reader sent to look for a renamed column will not find one.
+    **Absent, empty and unreadable are three different things**, and a vanished
+    object is the third.
+
+    So the modules read takes the definition as optional and turns `NULL` into
+    the same "the catalog changed while it was being read" the `XX000` path
+    gives. Not into a limitation and not into a skipped module (304): 304 is
+    for a statement this reader cannot *cut*, which is a fact about the object
+    and stays true on the next pull. This is a fact about the moment, and the
+    answer to it is to read again.
+
+    It was found by the live suite going red under its own parallelism, which
+    is what that suite is for: every test builds a schema and drops it, so a
+    pull is nearly always running across somebody's `DROP`. A defect that only
+    appears when two things happen at once has no other way to be found.
+
+310. **A pull and a rebuild can deadlock, and the answer is a sentence rather
+    than a lock order.** Reading a module's definition means deparsing it, and
+    `pg_get_viewdef` opens the view — so a pull holds `ACCESS SHARE` on every
+    view in the database for as long as that query runs. A rebuild takes
+    `ACCESS EXCLUSIVE` on the object it is about to replace (ADR-0009 §3).
+    Neither can be reordered: the pull's order is the catalog's, and the
+    rebuild's is one object. Measured, from the server log:
+
+    ```text
+    deadlock detected
+    Process A: LOCK TABLE "app"."granted" IN ACCESS EXCLUSIVE MODE
+    Process B: SELECT … pg_get_viewdef(c.oid, true) …
+    ```
+
+    The engine detects the cycle, picks a victim and rolls it back **whole** —
+    there is no half-read schema and no half-applied plan, which is the only
+    property that matters here. What was missing was the words: `40P01` reached
+    an operator as `db error` and nothing else, on both paths.
+
+    So both say it: the pull's guard (267) gains a `40P01` arm beside its
+    `XX000` one, and `before_a_rebuild` wraps the lock it takes. Each says the
+    same three things — it was a tie, nothing changed, run it again — and the
+    rebuild's names the likely other side, because "a `pull` or a `status`
+    opens every view in the database" is not something an operator can be
+    expected to know.
+
+    Not solved by taking a weaker lock: the lock is what makes the catalog
+    enumeration before the `DROP` mean anything. Not solved by holding the
+    deployment lock either — that serializes deployers, and a `pull` is not
+    one.
+
+    Found by the live suite, where fifty tests read the catalog while a handful
+    lock objects. The suite retries, and says in the helper that the retry is
+    its own concurrency rather than the product's.
+
+311. **The drop order for dependents is a topological order, not a depth.**
+    A breadth-first walk gives each dependent the depth of the *shortest* path
+    to it, and two dependents at one depth come out in whatever order the
+    catalog gave. Measured, that is wrong the moment a diamond appears:
+
+    ```text
+    a and b are both views over v, and b is also over a
+        DROP VIEW mj.a  ->  cannot drop view mj.a because other objects
+                            depend on it
+                            DETAIL:  view mj.b depends on view mj.a
+    ```
+
+    which is the applyable-and-predictably-fails outcome SPEC §7.5 exists to
+    prevent — the same one the depth walk was added to fix, one shape further
+    out. So the walk records the *edges* and the order comes from them: a node
+    is ready when everything that depends on it has already gone, ties broken
+    by name so that a plan is the same plan twice.
+
+    **A cycle is a case, not an impossibility.** `CREATE OR REPLACE` closes one
+    between two `BEGIN ATOMIC` routines — measured, `pg_depend` then holds both
+    directions and neither routine can be dropped first. There is no order, so
+    each member is named as something the plan cannot put back rather than
+    emitted in an order that fails. The same for a cycle that runs through the
+    module being rebuilt: it is not one of its own dependents, and what the
+    walk coming back to it really says is that no rebuild of it is possible
+    without `CASCADE`, which SPEC 14.3 does not offer.
+
+    A depth is the answer to "how far", and the question was "in what order".
+
+312. **The transaction probe compares against a value it invented, not against
+    a constant.** Both sides of it — the pull refusing a caller's transaction,
+    the rebuild requiring one — are `set_config(…, is_local => true)` in one
+    statement and `current_setting` in the next: inside a transaction the
+    setting survives to be read, outside one the implicit transaction ends and
+    it does not.
+
+    Against the constant `'yes'` that read had a third outcome nobody asked
+    for. A session carrying `SET pbps.in_a_transaction = 'yes'` answers `'yes'`
+    on an autocommit connection, and the two sides fail in opposite directions:
+    the rebuild believes its reads are serialized when `LOCK TABLE` has already
+    been released at the end of its own statement, and the pull refuses a
+    connection that has no transaction at all. The first is a guard still in
+    the code and no longer guarding; the second is a valid plan refused.
+
+    A value invented per call cannot be sitting in the session, so the read is
+    equal only if *this* call's `set_config` survived — which is the question
+    being asked. A type that cannot hold the bad value beats a branch that
+    checks for it, and here the value is the type.
+
+313. **A routine argument folds ASCII case only.** `RoutineArg` lower-cased
+    with `char::to_lowercase`, which is Unicode's fold and not this engine's.
+    Measured:
+
+    ```text
+    CREATE FUNCTION mn.f(a mn.Ätype) …   ->  mn.f(mn."Ätype")
+    ```
+
+    The engine left the byte alone and *quoted* the name rather than folding
+    it. A Unicode fold turns the declared spelling into `ätype`, which names a
+    type that does not exist — so the key points at nothing, `module_oid`
+    resolves nothing, and the object is planned as absent. The emitters' own
+    `unquoted` has always been `to_ascii_lowercase`; this is the same rule in
+    the model, where the two were quietly disagreeing.
+
+    **Amended: whitespace is ASCII too.** The same rule, one character class
+    over. `char::is_whitespace` is Unicode's answer, and a non-breaking space
+    is whitespace to it; to this engine every non-ASCII byte is an identifier
+    character. Measured, `CREATE FUNCTION r8.f(v r8.a\u{a0}b)` is accepted with
+    the identity `r8.f(r8."a\u{a0}b")`, and `r8.a b` with a plain space names
+    no type at all — so the fold turned a valid key into one that resolved
+    nothing. The fold trims and collapses ASCII whitespace only, and the
+    whitelist admits any non-ASCII byte, which is `continues_ident`'s rule.
+    The dialect's normalizer follows the same rule wherever it looks for a
+    gap — before the array keyword, after `interval`, around a modifier — so
+    `a\u{a0}array` is a type name and not `a[]`. And so does the emitter's
+    trim of a module body: measured, `CREATE VIEW v AS SELECT 1 AS x\u{a0}`
+    names the column `x\u{a0}`, and `str::trim` had taken the byte off the
+    end of the body before the `CREATE`, so the view the plan made had a
+    column the declaration does not name. And the identity's own test for an
+    empty argument list: measured, a type may be named by one non-breaking
+    space and `g(\u{a0})` is a routine of one argument, which a Unicode trim
+    read as `g()`. And `$`, which `continues_ident` names and the whitelist
+    did not: measured, `CREATE FUNCTION dl.h(a dl.money$type)` is accepted
+    with the identity `dl.h(dl."money$type")`, and the argument was refused
+    before it reached the engine.
+
+314. **`pg_depend` holds a row per column a dependent uses, not a row per
+    dependent.** Measured, a routine reading three columns of a view has three
+    edges to it:
+
+    ```text
+    dependent | refobjsubid | edges
+    mq.uses() |     1       |   3
+    mq.uses() |     2       |   3
+    mq.uses() |     3       |   3
+    ```
+
+    Where a query returns one row per edge and the reader deduplicates by name,
+    that is harmless. Where a query *joins* on the edge, it is not: the
+    argument query cross-joined `unnest(proargtypes)` once per edge and rebuilt
+    a one-argument routine as `f(integer,integer,integer)` — an identity no
+    declaration holds, so an otherwise manageable rebuild was refused and the
+    walk could not resolve the object it had just named.
+
+    So the edge is deduplicated before the join, and the dependents query is
+    `DISTINCT` over its whole union as well. The second was already harmless —
+    the caller deduplicates by description — and it is done anyway: a reader
+    that has to remember to deduplicate is one edit away from not doing it.
+
+    **Duplication that repeats a row is a tidiness problem; duplication that
+    feeds a join is a wrong value.** The two look the same in the query and
+    nothing distinguishes them but knowing what the rows are for.
+
+315. **The dependency scan lexes with the dialect's rules.** `creation_order`
+    reads what is left of a definition after literals and comments are
+    blanked, and the shared `code_only` blanked them by one engine's rules:
+    `[…]` a quoted identifier, `'…'` closed by the next single quote, no
+    `E'…'`, no `$tag$…$tag$`. Measured, `CREATE VIEW es.b AS SELECT E'x\' ,
+    es.a' AS s` is one literal to PostgreSQL; the shared scanner closed it at
+    the `\'`, read `, es.a` as code, and drew an edge from `b` to `a`. With
+    `a` selecting from `b` that edge closed a cycle, the members were emitted
+    in name order, `a` came first, and its `CREATE VIEW` failed inside the
+    plan's transaction — a valid plan refused, with no `depends_on:` able to
+    remove the edge that refused it.
+
+    The `Lexicon` a dialect already supplies for the comparison scanner
+    (ADR-0011 Amendment 2) is what decides where a region ends, so it now
+    supplies `code_only` too, and `Dialect::code_only` hands it to
+    `creation_order_with` and to the emitter's name scans. Not a second table
+    of delimiters in the model: the model keeps its `code_only` for the
+    callers that have no dialect, and the differ, which has one, lexes with
+    it.
+
+    A dollar-quoted string is a literal to this scan too, blanked, with one
+    exception: a routine's body. On this engine the body is itself one — `AS
+    $$ SELECT app.f(1) $$` — and the name scans exist to read what the body
+    says; blanked, every routine would call nothing and depend on nothing. A
+    dollar-quoted *datum* is not the body, and reading it as code drew an
+    edge from the view that holds it to the view it names — with the other
+    direction real, a cycle, and the dependent created first. What tells the
+    two apart is the word before the string: a body follows `AS`, and a datum
+    never does — measured, `CREATE VIEW v AS SELECT 1 AS $x$` is a syntax
+    error, so in a definition the engine accepts a dollar-quoted string after
+    `AS` can only be a body. The body is lexed by the same rules, its own
+    literals, comments and dollar-quoted data blanked. A comment between the
+    keyword and the body is already blank by the time the question is asked:
+    measured, `AS /* c */ $$ SELECT 1 $$` is a body. The body's tags are
+    blanked with the literals: a delimiter is not a name, and one read as
+    code was a mention of a module named `$a$` from inside every routine it
+    delimited. And the gap before the
+    string is the dialect's: a type named `as\u{a0}` applied to a string —
+    measured, `SELECT as\u{a0} $$app.a$$` is a valid view — is not the
+    keyword, and the trim that looks for it discards only whitespace the
+    dialect does not count as a name byte. The body written as a plain `'…'`
+    literal stays blanked, which is #228.
+
+    **Amended: the boundaries and the prefixes are the dialect's too.** A
+    literal's prefix is part of its token — measured, `N'x'`, `B'101'`,
+    `X'1F'`, `U&'d\0061ta'` and `E'y'` are literals, while `note'x'` is the
+    type `note` applied to a string — so `Lexicon` names the prefixes and
+    `code_only` blanks one with its literal; left as code, the `E` matched a
+    view named `e`. And where a word ends is the engine's rule: every
+    non-ASCII byte continues an identifier on PostgreSQL, so `x\u{a0}y` is
+    one alias, and the scan that read the byte as a gap found a word `y` in
+    it. The model's `Lexis` carries both the dialect's `code_only` and its
+    identifier rule; the differ and the emitter's name scans hand it the
+    dialect's, and the shared scanner keeps SQL Server's as its own.
+
+    **Amended: a doubled quote does not cost a literal its prefix.** The
+    scanner closed a `U&'…'` at the first quote of a doubled pair and reopened
+    an ordinary literal, which then had no prefix and swallowed no clause.
+    Measured, `U&'a''b' uescape '!'` is the string `a'b` — one literal, one
+    clause — and the word left as code matched a module named `uescape`. A
+    doubled quote is now read as a quote *inside* the literal, which is what
+    the engine reads it as.
+
+    **Amended: a prefix letter is a prefix only where a name does not end
+    there.** The emitter's own scan guarded `$` against opening a
+    dollar-quoted literal in the middle of a name and guarded nothing else.
+    Measured, with a domain `dq.code`, `CREATE FUNCTION dq.f(a dq.code
+    DEFAULT dq.code'x\', b integer DEFAULT 1)` is accepted and the default
+    reads back as `'x\'::text` — the type applied to the plain string `x\`.
+    Read from the `e'`, the scan took an escape string, the `\'` did not
+    close it, the rest of the declaration was swallowed, and the gate refused
+    a routine the engine creates under exactly the declared key. The quote
+    itself still opens a plain literal there, which is the engine's reading of
+    `note'x'` and the rule the shared lexer already had.
+
+    **Amended: a `UESCAPE` clause goes with the literal it follows.** Measured,
+    `U&'d!0061ta' UESCAPE '!'` is the string `data`, and the clause is part of
+    that token. The scan blanked the literal and left the word `UESCAPE` as
+    code, where it matched a module named `uescape`; with that module selecting
+    from the view holding the literal, the invented edge closed a cycle and the
+    dependent was created first. `code_only` remembers that a literal opened
+    with the `u&` prefix and blanks the clause with it — the escape character
+    itself changes nothing, because the contents are blanked either way.
+
+    **Amended: a Unicode-escaped identifier is read as the name it spells.**
+    Measured, `SELECT * FROM dq.U&"\007a"` and `FROM U&"dq".U&"!007a"
+    UESCAPE '!'` both select from `dq.z`; the scan read the spelling on the
+    page, found no `z` in it, and with `a` sorting first created `a` over a
+    view that did not exist yet. `Lexicon` says whether the engine has the
+    form, and `code_only` replaces `U&"…"` and its clause with the quoted
+    name they decode to, padded so that offsets survive; a spelling that does
+    not decode is left as it is, for the engine to refuse. SQL Server has no
+    such form.
+
+316. **A bare reserved word is not a reference.** The name scans read a bare
+    word as a possible mention of a module of that name, because a
+    definition written inside its own schema very often omits the qualifier.
+    A view named `select` made every other view mention it: `select 1` drew
+    an edge from `z` to `select`, `select` selecting from `z` drew the real
+    one back, and the cycle was broken by name order, which created `select`
+    over a view that did not exist yet — a valid plan refused, with no
+    `depends_on:` able to remove an edge.
+
+    A word the engine refuses as a bare name cannot be one. **Measured** on
+    PostgreSQL 18.6, with a table, a function and a type of each name: every
+    word of `pg_get_keywords() WHERE catcode = 'R'` is refused as `FROM word`,
+    `word(1)` and `::word`, except `current_catalog`, `current_date`,
+    `current_role`, `current_time`, `current_timestamp`, `current_user`,
+    `localtime`, `localtimestamp`, `session_user`, `system_user` and `user`,
+    which `FROM word` accepts; the type-or-function-name category is not
+    reserved in this sense (`FROM between`, `FROM join` are accepted); and
+    after a dot any word is a name (`FROM app.select` is accepted). On SQL
+    Server 2022, every documented reserved keyword is refused as `FROM word`,
+    and as `FROM dbo.word` all but `disk`, `dump`, `load`, `precision` and
+    `securityaudit`.
+
+    So `Lexicon` carries `reserved`, each dialect's measured table, and the
+    scan matches a reserved name only in its quoted spelling — `"select"`,
+    `[select]` — or qualified, which is a name whatever the word. The shared
+    scanner reserves nothing: the loader has no engine to ask, and an edge it
+    draws too many of is one the differ, which has one, does not draw. The
+    table is read from the engine, not from memory, and a word a later engine
+    reserves is a bare mention the scan still reads — an edge too many, in the
+    direction the scan has always erred.
+
+318. **A quoting character doubled inside a name is one character of it.**
+    The name scans dropped every `"` from the lexed definition, so
+    `app."z""q"` read as `app.zq` while the candidate's own name was `z"q`:
+    the needle matched nothing, no edge was drawn, and with the dependent
+    sorting first its `CREATE` came before the view it selects from — a valid
+    plan refused. Measured, `CREATE VIEW dq."z""q"` names the view `z"q` and
+    a view over it is written `FROM dq."z""q"`; `[a]]b]` is the same rule one
+    engine over, and the emitters have always written a name that way
+    (`quote` doubles what it must). The unquoting keeps a doubled delimiter as
+    the single character it stands for, and the needle built from the declared
+    name carries it too.
+
+317. **A bare name is a reference only where the engine would look it up.**
+    The scan read a bare word as a mention of a same-named module in *any*
+    schema. With no extras, `a.x AS SELECT * FROM b.z` over `b.z AS SELECT 1
+    AS x` is a valid plan, and the alias `x` in `b.z` was read as a mention
+    of `a.x`: a cycle with the real edge, broken by name order, which
+    created `a.x` over a view that did not exist yet.
+
+    **Measured.** On PostgreSQL a bare name in a definition resolves through
+    the write path every statement runs under — the object's own schema and
+    the configured extras (276) — and nowhere else. On SQL Server 2022, with
+    `b.z` and `dbo.z` both present, `CREATE VIEW a.x AS SELECT * FROM z`
+    reads `dbo.z`; with `a.z` present it reads `a.z`; with only `b.z` it is
+    refused. So `Dialect::resolves_bare_name` says which schemas a bare name
+    in a definition in a given schema may resolve in — PostgreSQL's own and
+    extras, SQL Server's own and `dbo` — and `creation_order_with` reads the
+    bare form only for a candidate in one of them; the qualified form is an
+    edge wherever it points. SQL Server's second step is the caller's default
+    schema, which is `dbo` for a login given no other; a deployer whose
+    default schema is another one says the edge with `depends_on:`, which
+    can add an edge and never has to remove one. The shared scanner, and the
+    emitter's mention scans (ADR-0013 §3), keep reading a bare name
+    everywhere: a report and a rebind check are over-inclusive by design.
+
+    **Amended: the path is ordered, so the answer is a rank and not a yes.**
+    The engine resolves a bare name in the *first* entry of the path that
+    holds one. Measured, with `z.p` and `a.p` both present, a bare `p` binds
+    `z.p` under `SET search_path = "z", "a"` and `a.p` under `"a", "z"`; on
+    SQL Server 2022, with `dbo.p` and `a.p` both present, `CREATE VIEW a.x AS
+    SELECT * FROM p` reads `a.p`, so the own schema outranks `dbo`. Read as
+    two candidates, a bare `p` in `z.x` drew an edge to `a.p` as well as to
+    `z.p`; with `a.p` selecting from `z.x` that closed a cycle, and name order
+    created `a.p` first. `Dialect::bare_name_rank` gives the position on the
+    path, and among the declared modules sharing a bare name only the
+    best-placed one takes the bare form.

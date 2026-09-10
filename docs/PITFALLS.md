@@ -819,6 +819,29 @@ It survived because **every `--dev` test passed a connection string**: the
 docker path had no automated coverage at all. Reading found it; running could
 not have.
 
+## A guard written as a `for` over a `Result`
+
+A read that must return exactly one row grew a guard for the case where it
+returns none:
+
+```rust
+for row in rows.first().ok_or_else(|| vanished(oid)) { ... }
+```
+
+It compiles, and it does nothing. `Result` is an `IntoIterator` over its `Ok`,
+so the `Err` is discarded and the loop runs zero times — the guard is in plain
+sight, in a diff, in review, and the failing case takes the silent path it was
+written to close. The same shape swallows an `Option`'s `None`.
+
+It arrived by editing a loop over many rows into a read of one, keeping the
+`for` and adding the check inside its head. Nothing about the change looks like
+removing a check.
+
+**A guard that must stop the function is `let … ?` or an early return, never a
+loop header.** And a guard whose failing case has no test is a guard whose
+failing case has never run: this one was found by reading, and the read only
+happened because the two fixes before it were about the same silence.
+
 ## One rule, spelled in three places
 
 The definition scanner asks "does the identifier before this character end
@@ -1293,6 +1316,146 @@ one column and "and is it that kind of thing after all?" in another. A reader
 that switches on the first and never looks at the second is not reading the
 catalog, it is reading half of it.
 
+## A fallback arm, and a filter inside a known arm
+
+A union with one arm per catalog and a last arm for everything else looks like
+it enumerates from the catalog rather than from memory. It does not, if an arm
+can throw a row away:
+
+```sql
+JOIN pg_catalog.pg_class c2 ON c2.oid = con.conrelid     -- 0 for a domain
+WHERE ... AND NOT tg.tgisinternal                        -- and this one too
+```
+
+Both rows matched a class the list already knew, so the fallback — which
+selects the classes *not* on the list — could not see them. The dependent
+vanished, the rebuild reported itself unblocked, and the `DROP` failed at
+apply.
+
+**The rule.** A fallback covers a class with no arm. Nothing covers an arm that
+is not total over its own class. Every filter inside an arm has to be a
+*column*, not a `WHERE`: the row comes back saying what it is and why this
+project cannot hold it, so "there is something here I cannot put back" never
+becomes "there is nothing there".
+
+A third instance got there without a filter. The view arm was total, and it
+named a user rule on the view *as the view*, because that is what the rule's
+`ev_class` is — and the walk, seeing the root, discarded it. An arm that is
+total over its class still has to say *which* object the row is: a row named
+as one the reader already holds is the same silence with a different cause.
+
+## The identity is in the key and in the body, and the engine trusts the body
+
+Where the emitter composes a prefix and the declaration holds the rest, any
+part of the identity that the grammar puts *after* the split is written twice —
+once in the key the tool plans against, once in the text the engine reads. The
+engine reads only its copy, and accepts a disagreement without a word.
+
+PostgreSQL has two, both measured:
+
+```text
+key app.t.audit    body AFTER INSERT ON app.other   -> the trigger lands on app.other
+key app.f(integer) body (x text) RETURNS int …      -> the function is app.f(text)
+```
+
+In each case the object is created, the apply reports success, and the key
+names nothing. The next plan creates it again and drops nothing, for ever.
+
+**The rule.** Every part of an identity that appears in the body gets a check
+in `validate_module`, and the check refuses only what it is *certain* about —
+a gate that guesses refuses valid plans, which is the one direction it may not
+be wrong in. What it cannot decide is left to the catalog assertion after the
+`CREATE`, which is keyed by the identity and fails inside the transaction.
+
+## A helper whose message names the wrong cause
+
+`missing(column)` said "the query and this code have gone out of step", which
+is true of every `NULL` a column reader meets — except the ones where it is
+not. A deparser answering `NULL` for an object that has just been dropped is
+not a renamed column; it is the catalog moving under a read. The message sent
+every future reader to the one place there was nothing to find.
+
+**The rule.** A generic error helper is a claim about the cause, not just the
+shape. Before reusing one, ask whether the cause it names is the only cause
+that reaches it — and where it is not, the caller says which case it is in.
+`Option` at the call site is what makes that possible: `text` collapses
+"absent" into "wrong", `optional_text` lets the caller keep them apart.
+
+## A fixture that reaches outside its own schema
+
+Every test here builds a schema and drops it with `CASCADE`, which is what
+makes them safe to run beside each other. Two fixtures broke that:
+
+- `CREATE EXTENSION` beside another test's `CREATE EXTENSION` deadlocked the
+  suite — four unrelated tests came back `40P01`. There is one extension in
+  this suite, and a test that needs an extension-owned object joins it.
+- attaching an object to an extension the *database* owns rather than the
+  schema. Measured, `DROP SCHEMA … CASCADE` over a schema holding a member
+  drops the extension itself: attaching a materialized view to `plpgsql` took
+  plpgsql, and every plpgsql function in the database, out with the schema.
+
+**The rule.** A fixture may create and drop only things its own schema owns.
+Anything database-wide — an extension, a role, a cast — is shared with every
+other test in the run and with every other run on the container.
+
+## A probe that compares against a constant
+
+Two guards here ask the engine "is there a transaction open?" by setting a
+transaction-local GUC in one statement and reading it back in the next. Both
+compared the answer against `'yes'` — and `'yes'` is a value a session can be
+holding already, at session scope, where a transaction-local set cannot clear
+it. The read then answers correctly-shaped nonsense, and the two guards fail in
+opposite directions: one waves a rebuild through with no lock, the other
+refuses a pull that is doing nothing wrong.
+
+**The rule.** A probe whose whole content is "did *my* write survive?" has to
+compare against a value only this call could have written. A constant makes the
+question "is this value present?", which is a different question with the same
+shape — and the difference is invisible until somebody's session supplies the
+constant.
+
+## A depth is not an order
+
+A breadth-first walk gives each node the length of the *shortest* path to it,
+and nodes at one depth come out in catalog order. That is an answer to "how
+far", and drop order is an answer to "before what". They agree on a chain and
+disagree on the first diamond: `a` and `b` both over `v`, `b` also over `a` —
+one level holds both, and dropping `a` first fails because `b` is still there.
+
+**The rule.** When the output is an order, record the edges and sort them. A
+depth is a summary of the edges, and the thing that was thrown away is exactly
+the thing the order needed. And a topological sort has a failure case a depth
+walk cannot even represent — a cycle — so it has to say so rather than emit an
+order that does not exist.
+
+## A list closed by an argument
+
+The carried-state enumeration was short four times. Each time the fix was to
+add the missing one; the third time it also came with an argument for why the
+list was now complete — what else a `DROP` could take, and why each of those
+was carried back by the declaration. The argument was careful and it was wrong
+by the next round.
+
+What closed it was a query:
+
+```sql
+-- every catalog that keys a row by an object's address
+SELECT c.relname FROM pg_class c
+ WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+   AND EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = c.oid AND a.attname = 'classoid')
+   AND EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = c.oid AND a.attname = 'objoid');
+```
+
+run in a test and compared against the list in the code, so the next release's
+sixth catalog fails a test rather than passing unnoticed.
+
+**The rule.** "Enumerate from the catalog, not from memory" applies to the
+*reasoning* as much as to the list. A justification for why a list is complete
+is memory with more words in it. Where the engine can be asked, ask it in a
+test.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run
@@ -1497,7 +1660,7 @@ loud, so this cost minutes rather than a release; the lesson is that **the local
 command and the CI command are two different tests**, and only one of them
 counts. A fixture name must be unique per test, not per process.
 
-Eleven so far, every one invisible in a green run. **Assert the specific failure,
+Twelve so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 A fixture for "a state recorded by a version this build cannot read", written
@@ -1549,6 +1712,17 @@ three ways a state can be unreadable rather than one row asserted about twice.
   meant.** Assert the parsed field. The same shape was one bump away in the
   plan and ids tests, and all three were fixed together (DECISIONS 149's
   commit).
+- A guard over several kinds, asserted on the one kind where it does nothing.
+  The PostgreSQL dependency reader filters `pg_depend`'s **internal** edges,
+  `deptype <> 'i'`, and the test that covered it asked for the dependents of a
+  *function* — which has no internal reverse edges at all, so removing the
+  filter changed nothing and the test stayed green. A view has two, its
+  `_RETURN` rule and its row type, and without the filter every view depends on
+  itself and no view can be rebuilt. **Revert-and-watch-fail is what found it,
+  and only because the revert was run:** the test was written first and looked
+  like coverage. When a guard names a set — kinds, catalogs, classes — the case
+  it is asserted on has to be one the guard actually changes, which is not
+  always the first one that comes to hand.
 
 Since these appeared, every fix is reverted and its new test watched to fail
 before the fix is kept. That habit caught three of them. It did not catch

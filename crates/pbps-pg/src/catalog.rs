@@ -29,8 +29,8 @@ use pbps_db::{Conn, DbError, Row};
 use pbps_model::TableName;
 
 use crate::introspect::{
-    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawTable,
-    assemble,
+    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawModule,
+    RawModuleArg, RawTable, assemble,
 };
 
 /// The schemas that are never a project's.
@@ -84,9 +84,19 @@ fn tables_query() -> String {
         "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r'
+      WHERE {ORDINARY_TABLE}
         AND {NOT_A_PROJECTS_SCHEMA}
         AND {NOT_ONE_OF_OURS}
+      ORDER BY n.nspname, c.relname"
+    )
+}
+
+/// What makes a `pg_class` row `c` a table this model holds: the predicate of
+/// [`tables_query`], as one string, so that the one other reader that has to
+/// agree with it — the trigger arm of [`modules_query`], and its complement in
+/// [`unheld_modules_query`] — cannot drift from it. Each flag is the negation
+/// of a case [`partitioned_query`] names.
+const ORDINARY_TABLE: &str = "c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                          WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
         AND NOT c.relrowsecurity
@@ -96,8 +106,179 @@ fn tables_query() -> String {
         AND c.relreplident = 'd'
         AND NOT c.relhasrules
         AND c.reloftype = 0
-        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')
-      ORDER BY n.nspname, c.relname"
+        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')";
+
+/// Whether the relation `c` a trigger is on is one the pull reads back — a
+/// view, or a table [`tables_query`] holds.
+///
+/// A trigger is read with its relation or not at all. **Measured**, the engine
+/// allows a trigger on a partitioned table and on an `UNLOGGED` one, and a
+/// trigger read back without the relation it is on is a module whose `on:`
+/// names a table the schema does not have — `check_names` refuses that, so
+/// the whole pull was one nothing could load. The relation is already named
+/// as a limitation by [`partitioned_query`]; the trigger is named beside it
+/// by [`unheld_modules_query`] rather than silently gone.
+fn on_a_relation_the_pull_holds() -> String {
+    // The view reader's own filter too: measured, a user's `INSTEAD OF`
+    // trigger on a view an extension owns is not extension-owned itself, and
+    // read back it named a view the pull had left out.
+    let view_not_extension = not_an_extensions("c.oid", "pg_class");
+    format!(
+        "((c.relkind = 'v' AND {view_not_extension}) OR ({ORDINARY_TABLE} AND {NOT_ONE_OF_OURS}))"
+    )
+}
+
+/// Objects owned by an extension, which are nobody's declarations.
+///
+/// `CREATE EXTENSION` installs functions, views and types that belong to the
+/// extension and are dropped with it. `CREATE EXTENSION … SCHEMA app` puts them
+/// in a project's schema, where a reader without this filter reports every one
+/// as an undeclared module and the next plan offers to drop them — objects
+/// whose declaration lives in a `.sql` file the extension owns and this project
+/// does not have.
+///
+/// Left out rather than reported: they are not a limitation of the model, they
+/// are somebody else's objects. `DROP EXTENSION` is how one goes away
+/// (DECISIONS 305).
+const NOT_AN_EXTENSIONS: &str = "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                    WHERE d.objid = %OID% AND d.classid = %CLASS%::regclass
+                      AND d.deptype = 'e')";
+
+fn not_an_extensions(oid: &str, class: &str) -> String {
+    NOT_AN_EXTENSIONS
+        .replace("%OID%", oid)
+        .replace("%CLASS%", &format!("'pg_catalog.{class}'"))
+}
+
+/// Which `pg_proc` rows are modules this model holds.
+///
+/// One spelling, used by both the module query and the argument query, and the
+/// reason is not tidiness: a routine whose row the first query returns and the
+/// second does not is keyed as `f()` — a different object from `f(integer)`,
+/// under a name that looks right. One rule, one home (PITFALLS).
+const ROUTINE_IS_A_MODULE: &str = "p.prokind IN ('f', 'p')";
+
+/// Views, functions, procedures and triggers, each with the text this engine
+/// deparses for it (ADR-0009 §2).
+///
+/// One query and not four, because the assembler wants one list and the four
+/// catalogs answer the same four questions — the kind, where it lives, what it
+/// is called, and what it says. `pg_get_functiondef` is asked only of `f` and
+/// `p`: **measured**, it refuses an aggregate by name (`"agg" is an aggregate
+/// function`), so a `prokind` filter is not tidiness but the difference between
+/// a pull and an error.
+///
+/// The identity's argument types are a second query — one row each — rather
+/// than a joined string, because a type name may contain the character that
+/// would separate them: `format_type` quotes one that needs it, and a reader
+/// splitting on commas would cut `"a,b"` in half.
+fn modules_query() -> String {
+    let view_not_extension = not_an_extensions("c.oid", "pg_class");
+    let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
+    let trigger_not_extension = not_an_extensions("tg.oid", "pg_trigger");
+    let held = on_a_relation_the_pull_holds();
+    format!(
+        "SELECT c.oid::int8 AS oid, 'v' AS kind, n.nspname AS schema_name,
+                c.relname AS name, '' AS on_table,
+                pg_catalog.pg_get_viewdef(c.oid, true) AS definition
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind = 'v'
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {view_not_extension}
+          UNION ALL
+         SELECT p.oid::int8, p.prokind::text, n.nspname, p.proname, '',
+                pg_catalog.pg_get_functiondef(p.oid)
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE {ROUTINE_IS_A_MODULE}
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {proc_not_extension}
+          UNION ALL
+         SELECT tg.oid::int8, 't', n.nspname, tg.tgname, c.relname,
+                pg_catalog.pg_get_triggerdef(tg.oid)
+           FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT tg.tgisinternal
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {trigger_not_extension}
+            AND {held}
+          ORDER BY 3, 4, 1"
+    )
+}
+
+/// One row per routine argument, in position order.
+///
+/// `format_type` under the canonical empty `search_path`, which is what makes
+/// this the identity the engine keys on: a built-in bare, a user type
+/// schema-qualified, every modifier already discarded (ADR-0009 §1).
+fn module_args_query() -> String {
+    let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
+    format!(
+        "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
+                pg_catalog.format_type(u.ty, NULL) AS ty
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes)
+                    WITH ORDINALITY AS u(ty, pos)
+          WHERE {ROUTINE_IS_A_MODULE}
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {proc_not_extension}
+          ORDER BY 1, 2"
+    )
+}
+
+/// The module-shaped objects the model does not hold, so that they are named
+/// rather than missing — the same rule as [`unheld_query`] for tables.
+///
+/// A materialized view is a view with rows; an aggregate and a window function
+/// are `pg_proc` entries `pg_get_functiondef` refuses outright. Reading any of
+/// them back as the ordinary kind would make a plan that recreates it as
+/// something else.
+///
+/// [`NOT_AN_EXTENSIONS`] here too, and for the same reason it is on the module
+/// queries: an extension installed into a project's schema owns aggregates and
+/// materialized views of its own, and DECISIONS 305 says those are left out
+/// **silently** rather than reported. Reported, they are worse than noise —
+/// `managed_limitations` refuses every command for a limitation whose name is
+/// in the managed set, so an extension object colliding with a declared name
+/// would refuse a plan that is correct. A filter the ordinary reader applies
+/// and the limitation reader does not is a rule with a hole in it.
+fn unheld_modules_query() -> String {
+    let matview_not_extension = not_an_extensions("c.oid", "pg_class");
+    let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
+    let trigger_not_extension = not_an_extensions("tg.oid", "pg_trigger");
+    let held = on_a_relation_the_pull_holds();
+    format!(
+        "SELECT n.nspname AS schema_name, c.relname AS name,
+                'a materialized view, which holds rows a plan would have to refresh' AS detail
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind = 'm'
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {matview_not_extension}
+          UNION ALL
+         SELECT n.nspname, p.proname,
+                CASE p.prokind WHEN 'a' THEN 'an aggregate function'
+                               ELSE 'a window function' END
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE p.prokind IN ('a', 'w')
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {proc_not_extension}
+          UNION ALL
+         SELECT n.nspname, c.relname || '.' || tg.tgname,
+                'a trigger on `' || n.nspname || '.' || c.relname
+                  || '` (not a table or a view this pull holds)'
+           FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT tg.tgisinternal
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {trigger_not_extension}
+            AND NOT {held}
+          ORDER BY 1, 2"
     )
 }
 
@@ -348,9 +529,41 @@ const BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
 ///
 /// A custom GUC under this tool's own prefix, so that a caller whose transaction
 /// this refuses is left holding nothing it did not already have.
-const PROBE_SET: &str = "SELECT pg_catalog.set_config('pbps.in_a_transaction', 'yes', true)";
-const PROBE_READ: &str =
+pub(crate) const PROBE_READ: &str =
     "SELECT COALESCE(current_setting('pbps.in_a_transaction', true), '') AS probe";
+
+/// A value this call invents, because a constant one can already be sitting in
+/// the session.
+///
+/// The probe is `set_config(…, is_local => true)` in one statement and
+/// `current_setting` in the next: inside a transaction the setting survives to
+/// be read, and outside one the implicit transaction ends and it does not.
+/// Compared against a constant, that read has a third outcome nobody asked
+/// for — a session that already carries
+/// `SET pbps.in_a_transaction = 'yes'` answers `'yes'` on an autocommit
+/// connection, and every caller of the probe then believes something the
+/// engine never said. On the rebuild's side that means `LOCK TABLE` released
+/// at the end of its own statement, and a carried-state read that is not
+/// serialized with the `DROP` at all: a guard still in the code and no longer
+/// guarding. On the pull's side it means the opposite and just as bad — a
+/// connection with no transaction refused as though it had one.
+///
+/// A value invented per call cannot be sitting in the session. The read is
+/// then only equal if *this* call's `set_config` survived, which is exactly
+/// the question. Hex and `-` only, because it is interpolated into a
+/// statement.
+pub(crate) fn probe_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    format!("{:x}-{:x}-{:x}", std::process::id(), nanos, n)
+}
+
+pub(crate) fn probe_set(token: &str) -> String {
+    format!("SELECT pg_catalog.set_config('pbps.in_a_transaction', '{token}', true)")
+}
 
 /// `true` is `is_local`: the setting belongs to this transaction and goes back
 /// when it ends, whichever way it ends.
@@ -617,6 +830,44 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             nondefault_column_options: flag(&row, "nondefault_column_options")?,
         });
     }
+    for row in conn.query(&modules_query()).await? {
+        let kind = first_char(&text(&row, "kind")?).unwrap_or('?');
+        let schema = text(&row, "schema_name")?;
+        let name = text(&row, "name")?;
+        // Not `text`: a `NULL` here is not a column this reader has lost track
+        // of, and saying so sends the reader to the one place that is right.
+        let Some(definition) = optional_text(&row, "definition")? else {
+            return Err(deparsed_away(kind, &schema, &name));
+        };
+        raw.modules.push(RawModule {
+            oid: number(&row, "oid")?,
+            kind,
+            schema,
+            name,
+            on_table: text(&row, "on_table")?,
+            definition,
+        });
+    }
+    for row in conn.query(&module_args_query()).await? {
+        raw.module_args.push(RawModuleArg {
+            routine_oid: number(&row, "oid")?,
+            position: number(&row, "pos")?,
+            ty: text(&row, "ty")?,
+        });
+    }
+    for row in conn.query(&unheld_modules_query()).await? {
+        let schema = text(&row, "schema_name")?;
+        let name = text(&row, "name")?;
+        warnings.push(Limitation {
+            table: TableName::new(&schema, &name),
+            detail: format!(
+                "`{schema}.{name}` is {}, which this model does not hold. It is left out of the \
+                 pull entirely — not read back as an ordinary module, which would make a plan \
+                 that recreates it as something else.",
+                text(&row, "detail")?
+            ),
+        });
+    }
     Ok((raw, warnings))
 }
 
@@ -658,10 +909,11 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
 /// transaction would answer from their uncommitted writes, which is not what
 /// "what the database looks like" means.
 async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
-    conn.query(PROBE_SET).await?;
+    let token = probe_token();
+    conn.query(&probe_set(&token)).await?;
     let rows = conn.query(PROBE_READ).await?;
     let row = rows.first().ok_or_else(|| missing("probe"))?;
-    if text(row, "probe")? == "yes" {
+    if text(row, "probe")? == token {
         return Err(DbError::Driver {
             code: None,
             message: "this connection already has an open transaction, and a pull cannot run \
@@ -687,12 +939,75 @@ fn schema_changed_underneath(e: DbError) -> DbError {
                  this is that guard firing. Run it again when the other change has finished."
             ),
         },
+        // A deadlock, which reaches an operator as `db error` and nothing
+        // else. It is the third way the catalog moves under this read, and
+        // the only one where the engine has already decided the outcome.
+        //
+        // The pull deparses every view in the database, and
+        // `pg_get_viewdef` opens each one — so the read holds `ACCESS SHARE`
+        // on relations a rebuild wants exclusively (ADR-0009 §3), and the two
+        // orders can cross. Measured from the server log:
+        //
+        // ```text
+        // deadlock detected
+        // Process A: LOCK TABLE "app"."granted" IN ACCESS EXCLUSIVE MODE
+        // Process B: SELECT … pg_get_viewdef(c.oid, true) …
+        // ```
+        //
+        // Nothing is half-read and nothing is half-written: the engine chose a
+        // victim and rolled it back whole. What the message has to say is that
+        // it was a tie, not a fault, and that running again is the answer.
+        DbError::Driver { code, .. } if code.as_deref() == Some("40P01") => DbError::Driver {
+            code: code.clone(),
+            message: format!(
+                "the catalog changed while it was being read: {e} (deadlock).\n\
+                 Another session was changing this database while the pull was reading it, and \
+                 the two needed the same objects in opposite orders. The engine broke the tie \
+                 and rolled this read back whole. Run it again when the other change has \
+                 finished."
+            ),
+        },
         DbError::Driver { .. }
         | DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => e,
+    }
+}
+
+/// A deparse that came back `NULL`, which is the object having gone.
+///
+/// **Measured**, the deparsers answer `NULL` for an oid that is not there
+/// rather than raising:
+///
+/// ```text
+/// pg_get_viewdef(999999, true)  ->  NULL
+/// pg_get_functiondef(999999)    ->  NULL
+/// ```
+///
+/// The pull reads the catalog in one `REPEATABLE READ` snapshot so that it
+/// cannot report half of a change as a whole schema — but a deparser resolves
+/// its oid through the syscache against a *fresh* snapshot, so an object
+/// dropped between the scan and the deparse comes back as a row with a name
+/// and no definition. That is the catalog moving under the read, which is the
+/// case [`schema_changed_underneath`] already exists for; it arrives here as a
+/// `NULL` instead of as `XX000` because these two functions do not raise.
+///
+/// Reported as [`missing`] it read as "the query and this code have gone out
+/// of step", which sends a reader to look for a renamed column — the one thing
+/// that is not wrong here. **Absent, empty and unreadable are three different
+/// things**, and a vanished object is the third.
+fn deparsed_away(kind: char, schema: &str, name: &str) -> DbError {
+    DbError::Driver {
+        code: None,
+        message: format!(
+            "the catalog changed while it was being read: `{schema}.{name}` (kind `{kind}`) was \
+             there when the catalog was scanned and gone when its definition was deparsed.\n\
+             Something applied DDL to this database during the pull. The read is taken in one \
+             snapshot so that it cannot report half of a change as a whole schema, and this is \
+             that guard firing. Run it again when the other change has finished."
+        ),
     }
 }
 
@@ -818,8 +1133,18 @@ mod tests {
         // Set, then read in a *separate* statement: the whole probe is that a
         // `SET LOCAL` outlives its own statement only inside a transaction.
         // Pinned live by `a_pull_inside_the_callers_own_transaction_is_refused`.
-        assert!(PROBE_SET.contains("'pbps.in_a_transaction', 'yes', true"));
+        assert!(probe_set("abc").contains("'pbps.in_a_transaction', 'abc', true"));
         assert!(PROBE_READ.contains("current_setting('pbps.in_a_transaction', true)"));
+        // And the value is this call's, not a constant a session can already
+        // hold: two probes never agree, so a retained setting cannot answer
+        // for one of them.
+        assert_ne!(probe_token(), probe_token());
+        assert!(
+            probe_token()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "the token is interpolated into a statement"
+        );
     }
 
     /// The filters ADR-0012 §6 and this file's own documentation turn on. A
@@ -876,6 +1201,50 @@ mod tests {
     /// between them: `validate_table` refuses a declaration naming one of these
     /// tables because the reader hides it, so a name added to one and not the
     /// other is a table that is created and then never seen again.
+    /// The module query and the argument query have to agree about which
+    /// `pg_proc` rows are modules, and the failure if they do not is silent:
+    /// a routine the first returns and the second does not is keyed `f()`,
+    /// which is a different object from `f(integer)` under a name that looks
+    /// right.
+    /// A trigger is read with its relation or not at all: the arm that reads
+    /// it and the arm that names it as left out are the table reader's own
+    /// predicate and its negation, and a copy of that predicate would be a
+    /// rule with two spellings.
+    #[test]
+    fn a_trigger_is_selected_by_the_predicate_that_selects_its_table() {
+        assert!(tables_query().contains(ORDINARY_TABLE));
+        let held = on_a_relation_the_pull_holds();
+        assert!(held.contains(ORDINARY_TABLE));
+        assert!(held.contains("c.relkind = 'v'"));
+        assert!(held.contains(&not_an_extensions("c.oid", "pg_class")));
+        assert!(
+            modules_query().contains(&format!("AND {held}")),
+            "{}",
+            modules_query()
+        );
+        assert!(
+            unheld_modules_query().contains(&format!("AND NOT {held}")),
+            "{}",
+            unheld_modules_query()
+        );
+    }
+
+    #[test]
+    fn a_routine_and_its_arguments_are_selected_by_one_predicate() {
+        for query in [modules_query(), module_args_query()] {
+            assert!(query.contains(ROUTINE_IS_A_MODULE), "{query}");
+            // And no second one: a query that filtered `prokind` twice could
+            // satisfy the line above and still disagree with the other query.
+            // The `prokind` the module query *selects* is not a filter.
+            assert_eq!(query.matches("prokind IN").count(), 1, "{query}");
+        }
+        // The extension filter is the other half of "the same rows", and it is
+        // built by one function for both.
+        for query in [modules_query(), module_args_query()] {
+            assert!(query.contains("d.deptype = 'e'"), "{query}");
+        }
+    }
+
     #[test]
     fn the_filter_hides_exactly_the_names_the_validation_refuses() {
         for name in OURS {

@@ -61,7 +61,8 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Column, ColumnRef, ColumnType, ForeignKey, Identity, Index, IndexColumn,
-    PrimaryKey, ReferentialAction, Schema, Table, TableName, UniqueConstraint,
+    Module, ModuleId, ModuleKind, ObjectName, PrimaryKey, ReferentialAction, RoutineArg, RoutineId,
+    Schema, Table, TableName, UniqueConstraint,
 };
 
 use crate::types;
@@ -72,6 +73,32 @@ pub struct RawTable {
     pub oid: i64,
     pub schema: String,
     pub name: String,
+}
+
+/// One module, with the text this engine deparses for it.
+///
+/// The whole deparsed statement, not the part a declaration holds: where the
+/// prefix ends is a rule about this engine's grammar, and a rule is worth more
+/// where it can be tested without a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawModule {
+    pub oid: i64,
+    /// `v`, `f`, `p` or `t` — `relkind` for a view, `prokind` for a routine.
+    pub kind: char,
+    pub schema: String,
+    pub name: String,
+    /// The table a trigger is on, empty for every other kind.
+    pub on_table: String,
+    pub definition: String,
+}
+
+/// One argument of one routine's identity, as `format_type` prints it under the
+/// canonical empty `search_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawModuleArg {
+    pub routine_oid: i64,
+    pub position: i64,
+    pub ty: String,
 }
 
 /// One live column of one table.
@@ -235,6 +262,8 @@ pub struct RawCatalog {
     pub columns: Vec<RawColumn>,
     pub constraints: Vec<RawConstraint>,
     pub indexes: Vec<RawIndex>,
+    pub modules: Vec<RawModule>,
+    pub module_args: Vec<RawModuleArg>,
 }
 
 /// One fact about the database that the model cannot hold.
@@ -501,7 +530,178 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         pulled.schema.tables.insert(parts.name.clone(), table);
     }
 
+    let args_by_routine = group(&raw.module_args, |a| a.routine_oid);
+    for raw_module in &raw.modules {
+        add_module(raw_module, &args_by_routine, &mut pulled);
+    }
+
     pulled
+}
+
+/// One module, or a note saying why it is not one.
+///
+/// Nothing here ever leaves a module out silently: the three ways this can fail
+/// — a kind the reader does not know, an argument type that is not one, and a
+/// deparsed statement whose prefix is not the shape this engine writes — each
+/// produce a warning naming the object. A module read as absent is a plan that
+/// creates it, on top of the one that is already there.
+fn add_module(
+    raw: &RawModule,
+    args_by_routine: &BTreeMap<i64, Vec<&RawModuleArg>>,
+    pulled: &mut Pulled,
+) {
+    let here = ObjectName::new(&raw.schema, &raw.name);
+    let (kind, id, definition) = match raw.kind {
+        'v' => (
+            ModuleKind::View,
+            ModuleId::Named(here.clone()),
+            // `pg_get_viewdef` returns the query and ends it with a `;`, and
+            // the declaration holds what follows `AS` — where a `;` would end
+            // the `CREATE` statement rather than the query inside it.
+            Some(raw.definition.trim().trim_end_matches(';').trim_end()),
+        ),
+        kind @ ('f' | 'p') => {
+            let mut args = Vec::new();
+            for arg in args_by_routine.get(&raw.oid).map_or(&[][..], Vec::as_slice) {
+                match arg.ty.parse::<RoutineArg>() {
+                    Ok(parsed) => args.push(parsed),
+                    Err(e) => {
+                        return note(
+                            pulled,
+                            &here,
+                            format!(
+                                "`{here}` is a routine whose argument {} this model cannot hold as \
+                                 an identity: {e}. It is left out of the pull, because a routine \
+                                 keyed by the wrong signature is one whose `DROP` names another \
+                                 object.",
+                                arg.position
+                            ),
+                        );
+                    }
+                }
+            }
+            let prefix = if kind == 'f' {
+                "CREATE OR REPLACE FUNCTION "
+            } else {
+                "CREATE OR REPLACE PROCEDURE "
+            };
+            (
+                if kind == 'f' {
+                    ModuleKind::Function
+                } else {
+                    ModuleKind::Procedure
+                },
+                ModuleId::Routine(RoutineId::new(here.clone(), args)),
+                after_the_name(&raw.definition, prefix),
+            )
+        }
+        't' => (
+            ModuleKind::Trigger,
+            ModuleId::Trigger {
+                on: ObjectName::new(&raw.schema, &raw.on_table),
+                name: raw.name.clone(),
+            },
+            after_the_name(&raw.definition, "CREATE TRIGGER "),
+        ),
+        other => {
+            return note(
+                pulled,
+                &here,
+                format!(
+                    "`{here}` is a module of a kind this reader does not know (`{other}`). It is \
+                     left out of the pull rather than read back as one of the kinds it is not."
+                ),
+            );
+        }
+    };
+
+    let Some(definition) = definition.filter(|d| !d.is_empty()) else {
+        return note(
+            pulled,
+            &here,
+            format!(
+                "`{here}` is a module whose definition this reader could not separate from the \
+                 statement the engine deparsed for it. It is left out of the pull rather than \
+                 recorded with a body that is not its own — an empty definition would read as a \
+                 module with nothing in it, and the next plan would write that back."
+            ),
+        );
+    };
+
+    // The same round trip the tables are asked for: a module id is written as
+    // text and read back by parsing it, and PostgreSQL will give a name that
+    // does not survive that — a view called `f(int)`, a schema called `a.b`.
+    if ModuleId::from_str(&id.to_string()).as_ref() != Ok(&id) {
+        return note(
+            pulled,
+            &here,
+            format!(
+                "`{id}` is a module whose identity the declaration format cannot write back: it \
+                 is stored as text and read by parsing it, and this one does not survive that. It \
+                 is left out of the pull entirely rather than pulled into a schema that will not \
+                 load."
+            ),
+        );
+    }
+
+    pulled.schema.modules.insert(
+        id,
+        Module {
+            kind,
+            description: None,
+            definition: definition.to_owned(),
+        },
+    );
+}
+
+/// The part of a deparsed statement a declaration holds: everything after the
+/// object's name.
+///
+/// **Measured on 18.6**, the three shapes this has to cut:
+///
+/// ```text
+/// CREATE OR REPLACE FUNCTION m4."odd Name"(a integer)⏎ RETURNS integer …
+/// CREATE OR REPLACE PROCEDURE m4.p(a integer)⏎ LANGUAGE sql …
+/// CREATE TRIGGER "audit x" AFTER INSERT ON m4.t FOR EACH ROW …
+/// ```
+///
+/// The name is stepped over rather than searched for. Looking for the first
+/// `(` finds the wrong one in `"f(x)"."g"`, and rebuilding the name to compare
+/// against would have to reproduce the engine's own quoting rules — which is
+/// the deparser's job, not this reader's. `None` where the text is not this
+/// shape at all, so that the caller can say so rather than record an empty
+/// body (DECISIONS 304).
+fn after_the_name<'a>(deparsed: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = deparsed.trim_start().strip_prefix(prefix)?;
+    Some(after_a_qualified_name(rest)?.trim())
+}
+
+fn after_a_qualified_name(text: &str) -> Option<&str> {
+    let mut rest = after_one_identifier(text)?;
+    while let Some(next) = rest.strip_prefix('.') {
+        rest = after_one_identifier(next)?;
+    }
+    Some(rest)
+}
+
+fn after_one_identifier(text: &str) -> Option<&str> {
+    let Some(mut rest) = text.strip_prefix('"') else {
+        // A bare identifier is what the deparser writes when no quoting is
+        // needed, and it ends at the first character that cannot continue one.
+        let end = text
+            .find(|c: char| !pbps_dialect::continues_ident(c))
+            .unwrap_or(text.len());
+        return (end > 0).then(|| &text[end..]);
+    };
+    loop {
+        let close = rest.find('"')?;
+        let tail = &rest[close + 1..];
+        // A doubled quote is a quote inside the name and does not close it.
+        match tail.strip_prefix('"') {
+            Some(after) => rest = after,
+            None => return Some(tail),
+        }
+    }
 }
 
 fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Vec<&T>> {
@@ -1439,6 +1639,190 @@ fn unresolved(pulled: &mut Pulled, parts: &Parts, kind: &str, name: &str, attnum
 
 #[cfg(test)]
 mod tests {
+
+    fn raw_module(kind: char, name: &str, definition: &str) -> RawModule {
+        RawModule {
+            oid: 1,
+            kind,
+            schema: "app".into(),
+            name: name.into(),
+            on_table: String::new(),
+            definition: definition.into(),
+        }
+    }
+
+    fn modules(raw: RawCatalog) -> Pulled {
+        assemble(&raw)
+    }
+
+    /// Measured on 18.6, one shape per kind. The declaration holds everything
+    /// after the name, so what this asserts is where the cut falls — including
+    /// on a name the deparser had to quote, which is the case a search for the
+    /// first `(` gets wrong.
+    #[test]
+    fn a_deparsed_statement_is_cut_where_the_declaration_begins() {
+        let raw = RawCatalog {
+            modules: vec![
+                raw_module(
+                    'v',
+                    "v",
+                    " SELECT id,\n    a\n   FROM app.t\n  WHERE a IS NULL;",
+                ),
+                raw_module(
+                    'f',
+                    "odd Name",
+                    "CREATE OR REPLACE FUNCTION app.\"odd Name\"(a integer)\n RETURNS integer\n \
+                     LANGUAGE sql\nAS $function$ SELECT a $function$\n",
+                ),
+                raw_module(
+                    'p',
+                    "p",
+                    "CREATE OR REPLACE PROCEDURE app.p(a integer)\n LANGUAGE sql\nAS $procedure$ \
+                     SELECT 1 $procedure$\n",
+                ),
+                RawModule {
+                    on_table: "t".into(),
+                    ..raw_module(
+                        't',
+                        "audit x",
+                        "CREATE TRIGGER \"audit x\" AFTER INSERT ON app.t FOR EACH ROW EXECUTE \
+                         FUNCTION app.trf()",
+                    )
+                },
+            ],
+            module_args: vec![RawModuleArg {
+                routine_oid: 1,
+                position: 1,
+                ty: "integer".into(),
+            }],
+            ..RawCatalog::default()
+        };
+        let pulled = modules(raw);
+        let got: Vec<(String, String)> = pulled
+            .schema
+            .modules
+            .iter()
+            .map(|(id, m)| (id.to_string(), m.definition.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                // The `;` `pg_get_viewdef` ends the query with is not part of
+                // what follows `AS`, and neither is the layout it leads with.
+                (
+                    "app.v".to_owned(),
+                    "SELECT id,\n    a\n   FROM app.t\n  WHERE a IS NULL".to_owned(),
+                ),
+                (
+                    "app.odd Name(integer)".to_owned(),
+                    "(a integer)\n RETURNS integer\n LANGUAGE sql\nAS $function$ SELECT a \
+                     $function$"
+                        .to_owned()
+                ),
+                (
+                    "app.p(integer)".to_owned(),
+                    "(a integer)\n LANGUAGE sql\nAS $procedure$ SELECT 1 $procedure$".to_owned()
+                ),
+                (
+                    "app.t.audit x".to_owned(),
+                    "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()".to_owned()
+                ),
+            ],
+            "{pulled:#?}"
+        );
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// Absent, empty and unreadable are three different things. A module the
+    /// reader cannot cut is named and left out — never recorded with an empty
+    /// body, which the next plan would write back over a working object.
+    #[test]
+    fn a_statement_this_reader_cannot_cut_is_named_and_never_read_as_empty() {
+        for definition in [
+            // Not the prefix this engine writes.
+            "CREATE FUNCTION app.f(a integer) RETURNS integer",
+            // The prefix, and then nothing that is a name.
+            "CREATE OR REPLACE FUNCTION (a integer)",
+            // A quoted name nothing closes.
+            "CREATE OR REPLACE FUNCTION app.\"f(a integer)",
+            // The name, and nothing after it.
+            "CREATE OR REPLACE FUNCTION app.f",
+            "",
+        ] {
+            let pulled = modules(RawCatalog {
+                modules: vec![raw_module('f', "f", definition)],
+                ..RawCatalog::default()
+            });
+            assert!(
+                pulled.schema.modules.is_empty(),
+                "`{definition}` produced a module"
+            );
+            assert_eq!(pulled.warnings.len(), 1, "`{definition}`");
+            assert!(
+                pulled.warnings[0].contains("app.f"),
+                "{}",
+                pulled.warnings[0]
+            );
+        }
+    }
+
+    /// The same question the tables are asked: a name the declaration format
+    /// cannot write back takes its object out of the pull. A view called
+    /// `f(int)` reads back as a routine with an argument list, which is a
+    /// different object under a key nothing would ever match.
+    #[test]
+    fn a_module_whose_name_the_declaration_cannot_write_is_left_out_and_named() {
+        let pulled = modules(RawCatalog {
+            modules: vec![raw_module('v', "f(int)", "SELECT 1")],
+            ..RawCatalog::default()
+        });
+        assert!(pulled.schema.modules.is_empty(), "{pulled:#?}");
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("cannot write back"),
+            "{}",
+            pulled.warnings[0]
+        );
+    }
+
+    /// A routine keyed by the wrong signature is a routine whose `DROP` names
+    /// another object, so an argument spelling this model cannot hold takes it
+    /// out rather than being dropped from the list.
+    #[test]
+    fn a_routine_argument_the_model_cannot_hold_takes_the_routine_out() {
+        let pulled = modules(RawCatalog {
+            modules: vec![raw_module(
+                'f',
+                "f",
+                "CREATE OR REPLACE FUNCTION app.f(a integer) RETURNS integer",
+            )],
+            module_args: vec![RawModuleArg {
+                routine_oid: 1,
+                position: 1,
+                ty: "integer; DROP TABLE t".into(),
+            }],
+            ..RawCatalog::default()
+        });
+        assert!(pulled.schema.modules.is_empty(), "{pulled:#?}");
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("app.f"),
+            "{}",
+            pulled.warnings[0]
+        );
+    }
+
+    /// A kind the reader has never seen is not read back as one of the kinds it
+    /// is not — the failure that would recreate a materialized view as a view.
+    #[test]
+    fn a_kind_this_reader_does_not_know_is_named_rather_than_guessed() {
+        let pulled = modules(RawCatalog {
+            modules: vec![raw_module('m', "mv", "SELECT 1")],
+            ..RawCatalog::default()
+        });
+        assert!(pulled.schema.modules.is_empty(), "{pulled:#?}");
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+    }
     use super::*;
 
     fn table(oid: i64, name: &str) -> RawTable {
@@ -1531,6 +1915,7 @@ mod tests {
             ],
             constraints: vec![pk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
@@ -1553,6 +1938,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![pk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).primary_key.is_none());
@@ -1572,6 +1958,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![not_null],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).checks.is_empty());
@@ -1590,6 +1977,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![odd],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(pulled.limitations.len(), 1);
@@ -1613,6 +2001,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![pk],
             indexes: vec![backing, index(51, 1, "t_a_ix")],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).primary_key.is_some());
@@ -1636,6 +2025,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -1670,6 +2060,7 @@ mod tests {
             ],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         let key = &pulled.schema.tables[&TableName::new("app", "t")].foreign_keys["t_fk"];
@@ -1692,6 +2083,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -1720,6 +2112,7 @@ mod tests {
             ],
             constraints: Vec::new(),
             indexes: vec![ix],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         let read = &only(&pulled).indexes["t_ix"];
@@ -1746,6 +2139,7 @@ mod tests {
                 columns: vec![col(1, 1, "a", "integer")],
                 constraints: Vec::new(),
                 indexes: vec![ix],
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             assert_eq!(
@@ -1781,6 +2175,7 @@ mod tests {
                 columns: vec![col(1, 1, "a", "integer")],
                 constraints: Vec::new(),
                 indexes: vec![ix],
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             assert!(only(&pulled).indexes.is_empty(), "{name}");
@@ -1804,6 +2199,7 @@ mod tests {
             columns: vec![column],
             constraints: vec![check],
             indexes: vec![ix],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         let read = only(&pulled);
@@ -1843,6 +2239,7 @@ mod tests {
                 columns: vec![col(1, 1, "when", spelling)],
                 constraints: Vec::new(),
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             assert!(pulled.schema.tables.is_empty(), "{spelling}");
@@ -1858,6 +2255,7 @@ mod tests {
             columns: vec![col(1, 1, "when", "timestamp with time zone")],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(
@@ -1887,6 +2285,7 @@ mod tests {
                 columns: vec![column],
                 constraints: Vec::new(),
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             assert_eq!(!pulled.warnings.is_empty(), reported, "always={always}");
@@ -1912,6 +2311,7 @@ mod tests {
             columns: vec![column],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(pulled.limitations.len(), 1);
@@ -1932,6 +2332,7 @@ mod tests {
             columns: vec![column],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(only(&pulled).columns["total"].default, None);
@@ -1957,6 +2358,7 @@ mod tests {
                 columns: vec![col(1, 1, "a", "integer")],
                 constraints: vec![c],
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             let read = only(&pulled);
@@ -1982,6 +2384,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![c],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).unique.is_empty());
@@ -2009,6 +2412,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -2034,6 +2438,7 @@ mod tests {
             columns: vec![col(1, 1, "id", "integer")],
             constraints: vec![check],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(only(&pulled).checks["t_ck"].expression, "(id > 0)");
@@ -2051,6 +2456,7 @@ mod tests {
             columns: vec![col(1, 1, "id", "integer")],
             constraints: vec![check],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).checks.is_empty());
@@ -2073,6 +2479,7 @@ mod tests {
                 columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
                 constraints: vec![fk],
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             assert_eq!(
@@ -2097,6 +2504,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: Vec::new(),
             indexes: vec![ix],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).indexes.is_empty());
@@ -2116,6 +2524,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: Vec::new(),
             indexes: vec![ix.clone()],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).indexes.is_empty());
@@ -2130,6 +2539,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![uq],
             indexes: vec![ix],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).unique.is_empty());
@@ -2150,6 +2560,7 @@ mod tests {
             columns: vec![column],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(
@@ -2172,6 +2583,7 @@ mod tests {
             columns: vec![column],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(only(&pulled).columns["name"].ty.to_string(), "text");
@@ -2210,6 +2622,7 @@ mod tests {
                 columns: vec![column],
                 constraints: Vec::new(),
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             assert_eq!(
@@ -2243,6 +2656,7 @@ mod tests {
             ],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -2265,6 +2679,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "text")],
             constraints: Vec::new(),
             indexes: vec![ix],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).indexes.is_empty());
@@ -2289,6 +2704,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), col(1, 2, "b", "integer")],
             constraints: vec![pk],
             indexes: vec![backing],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).primary_key.is_none());
@@ -2317,6 +2733,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), col(2, 1, "a", "integer")],
             constraints: vec![fk],
             indexes: vec![referenced],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         let p = &pulled.schema.tables[&TableName::new("app", "p")];
@@ -2354,6 +2771,7 @@ mod tests {
                 columns: vec![col(1, 1, "a", "integer")],
                 constraints: vec![c],
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             let t = only(&pulled);
@@ -2384,6 +2802,7 @@ mod tests {
             columns: vec![column],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         // Carried: the default is exactly what the model says. Named: the
@@ -2424,6 +2843,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).foreign_keys.is_empty());
@@ -2461,6 +2881,7 @@ mod tests {
             columns: vec![col(1, 1, "x", "integer")],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -2481,6 +2902,7 @@ mod tests {
             columns: vec![col(1, 1, "a.b", "integer")],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -2522,6 +2944,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), col(2, 1, "a", "integer")],
             constraints: vec![fk],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(pulled.schema.tables.len(), 1, "{:?}", pulled.schema.tables);
@@ -2592,6 +3015,7 @@ mod tests {
             ],
             constraints: vec![fk, pk],
             indexes: vec![backing],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(
@@ -2691,6 +3115,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer")],
             constraints: vec![c],
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).checks.is_empty());
@@ -2731,6 +3156,7 @@ mod tests {
                 columns: vec![col(1, 1, "id", "integer"), col(1, 2, "valid", "daterange")],
                 constraints: vec![c],
                 indexes: Vec::new(),
+                ..RawCatalog::default()
             };
             let pulled = assemble(&raw);
             let t = only(&pulled);
@@ -2775,6 +3201,7 @@ mod tests {
             columns: vec![col(1, 1, "a", "integer"), column],
             constraints: Vec::new(),
             indexes: Vec::new(),
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert_eq!(pulled.limitations.len(), 1);
@@ -2799,6 +3226,7 @@ mod tests {
             columns: vec![column, col(1, 2, "note", "text")],
             constraints: vec![pk],
             indexes: vec![backing],
+            ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);

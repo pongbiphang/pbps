@@ -61,6 +61,28 @@ impl Dialect for Mssql {
             quoted_identifiers: &[('[', ']'), ('"', '"')],
             escape_strings: false,
             dollar_quoted_strings: false,
+            string_prefixes: &["n"],
+            identifier_continues: pbps_model::module::is_regular_identifier_continue,
+            reserved: ident::is_reserved,
+            unicode_identifiers: false,
+        }
+    }
+
+    /// The module's own schema, then `dbo`. **Measured** on SQL Server 2022:
+    /// with `b.z` and `dbo.z` both present, `CREATE VIEW a.x AS SELECT *
+    /// FROM z` reads `dbo.z`; with `a.p` and `dbo.p` both present it reads
+    /// `a.p`; with only `b.z` it is refused (`Invalid object name 'z'`). So
+    /// the own schema outranks `dbo`, and nothing else is on the path. The
+    /// second step is the caller's default schema, which is `dbo` for every
+    /// login that has not been given another; a deployer with another default
+    /// schema says the edge with `depends_on:` (DECISIONS 317).
+    fn bare_name_rank(&self, from: &str, to: &str) -> Option<usize> {
+        if from.eq_ignore_ascii_case(to) {
+            Some(0)
+        } else if to.eq_ignore_ascii_case("dbo") {
+            Some(1)
+        } else {
+            None
         }
     }
 
@@ -169,6 +191,17 @@ impl Dialect for Mssql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare name resolves in the module's own schema first and then in
+    /// `dbo`, compared the way this engine compares names, and nowhere else.
+    #[test]
+    fn a_bare_name_ranks_the_own_schema_ahead_of_dbo() {
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "app"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "APP"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "dbo"), Some(1));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "dbo", "dbo"), Some(0));
+        assert_eq!(Dialect::bare_name_rank(&Mssql, "app", "other"), None);
+    }
 
     /// The framing moved here from `pbps-db` unchanged (ADR-0014 §2). The two
     /// properties the live rollback test depends on are pinned where the text

@@ -36,7 +36,6 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::name::TableName;
-use crate::types::ColumnType;
 
 /// The qualified name of a database object: `schema.object`.
 ///
@@ -45,6 +44,327 @@ use crate::types::ColumnType;
 /// named after a table" is not a rule to remember but a consequence of the two
 /// names having one type. [`check_names`] is that consequence made checkable.
 pub type ObjectName = TableName;
+
+/// One argument type of a routine's identity, in the engine's own spelling.
+///
+/// **Not a [`ColumnType`], and the difference is not a nicety.** Measured on
+/// PostgreSQL 18.6, a routine's identity is `proargtypes` rendered by
+/// `format_type` — the same list `oid::regprocedure` prints — and it holds
+/// spellings a column type cannot:
+///
+/// ```text
+/// CREATE FUNCTION id.a(varchar(10), "char", int[], id.pos) ...
+///   -> id.a(character varying,"char",integer[],id.pos)
+/// ```
+///
+/// An array, a quoted name whose case the engine keeps, and a schema-qualified
+/// user type. [`ColumnType`]'s base name admits ASCII alphanumerics, underscore
+/// and space and lowercases what it holds, so of those four one is refused for
+/// its brackets, one for its quotes, one for its dot, and the quoted one would
+/// have its case taken away as well. And a dialect's column normalizer is a
+/// closed catalogue of the engine's own type names, which refuses a domain the
+/// user declared — while a routine may take one.
+///
+/// So this holds text and compares as text, for the reason
+/// [`Module::definition`] does: **the engine is the normalizer.**
+/// `Dialect::normalize_routine_arg` turns a declared spelling into the one the
+/// catalog will show, and this type carries the result.
+///
+/// Modifiers are gone by then, not stripped here: the engine discards them
+/// when it identifies a routine (`f(varchar(10))` and `f(varchar(20))` are one
+/// function, ADR-0009 §1), which is the dialect's normalization to perform and
+/// this type's to record.
+///
+/// # The one opinion it does have
+///
+/// Inviolable constraint 1 says two semantically identical schemas must be
+/// `==`, and `app.f(int, text)` and `app.f(INT,text)` are one key, before any
+/// dialect is present to say so — the loader builds the map, and an offline
+/// `plan` compares two maps without a connection. So the text is canonicalized
+/// on the way in, and **only where every SQL engine agrees**: outside double
+/// quotes, ASCII case does not matter and whitespace around punctuation does
+/// not either. Inside them nothing is touched, which is the whole reason this
+/// is not a [`ColumnType`]: `"char"` is a type whose case the engine keeps,
+/// and lowercasing it would name a different type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutineArg(String);
+
+impl RoutineArg {
+    /// The spelling, unchanged.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What a routine argument's text may not be.
+///
+/// Every rule here is about the *shape* the identity string needs, and none is
+/// about which types exist: a type this model has never heard of is a type the
+/// engine may still have, and refusing it here would refuse a valid routine
+/// because the model's catalogue is younger than the database.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RoutineArgError {
+    #[error("a routine argument type is empty")]
+    Empty,
+
+    /// Text that is not one type name: an unbalanced bracket, quote or
+    /// parenthesis; a comma outside all of them, which is the character that
+    /// separates one argument from the next; or, outside quotes, a character a
+    /// type name is not written with.
+    #[error("`{0}` is not one routine argument type")]
+    Shape(String),
+}
+
+impl FromStr for RoutineArg {
+    type Err = RoutineArgError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // ASCII whitespace, here and below: to this engine every non-ASCII
+        // byte is an identifier character, a non-breaking space included.
+        // Measured, `CREATE FUNCTION r8.f(v r8.a\u{a0}b)` is accepted and its
+        // identity reads `r8.f(r8."a\u{a0}b")` — the byte kept and the name
+        // quoted — while `r8.a b` with a plain space names no type at all. A
+        // fold that took Unicode's word for what whitespace is turned the
+        // first spelling into the second, and the key pointed at nothing.
+        let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+        if t.is_empty() {
+            return Err(RoutineArgError::Empty);
+        }
+        // A Unicode-escaped identifier first, so that the pass below sees the
+        // plain quoted name it spells and nothing else has to know the form.
+        let t = &*without_unicode_escapes(t)?;
+        // Structure and canonical form in one pass, because the second needs
+        // the first: whether a character is punctuation to fold around, or a
+        // byte of a quoted name to leave alone, is what the quote state says.
+        let mut out = String::with_capacity(t.len());
+        let mut parens = 0usize;
+        let mut brackets = 0usize;
+        let mut quoted = false;
+        let mut pending_space = false;
+        let mut chars = t.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if quoted {
+                out.push(c);
+                if c == '"' {
+                    // A doubled quote is a quote inside the name, which is how
+                    // both engines spell one, so it does not close the region.
+                    if t[i + 1..].starts_with('"') {
+                        out.push('"');
+                        chars.next();
+                    } else {
+                        quoted = false;
+                    }
+                }
+                continue;
+            }
+            if c.is_ascii_whitespace() {
+                pending_space = !out.is_empty();
+                continue;
+            }
+            match c {
+                '(' => parens += 1,
+                ')' => parens = parens.checked_sub(1).ok_or_else(|| shape(t))?,
+                '[' => brackets += 1,
+                ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
+                ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
+                ',' | '"' | '.' | '_' | '$' => {}
+                // Any non-ASCII byte is a name byte, which is the engine's own
+                // rule (`continues_ident`): a letter, a symbol, a space that is
+                // not the ASCII one. So is `$`, above — measured, `dl.money$type`
+                // is a type the engine identifies as `dl."money$type"`.
+                c if c.is_alphanumeric() || !c.is_ascii() => {}
+                // Everything else. A type name is written with letters,
+                // digits, `_`, `.`, and the punctuation above; a semicolon, an
+                // apostrophe or the start of a comment is not one, and this
+                // text is interpolated verbatim into `DROP FUNCTION` and
+                // `GRANT`. A whitelist makes that statement safe by
+                // construction instead of by review — and refusing an
+                // unwritable name costs nothing, because no catalog returns
+                // one.
+                _ => return Err(shape(t)),
+            }
+            // A space between two words is part of the name — `timestamp with
+            // time zone` — and a space beside punctuation is layout.
+            //
+            // `.` is in that punctuation, because the engine accepts a space
+            // around a qualified type's dot and never writes one back:
+            // **measured**, `CREATE FUNCTION md.spaced(a md . my_type)` is
+            // accepted and its identity reads `md.spaced(md.my_type)`. Left
+            // unfolded, the declared key and the catalog key differ, and every
+            // plan drops and recreates a routine that never changed.
+            if pending_space
+                && !matches!(c, '(' | ')' | '[' | ']' | ',' | '.')
+                && !out.ends_with(['(', '[', ',', '.'])
+            {
+                out.push(' ');
+            }
+            pending_space = false;
+            if c == '"' {
+                quoted = true;
+                out.push(c);
+            } else {
+                // **ASCII only**, which is the engine's rule and not a
+                // simplification of it: measured, `CREATE FUNCTION
+                // mn.f(a mn.Ätype)` reads back as `mn.f(mn."Ätype")` — the
+                // engine left the byte alone and quoted the name rather than
+                // folding it. A Unicode fold would turn the declared spelling
+                // into `ätype`, which is a *different* type name, and the key
+                // would then point at nothing. The dialect's own folding is
+                // ASCII (`unquoted` in the emitters), and this is the same
+                // rule in the model.
+                out.push(c.to_ascii_lowercase());
+            }
+        }
+        if quoted || parens != 0 || brackets != 0 {
+            return Err(shape(t));
+        }
+        Ok(RoutineArg(out))
+    }
+}
+
+fn shape(s: &str) -> RoutineArgError {
+    RoutineArgError::Shape(s.to_owned())
+}
+
+/// Every `U&"…"` outside a quoted region, with or without its `UESCAPE 'x'`,
+/// rewritten as the plain quoted identifier it spells.
+///
+/// PostgreSQL accepts the form wherever an identifier goes, a routine's
+/// argument type included: **measured**, `CREATE FUNCTION r12.a(v
+/// r12.U&"\006doney")` has the identity `r12.a(r12.money)`, and with
+/// `UESCAPE '!'` the escape character is the one given. Canonicalized here to
+/// the quoted form rather than carried, so that one spelling of a name is one
+/// key. A form that does not decode is refused as text that is not one
+/// argument, which is what the engine says of it too.
+fn without_unicode_escapes(t: &str) -> Result<std::borrow::Cow<'_, str>, RoutineArgError> {
+    if !t.contains("&\"") {
+        return Ok(std::borrow::Cow::Borrowed(t));
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while !rest.is_empty() {
+        if rest.starts_with('"') {
+            let end = quoted_end(rest).ok_or_else(|| shape(t))?;
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        let opens = rest.len() > 2
+            && rest.is_char_boundary(2)
+            && rest[..2].eq_ignore_ascii_case("u&")
+            && rest[2..].starts_with('"')
+            && !out
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !opens {
+            let c = rest.chars().next().expect("not empty");
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let end = quoted_end(&rest[2..]).ok_or_else(|| shape(t))? + 2;
+        let inner = rest[3..end - 1].replace("\"\"", "\"");
+        rest = &rest[end..];
+        let mut escape = '\\';
+        // `UESCAPE 'x'`, after ASCII whitespace: the engine's whitespace.
+        let after = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if after.len() > 7
+            && after.is_char_boundary(7)
+            && after[..7].eq_ignore_ascii_case("uescape")
+        {
+            let clause = after[7..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let mut chars = clause.chars();
+            match (chars.next(), chars.next(), chars.next()) {
+                (Some('\''), Some(e), Some('\''))
+                    if e != '\'' && e != '+' && !e.is_ascii_hexdigit() && !e.is_whitespace() =>
+                {
+                    escape = e;
+                    rest = &clause[2 + e.len_utf8()..];
+                }
+                _ => return Err(shape(t)),
+            }
+        }
+        let decoded = decode_unicode_escapes(&inner, escape).ok_or_else(|| shape(t))?;
+        out.push('"');
+        out.push_str(&decoded.replace('"', "\"\""));
+        out.push('"');
+    }
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// The end of the `"…"` at the front of `text`, a doubled quote being a quote
+/// inside the name.
+fn quoted_end(text: &str) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// `\XXXX` and `\+XXXXXX` to the code point they name, a doubled escape to
+/// itself, and a surrogate pair to the one character it encodes — the rules
+/// PostgreSQL reads `U&"…"` by. `None` where the text does not decode: a
+/// digit that is not hex, a lone surrogate.
+pub fn decode_unicode_escapes(inner: &str, escape: char) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    let mut high: Option<u32> = None;
+    while let Some(c) = chars.next() {
+        if c != escape {
+            if high.is_some() {
+                return None;
+            }
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&escape) {
+            chars.next();
+            if high.is_some() {
+                return None;
+            }
+            out.push(escape);
+            continue;
+        }
+        let digits = if chars.peek() == Some(&'+') {
+            chars.next();
+            6
+        } else {
+            4
+        };
+        let mut code = 0u32;
+        for _ in 0..digits {
+            code = code * 16 + chars.next()?.to_digit(16)?;
+        }
+        match (high.take(), code) {
+            (None, 0xD800..=0xDBFF) => high = Some(code),
+            (Some(h), 0xDC00..=0xDFFF) => {
+                out.push(char::from_u32(
+                    0x10000 + ((h - 0xD800) << 10) + (code - 0xDC00),
+                )?);
+            }
+            (None, code) => out.push(char::from_u32(code)?),
+            (Some(_), _) => return None,
+        }
+    }
+    if high.is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+impl fmt::Display for RoutineArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// The identity of a routine: its qualified name **and** its argument types.
 ///
@@ -59,11 +379,11 @@ pub struct RoutineId {
     /// Empty for a routine declared `f()`. A routine that takes no arguments
     /// is still a routine — the parentheses in the declared name are what
     /// separate it from a view, not the presence of an argument.
-    pub args: Vec<ColumnType>,
+    pub args: Vec<RoutineArg>,
 }
 
 impl RoutineId {
-    pub fn new(name: ObjectName, args: Vec<ColumnType>) -> Self {
+    pub fn new(name: ObjectName, args: Vec<RoutineArg>) -> Self {
         Self { name, args }
     }
 }
@@ -177,7 +497,7 @@ impl ModuleId {
     }
 
     /// The declared argument types, where the kind has them.
-    pub fn args(&self) -> Option<&[ColumnType]> {
+    pub fn args(&self) -> Option<&[RoutineArg]> {
         match self {
             ModuleId::Routine(r) => Some(&r.args),
             ModuleId::Named(_) | ModuleId::Trigger { .. } => None,
@@ -201,7 +521,7 @@ pub enum ModuleIdError {
         whole: String,
         argument: String,
         #[source]
-        source: crate::types::TypeParseError,
+        source: RoutineArgError,
     },
 }
 
@@ -225,24 +545,74 @@ impl fmt::Display for ModuleId {
 /// of the JSON map key its own `Display` had written (PITFALLS: a round trip
 /// tested only on the simple case).
 ///
-/// `None` if the parentheses do not balance, which the caller reports as a
+/// `None` if the brackets do not balance, which the caller reports as a
 /// malformed identity rather than guessing where the argument ended.
+///
+/// # It has to know every place a comma can hide, not one
+///
+/// A first version tracked parentheses only, which was the whole story while
+/// an argument was a [`crate::ColumnType`]. [`RoutineArg`] admits two more:
+/// `"a,b"` is one quoted type name PostgreSQL will hand back for a type
+/// created with that name, and a comma inside `[…]` is inside the argument
+/// too. Splitting on either produced two halves that each fail
+/// `RoutineArg`'s own balance check, so `app.f(s."a,b")` was a valid
+/// declaration its own `Display` could write and nothing could read back.
+///
+/// The states are exactly the ones [`RoutineArg::from_str`] tracks, and they
+/// are here rather than shared with it because that one is folding text as it
+/// goes and this one only has to find a boundary — two readers of one rule,
+/// which is a shape this project has been wrong about before
+/// (PITFALLS: one rule, spelled in three places). They are pinned together by
+/// `an_identity_holding_an_array_and_a_quoted_name_round_trips`.
 fn split_top_level(args: &str) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
-    let mut depth = 0usize;
+    let mut parens = 0usize;
+    let mut brackets = 0usize;
+    let mut quoted = false;
     let mut start = 0usize;
-    for (i, c) in args.char_indices() {
+    let mut chars = args.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if quoted {
+            if c == '"' {
+                // A doubled quote is a quote inside the name, and does not
+                // close the region.
+                if args[i + 1..].starts_with('"') {
+                    chars.next();
+                } else {
+                    quoted = false;
+                }
+            }
+            continue;
+        }
         match c {
-            '(' => depth += 1,
-            ')' => depth = depth.checked_sub(1)?,
-            ',' if depth == 0 => {
+            '"' => quoted = true,
+            // The one place a single quote is part of an argument: the
+            // escape character of a `UESCAPE 'x'` clause, which may be the
+            // very punctuation this scan splits on — measured, `CREATE
+            // FUNCTION ue.f(a ue.U&"d,0061ta" UESCAPE ',', b ue.U&"d)0061ta"
+            // UESCAPE ')')` is accepted with the identity `ue.f(ue.data,
+            // ue.data)`. Stepped over as the three characters it is; a quote
+            // that is not one is left for `RoutineArg` to refuse.
+            '\'' => {
+                let mut rest = args[i + 1..].chars();
+                if let (Some(escape), Some('\'')) = (rest.next(), rest.next()) {
+                    chars.next();
+                    let _ = escape;
+                    chars.next();
+                }
+            }
+            '(' => parens += 1,
+            ')' => parens = parens.checked_sub(1)?,
+            '[' => brackets += 1,
+            ']' => brackets = brackets.checked_sub(1)?,
+            ',' if parens == 0 && brackets == 0 => {
                 parts.push(&args[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
     }
-    if depth != 0 {
+    if quoted || parens != 0 || brackets != 0 {
         return None;
     }
     parts.push(&args[start..]);
@@ -265,7 +635,16 @@ impl FromStr for ModuleId {
                 .parse()
                 .map_err(|_| ModuleIdError::Shape(s.to_owned()))?;
             let mut types = Vec::new();
-            if !args.trim().is_empty() {
+            // ASCII whitespace, as `RoutineArg` trims it: to PostgreSQL a
+            // non-breaking space is an identifier — measured, `CREATE TYPE
+            // ar." "` (one U+00A0) and `CREATE FUNCTION ar.g(a \u{a0})` are
+            // accepted, with the identity `g(" ")` — so `f(\u{a0})` is a
+            // routine of one argument, and a trim that took Unicode's word
+            // for it read the key as `f()` and refused the body for its count.
+            if !args
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .is_empty()
+            {
                 for arg in
                     split_top_level(args).ok_or_else(|| ModuleIdError::Shape(s.to_owned()))?
                 {
@@ -423,7 +802,67 @@ pub struct Hints {
 /// and the environment is unchanged. The escape hatch for the cases it gets
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
-    references_as(definition, name, Case::Folded)
+    references_with(definition, name, &SHARED)
+}
+
+/// What the name scans need of an engine's lexis: how a definition is
+/// reduced to code, which characters continue an identifier, and which words
+/// can never be a bare name.
+///
+/// All three are the engine's rules. The second decides where a word ends —
+/// on PostgreSQL every non-ASCII byte continues a name, so `x\u{a0}y` is one
+/// alias and not `x` beside `y`; on SQL Server a non-breaking space is
+/// whitespace (DECISIONS 315). The third decides whether a bare word can be
+/// a reference at all: `select 1` mentions no view named `select`, because
+/// a view of that name is only ever written quoted (DECISIONS 316).
+#[derive(Clone, Copy)]
+pub struct Lexis<'a> {
+    /// The definition with everything that is not code blanked out.
+    pub code_only: &'a dyn Fn(&str) -> String,
+    /// Whether a character continues an unquoted identifier.
+    pub continues_ident: fn(char) -> bool,
+    /// Whether a lower-cased word can never stand unquoted as a name.
+    pub reserved: fn(&str) -> bool,
+    /// Where the second schema sits on the path a bare name in a definition
+    /// in the first is looked up along, or `None` where it is not on it — the
+    /// engine's lookup order (DECISIONS 317).
+    pub bare_rank: &'a dyn Fn(&str, &str) -> Option<usize>,
+}
+
+/// The answer of a lexis that reserves nothing: every bare word may be a
+/// name.
+pub fn never_reserved(_: &str) -> bool {
+    false
+}
+
+/// The answer of a lexis that looks a bare name up everywhere, every schema
+/// on an equal footing: an edge too many, never one too few.
+pub fn every_schema(_: &str, _: &str) -> Option<usize> {
+    Some(0)
+}
+
+/// The shared scanner's own lexis: SQL Server's identifier rule, which is
+/// where it came from, and no reserved words — the loader has no engine to
+/// ask, and a bare word it reads as a reference is an edge the differ, which
+/// has one, does not draw.
+pub const SHARED: Lexis<'static> = Lexis {
+    code_only: &code_only,
+    continues_ident: is_regular_identifier_continue,
+    reserved: never_reserved,
+    bare_rank: &every_schema,
+};
+
+/// [`references`], with the definition read by `lexis` rather than by the
+/// shared scanner — a dialect's own, where the caller has one (DECISIONS 315).
+pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -> bool {
+    references_in(
+        &(lexis.code_only)(definition),
+        name,
+        Case::Folded,
+        lexis.continues_ident,
+        lexis.reserved,
+        true,
+    )
 }
 
 /// How the scan compares letters, narrowest last.
@@ -459,13 +898,56 @@ fn qualified(name: &ObjectName, case: Case) -> String {
     format!("{}.{}", cased(&name.schema, case), cased(&name.name, case))
 }
 
+#[cfg(test)]
 fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
-    let haystack = scannable(definition, case);
+    references_in(
+        &code_only(definition),
+        name,
+        case,
+        is_regular_identifier_continue,
+        never_reserved,
+        true,
+    )
+}
 
-    // The qualified form, and the bare one — a definition written inside its
-    // own schema very often omits the qualifier.
-    contains_word(&haystack, &qualified(name, case))
-        || contains_word(&haystack, &cased(&name.name, case))
+/// Whether `code` — a definition already lexed to code — mentions `name`,
+/// with words ending where `continues` says they do, a bare word that
+/// `reserved` names counting only where it is quoted, and the bare form
+/// counting at all only where `bare` says the engine would look there.
+fn references_in(
+    code: &str,
+    name: &ObjectName,
+    case: Case,
+    continues: fn(char) -> bool,
+    reserved: fn(&str) -> bool,
+    bare: bool,
+) -> bool {
+    let haystack = scannable_code(code, case, continues, false);
+
+    // The qualified form first — a word after a dot is a name whatever it
+    // is: measured, `FROM app.select` is accepted on PostgreSQL.
+    if contains_word(&haystack, &qualified(name, case), continues) {
+        return true;
+    }
+    // A bare name resolves through the engine's lookup path and nowhere
+    // else, so a same-named module in a schema off that path is not what
+    // the word means (DECISIONS 317).
+    if !bare {
+        return false;
+    }
+    // Then the bare one — a definition written inside its own schema very
+    // often omits the qualifier. A reserved word is a name only where it is
+    // quoted: measured, `FROM select` is a syntax error on both engines and
+    // `FROM "select"` names the view, so a bare `select` mentions nothing —
+    // and read as a mention, it drew an edge from every view to the one of
+    // that name (DECISIONS 316).
+    let bare = cased(&name.name, case);
+    if reserved(&name.name.to_ascii_lowercase()) {
+        let quoted = scannable_code(code, case, continues, true);
+        contains_word(&quoted, &format!("\"{bare}\""), continues)
+    } else {
+        contains_word(&haystack, &bare, continues)
+    }
 }
 
 /// The definition with everything that is not code blanked out.
@@ -680,12 +1162,77 @@ fn folded(s: &str) -> String {
 
 /// Lower-cases, drops the quoting characters and closes the gaps around dots,
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
+#[cfg(test)]
 fn scannable(definition: &str, case: Case) -> String {
-    let lowered = cased(&code_only(definition), case);
-    let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
+    scannable_code(
+        &code_only(definition),
+        case,
+        is_regular_identifier_continue,
+        false,
+    )
+}
+
+/// Whitespace to the scan: what Unicode calls whitespace **and the engine
+/// does not read as a name byte**. A non-breaking space continues an
+/// identifier on PostgreSQL, and read as a gap it split `x\u{a0}y` into a
+/// word the needle matched.
+fn is_a_gap(ch: char, continues: fn(char) -> bool) -> bool {
+    ch.is_whitespace() && !continues(ch)
+}
+
+fn scannable_code(
+    code: &str,
+    case: Case,
+    continues: fn(char) -> bool,
+    keep_quotes: bool,
+) -> String {
+    let lowered = cased(code, case);
+    // A quoting character goes; a bracket that stood between two identifier
+    // characters leaves a space behind. On PostgreSQL `[` is a subscript and
+    // `ARRAY[` an array constructor, not a quote — measured, a view over
+    // `(ARRAY[app.z()])[1]` is refused until `app.z()` exists — and dropping
+    // the bracket outright glued `ARRAY[app.z` into `arrayapp.z`, where no word
+    // boundary was left for the needle to match. The space is only put where
+    // the glue would form, so `[dbo].[v]` still folds to `dbo.v` (239).
+    //
+    // With `keep_quotes`, every quoting character becomes `"` instead, for
+    // the one needle that has to see them: a reserved word, which is a name
+    // only where it is quoted (316).
+    //
+    // A *doubled* quoting character is one character of the name and not two
+    // delimiters — measured, `dq."z""q"` names the view `z"q` and `[a]]b]`
+    // names `a]b` — so it survives into the haystack, where the needle built
+    // from the declared name carries the same character (DECISIONS 318).
+    let mut unquoted = String::with_capacity(lowered.len());
+    let mut skip_to = 0usize;
+    for (i, ch) in lowered.char_indices() {
+        if i < skip_to {
+            continue;
+        }
+        if matches!(ch, '"' | ']') && lowered[i + ch.len_utf8()..].starts_with(ch) {
+            unquoted.push(ch);
+            skip_to = i + 2 * ch.len_utf8();
+            continue;
+        }
+        match ch {
+            '"' | '`' | '[' | ']' if keep_quotes => unquoted.push('"'),
+            '"' | '`' => {}
+            '[' | ']' => {
+                let glued = unquoted.chars().next_back().is_some_and(continues)
+                    && lowered[i + ch.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| continues(c) || c == '.');
+                if glued {
+                    unquoted.push(' ');
+                }
+            }
+            _ => unquoted.push(ch),
+        }
+    }
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
-        if ch.is_whitespace() {
+        if is_a_gap(ch, continues) {
             // From `out`, not from `unquoted`: what precedes this character in
             // the *result* is the dot itself when the whitespace between them
             // has already been dropped. Read from the input it was the first
@@ -696,7 +1243,7 @@ fn scannable(definition: &str, case: Case) -> String {
             let before = out.chars().next_back();
             let after = unquoted[i + ch.len_utf8()..]
                 .chars()
-                .find(|c| !c.is_whitespace());
+                .find(|c| !is_a_gap(*c, continues));
             // Whitespace that only separates a qualifier from its dot is
             // noise; everywhere else it is a boundary and must be kept.
             if before == Some('.') || after == Some('.') {
@@ -709,13 +1256,13 @@ fn scannable(definition: &str, case: Case) -> String {
 }
 
 /// Whether `needle` occurs with no identifier character on either side.
-fn contains_word(haystack: &str, needle: &str) -> bool {
+fn contains_word(haystack: &str, needle: &str, continues: fn(char) -> bool) -> bool {
     let mut from = 0;
     while let Some(at) = haystack[from..].find(needle) {
         let start = from + at;
         let end = start + needle.len();
-        if !is_ident_char(haystack[..start].chars().next_back())
-            && !is_ident_char(haystack[end..].chars().next())
+        if !is_ident_char(haystack[..start].chars().next_back(), continues)
+            && !is_ident_char(haystack[end..].chars().next(), continues)
         {
             return true;
         }
@@ -728,8 +1275,8 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 /// `sales.dbo.active_customer`, and `active_customer` must not match inside
 /// `dbo.active_customer` — the qualified needle is tried first and answers that
 /// case properly.
-fn is_ident_char(c: Option<char>) -> bool {
-    c.is_some_and(|c| is_regular_identifier_continue(c) || c == '.')
+fn is_ident_char(c: Option<char>, continues: fn(char) -> bool) -> bool {
+    c.is_some_and(|c| continues(c) || c == '.')
 }
 
 /// Whether a character can continue an unquoted SQL Server identifier.
@@ -738,7 +1285,7 @@ fn is_ident_char(c: Option<char>) -> bool {
 /// `is_alphanumeric`; SQL Server additionally admits these four symbols after
 /// the first character. Keyword and dependency scans share this boundary so
 /// `seq$null` cannot mean one token to one and two tokens to the other.
-pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
+pub fn is_regular_identifier_continue(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')
 }
 
@@ -753,14 +1300,58 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 /// One edge the scan cannot supply: between the overloads of one routine name,
 /// which the scan cannot tell apart, only `depends_on:` orders (DECISIONS 212).
 pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
+    creation_order_with(modules, deps, &SHARED)
+}
+
+/// [`creation_order`], with every definition lexed by `lex` — the dialect's
+/// own `code_only` — rather than by the shared scanner.
+///
+/// The scan reads what is left after literals and comments are blanked, and
+/// where a literal ends is the engine's rule: **measured**, `SELECT E'x\' ,
+/// es.a'` is one literal to PostgreSQL, and the shared scanner closed it at
+/// the `\'` and read the name after it as code — an edge that was not
+/// there, which closed a cycle, which put a view before the one it selects
+/// from (DECISIONS 315).
+pub fn creation_order_with(
+    modules: &BTreeMap<ModuleId, Module>,
+    deps: &ModuleDeps,
+    lexis: &Lexis<'_>,
+) -> Vec<ModuleId> {
     let names: Vec<ModuleId> = modules.keys().cloned().collect();
+    // Lexed once each, not once per comparison.
+    let lexed: BTreeMap<&ModuleId, String> = modules
+        .iter()
+        .map(|(name, module)| (name, (lexis.code_only)(&module.definition)))
+        .collect();
+    let continues = lexis.continues_ident;
+    let reserved = lexis.reserved;
+    let bare_rank = lexis.bare_rank;
 
     // The edges for one comparison. Only the scanned ones move with it:
     // `depends_on:` and a trigger's target are identities, not text.
     let needs_among = |pending: &[ModuleId], case: Case| {
         let mut needs: BTreeMap<ModuleId, BTreeSet<ModuleId>> = BTreeMap::new();
         for name in pending {
-            let module = &modules[name];
+            let code = &lexed[name];
+            // A bare word resolves in the *first* schema of the lookup path
+            // that holds the name, so among the candidates sharing one only
+            // the best-placed is what the word can mean; an edge to another
+            // is invented, and one such edge closed a cycle that emitted a
+            // view before the one it selects from (DECISIONS 317).
+            let mut nearest: BTreeMap<String, usize> = BTreeMap::new();
+            for other in pending {
+                if other == name {
+                    continue;
+                }
+                if let Some(referenced) = other.referenced_name()
+                    && let Some(rank) = bare_rank(name.schema(), other.schema())
+                {
+                    nearest
+                        .entry(cased(&referenced.name, case))
+                        .and_modify(|best| *best = (*best).min(rank))
+                        .or_insert(rank);
+                }
+            }
             let mut set: BTreeSet<ModuleId> = BTreeSet::new();
             for other in pending {
                 if other == name {
@@ -790,9 +1381,11 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
                 let sibling = matches!(name, ModuleId::Routine(_))
                     && other.referenced_name() == name.referenced_name();
                 let referenced = !sibling
-                    && other
-                        .referenced_name()
-                        .is_some_and(|n| references_as(&module.definition, &n, case));
+                    && other.referenced_name().is_some_and(|n| {
+                        let bare = bare_rank(name.schema(), other.schema())
+                            .is_some_and(|rank| nearest.get(&cased(&n.name, case)) == Some(&rank));
+                        references_in(code, &n, case, continues, reserved, bare)
+                    });
                 if declared || attached || referenced {
                     set.insert(other.clone());
                 }
@@ -1061,6 +1654,257 @@ mod tests {
         assert_eq!(
             creation_order(&m, &ModuleDeps::default()),
             vec![id("dbo.base"), id("dbo.middle"), id("dbo.top")]
+        );
+    }
+
+    /// A bracket is a subscript or an array constructor on PostgreSQL, and
+    /// dropping it as a quote glued `ARRAY[app.z` into one word — measured,
+    /// the view is refused until the function exists, and the scan saw no
+    /// edge to put the function first.
+    #[test]
+    fn a_bracket_between_two_words_keeps_them_apart() {
+        assert_eq!(
+            scannable("SELECT (ARRAY[app.z()])[1] AS v", Case::Folded),
+            "select (array app.z())1 as v"
+        );
+        assert!(references("SELECT (ARRAY[app.z()])[1]", &n("app.z")));
+        assert!(references("SELECT x[app.z()]", &n("app.z")));
+        // And where nothing would be glued, nothing is added: the quoted
+        // spellings fold to the same string they always did.
+        assert_eq!(
+            scannable("SELECT * FROM [dbo].[active_customer]", Case::Folded),
+            "select * from dbo.active_customer"
+        );
+        let m = modules(&[
+            ("app.a", "SELECT (ARRAY[app.z()])[1] AS v"),
+            ("app.z()", "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.z()"), id("app.a")]
+        );
+    }
+
+    /// Where a literal ends is the engine's rule, and the order is decided on
+    /// what is left after the engine's literals are blanked: a lexer that
+    /// reads `E'x\' , app.a'` as one literal sees no edge from `b` to `a`,
+    /// and the shared scanner, which closes it at the `\'`, sees one and
+    /// makes a cycle of the two.
+    #[test]
+    fn the_order_is_decided_on_the_code_the_dialect_lexes() {
+        let m = modules(&[
+            ("app.a", "SELECT * FROM app.b"),
+            ("app.b", "SELECT E'x\\' , app.a' AS s"),
+        ]);
+        let engine_reads_an_escape_string =
+            |d: &str| d.replace("E'x\\' , app.a'", "               ");
+        let lexis = Lexis {
+            code_only: &engine_reads_an_escape_string,
+            continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
+            bare_rank: &every_schema,
+        };
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("app.b"), id("app.a")]
+        );
+        // The shared scanner's reading: a cycle, broken by name order, which
+        // puts `a` before the view it selects from.
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.a"), id("app.b")]
+        );
+        assert!(!references_with(
+            "SELECT E'x\\' , app.a' AS s",
+            &n("app.a"),
+            &lexis
+        ));
+    }
+
+    /// Where a word ends is the engine's rule too: a non-breaking space
+    /// continues an identifier on PostgreSQL, so `x\u{a0}y` is one alias and
+    /// no mention of `y`; read as a gap, it was.
+    #[test]
+    fn a_word_ends_where_the_dialect_says_it_does() {
+        let every_non_ascii_byte_is_a_name_byte =
+            |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: every_non_ascii_byte_is_a_name_byte,
+            reserved: never_reserved,
+            bare_rank: &every_schema,
+        };
+        let text = "SELECT 1 AS x\u{a0}y FROM app.z";
+        assert!(!references_with(text, &n("app.y"), &lexis));
+        assert!(references_with(text, &n("app.z"), &lexis));
+        assert!(
+            references(text, &n("app.y")),
+            "the shared scanner's reading"
+        );
+        let m = modules(&[
+            ("app.y", "SELECT * FROM app.z"),
+            ("app.z", "SELECT 1 AS x\u{a0}y"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("app.z"), id("app.y")]
+        );
+    }
+
+    /// A quoting character doubled inside a name is one character of the
+    /// name: measured, `dq."z""q"` names the view `z"q`, and a view over it
+    /// is written `FROM dq."z""q"`. Read as two delimiters, the haystack said
+    /// `dq.zq`, the needle `dq.z"q` matched nothing, and with the dependent
+    /// sorting first its `CREATE` came before the view it selects from.
+    #[test]
+    fn a_quoting_character_doubled_inside_a_name_is_one_character_of_it() {
+        let m = modules(&[
+            ("app.a", "SELECT * FROM app.\"z\"\"q\""),
+            ("app.z\"q", "SELECT 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.z\"q"), id("app.a")]
+        );
+        // The bracket form is the same rule on the other engine.
+        let m = modules(&[
+            ("dbo.a", "SELECT * FROM [dbo].[z]]q]"),
+            ("dbo.z]q", "SELECT 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.z]q"), id("dbo.a")]
+        );
+        // And a name without one still reads as it did.
+        assert!(references("SELECT * FROM [dbo].[v]", &n("dbo.v")));
+        assert!(references("SELECT * FROM app.\"v\"", &n("app.v")));
+    }
+
+    /// A bare name resolves through the engine's lookup path: measured, on
+    /// PostgreSQL with no extras a bare `x` in `b.z` cannot mean `a.x`, and
+    /// on SQL Server a bare `z` in `a.x` reads `a.z` or `dbo.z` and never
+    /// `b.z`. Read everywhere, the alias `x` in `b.z` mentioned `a.x`, closed
+    /// a cycle with the real edge, and put `a.x` first.
+    #[test]
+    fn a_bare_name_is_a_reference_only_where_the_engine_would_look_it_up() {
+        let own_schema_only = |from: &str, to: &str| (from == to).then_some(0);
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
+            bare_rank: &own_schema_only,
+        };
+        let m = modules(&[("a.x", "SELECT * FROM b.z"), ("b.z", "SELECT 1 AS x")]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("b.z"), id("a.x")]
+        );
+        // The shared scanner looks everywhere, and keeps its reading: a
+        // cycle, broken by name order.
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("a.x"), id("b.z")]
+        );
+        // A bare name inside the path is still an edge; the qualified form
+        // is one wherever it points.
+        let m = modules(&[
+            ("a.x", "SELECT * FROM z"),
+            ("a.z", "SELECT 1 AS y"),
+            ("b.w", "SELECT * FROM a.x"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("a.z"), id("a.x"), id("b.w")]
+        );
+        let m = modules(&[("a.x", "SELECT * FROM z"), ("b.z", "SELECT 1 AS y")]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("a.x"), id("b.z")],
+            "off the path, a bare name is no edge, and name order decides"
+        );
+        // And the *first* entry of the path that holds the name is the one
+        // the word means: measured, with `z.p` and `a.p` both present, a bare
+        // `p` under `search_path = "z", "a"` binds `z.p`. Counting `a.p` as a
+        // candidate too invented an edge that closed a cycle with the real
+        // one, and name order then put `a.p` before the view it selects from.
+        let z_then_a = |from: &str, to: &str| {
+            if from == to {
+                Some(0)
+            } else if to == "a" {
+                Some(1)
+            } else {
+                None
+            }
+        };
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
+            bare_rank: &z_then_a,
+        };
+        let m = modules(&[
+            ("a.p", "SELECT * FROM z.x"),
+            ("z.p", "SELECT 1 AS v"),
+            ("z.x", "SELECT * FROM p"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("z.p"), id("z.x"), id("a.p")]
+        );
+        // With the nearer one gone, the word means the one that is left.
+        let m = modules(&[("a.p", "SELECT 1 AS v"), ("z.x", "SELECT * FROM p")]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("a.p"), id("z.x")]
+        );
+    }
+
+    /// A reserved word is a name only where it is quoted: measured, `FROM
+    /// select` is a syntax error on both engines and `FROM "select"` names
+    /// the view, so a bare `select` mentions no view named `select`. Read as
+    /// a mention, it drew an edge from every view to that one; with the real
+    /// edge the other way, a cycle, and the dependent was created first.
+    #[test]
+    fn a_reserved_word_is_a_reference_only_where_it_is_quoted() {
+        fn select_is_reserved(word: &str) -> bool {
+            word == "select"
+        }
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: is_regular_identifier_continue,
+            reserved: select_is_reserved,
+            bare_rank: &every_schema,
+        };
+        let select = n("app.select");
+        assert!(!references_with("select 1 AS x", &select, &lexis));
+        assert!(!references_with("SELECT * FROM app.z", &select, &lexis));
+        for quoted in [
+            "SELECT * FROM \"select\"",
+            "SELECT * FROM [select]",
+            "SELECT * FROM \"SELECT\"",
+            "SELECT * FROM app.\"select\"",
+            // After a dot the word is a name whatever it is: measured, `FROM
+            // app.select` is accepted on PostgreSQL.
+            "SELECT * FROM app.select",
+        ] {
+            assert!(references_with(quoted, &select, &lexis), "{quoted}");
+        }
+        // A word that is not reserved is a mention bare, as before.
+        assert!(references_with("SELECT * FROM z", &n("app.z"), &lexis));
+        let m = modules(&[
+            ("app.select", "SELECT * FROM app.z"),
+            ("app.z", "select 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("app.z"), id("app.select")]
+        );
+        // The shared scanner reserves nothing, and keeps its reading: a
+        // cycle, broken by name order, which puts `select` first.
+        assert!(references("select 1 AS x", &select));
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.select"), id("app.z")]
         );
     }
 
@@ -1572,11 +2416,13 @@ mod tests {
             "app.v",
             "app.f(integer,text)",
             // A modifier with its own comma: the argument separator and the
-            // one inside `decimal(10, 2)` are the same character, and only
-            // nesting tells them apart. Spelled as `ColumnType` spells it,
-            // because that is what wrote the key.
-            "app.f(decimal(10, 2))",
-            "app.f(decimal(10, 2),text,numeric(38, 10))",
+            // one inside `decimal(10,2)` are the same character, and only
+            // nesting tells them apart. Spelled without the space, because
+            // `RoutineArg` folds whitespace beside punctuation — the same
+            // canonical form whichever way the declaration wrote it, which is
+            // the property `one_routine_written_two_ways_is_one_key` asserts.
+            "app.f(decimal(10,2))",
+            "app.f(decimal(10,2),text,numeric(38,10))",
             "app.f()",
             "app.orders.audit",
         ] {
@@ -1606,6 +2452,228 @@ mod tests {
             "app.f(,)",
         ] {
             assert!(bad.parse::<ModuleId>().is_err(), "`{bad}` must not parse");
+        }
+    }
+
+    /// Every spelling PostgreSQL 18.6 puts in a routine's identity, measured
+    /// from `proargtypes` through `format_type` — the same list
+    /// `oid::regprocedure` prints, and the reason a routine argument is not a
+    /// `ColumnType`: of these, only three would parse as one.
+    #[test]
+    fn every_identity_spelling_the_engine_writes_is_one_argument() {
+        for spelling in [
+            "character varying",
+            "\"char\"",
+            "integer",
+            "numeric",
+            "timestamp with time zone",
+            "integer[]",
+            "text[]",
+            "id.pos",
+            "time without time zone",
+            "interval",
+            "bit varying",
+            "character",
+            "double precision[]",
+            "\"My Type\"",
+            "s.\"Odd Name\"[]",
+        ] {
+            let arg: RoutineArg = spelling.parse().expect(spelling);
+            assert_eq!(arg.to_string(), spelling, "{spelling} did not survive");
+        }
+    }
+
+    /// The canonicalization is only what every SQL engine agrees on: outside
+    /// quotes, case and the whitespace beside punctuation do not matter.
+    /// Inside them nothing is touched — `"char"` is a real type on PostgreSQL
+    /// and `"CHAR"` is not the same one.
+    #[test]
+    fn an_argument_is_folded_outside_quotes_and_kept_inside_them() {
+        for (written, canonical) in [
+            ("INT", "int"),
+            ("  Integer  ", "integer"),
+            ("decimal(10, 2)", "decimal(10,2)"),
+            ("integer []", "integer[]"),
+            ("TIMESTAMP  WITH   TIME ZONE", "timestamp with time zone"),
+            ("Character Varying ( 10 )", "character varying(10)"),
+            ("ID.Pos", "id.pos"),
+            // The engine accepts a space around a qualified type's dot and
+            // never writes one back, so the two spellings have to be one key.
+            ("md . my_type", "md.my_type"),
+            ("md .my_type", "md.my_type"),
+            ("md. my_type", "md.my_type"),
+            ("s . \"Odd Name\" []", "s.\"Odd Name\"[]"),
+            // ASCII only, which is the engine's rule: measured,
+            // `CREATE FUNCTION mn.f(a mn.Ätype)` reads back as
+            // `mn.f(mn.\"Ätype\")` — the byte is left alone and the name is
+            // quoted rather than folded. A Unicode fold would write `ätype`,
+            // which names a type that does not exist.
+            ("MN.Ätype", "mn.Ätype"),
+            ("ÄÖÜ", "ÄÖÜ"),
+            // And ASCII whitespace only: a non-breaking space is a name byte
+            // to the engine — measured, `r8.a\u{a0}b` is a type and `r8.a b`
+            // is not — so it is neither folded to a space nor trimmed away.
+            ("r8.a\u{a0}b", "r8.a\u{a0}b"),
+            // A Unicode-escaped identifier is the plain quoted name it spells,
+            // decoded with its own escape or the default. Measured:
+            // `r12.U&"\006doney"` is identified as `r12.money`.
+            ("app.U&\"\\006doney\"", "app.\"money\""),
+            ("app.u&\"M!00f6ney\" UESCAPE '!'", "app.\"Möney\""),
+            ("U&\"\\0061pp\".t", "\"app\".t"),
+            ("U&\"d\\0061t\\+000061\"[]", "\"data\"[]"),
+            ("U&\"\\D83D\\DE00\"", "\"😀\""),
+            ("U&\"a\"\"b\"", "\"a\"\"b\""),
+            // Inside a quoted name it is text, and after a name byte `U&` is
+            // not the prefix.
+            ("\"U&\"\"x\"\"\"", "\"U&\"\"x\"\"\""),
+            ("  r8.a\u{2003}b  ", "r8.a\u{2003}b"),
+            ("\u{a0}r8.x\u{a0}", "\u{a0}r8.x\u{a0}"),
+            ("r8.→", "r8.→"),
+            ("\"char\"", "\"char\""),
+            ("\"CHAR\"", "\"CHAR\""),
+            ("s.\"Odd Name\"", "s.\"Odd Name\""),
+            ("\"a\"\"b\"", "\"a\"\"b\""),
+        ] {
+            assert_eq!(
+                written.parse::<RoutineArg>().expect(written).to_string(),
+                canonical,
+                "{written}"
+            );
+        }
+        assert_ne!(
+            "\"char\"".parse::<RoutineArg>().unwrap(),
+            "\"CHAR\"".parse::<RoutineArg>().unwrap(),
+            "a quoted type name keeps its case, and these are two types"
+        );
+        assert_ne!(
+            "Ätype".parse::<RoutineArg>().unwrap().as_str(),
+            "ätype",
+            "a fold that changes a byte the engine leaves alone names another type"
+        );
+    }
+
+    /// The negative half, which is where a structural rule earns its place: an
+    /// argument that could not be written into an identity string and read
+    /// back out of one is refused rather than stored.
+    #[test]
+    fn text_that_is_not_one_argument_is_refused() {
+        // A Unicode-escaped identifier that does not decode, or a `UESCAPE`
+        // the engine would refuse: not one argument either.
+        for malformed in [
+            "U&\"\\00G1\"",
+            "U&\"\\D83D\"",
+            "U&\"\\DE00\"",
+            "U&\"!0074\" UESCAPE '+'",
+            "U&\"!0074\" UESCAPE ''",
+            "U&\"\\0074",
+        ] {
+            assert!(malformed.parse::<RoutineArg>().is_err(), "{malformed}");
+        }
+        for bad in [
+            "",
+            "   ",
+            // The character that separates one argument from the next.
+            "integer,text",
+            // Nothing closes them.
+            "integer[",
+            "\"unclosed",
+            "numeric(10",
+            "numeric)",
+            "integer]",
+            // Characters no type name is written with — and this text is
+            // interpolated into `DROP FUNCTION`.
+            "integer; DROP TABLE t",
+            "integer'",
+            "integer -- note",
+            "integer/*note*/",
+        ] {
+            assert!(
+                bad.parse::<RoutineArg>().is_err(),
+                "`{bad}` is not one argument"
+            );
+        }
+        // And a comma that is *inside* something is not a separator.
+        assert!("numeric(10,2)".parse::<RoutineArg>().is_ok());
+        // A `$` is a name byte: measured, `dl.money$type` is a type.
+        assert_eq!(
+            "dl.money$type"
+                .parse::<RoutineArg>()
+                .expect("one argument")
+                .as_str(),
+            "dl.money$type"
+        );
+    }
+
+    /// The identity string carries them the same way, which is what makes the
+    /// map key and the JSON key the same text.
+    /// A `UESCAPE` character may be the punctuation the identity is split
+    /// on — measured, the engine accepts `,`, `(`, `)`, `[`, `]` and `.` as
+    /// the escape — and the split has to step over the clause rather than
+    /// cut the identity at it.
+    #[test]
+    fn an_escape_character_that_is_punctuation_does_not_split_the_identity() {
+        for (spelled, canonical) in [
+            (
+                "app.f(app.U&\"d,0061ta\" UESCAPE ',')",
+                "app.f(app.\"data\")",
+            ),
+            (
+                "app.f(app.U&\"d)0061ta\" UESCAPE ')')",
+                "app.f(app.\"data\")",
+            ),
+            (
+                "app.f(app.U&\"d(0061ta\" UESCAPE '(')",
+                "app.f(app.\"data\")",
+            ),
+            (
+                "app.f(app.U&\"d[0061ta\" UESCAPE '[', integer)",
+                "app.f(app.\"data\",integer)",
+            ),
+            (
+                "app.f(integer, app.U&\"d]0061ta\" UESCAPE ']', text)",
+                "app.f(integer,app.\"data\",text)",
+            ),
+        ] {
+            let id: ModuleId = spelled.parse().unwrap_or_else(|e| panic!("{spelled}: {e}"));
+            assert_eq!(id.to_string(), canonical, "{spelled}");
+        }
+        // A quote that is not an escape clause is still not an argument.
+        for malformed in ["app.f(a'b)", "app.f('x')", "app.f(app.U&\"x\" UESCAPE ',)"] {
+            assert!(malformed.parse::<ModuleId>().is_err(), "{malformed}");
+        }
+    }
+
+    /// An argument list that is one non-ASCII byte is a list of one: to
+    /// PostgreSQL the byte is a name (measured, `g(\u{a0})` is `g(" ")`),
+    /// and only ASCII whitespace makes the list empty.
+    #[test]
+    fn an_argument_list_of_one_non_ascii_byte_is_not_empty() {
+        let one: ModuleId = "app.f(\u{a0})".parse().expect("a module id");
+        assert_eq!(one.args().map(<[RoutineArg]>::len), Some(1));
+        assert_eq!(one.to_string(), "app.f(\u{a0})");
+        let none: ModuleId = "app.f( \t )".parse().expect("a module id");
+        assert_eq!(none.args().map(<[RoutineArg]>::len), Some(0));
+    }
+
+    #[test]
+    fn an_identity_holding_an_array_and_a_quoted_name_round_trips() {
+        for spelling in [
+            "app.f(\"char\",integer[])",
+            "app.f(character varying,timestamp with time zone)",
+            "app.f(id.pos)",
+            // The comma that is not a separator, in each of the three places
+            // it can hide: a modifier, a quoted name, and a bracket.
+            "app.f(numeric(10,2),text)",
+            "app.f(s.\"a,b\",integer)",
+            "app.f(\"a,b\"[],\"c\"\"d\")",
+        ] {
+            let parsed: ModuleId = spelling.parse().unwrap();
+            assert_eq!(parsed.to_string(), spelling);
+            assert_eq!(
+                serde_json::from_str::<ModuleId>(&serde_json::to_string(&parsed).unwrap()).unwrap(),
+                parsed,
+                "{spelling} does not survive JSON"
+            );
         }
     }
 
