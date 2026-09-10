@@ -573,16 +573,23 @@ SELECT c.relkind::text AS relkind,
                   AND ($2 <> '' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
                         WHERE a.attrelid = c.oid AND a.attname = $2
                           AND NOT a.attisdropped
-                          AND a.attnum = ANY (i.indkey::int2[])))) AS column_is_indexed
+                          AND a.attnum = ANY (i.indkey::int2[])))) AS column_is_indexed,
+       (SELECT k.conname::text FROM pg_catalog.pg_constraint k
+         WHERE k.conrelid = c.oid AND k.contype = 'c' AND k.convalidated
+           AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                        WHERE a.attrelid = c.oid AND a.attname = $2
+                          AND NOT a.attisdropped AND a.attnum = ANY (k.conkey))
+         ORDER BY k.conname LIMIT 1) AS validated_column_check
   FROM pg_catalog.pg_class c
  WHERE c.oid = pg_catalog.to_regclass($1)";
 
 /// Fills in what only a connection knows, and takes the answer back where the
 /// table is a shape ADR-0012 did not measure.
 ///
-/// `column` is the column a type change is about, or empty. It is what decides
-/// the third limit: an `ALTER TYPE` on an indexed column has to rebuild the
-/// index too, and that cost was never measured.
+/// `column` is the target of a type or nullability change, or empty for other
+/// changes. An indexed type change can rebuild the index too; a validated
+/// check on a column being tightened may let the engine skip the scan, but
+/// deciding that from its expression would violate SPEC §8.2.
 pub async fn against(
     conn: &mut Conn,
     estimate: &mut Estimate,
@@ -637,6 +644,19 @@ pub async fn against(
             "an index is built over the column this change retypes, so the index is rebuilt with \
              it, and ADR-0012 records that this was not measured",
         );
+    }
+    // Of column type/nullability changes, only tightening nullability reads
+    // every row without a rewrite. A validated check is a possible proof, not
+    // one we can interpret: keep the known rewrite and lock answers intact.
+    if column.is_some()
+        && estimate.rewrite == Rewrite::No
+        && estimate.reads == Reads::EveryRow
+        && let Some(name) = row.try_get::<&str>("validated_column_check")?
+    {
+        estimate.reads = Reads::Unknown(format!(
+            "validated check constraint {name} refers to this column; the engine may use it \
+             to skip the NOT NULL scan, but this tool does not parse its expression"
+        ));
     }
     Ok(())
 }

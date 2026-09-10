@@ -17287,6 +17287,97 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         .expect("drop");
 }
 
+/// A validated check may prove NOT NULL, while its unvalidated counterpart
+/// proves nothing. The estimate cannot parse the expression to decide, so its
+/// uncertainty is pinned beside the engine's actual scan in all three states.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Lock, Reads, Rewrite, against};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("check_scan");
+    fresh(&mut conn, &s).await;
+    for (name, check, expected_read) in [
+        ("absent", "", 100000),
+        (
+            "validated",
+            ", CONSTRAINT v_present CHECK (v IS NOT NULL)",
+            0,
+        ),
+        ("unvalidated", "", 100000),
+    ] {
+        conn.execute(&format!(
+            "CREATE TABLE {s}.{name} (v integer, w integer {check}) WITH (autovacuum_enabled = false);
+             INSERT INTO {s}.{name} SELECT g, g FROM generate_series(1, 100000) g;"
+        ))
+        .await
+        .expect("the fixture");
+        if name == "unvalidated" {
+            conn.execute(&format!(
+                "ALTER TABLE {s}.{name} ADD CONSTRAINT v_present CHECK (v IS NOT NULL) NOT VALID"
+            ))
+            .await
+            .expect("an unvalidated check");
+        }
+        let table = TableName::new(&s, name);
+        let tighten = |column: &str, to_nullable| Change::AlterColumnNullability {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: table.column(column),
+            ty: ty("integer"),
+            to_nullable,
+        };
+        let mut ours =
+            one_estimate(&tighten("v", false), Strategy::default()).expect("an estimate");
+        against(&mut conn, &mut ours, Some("v"))
+            .await
+            .expect("the connected estimate");
+        assert_eq!(ours.rewrite, Rewrite::No, "{name}: {ours:#?}");
+        assert_eq!(ours.lock, Lock::AccessExclusive, "{name}: {ours:#?}");
+        if name == "validated" {
+            assert!(
+                matches!(&ours.reads, Reads::Unknown(why) if why.contains("v_present")),
+                "{ours:#?}"
+            );
+        } else {
+            assert_eq!(ours.reads, Reads::EveryRow, "{name}: {ours:#?}");
+        }
+
+        // A check over v says nothing about w, and relaxing v asks no proof.
+        for (column, nullable, expected) in
+            [("w", false, Reads::EveryRow), ("v", true, Reads::Nothing)]
+        {
+            let mut other =
+                one_estimate(&tighten(column, nullable), Strategy::default()).expect("an estimate");
+            against(&mut conn, &mut other, Some(column))
+                .await
+                .expect("the other estimate");
+            assert_eq!(other.reads, expected, "{name}: {other:#?}");
+        }
+        conn.execute("SELECT pg_stat_force_next_flush()")
+            .await
+            .expect("flush fixture statistics");
+        let stat = format!(
+            "SELECT seq_tup_read::int FROM pg_stat_user_tables WHERE relid = '{s}.{name}'::regclass"
+        );
+        let before = number(&mut conn, &stat).await;
+        conn.execute(&format!(
+            "ALTER TABLE {s}.{name} ALTER COLUMN v SET NOT NULL"
+        ))
+        .await
+        .expect("tighten the column");
+        conn.execute("SELECT pg_stat_force_next_flush()")
+            .await
+            .expect("flush statement statistics");
+        let read = number(&mut conn, &stat).await - before;
+        assert_eq!(read, expected_read, "{name}: engine scan beside {ours:#?}");
+    }
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// The locks one statement holds on one relation, read from inside the
 /// statement's own transaction — which is the only place they are still there —
 /// and rolled back afterwards so the next statement starts from the same
