@@ -871,13 +871,20 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             grantee: optional_text(&row, "grantee")?,
             schema: text(&row, "schema_name")?,
             object: optional_text(&row, "object_name")?,
-            args: optional_text(&row, "args")?,
             kind: granted_kind(&text(&row, "source")?, &text(&row, "kind")?),
+            routine_oid: row.try_get::<i64>("routine_oid")?,
             permission: text(&row, "privilege_type")?,
             grantable: flag(&row, "is_grantable")?,
             column: optional_text(&row, "column_name")?,
             defaulted: flag(&row, "defaulted")?,
             owner: text(&row, "owner")?,
+        });
+    }
+    for row in conn.query(&grant_routine_args_query()).await? {
+        raw.routine_args.push(RawModuleArg {
+            routine_oid: number(&row, "oid")?,
+            position: number(&row, "pos")?,
+            ty: text(&row, "ty")?,
         });
     }
     for row in conn.query(OTHER_ACLS).await? {
@@ -959,17 +966,23 @@ SELECT r.rolname AS name, r.rolsuper AS superuser
 /// engine's own encoding, positional and extended by releases, and a letter
 /// this code did not know would read as no permission at all.
 ///
-/// # The routine signature is spelled the way the module pull spells it
+/// # The routine arm carries an oid, not a signature
 ///
-/// `unnest(proargtypes)` with `format_type`, and **not**
-/// `pg_get_function_identity_arguments`, which is the obvious call and the
-/// wrong one: measured, it renders a procedure's argument as `IN integer`,
-/// mode and all, while [`module_args_query`] renders the same routine's
-/// identity as `integer`. A grant target has to be the identity the module
-/// pull produced or nothing matches it — the managed-set filter compares
-/// `GrantTarget::Routine` against `ModuleId::Routine` — and two spellings of
-/// one signature would have every grant on a procedure read as a grant on an
-/// object the declarations do not have.
+/// The signature is assembled from [`grant_routine_args_query`]'s rows, and
+/// that is the whole point: a rendered signature has to be split to be used
+/// again, and a comma is not a separator. **Measured**, a type named
+/// `amount,type` renders as `cm."amount,type"`, so the comma that separates
+/// arguments and the comma inside one are the same character. Split, every
+/// fragment failed to parse and a valid grant on a managed routine became
+/// unexpressible — which refuses the connected plan.
+///
+/// The arguments themselves are `unnest(proargtypes)` with `format_type`, and
+/// **not** `pg_get_function_identity_arguments`: measured, that renders a
+/// procedure's argument as `IN integer`, mode and all, while
+/// [`module_args_query`] renders the same routine's identity as `integer`. A
+/// grant target has to be the identity the module pull produced or nothing
+/// matches it — the managed-set filter compares `GrantTarget::Routine` against
+/// `ModuleId::Routine`.
 ///
 /// The four arms are the four catalogs that carry an ACL a declaration could
 /// name. Column grants come too (`pg_attribute.attacl`), because the object's
@@ -980,7 +993,7 @@ fn grants_query() -> String {
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS object_name,
                 'rel' AS source, c.relkind::text AS kind,
-                NULL::text AS args, NULL::text AS column_name,
+                NULL::int8 AS routine_oid, NULL::text AS column_name,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
                 a.privilege_type, a.is_grantable,
@@ -996,7 +1009,7 @@ fn grants_query() -> String {
             AND {NOT_ONE_OF_OURS}
          UNION ALL
          SELECT n.nspname, c.relname, 'rel', c.relkind::text,
-                NULL::text, at.attname,
+                NULL::int8, at.attname,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
@@ -1010,10 +1023,7 @@ fn grants_query() -> String {
             AND {NOT_ONE_OF_OURS}
          UNION ALL
          SELECT n.nspname, p.proname, 'pro', p.prokind::text,
-                COALESCE((SELECT pg_catalog.string_agg(
-                                     pg_catalog.format_type(u.ty, NULL), ', ' ORDER BY u.pos)
-                            FROM pg_catalog.unnest(p.proargtypes)
-                                 WITH ORDINALITY AS u(ty, pos)), ''), NULL::text,
+                p.oid::int8, NULL::text,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
@@ -1025,7 +1035,7 @@ fn grants_query() -> String {
           WHERE {NOT_A_PROJECTS_SCHEMA}
          UNION ALL
          SELECT n.nspname, NULL::text, 'nsp', '',
-                NULL::text, NULL::text,
+                NULL::int8, NULL::text,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
@@ -1049,6 +1059,30 @@ fn grants_query() -> String {
 /// filter that named only the declarable kinds reported the role as holding
 /// nothing there, which is *absent* reading as *empty*.
 const NOT_AN_INDEX_OR_TOAST: &str = "c.relkind NOT IN ('i', 'I', 't')";
+
+/// The argument types of every routine a grant can name, one row per
+/// argument, in order.
+///
+/// [`module_args_query`]'s wider twin. That one is filtered to the routines
+/// this model declares; a grant may be on any routine at all — an aggregate,
+/// an extension's function — and the reader has to be able to say what it is
+/// on before it can say the model cannot hold it.
+///
+/// `proargtypes` rather than `proallargtypes`, matching the module pull: it is
+/// the `IN` and `INOUT` types, which is what the engine's own identity for a
+/// routine is made of.
+fn grant_routine_args_query() -> String {
+    format!(
+        "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
+                pg_catalog.format_type(u.ty, NULL) AS ty
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes)
+                    WITH ORDINALITY AS u(ty, pos)
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+          ORDER BY 1, 2"
+    )
+}
 
 /// Every grant in a catalog whose target the model cannot name (see
 /// [`RawOtherGrant`], which lists the fourteen `aclitem[]` columns and why

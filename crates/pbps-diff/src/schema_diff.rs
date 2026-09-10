@@ -1212,10 +1212,19 @@ fn diff_roles(
         };
         // A rename, where the principal is the cluster's, is a rename a human
         // performed there — and on this engine an ACL entry holds the role's
-        // oid rather than its name, so every grant followed it and nothing
-        // has to be re-granted. The connected check confirms the cluster has
-        // the declared name; the grant comparison below then runs against it,
-        // which is right either way because the two names are one principal.
+        // oid rather than its name, so every grant followed it and nothing has
+        // to be re-granted.
+        //
+        // **This elision is sound only behind the connected check**
+        // (`pbps_pg::roles::rename_evidence`), and the check is not "does the
+        // new name exist". If the *old* name is still there as well, the two
+        // are two principals: emitting nothing would leave the old one holding
+        // everything pbps was managing while the declared one holds nothing,
+        // and the plan would then record the declared one as holding it all.
+        // The evidence that makes the rename a rename is the old name's
+        // **absence**; and if the old role was dropped and a new one created
+        // instead, its grants went with it, the pull shows the new role
+        // holding nothing, and every declared grant is planned here anyway.
         if base_name != name && manages_roles {
             changes.push(Change::RenameRole {
                 uid: uid.clone(),

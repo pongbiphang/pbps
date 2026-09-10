@@ -15357,6 +15357,87 @@ async fn a_declared_role_the_cluster_lacks_is_named_with_the_create_role_to_run(
     db.drop().await;
 }
 
+/// ADR-0010 §3, and the half `missing_roles` cannot answer. A rename is
+/// elided by the differ on this dialect, and that elision is sound only where
+/// the cluster really performed the rename — which "the new name exists" does
+/// not establish, because the new name may be somebody else.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster() {
+    use pbps_pg::roles::RenameEvidence;
+
+    let mut db = TestDb::create("renameev").await;
+    let from = least_privilege_role(&mut db, "renamefrom").await;
+    let to = format!("pbps_renameto_{}", std::process::id());
+    let _ = db.conn.execute(&format!("DROP ROLE IF EXISTS {to}")).await;
+
+    // Only the old name: the rename has not been run.
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::NotRunYet
+    );
+
+    // Both names: `to` is a different principal, and this is the case a
+    // check that only asked whether `to` exists would wave through — leaving
+    // `from` holding everything pbps manages and recording `to` as holding it.
+    db.conn
+        .execute(&format!("CREATE ROLE {to} LOGIN PASSWORD 'live-test'"))
+        .await
+        .expect("a second, unrelated role");
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::BothPresent
+    );
+    let refusal = pbps_pg::roles::refuse_rename(&from, &to, RenameEvidence::BothPresent)
+        .expect("two principals")
+        .to_string();
+    assert!(refusal.contains("different principal"), "{refusal}");
+
+    // The rename actually performed: the old name is gone, and the role's oid
+    // is unchanged — which is why nothing has to be re-granted.
+    cleanup_role(&mut db, &to).await;
+    let oid_before = text(
+        &mut db.conn,
+        &format!("SELECT oid::text FROM pg_catalog.pg_roles WHERE rolname = '{from}'"),
+    )
+    .await;
+    db.conn
+        .execute(&format!("ALTER ROLE {from} RENAME TO {to}"))
+        .await
+        .expect("rename the role");
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::Done
+    );
+    assert!(pbps_pg::roles::refuse_rename(&from, &to, RenameEvidence::Done).is_none());
+    assert_eq!(
+        text(
+            &mut db.conn,
+            &format!("SELECT oid::text FROM pg_catalog.pg_roles WHERE rolname = '{to}'"),
+        )
+        .await,
+        oid_before,
+        "the grants follow the oid, which is why the rename needs no re-granting"
+    );
+
+    // And with neither there, there is nothing to rename and nothing to grant.
+    cleanup_role(&mut db, &to).await;
+    assert_eq!(
+        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
+            .await
+            .expect("ask the cluster"),
+        RenameEvidence::NeitherPresent
+    );
+
+    db.drop().await;
+}
+
 /// The pull runs as the least-privileged account there is, because that is the
 /// account a deployment uses — and a read that needs a superuser is a read
 /// that will fail in the one environment that matters.

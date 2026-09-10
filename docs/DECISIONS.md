@@ -8105,3 +8105,43 @@ SPEC is in sync with all of these.
     `pg_tablespace` is a cluster object whose question is `pg_shdepend`'s. A
     live test runs the enumerating query and compares it with that list, so a
     fifteenth column in a later release fails there instead of going unnoticed.
+
+377. **A rename is elided only where the *old* name is gone from the cluster.**
+    370 has the differ build no `RenameRole` on a dialect that does not own the
+    principal, on the ground that an ACL entry holds the role's oid and every
+    grant followed the rename. That is true of a rename; it is not true of a
+    name.
+
+    If both names exist, `to` is a different principal. The plan then emits
+    nothing — the two grant sets compare equal — while `from` goes on holding
+    everything pbps was managing and `to` holds none of it, and the apply
+    records `to` as holding it all. A wrong recording with a single deployer,
+    which is the shape the finding rules always fix.
+
+    So the elision has a precondition, and it is not "the new name exists":
+    `pbps_pg::roles::rename_evidence` reads all four states and only
+    `Done` — old gone, new present — lets the rename pass. `BothPresent`,
+    `NotRunYet` and `NeitherPresent` each refuse with the
+    `ALTER ROLE … RENAME TO …` to run.
+
+    The remaining ambiguity is stated rather than hidden: `Done` cannot tell a
+    rename from a drop-and-create. It does not have to. If the old role was
+    dropped, its grants went with it, the pull shows the new role holding
+    nothing, and every declared grant is planned here anyway — so the plan is
+    right either way. Proving identity outright needs the role's oid in the
+    recorded state, which is a format change and not this step's.
+
+378. **A routine's arguments travel as rows, never as a rendered signature.**
+    A signature aggregated into one string has to be split again to be used,
+    and the separator is not a separator. **Measured**: a type named
+    `amount,type` renders as `cm."amount,type"`, so
+    `pg_get_function_identity_arguments` and any `string_agg` of `format_type`
+    both hand back a comma that belongs *inside* an argument.
+
+    Split on it, every fragment failed `RoutineArg`, and a valid grant on a
+    managed routine became targetless unexpressible state — which refuses the
+    connected plan, so a legal declaration could not be applied at all. The
+    grants query therefore returns the `pg_proc` oid and the arguments come
+    from their own query, one row per argument in order, the shape
+    `module_args_query` already uses. Nothing re-parses one string into a list,
+    which is what makes the whole class unrepresentable rather than handled.

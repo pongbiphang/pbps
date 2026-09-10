@@ -266,6 +266,10 @@ pub struct RawCatalog {
     pub module_args: Vec<RawModuleArg>,
     pub roles: Vec<RawRole>,
     pub grants: Vec<RawGrant>,
+    /// One row per argument of every routine a grant can name, in order — the
+    /// same shape as [`RawCatalog::module_args`], and a wider set: a grant may
+    /// be on a routine the module pull leaves out.
+    pub routine_args: Vec<RawModuleArg>,
     pub default_acls: Vec<RawDefaultAcl>,
     pub other_grants: Vec<RawOtherGrant>,
     pub held_elsewhere: Vec<RawSharedDependency>,
@@ -328,8 +332,20 @@ pub struct RawGrant {
     pub schema: String,
     /// `None` when the target is the schema itself.
     pub object: Option<String>,
-    /// A routine's identity arguments, where the object is one.
-    pub args: Option<String>,
+    /// The `pg_proc` oid, where the object is a routine — and **not** its
+    /// rendered signature.
+    ///
+    /// A signature aggregated into one string has to be split again to be
+    /// used, and a comma is not a separator: measured, a type named
+    /// `amount,type` renders as `cm."amount,type"`, so
+    /// `pg_get_function_identity_arguments` and any `string_agg` of
+    /// `format_type` both hand back a comma that belongs *inside* an argument.
+    /// Split on it, each fragment failed to parse and a valid grant on a
+    /// managed routine became targetless unexpressible state — which refuses
+    /// the connected plan. The arguments therefore travel as rows
+    /// ([`RawCatalog::routine_args`]), the way the module pull already carries
+    /// them, and are never re-parsed out of one string.
+    pub routine_oid: Option<i64>,
     /// Which catalog the row came from, and that catalog's own kind letter.
     ///
     /// A typed pair rather than one `char`, because the two alphabets overlap
@@ -788,12 +804,21 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         }
     }
 
+    // The arguments of every routine a grant can name, in order, as the
+    // catalog spells each type. Never one joined string: a comma can be part
+    // of an argument (`cm."amount,type"`), so a rendered signature cannot be
+    // split back into the list it came from.
+    let mut signatures: BTreeMap<i64, Vec<&str>> = BTreeMap::new();
+    for arg in &raw.routine_args {
+        signatures.entry(arg.routine_oid).or_default().push(&arg.ty);
+    }
+
     let mut public_executes: Vec<String> = Vec::new();
     let mut closed_to_public: BTreeSet<String> = raw
         .grants
         .iter()
         .filter(|g| matches!(g.kind, GrantedKind::Routine('f' | 'p')) && !g.defaulted)
-        .map(target_label)
+        .map(|g| target_label(g, &signatures))
         .collect();
 
     for g in &raw.grants {
@@ -802,14 +827,14 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             // it cannot be declared, and comparing it would report every
             // database's default `EXECUTE` on every function as a difference.
             if matches!(g.kind, GrantedKind::Routine('f' | 'p')) && g.permission == "EXECUTE" {
-                closed_to_public.remove(&target_label(g));
-                public_executes.push(target_label(g));
+                closed_to_public.remove(&target_label(g, &signatures));
+                public_executes.push(target_label(g, &signatures));
             } else {
                 pulled.warnings.push(format!(
                     "PUBLIC holds {} on {}, which is every principal in the cluster and not a \
                      role this project can declare (ADR-0010 §5)",
                     g.permission,
-                    target_label(g)
+                    target_label(g, &signatures)
                 ));
             }
             continue;
@@ -827,7 +852,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             pulled.warnings.push(format!(
                 "`{grantee}` holds {} on {}, and is not a role this project can declare",
                 g.permission,
-                target_label(g)
+                target_label(g, &signatures)
             ));
             continue;
         }
@@ -846,7 +871,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on {} is not a permission this model holds; the \
                      declarations cannot express it",
                     g.permission,
-                    target_label(g)
+                    target_label(g, &signatures)
                 ),
             );
             continue;
@@ -865,12 +890,12 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on column `{column}` of {} is a column-level grant, which \
                      the declarations cannot express",
                     g.permission,
-                    target_label(g)
+                    target_label(g, &signatures)
                 ),
             );
             continue;
         }
-        let target = match target_of(g) {
+        let target = match target_of(g, &signatures) {
             Ok(target) => target,
             Err(what) => {
                 unexpressible(pulled, None, format!("role {grantee}: {what}"));
@@ -889,7 +914,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on {} is `WITH GRANT OPTION`, which the declarations \
                      cannot express",
                     g.permission,
-                    target_label(g)
+                    target_label(g, &signatures)
                 ),
             );
             continue;
@@ -1048,7 +1073,10 @@ fn default_acl_objects(objtype: char) -> &'static str {
 }
 
 /// The target a grant names, or why the model cannot name it.
-fn target_of(g: &RawGrant) -> Result<pbps_model::GrantTarget, String> {
+fn target_of(
+    g: &RawGrant,
+    signatures: &BTreeMap<i64, Vec<&str>>,
+) -> Result<pbps_model::GrantTarget, String> {
     let Some(object) = g.object.as_deref() else {
         return Ok(pbps_model::GrantTarget::Schema(g.schema.clone()));
     };
@@ -1082,16 +1110,28 @@ fn target_of(g: &RawGrant) -> Result<pbps_model::GrantTarget, String> {
         // A routine, written with its signature: a name is not an identity
         // where the kind overloads (ADR-0009 §1).
         GrantedKind::Routine('f' | 'p') => {
-            match g.args.as_deref().unwrap_or_default().parse::<RoutineArgs>() {
-                Ok(args) => Ok(pbps_model::GrantTarget::Routine(
-                    pbps_model::RoutineId::new(name, args.0),
-                )),
-                Err(bad) => Err(format!(
-                    "{} on `{name}` is on a routine whose argument `{bad}` a declaration cannot \
-                     spell",
-                    g.permission
-                )),
+            let mut args = Vec::new();
+            for spelled in routine_args(g, signatures) {
+                match spelled.parse::<RoutineArg>() {
+                    Ok(arg) => args.push(arg),
+                    // The characters a declaration's argument admits are a
+                    // closed set; one outside it is a routine whose grant the
+                    // model cannot write down. Named rather than dropped —
+                    // and named as the *whole* argument, because the reason
+                    // this is a list and not a split string is that an
+                    // argument may contain a comma.
+                    Err(_) => {
+                        return Err(format!(
+                            "{} on `{name}` is on a routine whose argument `{spelled}` a \
+                             declaration cannot spell",
+                            g.permission
+                        ));
+                    }
+                }
             }
+            Ok(pbps_model::GrantTarget::Routine(
+                pbps_model::RoutineId::new(name, args),
+            ))
         }
         GrantedKind::Routine(other) => Err(format!(
             "{} on `{name}` is on {}, which this model does not declare",
@@ -1130,39 +1170,27 @@ fn routine_kind(prokind: char) -> &'static str {
 
 /// A grant's target as a message names it, before the model has decided
 /// whether it can hold one.
-fn target_label(g: &RawGrant) -> String {
-    match (&g.object, &g.args) {
-        (Some(object), Some(args)) => format!("`{}.{object}({args})`", g.schema),
+fn target_label(g: &RawGrant, signatures: &BTreeMap<i64, Vec<&str>>) -> String {
+    match (&g.object, g.routine_oid) {
+        (Some(object), Some(_)) => format!(
+            "`{}.{object}({})`",
+            g.schema,
+            routine_args(g, signatures).join(", ")
+        ),
         (Some(object), None) => format!("`{}.{object}`", g.schema),
         (None, _) => format!("schema `{}`", g.schema),
     }
 }
 
-/// The identity arguments of a routine, as `pg_get_function_identity_arguments`
-/// prints them, parsed into the model's list.
+/// The argument types of the routine this grant is on, in order.
 ///
-/// Its own type only so that the parse can fail by naming the argument it
-/// could not spell: a declaration's argument admits a closed set of characters
-/// ([`RoutineArg`]), and one outside it is a routine whose grant the model
-/// cannot write down.
-struct RoutineArgs(Vec<RoutineArg>);
-
-impl std::str::FromStr for RoutineArgs {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.trim().is_empty() {
-            return Ok(RoutineArgs(Vec::new()));
-        }
-        s.split(',')
-            .map(|arg| {
-                arg.trim()
-                    .parse::<RoutineArg>()
-                    .map_err(|_| arg.trim().to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(RoutineArgs)
-    }
+/// Empty for a routine that takes none — which is a routine all the same, and
+/// is why `RoutineId` keeps the parentheses.
+fn routine_args<'a>(g: &RawGrant, signatures: &BTreeMap<i64, Vec<&'a str>>) -> Vec<&'a str> {
+    g.routine_oid
+        .and_then(|oid| signatures.get(&oid))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// One module, or a note saying why it is not one.
@@ -2301,7 +2329,10 @@ mod tests {
             grantee: grantee.map(str::to_owned),
             schema: "app".to_owned(),
             object: object.map(str::to_owned),
-            args: matches!(kind, GrantedKind::Routine(_)).then(String::new),
+            // Oid 1 is the fixture's one routine; `signature` gives it the
+            // arguments a test needs, and a test that gives it none leaves
+            // the routine `f()`.
+            routine_oid: matches!(kind, GrantedKind::Routine(_)).then_some(1),
             kind,
             permission: permission.to_owned(),
             grantable: false,
@@ -2309,6 +2340,19 @@ mod tests {
             defaulted: false,
             owner: "deploy".to_owned(),
         }
+    }
+
+    /// The argument rows for the fixture's single routine, oid 1.
+    fn signature(types: &[&str]) -> Vec<RawModuleArg> {
+        types
+            .iter()
+            .enumerate()
+            .map(|(at, ty)| RawModuleArg {
+                routine_oid: 1,
+                position: at as i64 + 1,
+                ty: (*ty).to_owned(),
+            })
+            .collect()
     }
 
     fn pulled_role<'a>(pulled: &'a Pulled, name: &str) -> &'a pbps_model::Role {
@@ -2335,16 +2379,14 @@ mod tests {
                     GrantedKind::Relation('v'),
                     "SELECT",
                 ),
-                RawGrant {
-                    args: Some("integer, text".to_owned()),
-                    ..grant(
-                        Some("app_reader"),
-                        Some("f"),
-                        GrantedKind::Routine('f'),
-                        "EXECUTE",
-                    )
-                },
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Routine('f'),
+                    "EXECUTE",
+                ),
             ],
+            routine_args: signature(&["integer", "text"]),
             ..RawCatalog::default()
         });
         let targets: Vec<String> = pulled_role(&pulled, "app_reader")
@@ -2504,6 +2546,68 @@ mod tests {
         assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
     }
 
+    /// A comma is not a separator. **Measured**, a type named `amount,type`
+    /// renders as `cm."amount,type"`, so the comma that separates arguments
+    /// and the comma inside one are the same character — and a signature read
+    /// back as one string and split again turned a valid grant on a managed
+    /// routine into targetless unexpressible state, which refuses the
+    /// connected plan.
+    #[test]
+    fn a_comma_inside_an_argument_type_does_not_split_the_signature() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("f"),
+                GrantedKind::Routine('f'),
+                "EXECUTE",
+            )],
+            routine_args: signature(&["app.\"amount,type\"", "integer"]),
+            ..RawCatalog::default()
+        });
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["app.f(app.\"amount,type\",integer)"]
+        );
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// And an argument the declaration really cannot spell is named whole,
+    /// which is the other half of not splitting: half an argument in an error
+    /// message sends the reader to a type that does not exist. An unbalanced
+    /// quote is the shape `RoutineArg` refuses — a quoted name with a comma or
+    /// a parenthesis inside it is perfectly spellable, which is why the test
+    /// above exists at all.
+    #[test]
+    fn an_argument_a_declaration_cannot_spell_is_named_in_full() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("f"),
+                GrantedKind::Routine('f'),
+                "EXECUTE",
+            )],
+            routine_args: signature(&["app.\"never closed"]),
+            ..RawCatalog::default()
+        });
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("app.\"never closed"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
     /// The kinds this model does not declare still hold real grants —
     /// **measured**, a `GRANT SELECT` on a materialized view and on a
     /// partitioned table both land in `relacl` — so each is reported. Left out
@@ -2575,16 +2679,14 @@ mod tests {
                     GrantedKind::Relation('f'),
                     "SELECT",
                 ),
-                RawGrant {
-                    args: Some("integer".to_owned()),
-                    ..grant(
-                        Some("app_reader"),
-                        Some("f"),
-                        GrantedKind::Routine('p'),
-                        "EXECUTE",
-                    )
-                },
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Routine('p'),
+                    "EXECUTE",
+                ),
             ],
+            routine_args: signature(&["integer"]),
             ..RawCatalog::default()
         });
         // The foreign table is unexpressible; the procedure is a grant.

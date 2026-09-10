@@ -154,6 +154,86 @@ pub fn refuse_missing(name: &str) -> DialectError {
     }
 }
 
+/// What the cluster says about a role the declarations have renamed.
+///
+/// The elision in `pbps_diff` — no `RenameRole` where the principal is the
+/// cluster's — is sound only behind this. Name existence is **not** identity:
+/// if the old name is still there, `new` is some other principal, and a plan
+/// that emitted nothing would leave the old role holding everything pbps was
+/// managing while the declared one holds nothing, and then record the
+/// declared one as holding it all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameEvidence {
+    /// The old name is gone and the new one is there. The rename happened —
+    /// and if instead the old role was dropped and a new one created, its
+    /// grants went with it, so the pull shows the new role holding nothing and
+    /// every declared grant is planned. Either way the plan is right.
+    Done,
+    /// Both names exist. Two principals, and pbps has no way to tell which one
+    /// its declarations mean.
+    BothPresent,
+    /// Neither exists. Nothing to rename and nothing to grant on.
+    NeitherPresent,
+    /// The old name is there and the new one is not: the rename has not been
+    /// run.
+    NotRunYet,
+}
+
+/// Which of the four the cluster is in, for a declared rename `from` -> `to`.
+pub async fn rename_evidence(
+    conn: &mut Conn,
+    from: &str,
+    to: &str,
+) -> Result<RenameEvidence, DbError> {
+    let present = |missing: &[String], name: &str| !missing.iter().any(|m| m == name);
+    let missing = missing_roles(conn, &[from, to].into_iter().collect()).await?;
+    Ok(match (present(&missing, from), present(&missing, to)) {
+        (false, true) => RenameEvidence::Done,
+        (true, true) => RenameEvidence::BothPresent,
+        (false, false) => RenameEvidence::NeitherPresent,
+        (true, false) => RenameEvidence::NotRunYet,
+    })
+}
+
+/// The refusal a caller renders for a rename the cluster has not performed.
+///
+/// `None` where the evidence is [`RenameEvidence::Done`] — there is nothing to
+/// refuse, and the differ's silence about the rename is then correct.
+#[must_use]
+pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<DialectError> {
+    let (quoted_from, quoted_to) = match (crate::quote(from), crate::quote(to)) {
+        (Ok(f), Ok(t)) => (f, t),
+        (Err(e), _) | (_, Err(e)) => return Some(e),
+    };
+    let why = match evidence {
+        RenameEvidence::Done => return None,
+        // The case that makes this check exist rather than `missing_roles`
+        // alone: `to` exists, so a check that asked only "is the new name
+        // there" would pass — and `to` is a different principal.
+        RenameEvidence::BothPresent => format!(
+            "both `{from}` and `{to}` exist in the cluster, so `{to}` is a different principal \
+             and not `{from}` under a new name. pbps does not own the principal (ADR-0010 §3), \
+             and it cannot tell which of the two its declarations mean: renaming the role would \
+             move the grants, while granting to `{to}` would leave `{from}` holding everything \
+             it holds now. Rename the role, or drop `{to}` if it was created by mistake"
+        ),
+        RenameEvidence::NeitherPresent => format!(
+            "neither `{from}` nor `{to}` is in the cluster, so there is no principal to rename \
+             and none to grant on (ADR-0010 §3)"
+        ),
+        RenameEvidence::NotRunYet => format!(
+            "`{from}` is still in the cluster and `{to}` is not: the rename this revision \
+             declares has not been run. A PostgreSQL role is a cluster object and pbps does not \
+             own it (ADR-0010 §3); the grants follow the role's oid, so nothing has to be \
+             re-granted afterwards"
+        ),
+    };
+    Some(invalid(format!(
+        "{why}. Run it by hand, then plan again:\n\n    ALTER ROLE {quoted_from} RENAME TO \
+         {quoted_to};"
+    )))
+}
+
 /// One reason the cluster will refuse `DROP ROLE`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DropBlocker {
@@ -351,6 +431,31 @@ mod tests {
         assert!(owns.contains("3 objects"), "{owns}");
         assert!(owns.contains("in this database"), "{owns}");
         assert!(!owns.contains("REVOKE"), "{owns}");
+    }
+
+    /// Name existence is not identity. The case that matters is the one a
+    /// "does the new name exist" check would wave through: both names there,
+    /// two principals, and an empty plan that records the declared role as
+    /// holding what the old one still holds.
+    #[test]
+    fn a_rename_is_refused_unless_the_old_name_is_gone() {
+        assert!(refuse_rename("old", "new", RenameEvidence::Done).is_none());
+        let both = refuse_rename("old", "new", RenameEvidence::BothPresent)
+            .expect("two principals")
+            .to_string();
+        assert!(both.contains("different principal"), "{both}");
+        assert!(
+            both.contains(r#"ALTER ROLE "old" RENAME TO "new";"#),
+            "{both}"
+        );
+        let not_yet = refuse_rename("old", "new", RenameEvidence::NotRunYet)
+            .expect("the rename has not been run")
+            .to_string();
+        assert!(not_yet.contains("has not been run"), "{not_yet}");
+        let neither = refuse_rename("old", "new", RenameEvidence::NeitherPresent)
+            .expect("no principal at all")
+            .to_string();
+        assert!(neither.contains("no principal to rename"), "{neither}");
     }
 
     /// The refusal carries the statement, not a description of it.

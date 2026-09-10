@@ -488,7 +488,11 @@ had them.
   granted rather than created, because refusing it would refuse the only way a
   role ever comes under management here; a dropped role has its grants revoked
   and is left standing; a rename emits nothing, because an ACL entry holds the
-  role's oid and every grant followed it. The emitter keeps all five arms, and
+  role's oid and every grant followed it. That last elision has a precondition
+  §3 does not state and DECISIONS 377 does: the evidence of a rename is the
+  **old** name's absence, not the new name's presence. With both names in the
+  cluster they are two principals, and an empty plan would leave the old one
+  holding everything and record the new one as holding it. The emitter keeps all five arms, and
   the three it refuses name the statement a human runs.
 - **`maintain` needs two servers to test at all** (DECISIONS 374). The
   amendment above set the rule and this is what obeying it costs: the live

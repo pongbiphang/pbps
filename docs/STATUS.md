@@ -502,7 +502,10 @@ builds no `CreateRole`, `DropRole` or `RenameRole` at all on such a dialect — 
 declared role is granted rather than created, because refusing it would refuse
 the only way a role ever comes under management here; a dropped role has its
 grants revoked and is left standing; a rename emits nothing, because an ACL
-entry holds the role's oid and every grant already followed it. The emitter
+entry holds the role's oid and every grant already followed it — behind a
+connected check whose evidence is the **old** name's absence, since with both
+names in the cluster they are two principals and an empty plan would record the
+wrong one as holding the grants (DECISIONS 377). The emitter
 keeps all five arms and the three it refuses name the statement a human runs.
 
 `validate_role` lands ADR-0010 §1, §2 and §6 offline: a grant in a schema the
@@ -531,7 +534,10 @@ one alphabet and a function in the other, so a grant on a foreign table would
 have come back as a grant on a *function* of that name. The catalogs are now
 enumerated from the engine — PostgreSQL 18 has fourteen `aclitem[]` columns —
 and the eight whose targets no declaration can name are reported rather than
-dropped, with a live test that fails when a release adds a fifteenth.
+dropped, with a live test that fails when a release adds a fifteenth. A third
+of the same family came from review: a routine's arguments now travel as rows
+rather than as a rendered signature, because a type named `amount,type` puts
+the argument separator inside an argument (DECISIONS 378).
 
 Two costs the rules imposed rather than the code: the live suite and the
 `live-pg` CI job now start a pinned PostgreSQL **16** beside the pinned 18,
