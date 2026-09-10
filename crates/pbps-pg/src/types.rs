@@ -1084,6 +1084,286 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     }
 }
 
+/// Whether this type's text rendering is the same in **every** session — the
+/// question a length probe must answer before it may measure one.
+///
+/// A probe is issued before the deployment's transaction framing is
+/// established, so it runs under the operator's own settings while the
+/// statement it clears runs under the ones that framing pins (DECISIONS 267:
+/// `DateStyle`, `TimeZone`, `IntervalStyle`, `timezone_abbreviations`,
+/// `transform_null_equals`, `bytea_output`, `extra_float_digits`). Where a
+/// rendering moves between the two, the length the probe measures is not the
+/// length the `ALTER` will measure — and it goes wrong in **both** directions,
+/// which is why the answer is an allow-list and not a correction. Where the
+/// operator's rendering is the longer (a `bytea` under `escape`, a `timestamp`
+/// under `Postgres`), the probe counts rows this engine would have taken and a
+/// valid plan is refused. Where it is the shorter (an `interval` under
+/// `sql_standard`, a `float8` under a lower `extra_float_digits`), the probe
+/// counts nothing and clears a statement the engine then refuses — the exact
+/// failure a probe exists to prevent, arriving through the probe.
+///
+/// **Measured on 18.6**, each value rendered under the pinned setting and
+/// under another, as character counts:
+///
+/// ```text
+/// bytea       '\x0102'              hex 6         escape 8
+/// interval    '1 day 02:00:00'      postgres 14   sql_standard 9
+/// timestamp   '2026-01-02 12:00'    ISO 19        Postgres 24
+/// timestamptz the same, +00         UTC 22        Asia/Kolkata 25
+/// float8      1.0/3.0               digits 1 18   digits 0 17   digits -5 12
+/// ```
+///
+/// The pinned column is the left one, and it is not consistently the longer or
+/// the shorter: `bytea` and the date-and-time types render longer unpinned,
+/// `interval` and `float8` render shorter.
+///
+/// and, with all of those settings changed at once against the pinned ones,
+/// `json` (37), `jsonb` (38), `uuid` (36), `boolean` (4) and `numeric` (10) do
+/// not move. A `date` does not move either — every `DateStyle` this engine has
+/// prints ten characters for one — but it stays excluded with the rest of its
+/// family rather than being carved out, because that equality is a coincidence
+/// of the styles that exist and not a property anything promises.
+///
+/// This is an **allow-list**, and deliberately: a type this catalogue does not
+/// know renders however its own output function chooses, and `lc_monetary`,
+/// which decides how `money` prints, is not pinned at all — `CANONICAL_PATH`
+/// says why it cannot be. Silence for a rendering nobody measured is the
+/// answer this repo wants; a guess is not.
+fn renders_alike_everywhere(t: &ColumnType) -> bool {
+    matches!(
+        family(t),
+        Family::Exact(..) | Family::Bool | Family::Text { .. } | Family::Uuid | Family::Json { .. }
+    )
+}
+
+/// What a stored value must satisfy for `ALTER COLUMN … TYPE` to **fail** on
+/// it — the predicate a pre-flight probe counts (SPEC §7.5), over `value`.
+///
+/// `None` where no count exists, which is not the same as "nothing can go
+/// wrong": a change may lose data without ever failing, and those are listed
+/// in [`crate::preflight`]'s own documentation rather than answered here with
+/// a zero. Reducing a `numeric`'s scale rounds (measured, `1.55` into
+/// `numeric(10,1)` is `1.6`), a float into an integer rounds (`1.5` is `2`),
+/// a shorter `interval` rounds, `json` into `jsonb` drops duplicate keys and
+/// whitespace, and `double precision` into `real` drops precision. Not one of
+/// them raises, so there is no row to point at; the `narrowing` class is what
+/// stops them at the gate.
+///
+/// `None` also where the count would be **measured wrong**: a length taken over
+/// a rendering the session settings move is not the length the `ALTER` takes,
+/// so a `bytea`, an `interval`, a date-and-time type or a binary float into a
+/// bounded string gets no probe at all. `renders_alike_everywhere` holds that
+/// list and the measurements behind it.
+///
+/// # Why this is a predicate and not a cast
+///
+/// The obvious probe — "count the rows a cast rejects" — cannot be written on
+/// this engine, and writing it anyway is worse than having no probe.
+/// **Measured on 18.6**: an explicit `CAST` to a bounded string *truncates*
+/// where the `ALTER` *refuses*.
+///
+/// ```text
+/// SELECT 'abcde'::varchar(4);                     -- 'abcd'
+/// ALTER TABLE t ALTER COLUMN v TYPE varchar(4);   -- ERROR: value too long
+/// ```
+///
+/// So a cast-based probe over a table holding `'abcde'` counts **zero** and
+/// reports the change safe, and the statement it cleared then fails. That is
+/// the shape [`crate::preflight`] exists to prevent, arriving through the one
+/// construct that looks like the answer. The cast is an *explicit* conversion
+/// and the `ALTER` is an *assignment*, and only the second is what runs.
+///
+/// Both types must already be normalized, as everywhere else here.
+pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> Option<String> {
+    // Nothing to count where the engine will not attempt the change at all:
+    // `emit` refuses it by name with the `USING` clause spelled out
+    // (ADR-0012 §5), and a probe beside that refusal would only argue with it.
+    if change_risk(from, to) != TypeChangeRisk::Narrowing {
+        return None;
+    }
+    // `NaN` and both infinities sort **greatest** here rather than outside the
+    // order — measured, `'NaN'::numeric > 1e131071` is true, and so is
+    // `'NaN'::float8 = 'NaN'::float8`, where C would say neither. So a plain
+    // range test catches them, and where the target *accepts* one of them it
+    // has to be taken back out by name or the probe refuses a change the
+    // engine makes (measured: `'NaN'::float8` into `numeric(10,2)` is `NaN`).
+    let exact = format!("({value})::numeric");
+    let not_nan = format!("{exact} <> 'NaN'::numeric");
+    let finite =
+        format!("{not_nan} AND {exact} <> 'Infinity'::numeric AND {exact} <> '-Infinity'::numeric");
+    // A binary float is measured in **its own domain**, never through
+    // `numeric`. `float8::numeric` on this engine goes by way of the float's
+    // shortest round-tripping decimal, not its exact value, so it is a
+    // *rounding* and the rounding is large where the value is: **measured on
+    // 18.6**, `(-9223372036854775808::float8)::numeric` is
+    // `-9223372036854780000`, four thousand million out. Both boundary tests
+    // below sit exactly where that error is biggest, and both got it wrong in
+    // the direction that refuses a valid plan (DECISIONS 411):
+    //
+    // ```text
+    // -9223372036854775808::float8 -> bigint   engine: stored exactly
+    //                                          numeric domain: violation
+    //  3.4028235677973362e38       -> real     engine: stored as 3.4028235e+38
+    //                                          numeric domain: violation
+    // ```
+    //
+    // The comparisons are the same numbers; only the domain changes. Every
+    // threshold either arm needs is exactly representable as a `float8` — the
+    // integer bounds by construction, and `2^128 - 2^103` because it asks for
+    // 25 mantissa bits out of 53.
+    let binary = format!("({value})::float8");
+    let binary_finite = format!(
+        "{binary} <> 'NaN'::float8 AND {binary} <> 'Infinity'::float8 AND \
+         {binary} <> '-Infinity'::float8"
+    );
+    match (family(from), family(to)) {
+        // A bounded string target, from a source whose rendering every session
+        // agrees on. The value is measured after its **trailing spaces** are
+        // taken off and nothing else: measured, `'abc  '` into `varchar(3)` is
+        // `'abc'` and `E'abc\t'` into the same is `value too long`. `length`,
+        // not `octet_length` — the bound is in characters, measured, `'王小明'`
+        // is three of them and nine bytes and fits `varchar(3)`.
+        //
+        // The guard is the whole difference between a length this engine will
+        // measure and one only the operator's session would:
+        // `renders_alike_everywhere` carries the measurements and the reason
+        // (DECISIONS 406).
+        (
+            _,
+            Family::Text {
+                len: Len::Bounded(n),
+                ..
+            },
+        ) if renders_alike_everywhere(from) => {
+            Some(format!("length(rtrim(({value})::text, ' ')) > {n}"))
+        }
+
+        // An integer target. The engine tests the value it would *store*, so
+        // the test is on the rounded one: measured, `2147483647.4` into
+        // `integer` is accepted and `2147483647.6` is `integer out of range`.
+        (Family::Exact(Exact::Numeric { .. }), Family::Exact(Exact::Integer { max })) => {
+            let min = -max - 1;
+            Some(format!("round({exact}) > {max} OR round({exact}) < {min}"))
+        }
+        // The same question from a float, and **not** through `round`, which
+        // rounds the other way. Measured, this engine rounds a float to an
+        // integer half-to-even and a `numeric` half-away-from-zero: `0.5`,
+        // `1.5` and `2.5` become `0`, `2` and `2`. So the boundary is
+        // asymmetric and is written out rather than derived — measured,
+        // `2147483647.5::float8` into `integer` is out of range and
+        // `-2147483648.5::float8` is `-2147483648`, which fits.
+        (Family::Approx { .. }, Family::Exact(Exact::Integer { max })) => {
+            let min = -max - 1;
+            // No guard for `NaN` or an infinity: this engine orders `NaN`
+            // greatest among floats and `Infinity` next, so both fall out of
+            // the upper test and `-Infinity` out of the lower — and the engine
+            // refuses all three into an integer, measured (`cannot convert
+            // NaN to integer`). Counting them is the right answer, not an
+            // accident of the ordering.
+            Some(format!(
+                "{binary} >= {max}.5::float8 OR {binary} < {min}.5::float8"
+            ))
+        }
+
+        // A bounded `numeric` target. Measured, the engine's own message says
+        // which value it tests — "a field with precision 10, scale 4 must
+        // round to an absolute value less than 10^6" — so the test is on the
+        // value rounded to the target's scale, and `999999.995` stored as
+        // `numeric(10,2)` fails into `numeric(10,4)` because it is already
+        // `1000000.00`. An infinity is refused (`cannot hold an infinite
+        // value`) and a `NaN` is **kept**, so only the first is counted.
+        (
+            Family::Exact(..) | Family::Approx { .. },
+            Family::Exact(Exact::Numeric {
+                int_digits: Some(digits),
+                scale,
+            }),
+        ) => {
+            let scale = scale.unwrap_or(0);
+            Some(format!(
+                "{not_nan} AND abs(round({exact}, {scale})) >= 10::numeric^{digits}"
+            ))
+        }
+
+        // A binary float target, which overflows rather than saturating:
+        // measured, `3.5e38` into `real` is `value out of range: overflow`.
+        // The threshold is the midpoint above the largest value the target
+        // holds, and it is written as the engine's own arithmetic rather than
+        // as a decimal literal three hundred digits long. **Measured** by
+        // bisection: the largest `double precision` that becomes a `real` is
+        // `3.4028235677973362e38` and the smallest that overflows is
+        // `2^128 - 2^103` exactly; the same construction one exponent range up
+        // is the `double precision` bound, and the value just below it
+        // converts while the value at it does not.
+        //
+        // An infinity passes straight through (measured, `'Infinity'::float8`
+        // into `real` is `Infinity`) and so does a `NaN`, so both leave the
+        // count.
+        // The same question from a float, in the float's own domain. Only the
+        // `real` target reaches here: `real -> double precision` is a widening
+        // and `change_risk` has already answered `Safe`, so the threshold is
+        // always `2^128 - 2^103` and always representable. Were the other one
+        // ever reachable, `2::float8^1024` is `Infinity` and the guard above
+        // has already taken every infinity out, so it would report no
+        // violation rather than a wrong one.
+        (Family::Approx { .. }, Family::Approx { max_exact_int }) => {
+            let (base, mantissa) = if max_exact_int <= 1 << 24 {
+                (128, 103)
+            } else {
+                (1024, 970)
+            };
+            Some(format!(
+                "{binary_finite} AND abs({binary}) >= (2::float8^{base} - 2::float8^{mantissa})"
+            ))
+        }
+        (_, Family::Approx { max_exact_int }) => {
+            let (base, mantissa) = if max_exact_int <= 1 << 24 {
+                (128, 103)
+            } else {
+                (1024, 970)
+            };
+            Some(format!(
+                "{finite} AND abs({exact}) >= (2::numeric^{base} - 2::numeric^{mantissa})"
+            ))
+        }
+
+        // A date the target's calendar cannot reach. Measured,
+        // `'294276-12-31'::date` is the last one that becomes a `timestamp`
+        // and `'294277-01-01'` is `date out of range for timestamp`.
+        (
+            Family::Temporal {
+                last_year: Some(_), ..
+            },
+            Family::Temporal {
+                last_year: Some(last),
+                ..
+            },
+        ) => {
+            // `infinity` has to come out by name, exactly as it does for the
+            // numeric families above: it sorts after every finite value, so a
+            // plain range test flags it, and **measured on 18.6** the engine
+            // converts it and keeps it —
+            // `'infinity'::date` into a `timestamp` is `infinity`, not `date
+            // out of range`. Counting it refuses a plan this engine accepts.
+            //
+            // One spelling serves every source in this family: measured,
+            // `'infinity'::date` compares *equal* to `'infinity'::timestamp`
+            // and to `'infinity'::timestamptz`, so the literal does not have
+            // to be written per source type. `-infinity` needs no exclusion —
+            // it cannot satisfy a `>` against a finite bound — and there is no
+            // lower test to catch it, `Family::Temporal` carrying no
+            // `first_year`.
+            Some(format!(
+                "{value} <> 'infinity'::date AND {value} > '{last}-12-31'::date"
+            ))
+        }
+
+        // Everything else narrows without a row to point at; the list is in
+        // this function's own documentation.
+        _ => None,
+    }
+}
+
 /// The spelling this engine puts in a routine's identity, from a declared one
 /// (ADR-0009 §1, DECISIONS 301 and 303).
 ///
@@ -2033,6 +2313,137 @@ mod tests {
         normalize(&ty(s))
             .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
             .to_string()
+    }
+
+    /// DECISIONS 411: a float's boundary is tested as a float.
+    ///
+    /// The two predicates a float source reaches must not mention `numeric` at
+    /// all. `float8::numeric` rounds through the shortest decimal, and both of
+    /// these sit exactly where that rounding is largest, so a `numeric` in
+    /// either is the bug itself rather than a detail of it. Asserted on the
+    /// text because the failure is invisible in the answer until a row sits on
+    /// the boundary, and the live suite is what puts one there.
+    #[test]
+    fn a_float_source_is_measured_without_a_numeric_in_sight() {
+        let predicate = |from: &str, to: &str| {
+            let from = normalize(&ty(from)).expect("a source type normalizes");
+            let to = normalize(&ty(to)).expect("a target type normalizes");
+            cannot_become(&from, &to, "\"v\"")
+                .unwrap_or_else(|| panic!("`{from}` -> `{to}` should have a predicate to count"))
+        };
+        for (from, to) in [
+            ("double precision", "bigint"),
+            ("double precision", "integer"),
+            ("double precision", "smallint"),
+            ("real", "integer"),
+            ("double precision", "real"),
+        ] {
+            let got = predicate(from, to);
+            assert!(
+                !got.contains("numeric"),
+                "`{from}` -> `{to}` measures a float through `numeric`: {got}"
+            );
+            assert!(got.contains("float8"), "{got}");
+        }
+
+        // And the other half: an exact source keeps the exact domain, because
+        // that is the domain the `ALTER` itself converts in.
+        for (from, to) in [
+            ("numeric(30,0)", "bigint"),
+            ("numeric", "real"),
+            ("bigint", "real"),
+        ] {
+            let got = predicate(from, to);
+            assert!(
+                got.contains("numeric"),
+                "`{from}` -> `{to}` is exact and must stay exact: {got}"
+            );
+        }
+    }
+
+    /// The calendar probe leaves `infinity` alone, because the target keeps it.
+    ///
+    /// Every other range test here takes its sentinels out by name where the
+    /// target accepts them; this family is the one that did not, and an
+    /// `infinity` sorting after the finite bound is counted as a violation of
+    /// a conversion this engine performs. Both halves are asserted: the
+    /// exclusion, and the finite bound it must not have replaced.
+    #[test]
+    fn a_date_the_target_keeps_is_not_counted_against_its_calendar() {
+        let predicate = |from: &str, to: &str| {
+            let from = normalize(&ty(from)).expect("a source type normalizes");
+            let to = normalize(&ty(to)).expect("a target type normalizes");
+            cannot_become(&from, &to, "\"v\"")
+                .unwrap_or_else(|| panic!("`{from}` -> `{to}` should have a predicate to count"))
+        };
+        for (from, to) in [
+            ("date", "timestamp without time zone"),
+            ("date", "timestamp with time zone"),
+        ] {
+            let got = predicate(from, to);
+            assert!(
+                got.contains("<> 'infinity'::date"),
+                "`{from}` -> `{to}` counts a value the engine keeps: {got}"
+            );
+            assert!(
+                got.contains("'294276-12-31'::date"),
+                "`{from}` -> `{to}` lost the calendar bound itself: {got}"
+            );
+        }
+    }
+
+    /// A length probe is taken only over a rendering every session prints
+    /// alike (DECISIONS 406).
+    ///
+    /// The probe runs before the deployment pins its settings and the `ALTER`
+    /// runs after, so a source whose `::text` moves with `bytea_output`,
+    /// `IntervalStyle`, `DateStyle`, `TimeZone` or `extra_float_digits` would
+    /// be measured under one rendering and converted under another — and the
+    /// unpinned one is the longer, so the count refuses a plan this engine
+    /// accepts. Both halves are asserted: the sources that keep their probe
+    /// matter as much as the ones that lose it, or the gate could be a rule
+    /// that switched every probe off.
+    #[test]
+    fn a_length_probe_is_taken_only_over_a_rendering_no_setting_moves() {
+        let probe = |from: &str| {
+            let from = normalize(&ty(from)).expect("a source type normalizes");
+            let to = normalize(&ty("character varying(6)")).expect("a target type normalizes");
+            cannot_become(&from, &to, "\"v\"")
+        };
+        for from in [
+            "integer",
+            "bigint",
+            "numeric(12,2)",
+            "boolean",
+            "uuid",
+            "text",
+            "character(9)",
+            "json",
+            "jsonb",
+        ] {
+            let got = probe(from);
+            assert!(
+                got.as_deref().is_some_and(|p| p.contains("length(rtrim")),
+                "`{from}` renders the same in every session, so it keeps its probe: {got:?}"
+            );
+        }
+        for from in [
+            "bytea",
+            "interval",
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "real",
+            "double precision",
+        ] {
+            assert_eq!(
+                probe(from),
+                None,
+                "`{from}` renders differently under a setting the framing pins, \
+                 so no length may be measured for it"
+            );
+        }
     }
 
     /// A qualified or quoted name is the type only under the spelling the

@@ -1,16 +1,84 @@
 //! What a plan is asked about a live database before its first statement runs
-//! — the reference-data half (ADR-0004).
+//! (SPEC §7.5).
 //!
-//! Only the pre-delete probe is here, with the refusal DECISIONS 124 pairs
-//! with it. The rest of this dialect's probes — the not-null backfill, the
-//! unique duplicate, the foreign-key orphan, the type change — arrive with
-//! Phase 5 step 9, which is where `pbps-mssql`'s `preflight.rs` and
-//! `impact.rs` have their counterparts. This one is here because a
-//! `DeleteRow` cannot be emitted without it: the delete's own guard and the
-//! probe are the same count, and the guard is part of the statement. Being the
-//! same count is a claim to keep true: whatever makes one of them refuse has
-//! to make the other refuse, or the refusal arrives after a staged apply has
-//! committed everything ahead of the delete (DECISIONS 333).
+//! Each risky change knows how it can fail, so each becomes a query that counts
+//! the rows that would break it. On a non-zero count `apply` stops **before the
+//! first statement**, reporting the real number rather than letting the engine
+//! find it halfway through: "4,213 rows violate ck_customer_amount" is
+//! actionable and "the ALTER failed" is not.
+//!
+//! This is not a second risk classifier. Classification is static and happens
+//! offline (§7.2); these run at apply time, where a connection is guaranteed
+//! and reading the data is the job.
+//!
+//! # Two groups, because `order_key` reads the table twice
+//!
+//! A type change and a nullability change run at **rank 9**, before every row
+//! change, so their probes meet exactly the rows that are stored now. Every
+//! constraint this plan adds runs at **rank 13**, after them, so those probes
+//! meet the rows [`rows_after`] projects — what is stored, minus what the plan
+//! deletes and rewrites, plus what it writes. Built from the stored rows alone
+//! they would refuse the ordinary ADR-0004 plan, which declares the parent rows
+//! and the key that references them together.
+//!
+//! # Where a probe is deliberately absent
+//!
+//! An empty result means "nothing was checked", never "nothing is wrong", so
+//! the cases are named here rather than left to be discovered. The caller
+//! reports how many probes could not be checked and does not count them as
+//! passes.
+//!
+//! - **A narrowing with no row to point at.** Reducing a `numeric`'s scale
+//!   rounds (measured, `1.55` into `numeric(10,1)` is `1.6`), a float into an
+//!   integer rounds, a shorter `interval` rounds, `json` into `jsonb` drops
+//!   duplicate keys and whitespace, and `double precision` into `real` drops
+//!   precision. None of them raises, so no count exists; the `narrowing` class
+//!   is what stops them at the gate. [`crate::types::cannot_become`] holds the
+//!   list.
+//! - **A narrowing whose count would be measured under the wrong settings.** A
+//!   probe runs before the deployment's transaction framing is established, so
+//!   it renders values under the operator's session and the statement it clears
+//!   renders them under the pinned one (DECISIONS 267). Measured, a `bytea`, an
+//!   `interval`, a `timestamp` and a `double precision` all print to different
+//!   lengths under the two, in both directions: a length probe over one of them
+//!   would refuse a plan this engine accepts, or clear one it refuses. Those
+//!   sources get no length probe (DECISIONS 406).
+//! - **Drops and renames.** Every row of a dropped column is "affected", and a
+//!   count of them would always look alarming and never decide anything. A
+//!   rename carries a dependency risk rather than a data one, and
+//!   [`crate::impact`] is what asks the catalog about it.
+//! - **A value this plan writes that no probe can evaluate** — a default that is
+//!   not a literal, which has no value until it runs (DECISIONS 124), and a key
+//!   spanning a column this plan *narrows*, whose projection would be a `CAST`
+//!   that can raise (DECISIONS 392).
+//! - **A check on a table this plan retypes a column of.** The conversion runs
+//!   at rank 9 and the check is added at rank 13, so the engine tests the
+//!   converted value while a probe tests the stored one. Measured, a
+//!   `numeric(10,2)` holding `1.50` converted to `numeric(10,0)` and then given
+//!   `CHECK (v = round(v))` is accepted by the engine and counted as a
+//!   violation by a probe over the stored value — a valid plan refused. The
+//!   predicate is arbitrary SQL that names its own columns, so supplying
+//!   converted values would mean rewriting that text by substitution, which
+//!   this module refuses; the answer is no probe (DECISIONS 410).
+//! - **A check whose expression the probe cannot evaluate here.** The text is
+//!   never rewritten for a rename — rewriting SQL by substitution is how a tool
+//!   that promised not to parse SQL starts parsing it badly — and an
+//!   unqualified name in it binds under the write path the emitted statement
+//!   carries (DECISIONS 259) where a probe, being one `SELECT`, carries none.
+//!   A column this same plan *adds* is not there to read either. Each of those
+//!   makes the probe fail to run, and the runner says so by name, which is the
+//!   more visible of the two silences.
+//! - **Roles and grants**, which are Phase 5 step 6: `emit` refuses every one of
+//!   them by name until it lands, so there is no plan for a probe to be part of.
+//!
+//! # The reference-data half (ADR-0004)
+//!
+//! The pre-delete probe is here for a reason the others are not: a `DeleteRow`
+//! cannot be emitted without it. The delete's own guard and the probe are the
+//! same count, and the guard is part of the statement. Being the same count is
+//! a claim to keep true — whatever makes one of them refuse has to make the
+//! other refuse, or the refusal arrives after a staged apply has committed
+//! everything ahead of the delete (DECISIONS 333).
 //!
 //! # Why the referencing tables are found at run time
 //!
@@ -126,6 +194,66 @@ const STORED: &str = "'ch.' || pg_catalog.quote_ident(c.attname)";
 /// error, so every probe is checked for one before it is returned
 /// (DECISIONS 353).
 const COLLATION_MARK: char = '\u{1}';
+
+/// The SQL that reads one column's `COLLATE` clause out of the catalog, as the
+/// text a mark stands for: ` COLLATE <schema>.<collation>`, or the empty
+/// string where the column has no collation of its own.
+///
+/// `relation` and `column` arrive as SQL literals naming the stored relation
+/// and the stored column, because the clause is evaluated by the engine and
+/// not by anything here. `also` is a further condition the column must meet to
+/// keep its collation — a column this plan retypes carries one into the new
+/// type only where that type has one — and is empty where there is none.
+fn collation_clause(relation: &str, column: &str, also: &str) -> String {
+    format!(
+        "(SELECT CASE WHEN a.attcollation <> 0{also} \
+         THEN ' COLLATE ' || pg_catalog.quote_ident(n.nspname) || '.' \
+         || pg_catalog.quote_ident(c.collname) ELSE '' END \
+         FROM pg_catalog.pg_attribute a \
+         LEFT JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace \
+         WHERE a.attrelid = pg_catalog.to_regclass({relation}) AND a.attname = {column})"
+    )
+}
+
+/// `body` as the pieces the engine concatenates to rebuild it: its literal
+/// text, and in place of each collation mark the clause that reads that
+/// collation from the catalog.
+///
+/// Shared by every probe that assembles a statement rather than writing one,
+/// so that the mark means one thing in this file. A body with no mark comes
+/// back as a single literal, which is why callers ask [`assembled_int`]
+/// whether assembly is needed at all rather than deciding here.
+fn pieces_of(body: &str, clauses: &[String]) -> Vec<String> {
+    let mut pieces = Vec::new();
+    for (i, part) in body.split(COLLATION_MARK).enumerate() {
+        if i % 2 == 0 {
+            pieces.push(value_literal(part));
+        } else {
+            let clause = &clauses[part.parse::<usize>().expect("a mark's index")];
+            pieces.push(format!("COALESCE({clause}, '')"));
+        }
+    }
+    pieces
+}
+
+/// One integer term, assembled by the engine where it carries a collation mark
+/// and left as it is where it does not.
+///
+/// [`query_to_xml`](https://www.postgresql.org/docs/18/functions-xml.html) is
+/// this engine's only way to run generated SQL from inside a `SELECT`, and a
+/// probe has to be one `SELECT` (DECISIONS 325). A probe with no collation to
+/// ask about stays readable instead.
+fn assembled_int(term: &str, clauses: &[String]) -> String {
+    if !term.contains(COLLATION_MARK) {
+        return term.to_owned();
+    }
+    format!(
+        "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',
+                              pg_catalog.query_to_xml('SELECT (' || {} || ') AS n', false, true, ''))                 )[1]::text::int), 0)",
+        pieces_of(term, clauses).join(" || ")
+    )
+}
 
 /// The key as a conjunction the engine assembles at run time: ` AND p.<rc>
 /// [COLLATE …] OPERATOR(…) <child side>` for each of its columns, where
@@ -322,6 +450,12 @@ struct AsStored {
     /// `ALTER COLUMN … TYPE` runs at rank 9, before the deletes, so a key
     /// spanning one compares converted values (DECISIONS 340).
     retyped: BTreeMap<ColumnRef, pbps_model::ColumnType>,
+    /// The same columns, with the type they have **now**. A probe that
+    /// projects a stored value through the new type has to know whether that
+    /// conversion can fail before it writes it: a `CAST` that raises takes the
+    /// whole probe with it, and the runner reports the probe as unchecked
+    /// rather than as a violation.
+    retyped_from: BTreeMap<ColumnRef, pbps_model::ColumnType>,
     /// The type of every column a row change of this plan carries a type
     /// for, as the plan leaves it: a literal the probe compares against
     /// another literal is compared through it (DECISIONS 341).
@@ -420,8 +554,26 @@ impl AsStored {
                 } => {
                     this.columns.insert(table.column(to), from.clone());
                 }
-                Change::CreateTable { name, .. } => {
+                Change::CreateTable { name, table, .. } => {
                     this.created.insert(name.clone());
+                    // A created table's columns are entirely in the plan, so
+                    // its **key** has a type here where a stored table's has
+                    // none: `InsertRow` carries the type of every non-key
+                    // column and no more, and the row key is what a foreign
+                    // key most often points at. Without this the two sides of
+                    // a key between two created tables are unknown literals,
+                    // which the engine resolves to `text` and compares as
+                    // text — measured, a parent spelling its `numeric(5,1)`
+                    // key `1.0` and a child spelling its `numeric(5,2)` one
+                    // `1.00` (each the engine's own rendering, which is what
+                    // the spelling check requires) counted one orphan, and
+                    // the engine took the plan. The same reasoning as
+                    // DECISIONS 339 and 341, arriving at the column the row
+                    // changes cannot describe.
+                    for (column, declared) in &table.columns {
+                        this.column_types
+                            .insert(name.column(column), declared.ty.clone());
+                    }
                 }
                 // Both run before the deletes (`order_key`), so a child
                 // counted through either would refuse a delete that will be
@@ -577,8 +729,11 @@ impl AsStored {
                         },
                     );
                 }
-                Change::AlterColumnType { column, to, .. } => {
+                Change::AlterColumnType {
+                    column, from, to, ..
+                } => {
                     this.retyped.insert(column.clone(), to.clone());
+                    this.retyped_from.insert(column.clone(), from.clone());
                 }
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
@@ -606,6 +761,16 @@ impl AsStored {
             }
         }
         this
+    }
+
+    /// Whether this plan retypes any column of a table.
+    ///
+    /// One spelling, because two probes ask it and they must not drift apart:
+    /// a retype is the one plan change that leaves a probe *able* to run and
+    /// wrong, so whichever probe forgets to ask this is the one that refuses a
+    /// valid plan (DECISIONS 410).
+    fn retypes_in(&self, table: &TableName) -> bool {
+        self.retyped.keys().any(|c| c.table == *table)
     }
 
     /// The name the catalog has for a table this plan names, or `None` where
@@ -1671,16 +1836,10 @@ fn planned_key_probes(
                         None => String::new(),
                     };
                     collated.insert(r.clone(), clauses.len());
-                    clauses.push(format!(
-                        "(SELECT CASE WHEN a.attcollation <> 0{still_collatable} \
-                         THEN ' COLLATE ' || pg_catalog.quote_ident(n.nspname) || '.' \
-                         || pg_catalog.quote_ident(c.collname) ELSE '' END \
-                         FROM pg_catalog.pg_attribute a \
-                         LEFT JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation \
-                         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace \
-                         WHERE a.attrelid = pg_catalog.to_regclass({}) AND a.attname = {})",
-                        value_literal(&parent),
-                        value_literal(&stored_r.name)
+                    clauses.push(collation_clause(
+                        &value_literal(&parent),
+                        &value_literal(&stored_r.name),
+                        &still_collatable,
                     ));
                     Box::new(move |alias: &str| {
                         Some(if alias == "q" { q.clone() } else { p.clone() })
@@ -1901,33 +2060,13 @@ fn planned_key_probes(
         // The text of `body` as the engine will concatenate it: its literal
         // pieces, and in place of each mark the clause that reads the
         // collation from the catalog.
-        let spliced = |body: &str| -> Vec<String> {
-            let mut pieces = Vec::new();
-            for (i, part) in body.split(COLLATION_MARK).enumerate() {
-                if i % 2 == 0 {
-                    pieces.push(value_literal(part));
-                } else {
-                    let clause = &clauses[part.parse::<usize>().expect("a mark's index")];
-                    pieces.push(format!("COALESCE({clause}, '')"));
-                }
-            }
-            pieces
-        };
+        let spliced = |body: &str| -> Vec<String> { pieces_of(body, &clauses) };
         // One integer term of the count, assembled by the engine where it
         // carries a mark — a row this plan inserts, compared with a parent
         // row it inserts under the referenced column's collation (DECISIONS
         // 366) — and as it is where it does not, so that a probe with no
         // collation to ask about stays readable.
-        let evaluated = |term: &str| -> String {
-            if !term.contains(COLLATION_MARK) {
-                return term.to_owned();
-            }
-            format!(
-                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',
-                              pg_catalog.query_to_xml('SELECT (' || {} || ') AS n', false, true, ''))                 )[1]::text::int), 0)",
-                spliced(term).join(" || ")
-            )
-        };
+        let evaluated = |term: &str| -> String { assembled_int(term, &clauses) };
         let stored_rows = |body: &str| {
             let pieces = spliced(body);
             format!(
@@ -2198,18 +2337,805 @@ fn described_backfill(column: &str, table: &TableName, added: Option<&AddedColum
     }
 }
 
+/// Which rows the statement a probe is built for will meet.
+enum Applies<'a> {
+    AllRows,
+    /// The `WHERE` of a partial unique index, verbatim as declared.
+    Where(&'a str),
+}
+
+/// One table's rows in `columns`, as this plan will have left them by the time
+/// the change that asks runs — a derived table whose columns are `k0`..`kn`.
+///
+/// Not "what is stored", and that is the difference between a probe that works
+/// and one that refuses the ordinary plan. `order_key` runs every row change
+/// before every constraint this plan adds, so a plan that inserts the parent
+/// rows and *then* adds the foreign key is a plan the constraint will accept —
+/// and a probe built from the stored rows alone counts every child as an
+/// orphan and refuses it. The same for a plan that deletes the duplicates
+/// before adding the unique constraint.
+///
+/// The engine does the arithmetic: what is stored, minus the rows this plan
+/// deletes and the ones it rewrites in these very columns, union what it
+/// writes — a literal row per insert, and per rewriting update a row that takes
+/// the changed cells from the plan and the rest from the table.
+///
+/// `None` means **no probe**, and it is returned wherever a value cannot be
+/// spelled rather than guessed at:
+///
+/// - a cell this plan writes to a default that is not a literal, which has no
+///   value until it runs (DECISIONS 124's shape, and 117's on the other
+///   dialect);
+/// - a column of the key whose type this plan *narrows*, because projecting the
+///   stored value through the new type means a `CAST` that can raise, and a
+///   probe that raises is reported as **unchecked** while the apply proceeds.
+///   The row that would raise cannot survive the `ALTER COLUMN … TYPE` either,
+///   and that change's own conversion probe is what counts it and names the
+///   column;
+/// - a table this plan creates whose declared rows cannot all be spelled,
+///   because "this table will hold rows I cannot spell" is not "this table will
+///   be empty", and calling it empty makes every matching child an orphan.
+///
+/// A created table that declares *no* rows is a different answer: it will hold
+/// none, and none is an answer. It comes back as the empty relation rather than
+/// as `None`, or a foreign key into a new and empty parent would go unprobed.
+fn rows_after(
+    names: &AsStored,
+    table: &TableName,
+    columns: &[String],
+    alias: &str,
+    applies: &Applies<'_>,
+) -> Result<Option<String>, DialectError> {
+    let moved = names.moved.get(table);
+    let filter = match applies {
+        Applies::AllRows => None,
+        Applies::Where(predicate) => {
+            // The predicate is arbitrary SQL over the whole row and this
+            // relation is a projection of a few columns unioned with rows that
+            // are not in the table yet, so it can only be asked of the stored
+            // branch and only where this plan leaves that branch alone. A row
+            // the plan writes may move in or out of the filtered set on a
+            // column the predicate reads and this projection never selects; a
+            // column the plan renames makes the predicate name nothing, or
+            // silently name a different column; a column the plan adds is not
+            // there to read; and a column the plan retypes changes what the
+            // predicate's own literals are coerced to. Where it cannot be
+            // asked the answer is no probe, never the unfiltered count — that
+            // counts collisions among the very rows the index exempts and
+            // refuses a plan the engine accepts (the other dialect's
+            // DECISIONS 236).
+            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
+                || names.columns.keys().any(|c| c.table == *table)
+                || names.columns_added.keys().any(|c| c.table == *table)
+                || names.retypes_in(table)
+            {
+                return Ok(None);
+            }
+            Some(*predicate)
+        }
+    };
+
+    // One column of one branch, named `k{i}` so that the derived table has
+    // names whichever branch comes first, and projected through the type this
+    // plan gives the column where it gives it one.
+    let projected = |i: usize, column: &str, sql: String| -> Option<String> {
+        let reference = table.column(column);
+        match (
+            names.retyped_from.get(&reference),
+            names.retyped.get(&reference),
+        ) {
+            (Some(from), Some(to)) => {
+                let from = crate::types::normalize(from).ok()?;
+                let to = crate::types::normalize(to).ok()?;
+                // Only a widening is written out. A narrowing `CAST` raises on
+                // the row that cannot make the trip, and takes the probe with
+                // it; `TypeChangeRisk::Safe` is by its own definition the class
+                // that cannot fail, so this cast cannot either.
+                (crate::types::change_risk(&from, &to) == pbps_dialect::TypeChangeRisk::Safe)
+                    .then(|| format!("CAST({sql} AS {to}) AS k{i}"))
+            }
+            _ => Some(format!("{sql} AS k{i}")),
+        }
+    };
+
+    let mut branches = Vec::new();
+    // Whether a row this plan writes had to be dropped because one of its key
+    // cells is a value no probe can evaluate. It is the difference between
+    // "this table will hold no rows" and "this table will hold rows I cannot
+    // spell", and the tail of this function treats those two very differently.
+    let mut unspellable = false;
+
+    if let Some(stored) = names.table(table) {
+        let mut selected = Vec::new();
+        for (i, column) in columns.iter().enumerate() {
+            let reference = table.column(column);
+            // A column this plan *adds* is not there for the probe to read —
+            // naming it is `42703`, and a probe that raises is reported as
+            // unchecked while the apply proceeds. What every row already in the
+            // table will hold in it stands in its place instead: the backfill,
+            // where the plan carries one it can evaluate.
+            let read = match names.columns_added.get(&reference) {
+                Some(added) => match backfill_of(added) {
+                    Some(held) => held,
+                    None => {
+                        unspellable = true;
+                        break;
+                    }
+                },
+                None => match names.column(&reference) {
+                    Some(stored_column) => format!("{alias}.{}", quote(&stored_column.name)?),
+                    None => {
+                        unspellable = true;
+                        break;
+                    }
+                },
+            };
+            match projected(i, column, read) {
+                Some(sql) => selected.push(sql),
+                None => {
+                    unspellable = true;
+                    break;
+                }
+            }
+        }
+        if !unspellable && !selected.is_empty() {
+            let mut sql = format!(
+                "SELECT {} FROM {} AS {alias}",
+                selected.join(", "),
+                qualified(&stored)?
+            );
+            let mut wheres = Vec::new();
+            // Parenthesised: the predicate is the user's text, and an `OR` in
+            // it would otherwise bind looser than the exclusion below.
+            if let Some(predicate) = filter {
+                wheres.push(format!("({predicate})"));
+            }
+            // Minus the rows this plan takes away or rewrites within these
+            // columns: both run first, so counting them is counting a state
+            // that will not be there. A rewritten row comes back below, as the
+            // plan will leave it.
+            if let Some(m) = moved {
+                let gone: BTreeSet<String> = m
+                    .deleted
+                    .iter()
+                    .chain(
+                        m.updated
+                            .iter()
+                            .filter(|(_, cells)| cells.keys().any(|c| columns.contains(c)))
+                            .map(|(key, _)| key),
+                    )
+                    .map(|k| value_literal(k.as_str()))
+                    .collect();
+                if !gone.is_empty() {
+                    let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                        return Ok(None);
+                    };
+                    wheres.push(format!(
+                        "{alias}.{} NOT IN ({})",
+                        quote(&key_column.name)?,
+                        gone.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+            if !wheres.is_empty() {
+                sql.push_str(&format!(" WHERE {}", wheres.join(" AND ")));
+            }
+            branches.push(sql);
+        }
+    }
+
+    // And what this plan puts there.
+    if let Some(m) = moved
+        && !unspellable
+    {
+        let unprobeable = |column: &String, key: &RowKey| {
+            m.unprobeable
+                .get(column)
+                .is_some_and(|rows| rows.contains(key))
+        };
+        for (key, cells) in &m.inserted {
+            let mut values = Vec::new();
+            for (i, column) in columns.iter().enumerate() {
+                // An insert names the whole row (DECISIONS 136), so a column
+                // absent from it is one the *engine* fills in — an identity,
+                // whose value is not knowable before the insert runs. NULL in
+                // its place is the "invent a violation" direction: two inserted
+                // rows both reading NULL make a unique constraint report a
+                // collision the engine would never produce, and make the parent
+                // side of a foreign-key probe turn every real child into an
+                // orphan.
+                let Some(sql) = cells.get(column) else {
+                    unspellable = true;
+                    break;
+                };
+                if unprobeable(column, key) {
+                    unspellable = true;
+                    break;
+                }
+                match projected(i, column, names.typed(&table.column(column), sql.clone())) {
+                    Some(sql) => values.push(sql),
+                    None => {
+                        unspellable = true;
+                        break;
+                    }
+                }
+            }
+            if unspellable {
+                break;
+            }
+            branches.push(format!("SELECT {}", values.join(", ")));
+        }
+        for (key, cells) in &m.updated {
+            if unspellable {
+                break;
+            }
+            if !cells.keys().any(|c| columns.contains(c)) {
+                continue;
+            }
+            let (Some(stored), Some(key_column)) = (
+                names.table(table),
+                names.column(&table.column(&m.key_column)),
+            ) else {
+                continue;
+            };
+            let mut values = Vec::new();
+            for (i, column) in columns.iter().enumerate() {
+                // The cells this update writes, and the table's own for the
+                // rest: an update names only what changes, and the columns it
+                // leaves alone are still part of the key.
+                let read = match cells.get(column) {
+                    Some(Some(sql)) => names.typed(&table.column(column), sql.clone()),
+                    Some(None) if unprobeable(column, key) => {
+                        unspellable = true;
+                        break;
+                    }
+                    // Set to NULL: spelled so, rather than read from the row it
+                    // is about to leave.
+                    Some(None) => "NULL".to_owned(),
+                    None => match names.column(&table.column(column)) {
+                        Some(c) => format!("{alias}.{}", quote(&c.name)?),
+                        None => {
+                            unspellable = true;
+                            break;
+                        }
+                    },
+                };
+                match projected(i, column, read) {
+                    Some(sql) => values.push(sql),
+                    None => {
+                        unspellable = true;
+                        break;
+                    }
+                }
+            }
+            if unspellable {
+                break;
+            }
+            branches.push(format!(
+                "SELECT {} FROM {} AS {alias} WHERE {alias}.{} = {}",
+                values.join(", "),
+                qualified(&stored)?,
+                quote(&key_column.name)?,
+                value_literal(key.as_str())
+            ));
+        }
+    }
+
+    // Before the branches are used, not after them. A relation missing one row
+    // is not this table's contents, and which way it lies depends only on which
+    // side of the constraint it is on: on the parent side a child matching the
+    // missing row reads as an orphan and a valid foreign key is refused; on the
+    // child side an orphan hidden in the missing row is not counted at all.
+    if unspellable {
+        return Ok(None);
+    }
+    if !branches.is_empty() {
+        return Ok(Some(branches.join("\n UNION ALL ")));
+    }
+    // Nothing to select from, which happens only for a table this plan creates
+    // that declares no rows. It will hold none, and none is an answer: every
+    // non-NULL reference on the child side of a foreign key into it is an
+    // orphan. `WHERE false` is what makes it the empty relation, and each
+    // column still states its type so the outer query can compare against it.
+    let mut empty = Vec::new();
+    for (i, column) in columns.iter().enumerate() {
+        let Some(ty) = names.final_type(&table.column(column)) else {
+            return Ok(None);
+        };
+        empty.push(format!(
+            "CAST(NULL AS {}) AS k{i}",
+            crate::types::normalize(&ty).unwrap_or(ty)
+        ));
+    }
+    Ok(Some(format!("SELECT {} WHERE false", empty.join(", "))))
+}
+
+/// What every stored row of a table holds in a column this plan adds, once the
+/// `ADD COLUMN` has run: `None` for a backfill no probe can evaluate.
+///
+/// The same three answers [`planned_key_probes`] reads, spelled once: an
+/// identity hands every stored row a value from a sequence, an expression
+/// default has no value until it runs, and a literal is compared through the
+/// column's declared type — two spellings of one `date` are one value to the
+/// engine and two strings to a comparison of unknown literals (DECISIONS 339).
+fn backfill_of(added: &AddedColumn) -> Option<String> {
+    if added.identity {
+        return None;
+    }
+    match &added.default {
+        Some(default) => {
+            let literal = constant_default(default)?;
+            if crate::rows::unwrapped(literal).eq_ignore_ascii_case("null") {
+                return Some("NULL".to_owned());
+            }
+            Some(format!(
+                "CAST(({literal}) AS {})",
+                crate::types::normalize(&added.ty).unwrap_or_else(|_| added.ty.clone())
+            ))
+        }
+        // A column added with no default arrives at NULL in every stored row.
+        None => Some("NULL".to_owned()),
+    }
+}
+
+/// `r.k0 .. r.kn`: the columns [`rows_after`] names its relation's with.
+fn keys(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("r.k{i}")).collect()
+}
+
+/// The NULLs a `NOT NULL` would reject.
+///
+/// `from` is the relation the statement will meet and `reads` is how a row in
+/// it reads in this column — the quoted column name, or an expression where
+/// this plan is the one deciding what is there.
+fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Probe {
+    Probe::new(
+        format!("existing NULLs in {column}, which NOT NULL would reject"),
+        format!("SELECT count(*)::int AS n FROM {from} WHERE {reads} IS NULL;"),
+    )
+}
+
+/// The rows that would collide under a new unique constraint or unique index.
+///
+/// **Rows with a NULL in any column of the key are left out, and that is this
+/// engine's rule rather than tidiness.** A unique constraint here is `NULLS
+/// DISTINCT` unless it says otherwise, and nothing this dialect emits says
+/// otherwise — measured on 18.6, two rows holding NULL are accepted, and so are
+/// two rows holding `(1, NULL)` under a two-column key. `GROUP BY` is the
+/// opposite: it treats NULLs as equal, so the count it gives for those very
+/// rows is two. Ported straight from the SQL Server probe, where `UNIQUE` does
+/// treat NULLs as equal, this refused a plan the engine accepts — which is the
+/// worse of the two directions to be wrong in.
+fn duplicate_probe(from: &str, columns: &[String], description: &str) -> Probe {
+    let list = columns.join(", ");
+    let present: Vec<String> = columns.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+    Probe::new(
+        description,
+        // The rows, not the groups: "3 duplicate groups" makes an operator do
+        // arithmetic before they know how much data is involved.
+        format!(
+            "SELECT COALESCE(sum(c), 0)::int AS n FROM (\n    SELECT count(*) AS c FROM {from}\n     WHERE {}\n     GROUP BY {list} HAVING count(*) > 1) AS dup;",
+            present.join(" AND ")
+        ),
+    )
+}
+
+/// The probes one change implies, in the names the database still has.
+///
+/// The ordering the arms rely on is `order_key`'s, and it is the reason two
+/// groups of probes read the table differently. A type change and a
+/// nullability change run at rank 9, **before** every row change, so their
+/// probes meet exactly the rows that are stored now. Every constraint this plan
+/// adds runs at rank 13, **after** them, so those probes meet the rows
+/// [`rows_after`] projects.
+fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> {
+    match change {
+        // A new column the declarations require a value in, with nothing to
+        // put there. Every existing row breaks it, so the count is the table's
+        // own — and it is a count rather than a yes, because "4,213 rows"
+        // is what tells an operator what backfilling this will cost.
+        Change::AddColumn {
+            table,
+            name,
+            column,
+            ..
+        } if !column.nullable && !column.has_required_add_value_source() => {
+            let Some(stored) = names.table(table) else {
+                return Ok(Vec::new());
+            };
+            // The model's marker is lexical and deliberately conservative: it
+            // answers "could this expression mean NULL?" by looking for the
+            // word, and `NULLIF` is one of the words. **Measured on 18.6**, a
+            // nonempty table takes
+            // `ADD COLUMN c integer NOT NULL DEFAULT NULLIF(1, 2)` and every
+            // row reads `1`, while `NULLIF(1, 1)` is `contains null values` —
+            // one word, both answers. Counting the whole table on the word
+            // alone refuses the first.
+            //
+            // The count is therefore kept only where the value is one this
+            // module can read *without running anything*: no default at all,
+            // or a default that is the literal `NULL`. An expression is the
+            // case DECISIONS 124 already answers with no probe rather than a
+            // guess, and the alternative is worse than silence — asking the
+            // engine `(expr) IS NULL` would run the operator's own function
+            // before the plan is approved, which is the shape of #274 and
+            // something no probe in this crate does.
+            if let Some(default) = column.default.as_deref() {
+                let Some(literal) = constant_default(default) else {
+                    return Ok(Vec::new());
+                };
+                if !crate::rows::unwrapped(literal).eq_ignore_ascii_case("null") {
+                    return Ok(Vec::new());
+                }
+            }
+            Ok(vec![Probe::new(
+                format!(
+                    "rows that have no value for the new NOT NULL column {}",
+                    table.column(name)
+                ),
+                format!("SELECT count(*)::int AS n FROM {};", qualified(&stored)?),
+            )])
+        }
+
+        Change::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        } => match names.column(column) {
+            Some(stored) => Ok(vec![null_probe(
+                column,
+                &qualified(&stored.table)?,
+                &quote(&stored.name)?,
+            )]),
+            None => Ok(Vec::new()),
+        },
+
+        Change::AlterColumnType {
+            column,
+            from,
+            to,
+            from_nullable,
+            to_nullable,
+            ..
+        } => {
+            let Some(stored) = names.column(column) else {
+                return Ok(Vec::new());
+            };
+            let table = qualified(&stored.table)?;
+            let quoted = quote(&stored.name)?;
+            let mut out = Vec::new();
+            // One `ALTER TABLE` takes both subcommands (ADR-0011 Amendment 1),
+            // so a type change that also tightens the column carries the other
+            // change's probe too.
+            if *from_nullable && !*to_nullable {
+                out.push(null_probe(column, &table, &quoted));
+            }
+            let (Ok(from), Ok(to)) = (crate::types::normalize(from), crate::types::normalize(to))
+            else {
+                return Ok(out);
+            };
+            if let Some(fails) = crate::types::cannot_become(&from, &to, &quoted) {
+                out.push(Probe::new(
+                    format!("values in {column} that cannot become {to}"),
+                    // The NULLs are excluded here and counted by the probe
+                    // above where there is one: a NULL converts to a NULL
+                    // whatever the target, and counting it under "cannot
+                    // become" would name the wrong problem.
+                    format!(
+                        "SELECT count(*)::int AS n FROM {table}\n WHERE {quoted} IS NOT NULL AND ({fails});"
+                    ),
+                ));
+            }
+            Ok(out)
+        }
+
+        Change::AddCheck {
+            table,
+            name,
+            constraint,
+        } => {
+            let Some(stored) = names.table(table) else {
+                return Ok(Vec::new());
+            };
+            let moved = names.moved.get(table);
+            // A row this plan writes cannot be spelled against an arbitrary
+            // predicate: evaluating one needs every column of the row, and the
+            // plan carries only the cells it sets. Unlike a foreign key, whose
+            // columns *are* the constraint, so [`rows_after`] can build them.
+            //
+            // And a column this plan **retypes** takes the probe with it. The
+            // conversion runs at rank 9 and the check is added at rank 13, so
+            // the engine tests the converted value and a probe over the stored
+            // one tests a different value. **Measured on 18.6**: a
+            // `numeric(10,2)` holding `1.50` and `2.25`, converted to
+            // `numeric(10,0)` and then given `CHECK (v = round(v))` — the
+            // engine stores `2` and `2` and accepts the constraint, while
+            // `WHERE NOT (v = round(v))` over the stored values counts **both
+            // rows** and refuses the plan.
+            //
+            // A skip and not a projection: the predicate is arbitrary SQL that
+            // names its columns itself, and supplying converted values would
+            // mean rewriting that text by substitution — the thing this module
+            // refuses to do. A skip and not a failing probe, which is how the
+            // rename and added-column cases are handled two comments down:
+            // those make the probe *fail to run*, and the runner says so by
+            // name. A retype leaves the probe able to run and quietly wrong,
+            // which is the one outcome no report can catch (DECISIONS 410).
+            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
+                || names.retypes_in(table)
+            {
+                return Ok(Vec::new());
+            }
+            let mut sql = format!(
+                // A CHECK rejects a row only when its predicate is FALSE;
+                // UNKNOWN passes. `WHERE NOT (expr)` has exactly that
+                // behaviour — measured, a row holding NULL is accepted by
+                // `CHECK (v > 0)` and `WHERE NOT (v > 0)` counts none of them.
+                //
+                // The expression is not rewritten for renames: rewriting SQL
+                // text by substitution is how a tool that promised never to
+                // parse SQL starts parsing it badly. Such a probe fails to run
+                // and is reported as unchecked, which is honest.
+                //
+                // An unqualified name in it binds under the write path the
+                // emitted statement carries (DECISIONS 259) and this probe
+                // does not, because a probe is one `SELECT` and a `SET` cannot
+                // ride in one. A column reference needs no path and is the
+                // common case; an unqualified *function* or table makes the
+                // probe unchecked, and the runner says so.
+                "SELECT count(*)::int AS n FROM {} WHERE NOT ({})",
+                qualified(&stored)?,
+                constraint.expression
+            );
+            // Minus the rows it deletes: they will not be there to violate
+            // anything, and counting them refuses a plan that cleans up after
+            // itself before tightening.
+            if let Some(m) = moved
+                && !m.deleted.is_empty()
+            {
+                let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                    return Ok(Vec::new());
+                };
+                let gone: BTreeSet<String> = m
+                    .deleted
+                    .iter()
+                    .map(|k| value_literal(k.as_str()))
+                    .collect();
+                sql.push_str(&format!(
+                    " AND {} NOT IN ({})",
+                    quote(&key_column.name)?,
+                    gone.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            sql.push(';');
+            Ok(vec![Probe::new(
+                format!("rows that violate the new check {name}"),
+                sql,
+            )])
+        }
+
+        Change::AddUnique {
+            table,
+            name,
+            constraint,
+        } => {
+            let Some(rows) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)?
+            else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![duplicate_probe(
+                &format!("(\n{rows}\n) AS r"),
+                &keys(constraint.columns.len()),
+                &format!("rows that would collide under the new unique constraint {name}"),
+            )])
+        }
+
+        // A unique index asks the same question, over the rows its predicate
+        // keeps. A plain index constrains nothing and falls to the arm below.
+        Change::AddIndex { table, name, index } if index.unique => {
+            // The key columns only. `INCLUDE` is payload the engine carries in
+            // the leaf and never compares, so counting it would group rows the
+            // index will still collide.
+            let columns: Vec<String> = index.columns.iter().map(|c| c.name.clone()).collect();
+            let applies = match &index.filter {
+                Some(predicate) => Applies::Where(predicate),
+                None => Applies::AllRows,
+            };
+            let Some(rows) = rows_after(names, table, &columns, "c", &applies)? else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![duplicate_probe(
+                &format!("(\n{rows}\n) AS r"),
+                &keys(columns.len()),
+                &format!("rows that would collide under the new unique index {name}"),
+            )])
+        }
+
+        Change::SetPrimaryKey {
+            table,
+            to: Some(pk),
+            ..
+        } => {
+            let Some(rows) = rows_after(names, table, &pk.columns, "c", &Applies::AllRows)? else {
+                return Ok(Vec::new());
+            };
+            let from = format!("(\n{rows}\n) AS r");
+            // Both questions, because a primary key asks both: this engine
+            // sets `NOT NULL` on every column of one itself — measured, which
+            // is why a nullable primary key column is refused offline
+            // (DECISIONS 266) — and then the key has to be unique.
+            let mut out: Vec<Probe> = pk
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, declared)| null_probe(&table.column(declared), &from, &format!("r.k{i}")))
+                .collect();
+            out.push(duplicate_probe(
+                &from,
+                &keys(pk.columns.len()),
+                "rows that would collide under the new primary key",
+            ));
+            Ok(out)
+        }
+
+        Change::AddForeignKey {
+            table,
+            name,
+            constraint,
+        } => orphan_probe(names, table, name, constraint),
+
+        // Everything else either cannot fail on the data or cannot be counted.
+        Change::CreateTable { .. }
+        | Change::DropTable { .. }
+        | Change::RenameTable { .. }
+        | Change::AddColumn { .. }
+        | Change::DropColumn { .. }
+        | Change::RenameColumn { .. }
+        | Change::AlterColumnNullability {
+            to_nullable: true, ..
+        }
+        | Change::AlterColumnDefault { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::SetPrimaryKey { to: None, .. }
+        | Change::DropUnique { .. }
+        | Change::DropForeignKey { .. }
+        | Change::DropCheck { .. }
+        // The unique ones are counted above; a plain index refuses nothing.
+        | Change::AddIndex { .. }
+        | Change::DropIndex { .. }
+        // A module holds no rows. A definition the engine will not compile
+        // fails inside the plan's transaction, where the rollback is total.
+        | Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::DropModule { .. }
+        // The whole content of a declared row is in the plan, and anything the
+        // engine refuses about it rolls the plan back.
+        | Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::SetDataMode { .. }
+        // The pre-delete probe of ADR-0004 is built by `probes` itself, beside
+        // the refusals that go with it.
+        | Change::DeleteRow { .. }
+        // Roles and grants are Phase 5 step 6, and `emit` refuses every one of
+        // them by name until it lands. The securable probe the other dialect
+        // asks for a schema target belongs with that step, not ahead of it.
+        | Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. } => Ok(Vec::new()),
+    }
+}
+
+/// The child rows a new foreign key would have no parent for.
+///
+/// Both sides as this plan will leave them ([`rows_after`]): the key sorts
+/// after every row change, so a plan that supplies the missing parent rows, or
+/// repairs the orphaned children, is a plan this constraint will accept.
+///
+/// # The collation the comparison is made under
+///
+/// The engine's own referential check compares under the **referenced**
+/// column's collation, and two stored columns collated differently cannot be
+/// compared without saying which — measured, `q.k0 = r.k0` between them is
+/// `could not determine which collation to use for string hashing`, and the
+/// probe would be reported as unchecked. Only the catalog can spell that
+/// collation, so the comparison carries a mark that the engine replaces with
+/// ` COLLATE <schema>.<collation>` when it assembles the count (DECISIONS 353).
+///
+/// The mark goes on the comparison itself and not inside the derived table:
+/// measured, a `COLLATE` in the projection does not survive into the join and
+/// the same error comes back.
+///
+/// A side this plan spells — a literal it inserts, the backfill of a column it
+/// adds, a value it converts — carries no mark. Two literals compare under the
+/// database's own collation and there is no conflict to resolve, and a column
+/// this plan retypes has whatever collation the new type gives it, which is a
+/// question the catalog cannot answer about a type that is not there yet.
+fn orphan_probe(
+    names: &AsStored,
+    table: &TableName,
+    name: &str,
+    constraint: &pbps_model::ForeignKey,
+) -> Result<Vec<Probe>, DialectError> {
+    let Some(child) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)? else {
+        return Ok(Vec::new());
+    };
+    let parent_table = &constraint.references_table;
+    let Some(parent) = rows_after(
+        names,
+        parent_table,
+        &constraint.references_columns,
+        "p",
+        &Applies::AllRows,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+
+    // Per referenced column compared as a stored column, the SQL that spells
+    // its collation from the catalog, and the mark that stands for it.
+    let mut clauses: Vec<String> = Vec::new();
+    let mut join = Vec::new();
+    for (i, referenced) in constraint.references_columns.iter().enumerate() {
+        let reference = parent_table.column(referenced);
+        let spelled_by_the_plan = names.columns_added.contains_key(&reference)
+            || names.retyped.contains_key(&reference)
+            || names.table(parent_table).is_none();
+        let mark = match names.column(&reference) {
+            Some(stored) if !spelled_by_the_plan => {
+                let clause = collation_clause(
+                    &value_literal(&qualified(&stored.table)?),
+                    &value_literal(&stored.name),
+                    "",
+                );
+                clauses.push(clause);
+                format!("{COLLATION_MARK}{}{COLLATION_MARK}", clauses.len() - 1)
+            }
+            _ => String::new(),
+        };
+        join.push(format!("q.k{i}{mark} = r.k{i}"));
+    }
+
+    // A row with any NULL in the key is exempt from the constraint — this
+    // engine's default is `MATCH SIMPLE`, measured: a child holding
+    // `(99, NULL)` is accepted by a two-column key whose parent has no `99` at
+    // all. Excluding those rows is the rule, not leniency.
+    let present: Vec<String> = (0..constraint.columns.len())
+        .map(|i| format!("r.k{i} IS NOT NULL"))
+        .collect();
+    let term = format!(
+        "(SELECT count(*) FROM (\n{child}\n) AS r\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM (\n{parent}\n) AS q WHERE {}))",
+        present.join("\n   AND "),
+        join.join(" AND ")
+    );
+    Ok(vec![Probe::new(
+        format!("rows with no matching parent for the new foreign key {name}"),
+        format!(
+            "SELECT LEAST({}, 2147483647)::int AS n;",
+            assembled_int(&term, &clauses)
+        ),
+    )])
+}
+
 /// Every probe this dialect asks before a plan runs.
 ///
-/// Per `DeleteRow`, the count of what still references the row, and then one
-/// refusal per table this plan writes to a default the probe cannot evaluate
-/// (DECISIONS 124). Nothing else yet: see this module's own documentation for
-/// what Phase 5 step 9 adds.
+/// Per `DeleteRow`, the count of what still references the row and the
+/// refusals that go with it (DECISIONS 124); per every other change, what
+/// [`build`] makes of it.
 ///
-/// The count comes first, so a reader meets the rows before the refusal.
+/// The delete's count comes first, so a reader meets the rows before the
+/// refusal.
+///
+/// A probe that cannot be built is left out rather than reported as a failure:
+/// the caller is told how many probes ran and how many could not be checked,
+/// and a `DialectError` here would refuse the whole plan for a question nobody
+/// could ask.
 pub(crate) fn probes(changes: &ChangeSet) -> Vec<Probe> {
     let names = AsStored::of(changes);
     let mut out = Vec::new();
     for p in &changes.changes {
+        out.extend(build(&p.change, &names).unwrap_or_default());
         if let Change::DeleteRow {
             table,
             key_column,
@@ -2292,6 +3218,54 @@ mod tests {
         );
     }
 
+    /// DECISIONS 410: a check on a table this plan retypes a column of gets no
+    /// probe, because the probe would read the value the conversion is about to
+    /// replace.
+    ///
+    /// The positive half is asserted first and matters as much: a check on a
+    /// table the plan leaves alone must still be probed, or the skip could be a
+    /// rule that switched every check probe off.
+    #[test]
+    fn a_check_on_a_table_this_plan_retypes_is_not_probed_against_the_old_values() {
+        let table: TableName = "app.t".parse().expect("a table name");
+        let check = |t: &TableName| Change::AddCheck {
+            table: t.clone(),
+            name: "t_rounded".to_owned(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "v = round(v)".to_owned(),
+            },
+        };
+        let retype = |t: &TableName| Change::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: t.column("v"),
+            from: "numeric(10,2)".parse().expect("a type"),
+            to: "numeric(10,0)".parse().expect("a type"),
+            from_nullable: true,
+            to_nullable: true,
+        };
+
+        let alone = probes(&set(vec![check(&table)]));
+        assert_eq!(alone.len(), 1, "a check on an untouched table is probed");
+        assert!(alone[0].sql.contains("v = round(v)"), "{}", alone[0].sql);
+
+        let retyped = probes(&set(vec![retype(&table), check(&table)]));
+        assert!(
+            retyped.iter().all(|p| !p.sql.contains("v = round(v)")),
+            "the conversion runs first, so the stored value is not the one the \
+             engine will test: {retyped:#?}"
+        );
+
+        // The retype has to be on *this* table. A conversion elsewhere in the
+        // plan says nothing about this check, and a rule phrased over the plan
+        // rather than the table would silence every probe in a busy plan.
+        let elsewhere: TableName = "app.other".parse().expect("a table name");
+        let split = probes(&set(vec![retype(&elsewhere), check(&table)]));
+        assert!(
+            split.iter().any(|p| p.sql.contains("v = round(v)")),
+            "{split:#?}"
+        );
+    }
+
     /// A key this plan adds is asked about from the plan alone — and the
     /// hidden-children refusal names the child outright (DECISIONS 336, 345).
     #[test]
@@ -2324,7 +3298,17 @@ mod tests {
             ])
         };
         let asked = probes(&plan(column.clone()));
-        assert_eq!(asked.len(), 3, "{asked:#?}");
+        // Four: the orphan count the key itself asks for, and then the three
+        // the delete asks — the count, whether it could be complete, and the
+        // key this plan adds over a column it also adds.
+        assert_eq!(asked.len(), 4, "{asked:#?}");
+        assert!(
+            asked[0]
+                .description
+                .contains("no matching parent for the new foreign key child_status_fkey"),
+            "{asked:#?}"
+        );
+        let asked = asked[1..].to_vec();
         // Every probe answers in the runner's width, and a count past it
         // is the width's maximum rather than an out-of-range error the
         // runner would read as unchecked (DECISIONS 342, 343).
@@ -2381,11 +3365,20 @@ mod tests {
         // the refusal is not.
         column.default = None;
         let asked = probes(&plan(column));
-        assert_eq!(asked.len(), 3, "{asked:#?}");
+        assert_eq!(asked.len(), 4, "{asked:#?}");
         assert!(
-            asked[2].sql.contains("AND p.\"code\" = NULL"),
+            asked[3].sql.contains("AND p.\"code\" = NULL"),
             "{}",
-            asked[2].sql
+            asked[3].sql
+        );
+        // The key's own orphan count is still asked, and every stored row
+        // holds NULL in the column it spans — a tuple that references nothing
+        // under MATCH SIMPLE, so the count excludes them rather than calling
+        // each one an orphan.
+        assert!(
+            asked[0].sql.contains("r.k0 IS NOT NULL"),
+            "{}",
+            asked[0].sql
         );
     }
 
