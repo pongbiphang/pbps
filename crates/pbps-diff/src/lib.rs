@@ -11,7 +11,9 @@ pub mod identity;
 pub mod managed;
 pub mod schema_diff;
 
-pub use identity::{Blocker, Context, RenameSide, Resolution, intent_is_absorbed, resolve};
+pub use identity::{
+    Blocker, Context, RenameSide, Resolution, intent_is_absorbed, resolve, resolve_with_annotations,
+};
 pub use managed::{Scoped, observed_ids, scope};
 pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial, order_role_drops};
 
@@ -419,6 +421,115 @@ mod tests {
             matches!(&errs[0], Blocker::RenameTargetExists { target } if target == "new"),
             "the blocker must name the occupied target: {errs:?}"
         );
+    }
+
+    /// A stale annotation may describe a rename that already happened before
+    /// the source name was reused. Dropping that newer identity is valid and
+    /// must not be refused as though the annotation were a fresh command.
+    #[test]
+    fn an_absorbed_table_rename_annotation_does_not_block_dropping_a_reused_source() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.new", &["id"])]);
+        let s = schema(&[("dbo.new", &["id"])]);
+        let intents = [
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.new"),
+            },
+            Intent::DropTable {
+                table: t("dbo.old"),
+                reason: "retired".into(),
+            },
+        ];
+
+        let r = resolve_with_annotations(&s, &ids, &intents, 1, &ctx())
+            .expect("a stale annotation must be absorbed when its reused source is dropped");
+        assert!(r.renamed_tables.is_empty());
+        assert_eq!(r.dropped_tables.len(), 1);
+        assert!(r.ids.table_uid(&t("dbo.old")).is_none());
+        assert!(r.ids.table_uid(&t("dbo.new")).is_some());
+    }
+
+    /// The same stale-annotation rule applies to columns, whose source and
+    /// target share a table but still represent separate identities.
+    #[test]
+    fn an_absorbed_column_rename_annotation_does_not_block_dropping_a_reused_source() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "new"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let intents = [
+            Intent::RenameColumn {
+                table: t("dbo.t"),
+                from: "old".into(),
+                to: "new".into(),
+            },
+            Intent::DropColumn {
+                column: "dbo.t.old".parse().unwrap(),
+                reason: "retired".into(),
+            },
+        ];
+
+        let r = resolve_with_annotations(&s, &ids, &intents, 1, &ctx())
+            .expect("a stale annotation must be absorbed when its reused source is dropped");
+        assert!(r.renamed_columns.is_empty());
+        assert_eq!(r.dropped_columns.len(), 1);
+        assert!(r.ids.column_uid(&"dbo.t.old".parse().unwrap()).is_none());
+        assert!(r.ids.column_uid(&"dbo.t.new".parse().unwrap()).is_some());
+    }
+
+    /// Roles carry the same identity provenance even though their names are
+    /// unqualified and their memberships make an accidental recreation costly.
+    #[test]
+    fn an_absorbed_role_rename_annotation_does_not_block_dropping_a_reused_source() {
+        let ids = resolve(
+            &with_roles(&[("dbo.t", &["id"])], &["old", "new"]),
+            &IdsFile::default(),
+            &[],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["new"]);
+        let intents = [
+            Intent::RenameRole {
+                from: "old".into(),
+                to: "new".into(),
+            },
+            Intent::DropRole {
+                role: "old".into(),
+                reason: "retired".into(),
+            },
+        ];
+
+        let r = resolve_with_annotations(&s, &ids, &intents, 1, &ctx())
+            .expect("a stale annotation must be absorbed when its reused source is dropped");
+        assert!(r.renamed_roles.is_empty());
+        assert_eq!(r.dropped_roles.len(), 1);
+        assert!(r.ids.role_uid("old").is_none());
+        assert!(r.ids.role_uid("new").is_some());
+    }
+
+    /// A rename supplied as a current decision is not stale provenance: even
+    /// with a companion drop, an occupied target must remain a blocker.
+    #[test]
+    fn an_explicit_rename_plus_drop_still_reports_its_target_collision() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.new", &["id"])]);
+        let s = schema(&[("dbo.new", &["id"])]);
+        let intents = [
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.new"),
+            },
+            Intent::DropTable {
+                table: t("dbo.old"),
+                reason: "retired".into(),
+            },
+        ];
+
+        let errs = resolve_with_annotations(&s, &ids, &intents, 0, &ctx()).unwrap_err();
+        assert_eq!(errs.len(), 1, "the target collision is the only blocker");
+        assert!(matches!(
+            &errs[0],
+            Blocker::RenameTargetExists { target } if target == "dbo.new"
+        ));
     }
 
     /// A target that is neither declared nor known is still a misspelling, not

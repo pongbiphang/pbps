@@ -3167,10 +3167,11 @@ pub fn cmd_plan_db(
     refuse_invalid_declarations(&loaded, dialect.as_ref())?;
     let created_at = crate::now();
 
-    let resolved = match pbps_diff::resolve(
+    let resolved = match pbps_diff::resolve_with_annotations(
         &loaded.schema,
         &ids,
         &loaded.intents,
+        loaded.intents.len(),
         &crate::context(project.root()),
     ) {
         Ok(r) => r,

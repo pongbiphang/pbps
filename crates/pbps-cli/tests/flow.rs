@@ -316,6 +316,31 @@ fn recording_the_intent_resolves_the_rename() {
     );
 }
 
+/// A declaration annotation is loaded before a current CLI decision. When the
+/// identity file already contains distinct `old` and `new` identities, the
+/// current drop of `old` must not make the retained annotation look like a
+/// fresh rename command and block the write.
+#[test]
+fn dropping_a_reused_source_absorbs_its_stale_annotation_through_the_cli() {
+    let d = Demo::new("stale-annotation-drop");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  old: {type: int}\n  new: {type: int}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  new: {type: int, renamed_from: old}\n",
+    );
+    let o = d.run(&["drop", "dbo.t.old", "--reason", "retired"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The annotation remains in YAML until fmt, but the identity write already
+    // consumed the reused source. A second plan therefore has no blocker.
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 #[test]
 fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
     let d = Demo::new("drop");
