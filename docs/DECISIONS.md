@@ -8262,3 +8262,18 @@ SPEC is in sync with all of these.
     reads every schema the cluster has and requires the reader's answer and the
     validator's to agree about each. A list written in this repo would be the
     thing that drifts.
+
+386. **The ledger is hidden by name *and* by kind.** SPEC §8.1 names two
+    **tables**, and `modules_query` already reads that way: a view is kept
+    whatever it is called, and only an ordinary table is filtered by name. The
+    grants query applied the name filter to every `pg_class` row, so a project
+    declaring a view `app.__pbps_state` had it pulled as a module while its
+    `relacl` row was thrown away — the grant on it read back as absent, the
+    apply's own read-back refused the plan for not having achieved its
+    postcondition, and every plan after it proposed the same `GRANT` again.
+
+    The filter is `relkind = 'r'` first and the two names second, so nothing
+    but the tool's own kind of object can be hidden by carrying one of its
+    names. `validate_table` refuses a declared *table* of either name
+    (DECISIONS 274), which is why the table half needs no second thought and
+    the view half needed this one.

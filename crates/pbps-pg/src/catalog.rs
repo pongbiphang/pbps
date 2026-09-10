@@ -84,6 +84,17 @@ pub(crate) fn a_projects_schema(name: &str) -> bool {
 /// own ledger lives, so `app.__pbps_state` is still hidden here (#185).
 const NOT_ONE_OF_OURS: &str = "c.relname NOT IN ('__pbps_state', '__pbps_lock')";
 
+/// [`NOT_ONE_OF_OURS`], asked only of the kind this tool's own objects are.
+///
+/// The ledger is two **tables** (SPEC §8.1), and `modules_query` already reads
+/// that way: a view is kept whatever it is called, and only an ordinary table
+/// is filtered by name. The grants query has to agree, or a declared view named
+/// `app.__pbps_state` is pulled as a module while its `relacl` row is thrown
+/// away — the grant on it then reads back as absent, the apply's own read-back
+/// refuses the plan for not having achieved its postcondition, and every plan
+/// after it proposes the same `GRANT` again (DECISIONS 386).
+const NOT_ONE_OF_OUR_TABLES: &str = "(c.relkind <> 'r' OR c.relname NOT IN ('__pbps_state',                                      '__pbps_lock'))";
+
 /// The same two names, for the one other place that has to know them:
 /// `validate_table` refuses a declaration that uses one, because a table the
 /// reader always hides is one the pull reports absent and the next plan tries
@@ -1028,7 +1039,7 @@ fn grants_query() -> String {
                     (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))) AS a
           WHERE {NOT_AN_INDEX_OR_TOAST}
             AND {NOT_A_PROJECTS_SCHEMA}
-            AND {NOT_ONE_OF_OURS}
+            AND {NOT_ONE_OF_OUR_TABLES}
          UNION ALL
          SELECT n.nspname, c.relname, 'rel', c.relkind::text,
                 NULL::int8, at.attname,
@@ -1042,7 +1053,7 @@ fn grants_query() -> String {
            CROSS JOIN LATERAL pg_catalog.aclexplode(at.attacl) AS a
           WHERE at.attacl IS NOT NULL
             AND {NOT_A_PROJECTS_SCHEMA}
-            AND {NOT_ONE_OF_OURS}
+            AND {NOT_ONE_OF_OUR_TABLES}
          UNION ALL
          SELECT n.nspname, p.proname, 'pro', p.prokind::text,
                 p.oid::int8, NULL::text,
@@ -1645,6 +1656,32 @@ mod tests {
             NOT_ONE_OF_OURS.matches('\'').count(),
             OURS.len() * 2,
             "the filter names something `OURS` does not: {NOT_ONE_OF_OURS}"
+        );
+    }
+
+    /// The grants query hides the ledger by name **and** by kind, because the
+    /// ledger is two tables and `modules_query` keeps a view whatever it is
+    /// called. Hiding a view's ACL row instead pulls the view and drops the
+    /// grant on it, which no plan can then reach.
+    #[test]
+    fn the_grants_query_hides_the_ledger_by_kind_as_well_as_by_name() {
+        let sql = grants_query();
+        assert!(sql.contains(NOT_ONE_OF_OUR_TABLES), "{sql}");
+        // And not the kindless filter, which is what over-applied it.
+        assert!(
+            !sql.contains(&format!("AND {NOT_ONE_OF_OURS}")),
+            "the grants query still filters every relkind by name: {sql}"
+        );
+        for name in OURS {
+            assert!(
+                NOT_ONE_OF_OUR_TABLES.contains(&format!("'{name}'")),
+                "`{name}` is hidden from the inventory and not from the grants"
+            );
+        }
+        assert_eq!(
+            NOT_ONE_OF_OUR_TABLES.matches('\'').count(),
+            OURS.len() * 2 + 2,
+            "the two names, and the `r` that says which kind: {NOT_ONE_OF_OUR_TABLES}"
         );
     }
 }

@@ -15151,6 +15151,69 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
     db.drop().await;
 }
 
+/// The ledger is two **tables**, so the grants query hides those two names only
+/// where they are a table.
+///
+/// `modules_query` keeps a view whatever it is called, so a project may declare
+/// `app.__pbps_state` as a view; measured here, the grant on it is pulled while
+/// the grant on a *table* of that name is not. Hidden by name alone, the view
+/// came back without its grant, the apply's own read-back would refuse the plan
+/// for not having achieved its postcondition, and every plan after it would
+/// propose the same `GRANT` again.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_ledger_names_are_hidden_where_they_are_a_table_and_not_where_they_are_a_view() {
+    let mut db = TestDb::create("ledgername").await;
+    let role = least_privilege_role(&mut db, "ledgername").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        // A view of the ledger's name, which the module reader keeps.
+        "CREATE VIEW app.__pbps_state AS SELECT 1 AS id".to_owned(),
+        // And a table of it, which it does not.
+        "CREATE TABLE app.__pbps_lock (id integer)".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.__pbps_state TO {role}"),
+        format!("GRANT SELECT ON app.__pbps_lock TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert!(
+        pulled
+            .schema
+            .modules
+            .contains_key(&"app.__pbps_state".parse().expect("a module id")),
+        "the view is pulled: {:?}",
+        pulled.schema.modules.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !pulled
+            .schema
+            .tables
+            .contains_key(&"app.__pbps_lock".parse().expect("a table name")),
+        "a table of the ledger's name is not"
+    );
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["app.__pbps_state", "schema::app"],
+        "the view's grant is read and the table's is not"
+    );
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
 /// The reader's schema filter and the validator's, put to the engine.
 ///
 /// `NOT_A_PROJECTS_SCHEMA` is SQL and `catalog::a_projects_schema` is Rust, and
