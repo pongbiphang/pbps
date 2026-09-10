@@ -870,38 +870,14 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                 what,
             });
         };
-        let Ok(permission) = g.permission.parse::<pbps_model::Permission>() else {
-            unexpressible(
-                pulled,
-                None,
-                format!(
-                    "role {grantee}: {} on {} is not a permission this model holds; the \
-                     declarations cannot express it",
-                    g.permission,
-                    target_label(g, &signatures)
-                ),
-            );
-            continue;
-        };
-        if let Some(column) = &g.column {
-            // Measured while building ADR-0009 §3: after `GRANT SELECT (a) ON
-            // m9.v`, `pg_class.relacl` is NULL and the grant lives in
-            // `pg_attribute.attacl`. An object-level reader sees nothing at
-            // all, which is why this is reported rather than approximated by a
-            // grant on the whole object — that would be a *widening* the
-            // declarations then plan.
-            unexpressible(
-                pulled,
-                None,
-                format!(
-                    "role {grantee}: {} on column `{column}` of {} is a column-level grant, which \
-                     the declarations cannot express",
-                    g.permission,
-                    target_label(g, &signatures)
-                ),
-            );
-            continue;
-        }
+        // The target first, and every finding below carries it. `target: None`
+        // means *this grant has no target a declaration could name* — and
+        // `deploy::unexpressible_permissions` keeps every targetless finding
+        // whatever role or object it is about, because a permission on the
+        // database itself belongs to no object at all. Reported without one, a
+        // limitation on somebody else's table refused every connected plan,
+        // while the ordinary grant beside it on that same table was dropped as
+        // none of this project's business (DECISIONS 176).
         let target = match target_of(g, &signatures) {
             Ok(target) => target,
             Err(what) => {
@@ -955,6 +931,38 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             );
             continue;
         }
+        if let Some(column) = &g.column {
+            // Measured while building ADR-0009 §3: after `GRANT SELECT (a) ON
+            // m9.v`, `pg_class.relacl` is NULL and the grant lives in
+            // `pg_attribute.attacl`. An object-level reader sees nothing at
+            // all, which is why this is reported rather than approximated by a
+            // grant on the whole object — that would be a *widening* the
+            // declarations then plan.
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on column `{column}` of {} is a column-level grant, which \
+                     the declarations cannot express",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        let Ok(permission) = g.permission.parse::<pbps_model::Permission>() else {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is not a permission this model holds; the \
+                     declarations cannot express it",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        };
         if g.grantable {
             // `WITH GRANT OPTION` — a `*` in the ACL — lets the grantee grant
             // it onward, which the model does not hold. Folded in as a plain
@@ -2676,6 +2684,54 @@ mod tests {
         // ADR-0010 §7: the other half of why `serial` is refused at load.
         assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
         assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+    }
+
+    /// Every limitation on an object carries that object as its target, and
+    /// only a grant with no nameable target at all is targetless.
+    ///
+    /// The managed-set cut keeps every targetless finding whatever it is about
+    /// — a permission on the database itself belongs to no object, and a role
+    /// that gained one has changed. So a column-level grant on somebody
+    /// else's table, reported without a target, refused every connected plan
+    /// while the ordinary grant beside it on that same table was dropped as
+    /// none of this project's business (DECISIONS 176).
+    #[test]
+    fn a_limitation_on_an_object_carries_that_object_as_its_target() {
+        let on_customer = |permission: &str| {
+            grant(
+                Some("app_reader"),
+                Some("customer"),
+                GrantedKind::Relation('r'),
+                permission,
+            )
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                RawGrant {
+                    column: Some("email".to_owned()),
+                    ..on_customer("SELECT")
+                },
+                RawGrant {
+                    grantable: true,
+                    ..on_customer("INSERT")
+                },
+                // A word this engine has and the model does not hold.
+                on_customer("CONNECT"),
+            ],
+            ..declaring('f', &[])
+        });
+        let customer: pbps_model::GrantTarget =
+            "app.customer".parse().expect("a grant target parses");
+        assert_eq!(pulled.unexpressible.len(), 3, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled
+                .unexpressible
+                .iter()
+                .all(|u| u.target.as_ref() == Some(&customer)),
+            "{:?}",
+            pulled.unexpressible
+        );
     }
 
     /// A comma is not a separator. **Measured**, a type named `amount,type`
