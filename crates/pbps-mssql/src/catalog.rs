@@ -724,14 +724,7 @@ pub async fn schema_spellings(
     Ok(out)
 }
 
-/// What the engine says about the declared spellings of every table that
-/// declares rows: the ones it would not read back as written, and the keys
-/// it reads as one row.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Spellings {
-    pub misspelt: Vec<crate::rows::Misspelt>,
-    pub conflicts: Vec<pbps_model::RowConflict>,
-}
+pub use pbps_db::catalog::Spellings;
 
 /// Every declared spelling the engine would not read back as written, and
 /// every pair of keys it reads as one, over every table that declares rows

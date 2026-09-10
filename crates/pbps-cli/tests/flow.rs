@@ -1323,17 +1323,98 @@ fn pull_refuses_to_overwrite_role_identities() {
     assert!(!err.contains("nowhere.invalid"), "{err}");
 }
 
+/// A `postgres` project is served by the binary: `validate` checks the
+/// declarations against that dialect's own type catalogue, so a SQL Server
+/// spelling is refused by name and a PostgreSQL one passes. Until Phase 5
+/// step 10 wired the seam, the same project was refused outright as "not
+/// implemented yet" (DECISIONS 417).
 #[test]
-fn pull_names_the_dialect_it_needs() {
-    let d = Demo::new("pull-dialect");
+fn a_postgres_project_is_validated_against_the_postgres_catalogue() {
+    let d = Demo::new("pg-validate");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  n: {type: nvarchar(50)}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("postgres has no type `nvarchar(50)`"), "{err}");
+    assert!(!err.contains("not implemented"), "{err}");
+
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  n: {type: varchar(50)}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "ok", "{v}");
+    assert_eq!(v["data"]["dialect"], "postgres", "{v}");
+}
+
+/// A connected command on a `postgres` project reaches the connection: what
+/// stops it is the target, reported in the envelope as an unreachable
+/// environment, and never the dialect.
+#[test]
+fn a_connected_command_on_a_postgres_project_reaches_the_connection() {
+    let d = Demo::new("pg-connect");
     std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
     let o = d.run(&["pull", "--db", "Server=x;Database=y"]);
-    assert_eq!(code(&o), 1);
-    assert!(
-        stderr(&o).contains("only implemented for mssql"),
-        "{}",
-        stderr(&o)
-    );
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("cannot connect"), "{err}");
+    assert!(!err.contains("only implemented for"), "{err}");
+
+    d.table("table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n");
+    let o = d.run(&["verify", "--db", "Server=x;Database=y", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "environment.unreachable", "{v}");
+}
+
+/// A plan computed for `postgres` is explained like any other: the file half
+/// of `explain` needs the dialect only to name it, and a plan for the second
+/// engine used to be refused as one this build cannot explain.
+#[test]
+fn explain_reads_a_plan_computed_for_postgres() {
+    let d = Demo::new("pg-explain");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  n: {type: varchar(50)}\n",
+    )
+    .unwrap();
+    let plan = d.dir.join("pg.json");
+    let o = d.run(&["plan", "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "ok", "{v}");
+    assert_eq!(v["data"]["dialect"], "postgres", "{v}");
+    assert_eq!(v["data"]["change_count"], 1, "{v}");
 }
 
 // ---- docs (SPEC 9.4) and the strategy block (ADR-0003) ----
@@ -4054,37 +4135,6 @@ fn an_unquotable_plan_path_is_shown_rather_than_inlined() {
     );
 }
 
-/// A plan naming an engine this build has no dialect for is one it cannot
-/// explain, and the one-envelope contract covers that failure like the others.
-#[test]
-fn explain_json_emits_an_envelope_for_a_dialect_it_cannot_explain() {
-    let d = Demo::new("explaindialect");
-    d.table(ONE_COLUMN);
-    let plan = write_plan(&d, "pg.json", "transactional");
-    let raw = std::fs::read_to_string(&plan).unwrap();
-    std::fs::write(&plan, raw.replace("\"mssql\"", "\"postgres\"")).unwrap();
-
-    let o = d.run(&[
-        "explain",
-        "--plan",
-        plan.to_str().unwrap(),
-        "--format",
-        "json",
-    ]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
-    assert_eq!(v["result"], "unanswerable");
-    assert_eq!(v["findings"][0]["id"], "plan.unsupported-dialect");
-    assert!(
-        v["findings"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("postgres"),
-        "the message must name the engine: {v}"
-    );
-}
-
 /// An unset `url_env` variable is the commonest first-run problem, and `doctor`
 /// has a diagnosis for it. Failing at `target.resolve` instead made the
 /// single-environment path — the one a person onboarding actually types — the
@@ -4215,48 +4265,6 @@ fn doctor_reports_server_capabilities_or_says_it_could_not_read_them() {
 
 // ---- Eleventh review round ----
 
-/// `postgres` is an accepted `DialectName` with no implementation yet, so this
-/// is a reachable failure on a perfectly valid project — and it escaped before
-/// the JSON branch, leaving stdout empty.
-/// The one place a user meets the roadmap from the binary must agree with
-/// it: STATUS names PostgreSQL as Phase 5, and the refusal said Phase 4 for
-/// a phase that had closed.
-#[test]
-fn the_postgres_refusal_names_the_phase_status_names() {
-    let d = Demo::new("pgphase");
-    d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-
-    let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let err = stderr(&o);
-    assert!(err.contains("not implemented yet"), "{err}");
-    assert!(err.contains("Phase 5"), "{err}");
-    assert!(err.contains("docs/STATUS.md"), "{err}");
-    assert!(!err.contains("Phase 4"), "{err}");
-}
-
-#[test]
-fn validate_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
-    let d = Demo::new("validatedialect");
-    d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-
-    let o = d.run(&["validate", "--format", "json"]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
-    assert_eq!(v["result"], "unanswerable");
-    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
-    assert!(
-        v["findings"][0]["location"]["file"]
-            .as_str()
-            .unwrap()
-            .ends_with("pbps.yml"),
-        "{v}"
-    );
-}
-
 /// The file half of an explanation is the whole point of the command, and
 /// `target_state` already degrades an unreachable database to one line in the
 /// report. An unset `url_env` variable must not do worse than an unplugged
@@ -4331,42 +4339,6 @@ fn a_remedy_quotes_an_environment_name_a_shell_would_split() {
 // step in every read-only command routed through it. These are the sites that
 // sweep found; they are grouped because they are one bug, not four.
 
-/// `doctor`'s first act is selecting the dialect, so a project pbps.yml the
-/// tool cannot serve left stdout empty for the one command whose entire job is
-/// to say what is wrong with the project.
-#[test]
-fn doctor_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
-    let d = Demo::new("doctordialect");
-    d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-
-    let o = d.run(&["doctor", "--format", "json"]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
-    assert_eq!(v["command"], "doctor");
-    assert_eq!(v["result"], "unanswerable");
-    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
-}
-
-/// `verify` exits 2 on drift and 1 when it could not look (decision 25), and a
-/// scheduled drift-watch tells them apart from the envelope. Refusing the
-/// dialect without one made that scheduled job read "no output" instead.
-#[test]
-fn verify_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
-    let d = Demo::new("verifydialect");
-    d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-
-    let o = d.run(&["verify", "--db", "Server=x;Database=y", "--format", "json"]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
-    assert_eq!(v["command"], "verify");
-    assert_eq!(v["result"], "unanswerable");
-    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
-}
-
 /// Resolving the target happens in the dispatcher, before the command body, so
 /// an unset `url_env` — the commonest first-run failure — escaped even though
 /// the body itself was careful.
@@ -4387,28 +4359,6 @@ fn verify_json_emits_an_envelope_when_the_environment_variable_is_unset() {
     assert_eq!(v["command"], "verify");
     assert_eq!(v["result"], "unanswerable");
     assert_eq!(v["findings"][0]["id"], "environment.unconfigured");
-}
-
-/// `status` always exits 0 when it can report (decision 25), which is exactly
-/// why the case where it cannot has to be visible in the envelope rather than
-/// inferred from an empty stdout.
-#[test]
-fn status_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
-    let d = Demo::new("statusdialect");
-    d.table(ONE_COLUMN);
-    std::fs::write(
-        d.dir.join("pbps.yml"),
-        "dialect: postgres\nenvironments:\n  prod:\n    url_env: PBPS_STATUS_UNSET\n",
-    )
-    .unwrap();
-
-    let o = d.run(&["status", "--format", "json"]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
-    assert_eq!(v["command"], "status");
-    assert_eq!(v["result"], "unanswerable");
-    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
 }
 
 /// Listing the declarations is the step before `fmt` has anything at all to
@@ -4433,25 +4383,6 @@ fn fmt_json_emits_an_envelope_when_the_declarations_cannot_be_listed() {
 }
 
 // ---- Twelfth review round ----
-
-/// The site the sweep above missed. `plan`'s dialect step is a bare `dialect(`
-/// call in the same module, not `crate::dialect`, so the grep that found the
-/// other seven walked past it — which is the argument for the wrapper being at
-/// the call site rather than for being better at grepping.
-#[test]
-fn plan_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
-    let d = Demo::new("plandialect");
-    d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-
-    let o = d.run(&["plan", "--check", "--format", "json"]);
-    assert_eq!(code(&o), 1, "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
-    assert_eq!(v["command"], "plan");
-    assert_eq!(v["result"], "unanswerable");
-    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
-}
 
 // ---- Fourteenth review round ----
 

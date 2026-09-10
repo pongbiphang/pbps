@@ -62,10 +62,17 @@ use std::str::FromStr;
 use pbps_model::{
     CheckConstraint, Column, ColumnRef, ColumnType, ForeignKey, Identity, Index, IndexColumn,
     Module, ModuleId, ModuleKind, ObjectName, PrimaryKey, ReferentialAction, RoutineArg, RoutineId,
-    Schema, Table, TableName, UniqueConstraint,
+    Table, TableName, UniqueConstraint,
 };
 
 use crate::types;
+
+// The shapes a pull returns are `pbps-db`'s, filled here from `pg_catalog` and
+// re-exported under the paths this crate's callers and tests have always used
+// (DECISIONS 417). `unmanaged_modules` is SQL Server's inventory and stays
+// empty from this engine: what this pull cannot hold is left out and said in
+// `warnings`, as the field's own documentation records.
+pub use pbps_db::catalog::{Limitation, Pulled, Unexpressible};
 
 /// One ordinary table, as `pg_class` has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,53 +458,6 @@ pub struct RawDefaultAcl {
     pub objtype: char,
     /// The `aclitem[]` as the engine prints it.
     pub acl: String,
-}
-
-/// One fact about the database that the model cannot hold.
-///
-/// It carries the table it belongs to so that a caller can tell a limitation
-/// inside the managed set — which is drift it must not call clean — from one on
-/// a table this project does not declare.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Limitation {
-    pub table: TableName,
-    pub detail: String,
-}
-
-/// The result of a pull: the schema, and everything that could not be said.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Pulled {
-    pub schema: Schema,
-    /// Every limitation, rendered, in the order a reader should see them.
-    /// Never empty silence — see this module's own documentation.
-    pub warnings: Vec<String>,
-    pub limitations: Vec<Limitation>,
-    /// Permissions the model cannot hold and a drift check must not call
-    /// clean: a grant `WITH GRANT OPTION`, a column-level grant, a grant on a
-    /// sequence, a permission on a class the model cannot name. Each is left
-    /// out of the role's set — folded in or merely warned about, `verify`
-    /// compares the sets that remain and says "no drift" about a role that has
-    /// changed — and reported here beside the other differences
-    /// (DECISIONS 95, 97).
-    pub unexpressible: Vec<Unexpressible>,
-}
-
-/// One permission the model cannot hold, and enough about it for the caller to
-/// decide whether it is any of this project's business.
-///
-/// The same type as the SQL Server pull's, for the same reason: the securable
-/// travels with it, because filtered by role alone a column-level grant on
-/// somebody else's table stopped every command — while the *plain* grant on
-/// that same table was dropped by `scope`, whose recorded reason is that it is
-/// that table's business (DECISIONS 176).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unexpressible {
-    pub role: String,
-    /// The securable, where the permission names one a declaration could.
-    /// `None` for a class the model cannot name at all.
-    pub target: Option<pbps_model::GrantTarget>,
-    /// The difference, already rendered.
-    pub what: String,
 }
 
 /// The engine's referential action characters.

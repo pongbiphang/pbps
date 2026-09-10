@@ -87,8 +87,10 @@ async fn managed_state(
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
     reference: &Schema,
+    read: crate::engine::Read,
 ) -> anyhow::Result<pbps_diff::Scoped> {
-    let managed = managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes)).await?;
+    let managed =
+        managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes), read).await?;
     refuse_managed_limitations(&managed.limitations)?;
     let mut scoped = managed.scoped;
     scoped.schema = scoped
@@ -138,7 +140,17 @@ async fn baseline_state(
     recorded: &Schema,
     as_the_apply_reads_it: &DataScopes,
 ) -> anyhow::Result<(pbps_diff::Scoped, Schema)> {
-    let managed = managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes)).await?;
+    // Before the plan's transaction opens: the baseline is the database as
+    // it stands, not as this apply is about to leave it.
+    let managed = managed_state_full(
+        conn,
+        ids,
+        modules,
+        unmanaged,
+        &rows_to_read(scopes),
+        crate::engine::Read::Snapshot,
+    )
+    .await?;
     refuse_managed_limitations(&managed.limitations)?;
     let comparable = managed.scoped.schema.clone().with_observed_rows(
         &managed.rows,
@@ -177,7 +189,7 @@ async fn staged_baseline(
     recorded: &Schema,
     watched_scopes: &DataScopes,
 ) -> anyhow::Result<(pbps_diff::Scoped, Schema)> {
-    let pulled = pull(conn).await?;
+    let pulled = pull(conn, crate::engine::Read::Snapshot).await?;
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
     // Over the *watched* set, which contains the checked one: a module this
     // plan is about to write that the catalog cannot read back is a
@@ -200,10 +212,11 @@ async fn staged_baseline(
         &unreadable,
         pbps_config::Unmanaged::Ignore,
     )?;
-    let rows = pbps_mssql::catalog::read_rows(
+    let rows = crate::engine::read_rows(
         conn,
         &watching.schema,
         &rows_to_read(&pinned_scopes(checked_scopes, watched_scopes)),
+        crate::engine::Read::Snapshot,
     )
     .await
     .context("cannot read the declared rows back")?;
@@ -238,13 +251,14 @@ async fn managed_state_full(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     unmanaged: pbps_config::Unmanaged,
-    read: &BTreeMap<TableName, RowScope>,
+    rows: &BTreeMap<TableName, RowScope>,
+    read: crate::engine::Read,
 ) -> anyhow::Result<Managed> {
-    let pulled = pull(conn).await?;
+    let pulled = pull(conn, read).await?;
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
     let limitations = managed_limitations(&pulled, ids, modules);
     let scoped = cut(&pulled, ids, modules, &unreadable, unmanaged)?;
-    let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, read)
+    let rows = crate::engine::read_rows(conn, &scoped.schema, rows, read)
         .await
         .context("cannot read the declared rows back")?;
     Ok(Managed {
@@ -261,8 +275,11 @@ async fn managed_state_full(
 /// them from one read. Two reads would ask the engine the same thing twice
 /// and could get two answers, which is the very thing a movement comparison
 /// exists to detect (DECISIONS 174).
-async fn pull(conn: &mut Conn) -> anyhow::Result<pbps_mssql::introspect::Pulled> {
-    let pulled = pbps_mssql::catalog::introspect(conn)
+async fn pull(
+    conn: &mut Conn,
+    read: crate::engine::Read,
+) -> anyhow::Result<pbps_db::catalog::Pulled> {
+    let pulled = crate::engine::introspect(conn, read)
         .await
         .context("cannot read the database catalog")?;
     for w in &pulled.warnings {
@@ -273,7 +290,7 @@ async fn pull(conn: &mut Conn) -> anyhow::Result<pbps_mssql::introspect::Pulled>
 
 /// One cut of a pulled catalog down to a managed set. Pure.
 fn cut(
-    pulled: &pbps_mssql::introspect::Pulled,
+    pulled: &pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     unreadable: &[(ObjectName, String)],
@@ -362,7 +379,7 @@ async fn refuse_taken_role_names(
     // database reads as one name pass every check against the catalog, and
     // the second `CREATE ROLE` fails after everything before it has run
     // (DECISIONS 123).
-    let alike = pbps_mssql::catalog::names_alike(conn, &wanted)
+    let alike = crate::engine::names_alike(conn, &wanted)
         .await
         .context("cannot compare the declared role names")?;
     if !alike.is_empty() {
@@ -378,7 +395,7 @@ async fn refuse_taken_role_names(
             pairs.join(", ")
         );
     }
-    let held = pbps_mssql::catalog::principals_holding(conn, &wanted, &vacated)
+    let held = crate::engine::principals_holding(conn, &wanted, &vacated)
         .await
         .context("cannot read the database principals")?;
     if held.is_empty() {
@@ -451,8 +468,8 @@ pub(crate) fn catalogued_as(
     schema: &Schema,
     final_ids: &IdsFile,
     live_ids: &IdsFile,
-) -> pbps_mssql::rows::CatalogNames {
-    let mut out = pbps_mssql::rows::CatalogNames::new();
+) -> pbps_db::catalog::CatalogNames {
+    let mut out = pbps_db::catalog::CatalogNames::new();
     for (name, table) in &schema.tables {
         let live_table = live_name(name, final_ids, live_ids);
         // Only the key column is named to the catalog; every other column
@@ -465,7 +482,7 @@ pub(crate) fn catalogued_as(
             .and_then(|r| final_ids.column_uid(&r).cloned())
             .and_then(|uid| live_ids.columns.get(&uid))
             .map(|r| r.name.clone());
-        let at = pbps_mssql::rows::Catalogued {
+        let at = pbps_db::catalog::Catalogued {
             table: (live_table != *name).then_some(live_table),
             key_column: live_key.filter(|c| {
                 table
@@ -473,8 +490,11 @@ pub(crate) fn catalogued_as(
                     .as_ref()
                     .is_none_or(|pk| pk.columns.first() != Some(c))
             }),
+            // Read from the catalog by the engine whose question it is, under
+            // the two names above; a declaration cannot know it.
+            key_collation: None,
         };
-        if at != pbps_mssql::rows::Catalogued::default() {
+        if at != pbps_db::catalog::Catalogued::default() {
             out.insert(name.clone(), at);
         }
     }
@@ -492,9 +512,9 @@ pub(crate) fn catalogued_as(
 pub(crate) async fn refuse_misspelt(
     conn: &mut Conn,
     schema: &Schema,
-    at: &pbps_mssql::rows::CatalogNames,
+    at: &pbps_db::catalog::CatalogNames,
 ) -> anyhow::Result<()> {
-    let found = pbps_mssql::catalog::misspelt(conn, schema, at)
+    let found = crate::engine::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
     if found.misspelt.is_empty() && found.conflicts.is_empty() {
@@ -599,7 +619,7 @@ pub(crate) async fn refuse_wrongly_spelt_schemas(
 ) -> anyhow::Result<()> {
     let declared_by = schemas_declared(schema);
     let wanted: std::collections::BTreeSet<String> = declared_by.keys().cloned().collect();
-    let spelled = pbps_mssql::catalog::schema_spellings(conn, &wanted)
+    let spelled = crate::engine::schema_spellings(conn, &wanted)
         .await
         .context("cannot ask the engine how it spells the declared schemas")?;
     let wrong = wrongly_spelt(&spelled, &declared_by);
@@ -778,7 +798,7 @@ fn scopes_under(data: &DataScopes, final_ids: &IdsFile, live_ids: &IdsFile) -> D
 /// A module pbps cannot read is inside the managed set by name and outside it
 /// in fact; that is a partial schema, and the recorders already refuse one.
 pub(crate) fn managed_limitations(
-    pulled: &pbps_mssql::introspect::Pulled,
+    pulled: &pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
@@ -823,7 +843,7 @@ pub(crate) fn managed_limitations(
 /// permission on the database itself belongs to no object at all, and a role
 /// that gained one has changed (DECISIONS 105).
 pub(crate) fn unexpressible_permissions<'a>(
-    pulled: &'a pbps_mssql::introspect::Pulled,
+    pulled: &'a pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
 ) -> Vec<&'a str> {
@@ -992,7 +1012,7 @@ pub struct UnmanagedPolicy(String);
 /// Converts the dialect's unreadable-module inventory into the common name and
 /// description form used by connected commands.
 pub(crate) fn unreadable_modules(
-    modules: &[pbps_mssql::introspect::UnmanagedModule],
+    modules: &[pbps_db::catalog::UnmanagedModule],
 ) -> Vec<(pbps_model::ObjectName, String)> {
     modules
         .iter()
@@ -2422,12 +2442,6 @@ fn compare<K, V>(
 /// mapping the environment has never seen would report every uncommitted local
 /// rename as drift in production.
 pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Result<()> {
-    crate::output::or_unanswerable(
-        "verify",
-        json,
-        "project.unsupported-dialect",
-        db::require_mssql(project, "verify"),
-    )?;
     let dialect = crate::output::or_unanswerable(
         "verify",
         json,
@@ -2440,7 +2454,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     let (report, unmanaged_refusal, unmanaged_inventory) = match rt.block_on(async {
         let mut conn = db::connect(target).await?;
 
-        let Some(baseline) = pbps_mssql::state::latest(&mut conn).await? else {
+        let Some(baseline) = crate::engine::latest(&mut conn).await? else {
             bail!(
                 "`{}` has a ledger but no entries; there is nothing to compare against.\n\
                  Record one with `pbps snapshot` or `pbps baseline --reason ...`.",
@@ -2462,6 +2476,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // finished report, so that neither verdict can erase the other.
             pbps_config::Unmanaged::Ignore,
             &rows_to_read(&recorded_scopes),
+            crate::engine::Read::Snapshot,
         )
         .await?;
         let mut scoped = managed.scoped;
@@ -2668,7 +2683,6 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
 /// `pbps snapshot` — record the current state, refusing to bless a difference.
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
-    db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
     let (declared_modules, declared_data, loaded) =
         declared_scope(project, crate::dialect(project)?.as_ref())?;
@@ -2676,7 +2690,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        pbps_mssql::state::lock(&mut conn, &operator).await?;
+        crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
             let scoped = managed_state(
                 &mut conn,
@@ -2685,6 +2699,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 project.config.unmanaged,
                 &declared_data,
                 &loaded.schema,
+                crate::engine::Read::Snapshot,
             )
             .await?;
             report_missing(&scoped);
@@ -2693,7 +2708,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // Comparing against the recorded state is the whole guard. A snapshot
             // that overwrites a state it differs from is exactly "somebody SSHed in
             // and changed the schema" being quietly adopted by a pipeline.
-            match pbps_mssql::state::latest(&mut conn).await {
+            match crate::engine::latest(&mut conn).await {
                 Ok(Some(previous)) if !previous.snapshot.matches(&scoped.schema) && !force => {
                     bail!(
                         "`{}` differs from the state recorded at {} (entry #{}).\n\
@@ -2725,11 +2740,11 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             );
             snapshot.module_deps = loaded.hints.module_deps.clone();
             let tables = snapshot.schema.tables.len();
-            let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            let id = crate::engine::record(&mut conn, &snapshot).await?;
             Ok::<_, anyhow::Error>((id, tables))
         }
         .await;
-        let released = pbps_mssql::state::unlock(&mut conn).await;
+        let released = crate::engine::unlock(&mut conn).await;
         let (id, tables) = match result {
             Ok(recorded) => recorded,
             Err(error) => {
@@ -2750,7 +2765,6 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 
 /// `pbps baseline` — take the database as it stands as the new starting point.
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
-    db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
     let (declared_modules, declared_data, loaded) =
         declared_scope(project, crate::dialect(project)?.as_ref())?;
@@ -2758,7 +2772,7 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        pbps_mssql::state::lock(&mut conn, &operator).await?;
+        crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
             let scoped = managed_state(
                 &mut conn,
@@ -2767,6 +2781,7 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
                 project.config.unmanaged,
                 &declared_data,
                 &loaded.schema,
+                crate::engine::Read::Snapshot,
             )
             .await?;
             report_missing(&scoped);
@@ -2780,11 +2795,11 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
             snapshot.reason = Some(reason.to_owned());
 
             let tables = snapshot.schema.tables.len();
-            let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            let id = crate::engine::record(&mut conn, &snapshot).await?;
             Ok::<_, anyhow::Error>((id, tables))
         }
         .await;
-        let released = pbps_mssql::state::unlock(&mut conn).await;
+        let released = crate::engine::unlock(&mut conn).await;
         let (id, tables) = match result {
             Ok(recorded) => recorded,
             Err(error) => {
@@ -2925,13 +2940,12 @@ pub fn cmd_bootstrap(
         return Ok(());
     };
 
-    db::require_mssql(project, "bootstrap")?;
     let statements = crate::statements(&cs, dialect.as_ref())?;
     let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        pbps_mssql::state::lock(&mut conn, &operator).await?;
+        crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
         let result = async {
             // Before the declared rows go in: a spelling the engine reads back
@@ -2956,6 +2970,7 @@ pub fn cmd_bootstrap(
                 &declared_modules,
                 project.config.unmanaged,
                 &BTreeMap::new(),
+                crate::engine::Read::Snapshot,
             )
             .await?;
 
@@ -3040,6 +3055,7 @@ pub fn cmd_bootstrap(
                 project.config.unmanaged,
                 &loaded.schema.data_scopes(),
                 &loaded.schema,
+                crate::engine::Read::InsideOwnTransaction,
             )
             .await?;
             let mut snapshot = with_provenance(
@@ -3050,7 +3066,7 @@ pub fn cmd_bootstrap(
             // Every object was created from these declarations, so what was
             // declared is exactly what bootstrap holds (ADR-0009 §2.2).
             snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
-            let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            let id = crate::engine::record(&mut conn, &snapshot).await?;
             Ok::<_, anyhow::Error>((id, snapshot))
         }
         .await;
@@ -3062,7 +3078,7 @@ pub fn cmd_bootstrap(
         if transaction_attempted && let Err(error) = &result {
             record_failed_bootstrap(&mut conn, project.root(), &operator, error).await;
         }
-        let unlocked = pbps_mssql::state::unlock(&mut conn).await;
+        let unlocked = crate::engine::unlock(&mut conn).await;
         let (id, snapshot) = match result {
             Ok(built) => built,
             Err(error) => {
@@ -3098,8 +3114,11 @@ async fn record_failed_bootstrap(
         operator,
     );
     failed.git_sha = db::git_sha(root);
-    failed.reason = Some(pbps_mssql::state::truncate_reason(&error.to_string()));
-    match pbps_mssql::state::record(conn, &failed).await {
+    failed.reason = Some(crate::engine::truncate_reason(
+        conn.driver(),
+        &error.to_string(),
+    ));
+    match crate::engine::record(conn, &failed).await {
         Ok(id) => eprintln!("Bootstrap failure recorded as ledger entry #{id}."),
         Err(audit_error) => eprintln!(
             "warning: the failed bootstrap could not be added to the ledger: {audit_error}"
@@ -3108,11 +3127,10 @@ async fn record_failed_bootstrap(
 }
 
 /// `pbps state prune` — drop old snapshots.
-pub fn cmd_prune(project: &Project, target: &Target, keep: u32) -> anyhow::Result<()> {
-    db::require_mssql(project, "state prune")?;
+pub fn cmd_prune(target: &Target, keep: u32) -> anyhow::Result<()> {
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let removed = pbps_mssql::state::prune(&mut conn, keep).await?;
+        let removed = crate::engine::prune(&mut conn, keep).await?;
         // The effective figure, not the one asked for: `--keep 0` still keeps
         // the newest entry, and reporting "0 remain" would describe an
         // environment with no baseline — which is not what happened.
@@ -3131,12 +3149,11 @@ pub fn cmd_prune(project: &Project, target: &Target, keep: u32) -> anyhow::Resul
 }
 
 /// `pbps unlock` — clear a lock left behind by a process that died.
-pub fn cmd_unlock(project: &Project, target: &Target) -> anyhow::Result<()> {
-    db::require_mssql(project, "unlock")?;
+pub fn cmd_unlock(target: &Target) -> anyhow::Result<()> {
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let holder = pbps_mssql::state::lock_holder(&mut conn).await?;
-        match pbps_mssql::state::unlock(&mut conn).await? {
+        let holder = crate::engine::lock_holder(&mut conn).await?;
+        match crate::engine::unlock(&mut conn).await? {
             true => {
                 let who = holder
                     .map(|h| format!("`{}` since {}", h.locked_by, h.locked_at))
@@ -3167,7 +3184,6 @@ pub fn cmd_plan_db(
     sql_out: Option<&std::path::Path>,
     staged: bool,
 ) -> anyhow::Result<()> {
-    db::require_mssql(project, "plan --db")?;
     let dialect = crate::dialect(project)?;
     let loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
@@ -3198,7 +3214,7 @@ pub fn cmd_plan_db(
     let (cs, baseline_checksum, baseline_description) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
 
-        let Some(entry) = pbps_mssql::state::latest(&mut conn).await? else {
+        let Some(entry) = crate::engine::latest(&mut conn).await? else {
             bail!(
                 "`{}` has a ledger but no entries; there is nothing to plan against.\n\
                  Record one with `pbps baseline --reason ...`.",
@@ -3250,6 +3266,7 @@ pub fn cmd_plan_db(
             &recorded_modules,
             pbps_config::Unmanaged::Ignore,
             &pbps_model::data::read_scopes(&recorded_data, &declared_data),
+            crate::engine::Read::Snapshot,
         )
         .await?;
         refuse_unexpressible(&managed.scoped, &target.label, "plan again")?;
@@ -3425,7 +3442,7 @@ pub fn cmd_plan_db(
             .iter()
             .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
         {
-            let members = pbps_mssql::catalog::role_members(&mut conn)
+            let members = crate::engine::role_members(&mut conn)
                 .await
                 .context("cannot read the role memberships")?;
             // Ownership is refused, not planned around: the engine will not
@@ -3433,7 +3450,7 @@ pub fn cmd_plan_db(
             // who owns a securable, not a consequence of a drop. Said here,
             // before anything runs — a staged apply would otherwise commit
             // every DROP MEMBER and then fail on the DROP ROLE.
-            let owned = pbps_mssql::catalog::role_owned_securables(&mut conn)
+            let owned = crate::engine::role_owned_securables(&mut conn)
                 .await
                 .context("cannot read what the roles own")?;
             for p in &mut cs.changes {
@@ -3487,20 +3504,19 @@ pub fn cmd_plan_db(
         // honestly: whether ONLINE will be accepted at all, and whether an
         // addition that is metadata-only on Enterprise rewrites every row
         // here. An offline plan has to assume the conservative answer.
-        let edition = pbps_mssql::edition::edition(&mut conn).await?;
-        let refused = pbps_mssql::edition::online_not_supported(&cs, &edition);
-        if !refused.is_empty() {
+        let verdict = crate::engine::edition_verdict(&mut conn, &cs).await?;
+        if !verdict.refused_online.is_empty() {
             bail!(
                 "`strategy: online` is declared for {}, and `{}` runs {}, which has no online \
                  index operations.\n\
                  The statement would fail partway through the apply. Remove the hint, or deploy \
                  this change to an edition that supports it.",
-                refused.join(", "),
+                verdict.refused_online.join(", "),
                 target.label,
-                edition.name()
+                verdict.runs
             );
         }
-        for w in pbps_mssql::edition::size_of_data_warnings(&cs, &edition) {
+        for w in &verdict.warnings {
             eprintln!("warning: {w}");
         }
 
@@ -3643,7 +3659,6 @@ pub fn cmd_apply(
     target: &Target,
     request: &ApplyRequest<'_>,
 ) -> anyhow::Result<()> {
-    db::require_mssql(project, "apply")?;
     let dialect = crate::dialect(project)?;
     let operator = crate::operator(project.root());
     let plan_path = request.plan_path;
@@ -3840,7 +3855,7 @@ fn apply_identified(
     if !staged {
         reject_non_transactional(&statements)?;
     }
-    let targets = pbps_mssql::impact::RenameTarget::from_changes(&plan.changes);
+    let targets = crate::engine::rename_targets(target.driver(), &plan.changes);
     let deployment = Deployment {
         project,
         target,
@@ -3858,7 +3873,7 @@ fn apply_identified(
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
         // have been answered about a database that is already moving.
-        pbps_mssql::state::lock(&mut conn, operator).await?;
+        crate::engine::lock(&mut conn, operator).await?;
         let result = if staged {
             apply_staged_under_lock(&mut conn, &deployment, resume).await
         } else {
@@ -3869,7 +3884,7 @@ fn apply_identified(
         }
         // Released whatever happened. A lock left behind by a failed apply
         // blocks the very pipeline that would fix it.
-        let released = pbps_mssql::state::unlock(&mut conn).await;
+        let released = crate::engine::unlock(&mut conn).await;
         Ok::<_, anyhow::Error>((result, released))
     })?;
 
@@ -3885,7 +3900,7 @@ fn apply_identified(
 /// completed statement. A failure to write the audit must never replace the
 /// original deployment error.
 async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow::Error) {
-    let current = match pbps_mssql::state::latest(conn).await {
+    let current = match crate::engine::latest(conn).await {
         Ok(Some(entry)) => entry.snapshot,
         Ok(None) | Err(pbps_db::LedgerError::NotInitialized) => return,
         Err(audit_error) => {
@@ -3894,6 +3909,7 @@ async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow
         }
     };
     let failed = failed_apply_snapshot(
+        conn.driver(),
         current,
         d.operator,
         d.plan
@@ -3903,7 +3919,7 @@ async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow
         d.plan_checksum,
         error,
     );
-    match pbps_mssql::state::record(conn, &failed).await {
+    match crate::engine::record(conn, &failed).await {
         Ok(id) => eprintln!("Apply failure recorded as ledger entry #{id}."),
         Err(audit_error) => {
             eprintln!("warning: the failed apply could not be added to the ledger: {audit_error}")
@@ -3919,6 +3935,7 @@ async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow
 /// revision: doing so could let the next `--resume` skip statements from the
 /// wrong artifact. The operator and reason still describe the failed attempt.
 fn failed_apply_snapshot(
+    driver: pbps_db::Driver,
     mut current: StateSnapshot,
     operator: &str,
     attempted_git_sha: Option<String>,
@@ -3932,7 +3949,7 @@ fn failed_apply_snapshot(
         current.git_sha = attempted_git_sha;
         current.plan_checksum = Some(attempted_plan_checksum.to_owned());
     }
-    current.reason = Some(pbps_mssql::state::truncate_reason(&error.to_string()));
+    current.reason = Some(crate::engine::truncate_reason(driver, &error.to_string()));
     current
 }
 
@@ -3956,7 +3973,7 @@ struct Deployment<'a> {
     plan: &'a pbps_model::SavedPlan,
     plan_checksum: &'a str,
     statements: &'a [pbps_dialect::Statement],
-    rename_targets: &'a [pbps_mssql::impact::RenameTarget],
+    rename_targets: &'a [pbps_db::impact::RenameTarget],
     dialect: &'a dyn pbps_dialect::Dialect,
     operator: &'a str,
 }
@@ -3975,7 +3992,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         dialect,
         operator,
     } = *d;
-    let Some(entry) = pbps_mssql::state::latest(conn).await? else {
+    let Some(entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
             target.label
@@ -4046,6 +4063,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             project.config.unmanaged,
             &plan.data,
             &Schema::default(),
+            crate::engine::Read::InsideOwnTransaction,
         )
         .await?;
         // Everything this plan does not touch has to be what the baseline
@@ -4088,7 +4106,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // from the plan alone, since `apply --plan` needs nothing else.
         snapshot.declared = entry.snapshot.declared.clone();
         snapshot.declared.advance(&plan.changes);
-        Ok::<_, anyhow::Error>(pbps_mssql::state::record(conn, &snapshot).await?)
+        Ok::<_, anyhow::Error>(crate::engine::record(conn, &snapshot).await?)
     }
     .await;
     finish_transaction(conn, dialect, result).await
@@ -4126,7 +4144,7 @@ async fn apply_staged_under_lock(
         dialect,
         operator,
     } = *d;
-    let Some(entry) = pbps_mssql::state::latest(conn).await? else {
+    let Some(entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
             target.label
@@ -4354,6 +4372,7 @@ async fn apply_staged_under_lock(
             pbps_config::Unmanaged::Ignore,
             &scopes_at(plan, &live_ids),
             &Schema::default(),
+            crate::engine::Read::Snapshot,
         )
         .await?;
         // Scoped and identified by `live_ids`, not by the plan's mapping: a
@@ -4383,7 +4402,7 @@ async fn apply_staged_under_lock(
             last_statement: stmt.sql.clone(),
         });
         let recorded = checkpoint.schema.clone();
-        let id = pbps_mssql::state::record(conn, &checkpoint).await?;
+        let id = crate::engine::record(conn, &checkpoint).await?;
         println!("  statement {} of {total} done (checkpoint #{id})", i + 1);
         // The checkpoint is written *first*, and then the run stops. It says
         // what the database holds, which is the one thing a resume needs to be
@@ -4415,6 +4434,7 @@ async fn apply_staged_under_lock(
         project.config.unmanaged,
         &plan.data,
         &Schema::default(),
+        crate::engine::Read::Snapshot,
     )
     .await?;
     // And the last window of all: between the final checkpoint and this read.
@@ -4444,7 +4464,7 @@ async fn apply_staged_under_lock(
     // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
     snapshot.declared = entry.snapshot.declared.clone();
     snapshot.declared.advance(&plan.changes);
-    Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+    Ok(crate::engine::record(conn, &snapshot).await?)
 }
 
 /// The movement check a staged run can make: each read compared with the one
@@ -4590,10 +4610,10 @@ async fn check_role_drops(
     if expected.is_empty() {
         return Ok(());
     }
-    let members_now = pbps_mssql::catalog::role_members(conn)
+    let members_now = crate::engine::role_members(conn)
         .await
         .context("cannot read the role memberships")?;
-    let owned_now = pbps_mssql::catalog::role_owned_securables(conn)
+    let owned_now = crate::engine::role_owned_securables(conn)
         .await
         .context("cannot read what the roles own")?;
     for (name, listed) in expected {
@@ -4661,7 +4681,7 @@ async fn preflight(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
     plan: &pbps_model::SavedPlan,
-    rename_targets: &[pbps_mssql::impact::RenameTarget],
+    rename_targets: &[pbps_db::impact::RenameTarget],
 ) -> anyhow::Result<()> {
     // **The pins before the questions.** Every read below — the edition, the
     // role checks, the rename impact scans and the probes — used to run under
@@ -4680,16 +4700,15 @@ async fn preflight(
     // server, or to the same one after an edition change, and an `ONLINE = ON`
     // statement rejected halfway through an apply is precisely what the check
     // at plan time exists to prevent (ADR-0003).
-    let edition = pbps_mssql::edition::edition(conn).await?;
-    let refused = pbps_mssql::edition::online_not_supported(&plan.changes, &edition);
-    if !refused.is_empty() {
+    let verdict = crate::engine::edition_verdict(conn, &plan.changes).await?;
+    if !verdict.refused_online.is_empty() {
         bail!(
             "this plan carries `strategy: online` for {}, and this server runs {}, which has no \
              online index operations.\n\
              The plan was approved against an edition that supports it. Recompute it against \
              this environment with `pbps plan --db`.",
-            refused.join(", "),
-            edition.name()
+            verdict.refused_online.join(", "),
+            verdict.runs
         );
     }
 
@@ -4715,7 +4734,7 @@ async fn preflight(
 
     let mut blocked = Vec::new();
     for target in rename_targets {
-        let mut report = pbps_mssql::impact::rename_impact(conn, target).await?;
+        let mut report = crate::engine::rename_impact(conn, target).await?;
         report.blocking.retain(|r| !dropped.contains(&r.name));
         report.advisory.retain(|r| !dropped.contains(&r.name));
         if report.is_empty() {
@@ -5072,7 +5091,7 @@ mod tests {
     /// command over a securable outside the managed set (DECISIONS 176).
     #[test]
     fn an_unsupported_permission_on_somebody_elses_object_is_not_this_projects_drift() {
-        use pbps_mssql::introspect::{Pulled, Unexpressible};
+        use pbps_db::catalog::{Pulled, Unexpressible};
 
         let mine: TableName = "dbo.mine".parse().unwrap();
         let theirs: TableName = "dbo.theirs".parse().unwrap();
@@ -5130,8 +5149,8 @@ mod tests {
     }
 
     use super::*;
+    use pbps_db::catalog::{Limitation, Pulled, UnmanagedModule};
     use pbps_model::{DataMode, DataScope};
-    use pbps_mssql::introspect::{IntrospectionLimitation, Pulled, UnmanagedModule};
 
     /// A permission the declarations cannot hold stops every command that
     /// would write the state down, not just the one that plans over it: a
@@ -8062,11 +8081,11 @@ mod tests {
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![
-                IntrospectionLimitation {
+                Limitation {
                     table: "dbo.managed".parse().unwrap(),
                     detail: "dbo.managed has a computed column".into(),
                 },
-                IntrospectionLimitation {
+                Limitation {
                     table: "dbo.theirs".parse().unwrap(),
                     detail: "dbo.theirs has a computed column".into(),
                 },

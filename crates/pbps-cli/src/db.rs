@@ -160,17 +160,6 @@ pub fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
-/// Refuses politely on a dialect whose connected half does not exist yet.
-pub fn require_mssql(project: &Project, command: &str) -> anyhow::Result<()> {
-    if project.config.dialect != DialectName::Mssql {
-        bail!(
-            "`pbps {command}` is only implemented for mssql (this project's pbps.yml selects `{}`)",
-            project.config.dialect
-        );
-    }
-    Ok(())
-}
-
 /// Whether `dir` is inside a git checkout at all.
 ///
 /// Distinct from [`git_sha`] returning `None`, which a checkout with no commits

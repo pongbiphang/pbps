@@ -18,8 +18,6 @@
 //! which case this is, and an unreachable environment is `unanswerable` with
 //! no `data` at all (SPEC §9.8).
 
-use pbps_config::Project;
-
 use crate::{db, output};
 
 /// One ledger row, without opening its recorded schema.
@@ -179,18 +177,7 @@ fn row(entry: pbps_db::TimelineEntry) -> LedgerRow {
 }
 
 /// `pbps state list` — the environment's history, newest first.
-pub fn cmd_state_list(
-    project: &Project,
-    target: &db::Target,
-    limit: u32,
-    json: bool,
-) -> anyhow::Result<()> {
-    output::or_unanswerable(
-        "state list",
-        json,
-        "project.dialect-unsupported",
-        db::require_mssql(project, "state list"),
-    )?;
+pub fn cmd_state_list(target: &db::Target, limit: u32, json: bool) -> anyhow::Result<()> {
     let runtime = output::or_unanswerable("state list", json, "db.runtime", db::runtime())?;
 
     runtime.block_on(async {
@@ -201,7 +188,7 @@ pub fn cmd_state_list(
             db::connect(target).await,
         )?;
 
-        let found = match pbps_mssql::state::timeline(&mut conn, limit).await {
+        let found = match crate::engine::timeline(&mut conn, limit).await {
             Ok(entries) => Some(entries),
             // Not an error: a database this tool has never written to has no
             // history, and saying so is the answer. It is *not* an empty

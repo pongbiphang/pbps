@@ -76,168 +76,91 @@ use std::collections::BTreeMap;
 
 use pbps_db::{Conn, DbError, Row};
 use pbps_dialect::DialectError;
-use pbps_model::{ColumnRef, TableName};
+use pbps_model::TableName;
 
 use crate::emit::qualified;
 
-/// What is being renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RenameTarget {
-    Table(TableName),
-    Column(ColumnRef),
-}
+// The target, the referrer, the report and its error are `pbps-db`'s: one
+// shape, filled by each engine's own catalog queries (DECISIONS 417). Which
+// changes in a plan are rename targets stays this engine's question —
+// `rename_targets` below — and `RenameTarget::Module` is never one of them
+// here: the module documentation says whose question a dropped module is.
+pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
-impl RenameTarget {
-    /// The table whose dependants have to be queried.
-    pub fn table(&self) -> &TableName {
-        match self {
-            RenameTarget::Table(t) => t,
-            RenameTarget::Column(c) => &c.table,
-        }
-    }
-
-    /// The column, where the target is one.
-    fn column(&self) -> Option<&str> {
-        match self {
-            RenameTarget::Table(_) => None,
-            RenameTarget::Column(c) => Some(&c.name),
-        }
-    }
-
-    /// Every rename in a plan, as the objects they are renamed **from** — the
-    /// name the catalog still knows them by. Taking the new name would query
-    /// something that does not exist yet and report no impact at all, which is
-    /// the most dangerous possible answer.
-    ///
-    /// **Both halves of a column's name** have to be taken back, not just the
-    /// column's own. A `RenameColumn` carries the *declared*, post-rename table
-    /// (`pbps_diff::schema_diff::order_key` class 3 says why: the statement it
-    /// becomes names the table, and it runs after the table rename), so a plan
-    /// that renames `app.client` to `app.customer` and its `email` to
-    /// `contact_email` describes the column as `app.customer.email` — a table
-    /// the catalog will not have until a statement this report runs *before*
-    /// has executed. Read literally that is `ImpactError::Name` on a plan the
-    /// engine would accept, which is the refusal
-    /// `preflight::AsStored` exists to prevent one rank further on
-    /// (DECISIONS 407).
-    pub fn from_changes(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
-        use pbps_model::Change;
-        // The plan's name for a table, to the catalog's. Built first and over
-        // the whole plan, because the ordering that puts a table rename before
-        // its column renames is `order_key`'s and not this list's to assume.
-        let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
-        for p in &changes.changes {
-            if let Change::RenameTable { from, to, .. } = &p.change {
-                stored.insert(to, from);
-            }
-        }
-        changes
-            .changes
-            .iter()
-            .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
-                Change::RenameColumn { table, from, .. } => {
-                    let table = stored.get(table).map_or(table, |t| *t);
-                    Some(RenameTarget::Column(table.column(from)))
-                }
-                // A module rename reaches the plan as a drop plus a create, and
-                // what points at the old name is `crate::modules`' question.
-                // Exhaustive rather than `_`: a change added later that moves a
-                // name has to be considered here, and a catch-all would let it
-                // through in silence.
-                Change::DropModule { .. }
-                | Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                // A row's identity is its key, and a changed key is a delete
-                // plus an insert rather than a rename.
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. } => None,
-            })
-            .collect()
-    }
-}
-
-impl std::fmt::Display for RenameTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RenameTarget::Table(t) => write!(f, "table {t}"),
-            RenameTarget::Column(c) => write!(f, "column {c}"),
-        }
-    }
-}
-
-/// One object that refers to the thing being renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Referrer {
-    /// `function`, `procedure`, `view`, `index`, `constraint`, …
-    pub kind: String,
-    pub name: String,
-    /// Why this one matters, when the kind alone does not say it.
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ImpactReport {
-    pub target: String,
-
-    /// Referrers the engine refuses the statement over. **Empty on this
-    /// engine for a rename**, measured; the field is the abstraction's and the
-    /// module documentation says why nothing fills it.
-    pub blocking: Vec<Referrer>,
-
-    /// Objects that will break, which the engine will not stop.
-    pub advisory: Vec<Referrer>,
-
-    /// Objects the rename is carried into, which keep working.
-    pub carried: Vec<Referrer>,
-}
-
-impl ImpactReport {
-    pub fn is_empty(&self) -> bool {
-        self.blocking.is_empty() && self.advisory.is_empty() && self.carried.is_empty()
-    }
-}
-
-/// Why a rename's impact could not be reported.
+/// Every rename in a plan, as the objects they are renamed **from** — the
+/// name the catalog still knows them by. Taking the new name would query
+/// something that does not exist yet and report no impact at all, which is
+/// the most dangerous possible answer.
 ///
-/// Two failures kept apart, because the whole point of this module is that an
-/// empty report means "nothing depends on this". A name that cannot be written
-/// and a query that could not run are both *unknown*, and neither may arrive at
-/// a caller wearing the shape of "no dependants".
-#[derive(Debug, thiserror::Error)]
-pub enum ImpactError {
-    #[error(transparent)]
-    Query(#[from] DbError),
-
-    /// The target cannot be named: its own name cannot be written as an
-    /// identifier, or this database has no such column to report on. Both are
-    /// questions that could not be asked, and neither is an answer.
-    #[error(transparent)]
-    Name(#[from] DialectError),
+/// **Both halves of a column's name** have to be taken back, not just the
+/// column's own. A `RenameColumn` carries the *declared*, post-rename table
+/// (`pbps_diff::schema_diff::order_key` class 3 says why: the statement it
+/// becomes names the table, and it runs after the table rename), so a plan
+/// that renames `app.client` to `app.customer` and its `email` to
+/// `contact_email` describes the column as `app.customer.email` — a table
+/// the catalog will not have until a statement this report runs *before*
+/// has executed. Read literally that is `ImpactError::Name` on a plan the
+/// engine would accept, which is the refusal
+/// `preflight::AsStored` exists to prevent one rank further on
+/// (DECISIONS 407).
+pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
+    use pbps_model::Change;
+    // The plan's name for a table, to the catalog's. Built first and over
+    // the whole plan, because the ordering that puts a table rename before
+    // its column renames is `order_key`'s and not this list's to assume.
+    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for p in &changes.changes {
+        if let Change::RenameTable { from, to, .. } = &p.change {
+            stored.insert(to, from);
+        }
+    }
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
+            Change::RenameColumn { table, from, .. } => {
+                let table = stored.get(table).map_or(table, |t| *t);
+                Some(RenameTarget::Column(table.column(from)))
+            }
+            // A module rename reaches the plan as a drop plus a create, and
+            // what points at the old name is `crate::modules`' question.
+            // Exhaustive rather than `_`: a change added later that moves a
+            // name has to be considered here, and a catch-all would let it
+            // through in silence.
+            Change::DropModule { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            // A row's identity is its key, and a changed key is a delete
+            // plus an insert rather than a rename.
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect()
 }
 
 /// Every routine in this database whose body the engine keeps as **text**,
@@ -343,6 +266,20 @@ pub async fn rename_impact(
     // function answers NULL, and a raise in the middle of an impact report is
     // an error where the honest answer is an empty list (DECISIONS 336's
     // shape).
+    // Never built by `rename_targets`, and refused rather than answered if
+    // handed in from elsewhere: a module has no `attnum`, so the queries
+    // below would ask about "every column" of a relation `to_regclass` does
+    // not know and come back empty — the one answer this module exists not
+    // to give by mistake.
+    if let RenameTarget::Module(module) = target {
+        return Err(ImpactError::Name(DialectError::Invalid {
+            dialect: crate::types::DIALECT,
+            message: format!(
+                "module {module} is not a rename target on this engine: what depends on a \
+                 module about to be dropped is `modules::dependents`'s question"
+            ),
+        }));
+    }
     let relation = qualified(target.table())?;
     let mut report = ImpactReport {
         target: target.to_string(),
@@ -558,7 +495,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            RenameTarget::from_changes(&cs),
+            rename_targets(&cs),
             [
                 RenameTarget::Table(tname("app.client")),
                 RenameTarget::Column("app.client.email".parse().expect("a column")),
@@ -590,7 +527,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            RenameTarget::from_changes(&cs),
+            rename_targets(&cs),
             [
                 RenameTarget::Table(tname("app.order")),
                 RenameTarget::Column("app.customer.email".parse().expect("a column")),
@@ -610,7 +547,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::View,
             })],
         };
-        assert!(RenameTarget::from_changes(&cs).is_empty(), "{cs:#?}");
+        assert!(rename_targets(&cs).is_empty(), "{cs:#?}");
     }
 
     #[test]

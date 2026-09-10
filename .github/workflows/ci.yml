@@ -201,6 +201,11 @@ jobs:
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
       - run: cargo test -p pbps-cli --bin pbps -- --ignored
+      # The CLI end to end on this engine (issue #85): `bootstrap`, `verify`,
+      # `plan --db`, `apply`, `state list`, `pull`, `doctor`, each through the
+      # seam in `engine.rs`. Serial, because each test creates and drops a
+      # database of its own.
+      - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1
 
   # `plan --dev docker://<image>` starts a throwaway container of its own, and
   # nothing else reaches that code: every other `--dev` test passes a connection

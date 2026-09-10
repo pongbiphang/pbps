@@ -20,7 +20,7 @@ use crate::{context, db, declaration_file};
 #[derive(Debug, Args)]
 pub struct InitArgs {
     /// Database dialect for the new project
-    #[arg(long, default_value = "mssql", value_parser = ["mssql"])]
+    #[arg(long, default_value = "mssql", value_parser = ["mssql", "postgres"])]
     dialect: String,
 
     /// Add this named environment to pbps.yml
@@ -80,7 +80,7 @@ struct Prepared {
     config: Config,
     config_text: String,
     warnings: Vec<String>,
-    unmanaged: Vec<pbps_mssql::introspect::UnmanagedModule>,
+    unmanaged: Vec<pbps_db::catalog::UnmanagedModule>,
 }
 
 /// Creates a project at `root` without requiring one to exist already.
@@ -88,8 +88,10 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     let root = absolute(root)?;
     let dialect = match args.dialect.as_str() {
         "mssql" => DialectName::Mssql,
-        // clap currently prevents this, but keeping the match exhaustive at the
-        // boundary makes a future second value an intentional implementation.
+        "postgres" => DialectName::Postgres,
+        // clap's value parser prevents this, but keeping the match exhaustive
+        // at the boundary makes a future third value an intentional
+        // implementation.
         other => bail!("unsupported dialect `{other}`"),
     };
 
@@ -162,7 +164,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
             let pulled = db::runtime()?.block_on(async {
                 let mut conn =
                     pbps_db::Conn::connect(db::driver_for(config.dialect), &connection).await?;
-                pbps_mssql::catalog::introspect(&mut conn).await
+                crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await
             })?;
             let ids = mint_ids(&pulled.schema, &root)?;
             (
@@ -462,8 +464,8 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         // roles and rows a `pull --data` writes are checked by the checks that
         // own them, and a staged project that `pbps validate` would reject is
         // one this command must not leave behind (DECISIONS 141).
-        let dialect = pbps_mssql::Mssql;
-        let dialect_problems: Vec<String> = crate::declaration_problems(&loaded, &dialect)
+        let dialect = crate::dialect_for(project.config.dialect);
+        let dialect_problems: Vec<String> = crate::declaration_problems(&loaded, dialect.as_ref())
             .into_iter()
             .map(|(_, problem)| problem)
             .collect();

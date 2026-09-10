@@ -248,6 +248,10 @@ fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
 fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dialect>)> {
     match plan.dialect.as_str() {
         "mssql" => Ok((pbps_db::Driver::Mssql, Box::new(pbps_mssql::Mssql))),
+        "postgres" => Ok((
+            pbps_db::Driver::Postgres,
+            Box::new(pbps_pg::Postgres::new()),
+        )),
         other => {
             anyhow::bail!("this plan was computed for `{other}`, which this build cannot explain")
         }
@@ -420,13 +424,13 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
         // hiding a real case: `dbo.__pbps_state` dropped by hand while a live
         // lock survives. `explain` labelled that target "uninitialized" and went
         // on printing the approval command, while an apply was in fact running.
-        if let Some(lock) = pbps_mssql::state::lock_holder(&mut conn).await? {
+        if let Some(lock) = crate::engine::lock_holder(&mut conn).await? {
             return Ok(Err(lock));
         }
-        if !pbps_mssql::state::is_initialized(&mut conn).await? {
+        if !crate::engine::is_initialized(&mut conn).await? {
             return Err(pbps_db::LedgerError::NotInitialized);
         }
-        pbps_mssql::state::latest(&mut conn).await.map(Ok)
+        crate::engine::latest(&mut conn).await.map(Ok)
     });
     let checked = match checked {
         Ok(Err(lock)) => {

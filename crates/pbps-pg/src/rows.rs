@@ -58,33 +58,10 @@ use pbps_model::{ObservedRow, Row, RowKey, RowScope, Table, TableName, Value};
 use crate::emit::{qualified, value_literal};
 use crate::quote;
 
-/// Why a table's rows could not be read back.
-#[derive(Debug, thiserror::Error)]
-pub enum RowsError {
-    #[error("{table}: its rows cannot be read back — {why}")]
-    Unreadable { table: TableName, why: String },
-
-    #[error("{table}: reading its rows back failed: {source}")]
-    Read {
-        table: TableName,
-        // Boxed so the error is not larger than every `Ok` it travels beside.
-        #[source]
-        source: Box<DbError>,
-    },
-
-    /// The engine sent a value the mapping cannot hold — an integer column
-    /// whose text does not parse, say. A bug in this file, not bad data.
-    #[error("{table}.{column}: the engine sent `{text}`, which is not a {kind}")]
-    BadValue {
-        table: TableName,
-        column: String,
-        text: String,
-        kind: &'static str,
-    },
-
-    #[error(transparent)]
-    Dialect(#[from] DialectError),
-}
+// The row-read shapes are `pbps-db`'s, re-exported under this crate's paths
+// (DECISIONS 417). `Catalogued::key_collation` is this engine's field: read by
+// `catalog::key_collations` under the names the other two carry.
+pub use pbps_db::catalog::{CatalogNames, Catalogued, Misspelt, RowsError};
 
 /// What a column's text becomes once it is back in the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1080,21 +1057,6 @@ pub fn decode_alias(
     Ok((RowKey::from(requested), canonical.map(RowKey::from)))
 }
 
-/// One declared spelling the engine reads back differently, or cannot read
-/// at all (DECISIONS 101).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Misspelt {
-    pub table: TableName,
-    pub key: RowKey,
-    /// `None` for the key itself.
-    pub column: Option<String>,
-    pub declared: String,
-    /// The column's type, as the engine was asked to read the text.
-    pub ty: String,
-    /// What the engine reads back; `None` when it cannot convert the text.
-    pub canonical: Option<String>,
-}
-
 /// Every declared literal of one column, sent to the engine to be read the
 /// way the read-back reads it, beside its index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,31 +1075,6 @@ pub struct SpellingQuery {
     /// them on a table that does not hold either yet (DECISIONS 106).
     pub collisions: Option<String>,
 }
-
-/// What the catalog calls a table, its key column and that column's collation
-/// *now*, where the plan about to be checked renames them.
-///
-/// The spelling checks run before a statement of the plan has run, so the
-/// database still has the old names — and the collation, which is the one
-/// input here that is read from the catalog rather than declared, is read
-/// under those names. Absent entries mean "as declared", which is right for
-/// every table a plan does not rename and for one it has yet to create
-/// (DECISIONS 148).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Catalogued {
-    pub table: Option<TableName>,
-    pub key_column: Option<String>,
-    /// The key column's collation, schema and name, where it has one that is
-    /// not the database default. `None` is not "the default collation" as a
-    /// value — it is "nothing to write", which leaves the comparison to
-    /// whatever the expression's own collation is, and that is the right
-    /// answer for a table this plan is about to create: the emitter writes no
-    /// `COLLATE`, so its column will be created with the database's default.
-    pub key_collation: Option<(String, String)>,
-}
-
-/// Every declared table's catalog names, keyed by the declared table name.
-pub type CatalogNames = std::collections::BTreeMap<TableName, Catalogued>;
 
 /// The engine's own answer to "is this text the spelling it reads back":
 /// every declared text cell and every key, converted to its column's type and

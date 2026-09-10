@@ -9,7 +9,11 @@
 //! `__pbps_lock` lock (SPEC §8.1). Only the shapes: the SQL that reads and
 //! writes them is each engine's, so it lives beside that dialect's catalog
 //! queries. Keeping the types here is what stops the ledger's meaning from
-//! being defined twice.
+//! being defined twice. [`catalog`], [`impact`] and [`doctor`] hold the other
+//! answers a connected command consumes — what a pull found, what a rename
+//! touches, what `doctor` asks about — by the same rule and for the same
+//! reason: one definition each, filled by whichever engine the connection is
+//! to, so that `pbps-cli` can ask one question of either (DECISIONS 417).
 //!
 //! # Two drivers, named in two files
 //!
@@ -27,6 +31,9 @@
 //! `pbps-mssql` that already had it (DECISIONS 225).
 
 use pbps_dialect::TransactionFraming;
+pub mod catalog;
+pub mod doctor;
+pub mod impact;
 pub mod ledger;
 mod mssql;
 mod postgres;
@@ -446,6 +453,21 @@ pub enum Conn {
 }
 
 impl Conn {
+    /// Which driver this connection is over — and so which engine it is to.
+    ///
+    /// The one fact a caller may read off a connection: the dialect-level
+    /// dispatch in `pbps-cli` chooses an engine's catalog, ledger and impact
+    /// functions by it, the way this enum chooses a driver. Reading it is not
+    /// naming a driver type (constraint 9): the variant says *which*, and the
+    /// client inside stays this crate's.
+    #[must_use]
+    pub const fn driver(&self) -> Driver {
+        match self {
+            Conn::Mssql(_) => Driver::Mssql,
+            Conn::Postgres(_) => Driver::Postgres,
+        }
+    }
+
     /// Connects, in whichever string form the driver's own tooling uses.
     ///
     /// ADR-0014's seam table said this signature was unchanged. That was

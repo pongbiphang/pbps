@@ -24,9 +24,12 @@
 //! pin the empty path — the one value that does not move with the project's
 //! shape — and put back whatever the session had.
 
-use pbps_db::{Conn, DbError, Row};
+use pbps_db::{Conn, DbError, Param, Row};
 
 use pbps_model::{Schema, TableName};
+
+// What the spelling checks found is `pbps-db`'s shape (DECISIONS 417).
+pub use pbps_db::catalog::Spellings;
 
 use crate::introspect::{
     GrantedKind, Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawDefaultAcl, RawGrant,
@@ -650,21 +653,38 @@ const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', tr
 /// makes "a read that failed halfway leaves the session changed" not a case to
 /// handle but a case that cannot arise.
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
-    refuse_a_caller_owned_transaction(conn).await?;
-    conn.execute(BEGIN).await?;
-    let raw = match read_all(conn).await {
-        Ok(raw) => {
-            conn.execute("COMMIT").await?;
-            raw
-        }
-        // `ROLLBACK` rather than `COMMIT`, and its own error is dropped: a
-        // transaction the server has already killed must not replace the
-        // failure that killed it.
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK").await;
-            return Err(schema_changed_underneath(e));
-        }
-    };
+    introspect_in(conn, Scope::Own).await
+}
+
+/// Reads the managed set back **inside the transaction the caller holds**,
+/// seeing what it has written and not yet committed.
+///
+/// For one caller: the apply's read-back, which records what a plan built in
+/// the same transaction as the build, so that the ledger entry is as atomic as
+/// the change it describes and a read that failed undoes the statements too
+/// (`pbps-cli`, DECISIONS 147). [`introspect`] refuses that transaction (253)
+/// because it cannot tell whose it is; this function is the caller saying
+/// "mine, and read what I have done".
+///
+/// Under a savepoint, so that the canonical scope goes back when the read
+/// ends and the caller's transaction is left exactly as deep, as writable and
+/// under the same settings as it was found (see [`SAVEPOINT`]). **Not**
+/// `REPEATABLE READ`: the caller's isolation level is what it is — this tool's
+/// own framing opens `READ COMMITTED` — so the reads are as many snapshots as
+/// there are queries, of a catalog this very transaction has just written,
+/// under the apply lock that keeps every other deployer out. The hand-made DDL
+/// that could land between two of them is the hazard the other engine accepts
+/// on every read (DECISIONS 418).
+pub async fn introspect_within_transaction(conn: &mut Conn) -> Result<Pulled, DbError> {
+    introspect_in(conn, Scope::CallersTransaction).await
+}
+
+async fn introspect_in(conn: &mut Conn, scope: Scope) -> Result<Pulled, DbError> {
+    open(conn, scope).await?;
+    let outcome = read_all(conn).await;
+    let raw = close(conn, scope, outcome)
+        .await
+        .map_err(schema_changed_underneath)?;
 
     let mut pulled = assemble(&raw.0);
     // Prepended: a table the model cannot hold at all is the thing a reader
@@ -1255,6 +1275,98 @@ SELECT pg_catalog.pg_get_userbyid(da.defaclrole) AS grantor,
   LEFT JOIN pg_catalog.pg_namespace n ON n.oid = da.defaclnamespace
  ORDER BY 1, 2, 3";
 
+/// Whether this connection is inside a transaction block, asked the one way
+/// that reads differently in the two states through this driver (DECISIONS
+/// 253): a `SET LOCAL` on this tool's own GUC, read back in a second
+/// statement. The setting is left behind inside a caller's transaction, under
+/// this tool's prefix, and ends with it.
+pub async fn in_transaction(conn: &mut Conn) -> Result<bool, DbError> {
+    let token = probe_token();
+    conn.query(&probe_set(&token)).await?;
+    let rows = conn.query(PROBE_READ).await?;
+    let row = rows.first().ok_or_else(|| missing("probe"))?;
+    Ok(text(row, "probe")? == token)
+}
+
+/// Where a canonical-scope read runs (DECISIONS 253, 418).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Its own `REPEATABLE READ READ ONLY` transaction (250). Refused inside
+    /// a caller's transaction, which it would otherwise commit (253).
+    Own,
+    /// Inside the transaction the caller already holds, under a savepoint,
+    /// reading what that transaction has written and not yet committed. For
+    /// one caller: the apply's read-back, which records what a plan built in
+    /// the same transaction as the build (`pbps-cli`, DECISIONS 147). Refused
+    /// outside a transaction: "nothing uncommitted to see" is [`Scope::Own`]'s
+    /// answer, not this one's (418).
+    CallersTransaction,
+}
+
+/// The savepoint an in-transaction read runs under, and what it sets there.
+///
+/// `SET LOCAL transaction_read_only = on` keeps the promise `READ ONLY` makes
+/// for the other scope, for exactly as long as the savepoint: measured, a
+/// `CREATE TABLE` under it is `cannot execute CREATE TABLE in a read-only
+/// transaction`, and after `ROLLBACK TO SAVEPOINT` the caller's transaction is
+/// writable again. The canonical settings are `set_config(…, is_local)` and
+/// come back the same way — measured, the caller's `search_path` is what it
+/// was — which is why the savepoint is rolled back on success too: there is
+/// nothing a read has to keep, and everything it set has to go.
+const SAVEPOINT: &str = "SAVEPOINT pbps_read; SET LOCAL transaction_read_only = on";
+const UNWIND: &str = "ROLLBACK TO SAVEPOINT pbps_read; RELEASE SAVEPOINT pbps_read";
+
+async fn open(conn: &mut Conn, scope: Scope) -> Result<(), DbError> {
+    match scope {
+        Scope::Own => {
+            refuse_a_caller_owned_transaction(conn).await?;
+            conn.execute(BEGIN).await
+        }
+        Scope::CallersTransaction => {
+            if !in_transaction(conn).await? {
+                return Err(DbError::Driver {
+                    code: None,
+                    message: "this connection has no open transaction, and a read-back of one \
+                              cannot run outside it.\nThe read exists to see what the \
+                              caller's transaction has written and not yet committed; outside \
+                              a transaction there is nothing of the kind, and the plain read \
+                              takes its own snapshot instead."
+                        .to_owned(),
+                });
+            }
+            conn.execute(SAVEPOINT).await
+        }
+    }
+}
+
+/// Ends the scope the way its outcome requires. The scope's own failure to end
+/// is dropped on the error path: a transaction the server has already killed
+/// must not replace the failure that killed it.
+async fn close<T>(
+    conn: &mut Conn,
+    scope: Scope,
+    outcome: Result<T, DbError>,
+) -> Result<T, DbError> {
+    match (scope, outcome) {
+        (Scope::Own, Ok(value)) => {
+            conn.execute("COMMIT").await?;
+            Ok(value)
+        }
+        (Scope::Own, Err(e)) => {
+            let _ = conn.execute("ROLLBACK").await;
+            Err(e)
+        }
+        (Scope::CallersTransaction, Ok(value)) => {
+            conn.execute(UNWIND).await?;
+            Ok(value)
+        }
+        (Scope::CallersTransaction, Err(e)) => {
+            let _ = conn.execute(UNWIND).await;
+            Err(e)
+        }
+    }
+}
+
 /// The one failure the snapshot cannot prevent, named so that it does not
 /// arrive as a mystery.
 ///
@@ -1293,11 +1405,7 @@ SELECT pg_catalog.pg_get_userbyid(da.defaclrole) AS grantor,
 /// transaction would answer from their uncommitted writes, which is not what
 /// "what the database looks like" means.
 async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
-    let token = probe_token();
-    conn.query(&probe_set(&token)).await?;
-    let rows = conn.query(PROBE_READ).await?;
-    let row = rows.first().ok_or_else(|| missing("probe"))?;
-    if text(row, "probe")? == token {
+    if in_transaction(conn).await? {
         return Err(DbError::Driver {
             code: None,
             message: "this connection already has an open transaction, and a pull cannot run \
@@ -1449,6 +1557,338 @@ fn numbers(s: &str) -> Vec<i32> {
     s.split(',')
         .filter_map(|part| part.trim().parse().ok())
         .collect()
+}
+
+/// Reads the rows of every scoped table the schema has (ADR-0004).
+///
+/// The scope decides *which* rows — every row of an `exact` table, the declared
+/// keys of an `ensure` one — and it is supplied by the caller, because a
+/// database holds rows, not a notion of which of them are declared. A scoped
+/// table the schema does not have gets no entry: it is missing, which the
+/// managed-set check reports, and "missing" must not come back as "empty".
+///
+/// A table whose rows cannot be read (no single-column key, or a value the
+/// model cannot hold) fails the whole read rather than being skipped: a state
+/// recorded without it would say the table declares no rows, and the next drift
+/// check would be blind to the rows it exists to watch.
+///
+/// **It takes its own transaction**, for the reason [`introspect`] does and one
+/// more. `read_rows` is where this dialect's value spellings are fixed: the
+/// canonical settings are `set_config(…, is_local)` and therefore belong to a
+/// transaction, so a read outside one would render every date, interval,
+/// `bytea` and float under whatever the caller's session has (ADR-0013 §3, and
+/// [`crate::rows::read_expr`] for what that costs).
+pub async fn read_rows(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    read_rows_in(conn, schema, scopes, Scope::Own).await
+}
+
+/// [`read_rows`] inside the transaction the caller holds, for the reason and
+/// under the terms of [`introspect_within_transaction`]: the rows a plan's
+/// statements just wrote, read back before the commit that makes them so
+/// (DECISIONS 147, 418).
+pub async fn read_rows_within_transaction(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    read_rows_in(conn, schema, scopes, Scope::CallersTransaction).await
+}
+
+async fn read_rows_in(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+    scope: Scope,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
+        table: table.clone(),
+        source: Box::new(source),
+    };
+    let any = TableName::new("", "");
+    open(conn, scope).await.map_err(|e| read(&any, e))?;
+    // The scope's own error is a read error of no table in particular; the
+    // read's is already one.
+    let outcome = read_every_scoped_table(conn, schema, scopes).await;
+    match outcome {
+        Ok(out) => close(conn, scope, Ok(out)).await.map_err(|e| read(&any, e)),
+        Err(e) => {
+            // The scope is unwound for the read's error, which is the one
+            // returned; the unwinding's own outcome is not it.
+            let _: Result<(), DbError> =
+                close(conn, scope, Err(DbError::BadRow(String::new()))).await;
+            Err(e)
+        }
+    }
+}
+
+async fn read_every_scoped_table(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    let mut out = pbps_model::ObservedRows::new();
+    let any = TableName::new("", "");
+    conn.query(CANONICAL_PATH)
+        .await
+        .map_err(|e| crate::rows::RowsError::Read {
+            table: any,
+            source: Box::new(e),
+        })?;
+    for (name, scope) in scopes {
+        let Some(table) = schema.tables.get(name) else {
+            continue;
+        };
+        let mut observed = pbps_model::ObservedTable::default();
+        if let Some(query) = crate::rows::query(name, table, scope)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            for row in &conn.query(&query.sql).await.map_err(read)? {
+                let (key, cells) = crate::rows::decode(name, &query, row)?;
+                observed.rows.insert(key, cells);
+            }
+            if let Some(sql) = &query.aliases {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    // A requested key the table does not hold has no alias to
+                    // record — the row is simply not there, which is what an
+                    // `InsertRow` is for.
+                    if let (requested, Some(canonical)) = crate::rows::decode_alias(name, row)? {
+                        observed.aliases.insert(requested, canonical);
+                    }
+                }
+            }
+        }
+        out.insert(name.clone(), observed);
+    }
+    Ok(out)
+}
+
+/// Every declared value the engine would not read back as written, and every
+/// pair of declared keys it reads as one row (DECISIONS 101, 106; ADR-0013 §5).
+///
+/// Asked before anything is written, and asked of the engine: neither the model
+/// nor this crate can spell a value the engine's way without becoming the
+/// engine.
+///
+/// Inside the canonical scope, because the answer *is* a spelling and the
+/// spelling is what the settings decide. The comparison it feeds is against a
+/// state read under those same settings, and a check run under the operator's
+/// would report a date as misspelt on one machine and clean on the next.
+///
+/// The key columns' collations are read here, by [`key_collations`], under
+/// the names `at` carries: they decide which two keys are one row, and a
+/// caller cannot know them without asking this catalog.
+pub async fn misspelt(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let any = TableName::new("", "");
+    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
+        table: table.clone(),
+        source: Box::new(source),
+    };
+    refuse_a_caller_owned_transaction(conn)
+        .await
+        .map_err(|e| read(&any, e))?;
+    // The one input the checks read from the catalog rather than take from
+    // the declaration, read here so that the question is answered whole: a
+    // caller that hands in the names and forgets the collations gets the
+    // database default silently, which is the fallback DECISIONS 148 exists
+    // to refuse. `at` is the caller's under the names it knows; the copy
+    // carries what the catalog adds.
+    let mut at = at.clone();
+    key_collations(conn, &mut at, schema)
+        .await
+        .map_err(|e| read(&any, e))?;
+    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
+    let out = ask_about_every_spelling(conn, schema, &at).await;
+    match out {
+        Ok(out) => {
+            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+async fn ask_about_every_spelling(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let any = TableName::new("", "");
+    conn.query(CANONICAL_PATH)
+        .await
+        .map_err(|e| crate::rows::RowsError::Read {
+            table: any,
+            source: Box::new(e),
+        })?;
+    let mut out = Spellings::default();
+    let as_declared = crate::rows::Catalogued::default();
+    for (name, table) in &schema.tables {
+        let at = at.get(name).unwrap_or(&as_declared);
+        for q in crate::rows::spelling_queries(name, table, at)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            if let Some(sql) = &q.collisions {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
+                    let (Some((first, _)), Some((second, _))) =
+                        (q.literals.get(a), q.literals.get(b))
+                    else {
+                        continue;
+                    };
+                    // The key column's own type and collation decide it; the
+                    // second insert would fail on the primary key.
+                    out.conflicts.push(pbps_model::RowConflict {
+                        table: name.clone(),
+                        first: first.clone(),
+                        second: second.clone(),
+                        canonical: pbps_model::RowKey::from(canonical.as_str()),
+                    });
+                }
+            }
+            for row in &conn.query(&q.sql).await.map_err(read)? {
+                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
+                let Some((key, declared)) = q.literals.get(i) else {
+                    continue;
+                };
+                if canonical.as_deref() == Some(declared.as_str()) {
+                    continue;
+                }
+                out.misspelt.push(crate::rows::Misspelt {
+                    table: name.clone(),
+                    key: key.clone(),
+                    column: q.column.clone(),
+                    declared: declared.clone(),
+                    ty: q.ty.clone(),
+                    canonical,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// How the database spells each of the schema names a declaration grants on:
+/// `None` where it has no schema of that name at all.
+///
+/// The SQL Server question (DECISIONS 142), asked of this engine for the same
+/// reason and answered the only way it can be here. An identifier the emitter
+/// writes is always quoted, and a quoted name is compared byte for byte, so
+/// the one spelling this database can have for a declared schema is the
+/// declared one: `App` and `app` are two schemas, not two spellings. The query
+/// therefore answers presence — `nspname` equal to the text, exactly — and can
+/// never answer a different spelling. Asked rather than assumed, so that "the
+/// schema is there under this name" and "there is no such schema" stay two
+/// answers the caller receives from the engine (DECISIONS 417).
+pub async fn schema_spellings(
+    conn: &mut Conn,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, Option<String>>, DbError> {
+    let mut out = std::collections::BTreeMap::new();
+    if names.is_empty() {
+        return Ok(out);
+    }
+    let wanted: Vec<&String> = names.iter().collect();
+    let params: Vec<Param<'_>> = wanted.iter().map(|n| Param::Str(n.as_str())).collect();
+    let values: Vec<String> = (1..=wanted.len())
+        .map(|i| format!("(${i}::text)"))
+        .collect();
+    let sql = format!(
+        "WITH wanted(schema_name) AS (VALUES {})\n\
+         SELECT w.schema_name, n.nspname AS spelled\n  \
+           FROM wanted w\n  \
+           LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name",
+        values.join(", ")
+    );
+    for row in &conn.query_with(&sql, &params).await? {
+        let name: &str = row.try_get("schema_name")?.ok_or_else(|| {
+            DbError::BadRow("the schema spelling query returned a NULL name".to_owned())
+        })?;
+        let spelled: Option<&str> = row.try_get("spelled")?;
+        out.insert(name.to_owned(), spelled.map(ToOwned::to_owned));
+    }
+    Ok(out)
+}
+
+/// What the catalog calls each declared table's key column collation *now*.
+///
+/// The one input to the spelling checks that is read from the database rather
+/// than declared, and the one that decides whether two keys are one row. A
+/// table this plan creates has none — the emitter writes no `COLLATE`, so its
+/// column will take the database default — and that is what `None` means.
+///
+/// Read under the names the catalog has now, which is the caller's to supply:
+/// the checks run before the plan's first statement, so a table this revision
+/// renames is still under its old name (DECISIONS 148).
+pub async fn key_collations(
+    conn: &mut Conn,
+    at: &mut crate::rows::CatalogNames,
+    schema: &Schema,
+) -> Result<(), DbError> {
+    let as_declared = crate::rows::Catalogued::default();
+    let mut wanted: Vec<(TableName, TableName, String)> = Vec::new();
+    for (name, table) in &schema.tables {
+        if table.data.is_none() {
+            continue;
+        }
+        let entry = at.get(name).unwrap_or(&as_declared);
+        let Some(key) = table
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.columns.len() == 1)
+            .map(|pk| pk.columns[0].clone())
+        else {
+            continue;
+        };
+        wanted.push((
+            name.clone(),
+            entry.table.clone().unwrap_or_else(|| name.clone()),
+            entry.key_column.clone().unwrap_or(key),
+        ));
+    }
+    for (declared, stored, column) in wanted {
+        // `to_regclass` and not a cast: a table this plan creates does not
+        // exist yet, and `'s.t'::regclass` is an error where this is a NULL.
+        let sql = format!(
+            "SELECT co.collname AS collation_name, ns.nspname AS collation_schema\n  \
+               FROM pg_catalog.pg_attribute a\n  \
+               JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation\n  \
+               JOIN pg_catalog.pg_namespace ns ON ns.oid = co.collnamespace\n \
+              WHERE a.attrelid = pg_catalog.to_regclass({})\n                \
+                AND a.attname = {}",
+            crate::emit::value_literal(&format!(
+                "{}.{}",
+                quote_for_regclass(&stored.schema),
+                quote_for_regclass(&stored.name)
+            )),
+            crate::emit::value_literal(&column),
+        );
+        let rows = conn.query(&sql).await?;
+        let Some(row) = rows.first() else { continue };
+        let entry = at.entry(declared).or_default();
+        entry.key_collation = Some((text(row, "collation_schema")?, text(row, "collation_name")?));
+    }
+    Ok(())
+}
+
+/// One half of a name for `to_regclass`, which parses its argument as SQL
+/// rather than taking it literally: a name with a `"` or a `.` in it has to
+/// arrive quoted or the function reads it as two.
+fn quote_for_regclass(part: &str) -> String {
+    format!("\"{}\"", part.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -1684,270 +2124,4 @@ mod tests {
             "the two names, and the `r` that says which kind: {NOT_ONE_OF_OUR_TABLES}"
         );
     }
-}
-
-/// Reads the rows of every scoped table the schema has (ADR-0004).
-///
-/// The scope decides *which* rows — every row of an `exact` table, the declared
-/// keys of an `ensure` one — and it is supplied by the caller, because a
-/// database holds rows, not a notion of which of them are declared. A scoped
-/// table the schema does not have gets no entry: it is missing, which the
-/// managed-set check reports, and "missing" must not come back as "empty".
-///
-/// A table whose rows cannot be read (no single-column key, or a value the
-/// model cannot hold) fails the whole read rather than being skipped: a state
-/// recorded without it would say the table declares no rows, and the next drift
-/// check would be blind to the rows it exists to watch.
-///
-/// **It takes its own transaction**, for the reason [`introspect`] does and one
-/// more. `read_rows` is where this dialect's value spellings are fixed: the
-/// canonical settings are `set_config(…, is_local)` and therefore belong to a
-/// transaction, so a read outside one would render every date, interval,
-/// `bytea` and float under whatever the caller's session has (ADR-0013 §3, and
-/// [`crate::rows::read_expr`] for what that costs).
-pub async fn read_rows(
-    conn: &mut Conn,
-    schema: &Schema,
-    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
-) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
-    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
-        table: table.clone(),
-        source: Box::new(source),
-    };
-    let any = TableName::new("", "");
-    refuse_a_caller_owned_transaction(conn)
-        .await
-        .map_err(|e| read(&any, e))?;
-    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
-    let out = read_every_scoped_table(conn, schema, scopes).await;
-    match out {
-        Ok(out) => {
-            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
-            Ok(out)
-        }
-        Err(e) => {
-            // `ROLLBACK` rather than `COMMIT`, and its own error is dropped: a
-            // transaction the server has already killed must not replace the
-            // failure that killed it.
-            let _ = conn.execute("ROLLBACK").await;
-            Err(e)
-        }
-    }
-}
-
-async fn read_every_scoped_table(
-    conn: &mut Conn,
-    schema: &Schema,
-    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
-) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
-    let mut out = pbps_model::ObservedRows::new();
-    let any = TableName::new("", "");
-    conn.query(CANONICAL_PATH)
-        .await
-        .map_err(|e| crate::rows::RowsError::Read {
-            table: any,
-            source: Box::new(e),
-        })?;
-    for (name, scope) in scopes {
-        let Some(table) = schema.tables.get(name) else {
-            continue;
-        };
-        let mut observed = pbps_model::ObservedTable::default();
-        if let Some(query) = crate::rows::query(name, table, scope)? {
-            let read = |source| crate::rows::RowsError::Read {
-                table: name.clone(),
-                source: Box::new(source),
-            };
-            for row in &conn.query(&query.sql).await.map_err(read)? {
-                let (key, cells) = crate::rows::decode(name, &query, row)?;
-                observed.rows.insert(key, cells);
-            }
-            if let Some(sql) = &query.aliases {
-                for row in &conn.query(sql).await.map_err(read)? {
-                    // A requested key the table does not hold has no alias to
-                    // record — the row is simply not there, which is what an
-                    // `InsertRow` is for.
-                    if let (requested, Some(canonical)) = crate::rows::decode_alias(name, row)? {
-                        observed.aliases.insert(requested, canonical);
-                    }
-                }
-            }
-        }
-        out.insert(name.clone(), observed);
-    }
-    Ok(out)
-}
-
-/// Every declared value the engine would not read back as written, and every
-/// pair of declared keys it reads as one row (DECISIONS 101, 106; ADR-0013 §5).
-///
-/// Asked before anything is written, and asked of the engine: neither the model
-/// nor this crate can spell a value the engine's way without becoming the
-/// engine.
-///
-/// Inside the canonical scope, because the answer *is* a spelling and the
-/// spelling is what the settings decide. The comparison it feeds is against a
-/// state read under those same settings, and a check run under the operator's
-/// would report a date as misspelt on one machine and clean on the next.
-pub async fn misspelt(
-    conn: &mut Conn,
-    schema: &Schema,
-    at: &crate::rows::CatalogNames,
-) -> Result<Spellings, crate::rows::RowsError> {
-    let any = TableName::new("", "");
-    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
-        table: table.clone(),
-        source: Box::new(source),
-    };
-    refuse_a_caller_owned_transaction(conn)
-        .await
-        .map_err(|e| read(&any, e))?;
-    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
-    let out = ask_about_every_spelling(conn, schema, at).await;
-    match out {
-        Ok(out) => {
-            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
-            Ok(out)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK").await;
-            Err(e)
-        }
-    }
-}
-
-/// What the spelling checks found.
-#[derive(Debug, Default)]
-pub struct Spellings {
-    /// Declared texts the engine reads back differently, or not at all.
-    pub misspelt: Vec<crate::rows::Misspelt>,
-    /// Two declared keys the engine reads as one row, rendered as the message
-    /// a caller shows.
-    pub conflicts: Vec<String>,
-}
-
-async fn ask_about_every_spelling(
-    conn: &mut Conn,
-    schema: &Schema,
-    at: &crate::rows::CatalogNames,
-) -> Result<Spellings, crate::rows::RowsError> {
-    let any = TableName::new("", "");
-    conn.query(CANONICAL_PATH)
-        .await
-        .map_err(|e| crate::rows::RowsError::Read {
-            table: any,
-            source: Box::new(e),
-        })?;
-    let mut out = Spellings::default();
-    let as_declared = crate::rows::Catalogued::default();
-    for (name, table) in &schema.tables {
-        let at = at.get(name).unwrap_or(&as_declared);
-        for q in crate::rows::spelling_queries(name, table, at)? {
-            let read = |source| crate::rows::RowsError::Read {
-                table: name.clone(),
-                source: Box::new(source),
-            };
-            if let Some(sql) = &q.collisions {
-                for row in &conn.query(sql).await.map_err(read)? {
-                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
-                    let (Some((first, _)), Some((second, _))) =
-                        (q.literals.get(a), q.literals.get(b))
-                    else {
-                        continue;
-                    };
-                    out.conflicts.push(format!(
-                        "{name} declares row keys `{first}` and `{second}`, and this engine reads \
-                         both as the one row `{canonical}` — the key column's own type and \
-                         collation decide it. The second insert would fail on the primary key."
-                    ));
-                }
-            }
-            for row in &conn.query(&q.sql).await.map_err(read)? {
-                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
-                let Some((key, declared)) = q.literals.get(i) else {
-                    continue;
-                };
-                if canonical.as_deref() == Some(declared.as_str()) {
-                    continue;
-                }
-                out.misspelt.push(crate::rows::Misspelt {
-                    table: name.clone(),
-                    key: key.clone(),
-                    column: q.column.clone(),
-                    declared: declared.clone(),
-                    ty: q.ty.clone(),
-                    canonical,
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// What the catalog calls each declared table's key column collation *now*.
-///
-/// The one input to the spelling checks that is read from the database rather
-/// than declared, and the one that decides whether two keys are one row. A
-/// table this plan creates has none — the emitter writes no `COLLATE`, so its
-/// column will take the database default — and that is what `None` means.
-///
-/// Read under the names the catalog has now, which is the caller's to supply:
-/// the checks run before the plan's first statement, so a table this revision
-/// renames is still under its old name (DECISIONS 148).
-pub async fn key_collations(
-    conn: &mut Conn,
-    at: &mut crate::rows::CatalogNames,
-    schema: &Schema,
-) -> Result<(), DbError> {
-    let as_declared = crate::rows::Catalogued::default();
-    let mut wanted: Vec<(TableName, TableName, String)> = Vec::new();
-    for (name, table) in &schema.tables {
-        if table.data.is_none() {
-            continue;
-        }
-        let entry = at.get(name).unwrap_or(&as_declared);
-        let Some(key) = table
-            .primary_key
-            .as_ref()
-            .filter(|pk| pk.columns.len() == 1)
-            .map(|pk| pk.columns[0].clone())
-        else {
-            continue;
-        };
-        wanted.push((
-            name.clone(),
-            entry.table.clone().unwrap_or_else(|| name.clone()),
-            entry.key_column.clone().unwrap_or(key),
-        ));
-    }
-    for (declared, stored, column) in wanted {
-        // `to_regclass` and not a cast: a table this plan creates does not
-        // exist yet, and `'s.t'::regclass` is an error where this is a NULL.
-        let sql = format!(
-            "SELECT co.collname AS collation_name, ns.nspname AS collation_schema\n  \
-               FROM pg_catalog.pg_attribute a\n  \
-               JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation\n  \
-               JOIN pg_catalog.pg_namespace ns ON ns.oid = co.collnamespace\n \
-              WHERE a.attrelid = pg_catalog.to_regclass({})\n                \
-                AND a.attname = {}",
-            crate::emit::value_literal(&format!(
-                "{}.{}",
-                quote_for_regclass(&stored.schema),
-                quote_for_regclass(&stored.name)
-            )),
-            crate::emit::value_literal(&column),
-        );
-        let rows = conn.query(&sql).await?;
-        let Some(row) = rows.first() else { continue };
-        let entry = at.entry(declared).or_default();
-        entry.key_collation = Some((text(row, "collation_schema")?, text(row, "collation_name")?));
-    }
-    Ok(())
-}
-
-/// One half of a name for `to_regclass`, which parses its argument as SQL
-/// rather than taking it literally: a name with a `"` or a `.` in it has to
-/// arrive quoted or the function reads it as two.
-fn quote_for_regclass(part: &str) -> String {
-    format!("\"{}\"", part.replace('"', "\"\""))
 }

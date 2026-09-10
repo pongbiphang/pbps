@@ -1745,7 +1745,7 @@ async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
             }),
         ],
     };
-    let target = RenameTarget::from_changes(&changes)
+    let target = pbps_mssql::impact::rename_targets(&changes)
         .into_iter()
         .find(|target| matches!(target, RenameTarget::Column(_)))
         .expect("column rename target");
@@ -5794,6 +5794,7 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
         pbps_mssql::rows::Catalogued {
             table: Some(ci.clone()),
             key_column: Some("code".to_owned()),
+            key_collation: None,
         },
     )]
     .into_iter()

@@ -8772,3 +8772,138 @@ SPEC is in sync with all of these.
     this code's concern is the catalog state before the plan begins. This is
     the SQL Server instance of DECISIONS 407; unlike PostgreSQL's loud missing-
     name error, SQL Server's NULL lookup made the wrong answer look clean.
+
+417. **The connected seam is a `match` on the connection's driver in
+    `pbps-cli`, and the answers it routes are `pbps-db`'s types.** Step 10 of
+    Phase 5 (#85) had to remove `dialect()`'s refusal of `postgres`, and the
+    refusal was the least of it: `pbps-cli` named `pbps_mssql` at every
+    connected call site — the ledger, the catalog, the rename impact, the
+    edition, `doctor`'s permission read — 206 times, so the CLI *was* the SQL
+    Server implementation with a `Dialect` bolted on for the pure half. Two
+    shapes were weighed for the seam.
+
+    A trait in `pbps-dialect` was the obvious one and is not possible:
+    `pbps-db` already depends on `pbps-dialect` for `TransactionFraming`
+    (ADR-0014 §2), so a trait method taking a `Conn` is a dependency cycle.
+    And it would have bound the pure half — `validate`, offline `plan`, which
+    take only `pbps-dialect` — to the connection crate, for the benefit of the
+    other half. The engines therefore keep their connected work as free
+    `async fn`s over `pbps_db::Conn`, as ARCHITECTURE already said, and the
+    CLI's `engine` module routes to them: one function per question, an
+    exhaustive `match` on `Conn::driver()` in each, native `async fn` with no
+    `dyn` and no new dependency. A third engine is a compile error in every
+    one of those functions until it has an answer for each, which is the same
+    completeness a trait gives, in the place the engine's author would look.
+
+    **The types moved to `pbps-db`, beside the ledger's, for the reason the
+    ledger's are there** ("one definition each, filled by whichever engine").
+    `Pulled`, `Unexpressible`, `Limitation`, `UnmanagedModule`, `Catalogued`,
+    `Misspelt`, `Spellings`, `RowsError`, `RenameTarget`, `Referrer`,
+    `ImpactReport`, `ImpactError`, `GrantTargets`, `DataDemand` and the
+    `doctor::Ask` were each defined twice, and the pairs had drifted:
+
+    ```text
+    Pulled          mssql +unmanaged_modules       pg +limitations (both now)
+    Catalogued      pg +key_collation
+    RenameTarget    mssql +Module
+    ImpactReport    pg +carried
+    Spellings       mssql Vec<RowConflict>         pg Vec<String>
+    Limitation      mssql IntrospectionLimitation  pg Limitation
+    ```
+
+    Each is one struct now, with the union of fields, and every field one
+    engine never fills says so on the field — `unmanaged_modules` is empty
+    from PostgreSQL because that pull *leaves out* what it cannot hold and says
+    so in `warnings`, `carried` is empty from SQL Server because text carries
+    nothing, `Module` is never built by PostgreSQL's target builder and is
+    refused by name by its `rename_impact`. They could not have gone to
+    `pbps-dialect`: `RowsError` and `ImpactError` wrap a `DbError`, and the
+    same cycle applies. Each engine re-exports them under its old paths, so
+    its own code and tests did not move.
+
+    What stayed with the engine is what only the engine can spell: `Held`,
+    `Gap` and `Securable` (a gap's securable is rendered in that engine's
+    `GRANT` spelling, `OBJECT::[dbo].[t]` against `TABLE "app"."t"`, so the
+    seam hands the CLI the rendered text), the rename-target builder (only
+    SQL Server asks the drop side of a module rename through the impact query;
+    PostgreSQL answers it in `modules`), `truncate_reason` (UTF-16 units on
+    one, characters on the other), and PostgreSQL's `key_collations`, which
+    its `misspelt` now reads itself rather than trusting a caller to have
+    asked — the collation is the one input to the spelling check that is the
+    catalog's, and a caller that forgot it got the database default without a
+    word (DECISIONS 148).
+
+    **An engine-only question is answered by name on the other engine, never
+    with an empty answer.** `capabilities` on PostgreSQL is a fact —
+    `edition: None` means one edition, `supports_online: true` because every
+    release the emitter targets builds an index `CONCURRENTLY` — and a read
+    that failed is the `Err`, so `doctor` cannot confuse the two.
+    `edition_verdict` refuses nothing there for the same reason. The four role
+    questions (`names_alike`, `principals_holding`, `role_members`,
+    `role_owned_securables`) *refuse* on PostgreSQL, citing 211: each exists
+    to clear a `CREATE ROLE`, `RENAME ROLE` or `DROP ROLE` that dialect never
+    plans, so an answer would be one to a question nobody asked, and "none"
+    would be the empty answer this tool refuses everywhere else. The schema
+    spelling question (142) got a PostgreSQL implementation because it *can*
+    be asked there honestly: a quoted identifier is compared byte for byte, so
+    `App` and `app` are two schemas and never two spellings, and the query
+    answers presence — measured, the present name comes back as itself, the
+    upper-cased one as absent.
+
+    What the seam taught, recorded here because the third engine will read
+    this before any code (SPEC §12): the `pbps_mssql` rename-target builder
+    never received 407's table-name mapping, so on that engine a column rename
+    on a table the same plan renames is asked about under a name the catalog
+    does not have yet, and `OBJECT_ID` answers NULL — an empty impact report
+    for a rename that has referrers. That mapping landed separately in 416
+    and is preserved in the engine's `rename_targets` function here.
+    PostgreSQL's pull keeps no
+    unmanaged-module inventory, so an object it leaves out is invisible to
+    `unmanaged: error` as well as to the plan; PostgreSQL's `doctor` does not
+    yet ask about the rights a `data:` block or a `role:` grant needs, and the
+    seam hands them over so that the day it does no caller changes; and the
+    PostgreSQL-only connected checks — `roles::missing_roles`,
+    `rename_evidence`, `drop_blockers`, `unsupported_permissions`,
+    `modules::before_a_rebuild` — are reached by that crate's live suite and
+    by no command. Each is an issue, not this step. The one thing the seam
+    taught that *was* this step is 418: the first end-to-end `bootstrap` on
+    PostgreSQL was refused by the engine's own pull, and the CLI now says
+    where each catalog read runs.
+
+418. **The apply's read-back on PostgreSQL runs inside the apply transaction
+    under a savepoint, and the command says which kind of read it wants.** 147
+    puts the read-back and the ledger record inside the transaction that
+    built what they record, and 253 makes the pull refuse to run inside a
+    caller's transaction. Both are right, and together they refused every
+    `bootstrap` and `apply` on PostgreSQL through the binary — the first
+    end-to-end run through the seam of 417 ended in `this connection already
+    has an open transaction, and a pull cannot run inside one`. SQL Server
+    never asked the question: its catalog reads the same inside and outside
+    a transaction, so the CLI had never had to say.
+
+    The resolution is two entry points, not a flag on the pull, and a `Read`
+    the command names at every catalog read: `Snapshot`, the pull of 250,
+    which takes its own `REPEATABLE READ READ ONLY` transaction and keeps
+    refusing inside anybody else's; and `InsideOwnTransaction`, which
+    *requires* an open transaction and reads under a savepoint. They answer
+    different questions — "what does the database look like" against "what
+    did this transaction build" — and 253's point stands: the second is not
+    an accommodation of the first, and a caller that asks it outside a
+    transaction is refused by name, because "nothing uncommitted to see" is
+    the first question's answer and not this one's. The CLI passes
+    `InsideOwnTransaction` at exactly two sites, the read-backs of
+    `bootstrap` and `apply`, and `Snapshot` everywhere else, including the
+    baseline read the apply takes *before* its transaction opens.
+
+    Measured on 18.6: the savepoint carries `SET LOCAL transaction_read_only
+    = on`, and a `CREATE TABLE` under it fails with SQLSTATE 25006; after
+    `ROLLBACK TO SAVEPOINT` the caller's transaction is writable again, its
+    `search_path` is what the caller set, `transaction_read_only` is `off`,
+    and `txid_current_if_assigned()` is still non-null — the read left
+    nothing behind and ended nothing. The canonical settings 250 and 254 pin
+    are `set_config(…, is_local)` and go back with the savepoint, which is why
+    the savepoint is rolled back on the success path too: a read has nothing
+    to keep and everything it set has to go. The read sees the transaction's
+    own uncommitted `CREATE TABLE` and the row it inserted, which is the
+    whole reason it exists. Reverting the CLI's two `InsideOwnTransaction`
+    sites to `Snapshot` brings the original refusal back in both flow tests.

@@ -1091,6 +1091,27 @@ async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
     panic!("twenty pulls in a row were taken across another test's DDL");
 }
 
+/// The read-back inside the caller's transaction, with [`pull`]'s budget and
+/// for the same reason. One more thing is measured on every retry: a deadlock
+/// aborts the read's savepoint and not the caller's transaction, so the retry
+/// runs inside the *same* transaction and still sees its uncommitted build.
+async fn read_back_within(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
+    for _ in 0..20 {
+        match pbps_pg::catalog::introspect_within_transaction(conn).await {
+            Ok(pulled) => return pulled,
+            Err(e) => {
+                assert!(
+                    e.to_string()
+                        .contains("the catalog changed while it was being read"),
+                    "the read-back failed for a reason this suite does not cause: {e:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("twenty read-backs in a row were taken across another test's DDL");
+}
+
 /// The limitations this suite's own schema earned.
 ///
 /// Scoped for the same reason as [`ours`]: the container is shared, and a bare
@@ -8964,11 +8985,19 @@ async fn two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offl
         .expect("ask the engine");
     assert_eq!(found.conflicts.len(), 1, "{found:#?}");
     assert!(
-        found.conflicts[0].contains(&format!("{s}.keys")),
+        found.conflicts[0]
+            .to_string()
+            .contains(&format!("{s}.keys")),
         "{found:#?}"
     );
-    assert!(found.conflicts[0].contains("`New`"), "{found:#?}");
-    assert!(found.conflicts[0].contains("`new`"), "{found:#?}");
+    assert!(
+        found.conflicts[0].to_string().contains("`New`"),
+        "{found:#?}"
+    );
+    assert!(
+        found.conflicts[0].to_string().contains("`new`"),
+        "{found:#?}"
+    );
     // And the second insert is what that refusal is about.
     conn.execute(&format!("INSERT INTO {s}.keys VALUES ('New', 'a')"))
         .await
@@ -18485,4 +18514,209 @@ async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_deci
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+}
+
+/// A declared schema name is spelled exactly as declared on this engine, or
+/// not at all: quoted identifiers are compared byte for byte, so `App` and
+/// `app` are two schemas, and the spelling question (DECISIONS 142) can only
+/// ever answer presence. Both halves are pinned — the present name comes back
+/// as itself and the absent one as `None` — and so is the case that would be
+/// a respelling on SQL Server and is a different schema here (DECISIONS 417).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_declared_schema_is_spelled_as_declared_or_is_not_there() {
+    let mut conn = connect().await;
+    let schema = format!("spelled_{}", std::process::id());
+    conn.execute(&format!(
+        "DROP SCHEMA IF EXISTS \"{schema}\" CASCADE; CREATE SCHEMA \"{schema}\""
+    ))
+    .await
+    .expect("create the schema");
+    let upper = schema.to_ascii_uppercase();
+    let wanted: std::collections::BTreeSet<String> = [
+        schema.clone(),
+        upper.clone(),
+        "no_such_schema_here".to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let spelled = pbps_pg::catalog::schema_spellings(&mut conn, &wanted)
+        .await
+        .expect("ask the engine");
+    conn.execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .expect("drop the schema");
+    assert_eq!(spelled.len(), 3, "{spelled:#?}");
+    assert_eq!(spelled[&schema], Some(schema.clone()), "{spelled:#?}");
+    // Not a respelling of the one that exists: a different schema, absent.
+    assert_eq!(spelled[&upper], None, "{spelled:#?}");
+    assert_eq!(spelled["no_such_schema_here"], None, "{spelled:#?}");
+    let none = pbps_pg::catalog::schema_spellings(&mut conn, &Default::default())
+        .await
+        .expect("ask about nothing");
+    assert!(none.is_empty());
+}
+
+/// The read-back the apply needs runs **inside** the caller's transaction and
+/// sees what that transaction has written and not yet committed — a table
+/// created three statements ago is in the pull — and it leaves the transaction
+/// open, writable and under the caller's own settings: the savepoint it ran
+/// under is rolled back, taking the canonical scope with it (DECISIONS 418).
+/// Rolling the caller's transaction back afterwards takes everything with it,
+/// which is what the apply's atomicity promise means (147).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_read_back_inside_the_callers_transaction_sees_its_uncommitted_build() {
+    let mut conn = connect().await;
+    let s = probe_schema("within");
+    build(
+        &mut conn,
+        &s,
+        &format!("CREATE TABLE {s}.kept (id integer PRIMARY KEY)"),
+    )
+    .await;
+    conn.execute("SET search_path TO pg_catalog, caller_owned")
+        .await
+        .expect("a session setting of the caller's");
+
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!("CREATE TABLE {s}.uncommitted (id integer)"))
+        .await
+        .expect("create inside the transaction");
+
+    let pulled = read_back_within(&mut conn).await;
+    let names = ours(&pulled, &s);
+    assert!(
+        names.contains(&pbps_model::TableName::new(&s, "uncommitted")),
+        "the read-back must see the uncommitted build: {names:?}"
+    );
+    assert!(names.contains(&pbps_model::TableName::new(&s, "kept")));
+
+    // Still the caller's transaction: writable, and under the caller's own
+    // search path — the read's `set_config(…, is_local)` went back with its
+    // savepoint, and so did its `transaction_read_only`.
+    conn.execute(&format!("INSERT INTO {s}.kept VALUES (1)"))
+        .await
+        .expect("the transaction is writable after the read-back");
+    let path = text(&mut conn, "SELECT current_setting('search_path')").await;
+    assert_eq!(
+        path, "pg_catalog, caller_owned",
+        "the read left its scope behind"
+    );
+    let read_only = text(&mut conn, "SELECT current_setting('transaction_read_only')").await;
+    assert_eq!(read_only, "off");
+    assert!(
+        truth(
+            &mut conn,
+            "SELECT pg_catalog.txid_current_if_assigned() IS NOT NULL"
+        )
+        .await,
+        "the read-back must not have ended the caller's transaction"
+    );
+
+    // The rows too, read back inside the same transaction under the canonical
+    // spelling, and the row the transaction wrote is there.
+    let mut schema = Schema::default();
+    schema.tables.insert(
+        pbps_model::TableName::new(&s, "kept"),
+        ours_only(&pulled, &s)
+            .tables
+            .remove(&pbps_model::TableName::new(&s, "kept"))
+            .expect("the pulled table"),
+    );
+    let scopes = [(
+        pbps_model::TableName::new(&s, "kept"),
+        pbps_model::RowScope::Every {
+            known: Default::default(),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let rows = pbps_pg::catalog::read_rows_within_transaction(&mut conn, &schema, &scopes)
+        .await
+        .expect("rows read back inside the transaction");
+    assert_eq!(
+        rows[&pbps_model::TableName::new(&s, "kept")].rows.len(),
+        1,
+        "{rows:?}"
+    );
+
+    conn.execute("ROLLBACK").await.expect("rollback");
+    let survived = truth(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 'uncommitted')"
+        ),
+    )
+    .await;
+    assert!(
+        !survived,
+        "the read-back committed the caller's transaction"
+    );
+    assert_eq!(
+        number(&mut conn, &format!("SELECT count(*)::int FROM {s}.kept")).await,
+        0
+    );
+    conn.execute("RESET search_path").await.expect("reset");
+    drop_schema(&mut conn, &s).await;
+}
+
+/// The savepoint keeps the read read-only for exactly its own life: a write
+/// under it is refused by the engine, not by this code's good intentions, and
+/// the refusal does not poison the caller's transaction because the savepoint
+/// is what is rolled back (DECISIONS 418).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_read_back_savepoint_is_read_only_and_gives_the_transaction_back_writable() {
+    let mut conn = connect().await;
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute("SAVEPOINT pbps_read; SET LOCAL transaction_read_only = on")
+        .await
+        .expect("the read's savepoint");
+    let refused = conn
+        .execute("CREATE TEMP TABLE pbps_write_probe (id integer)")
+        .await
+        .expect_err("a write under the read-only savepoint");
+    assert_eq!(
+        refused.server_error_code().as_deref(),
+        Some("25006"),
+        "read_only_sql_transaction: {refused}"
+    );
+    conn.execute("ROLLBACK TO SAVEPOINT pbps_read; RELEASE SAVEPOINT pbps_read")
+        .await
+        .expect("unwind");
+    conn.execute("CREATE TEMP TABLE pbps_write_probe (id integer)")
+        .await
+        .expect("writable again after the savepoint is gone");
+    conn.execute("ROLLBACK").await.expect("rollback");
+}
+
+/// Outside a transaction the in-transaction read is refused, by name: there
+/// is nothing uncommitted for it to see, and "nothing" is not this read's
+/// answer but [`pbps_pg::catalog::introspect`]'s (DECISIONS 418).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_read_back_outside_a_transaction_is_refused_not_answered() {
+    let mut conn = connect().await;
+    let e = pbps_pg::catalog::introspect_within_transaction(&mut conn)
+        .await
+        .expect_err("refused outside a transaction");
+    assert!(e.to_string().contains("no open transaction"), "{e}");
+    let e = pbps_pg::catalog::read_rows_within_transaction(
+        &mut conn,
+        &Schema::default(),
+        &Default::default(),
+    )
+    .await
+    .expect_err("refused outside a transaction");
+    assert!(e.to_string().contains("no open transaction"), "{e}");
+    // And the connection is usable afterwards.
+    assert_eq!(number(&mut conn, "SELECT 1").await, 1);
+    assert!(
+        !pbps_pg::catalog::in_transaction(&mut conn)
+            .await
+            .expect("probe")
+    );
 }
