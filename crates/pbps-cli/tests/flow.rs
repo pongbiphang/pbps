@@ -6811,7 +6811,6 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
         })
     };
     let connection = own.connection().to_owned();
-    sql("CREATE USER shadow WITHOUT LOGIN;");
 
     let d = Demo::new("rolename-live");
     d.table(
@@ -6832,12 +6831,12 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
     // `CREATE ROLE` would fail after the tables went in. The engine says
     // which names are one (DECISIONS 123).
     let pair = |d: &Demo| {
-        for role in ["Reader", "reader"] {
+        // Distinct filenames keep both declarations present on a
+        // case-insensitive filesystem too; the role names, not their paths,
+        // are the values this assertion asks the database to compare.
+        for (file, role) in [("first.yml", "Reader"), ("second.yml", "reader")] {
             std::fs::write(
-                d.dir
-                    .join("schema")
-                    .join("roles")
-                    .join(format!("{role}.yml")),
+                d.dir.join("schema").join("roles").join(file),
                 format!("role: {role}\ngrants:\n  dbo.customer: [select]\n"),
             )
             .unwrap();
@@ -6845,14 +6844,8 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
         assert_eq!(code(&d.run(&["plan"])), 0);
     };
     let unpair = |d: &Demo| {
-        for role in ["Reader", "reader"] {
-            std::fs::remove_file(
-                d.dir
-                    .join("schema")
-                    .join("roles")
-                    .join(format!("{role}.yml")),
-            )
-            .unwrap();
+        for (file, role) in [("first.yml", "Reader"), ("second.yml", "reader")] {
+            std::fs::remove_file(d.dir.join("schema").join("roles").join(file)).unwrap();
             let o = d.run(&["drop-role", role, "--reason", "never created"]);
             assert_eq!(code(&o), 0, "{}", stderr(&o));
         }
@@ -6869,6 +6862,7 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
     unpair(&d);
 
     // Bootstrap: refused before the table goes in, naming the user.
+    sql("CREATE USER shadow WITHOUT LOGIN;");
     let o = d.run(&["bootstrap", "--db", &connection]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
