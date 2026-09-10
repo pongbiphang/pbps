@@ -49,6 +49,74 @@ fn conn_str() -> String {
     )
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn signed_defaults_are_comparable_before_and_after_catalog_folding() {
+    let mut db = TestDb::create("signed_defaults").await;
+    for (index, (default, stored, value)) in [
+        ("- 1", "((-1))", "-1"),
+        ("+ 1", "((1))", "1"),
+        ("-(-1)", "((1))", "1"),
+        ("- /* c */ 1", "((-1))", "-1"),
+        ("(-CAST('1' AS int))", "( -CONVERT([int],'1'))", "-1"),
+        ("(-CONVERT(int,'1'))", "( -CONVERT([int],'1'))", "-1"),
+        (
+            "(-CAST('1.25' AS decimal(10,2)))",
+            "( -CONVERT([decimal](10,2),'1.25'))",
+            "-1.25",
+        ),
+        (
+            "(-CONVERT(numeric(10,2),'1.25'))",
+            "( -CONVERT([numeric](10,2),'1.25'))",
+            "-1.25",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let column_type = if value == "-1.25" {
+            "decimal(10,2)"
+        } else {
+            "int"
+        };
+        db.conn.execute(&format!("CREATE TABLE dbo.t{index} (n {column_type} DEFAULT {default}); INSERT dbo.t{index} DEFAULT VALUES;")).await.unwrap();
+        let rows = db.conn.query(&format!("SELECT definition FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID('dbo.t{index}')")).await.unwrap();
+        assert_eq!(rows[0].try_get::<&str>("definition").unwrap(), Some(stored));
+        assert!(pbps_mssql::rows::is_constant(default), "declared {default}");
+        assert!(pbps_mssql::rows::is_constant(stored), "stored {stored}");
+        let rows = db
+            .conn
+            .query(&format!(
+                "SELECT CONVERT(varchar(20),n) AS n FROM dbo.t{index} WHERE n=({default})"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<&str>("n").unwrap(), Some(value));
+    }
+    // Keys travel as quoted data, so comments and groupings are not SQL
+    // trivia here. Even tab/LF differ from the ASCII spaces after a sign.
+    for (key, accepted) in [
+        ("- 1", true),
+        ("+  1", true),
+        ("-\t1", false),
+        ("-\n1", false),
+        ("- /* c */ 1", false),
+        ("-(-1)", false),
+        ("- -1", false),
+    ] {
+        let rows = db.conn.query(&format!("SELECT CONVERT(varchar(30),TRY_CONVERT(int,N'{key}')) AS i, CONVERT(varchar(30),TRY_CONVERT(decimal(10,2),N'{key}')) AS d")).await.unwrap();
+        for column in ["i", "d"] {
+            assert_eq!(
+                rows[0].try_get::<&str>(column).unwrap().is_some(),
+                accepted,
+                "{key:?} as {column}"
+            );
+        }
+    }
+    db.drop().await;
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,

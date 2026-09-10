@@ -638,12 +638,121 @@ pub fn confirms_default(spec: &pbps_model::Column) -> bool {
 /// module docs say why those are never put in the query. Conservative on
 /// purpose: a literal read as "not a literal" only costs the comparison.
 pub fn is_constant(default: &str) -> bool {
+    let Some(clean) = constant_trivia(default) else {
+        return false;
+    };
+    constant_operand(&clean, 0)
+}
+
+// Preserve token boundaries: removing a comment must not turn `1/*c*/2`
+// into a number, or `-/*c*/-1` into a line comment.
+fn constant_trivia(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' || c == '[' {
+            let close = if c == '[' { ']' } else { '\'' };
+            out.push(c);
+            loop {
+                let next = chars.next()?;
+                out.push(next);
+                if next == close {
+                    if chars.peek() != Some(&close) {
+                        break;
+                    }
+                    out.push(chars.next()?);
+                }
+            }
+        } else if c == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for next in chars.by_ref() {
+                if matches!(next, '\r' | '\n') {
+                    break;
+                }
+            }
+            out.push(' ');
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut depth = 1;
+            while depth != 0 {
+                let next = chars.next()?;
+                if next == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    depth += 1;
+                } else if next == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    depth -= 1;
+                }
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn constant_operand(default: &str, depth: usize) -> bool {
+    // Declarations are untrusted input; nested signs/casts must not exhaust
+    // the reader's stack. An unusually deep constant can remain unconfirmed.
+    if depth > 64 {
+        return false;
+    }
     let mut s = default.trim();
     while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
         s = s[1..s.len() - 1].trim();
     }
     if s.is_empty() {
         return false;
+    }
+    if let Some(operand) = s.strip_prefix(['-', '+']) {
+        return constant_operand(operand, depth + 1);
+    }
+    // SQL Server retains a numeric CAST as CONVERT in the catalog. Restrict
+    // traversal to built-in numeric targets, whose conversion is independent
+    // of date/language settings, and never admit a nonconstant operand.
+    let lower = s.to_ascii_lowercase();
+    let cast = lower.strip_prefix("cast").and_then(|rest| {
+        let start = s.len() - rest.len();
+        let body = s[start..].trim().strip_prefix('(')?.strip_suffix(')')?;
+        let at = body.to_ascii_lowercase().rfind(" as ")?;
+        Some((&body[..at], body[at + 4..].trim()))
+    });
+    let convert = lower.strip_prefix("convert").and_then(|rest| {
+        let start = s.len() - rest.len();
+        let body = s[start..].trim().strip_prefix('(')?.strip_suffix(')')?;
+        let mut parens = 0usize;
+        let separator = body.char_indices().find_map(|(at, c)| {
+            match c {
+                '(' => parens += 1,
+                ')' => parens = parens.saturating_sub(1),
+                ',' if parens == 0 => return Some(at),
+                _ => {}
+            }
+            None
+        })?;
+        Some((&body[separator + 1..], body[..separator].trim()))
+    });
+    if depth > 0
+        && let Some((operand, ty)) = cast.or(convert)
+    {
+        let Ok(ty) = ty.replace(['[', ']'], "").parse::<pbps_model::ColumnType>() else {
+            return false;
+        };
+        return matches!(
+            ty.base.to_ascii_lowercase().as_str(),
+            "tinyint"
+                | "smallint"
+                | "int"
+                | "bigint"
+                | "real"
+                | "float"
+                | "money"
+                | "smallmoney"
+                | "decimal"
+                | "numeric"
+        ) && crate::types::normalize(&ty).is_ok()
+            && constant_operand(operand, depth + 1);
     }
     if s.eq_ignore_ascii_case("null") {
         return true;
@@ -1058,6 +1167,16 @@ mod tests {
             "0",
             "((0))",
             "(-1)",
+            "- 1",
+            "+ 1",
+            "-(-1)",
+            "- /* c */ 1",
+            "- /* a /* b */ c */ ( + 1)",
+            "- -- c\n1",
+            "-CAST('1' AS int)",
+            "( -CONVERT([int],'1'))",
+            "-CAST('1.25' AS decimal(10,2))",
+            "( -CONVERT([numeric](10,2),'1.25'))",
             "1.5",
             ".5",
             "1e3",
@@ -1086,6 +1205,16 @@ mod tests {
             "0x1G",
             "1.2.3",
             "--1",
+            "- /* unfinished",
+            "- 1 + 2",
+            "- abs(1)",
+            "- CAST(NEWID() AS int)",
+            "- CONVERT(int, NEXT VALUE FOR dbo.seq)",
+            "- CAST('1' AS dbo.custom)",
+            "- CAST('01/02/2026' AS datetime)",
+            "- CONVERT(decimal(10,2), RAND())",
+            "- CONVERT(decimal(10,2), '1', 0)",
+            "1/* c */2",
             "'unterminated",
         ] {
             assert!(!is_constant(expression), "{expression}");
