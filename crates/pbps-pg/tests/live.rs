@@ -17066,7 +17066,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             from_nullable: true,
             to_nullable: true,
         };
-        let ours = estimate(&change)
+        let ours = estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
             .rewrite;
         let agrees = match &ours {
@@ -17139,7 +17139,9 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
     };
     assert!(
         matches!(
-            estimate(&change).expect("an estimate").rewrite,
+            estimate(&change, Strategy::default())
+                .expect("an estimate")
+                .rewrite,
             Rewrite::Unknown(_)
         ),
         "an estimate that answered this from the declaration would be wrong for \
@@ -17209,7 +17211,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
             format!("ALTER TABLE {s}.t ALTER COLUMN w TYPE character varying(20)"),
         ),
     ] {
-        let ours = estimate(change).expect("an estimate");
+        let ours = estimate(change, Strategy::default()).expect("an estimate");
         assert_eq!(ours.rewrite, Rewrite::No, "{ours:#?}");
         assert_eq!(ours.reads, expected_reads, "{ours:#?}");
 
@@ -17349,9 +17351,29 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
             },
             format!("CREATE INDEX ix ON {s}.t (v) WHERE v > 0"),
         ),
+        // The unfiltered build, with no `online` asked for. It is the case an
+        // estimate that decided concurrency from the filter alone got wrong:
+        // it named the lock that blocks nothing for a statement that blocks
+        // every writer.
+        (
+            Change::AddIndex {
+                table: table.clone(),
+                name: "ix_plain".into(),
+                index: Box::new(Index {
+                    columns: vec![IndexColumn {
+                        name: "v".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                }),
+            },
+            format!("CREATE INDEX ix_plain ON {s}.t (v)"),
+        ),
     ];
     for (change, sql) in cases {
-        let ours = estimate(&change).expect("an estimate");
+        let ours = estimate(&change, Strategy::default()).expect("an estimate");
         let modes = locks_held(&mut conn, &s, &sql, "t").await;
         assert!(
             modes.split(',').any(|m| m == ours.lock.to_string()),
@@ -17372,7 +17394,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
             on_update: ReferentialAction::NoAction,
         }),
     };
-    let ours = estimate(&key).expect("an estimate");
+    let ours = estimate(&key, Strategy::default()).expect("an estimate");
     assert_eq!(ours.lock, Lock::ShareRowExclusive);
     assert_eq!(ours.also_locks, [TableName::new(&s, "p")]);
     let sql = format!("ALTER TABLE {s}.t ADD CONSTRAINT fk FOREIGN KEY (v) REFERENCES {s}.p(id)");
@@ -17433,7 +17455,9 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     // whether it survives.
     for table in ["parted", "base", "plain", "indexed"] {
         assert_eq!(
-            estimate(&widen(table)).expect("an estimate").rewrite,
+            estimate(&widen(table), Strategy::default())
+                .expect("an estimate")
+                .rewrite,
             Rewrite::Yes,
             "integer -> bigint rebuilds, before the table is looked at"
         );
@@ -17445,7 +17469,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         ("indexed", false),
         ("plain", true),
     ] {
-        let mut e = estimate(&widen(table)).expect("an estimate");
+        let mut e = estimate(&widen(table), Strategy::default()).expect("an estimate");
         against(&mut conn, &mut e, Some("v"))
             .await
             .expect("read the table's shape");
@@ -17459,7 +17483,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
 
     // A table nobody has analyzed answers `-1`, and reading that as a row
     // count says the change is free on the largest table in the database.
-    let mut e = estimate(&widen("indexed")).expect("an estimate");
+    let mut e = estimate(&widen("indexed"), Strategy::default()).expect("an estimate");
     against(&mut conn, &mut e, None)
         .await
         .expect("read the shape");
@@ -17468,14 +17492,14 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     conn.execute(&format!("ANALYZE {s}.plain"))
         .await
         .expect("analyze");
-    let mut e = estimate(&widen("plain")).expect("an estimate");
+    let mut e = estimate(&widen("plain"), Strategy::default()).expect("an estimate");
     against(&mut conn, &mut e, None)
         .await
         .expect("read the shape");
     assert_eq!(e.rows, Some(Rows::Estimated(1000)), "{e:#?}");
 
     // A table this plan is about to create is not a table with no rows either.
-    let mut e = estimate(&widen("not_there")).expect("an estimate");
+    let mut e = estimate(&widen("not_there"), Strategy::default()).expect("an estimate");
     against(&mut conn, &mut e, None)
         .await
         .expect("read the shape");

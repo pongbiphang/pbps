@@ -838,7 +838,7 @@ fn foreign_key_clause(name: &str, fk: &ForeignKey) -> Result<String, DialectErro
 /// than refusing a plan whose destination is the same either way. An index
 /// without a filter has no expression to bind and needs no path at all, so
 /// nothing is lost by leaving the scope off it.
-const fn built_concurrently(index: &Index, strategy: Strategy) -> bool {
+pub(crate) const fn built_concurrently(index: &Index, strategy: Strategy) -> bool {
     strategy.online && index.filter.is_none()
 }
 

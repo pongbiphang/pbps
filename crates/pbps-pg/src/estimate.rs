@@ -45,7 +45,7 @@
 //! unknown when [`against`] finds one, whatever the static half said.
 
 use pbps_db::{Conn, DbError};
-use pbps_model::{Change, ColumnType, TableName};
+use pbps_model::{Change, ColumnType, Strategy, TableName};
 
 /// Whether the statement rebuilds the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +260,7 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 /// role, a grant, a data mode. A row change is `None` too, and deliberately: an
 /// `INSERT` of one declared row costs what one row costs, and putting it beside
 /// a rebuild of the whole table would bury the number that matters.
-pub fn estimate(change: &Change) -> Option<Estimate> {
+pub fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> {
     let e = |about: String, table: &TableName, rewrite, reads, lock| {
         Some(Estimate::new(about, table.clone(), rewrite, reads, lock))
     };
@@ -414,16 +414,24 @@ pub fn estimate(change: &Change) -> Option<Estimate> {
 
         Change::AddIndex { table, name, index } => {
             // A concurrent build is the one statement here that lets writes
-            // through — measured from a second session, `ShareUpdateExclusive`
-            // against the plain build's `ShareLock`. It reads every row twice
-            // rather than once, which is the trade it makes.
-            let concurrent = index.filter.is_none();
+            // through — measured from a second session,
+            // `ShareUpdateExclusiveLock` against the plain build's `ShareLock`.
+            // It reads every row twice rather than once, which is the trade it
+            // makes.
+            //
+            // Asked of the emitter rather than worked out again. `online` is a
+            // request and not an answer: this dialect drops it for a filtered
+            // index, because a concurrent build cannot share a batch with the
+            // path a filter binds under (DECISIONS 262). An estimate that
+            // decided for itself would name the lighter lock for a plan that
+            // takes the heavier one, which is the direction that surprises an
+            // operator.
             e(
                 format!("building the index {name}"),
                 table,
                 Rewrite::No,
                 Reads::EveryRow,
-                if concurrent {
+                if crate::emit::built_concurrently(index, strategy) {
                     Lock::ShareUpdateExclusive
                 } else {
                     Lock::Share
@@ -552,9 +560,12 @@ pub async fn against(
         );
         return Ok(());
     }
+    // Only where the change was going to rebuild the table anyway: that is
+    // what drags the index along with it. A change already answered `unknown`
+    // keeps the reason it was given, which is more specific than this one.
     if column.is_some()
+        && estimate.rewrite == Rewrite::Yes
         && row.try_get::<bool>("column_is_indexed")?.unwrap_or(false)
-        && estimate.rewrite != Rewrite::No
     {
         estimate.unknown(
             "an index is built over the column this change retypes, so the index is rebuilt with \
@@ -645,12 +656,15 @@ mod tests {
     /// rewrite nothing, and one of them reads every row.
     #[test]
     fn rewriting_nothing_is_not_the_same_as_reading_nothing() {
-        let tightened = estimate(&Change::AlterColumnNullability {
-            uid: "c_aaaaaa".parse().expect("a uid"),
-            column: cref("app.t.v"),
-            ty: ty("integer"),
-            to_nullable: false,
-        })
+        let tightened = estimate(
+            &Change::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: cref("app.t.v"),
+                ty: ty("integer"),
+                to_nullable: false,
+            },
+            Strategy::default(),
+        )
         .expect("an estimate");
         assert_eq!(tightened.rewrite, Rewrite::No);
         assert_eq!(tightened.reads, Reads::EveryRow);
@@ -659,14 +673,17 @@ mod tests {
             "a full scan under an exclusive lock is not cheap"
         );
 
-        let widened = estimate(&Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().expect("a uid"),
-            column: cref("app.t.v"),
-            from: ty("varchar(10)"),
-            to: ty("varchar(20)"),
-            from_nullable: true,
-            to_nullable: true,
-        })
+        let widened = estimate(
+            &Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: cref("app.t.v"),
+                from: ty("varchar(10)"),
+                to: ty("varchar(20)"),
+                from_nullable: true,
+                to_nullable: true,
+            },
+            Strategy::default(),
+        )
         .expect("an estimate");
         assert_eq!(widened.rewrite, Rewrite::No);
         assert_eq!(widened.reads, Reads::Nothing);
@@ -687,7 +704,8 @@ mod tests {
                 column: Box::new(c),
             }
         };
-        let guessed = estimate(&column("gen_random_uuid()")).expect("an estimate");
+        let guessed =
+            estimate(&column("gen_random_uuid()"), Strategy::default()).expect("an estimate");
         assert!(
             matches!(guessed.rewrite, Rewrite::Unknown(_)),
             "{guessed:#?}"
@@ -695,7 +713,7 @@ mod tests {
         assert!(!guessed.is_cheap(), "{guessed:#?}");
 
         // A literal is a literal, and the engine writes no row for it.
-        let literal = estimate(&column("'2026-01-02'")).expect("an estimate");
+        let literal = estimate(&column("'2026-01-02'"), Strategy::default()).expect("an estimate");
         assert_eq!(literal.rewrite, Rewrite::No);
         assert!(literal.is_cheap(), "{literal:#?}");
     }
@@ -714,7 +732,7 @@ mod tests {
                 on_update: pbps_model::ReferentialAction::NoAction,
             }),
         };
-        let e = estimate(&change).expect("an estimate");
+        let e = estimate(&change, Strategy::default()).expect("an estimate");
         assert_eq!(e.lock, Lock::ShareRowExclusive);
         assert_eq!(e.also_locks, [tname("app.parent")]);
         assert_eq!(e.lock.blocks(), "writes");
@@ -725,10 +743,54 @@ mod tests {
             constraint.references_table = tname("app.child");
         }
         assert!(
-            estimate(&self_referencing)
+            estimate(&self_referencing, Strategy::default())
                 .expect("an estimate")
                 .also_locks
                 .is_empty()
+        );
+    }
+
+    /// `online` is a request, and whether the build honours it is the
+    /// emitter's answer rather than this module's.
+    ///
+    /// Working it out again from the filter alone named the lighter lock for
+    /// every ordinary index build — a plan taking `ShareLock`, which blocks
+    /// writers, reported as taking one that blocks nothing.
+    #[test]
+    fn the_index_lock_is_the_one_the_emitter_will_actually_take() {
+        let index = |filter: Option<&str>| Change::AddIndex {
+            table: tname("app.t"),
+            name: "ix".into(),
+            index: Box::new(pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    name: "v".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: filter.map(str::to_owned),
+            }),
+        };
+        let online = Strategy { online: true };
+        let lock = |change: &Change, strategy: Strategy| {
+            estimate(change, strategy).expect("an estimate").lock
+        };
+        // No `online` asked for: an ordinary build, whatever the filter says.
+        assert_eq!(lock(&index(None), Strategy::default()), Lock::Share);
+        assert_eq!(
+            lock(&index(Some("v > 0")), Strategy::default()),
+            Lock::Share
+        );
+        // Asked for and honoured.
+        assert_eq!(lock(&index(None), online), Lock::ShareUpdateExclusive);
+        // Asked for and *dropped*, because a concurrent build cannot share a
+        // batch with the path a filter binds under (DECISIONS 262). The
+        // estimate has to follow the emitter, not the request.
+        assert_eq!(lock(&index(Some("v > 0")), online), Lock::Share);
+        assert_eq!(Lock::Share.blocks(), "writes");
+        assert_eq!(
+            Lock::ShareUpdateExclusive.blocks(),
+            "neither reads nor writes, only other schema changes"
         );
     }
 

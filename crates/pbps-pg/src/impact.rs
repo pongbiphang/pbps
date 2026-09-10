@@ -209,7 +209,9 @@ pub enum ImpactError {
     #[error(transparent)]
     Query(#[from] DbError),
 
-    /// The target's own name cannot be written as an identifier.
+    /// The target cannot be named: its own name cannot be written as an
+    /// identifier, or this database has no such column to report on. Both are
+    /// questions that could not be asked, and neither is an answer.
     #[error(transparent)]
     Name(#[from] DialectError),
 }
@@ -228,6 +230,10 @@ pub enum ImpactError {
 /// have to be escaped into a pattern, and getting that wrong is a report that
 /// silently matches nothing. This is the cheap filter; [`mentions`] is the
 /// exact one, and it runs here where the rules are testable without a server.
+///
+/// **Every schema the tool did not rule out**, and not only the managed ones:
+/// an undeclared `plpgsql` function that reads a managed table is exactly the
+/// referrer nobody will notice, and it breaks the same way.
 ///
 /// Extension-owned routines are left out. They are somebody else's objects,
 /// installed and upgraded by somebody else's script, and a rename in a schema
