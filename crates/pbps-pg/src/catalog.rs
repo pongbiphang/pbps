@@ -894,6 +894,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             name: text(&row, "name")?,
             permission: text(&row, "privilege_type")?,
             grantable: flag(&row, "is_grantable")?,
+            owner: optional_text(&row, "owner")?,
         });
     }
     for row in conn.query(HELD_ELSEWHERE).await? {
@@ -1103,53 +1104,71 @@ fn grant_routine_args_query() -> String {
 /// `pg_database` is filtered to **this** database: `CONNECT`, `TEMP` or
 /// `CREATE` on the one being deployed to is a fact about this deployment,
 /// while the same on another is that database's business.
+///
+/// Each arm carries its object's **owner**, for the same reason the ordinary
+/// ACL read does (DECISIONS 371): these columns are NULL until somebody
+/// touches them, and the moment one is touched the engine writes the owner's
+/// own inherent entry beside the change — measured on 18.6, `REVOKE USAGE ON
+/// TYPE ot.money_kind FROM PUBLIC` turns a NULL `typacl` into
+/// `{ot_owner=U/ot_owner}`. Read as a grant, that entry says a managed role
+/// holds something unnameable and refuses every plan connected to it, where
+/// nothing was granted at all.
 const OTHER_ACLS: &str = "\
 SELECT 'a type' AS class, pg_catalog.format_type(t.oid, NULL) AS name,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(t.typowner) AS owner
   FROM pg_catalog.pg_type t
   CROSS JOIN LATERAL pg_catalog.aclexplode(t.typacl) AS a
  UNION ALL
 SELECT 'a procedural language', l.lanname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(l.lanowner)
   FROM pg_catalog.pg_language l
   CROSS JOIN LATERAL pg_catalog.aclexplode(l.lanacl) AS a
  UNION ALL
 SELECT 'a foreign data wrapper', w.fdwname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(w.fdwowner)
   FROM pg_catalog.pg_foreign_data_wrapper w
   CROSS JOIN LATERAL pg_catalog.aclexplode(w.fdwacl) AS a
  UNION ALL
 SELECT 'a foreign server', s.srvname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(s.srvowner)
   FROM pg_catalog.pg_foreign_server s
   CROSS JOIN LATERAL pg_catalog.aclexplode(s.srvacl) AS a
  UNION ALL
 SELECT 'a configuration parameter', p.parname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       -- `pg_parameter_acl` has no owner column: a configuration parameter
+       -- belongs to nobody, so no entry in it can be the zero point.
+       NULL::name
   FROM pg_catalog.pg_parameter_acl p
   CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a
  UNION ALL
 SELECT 'a large object', m.oid::text,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(m.lomowner)
   FROM pg_catalog.pg_largeobject_metadata m
   CROSS JOIN LATERAL pg_catalog.aclexplode(m.lomacl) AS a
  UNION ALL
 SELECT 'this database', d.datname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
-       a.privilege_type, a.is_grantable
+       a.privilege_type, a.is_grantable,
+       pg_catalog.pg_get_userbyid(d.datdba)
   FROM pg_catalog.pg_database d
   CROSS JOIN LATERAL pg_catalog.aclexplode(d.datacl) AS a
  WHERE d.datname = pg_catalog.current_database()

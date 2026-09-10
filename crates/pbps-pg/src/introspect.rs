@@ -423,6 +423,13 @@ pub struct RawOtherGrant {
     pub name: String,
     pub permission: String,
     pub grantable: bool,
+    /// Who owns the object, or `None` where its catalog has no owner column
+    /// (`pg_parameter_acl`).
+    ///
+    /// Carried for the zero point (DECISIONS 371): these ACLs are NULL until
+    /// somebody touches them, and touching one writes the owner's own
+    /// inherent entry beside the change.
+    pub owner: Option<String>,
 }
 
 /// One `ALTER DEFAULT PRIVILEGES` entry (ADR-0010 §2).
@@ -902,6 +909,52 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                 continue;
             }
         };
+        // The string form is what a snapshot carries, and in it a `(` opens a
+        // routine signature: a legal PostgreSQL object name may contain one,
+        // and `app."sales(archive)"` reads back as a grant on a routine
+        // (DECISIONS 205, which measured this shape on the other engine). The
+        // structured target is kept — only its *string* form is ambiguous, and
+        // the target is what scopes the report to the managed set
+        // (`unexpressible_permissions`).
+        if target
+            .to_string()
+            .parse::<pbps_model::GrantTarget>()
+            .as_ref()
+            != Ok(&target)
+        {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is on an object whose name contains a parenthesis \
+                     or a period, which a declaration cannot spell — written out it reads back \
+                     as a different target; the declarations cannot express it",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        // An object this pull did not record: a table whose shape the reader
+        // refuses, a routine with an argument the model cannot hold, a
+        // definition that came back unreadable. The grant is still there, and
+        // written into the role it would name a target no declaration in the
+        // project has — making `validate` refuse the very project `pull` just
+        // wrote. *Absent, empty and unreadable are three different things*:
+        // this is the one the role's set must not read as ordinary.
+        if !recorded(&pulled.schema, &target) {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} is on an object this pull did not record, so the \
+                     declarations cannot express it",
+                    g.permission,
+                    target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
         if g.grantable {
             // `WITH GRANT OPTION` — a `*` in the ACL — lets the grantee grant
             // it onward, which the model does not hold. Folded in as a plain
@@ -963,6 +1016,17 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             None => continue,
             Some(grantee) => grantee,
         };
+        // The zero point again (DECISIONS 371), on the catalogs that carry no
+        // `acldefault` expansion because they need none: every one of these
+        // ACLs is NULL until somebody touches it. Measured on 18.6, `REVOKE
+        // USAGE ON TYPE ot.money_kind FROM PUBLIC` leaves
+        // `{ot_owner=U/ot_owner}` — the owner's inherent `USAGE`, written by
+        // the engine and not by anyone. Reported as unnameable state, it would
+        // refuse every plan connected to a role that owns a type, for a
+        // privilege nobody granted.
+        if Some(grantee) == g.owner.as_deref() {
+            continue;
+        }
         if !pulled.schema.roles.contains_key(grantee) {
             continue;
         }
@@ -1073,6 +1137,32 @@ fn default_acl_objects(objtype: char) -> &'static str {
 }
 
 /// The target a grant names, or why the model cannot name it.
+/// Whether the pull recorded the object a grant is on.
+///
+/// The assembly ahead of this one leaves objects out — a table with a shape
+/// the reader refuses, a routine whose argument the model cannot spell — and
+/// their ACL rows arrive here all the same. `pbps_model::role::check` refuses
+/// a grant on a target the project does not declare, so a role written with
+/// one would make the schema `pull` just produced fail its own validation.
+fn recorded(schema: &pbps_model::Schema, target: &pbps_model::GrantTarget) -> bool {
+    match target {
+        pbps_model::GrantTarget::Object(o) => {
+            schema.tables.contains_key(o)
+                || schema
+                    .modules
+                    .keys()
+                    .any(|id| id.referenced_name().as_ref() == Some(o))
+        }
+        pbps_model::GrantTarget::Routine(r) => schema
+            .modules
+            .keys()
+            .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
+        // Not an object the pull assembles: the model holds no list of
+        // schemas, and a `schema::` target names one directly.
+        pbps_model::GrantTarget::Schema(_) => true,
+    }
+}
+
 fn target_of(
     g: &RawGrant,
     signatures: &BTreeMap<i64, Vec<&str>>,
@@ -2359,6 +2449,41 @@ mod tests {
         pulled.schema.roles.get(name).expect("the role was pulled")
     }
 
+    /// The objects the grant fixtures name, as the assembly ahead of
+    /// `add_roles` records them: the table `app.customer`, the view
+    /// `app.recent`, and one routine `app.f` of the given kind and signature.
+    ///
+    /// A fixture with no objects in it would not exercise the ordinary path at
+    /// all — a grant on something this pull did not record is reported, never
+    /// folded into a role's set, which is what `recorded` is for.
+    fn declaring(kind: char, args: &[&str]) -> RawCatalog {
+        RawCatalog {
+            tables: vec![RawTable {
+                oid: 10,
+                schema: "app".to_owned(),
+                name: "customer".to_owned(),
+            }],
+            modules: vec![
+                RawModule {
+                    oid: 2,
+                    ..raw_module('v', "recent", " SELECT 1;")
+                },
+                raw_module(
+                    kind,
+                    "f",
+                    &format!(
+                        "CREATE OR REPLACE {} app.f({})\n LANGUAGE sql\nAS $$ SELECT 1 $$\n",
+                        if kind == 'f' { "FUNCTION" } else { "PROCEDURE" },
+                        args.join(", ")
+                    ),
+                ),
+            ],
+            module_args: signature(args),
+            routine_args: signature(args),
+            ..RawCatalog::default()
+        }
+    }
+
     /// The read-back of the ordinary case, and the one every other test here
     /// is a deviation from.
     #[test]
@@ -2386,8 +2511,7 @@ mod tests {
                     "EXECUTE",
                 ),
             ],
-            routine_args: signature(&["integer", "text"]),
-            ..RawCatalog::default()
+            ..declaring('f', &["integer", "text"])
         });
         let targets: Vec<String> = pulled_role(&pulled, "app_reader")
             .grants
@@ -2464,7 +2588,7 @@ mod tests {
                     "SELECT",
                 ),
             ],
-            ..RawCatalog::default()
+            ..declaring('f', &[])
         });
         assert!(pulled_role(&pulled, "deploy").grants.is_empty());
         assert_eq!(pulled_role(&pulled, "app_reader").grants.len(), 1);
@@ -2524,7 +2648,7 @@ mod tests {
                     "USAGE",
                 ),
             ],
-            ..RawCatalog::default()
+            ..declaring('f', &[])
         });
         assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
         let what: Vec<&str> = pulled
@@ -2562,8 +2686,7 @@ mod tests {
                 GrantedKind::Routine('f'),
                 "EXECUTE",
             )],
-            routine_args: signature(&["app.\"amount,type\"", "integer"]),
-            ..RawCatalog::default()
+            ..declaring('f', &["app.\"amount,type\"", "integer"])
         });
         assert_eq!(
             pulled_role(&pulled, "app_reader")
@@ -2686,8 +2809,7 @@ mod tests {
                     "EXECUTE",
                 ),
             ],
-            routine_args: signature(&["integer"]),
-            ..RawCatalog::default()
+            ..declaring('p', &["integer"])
         });
         // The foreign table is unexpressible; the procedure is a grant.
         assert_eq!(
@@ -2719,6 +2841,7 @@ mod tests {
             name: name.to_owned(),
             permission: "USAGE".to_owned(),
             grantable: false,
+            owner: Some("someone_else".to_owned()),
         };
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
@@ -2751,6 +2874,114 @@ mod tests {
         assert!(types.contains("app.code"), "{types}");
     }
 
+    /// The zero point reaches those catalogs too (DECISIONS 371). Every one of
+    /// them is NULL until somebody touches it, and **measured on 18.6**,
+    /// `REVOKE USAGE ON TYPE ot.money_kind FROM PUBLIC` turns a NULL `typacl`
+    /// into `{ot_owner=U/ot_owner}` — the owner's own inherent `USAGE`,
+    /// written by the engine. Read as a grant it says a managed role holds
+    /// something unnameable, which refuses every plan connected to it.
+    #[test]
+    fn the_owners_own_entry_in_an_unnameable_class_is_the_zero_point() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("ot_owner")],
+            other_grants: vec![RawOtherGrant {
+                grantee: Some("ot_owner".to_owned()),
+                class: "a type".to_owned(),
+                name: "app.money_kind".to_owned(),
+                permission: "USAGE".to_owned(),
+                grantable: false,
+                owner: Some("ot_owner".to_owned()),
+            }],
+            ..RawCatalog::default()
+        });
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// A grant on an object the assembly ahead of this one left out — a table
+    /// whose column type the declaration cannot write back, a routine whose
+    /// argument the model cannot hold. The grant is real and the object is
+    /// not in the pull, so folding it into the role would write a project
+    /// whose own `validate` refuses it, naming a target no declaration has.
+    #[test]
+    fn a_grant_on_an_object_this_pull_did_not_record_is_reported_not_folded_in() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(Some("app_reader"), None, GrantedKind::Schema, "USAGE"),
+                grant(
+                    Some("app_reader"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+            ],
+            // No tables and no modules: the table the grant is on was left out.
+            ..RawCatalog::default()
+        });
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["schema::app"],
+            "the schema grant stands; the one on the missing table does not"
+        );
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("did not record"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// The target crosses a snapshot as its string form, and in that form a
+    /// `(` opens a routine signature. **Measured**: `app.sales(archive)` is a
+    /// legal table name this dialect writes back unchanged, and it parses back
+    /// as `GrantTarget::Routine(app.sales(archive))` — a different object.
+    /// Recorded, the grant would reload as one on a routine, or not at all
+    /// (DECISIONS 205, the same shape on the other engine).
+    #[test]
+    fn a_target_whose_written_form_reads_back_as_another_object_is_reported() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            tables: vec![RawTable {
+                oid: 11,
+                schema: "app".to_owned(),
+                name: "sales(archive)".to_owned(),
+            }],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("sales(archive)"),
+                GrantedKind::Relation('r'),
+                "SELECT",
+            )],
+            ..RawCatalog::default()
+        });
+        // The table itself is in the pull: its name survives the *declaration*
+        // format, which is what keeps it there — only the grant target's form
+        // is ambiguous.
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&"app.sales(archive)".parse().expect("a table name parses")),
+            "{:?}",
+            pulled.schema.tables.keys().collect::<Vec<_>>()
+        );
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("parenthesis"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
     /// `WITH GRANT OPTION` survives into the message on those classes too: a
     /// role that can hand `USAGE` on a type onward is not the same as one that
     /// merely holds it.
@@ -2764,6 +2995,7 @@ mod tests {
                 name: "app.money".to_owned(),
                 permission: "USAGE".to_owned(),
                 grantable: true,
+                owner: Some("someone_else".to_owned()),
             }],
             ..RawCatalog::default()
         });

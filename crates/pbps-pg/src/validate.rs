@@ -136,13 +136,43 @@ impl TargetKind {
 /// `Ok(None)` is "the declarations do not have it" — the model's own finding
 /// ([`pbps_model::role::check`]), not this one's, and reporting it twice would
 /// have the user fix one message and see the other.
-fn target_kind(object: &ObjectName, schema: &Schema) -> Result<Option<TargetKind>, DialectError> {
-    if schema.tables.contains_key(object) {
-        return Ok(Some(TargetKind::Table));
+///
+/// **Which namespace a bare name means is read off the permissions**, exactly
+/// as [`crate::emit`]'s `securable` reads it. PostgreSQL keeps relations and
+/// routines in two namespaces and a name may be in both — measured on 18.6, a
+/// table `co.f` and a function `co.f(integer)` coexist, `GRANT SELECT ON TABLE
+/// co.f` reaches the table and `GRANT EXECUTE ON ROUTINE co.f` reaches the
+/// routine. Answering "a table" for both would refuse the second, which is a
+/// grant this engine runs (DECISIONS 379).
+fn target_kind(
+    object: &ObjectName,
+    permissions: &BTreeSet<Permission>,
+    schema: &Schema,
+) -> Result<Option<TargetKind>, DialectError> {
+    // A relation of that name, if the declarations have one. Not consulted
+    // first when `EXECUTE` is asked for: the emitter would write `ON ROUTINE`
+    // there, and the routine is what the grant reaches.
+    let relation = || {
+        if schema.tables.contains_key(object) {
+            return Some(TargetKind::Table);
+        }
+        schema
+            .modules
+            .iter()
+            .find(|(id, m)| {
+                m.kind == ModuleKind::View && id.referenced_name().as_ref() == Some(object)
+            })
+            .map(|_| TargetKind::View)
+    };
+    if !permissions.contains(&Permission::Execute)
+        && let Some(kind) = relation()
+    {
+        return Ok(Some(kind));
     }
     let answering: Vec<(&ModuleId, ModuleKind)> = schema
         .modules
         .iter()
+        .filter(|(id, _)| matches!(id, ModuleId::Routine(_)))
         .filter(|(id, _)| id.referenced_name().as_ref() == Some(object))
         .map(|(id, m)| (id, m.kind))
         .collect();
@@ -168,12 +198,17 @@ fn target_kind(object: &ObjectName, schema: &Schema) -> Result<Option<TargetKind
             signatures.join(", ")
         )));
     }
-    Ok(answering.first().map(|(_, kind)| match kind {
-        ModuleKind::View => TargetKind::View,
-        ModuleKind::Procedure => TargetKind::Procedure,
-        // A trigger has no `referenced_name`, so nothing here answers to one.
-        ModuleKind::Function | ModuleKind::Trigger => TargetKind::Function,
-    }))
+    if let Some((_, kind)) = answering.first() {
+        return Ok(Some(match kind {
+            ModuleKind::Procedure => TargetKind::Procedure,
+            // A trigger has no `referenced_name`, and a view is not a
+            // `ModuleId::Routine`, so neither answers here.
+            ModuleKind::Function | ModuleKind::View | ModuleKind::Trigger => TargetKind::Function,
+        }));
+    }
+    // `EXECUTE` on a name the declarations hold only as a relation: the kind
+    // is the relation's, so the message below names what it actually is.
+    Ok(relation())
 }
 
 /// What the declarations say the routine at this exact signature is.
@@ -312,7 +347,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                     )));
                 }
                 let kind = match target {
-                    GrantTarget::Object(o) => match target_kind(o, schema) {
+                    GrantTarget::Object(o) => match target_kind(o, permissions, schema) {
                         Ok(kind) => kind,
                         Err(e) => {
                             errs.push(e);
@@ -379,6 +414,13 @@ mod tests {
         module("app.f(integer)", ModuleKind::Function);
         module("app.f(text)", ModuleKind::Function);
         module("app.solo(integer)", ModuleKind::Function);
+        // A name in both namespaces. **Measured on 18.6**: a table `co.f` and
+        // a function `co.f(integer)` coexist, and each takes its own GRANT.
+        schema.tables.insert(
+            "app.both".parse().expect("a table name parses"),
+            Table::default(),
+        );
+        module("app.both(integer)", ModuleKind::Function);
         schema
     }
 
@@ -422,6 +464,36 @@ mod tests {
         ]);
         let problems = messages("app_reader", &role);
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// Relations and routines are two namespaces on this engine and a name may
+    /// be in both. **Measured on 18.6**: with a table `co.f` and a function
+    /// `co.f(integer)` in place, `GRANT SELECT ON TABLE co.f` reaches the
+    /// table and `GRANT EXECUTE ON ROUTINE co.f` reaches the routine. Which
+    /// one a bare target means is read off the permissions — the same answer
+    /// [`crate::emit`] writes into the statement — so calling it a table
+    /// whenever a table of that name exists refused a grant this engine runs.
+    #[test]
+    fn a_bare_name_in_both_namespaces_is_read_off_the_permissions() {
+        let both = |permissions: &[Permission]| {
+            granting(&[
+                ("schema::app", &[Permission::Usage]),
+                ("app.both", permissions),
+            ])
+        };
+        for permissions in [&[Permission::Execute][..], &[Permission::Select][..]] {
+            let problems = messages("app_reader", &both(permissions));
+            assert!(problems.is_empty(), "{permissions:?}: {problems:?}");
+        }
+        // The kind still decides what the word may be: a set with `execute` in
+        // it is the routine's, and `truncate` is not a routine's word. The
+        // emitter would write one `ON ROUTINE` statement carrying both.
+        let problems = messages(
+            "app_reader",
+            &both(&[Permission::Execute, Permission::Truncate]),
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("a function"), "{}", problems[0]);
     }
 
     /// §1, and it is a refusal because the plan applies cleanly and the role

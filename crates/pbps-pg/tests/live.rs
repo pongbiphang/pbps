@@ -15043,6 +15043,251 @@ async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
     db.drop().await;
 }
 
+/// A name in **both** namespaces, which this engine allows: relations and
+/// routines live in separate catalogs, and `co.f` may be a table and a
+/// function at once.
+///
+/// Measured here: the emitter's `GRANT SELECT ON TABLE app.f` lands in
+/// `pg_class.relacl` and its `GRANT EXECUTE ON ROUTINE app.f` lands in
+/// `pg_proc.proacl` — two objects under one name, each reached by the word the
+/// permission set picked. `validate::role` reads the namespace the same way,
+/// so neither declaration is refused before the plan exists.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name() {
+    use pbps_model::{Change, GrantTarget, Module, ModuleKind, Permission, Role, Strategy, Table};
+
+    let mut db = TestDb::create("bothns").await;
+    let role = least_privilege_role(&mut db, "bothns").await;
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.f (id integer)",
+        "CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'",
+    ] {
+        db.conn.execute(sql).await.expect(sql);
+    }
+
+    // The declarations the two grants come from. One role cannot hold both:
+    // `app.f` is one key in the grant map, and a set with `execute` and
+    // `select` in it is the mixed one `validate::role` refuses.
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert("app.f".parse().expect("a table name"), Table::default());
+    declared.modules.insert(
+        "app.f(integer)".parse().expect("a module id"),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "SELECT $1".to_owned(),
+        },
+    );
+    let pg = Postgres::new();
+    let granting = |permission: Permission| {
+        let mut role = Role::default();
+        role.grants.insert(
+            "schema::app".parse().expect("a grant target"),
+            [Permission::Usage].into_iter().collect(),
+        );
+        role.grants.insert(
+            "app.f".parse().expect("a grant target"),
+            [permission].into_iter().collect(),
+        );
+        role
+    };
+    for permission in [Permission::Select, Permission::Execute] {
+        let problems = pg.validate_role(&role, &granting(permission), &declared);
+        assert!(problems.is_empty(), "{permission:?}: {problems:?}");
+        let change = Change::Grant {
+            role: role.clone(),
+            target: "app.f".parse::<GrantTarget>().expect("a grant target"),
+            permissions: [permission].into_iter().collect(),
+        };
+        for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+            db.conn
+                .execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+
+    // Each landed on its own object, and on neither the other.
+    let relacl = text(
+        &mut db.conn,
+        "SELECT COALESCE(relacl::text, '') FROM pg_class WHERE oid = 'app.f'::regclass",
+    )
+    .await;
+    let proacl = text(
+        &mut db.conn,
+        "SELECT COALESCE(proacl::text, '') FROM pg_proc WHERE oid = \
+         'app.f(integer)'::regprocedure",
+    )
+    .await;
+    assert!(relacl.contains(&format!("{role}=r/")), "{relacl}");
+    assert!(!relacl.contains(&format!("{role}=X/")), "{relacl}");
+    assert!(proacl.contains(&format!("{role}=X/")), "{proacl}");
+    assert!(!proacl.contains(&format!("{role}=r/")), "{proacl}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The zero point on the catalogs whose targets no declaration can name
+/// (DECISIONS 371). Every one of those ACLs is NULL until somebody touches it,
+/// and **measured**, `REVOKE USAGE ON TYPE app.money_kind FROM PUBLIC` turns a
+/// NULL `typacl` into `{owner=U/owner}` — the owner's own inherent `USAGE`,
+/// written by the engine and granted by nobody.
+///
+/// Read as a grant it says a managed role holds something unnameable, which
+/// refuses every plan connected to that role. The read still has to work,
+/// though: the second half grants the same `USAGE` to another role and that
+/// one is reported.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_owners_own_entry_in_a_touched_acl_is_not_read_as_an_unnameable_grant() {
+    let mut db = TestDb::create("ownertype").await;
+    let owner = least_privilege_role(&mut db, "ownertype").await;
+    let other = least_privilege_role(&mut db, "ownertypeb").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TYPE app.money_kind AS ENUM ('a', 'b')".to_owned(),
+        format!("ALTER TYPE app.money_kind OWNER TO {owner}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT (typacl IS NULL)::text FROM pg_type WHERE typname = 'money_kind'",
+        )
+        .await,
+        "true",
+        "nothing has been granted on it"
+    );
+    db.conn
+        .execute("REVOKE USAGE ON TYPE app.money_kind FROM PUBLIC")
+        .await
+        .expect("revoke from public");
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT typacl::text FROM pg_type WHERE typname = 'money_kind'",
+        )
+        .await,
+        format!("{{{owner}=U/{owner}}}"),
+        "the owner's inherent entry, and it is all there is"
+    );
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert!(
+        pulled.unexpressible.iter().all(|u| u.role != owner),
+        "{:?}",
+        pulled.unexpressible
+    );
+
+    // And a grant somebody really made is still reported.
+    db.conn
+        .execute(&format!("GRANT USAGE ON TYPE app.money_kind TO {other}"))
+        .await
+        .expect("grant to the other role");
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let mine: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| u.role == other)
+        .map(|u| u.what.as_str())
+        .collect();
+    assert_eq!(mine.len(), 1, "{mine:?}");
+    assert!(mine[0].contains("a type"), "{}", mine[0]);
+    assert!(mine[0].contains("app.money_kind"), "{}", mine[0]);
+    assert!(
+        pulled.unexpressible.iter().all(|u| u.role != owner),
+        "{:?}",
+        pulled.unexpressible
+    );
+
+    cleanup_role(&mut db, &other).await;
+    cleanup_role(&mut db, &owner).await;
+    db.drop().await;
+}
+
+/// Two grants a role really holds on two objects the pull cannot carry into
+/// the declarations, each reported rather than written into the role.
+///
+/// The first object is left out of the pull entirely — a `bit(3)` column is a
+/// spelling this catalogue stores opaque and reads back as a different type
+/// (issue #130) — and a grant recorded on it would name a target the project
+/// does not declare, which `pbps_model::role::check` refuses: `pull` would
+/// write a project its own `validate` rejects.
+///
+/// The second is in the pull and its *target* is what cannot be written: a `(`
+/// opens a routine signature in the string form a snapshot carries, so
+/// `app."sales(archive)"` reloads as a grant on a routine (DECISIONS 205, the
+/// same shape measured on the other engine).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded() {
+    let mut db = TestDb::create("leftout").await;
+    let role = least_privilege_role(&mut db, "leftout").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE TABLE app.bits (b bit(3))".to_owned(),
+        "CREATE TABLE app.\"sales(archive)\" (id integer)".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.bits TO {role}"),
+        format!("GRANT SELECT ON app.\"sales(archive)\" TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let tables: Vec<String> = pulled
+        .schema
+        .tables
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        tables,
+        ["app.sales(archive)"],
+        "the `bit(3)` table is left out of the pull and the other one is not"
+    );
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["schema::app"],
+        "neither object grant is recorded"
+    );
+    let mine: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| u.role == role)
+        .map(|u| u.what.as_str())
+        .collect();
+    assert_eq!(mine.len(), 2, "{mine:?}");
+    assert!(
+        mine.iter().any(|w| w.contains("did not record")),
+        "{mine:?}"
+    );
+    assert!(mine.iter().any(|w| w.contains("parenthesis")), "{mine:?}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
 /// ADR-0010 §5. A NULL ACL is the engine's default and not an empty set, and
 /// the default for a routine hands `EXECUTE` to PUBLIC — measured here by a
 /// role that holds nothing but `USAGE` calling the function.

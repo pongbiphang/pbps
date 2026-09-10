@@ -494,6 +494,13 @@ had them.
   cluster they are two principals, and an empty plan would leave the old one
   holding everything and record the new one as holding it. The emitter keeps all five arms, and
   the three it refuses name the statement a human runs.
+- **A name may be in two namespaces at once** (DECISIONS 379). §6's
+  permission-vs-kind table is what makes a bare object target sound — a set
+  with `execute` in it is a routine's — and landing it showed the other half:
+  relations and routines are separate catalogs here, so `co.f` may be a table
+  *and* a function, measured on 18.6. The offline check reads the namespace off
+  the permission set exactly as the emitter does; reading the relation first
+  refused a `GRANT EXECUTE` the engine runs.
 - **`maintain` needs two servers to test at all** (DECISIONS 374). The
   amendment above set the rule and this is what obeying it costs: the live
   suite and the `live-pg` CI job now start a pinned PostgreSQL 16 beside the

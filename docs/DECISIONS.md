@@ -8145,3 +8145,34 @@ SPEC is in sync with all of these.
     from their own query, one row per argument in order, the shape
     `module_args_query` already uses. Nothing re-parses one string into a list,
     which is what makes the whole class unrepresentable rather than handled.
+
+379. **On PostgreSQL a bare grant target is read in the namespace its
+    permissions name, not in the relations first.** Relations and routines are
+    two catalogs on this engine and one name may be in both: **measured on
+    18.6**, a table `co.f` and a function `co.f(integer)` coexist, `GRANT
+    SELECT ON TABLE co.f` lands in `pg_class.relacl` and `GRANT EXECUTE ON
+    ROUTINE co.f` lands in `pg_proc.proacl`.
+
+    `emit::securable` already read the class off the permission set — a set
+    with `execute` in it is a routine's — and `validate::target_kind` answered
+    "a table" whenever a table of that name existed. The two disagreed exactly
+    where the engine allows both, and the offline check refused a grant the
+    engine runs. They now read the same fact the same way; a mixed set is
+    still refused, because the kind check follows the namespace the
+    permissions chose (372).
+
+380. **A grant is folded into a role only when the pull recorded the object it
+    is on, and only when the target survives being written out.** The assembly
+    before `add_roles` leaves objects out — a `bit(3)` column is a spelling
+    read back as a different type (issue #130), a routine argument may be one
+    `RoutineArg` cannot hold — and their ACL rows arrive all the same.
+    Recorded, the role names a target the project does not declare and
+    `pbps_model::role::check` refuses the very schema `pull` just wrote.
+
+    The second half is 205's shape on this engine: `app."sales(archive)"` is a
+    legal table name this dialect writes back unchanged, and its grant target
+    parses back as the routine `app.sales(archive)` — a different object. Both
+    are reported as unexpressible with the structured target kept, so the
+    managed-set cut still applies to them; dropped instead, `pull` would write
+    a role narrower than the database holds and the next plan would revoke what
+    nobody removed (105).

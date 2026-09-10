@@ -1246,6 +1246,11 @@ fn by_hand(why: String, statement: String) -> DialectError {
 /// word against kind, so a set containing `EXECUTE` is a routine's and a set
 /// without one is a table's. A declaration that mixed them is refused before a
 /// plan exists.
+///
+/// `validate::target_kind` reads the namespace off the same set, so the two
+/// never disagree where this engine allows one name in both — measured on
+/// 18.6, a table `co.f` and a function `co.f(integer)` coexist (DECISIONS
+/// 379).
 fn securable(
     target: &GrantTarget,
     permissions: &BTreeSet<Permission>,
