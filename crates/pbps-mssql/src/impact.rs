@@ -390,23 +390,26 @@ fn mentions(definition: &str, column: &str) -> bool {
     if definition.contains(&format!("[{column}]")) {
         return true;
     }
-    let bytes = definition.as_bytes();
     let mut from = 0;
     while let Some(offset) = definition[from..].find(column) {
         let start = from + offset;
         let end = start + column.len();
-        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
-        let after_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+        // A UTF-8 continuation byte is not a delimiter. Share the SQL Server
+        // lexer's character rule so every scan agrees on where a name ends.
+        let before_ok = !definition[..start]
+            .chars()
+            .next_back()
+            .is_some_and(pbps_model::module::is_regular_identifier_continue);
+        let after_ok = !definition[end..]
+            .chars()
+            .next()
+            .is_some_and(pbps_model::module::is_regular_identifier_continue);
         if before_ok && after_ok {
             return true;
         }
         from = start + first.len_utf8();
     }
     false
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'@' || b == b'#'
 }
 
 #[cfg(test)]
@@ -566,6 +569,34 @@ mod tests {
         assert!(mentions("SELECT xä, ä FROM t", "ä"));
         assert!(!mentions("SELECT x FROM t", "ä"));
         assert!(!mentions("", "ä"));
+    }
+
+    #[test]
+    fn unicode_identifier_neighbors_do_not_become_delimiters() {
+        for definition in ["SELECT xää FROM t", "SELECT ääx FROM t", "SELECT ää FROM t"] {
+            assert!(!mentions(definition, "ä"), "{definition}");
+        }
+        for definition in [
+            "SELECT ä FROM t",
+            "SELECT [ä] FROM t",
+            "SELECT xää, ä FROM t",
+            "SELECT ääx, ä FROM t",
+        ] {
+            assert!(mentions(definition, "ä"), "{definition}");
+        }
+    }
+
+    #[test]
+    fn sql_server_identifier_symbols_do_not_split_a_reference() {
+        for symbol in ['@', '#', '_', '$'] {
+            for definition in [
+                format!("SELECT x{symbol}ä FROM t"),
+                format!("SELECT ä{symbol}x FROM t"),
+            ] {
+                assert!(!mentions(&definition, "ä"), "{definition}");
+                assert!(mentions(&format!("{definition}; SELECT ä FROM t"), "ä"));
+            }
+        }
     }
 
     #[test]
