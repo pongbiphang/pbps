@@ -578,7 +578,13 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
         "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => {
             format!("CONVERT(nvarchar(max), {quoted}, 126)")
         }
-        "float" | "real" => format!("CONVERT(nvarchar(max), {quoted}, 3)"),
+        // The MAX conversion path overflows for valid floats (including
+        // -255) on SQL Server 17.0.4075.5, even with varchar as the target.
+        // Render into a bounded buffer first; 99 characters exceed the
+        // signed 17-digit scientific form, then widen without formatting.
+        "float" | "real" => {
+            format!("CONVERT(nvarchar(max), CONVERT(varchar(99), {quoted}, 3))")
+        }
         // `money` and `smallmoney` hold four decimal places and the default
         // style renders two: `1.0001` came back `1.00`, so a pull wrote a
         // declaration for a value the table does not hold and the next
@@ -1584,7 +1590,10 @@ mod tests {
             read_expr("[b]", "varbinary"),
             "CONVERT(nvarchar(max), [b], 1)"
         );
-        assert_eq!(read_expr("[f]", "float"), "CONVERT(nvarchar(max), [f], 3)");
+        assert_eq!(
+            read_expr("[f]", "float"),
+            "CONVERT(nvarchar(max), CONVERT(varchar(99), [f], 3))"
+        );
         assert_eq!(read_expr("[c]", "char"), "RTRIM([c])");
         assert_eq!(read_expr("[g]", "geography"), "[g].ToString()");
         assert_eq!(read_expr("[n]", "decimal"), "CONVERT(nvarchar(max), [n])");
