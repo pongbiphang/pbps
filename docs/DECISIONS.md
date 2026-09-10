@@ -6534,6 +6534,18 @@ SPEC is in sync with all of these.
     identifier rule; the differ and the emitter's name scans hand it the
     dialect's, and the shared scanner keeps SQL Server's as its own.
 
+    **Amended: a prefix letter is a prefix only where a name does not end
+    there.** The emitter's own scan guarded `$` against opening a
+    dollar-quoted literal in the middle of a name and guarded nothing else.
+    Measured, with a domain `dq.code`, `CREATE FUNCTION dq.f(a dq.code
+    DEFAULT dq.code'x\', b integer DEFAULT 1)` is accepted and the default
+    reads back as `'x\'::text` — the type applied to the plain string `x\`.
+    Read from the `e'`, the scan took an escape string, the `\'` did not
+    close it, the rest of the declaration was swallowed, and the gate refused
+    a routine the engine creates under exactly the declared key. The quote
+    itself still opens a plain literal there, which is the engine's reading of
+    `note'x'` and the rule the shared lexer already had.
+
     **Amended: a `UESCAPE` clause goes with the literal it follows.** Measured,
     `U&'d!0061ta' UESCAPE '!'` is the string `data`, and the clause is part of
     that token. The scan blanked the literal and left the word `UESCAPE` as

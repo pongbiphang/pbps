@@ -7834,6 +7834,53 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// A type name that ends in a literal's prefix letter is a name, and the
+/// literal after it is a plain one: measured, with a domain `s.code`, `(a
+/// s.code DEFAULT s.code'x\', b integer DEFAULT 1)` is accepted and the
+/// default reads back as `'x\'::text`. Read from the `e'`, the scan took an
+/// escape string, the `\'` never closed it, and the gate refused a routine
+/// the engine creates under exactly the declared key.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_type_name_ending_in_a_prefix_letter_is_not_a_literals_prefix() {
+    let s = emit_schema("prefix_letter");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE DOMAIN {s}.code AS text"))
+        .await
+        .expect("a domain whose name ends in the escape prefix");
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    let id: pbps_model::ModuleId = format!("{s}.f({s}.code,integer)")
+        .parse()
+        .expect("a module id");
+    let definition = format!(
+        "(a {s}.code DEFAULT {s}.code'x\\', b integer DEFAULT 1) RETURNS int LANGUAGE sql AS $$ \
+         SELECT 1 $$"
+    );
+    let module = module(pbps_model::ModuleKind::Function, &definition);
+    assert!(
+        pbps_dialect::Dialect::validate_module(&pg, &id, &module).is_empty(),
+        "the gate refused a declaration the engine accepts under this key"
+    );
+    declared.modules.insert(id.clone(), module);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = \
+                 '{s}'::regnamespace"
+            )
+        )
+        .await,
+        format!("{s}.f({s}.code,integer)")
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
 /// A `UESCAPE` clause is part of the literal it follows: measured,
 /// `U&'d!0061ta' uescape '!'` is the string `data`, in either case. Read as
 /// code, the word

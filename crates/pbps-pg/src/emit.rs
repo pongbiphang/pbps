@@ -216,15 +216,40 @@ fn without_grouping(expression: &str) -> &str {
 /// that walks per character asks this rather than [`skip_datum`] directly,
 /// so that there is one place the rule is spelled.
 fn skip_datum_at(text: &str, at: usize) -> Option<usize> {
-    if text[at..].starts_with('$')
-        && text[..at]
-            .chars()
-            .next_back()
-            .is_some_and(pbps_dialect::continues_ident)
+    let rest = &text[at..];
+    if text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(pbps_dialect::continues_ident)
+        && (rest.starts_with('$')
+            || LITERAL_PREFIXES
+                .iter()
+                .any(|prefix| starts_with_ignoring_ascii_case(rest, prefix)))
     {
         return None;
     }
-    skip_datum(&text[at..])
+    skip_datum(rest)
+}
+
+/// The prefixes [`skip_datum`] reads, each of which is also a byte that
+/// continues an identifier — which is what [`skip_datum_at`] has to rule out.
+///
+/// A prefix is part of a literal's token only where a name does not end
+/// there: **measured**, with a domain `dq.code`, `CREATE FUNCTION dq.f(a
+/// dq.code DEFAULT dq.code'x\', b integer DEFAULT 1)` is accepted and its
+/// default reads back as `'x\'::text`, the type applied to the plain string
+/// `x\`. Read from the `e'` alone it was an escape string, the `\'` did not
+/// close it, the scan swallowed the rest of the declaration, and the gate
+/// refused a routine the engine creates under exactly the declared key. The
+/// quote itself still opens a plain literal there, which is the engine's own
+/// reading (DECISIONS 315).
+const LITERAL_PREFIXES: &[&str] = &["e'", "u&'", "n'"];
+
+/// Whether `text` begins with `prefix`, letter case aside.
+fn starts_with_ignoring_ascii_case(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.is_char_boundary(prefix.len())
+        && text[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 fn skip_datum(rest: &str) -> Option<usize> {
@@ -2541,6 +2566,21 @@ mod tests {
             (
                 "app.f(integer)",
                 "/* the id */ (a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A type name ending in a literal's prefix letter is a name:
+            // measured, with a domain `app.code`, `(a app.code DEFAULT
+            // app.code'x\', b integer DEFAULT 1)` is accepted and the
+            // default reads back as `'x\'::text`. Read as an escape string,
+            // the `\'` left the literal open and the scan swallowed the rest.
+            (
+                "app.f(app.code,integer)",
+                "(a app.code DEFAULT app.code'x\\', b integer DEFAULT 1) RETURNS int LANGUAGE \
+                 sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(app.done,integer)",
+                "(a app.done DEFAULT app.done'x\\', b integer DEFAULT 1) RETURNS int LANGUAGE \
+                 sql AS $$ SELECT 1 $$",
             ),
             // A Unicode-escaped name carries its `UESCAPE` clause, and the
             // mode may follow the clause: measured, these are `app.f()`,
