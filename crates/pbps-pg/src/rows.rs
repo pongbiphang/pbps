@@ -513,16 +513,45 @@ fn is_a_typed_literal(s: &str) -> bool {
     if crate::emit::is_a_bare_literal(tail) {
         return true;
     }
-    // The string, then an interval's field words and nothing else.
+    // The string, then an interval's field qualifier and nothing else: not
+    // any words — `BOOLEAN 'false' OR flip()` is an expression, and one a
+    // probe must not evaluate a second time (DECISIONS 368).
     let Some(end) = string_end(tail, start - head_end) else {
         return false;
     };
-    let after = &tail[end..];
-    crate::emit::is_a_bare_literal(&tail[..end])
-        && !after.trim().is_empty()
-        && after
-            .bytes()
-            .all(|b| is_word(b) || b.is_ascii_whitespace() || matches!(b, b'(' | b')' | b','))
+    crate::emit::is_a_bare_literal(&tail[..end]) && is_an_interval_qualifier(&tail[end..])
+}
+
+/// Whether `s` is one of the field qualifiers the grammar lets follow an
+/// `INTERVAL` literal — `DAY`, `HOUR TO MINUTE`, `SECOND(3)`, `DAY TO
+/// SECOND (2)` — read past comments and case. **Measured** on 18.6: each of
+/// those is accepted; `DAYS` and `TO DAY` are syntax errors (DECISIONS 368).
+fn is_an_interval_qualifier(s: &str) -> bool {
+    const FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
+    let Some(text) = type_text(s) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    // One precision, `(n)`, at the very end and only after `second`.
+    let (words, precision) = match lower.split_once('(') {
+        Some((head, tail)) => match tail.strip_suffix(')') {
+            Some(n) if !n.trim().is_empty() && n.trim().bytes().all(|b| b.is_ascii_digit()) => {
+                (head, true)
+            }
+            _ => return false,
+        },
+        None => (lower.as_str(), false),
+    };
+    let words: Vec<&str> = words.split_whitespace().collect();
+    let last_is_second = words.last() == Some(&"second");
+    if precision && !last_is_second {
+        return false;
+    }
+    match words.as_slice() {
+        [field] => FIELDS.contains(field),
+        [from, "to", to] => FIELDS.contains(from) && FIELDS.contains(to),
+        _ => false,
+    }
 }
 
 /// Whether `s` is one numeric literal in a spelling this engine reads.
@@ -1699,6 +1728,9 @@ mod tests {
             "INTERVAL '1' DAY",
             "INTERVAL '1' HOUR TO MINUTE",
             "INTERVAL '1' SECOND(3)",
+            "INTERVAL '1 2:03:04.5678' DAY TO SECOND (2)",
+            "interval '1' day",
+            "INTERVAL '1' /* c */ DAY /* d */",
             "- INTERVAL '1 day'",
             "(DATE '2026-02-01')",
             "DATE '2026-02-01'::date",
@@ -1791,6 +1823,17 @@ mod tests {
             "DATE /* unterminated '2026-02-01'",
             "DATE 'unterminated",
             "TIMESTAMP '2026-02-01' AT TIME ZONE 'UTC'",
+            // Words after the string that are no interval qualifier: an
+            // expression, a collation, a misspelt field (DECISIONS 368).
+            "BOOLEAN 'false' OR flip()",
+            "BOOLEAN 'false' OR random() > 0.5",
+            "INTEGER '1' + 1",
+            "TEXT 'a' COLLATE ci",
+            "INTERVAL '1' DAYS",
+            "INTERVAL '1' TO DAY",
+            "INTERVAL '1' DAY(3)",
+            "INTERVAL '1' DAY TO",
+            "INTERVAL '1' SECOND()",
             // A sign with nothing, or an expression, behind it.
             "-",
             "- -",

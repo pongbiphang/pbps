@@ -7923,3 +7923,18 @@ SPEC is in sync with all of these.
     keeps `DATE '01/02/2026'` outside on purpose: that a spelling is
     session-decided is a question about its value, and this one is about
     whether a probe can compare it.
+
+368. **What follows a typed literal's string is an interval qualifier or
+    nothing.** 367 admitted any words after the string so that `INTERVAL '1'
+    HOUR TO MINUTE` would read as the constant it is, and the whitelist of
+    letters and parentheses let `(BOOLEAN 'false' OR flip())` — a valid
+    default once parenthesised, a bare `DEFAULT x OR y` being a syntax error
+    — pass as a literal, so the read-back would have evaluated a volatile
+    expression a second time and refused a correct row write, or run a side
+    effect twice. **Measured** on 18.6: `DAY`, `HOUR TO MINUTE`, `SECOND(3)`,
+    `DAY TO SECOND (2)`, `YEAR TO MONTH` and a qualifier with comments
+    around it are each accepted; `DAYS` and `TO DAY` are syntax errors. The
+    reader now takes, after the string, one of the six field words, or two
+    joined by `TO`, with one `(n)` after a trailing `SECOND` — and nothing
+    else. A qualifier the grammar refuses by combination, `MINUTE TO DAY`,
+    is left to the engine, as every declaration it refuses by name is.
