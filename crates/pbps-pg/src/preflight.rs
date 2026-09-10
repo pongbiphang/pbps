@@ -35,14 +35,13 @@
 //!   precision. None of them raises, so no count exists; the `narrowing` class
 //!   is what stops them at the gate. [`crate::types::cannot_become`] holds the
 //!   list.
-//! - **A narrowing whose count would be measured under the wrong settings.** A
-//!   probe runs before the deployment's transaction framing is established, so
-//!   it renders values under the operator's session and the statement it clears
-//!   renders them under the pinned one (DECISIONS 267). Measured, a `bytea`, an
-//!   `interval`, a `timestamp` and a `double precision` all print to different
-//!   lengths under the two, in both directions: a length probe over one of them
-//!   would refuse a plan this engine accepts, or clear one it refuses. Those
-//!   sources get no length probe (DECISIONS 406).
+//! - **A narrowing into a type whose rendering no pin reaches.** A probe is
+//!   answered under the settings the statement it clears will run under, so a
+//!   length is measured where the pins decide the rendering — which they do
+//!   for every type `CATALOGUE` holds (DECISIONS 415, which replaced 406's
+//!   much narrower list once `run_probes` started pinning first). What is
+//!   still absent is a type the catalogue does not hold: `money` renders under
+//!   `lc_monetary`, which is not among the nine.
 //! - **Drops and renames.** Every row of a dropped column is "affected", and a
 //!   count of them would always look alarming and never decide anything. A
 //!   rename carries a dependency risk rather than a data one, and

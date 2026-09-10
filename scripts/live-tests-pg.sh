@@ -73,3 +73,9 @@ export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password
 # seconds is what proves the wait is bounded. It is why this suite takes half a
 # minute for six tests.
 cargo test -p pbps-pg --test live -- --ignored "$@"
+# And the CLI's own PostgreSQL-dependent test, which lives in the bin target
+# rather than in `tests/`: `deploy::preflight` and `deploy::run_probes` are
+# private, and the thing under test is that the second pins the session before
+# it asks anything (DECISIONS 415). Run here rather than left to
+# `cargo test --workspace`, which does not pass `--ignored`.
+cargo test -p pbps-cli --bin pbps -- --ignored "$@"

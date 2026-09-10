@@ -567,13 +567,16 @@ parent rows, declare the key that references them — is not refused for a
 violation the plan itself removes; and the orphan count compares under the
 referenced column's collation, spliced in from the catalog, because two columns
 collated differently cannot be compared at all (393). What a probe may
-**measure** is bounded too: probes run before the deployment's framing pins the
-session, so a length taken over a rendering any pinned setting moves is not the
-length the statement takes — measured, a `bytea` prints longer under the
-operator's session and an `interval` prints shorter, so the same probe would
-refuse a valid plan in one case and clear a doomed statement in the other. Only
-sources every session prints alike are measured (406); the ordering itself is
-issue #257, a fourth path for #174. And a check on a table this plan retypes a
+**measure** was bounded too, and the bound is gone: probes used to run before
+the deployment's framing pinned the session, so a length taken over a rendering
+any pinned setting moves was not the length the statement took — measured, a
+`bytea` prints longer under the operator's session and an `interval` prints
+shorter, so the same probe refused a valid plan in one case and cleared a
+doomed statement in the other. 406 answered that with an allow-list; #257
+answered it with the ordering, and `run_probes` now pins the session before it
+asks anything. The allow-list widened to every type the catalogue holds, each
+measured to agree with the engine on the same character, and the one thing left
+out is a rendering no pin reaches — `money`, through `lc_monetary` (415). And a check on a table this plan retypes a
 column of is not probed at all: the conversion runs at rank 9 and the check is
 added at rank 13, so measured, a `numeric(10,2)` holding `1.50` converted to
 `numeric(10,0)` and then given `CHECK (v = round(v))` is accepted by the engine

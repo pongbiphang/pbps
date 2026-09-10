@@ -195,6 +195,12 @@ jobs:
       # purpose: a firewall that drops rather than refuses is a category of its
       # own, and what proves the wait is bounded is waiting it out.
       - run: cargo test -p pbps-pg --test live -- --ignored
+      # The CLI's own PostgreSQL-dependent test, in the bin target rather than
+      # in `tests/` because `deploy::run_probes` is private and what it asserts
+      # is that the probes are answered under the settings the statements they
+      # clear will run under (DECISIONS 415). `cargo test --workspace` in
+      # `quick` builds it and does not run it: it is `#[ignore]`d.
+      - run: cargo test -p pbps-cli --bin pbps -- --ignored
 
   # `plan --dev docker://<image>` starts a throwaway container of its own, and
   # nothing else reaches that code: every other `--dev` test passes a connection

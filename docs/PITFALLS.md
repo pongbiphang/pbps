@@ -620,12 +620,23 @@ The same shape reaches a probe from the other side: a *literal the plan carries*
 is parsed under the operator's `DateStyle` too, so `CAST('01/02/2026' AS date)`
 inside a probe is 2 January where the statement writes 1 February.
 
-The narrow answer is an allow-list — measure a length only over a rendering no
-pinned setting moves (DECISIONS 406). The real answer is to establish the pins
-before the probes, which is issue #257, a fourth path for #174. Until then, the
-rule to carry is: **before writing a probe, ask which session decides the value
-it reads.** A probe and the statement it clears are not the same session, and
-nothing about the code says so.
+The narrow answer was an allow-list — measure a length only over a rendering no
+pinned setting moves (DECISIONS 406). It bought time and it was not the answer:
+it closed one of the three mechanisms for one kind of probe, and left the plan
+literal and the operator's own declared expression untouched. The answer is the
+ordering, and #257 established it: `run_probes` pins the session before it asks
+anything, the allow-list widened to every type the catalogue holds, and the
+probe and the statement became one session (DECISIONS 415).
+
+The rule that survives the fix is the one that found it: **before writing a
+probe, ask which session decides the value it reads.** The ordering is right
+today because a function makes it so, not because anything in the type system
+does — a probe run from a path that has not pinned would be wrong again in
+exactly these three ways, which is why `run_probes` pins itself rather than
+trusting its caller. And one mechanism is *not* closed by ordering at all: a
+probe still evaluates the operator's declared expression, so a volatile
+function in a `CHECK` advances a sequence before the plan's first statement
+(#274). Pinning a session does not stop a side effect.
 
 ## A guard shaped for one carrier of a hazard the model carries three ways
 
