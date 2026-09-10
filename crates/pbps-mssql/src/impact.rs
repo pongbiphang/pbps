@@ -23,6 +23,8 @@
 //! report says so rather than implying the list is complete; §7.4 puts a
 //! checklist in front of a human for exactly that reason.
 
+use std::collections::BTreeMap;
+
 use pbps_db::{Conn, DbError};
 use pbps_dialect::DialectError;
 use pbps_model::{Change, ColumnRef, ObjectName, TableName};
@@ -68,12 +70,23 @@ impl RenameTarget {
     /// Every rename in a plan, as the objects they are renamed *from* — which is
     /// the name the catalog still knows them by.
     pub fn from_changes(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
+        // A RenameColumn carries the declared, post-rename table because its
+        // statement runs after RenameTable. Impact runs before either one, so
+        // translate through a map built over the whole plan rather than rely on
+        // the changes' current ordering (DECISIONS 416).
+        let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+        for p in &changes.changes {
+            if let Change::RenameTable { from, to, .. } = &p.change {
+                stored.insert(to, from);
+            }
+        }
         changes
             .changes
             .iter()
             .filter_map(|p| match &p.change {
                 Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
                 Change::RenameColumn { table, from, .. } => {
+                    let table = stored.get(table).map_or(table, |t| *t);
                     Some(RenameTarget::Column(table.column(from)))
                 }
                 // A module rename reaches the plan as this drop plus a create,
@@ -538,9 +551,28 @@ mod tests {
             targets,
             [
                 RenameTarget::Table(tname("dbo.client")),
-                RenameTarget::Column("dbo.customer.email".parse().unwrap()),
+                RenameTarget::Column("dbo.client.email".parse().unwrap()),
             ],
             "only renames, and by their old names"
+        );
+    }
+
+    /// A column-only rename already names the table the catalog has. A reverse
+    /// lookup must not rewrite it unless this same plan renames that table.
+    #[test]
+    fn a_column_rename_without_a_table_rename_keeps_its_table() {
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: tname("dbo.customer"),
+                from: "email".into(),
+                to: "contact_email".into(),
+            })],
+        };
+
+        assert_eq!(
+            RenameTarget::from_changes(&cs),
+            [RenameTarget::Column("dbo.customer.email".parse().unwrap())]
         );
     }
 

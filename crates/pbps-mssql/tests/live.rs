@@ -1707,6 +1707,64 @@ async fn rename_impact_finds_the_dependencies_that_block() {
     db.drop().await;
 }
 
+/// Impact runs before either rename statement. A column rename therefore has
+/// to query the pre-rename table even though the plan carries the declared,
+/// post-rename table (DECISIONS 416). Otherwise every dependency query joins
+/// against NULL and a SCHEMABINDING blocker comes back as an empty report.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    use pbps_mssql::impact::{RenameTarget, rename_impact};
+
+    let mut db = TestDb::create("impact_table_column_rename").await;
+    db.conn
+        .execute("CREATE TABLE dbo.client (id int NOT NULL, email nvarchar(255) NULL);")
+        .await
+        .expect("create table");
+    db.conn
+        .execute(
+            "CREATE VIEW dbo.v_bound_client WITH SCHEMABINDING \
+             AS SELECT id, email FROM dbo.client;",
+        )
+        .await
+        .expect("create view");
+
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "dbo.client".parse().unwrap(),
+                to: "dbo.customer".parse().unwrap(),
+            }),
+            PlannedChange::new(Change::RenameColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: "dbo.customer".parse().unwrap(),
+                from: "email".into(),
+                to: "contact_email".into(),
+            }),
+        ],
+    };
+    let target = RenameTarget::from_changes(&changes)
+        .into_iter()
+        .find(|target| matches!(target, RenameTarget::Column(_)))
+        .expect("column rename target");
+    assert_eq!(target.to_string(), "column dbo.client.email");
+
+    let report = rename_impact(&mut db.conn, &target).await.expect("impact");
+    assert_eq!(
+        report
+            .blocking
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["dbo.v_bound_client"],
+        "the pre-rename table's schema-bound view must block: {report:?}"
+    );
+
+    db.drop().await;
+}
+
 /// The question the offline tests cannot answer: which form `OBJECT_ID`
 /// actually resolves.
 ///

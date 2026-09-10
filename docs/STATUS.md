@@ -619,9 +619,10 @@ column's name are taken back to the catalog's spelling, because a `RenameColumn`
 carries the declared, post-rename *table* and asking about it would refuse a
 valid plan (407); and the body scan steps by a character rather than a byte,
 because identifiers here are not ASCII and slicing a string off a character
-boundary panics (408). SQL Server has both defects in its own copy of this
-module, where the first makes the report come back empty rather than erroring:
-issues #256 and #262.
+boundary panics (408). SQL Server had both defects in its own copy of this
+module: the whole-plan table map now keeps a column target on its pre-rename
+table, where the catalog and a SCHEMABINDING blocker still exist (416), and the
+remaining identifier-boundary defect is #262.
 
 The estimate is ADR-0012 §3's boundary, built: **cost is not risk**, and nothing
 in the module reads or produces a risk class — a test asserts it over the
