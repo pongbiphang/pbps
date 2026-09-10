@@ -7798,6 +7798,11 @@ async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() 
     let s = emit_schema("escape_order");
     let mut conn = connect().await;
     fresh(&mut conn, &s).await;
+    // A type whose name ends in the byte a Unicode trim discards, applied to
+    // a dollar-quoted string: a datum after what only looks like `AS`.
+    conn.execute(&format!("CREATE DOMAIN {s}.\"as\u{a0}\" AS text"))
+        .await
+        .expect("a domain named as-nbsp");
     let pg = Postgres::new();
     let mut declared = Schema::default();
     declared.modules.insert(
@@ -7811,7 +7816,9 @@ async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() 
         format!("{s}.b").parse().expect("a module id"),
         module(
             pbps_model::ModuleKind::View,
-            &format!("SELECT E'x\\' , {s}.a' AS s, $$ {s}.a $$ AS t"),
+            &format!(
+                "SELECT E'x\\' , {s}.a' AS s, $$ {s}.a $$ AS t, {s}.as\u{a0} $$ {s}.a $$ AS u"
+            ),
         ),
     );
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);

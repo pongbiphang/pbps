@@ -811,13 +811,18 @@ fn blank(out: &mut String, ch: char) {
 }
 
 /// Whether the code lexed so far ends with the keyword `AS` as a word of its
-/// own — `has` does not end with it, and neither does `x$as`.
+/// own — `has` does not end with it, and neither does `x$as`, nor
+/// `as\u{a0}`: the gap before the string is whitespace the dialect does
+/// not count as a name byte, and a Unicode trim took the non-breaking space
+/// off a type named `as\u{a0}` and read a datum it was applied to as a body.
+/// Measured, `SELECT as\u{a0} $$app.a$$` is that type applied to a string,
+/// and a valid view.
 ///
 /// It is asked of the *lexed* text, so a comment between the keyword and the
 /// string it introduces is already a run of blanks: measured, `AS /* c */ $$
 /// SELECT 1 $$` is accepted as a body.
 fn follows_the_word_as(code: &str, continues: fn(char) -> bool) -> bool {
-    let code = code.trim_end();
+    let code = code.trim_end_matches(|c: char| c.is_whitespace() && !continues(c));
     let Some(start) = code.len().checked_sub(2) else {
         return false;
     };
@@ -2115,6 +2120,11 @@ mod code_only_tests {
         );
         let has = "SELECT * FROM es.has $$ es.a $$";
         assert_eq!(PG.code_only(has), blanked(has, &["$$ es.a $$"]));
+        // Nor is a type named `as\u{a0}` applied to a string: the gap before
+        // the string is ASCII whitespace, and the non-breaking space is a
+        // name byte (measured, a valid view).
+        let nbsp = "SELECT as\u{a0} $$ es.a $$ AS t";
+        assert_eq!(PG.code_only(nbsp), blanked(nbsp, &["$$ es.a $$"]));
         // And a datum inside the body is a datum.
         let nested = "AS $b$ SELECT $$ es.a $$ $b$";
         assert_eq!(PG.code_only(nested), blanked(nested, &["$$ es.a $$"]));
