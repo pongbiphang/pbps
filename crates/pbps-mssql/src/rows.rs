@@ -715,8 +715,17 @@ fn constant_operand(default: &str, depth: usize) -> bool {
     let cast = lower.strip_prefix("cast").and_then(|rest| {
         let start = s.len() - rest.len();
         let body = s[start..].trim().strip_prefix('(')?.strip_suffix(')')?;
-        let at = body.to_ascii_lowercase().rfind(" as ")?;
-        Some((&body[..at], body[at + 4..].trim()))
+        // AS is a token: tabs/newlines separate it just as spaces do.
+        // Comments have already become whitespace, and the target's type
+        // parser still refuses a suffix that is not a numeric type.
+        let (at, _) = body
+            .to_ascii_lowercase()
+            .rmatch_indices("as")
+            .find(|(at, _)| {
+                body[..*at].ends_with(char::is_whitespace)
+                    && body[*at + 2..].starts_with(char::is_whitespace)
+            })?;
+        Some((&body[..at], body[at + 2..].trim()))
     });
     let convert = lower.strip_prefix("convert").and_then(|rest| {
         let start = s.len() - rest.len();
@@ -1174,6 +1183,8 @@ mod tests {
             "- /* a /* b */ c */ ( + 1)",
             "- -- c\n1",
             "-CAST('1' AS int)",
+            "-CAST('1'\tAS\tint)",
+            "-CAST('1'\nAS\nint)",
             "( -CONVERT([int],'1'))",
             "-CAST('1.25' AS decimal(10,2))",
             "( -CONVERT([numeric](10,2),'1.25'))",
@@ -1209,6 +1220,8 @@ mod tests {
             "- 1 + 2",
             "- abs(1)",
             "- CAST(NEWID() AS int)",
+            "- CAST(NEWID()\tAS\tint)",
+            "- CAST(1\nASint)",
             "- CONVERT(int, NEXT VALUE FOR dbo.seq)",
             "- CAST('1' AS dbo.custom)",
             "- CAST('01/02/2026' AS datetime)",

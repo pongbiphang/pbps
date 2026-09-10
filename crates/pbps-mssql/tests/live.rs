@@ -59,6 +59,8 @@ async fn signed_defaults_are_comparable_before_and_after_catalog_folding() {
         ("-(-1)", "((1))", "1"),
         ("- /* c */ 1", "((-1))", "-1"),
         ("(-CAST('1' AS int))", "( -CONVERT([int],'1'))", "-1"),
+        ("(-CAST('1'\tAS\tint))", "( -CONVERT([int],'1'))", "-1"),
+        ("(-CAST('1'\nAS\nint))", "( -CONVERT([int],'1'))", "-1"),
         ("(-CONVERT(int,'1'))", "( -CONVERT([int],'1'))", "-1"),
         (
             "(-CAST('1.25' AS decimal(10,2)))",
