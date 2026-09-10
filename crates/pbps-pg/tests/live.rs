@@ -16959,6 +16959,26 @@ async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing(
 /// statement, which is what "was this table rebuilt" means rather than a proxy
 /// for it. §3 measured eleven rows by hand; this measures every pair the engine
 /// accepts and holds the estimate to all of them, which is the difference
+/// The estimate of a plan holding this one change.
+///
+/// `estimate::estimates` takes a whole `ChangeSet` because it is the only thing
+/// that can name a renamed table as the catalog still has it (DECISIONS 392),
+/// and the single-change entry point is not public for that reason. These tests
+/// are about one statement at a time, so they wrap it here rather than each
+/// building a plan of one.
+fn one_estimate(
+    change: &pbps_model::Change,
+    strategy: pbps_model::Strategy,
+) -> Option<pbps_pg::estimate::Estimate> {
+    pbps_pg::estimate::estimates(
+        &pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(change.clone())],
+        },
+        strategy,
+    )
+    .pop()
+}
+
 /// between a table somebody wrote down and one that cannot go stale without a
 /// red build.
 ///
@@ -16969,7 +16989,7 @@ async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing(
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
     use pbps_model::{Change, PlannedChange};
-    use pbps_pg::estimate::{Rewrite, estimate};
+    use pbps_pg::estimate::Rewrite;
 
     let mut conn = connect().await;
     let s = probe_schema_9("rewrite");
@@ -17066,7 +17086,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             from_nullable: true,
             to_nullable: true,
         };
-        let ours = estimate(&change, Strategy::default())
+        let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
             .rewrite;
         let agrees = match &ours {
@@ -17139,7 +17159,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
     };
     assert!(
         matches!(
-            estimate(&change, Strategy::default())
+            one_estimate(&change, Strategy::default())
                 .expect("an estimate")
                 .rewrite,
             Rewrite::Unknown(_)
@@ -17166,7 +17186,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
     use pbps_model::Change;
-    use pbps_pg::estimate::{Reads, Rewrite, estimate};
+    use pbps_pg::estimate::{Reads, Rewrite};
 
     let mut conn = connect().await;
     let s = probe_schema_9("scan");
@@ -17211,7 +17231,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
             format!("ALTER TABLE {s}.t ALTER COLUMN w TYPE character varying(20)"),
         ),
     ] {
-        let ours = estimate(change, Strategy::default()).expect("an estimate");
+        let ours = one_estimate(change, Strategy::default()).expect("an estimate");
         assert_eq!(ours.rewrite, Rewrite::No, "{ours:#?}");
         assert_eq!(ours.reads, expected_reads, "{ours:#?}");
 
@@ -17307,7 +17327,7 @@ async fn locks_held(conn: &mut Conn, schema: &str, sql: &str, relation: &str) ->
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
     use pbps_model::Change;
-    use pbps_pg::estimate::{Lock, estimate};
+    use pbps_pg::estimate::Lock;
 
     let mut conn = connect().await;
     let s = probe_schema_9("locks");
@@ -17373,7 +17393,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
         ),
     ];
     for (change, sql) in cases {
-        let ours = estimate(&change, Strategy::default()).expect("an estimate");
+        let ours = one_estimate(&change, Strategy::default()).expect("an estimate");
         let modes = locks_held(&mut conn, &s, &sql, "t").await;
         assert!(
             modes.split(',').any(|m| m == ours.lock.to_string()),
@@ -17394,7 +17414,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
             on_update: ReferentialAction::NoAction,
         }),
     };
-    let ours = estimate(&key, Strategy::default()).expect("an estimate");
+    let ours = one_estimate(&key, Strategy::default()).expect("an estimate");
     assert_eq!(ours.lock, Lock::ShareRowExclusive);
     assert_eq!(ours.also_locks, [TableName::new(&s, "p")]);
     let sql = format!("ALTER TABLE {s}.t ADD CONSTRAINT fk FOREIGN KEY (v) REFERENCES {s}.p(id)");
@@ -17425,7 +17445,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     use pbps_model::Change;
-    use pbps_pg::estimate::{Rewrite, Rows, against, estimate};
+    use pbps_pg::estimate::{Rewrite, Rows, against};
 
     let mut conn = connect().await;
     let s = probe_schema_9("shapes");
@@ -17455,7 +17475,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     // whether it survives.
     for table in ["parted", "base", "plain", "indexed"] {
         assert_eq!(
-            estimate(&widen(table), Strategy::default())
+            one_estimate(&widen(table), Strategy::default())
                 .expect("an estimate")
                 .rewrite,
             Rewrite::Yes,
@@ -17469,7 +17489,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         ("indexed", false),
         ("plain", true),
     ] {
-        let mut e = estimate(&widen(table), Strategy::default()).expect("an estimate");
+        let mut e = one_estimate(&widen(table), Strategy::default()).expect("an estimate");
         against(&mut conn, &mut e, Some("v"))
             .await
             .expect("read the table's shape");
@@ -17483,7 +17503,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
 
     // A table nobody has analyzed answers `-1`, and reading that as a row
     // count says the change is free on the largest table in the database.
-    let mut e = estimate(&widen("indexed"), Strategy::default()).expect("an estimate");
+    let mut e = one_estimate(&widen("indexed"), Strategy::default()).expect("an estimate");
     against(&mut conn, &mut e, None)
         .await
         .expect("read the shape");
@@ -17492,14 +17512,14 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     conn.execute(&format!("ANALYZE {s}.plain"))
         .await
         .expect("analyze");
-    let mut e = estimate(&widen("plain"), Strategy::default()).expect("an estimate");
+    let mut e = one_estimate(&widen("plain"), Strategy::default()).expect("an estimate");
     against(&mut conn, &mut e, None)
         .await
         .expect("read the shape");
     assert_eq!(e.rows, Some(Rows::Estimated(1000)), "{e:#?}");
 
     // A table this plan is about to create is not a table with no rows either.
-    let mut e = estimate(&widen("not_there"), Strategy::default()).expect("an estimate");
+    let mut e = one_estimate(&widen("not_there"), Strategy::default()).expect("an estimate");
     against(&mut conn, &mut e, None)
         .await
         .expect("read the shape");
@@ -17625,6 +17645,77 @@ async fn a_length_only_the_operators_own_session_would_measure_is_never_probed()
         sqlstate(&refused),
         "22001",
         "value too long, on the row no probe was allowed to count: {refused}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// DECISIONS 392: an estimate for a table this plan also renames is measured
+/// against the table the catalog still has.
+///
+/// The offline half asserts the two names. This is the half that says what the
+/// wrong one costs: asked about a name the database does not have yet, `against`
+/// answers "this database has no table by that name to measure" and drops the
+/// row count — a rename read as an absence, on a table sitting right there with
+/// a thousand rows in it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    use pbps_pg::estimate::{Rewrite, Rows, against, estimates};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("renamed");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.client (id integer PRIMARY KEY, v integer);
+         INSERT INTO {s}.client SELECT g, g FROM generate_series(1, 1000) g;"
+    ))
+    .await
+    .expect("the fixture");
+    conn.execute(&format!("ANALYZE {s}.client"))
+        .await
+        .expect("analyze");
+
+    let cs = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().expect("a uid"),
+                from: TableName::new(&s, "client"),
+                to: TableName::new(&s, "customer"),
+            }),
+            PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: TableName::new(&s, "customer").column("v"),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+            }),
+        ],
+    };
+    let mut es = estimates(&cs, Strategy::default());
+    assert_eq!(es.len(), 2, "{es:#?}");
+    let alter = &mut es[1];
+    assert_eq!(
+        alter.table,
+        TableName::new(&s, "customer"),
+        "the operator reads the name the table will have"
+    );
+    against(&mut conn, alter, Some("v"))
+        .await
+        .expect("read the table's shape");
+    assert_eq!(
+        alter.rows,
+        Some(Rows::Estimated(1000)),
+        "the rows are there to be counted, under the name the catalog has: {alter:#?}"
+    );
+    assert_eq!(
+        alter.rewrite,
+        Rewrite::Yes,
+        "and the static answer survives an ordinary table: {alter:#?}"
     );
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))

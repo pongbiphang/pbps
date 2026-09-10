@@ -8546,3 +8546,21 @@ SPEC is in sync with all of these.
     because Rust will not slice a string off a character boundary. The step is
     the width of the name's first character, and an empty name returns `false`
     before the loop rather than matching at every position.
+
+392. **An estimate names its table twice: as the plan has it, and as the
+    catalog does.** The same translation as DECISIONS 390, one module over. A
+    plan may rename a table and then alter one of its columns, and the
+    `AlterColumnType` and `RenameColumn` both carry the *declared*,
+    post-rename table. `estimate::against` reads `relkind`, `relhassubclass`
+    and `reltuples` from the catalog before any statement has run, so asked
+    about that name it found no row and reported "this database has no table by
+    that name to measure" — a rename read as an absence, on a table sitting
+    there with its rows in it. `Estimate` therefore carries `table`, which the
+    operator reads and which is the name the table will have when the statement
+    runs, and a private `stored`, which is the only name `against` may query.
+    Private is the design and not an accident: `Estimate` has no public
+    constructor, and the single-change `estimate` is not public either, so the
+    only way to hold one is `estimates(&ChangeSet, Strategy)` — the only
+    function that can see the rest of the plan. A caller mapping the
+    single-change form over a change set would rebuild exactly the estimate
+    that cannot be measured, and now cannot write it.

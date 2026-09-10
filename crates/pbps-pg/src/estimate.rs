@@ -43,9 +43,23 @@
 //! shapes ADR-0012 records as unmeasured — a partitioned table, an inheritance
 //! parent, and a type change on an indexed column — take the answer back to
 //! unknown when [`against`] finds one, whatever the static half said.
+//!
+//! # Two halves, and one entry point
+//!
+//! [`estimates`] answers from the plan alone and is the whole public surface;
+//! [`against`] fills in what only a connection knows. They are separate because
+//! the first is a pure function and the second is the one that can be wrong
+//! about which database it is looking at.
+//!
+//! A plan is what [`estimates`] takes, never a single change, and that is
+//! deliberate: a table this plan renames is described by its new name and has
+//! to be *measured* under the one the catalog still has, and only something
+//! holding the whole plan can know the difference (DECISIONS 392).
+
+use std::collections::BTreeMap;
 
 use pbps_db::{Conn, DbError};
-use pbps_model::{Change, ColumnType, Strategy, TableName};
+use pbps_model::{Change, ChangeSet, ColumnType, Strategy, TableName};
 
 /// Whether the statement rebuilds the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +142,19 @@ pub enum Rows {
 pub struct Estimate {
     /// The change, in the operator's words.
     pub about: String,
-    /// The table the statement runs on.
+    /// The table the statement runs on, as the **plan** names it. This is the
+    /// one the operator reads, and after a rename in the same plan it is the
+    /// name the table will have by the time the statement runs.
     pub table: TableName,
+    /// The same table as the **catalog** has it *now*, which is the only name
+    /// [`against`] can ask about — a plan that renames the table describes one
+    /// the database does not have yet, and the query would find nothing and
+    /// report a rename as "no such table" (DECISIONS 392).
+    ///
+    /// Private, and the reason is the whole design: `Estimate` has no public
+    /// constructor, so the only way to hold one is through [`estimates`], which
+    /// is the only function that can see the rest of the plan.
+    stored: TableName,
     pub rewrite: Rewrite,
     pub reads: Reads,
     pub lock: Lock,
@@ -145,6 +170,7 @@ impl Estimate {
     fn new(about: String, table: TableName, rewrite: Rewrite, reads: Reads, lock: Lock) -> Self {
         Self {
             about,
+            stored: table.clone(),
             table,
             rewrite,
             reads,
@@ -253,6 +279,45 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
     }
 }
 
+/// Every estimate a plan carries, each table named twice: as the plan names it
+/// and as the catalog has it now.
+///
+/// The plan-level entry point, and the **only** one — [`estimate`] is not
+/// public, because a caller mapping it over a change set would be building
+/// exactly the estimate that cannot be measured. A plan may rename a table and
+/// then alter one of its columns, and the `AlterColumnType` carries the
+/// *declared*, post-rename table (`pbps_diff::schema_diff::order_key` gives a
+/// column rename a class of its own after the table renames for the same
+/// reason). Asked about that name, [`against`] finds no row and reports "this
+/// database has no table by that name to measure" — a rename read as an absence,
+/// which is the failure this repo has a rule about (DECISIONS 392).
+///
+/// Changes with no estimate are dropped rather than carried as `None`: a
+/// module, a role, a grant and a row change are not about a table's stored
+/// rows, and [`estimate`] says which.
+pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
+    // Built over the whole plan before anything is estimated, because the
+    // order that puts a table rename ahead of what follows it is `order_key`'s
+    // guarantee and not this function's to lean on.
+    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for p in &changes.changes {
+        if let Change::RenameTable { from, to, .. } = &p.change {
+            stored.insert(to, from);
+        }
+    }
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            let mut e = estimate(&p.change, strategy)?;
+            if let Some(catalog) = stored.get(&e.table) {
+                e.stored = (*catalog).clone();
+            }
+            Some(e)
+        })
+        .collect()
+}
+
 /// What this change costs, from the typed change alone — SPEC §7.2 is untouched
 /// because not one row of data is read to answer it.
 ///
@@ -260,7 +325,7 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 /// role, a grant, a data mode. A row change is `None` too, and deliberately: an
 /// `INSERT` of one declared row costs what one row costs, and putting it beside
 /// a rebuild of the whole table would bury the number that matters.
-pub fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> {
+pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> {
     let e = |about: String, table: &TableName, rewrite, reads, lock| {
         Some(Estimate::new(about, table.clone(), rewrite, reads, lock))
     };
@@ -522,7 +587,7 @@ pub async fn against(
     estimate: &mut Estimate,
     column: Option<&str>,
 ) -> Result<(), DbError> {
-    let relation = match crate::emit::qualified(&estimate.table) {
+    let relation = match crate::emit::qualified(&estimate.stored) {
         Ok(name) => name,
         // A name this dialect cannot write is not a table with no rows in it.
         Err(_) => {
@@ -589,6 +654,67 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().expect("a table name")
+    }
+
+    /// DECISIONS 392: a table this plan renames is described by its new name
+    /// and measured under the one the catalog still has.
+    ///
+    /// The two names have to be right independently — the operator reads the
+    /// first and [`against`] queries the second — so both are asserted for
+    /// every arm that carries a table a rename can move.
+    #[test]
+    fn a_table_this_plan_renames_is_measured_under_the_name_the_catalog_has() {
+        use pbps_model::{ChangeSet, PlannedChange};
+
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaaaaa".parse().expect("a uid"),
+                    from: tname("app.client"),
+                    to: tname("app.customer"),
+                }),
+                PlannedChange::new(Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().expect("a uid"),
+                    column: cref("app.customer.v"),
+                    from: ty("integer"),
+                    to: ty("bigint"),
+                    from_nullable: true,
+                    to_nullable: true,
+                }),
+                PlannedChange::new(Change::RenameColumn {
+                    uid: "c_bbbbbb".parse().expect("a uid"),
+                    table: tname("app.customer"),
+                    from: "v".into(),
+                    to: "amount".into(),
+                }),
+                // A table this plan leaves alone, to show the translation is a
+                // lookup and not a rewrite of every name in sight.
+                PlannedChange::new(Change::AlterColumnType {
+                    uid: "c_cccccc".parse().expect("a uid"),
+                    column: cref("app.invoice.v"),
+                    from: ty("integer"),
+                    to: ty("bigint"),
+                    from_nullable: true,
+                    to_nullable: true,
+                }),
+            ],
+        };
+        let got: Vec<(String, String)> = estimates(&cs, Strategy::default())
+            .iter()
+            .map(|e| (e.table.to_string(), e.stored.to_string()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                // The rename's own estimate is about the table it finds, so it
+                // names the old one on both sides already.
+                ("app.client".to_owned(), "app.client".to_owned()),
+                ("app.customer".to_owned(), "app.client".to_owned()),
+                ("app.customer".to_owned(), "app.client".to_owned()),
+                ("app.invoice".to_owned(), "app.invoice".to_owned()),
+            ],
+            "the plan's name to read, the catalog's name to measure"
+        );
     }
 
     /// The rule the measured matrix draws: a rewrite is avoided only where the
