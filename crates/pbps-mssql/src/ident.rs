@@ -2,7 +2,11 @@
 
 use pbps_dialect::DialectError;
 
-/// The limit on a regular identifier, in characters, not bytes.
+/// SQL Server's limit on a regular identifier, in UTF-16 code units.
+///
+/// The `CHARS` suffix is retained for the public constant's compatibility, but
+/// SQL Server exposes this limit through `sysname` (`nvarchar(128)`), whose
+/// length is measured in UTF-16 units rather than Unicode scalar values.
 pub const MAX_IDENT_CHARS: usize = 128;
 
 /// Wraps an identifier in brackets, doubling any closing bracket inside it.
@@ -19,7 +23,7 @@ pub fn quote(ident: &str) -> Result<String, DialectError> {
     if ident.contains('\0') {
         return Err(DialectError::UnquotableIdent(ident.to_owned()));
     }
-    if ident.chars().count() > MAX_IDENT_CHARS {
+    if ident.encode_utf16().count() > MAX_IDENT_CHARS {
         return Err(DialectError::UnquotableIdent(ident.to_owned()));
     }
     Ok(format!("[{}]", ident.replace(']', "]]")))
@@ -60,12 +64,20 @@ mod tests {
         assert!(quote(&"x".repeat(MAX_IDENT_CHARS)).is_ok());
     }
 
-    /// The limit is 128 characters, not bytes: a name of 128 CJK characters is
-    /// legal even though it is 384 bytes.
     #[test]
-    fn the_length_limit_counts_characters() {
-        assert!(quote(&"\u{4f7f}".repeat(MAX_IDENT_CHARS)).is_ok());
-        assert!(quote(&"\u{4f7f}".repeat(MAX_IDENT_CHARS + 1)).is_err());
+    fn a_128_character_bmp_identifier_is_accepted() {
+        let ident = "\u{4f7f}".repeat(MAX_IDENT_CHARS);
+        assert_eq!(ident.chars().count(), MAX_IDENT_CHARS);
+        assert_eq!(ident.encode_utf16().count(), MAX_IDENT_CHARS);
+        assert!(quote(&ident).is_ok());
+    }
+
+    #[test]
+    fn a_128_character_supplementary_identifier_is_refused_by_utf16_width() {
+        let ident = "\u{1f600}".repeat(MAX_IDENT_CHARS);
+        assert_eq!(ident.chars().count(), MAX_IDENT_CHARS);
+        assert_eq!(ident.encode_utf16().count(), MAX_IDENT_CHARS * 2);
+        assert!(quote(&ident).is_err());
     }
 
     #[test]
