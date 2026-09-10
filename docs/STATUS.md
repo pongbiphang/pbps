@@ -596,7 +596,10 @@ level down: `InsertRow` types every non-key column and the row key is what a
 foreign key points at, so a parent spelling its key `1.0` and a child spelling
 its `1.00` counted an orphan the engine did not have. The types are in
 `Change::CreateTable` already, and the other dialect had been reading them
-there all along (413).
+there all along (413). And the missing-value count stopped believing a lexical
+marker: measured, `DEFAULT NULLIF(1, 2)` fills every row and `NULLIF(1, 1)` is
+`23502`, so the count is kept only for the two values this crate can read
+without running anything — no default, and a literal `NULL` (414).
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a

@@ -18082,3 +18082,91 @@ async fn a_key_between_two_created_tables_is_compared_as_the_engine_compares_it(
             .expect("drop");
     }
 }
+
+/// A default this engine fills every row from is not counted as a missing
+/// value.
+///
+/// `has_required_add_value_source` is lexical and deliberately conservative:
+/// it asks "could this expression mean NULL?" by looking for the word, and
+/// `NULLIF` is one of the words. Measured, `NULLIF(1, 2)` fills every row and
+/// `NULLIF(1, 1)` is `23502` — one word, both answers — so the count is kept
+/// only for a value this crate can read without running anything. The negative
+/// cases are the point: no default and a literal `NULL` must still be counted,
+/// or the fix would be a probe switched off.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() {
+    let mut conn = connect().await;
+    let s = probe_schema_9("addvalue");
+    fresh(&mut conn, &s).await;
+    let name = TableName::new(&s, "t");
+
+    for (default, counted_rows) in [
+        // The engine evaluates it to `1` and takes the change.
+        (Some("NULLIF(1, 2)"), None),
+        // An expression this crate will not evaluate: no probe, rather than a
+        // guess in either direction (DECISIONS 124's rule).
+        (Some("NULLIF(1, 1)"), None),
+        // Both halves the count still exists for.
+        (Some("NULL"), Some(3)),
+        (None, Some(3)),
+    ] {
+        conn.execute(&format!(
+            "DROP TABLE IF EXISTS {s}.t;
+             CREATE TABLE {s}.t (id integer);
+             INSERT INTO {s}.t VALUES (1), (2), (3);"
+        ))
+        .await
+        .expect("the fixture");
+
+        let mut before = Table::default();
+        before
+            .columns
+            .insert("id".into(), Column::new(ty("integer")));
+        let mut after = before.clone();
+        let mut added = Column::new(ty("integer")).not_null();
+        added.default = default.map(std::borrow::ToOwned::to_owned);
+        after.columns.insert("c".into(), added);
+
+        let mut base = Schema::default();
+        base.tables.insert(name.clone(), before);
+        let mut declared = Schema::default();
+        declared.tables.insert(name.clone(), after);
+        let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+        let ids = mint_ids(&declared, &base_ids, &[]);
+        let cs = plan(&base, &base_ids, &declared, &ids);
+
+        let measured = counts(&mut conn, &cs).await;
+        let missing: Vec<i64> = measured
+            .iter()
+            .filter(|(d, _)| d.contains("no value for the new NOT NULL column"))
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(
+            missing,
+            counted_rows.map_or_else(Vec::new, |n| vec![n]),
+            "default {default:?}: {measured:#?}"
+        );
+
+        // And the engine's own verdict on the very change the probe judged.
+        let refused = conn
+            .execute(&format!(
+                "ALTER TABLE {s}.t ADD COLUMN c integer NOT NULL{}",
+                default.map_or(String::new(), |d| format!(" DEFAULT {d}"))
+            ))
+            .await
+            .err();
+        assert_eq!(
+            refused.is_some(),
+            default != Some("NULLIF(1, 2)"),
+            "default {default:?}: the engine said {refused:?}"
+        );
+        if let Some(e) = refused {
+            assert_eq!(sqlstate(&e), "23502", "default {default:?}: {e}");
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}

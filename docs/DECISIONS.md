@@ -8666,3 +8666,35 @@ SPEC is in sync with all of these.
     reasoning of DECISIONS 339 and 341 — two unknown literals compare as text,
     and `'2026-01-02'` and `'01/02/2026'` are one `date` — arriving at the one
     column those entries could not reach.
+
+414. **The missing-value count is kept only for a value this crate can read
+    without running anything.** `has_required_add_value_source` is lexical and
+    deliberately so: `crates/pbps-model/src/schema.rs` looks for the words
+    `null`, `nullif`, `try_cast`, `try_convert` and `try_parse` in the default
+    expression, and answers "this column may arrive without a value" if it
+    finds one. That is the right *conservative* answer to give a risk class.
+    It is the wrong answer to hand a probe, which does not classify but counts
+    — and a count aborts the apply.
+
+    **Measured on 18.6**, one word and both answers:
+
+    ```text
+    ADD COLUMN c integer NOT NULL DEFAULT NULLIF(1, 2)   every row reads 1
+    ADD COLUMN c integer NOT NULL DEFAULT NULLIF(1, 1)   23502, contains null values
+    ```
+
+    So the count now stands only where there is no default at all, or a
+    default that is the literal `NULL` — the two cases `constant_default` can
+    read. An expression is the case DECISIONS 124 already answers with no
+    probe rather than a guess, and the trade is stated rather than hidden: a
+    `NULLIF(1, 1)` reaches the engine and is refused there, inside the plan's
+    own transaction, instead of being refused at the gate.
+
+    The alternative was rejected on purpose. Asking the engine
+    `SELECT CASE WHEN (expr) IS NULL THEN (SELECT count(*) ...) ELSE 0 END`
+    would answer exactly, and would also **run the operator's own expression
+    before the plan is approved** — the hazard #274 records, and something no
+    probe in this crate does; `backfill_of` splices a default only through
+    `constant_default` for the same reason. SQL Server has the same defect at
+    the same predicate, measured on the pinned image, and it is filed as #283
+    rather than carried here.

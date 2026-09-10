@@ -2743,6 +2743,31 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             let Some(stored) = names.table(table) else {
                 return Ok(Vec::new());
             };
+            // The model's marker is lexical and deliberately conservative: it
+            // answers "could this expression mean NULL?" by looking for the
+            // word, and `NULLIF` is one of the words. **Measured on 18.6**, a
+            // nonempty table takes
+            // `ADD COLUMN c integer NOT NULL DEFAULT NULLIF(1, 2)` and every
+            // row reads `1`, while `NULLIF(1, 1)` is `contains null values` —
+            // one word, both answers. Counting the whole table on the word
+            // alone refuses the first.
+            //
+            // The count is therefore kept only where the value is one this
+            // module can read *without running anything*: no default at all,
+            // or a default that is the literal `NULL`. An expression is the
+            // case DECISIONS 124 already answers with no probe rather than a
+            // guess, and the alternative is worse than silence — asking the
+            // engine `(expr) IS NULL` would run the operator's own function
+            // before the plan is approved, which is the shape of #274 and
+            // something no probe in this crate does.
+            if let Some(default) = column.default.as_deref() {
+                let Some(literal) = constant_default(default) else {
+                    return Ok(Vec::new());
+                };
+                if !crate::rows::unwrapped(literal).eq_ignore_ascii_case("null") {
+                    return Ok(Vec::new());
+                }
+            }
             Ok(vec![Probe::new(
                 format!(
                     "rows that have no value for the new NOT NULL column {}",
