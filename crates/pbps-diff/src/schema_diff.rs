@@ -61,6 +61,33 @@ pub enum DiffError {
          then declare the rows again — or rename the column instead of replacing it"
     )]
     DataKeyColumnChanged { table: TableName },
+
+    #[error(
+        "{table} has no baseline primary key and this plan does not restore the declared key, so its data rows cannot be matched"
+    )]
+    DataBaselineKeyAbsent { table: TableName },
+
+    #[error("{table} has a baseline primary key with {} columns ({columns:?}); pbps matches data rows only on a single-column key", columns.len())]
+    DataBaselineKeyNotSingle {
+        table: TableName,
+        columns: Vec<String>,
+    },
+}
+
+enum BaselineDataKey<'a> {
+    Absent,
+    Single(&'a str),
+    Multiple(&'a [String]),
+}
+
+impl<'a> BaselineDataKey<'a> {
+    fn of(table: &'a Table) -> Self {
+        match table.primary_key.as_ref().map(|pk| pk.columns.as_slice()) {
+            None => Self::Absent,
+            Some([column]) => Self::Single(column),
+            Some(columns) => Self::Multiple(columns),
+        }
+    }
 }
 
 /// One side's complete input: a state plus its own identity mapping.
@@ -687,15 +714,33 @@ fn diff_data(
     // to a different column leaves two sets of keys with nothing in common,
     // and matching them by text would update and delete the wrong rows.
     if base_rows.is_some() {
-        let base_key = base
-            .primary_key
-            .as_ref()
-            .filter(|pk| pk.columns.len() == 1)
-            .map(|pk| pk.columns[0].as_str());
-        if base_name_of.get(&key_column).map(String::as_str) != base_key {
-            errs.push(DiffError::DataKeyColumnChanged {
+        let error = match BaselineDataKey::of(base) {
+            BaselineDataKey::Absent => {
+                // The constraint diff runs first. Retained rows can still be
+                // compared using the declared key when this very plan restores it.
+                let restored = changes.iter().any(|change| {
+                    matches!(change,
+                    Change::SetPrimaryKey { table, from: None, to: Some(pk) }
+                    if table == name && pk.columns == [key_column.clone()])
+                });
+                (!restored).then(|| DiffError::DataBaselineKeyAbsent {
+                    table: name.clone(),
+                })
+            }
+            BaselineDataKey::Multiple(columns) => Some(DiffError::DataBaselineKeyNotSingle {
                 table: name.clone(),
-            });
+                columns: columns.to_vec(),
+            }),
+            BaselineDataKey::Single(base_key) => {
+                (base_name_of.get(&key_column).map(String::as_str) != Some(base_key)).then(|| {
+                    DiffError::DataKeyColumnChanged {
+                        table: name.clone(),
+                    }
+                })
+            }
+        };
+        if let Some(error) = error {
+            errs.push(error);
             return;
         }
     }
@@ -2336,6 +2381,85 @@ mod tests {
             "{:?}",
             kinds(&cs)
         );
+    }
+
+    #[test]
+    fn absent_baseline_key_is_restored_with_exact_row_changes() {
+        let mut base_t = lookup(DataMode::Exact, &[("new", "Old"), ("gone", "Gone")]);
+        base_t.primary_key = None;
+        let declared_t = lookup(DataMode::Exact, &[("new", "New"), ("added", "Added")]);
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        for kind in ["SetPrimaryKey", "UpdateRow", "InsertRow", "DeleteRow"] {
+            assert!(kinds(&cs).contains(&kind.to_owned()), "{:?}", kinds(&cs));
+        }
+    }
+
+    #[test]
+    fn composite_baseline_key_reports_its_columns_without_moved_key_advice() {
+        let declared = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut base = declared.clone();
+        base.primary_key
+            .as_mut()
+            .unwrap()
+            .columns
+            .push("label".to_owned());
+        let mut changes = Vec::new();
+        let mut errors = Vec::new();
+        let mapping = [
+            ("code".to_owned(), "code".to_owned()),
+            ("label".to_owned(), "label".to_owned()),
+        ]
+        .into();
+        diff_data(
+            &"dbo.s".parse().unwrap(),
+            &base,
+            &declared,
+            &mapping,
+            &mut changes,
+            &mut errors,
+        );
+        assert_eq!(
+            errors,
+            vec![DiffError::DataBaselineKeyNotSingle {
+                table: "dbo.s".parse().unwrap(),
+                columns: vec!["code".to_owned(), "label".to_owned()],
+            }]
+        );
+        let message = errors[0].to_string();
+        assert!(
+            message.contains("2 columns") && message.contains("single-column"),
+            "{message}"
+        );
+        assert!(!message.contains("Remove the block"), "{message}");
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn absent_baseline_key_without_restoration_is_refused_accurately() {
+        let declared = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut base = declared.clone();
+        base.primary_key = None;
+        let mut changes = Vec::new();
+        let mut errors = Vec::new();
+        diff_data(
+            &"dbo.s".parse().unwrap(),
+            &base,
+            &declared,
+            &BTreeMap::new(),
+            &mut changes,
+            &mut errors,
+        );
+        assert_eq!(
+            errors,
+            vec![DiffError::DataBaselineKeyAbsent {
+                table: "dbo.s".parse().unwrap()
+            }]
+        );
+        assert!(changes.is_empty());
     }
 
     /// The row keys on each side are values of that side's key column. When
