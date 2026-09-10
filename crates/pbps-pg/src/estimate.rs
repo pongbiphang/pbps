@@ -56,7 +56,7 @@
 //! to be *measured* under the one the catalog still has, and only something
 //! holding the whole plan can know the difference (DECISIONS 409).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
 use pbps_model::{Change, ChangeSet, ColumnType, Strategy, TableName};
@@ -155,6 +155,10 @@ pub struct Estimate {
     /// constructor, so the only way to hold one is through [`estimates`], which
     /// is the only function that can see the rest of the plan.
     stored: TableName,
+    /// Whether the catalog row is absent because this plan creates the table.
+    /// Kept private for the same reason as `stored`: only the whole plan can
+    /// supply this provenance.
+    created: bool,
     pub rewrite: Rewrite,
     pub reads: Reads,
     pub lock: Lock,
@@ -164,6 +168,8 @@ pub struct Estimate {
     pub also_locks: Vec<TableName>,
     /// Filled in by [`against`], which is the only half that can know it.
     pub rows: Option<Rows>,
+    /// Why [`rows`](Self::rows) is absent after [`against`] has run.
+    pub rows_unknown: Option<String>,
 }
 
 impl Estimate {
@@ -171,12 +177,14 @@ impl Estimate {
         Self {
             about,
             stored: table.clone(),
+            created: false,
             table,
             rewrite,
             reads,
             lock,
             also_locks: Vec::new(),
             rows: None,
+            rows_unknown: None,
         }
     }
 
@@ -301,9 +309,13 @@ pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
     // order that puts a table rename ahead of what follows it is `order_key`'s
     // guarantee and not this function's to lean on.
     let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    let mut created: BTreeSet<&TableName> = BTreeSet::new();
     for p in &changes.changes {
         if let Change::RenameTable { from, to, .. } = &p.change {
             stored.insert(to, from);
+        }
+        if let Change::CreateTable { name, .. } = &p.change {
+            created.insert(name);
         }
     }
     changes
@@ -314,6 +326,7 @@ pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
             if let Some(catalog) = stored.get(&e.table) {
                 e.stored = (*catalog).clone();
             }
+            e.created = created.contains(&e.table);
             Some(e)
         })
         .collect()
@@ -610,11 +623,22 @@ pub async fn against(
         )
         .await?;
     let Some(row) = rows.first() else {
-        // The table is not there. It is this plan's to create, or somebody
-        // else's to explain; either way the estimate is not about anything.
-        estimate.unknown("this database has no table by that name to measure");
+        if estimate.created {
+            // Static cost is a property of the statement and remains known.
+            // The plan may insert rows before this statement, though, so its
+            // provenance is not permission to claim an estimated zero.
+            estimate.rows_unknown = Some(
+                "this plan creates this table, so the database has no row count for it yet"
+                    .to_owned(),
+            );
+        } else {
+            let why = "this database has no table by that name to measure";
+            estimate.rows_unknown = Some(why.to_owned());
+            estimate.unknown(why);
+        }
         return Ok(());
     };
+    estimate.rows_unknown = None;
     estimate.rows = Some(match row.try_get::<i64>("reltuples")?.unwrap_or(-1) {
         -1 => Rows::NeverAnalyzed,
         n => Rows::Estimated(n),
