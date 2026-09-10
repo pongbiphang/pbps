@@ -8622,3 +8622,24 @@ SPEC is in sync with all of these.
     not "prefer floats", it is "measure in the domain the statement measures
     in" — the same rule DECISIONS 370 draws between a cast and an assignment,
     one level down.
+
+395. **The calendar probe takes `infinity` out by name, because the target
+    keeps it.** Every other range test in `cannot_become` already excludes the
+    sentinels its target accepts — 394's float arms, and the bounded-`numeric`
+    arm which counts an infinity and spares a `NaN`, each measured. The
+    temporal arm was written as a bare `value > 'last-12-31'::date` and did
+    not, so the one value that sorts after every finite date was counted as a
+    row the conversion cannot carry. **Measured on 18.6**: a `date` column
+    holding `infinity` becomes a `timestamp` holding `infinity`, and the
+    `ALTER` does not raise — while the probe counted 1 and refused the plan.
+    `'294277-01-01'` is still counted, and still `22008` at the engine, so the
+    bound itself is intact.
+
+    One spelling covers the whole family rather than one per source type:
+    **measured**, `'infinity'::date` compares *equal* to `'infinity'::timestamp`
+    and to `'infinity'::timestamptz`, so the literal need not be written three
+    times. `-infinity` is left alone deliberately — it cannot satisfy a `>`
+    against a finite bound, and there is no lower test for it to escape,
+    `Family::Temporal` carrying no `first_year`. This is the third instance of
+    a shape this file already names twice; the sweep that found it is the rule
+    in AGENTS.md, not a lucky read.

@@ -17823,6 +17823,92 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
         .expect("drop");
 }
 
+/// A `date` the target's calendar cannot reach is counted; `infinity` is not.
+///
+/// `infinity` sorts after every finite date, so the plain range test flagged
+/// it — and this engine converts it and keeps it, which makes the count a
+/// refusal of a valid plan. Each row is asserted twice, the probe's count and
+/// the engine's own verdict on the very `ALTER` the probe is about, so a probe
+/// that agreed for the wrong reason would have to survive both.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("calbound");
+    fresh(&mut conn, &s).await;
+
+    for (value, violates) in [
+        // The two the engine carries across unchanged, and the reason this
+        // test exists: measured, `'infinity'::date` into a `timestamp` is
+        // `infinity`, not an error.
+        ("infinity", false),
+        ("-infinity", false),
+        // The last date that converts, and the first that does not.
+        ("294276-12-31", false),
+        ("294277-01-01", true),
+    ] {
+        conn.execute(&format!(
+            "DROP TABLE IF EXISTS {s}.t;
+             CREATE TABLE {s}.t (v date);
+             INSERT INTO {s}.t VALUES ('{value}'::date);"
+        ))
+        .await
+        .expect("the fixture");
+
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: TableName::new(&s, "t").column("v"),
+                from: ty("date"),
+                to: ty("timestamp without time zone"),
+                from_nullable: true,
+                to_nullable: true,
+            })],
+        };
+        let measured = counts(&mut conn, &cs).await;
+        // Not `counted`: the free helper of that name is called again below.
+        let flagged = one(&measured, "cannot become");
+        assert_eq!(
+            flagged,
+            i64::from(violates),
+            "{value}: the probe counted {flagged}"
+        );
+
+        // And what this engine does with the same value and the same target.
+        let refused = conn
+            .execute(&format!(
+                "ALTER TABLE {s}.t ALTER COLUMN v TYPE timestamp without time zone"
+            ))
+            .await
+            .err();
+        assert_eq!(
+            refused.is_some(),
+            violates,
+            "{value}: the engine said {refused:?}"
+        );
+        match refused {
+            Some(e) => assert_eq!(sqlstate(&e), "22008", "{value}: {e}"),
+            // The value survives the trip *as itself*, which is the whole
+            // claim — not merely that the statement did not raise.
+            None => assert_eq!(
+                counted(
+                    &mut conn,
+                    &format!("SELECT count(*)::int FROM {s}.t WHERE v = '{value}'::timestamp"),
+                )
+                .await,
+                1,
+                "{value}: the engine kept something else"
+            ),
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// DECISIONS 394: a float's boundary is tested as a float, because
 /// `float8::numeric` rounds through the shortest decimal.
 ///

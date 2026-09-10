@@ -586,7 +586,11 @@ conversion probe called `-2^63` out of range for a `bigint` that stores it
 exactly, and the same rounding put the largest `double precision` that becomes
 a `real` past the overflow threshold. Both boundaries now compare as `float8`,
 while an exact source keeps the exact domain — which is the domain its own
-`ALTER` converts in (394).
+`ALTER` converts in (394). The same rule reached the calendar test last: a
+range probe excludes the sentinels its target accepts, and the temporal arm was
+the one that did not — measured, a `date` holding `infinity` becomes a
+`timestamp` holding `infinity`, so the count refused a plan this engine takes,
+while `'294277-01-01'` is still counted and still `22008` (395).
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a

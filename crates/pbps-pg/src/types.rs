@@ -1338,7 +1338,25 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
                 last_year: Some(last),
                 ..
             },
-        ) => Some(format!("{value} > '{last}-12-31'::date")),
+        ) => {
+            // `infinity` has to come out by name, exactly as it does for the
+            // numeric families above: it sorts after every finite value, so a
+            // plain range test flags it, and **measured on 18.6** the engine
+            // converts it and keeps it —
+            // `'infinity'::date` into a `timestamp` is `infinity`, not `date
+            // out of range`. Counting it refuses a plan this engine accepts.
+            //
+            // One spelling serves every source in this family: measured,
+            // `'infinity'::date` compares *equal* to `'infinity'::timestamp`
+            // and to `'infinity'::timestamptz`, so the literal does not have
+            // to be written per source type. `-infinity` needs no exclusion —
+            // it cannot satisfy a `>` against a finite bound — and there is no
+            // lower test to catch it, `Family::Temporal` carrying no
+            // `first_year`.
+            Some(format!(
+                "{value} <> 'infinity'::date AND {value} > '{last}-12-31'::date"
+            ))
+        }
 
         // Everything else narrows without a row to point at; the list is in
         // this function's own documentation.
@@ -2339,6 +2357,37 @@ mod tests {
             assert!(
                 got.contains("numeric"),
                 "`{from}` -> `{to}` is exact and must stay exact: {got}"
+            );
+        }
+    }
+
+    /// The calendar probe leaves `infinity` alone, because the target keeps it.
+    ///
+    /// Every other range test here takes its sentinels out by name where the
+    /// target accepts them; this family is the one that did not, and an
+    /// `infinity` sorting after the finite bound is counted as a violation of
+    /// a conversion this engine performs. Both halves are asserted: the
+    /// exclusion, and the finite bound it must not have replaced.
+    #[test]
+    fn a_date_the_target_keeps_is_not_counted_against_its_calendar() {
+        let predicate = |from: &str, to: &str| {
+            let from = normalize(&ty(from)).expect("a source type normalizes");
+            let to = normalize(&ty(to)).expect("a target type normalizes");
+            cannot_become(&from, &to, "\"v\"")
+                .unwrap_or_else(|| panic!("`{from}` -> `{to}` should have a predicate to count"))
+        };
+        for (from, to) in [
+            ("date", "timestamp without time zone"),
+            ("date", "timestamp with time zone"),
+        ] {
+            let got = predicate(from, to);
+            assert!(
+                got.contains("<> 'infinity'::date"),
+                "`{from}` -> `{to}` counts a value the engine keeps: {got}"
+            );
+            assert!(
+                got.contains("'294276-12-31'::date"),
+                "`{from}` -> `{to}` lost the calendar bound itself: {got}"
             );
         }
     }
