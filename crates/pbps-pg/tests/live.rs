@@ -17550,20 +17550,23 @@ async fn printed(conn: &mut Conn, set: &str, schema: &str, table: &str) -> i64 {
     .await
 }
 
-/// DECISIONS 406: a length probe is taken only over a rendering every session
-/// prints alike.
+/// DECISIONS 415: a length probe is measured in the session the statement will
+/// run in.
 ///
-/// A probe is issued before the deployment's transaction framing is established
-/// and the statement it clears runs after, so the two can render one stored
-/// value to two different lengths. Both halves are measured here against the
-/// engine, and in **both** directions: the `bytea` renders longer in the
-/// operator's session, so a length probe over it would refuse a change this
-/// engine makes; the `interval` renders shorter, so the same probe would clear
-/// one this engine refuses. A gate that only stopped the first would leave the
-/// worse of the two.
+/// This test was written for DECISIONS 406, which refused to measure a length
+/// at all over `bytea`, `interval` and the date-and-time types — because the
+/// probe ran under the operator's settings and the `ALTER` under the pinned
+/// ones. `run_probes` pins first now, so all three columns keep their probes
+/// and the claim becomes the stronger one: the probe and the statement agree.
+///
+/// The measured halves are kept, and in **both** directions, because they are
+/// what says the settings matter at all: the `bytea` renders *longer* in the
+/// operator's session and the `interval` renders *shorter*, so a probe taken
+/// in the wrong session goes wrong one way for one and the other way for the
+/// other.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-async fn a_length_only_the_operators_own_session_would_measure_is_never_probed() {
+async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -17616,41 +17619,52 @@ async fn a_length_only_the_operators_own_session_would_measure_is_never_probed()
         ],
     };
     let probes = Postgres::new().preflight(&cs);
-    let lengths: Vec<&str> = probes
+    let lengths = probes
         .iter()
-        .map(|p| p.sql.as_str())
-        .filter(|sql| sql.contains("length(rtrim"))
-        .collect();
+        .filter(|p| p.sql.contains("length(rtrim"))
+        .count();
     assert_eq!(
-        lengths.len(),
-        1,
-        "only the `integer`, which every session prints alike, keeps a length probe: {probes:#?}"
-    );
-    assert!(
-        lengths[0].contains("\"n\""),
-        "and it is the one over the integer column: {}",
-        lengths[0]
+        lengths, 3,
+        "every one of the three is measured now, not just the integer: {probes:#?}"
     );
 
-    // The session the statement runs in is the pinned one, so it is the one
-    // that decides — and it decides the two cases opposite ways.
+    // The session the probes are answered in is the session the statements run
+    // in, which is the whole change. Established exactly as the runner does.
+    conn.execute(pbps_dialect::Dialect::session_pins(&Postgres::new()).expect("this dialect pins"))
+        .await
+        .expect("the pins the runner establishes");
+
+    let measured = counts(&mut conn, &cs).await;
+    let counted_for = |table: &str| {
+        measured
+            .iter()
+            .find(|(d, _)| d.contains(&format!("{s}.{table}.v")) && d.contains("cannot become"))
+            .unwrap_or_else(|| panic!("a conversion probe for {table}: {measured:#?}"))
+            .1
+    };
+    // 6 characters into `varchar(6)`; 14 into `varchar(9)`; 10 into
+    // `varchar(6)`.
+    assert_eq!(counted_for("b"), 0, "{measured:#?}");
+    assert_eq!(counted_for("i"), 1, "{measured:#?}");
+    assert_eq!(counted_for("n"), 1, "{measured:#?}");
+
+    // And the engine, in that same session, agrees with each of them.
     conn.execute(&format!(
-        "SET bytea_output = 'hex'; SET IntervalStyle = 'postgres';
-         ALTER TABLE {s}.b ALTER COLUMN v TYPE varchar(6);"
+        "ALTER TABLE {s}.b ALTER COLUMN v TYPE varchar(6);"
     ))
     .await
-    .expect("the pinned session takes the bytea a probe over `escape` would have refused");
+    .expect("the pinned session takes the bytea its own probe cleared");
 
     let refused = conn
         .execute(&format!(
             "ALTER TABLE {s}.i ALTER COLUMN v TYPE varchar(9);"
         ))
         .await
-        .expect_err("the pinned session refuses the interval a probe over `sql_standard` cleared");
+        .expect_err("the pinned session refuses the interval its own probe counted");
     assert_eq!(
         sqlstate(&refused),
         "22001",
-        "value too long, on the row no probe was allowed to count: {refused}"
+        "value too long, on the row the probe counted: {refused}"
     );
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
@@ -18163,6 +18177,100 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
         );
         if let Some(e) = refused {
             assert_eq!(sqlstate(&e), "23502", "default {default:?}: {e}");
+        }
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// A length probe agrees with the engine for every rendering the pins decide
+/// (DECISIONS 415).
+///
+/// The narrow allow-list of DECISIONS 406 existed because the probe ran under
+/// the operator's settings and the `ALTER` under the pinned ones. `run_probes`
+/// now pins before it asks, so these eight sources get their probes back — and
+/// "back" has to mean *right*, which is what this measures: for each, the
+/// rendered length `L` read from the engine, then the probe and the engine
+/// asked the same two questions at `varchar(L)` and `varchar(L - 1)`.
+///
+/// The session is pinned here exactly as the runner pins it, because that is
+/// the claim: under those settings the two agree on the same character.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_decide() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("renders");
+    fresh(&mut conn, &s).await;
+    conn.execute(pbps_dialect::Dialect::session_pins(&Postgres::new()).expect("this dialect pins"))
+        .await
+        .expect("the pins the runner establishes");
+
+    for (declared, literal) in [
+        ("bytea", "'\\x0102'"),
+        ("interval", "'1 day 02:00:00'"),
+        ("date", "'2026-01-02'"),
+        ("time without time zone", "'12:00:00'"),
+        ("time with time zone", "'12:00:00'"),
+        ("timestamp without time zone", "'2026-01-02 12:00'"),
+        ("timestamp with time zone", "'2026-01-02 12:00'"),
+        ("real", "'0.1'"),
+        ("double precision", "(1.0/3.0)"),
+    ] {
+        let fixture = format!(
+            "DROP TABLE IF EXISTS {s}.t;
+             CREATE TABLE {s}.t (v {declared});
+             INSERT INTO {s}.t VALUES ({literal}::{declared});"
+        );
+        conn.execute(&fixture).await.expect("the fixture");
+        // The length under the pins, read from the engine rather than
+        // remembered: a number in this file would be the thing under test.
+        let rendered = counted(
+            &mut conn,
+            &format!("SELECT length(rtrim(v::text, ' '))::int FROM {s}.t"),
+        )
+        .await;
+        assert!(rendered > 1, "{declared} rendered {rendered} characters");
+
+        for (bound, violates) in [(rendered, false), (rendered - 1, true)] {
+            conn.execute(&fixture).await.expect("the fixture");
+            let to = format!("character varying({bound})");
+            let cs = ChangeSet {
+                changes: vec![PlannedChange::new(Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().expect("a uid"),
+                    column: TableName::new(&s, "t").column("v"),
+                    from: ty(declared),
+                    to: ty(&to),
+                    from_nullable: true,
+                    to_nullable: true,
+                })],
+            };
+            let measured = counts(&mut conn, &cs).await;
+            assert_eq!(
+                one(&measured, "cannot become"),
+                i64::from(violates),
+                "{declared} -> {to}: {measured:#?}"
+            );
+
+            // No `USING`, deliberately: the statement the probe is about is
+            // the *assignment*, and an explicit cast to a bounded string
+            // truncates where the assignment refuses (DECISIONS 370). Written
+            // with one, this test passed a `bytea` into `varchar(5)`.
+            let refused = conn
+                .execute(&format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE {to}"))
+                .await
+                .err();
+            assert_eq!(
+                refused.is_some(),
+                violates,
+                "{declared} -> {to}: the engine said {refused:?}"
+            );
+            if let Some(e) = refused {
+                assert_eq!(sqlstate(&e), "22001", "{declared} -> {to}: {e}");
+            }
         }
     }
 

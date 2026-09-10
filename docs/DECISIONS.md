@@ -8698,3 +8698,61 @@ SPEC is in sync with all of these.
     `constant_default` for the same reason. SQL Server has the same defect at
     the same predicate, measured on the pinned image, and it is filed as #283
     rather than carried here.
+
+415. **A probe pins its own session, and the allow-list of 406 widens to every
+    type the catalogue holds.** The pins were established by
+    `transaction_framing().begin` on one path and by a `session_pins` call on
+    the other, and **both ran after `deploy::preflight` returned**. So every
+    probe was answered under whatever settings the operator's session carried,
+    while the statement it cleared ran under the nine pinned ones. Three
+    mechanisms, each measured on 18.6 and each of them refusing a plan this
+    engine takes:
+
+    - **A value rendered to text.** `'\x0102'::bytea` is 6 characters under the
+      pinned `hex` and 8 under `escape`; `'1 day 02:00:00'::interval` is 14
+      under the pinned `postgres` and 9 under `sql_standard`. Not consistently
+      one direction, so a length probe goes wrong both ways.
+    - **A literal the plan carries.** `CAST('01/02/2026' AS date)` is 2 January
+      under the pinned `MDY` and 1 February under `DMY`.
+    - **The operator's own declared expression.** One stored row `2026-01-15`
+      and a declared `CHECK (d < '02/01/2026')`: the probe counts 1 under
+      `DMY` and 0 under the pinned `MDY`, and the engine accepts the
+      constraint.
+
+    The fix is the ordering, not a guard. `preflight` pins as its first act, so
+    the edition read, the role checks and the rename impact scans are pinned
+    too; and `run_probes` — the probe loop, extracted — **pins again rather
+    than trusting its caller**, because it is the function whose answers depend
+    on it and a second `SET` batch costs nothing. The staged path keeps its own
+    call for the case that skips `preflight` entirely: a `--resume`.
+
+    A per-probe `SET` prefix stays refused, and DECISIONS 260 is why: measured,
+    `DateStyle` is read at parse analysis and *does* take effect for the next
+    statement of the same batch, while `standard_conforming_strings` is read by
+    the lexer and does not. A prefix that fixes five settings and misses the
+    one deciding where a string ends is worse than no prefix, and `Probe` is
+    one statement by contract.
+
+    **406's allow-list then had no reason left.** It becomes
+    `renders_alike_under_the_pins`, which admits every family the catalogue
+    holds — measured under the pins, the probe and the engine agree on the same
+    character for all nine sources that had lost it:
+
+    ```text
+    bytea 6   interval 14   date 10   time 8   timetz 11
+    timestamp 19   timestamptz 22   real 3   float8 18
+    ```
+
+    each `varchar(L)` accepted and each `varchar(L - 1)` refused. It stays a
+    check rather than being deleted because one reason survives and is not the
+    ordering: `lc_monetary` is **not** among the nine, and measured with all
+    nine pinned and only the locale changed, `1234.56::money` is `$1,234.56`
+    under `en_US.utf8` and `1.234,56 €` under `de_DE.utf8` — nine characters
+    and ten. `money` cannot reach a probe today because ADR-0012 §1 keeps the
+    catalogue closed; the test is driven from `CATALOGUE` itself so that
+    admitting it later fails loudly rather than measuring it wrong in silence.
+
+    What the ordering does **not** fix: a probe still evaluates the declared
+    expression, so a volatile function in a `CHECK` advances a sequence before
+    the plan's first statement. That is #274, and pinning a session does
+    nothing about a side effect.

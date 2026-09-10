@@ -4291,11 +4291,11 @@ async fn apply_staged_under_lock(
     // Established here rather than once per statement: it covers a `--resume`
     // on a fresh connection, which starts partway through the plan, and every
     // statement after the one that fails.
-    if let Some(pins) = dialect.session_pins() {
-        conn.execute(pins)
-            .await
-            .context("the session settings this dialect's statements depend on could not be set")?;
-    }
+    //
+    // Kept even though `preflight` now pins as its first act: a `--resume`
+    // skips `preflight` entirely, so this is the only place the resumed
+    // statements get their settings from (DECISIONS 415).
+    pin_session(conn, dialect).await?;
 
     let total = statements.len();
     // The names the catalog has right now. It starts at whatever the newest
@@ -4642,12 +4642,39 @@ async fn check_role_drops(
     Ok(())
 }
 
+/// The settings this dialect's statements depend on, established on the
+/// connection.
+///
+/// Idempotent by construction — it is a list of `SET`s — and issued from more
+/// than one place on purpose. See [`run_probes`], which does not trust its
+/// caller to have called this.
+async fn pin_session(conn: &mut Conn, dialect: &dyn pbps_dialect::Dialect) -> anyhow::Result<()> {
+    if let Some(pins) = dialect.session_pins() {
+        conn.execute(pins)
+            .await
+            .context("the session settings this dialect's statements depend on could not be set")?;
+    }
+    Ok(())
+}
+
 async fn preflight(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
     plan: &pbps_model::SavedPlan,
     rename_targets: &[pbps_mssql::impact::RenameTarget],
 ) -> anyhow::Result<()> {
+    // **The pins before the questions.** Every read below — the edition, the
+    // role checks, the rename impact scans and the probes — used to run under
+    // whatever settings the operator's own session happened to carry, while
+    // the statements they clear ran under the pinned ones, because the framing
+    // that pins them is opened *after* this function returns and the staged
+    // path sets them after this call. Measured on 18.6, that gap refuses valid
+    // plans in three separate ways (DECISIONS 415).
+    //
+    // Here rather than at the two call sites: a caller that forgets is a
+    // caller that gets the old bug back, and this function is the one whose
+    // answers depend on it.
+    pin_session(conn, dialect).await?;
     // The edition, asked again. `plan --db` checked it, but nothing binds a
     // saved plan to an environment: the same file can be applied to a different
     // server, or to the same one after an edition change, and an `ONLINE = ON`
@@ -4728,10 +4755,27 @@ async fn preflight(
         );
     }
 
+    run_probes(conn, dialect, &plan.changes).await
+}
+
+/// What this plan implies about the data, asked of the engine (SPEC §7.5).
+///
+/// **Pins its own session**, and does not take the caller's word for it. A
+/// probe reads a rendering, parses a plan literal and parses the operator's own
+/// declared expression, and all three are decided by settings the framing pins
+/// — which used to be established only *after* this ran (DECISIONS 415). A
+/// second `SET` batch costs nothing; a probe answered under the wrong settings
+/// refuses a plan this engine takes.
+async fn run_probes(
+    conn: &mut Conn,
+    dialect: &dyn pbps_dialect::Dialect,
+    changes: &pbps_model::ChangeSet,
+) -> anyhow::Result<()> {
+    pin_session(conn, dialect).await?;
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
-    let probes = dialect.preflight(&plan.changes);
+    let probes = dialect.preflight(changes);
     for probe in &probes {
         // A probe can still legitimately fail to run — a check whose expression
         // names a column this plan renames, say, since expression text is never
@@ -4796,8 +4840,7 @@ async fn preflight(
     // "No probe" is not "no risk". Saying so keeps the operator's attention
     // where the approval already put it, rather than letting a clean pre-flight
     // read as a clean bill of health.
-    let unprobed: Vec<&str> = plan
-        .changes
+    let unprobed: Vec<&str> = changes
         .risks()
         .into_iter()
         .filter(|r| {
@@ -4929,6 +4972,98 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// DECISIONS 415: a probe is answered under the settings the statement it
+    /// clears will run under, because [`run_probes`] pins them itself.
+    ///
+    /// The operator's own session is the hostile one here, and it is hostile in
+    /// the way a real one is: `DateStyle` set on the connection, as a
+    /// `ALTER ROLE … SET` or a `PGOPTIONS` would. One stored row `2026-01-15`
+    /// and the declared `CHECK (d < '02/01/2026')` — 1 February under `DMY`,
+    /// 2 January under the pinned `MDY`. The engine takes the constraint; a
+    /// probe parsed under `DMY` counts the row and refuses it.
+    ///
+    /// Asserted against the engine's own verdict on the very statement, not
+    /// against a remembered count: the two have to agree, and either one alone
+    /// can be wrong for its own reasons.
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    fn a_probe_is_answered_under_the_settings_the_statement_will_run_under() {
+        // A runtime built by hand, as the flow suite does: this workspace's
+        // `tokio` carries `net`, `rt` and `time` and not `macros`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(a_probe_is_answered_under_the_pins());
+    }
+
+    async fn a_probe_is_answered_under_the_pins() {
+        use pbps_model::{Change, ChangeSet, CheckConstraint, PlannedChange};
+
+        let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &url)
+            .await
+            .expect("connect");
+
+        let schema = format!("pbps_pins_{}", std::process::id());
+        conn.execute(&format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE;
+             CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.t (d date);
+             INSERT INTO {schema}.t VALUES ('2026-01-15');"
+        ))
+        .await
+        .expect("the fixture");
+
+        // The operator's session, before pbps says anything.
+        conn.execute("SET DateStyle = 'ISO, DMY';")
+            .await
+            .expect("the operator's own setting");
+
+        let table: pbps_model::TableName = format!("{schema}.t").parse().expect("a table name");
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddCheck {
+                table: table.clone(),
+                name: "t_ck".to_owned(),
+                constraint: CheckConstraint {
+                    expression: "d < '02/01/2026'".to_owned(),
+                },
+            })],
+        };
+
+        let dialect = pbps_pg::Postgres::new();
+        let probed = run_probes(&mut conn, &dialect, &changes).await;
+
+        // And what the engine does with the statement the probe just judged,
+        // under the pins, which is where it will run. Established here rather
+        // than relied on from `run_probes`: the engine's verdict is this
+        // test's ground truth and must not move with the thing under test, or
+        // a regression fails on the wrong assertion.
+        conn.execute(
+            pbps_dialect::Dialect::session_pins(&dialect).expect("this dialect pins its session"),
+        )
+        .await
+        .expect("the pins the framing would establish");
+        let applied = conn
+            .execute(&format!(
+                "ALTER TABLE {schema}.t ADD CONSTRAINT t_ck CHECK (d < '02/01/2026');"
+            ))
+            .await;
+
+        let cleanup = conn
+            .execute(&format!("DROP SCHEMA {schema} CASCADE;"))
+            .await;
+        assert!(
+            applied.is_ok(),
+            "the engine takes this constraint under the pins: {applied:?}"
+        );
+        assert!(
+            probed.is_ok(),
+            "the probe refused a plan this engine takes: {probed:?}"
+        );
+        cleanup.expect("drop");
+    }
 
     /// `scope` drops a managed role's *plain* grant on an object nobody
     /// manages, with its reason recorded: that is the object's business. The

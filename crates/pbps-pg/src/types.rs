@@ -1084,56 +1084,52 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     }
 }
 
-/// Whether this type's text rendering is the same in **every** session — the
-/// question a length probe must answer before it may measure one.
+/// Whether this type's rendering is one the pins decide — the question a
+/// length probe must answer before it may measure one.
 ///
-/// A probe is issued before the deployment's transaction framing is
-/// established, so it runs under the operator's own settings while the
-/// statement it clears runs under the ones that framing pins (DECISIONS 267:
-/// `DateStyle`, `TimeZone`, `IntervalStyle`, `timezone_abbreviations`,
-/// `transform_null_equals`, `bytea_output`, `extra_float_digits`). Where a
-/// rendering moves between the two, the length the probe measures is not the
-/// length the `ALTER` will measure — and it goes wrong in **both** directions,
-/// which is why the answer is an allow-list and not a correction. Where the
-/// operator's rendering is the longer (a `bytea` under `escape`, a `timestamp`
-/// under `Postgres`), the probe counts rows this engine would have taken and a
-/// valid plan is refused. Where it is the shorter (an `interval` under
-/// `sql_standard`, a `float8` under a lower `extra_float_digits`), the probe
-/// counts nothing and clears a statement the engine then refuses — the exact
-/// failure a probe exists to prevent, arriving through the probe.
+/// **A probe now runs pinned.** `run_probes` establishes the nine settings
+/// before it asks anything, so the rendering a probe measures is the rendering
+/// the `ALTER` will measure (DECISIONS 415). That is what DECISIONS 389's
+/// allow-list existed to work around, and it is why this one is much wider:
+/// `bytea`, `interval`, the date-and-time types and the binary floats moved
+/// between the two sessions and no longer do.
 ///
-/// **Measured on 18.6**, each value rendered under the pinned setting and
-/// under another, as character counts:
+/// **Measured on 18.6** with the nine pinned, one row per family, the rendered
+/// length `L` taken with `length(rtrim(v::text, ' '))` and the engine asked
+/// twice:
 ///
 /// ```text
-/// bytea       '\x0102'              hex 6         escape 8
-/// interval    '1 day 02:00:00'      postgres 14   sql_standard 9
-/// timestamp   '2026-01-02 12:00'    ISO 19        Postgres 24
-/// timestamptz the same, +00         UTC 22        Asia/Kolkata 25
-/// float8      1.0/3.0               digits 1 18   digits 0 17   digits -5 12
+/// bytea        '\x0102'                 L=6    varchar(6) accepted   varchar(5) refused
+/// interval     '1 day 02:00:00'         L=14   varchar(14) accepted  varchar(13) refused
+/// date         '2026-01-02'             L=10   varchar(10) accepted  varchar(9) refused
+/// time         '12:00:00'               L=8    varchar(8) accepted   varchar(7) refused
+/// timetz       '12:00:00+00'            L=11   varchar(11) accepted  varchar(10) refused
+/// timestamp    '2026-01-02 12:00:00'    L=19   varchar(19) accepted  varchar(18) refused
+/// timestamptz  the same, +00            L=22   varchar(22) accepted  varchar(21) refused
+/// real         '0.1'                    L=3    varchar(3) accepted   varchar(2) refused
+/// float8       1.0/3.0                  L=18   varchar(18) accepted  varchar(17) refused
 /// ```
 ///
-/// The pinned column is the left one, and it is not consistently the longer or
-/// the shorter: `bytea` and the date-and-time types render longer unpinned,
-/// `interval` and `float8` render shorter.
+/// The boundary is exact in every one: the probe and the engine agree on the
+/// same character.
 ///
-/// and, with all of those settings changed at once against the pinned ones,
-/// `json` (37), `jsonb` (38), `uuid` (36), `boolean` (4) and `numeric` (10) do
-/// not move. A `date` does not move either — every `DateStyle` this engine has
-/// prints ten characters for one — but it stays excluded with the rest of its
-/// family rather than being carved out, because that equality is a coincidence
-/// of the styles that exist and not a property anything promises.
+/// # Why it is still a check at all
 ///
-/// This is an **allow-list**, and deliberately: a type this catalogue does not
-/// know renders however its own output function chooses, and `lc_monetary`,
-/// which decides how `money` prints, is not pinned at all — `CANONICAL_PATH`
-/// says why it cannot be. Silence for a rendering nobody measured is the
-/// answer this repo wants; a guess is not.
-fn renders_alike_everywhere(t: &ColumnType) -> bool {
-    matches!(
-        family(t),
-        Family::Exact(..) | Family::Bool | Family::Text { .. } | Family::Uuid | Family::Json { .. }
-    )
+/// Every name `CATALOGUE` holds is one of the families above, so today this
+/// answers `true` for every type that can reach it — `normalize` refuses the
+/// rest, and `cannot_become` is documented as taking normalized types. The
+/// check is not therefore decoration: it is the seam the day a type is added
+/// whose rendering **no pin reaches**.
+///
+/// There is a known candidate. `lc_monetary` is not among the nine and it
+/// decides how `money` prints: measured with all nine pinned and only the
+/// locale changed, `1234.56::money` is `$1,234.56` under `en_US.utf8` and
+/// `1.234,56 €` under `de_DE.utf8` — nine characters and ten. `money` is
+/// refused by the catalogue today for the unrelated reason that ADR-0012 §1
+/// keeps it closed; if it is ever admitted, it belongs on the other side of
+/// this function and the test below is what will say so.
+fn renders_alike_under_the_pins(t: &ColumnType) -> bool {
+    !matches!(family(t), Family::Unknown)
 }
 
 /// What a stored value must satisfy for `ALTER COLUMN … TYPE` to **fail** on
@@ -1152,7 +1148,7 @@ fn renders_alike_everywhere(t: &ColumnType) -> bool {
 /// `None` also where the count would be **measured wrong**: a length taken over
 /// a rendering the session settings move is not the length the `ALTER` takes,
 /// so a `bytea`, an `interval`, a date-and-time type or a binary float into a
-/// bounded string gets no probe at all. `renders_alike_everywhere` holds that
+/// bounded string gets no probe at all. `renders_alike_under_the_pins` holds that
 /// list and the measurements behind it.
 ///
 /// # Why this is a predicate and not a cast
@@ -1224,17 +1220,16 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
         // not `octet_length` — the bound is in characters, measured, `'王小明'`
         // is three of them and nine bytes and fits `varchar(3)`.
         //
-        // The guard is the whole difference between a length this engine will
-        // measure and one only the operator's session would:
-        // `renders_alike_everywhere` carries the measurements and the reason
-        // (DECISIONS 406).
+        // The guard is the seam for a rendering no pin reaches:
+        // `renders_alike_under_the_pins` carries the measurements and the
+        // reason (DECISIONS 415).
         (
             _,
             Family::Text {
                 len: Len::Bounded(n),
                 ..
             },
-        ) if renders_alike_everywhere(from) => {
+        ) if renders_alike_under_the_pins(from) => {
             Some(format!("length(rtrim(({value})::text, ' ')) > {n}"))
         }
 
@@ -2392,56 +2387,48 @@ mod tests {
         }
     }
 
-    /// A length probe is taken only over a rendering every session prints
-    /// alike (DECISIONS 406).
+    /// A length probe is taken over any rendering the pins decide, and over no
+    /// other (DECISIONS 415).
     ///
-    /// The probe runs before the deployment pins its settings and the `ALTER`
-    /// runs after, so a source whose `::text` moves with `bytea_output`,
-    /// `IntervalStyle`, `DateStyle`, `TimeZone` or `extra_float_digits` would
-    /// be measured under one rendering and converted under another — and the
-    /// unpinned one is the longer, so the count refuses a plan this engine
-    /// accepts. Both halves are asserted: the sources that keep their probe
-    /// matter as much as the ones that lose it, or the gate could be a rule
-    /// that switched every probe off.
+    /// `run_probes` pins the session before it asks anything, so a source whose
+    /// `::text` moves with `bytea_output`, `IntervalStyle`, `DateStyle`,
+    /// `TimeZone` or `extra_float_digits` is measured under the rendering the
+    /// `ALTER` will use — the whole reason DECISIONS 406's narrower list
+    /// existed.
+    ///
+    /// **Driven from `CATALOGUE` itself, deliberately.** A type added to the
+    /// catalogue whose rendering no pin reaches — `money` is the known
+    /// candidate, through `lc_monetary` — would otherwise be measured wrong in
+    /// silence. Here it fails this test instead, and whoever adds it has to
+    /// say which side of `renders_alike_under_the_pins` it belongs on.
+    ///
+    /// The second half is the one that stops the rule from becoming "always
+    /// yes": `money` and the rest are refused before `cannot_become` is ever
+    /// asked, and that refusal is what stands in for the guard today.
     #[test]
-    fn a_length_probe_is_taken_only_over_a_rendering_no_setting_moves() {
-        let probe = |from: &str| {
-            let from = normalize(&ty(from)).expect("a source type normalizes");
+    fn a_length_probe_is_taken_over_every_rendering_the_pins_decide_and_no_other() {
+        for (name, _) in CATALOGUE {
+            let from = normalize(&ty(name))
+                .unwrap_or_else(|e| panic!("`{name}` is in the catalogue and must normalize: {e}"));
             let to = normalize(&ty("character varying(6)")).expect("a target type normalizes");
-            cannot_become(&from, &to, "\"v\"")
-        };
-        for from in [
-            "integer",
-            "bigint",
-            "numeric(12,2)",
-            "boolean",
-            "uuid",
-            "text",
-            "character(9)",
-            "json",
-            "jsonb",
-        ] {
-            let got = probe(from);
+            // A same-family target is not a narrowing into bounded text, so
+            // the two string types answer this question elsewhere.
+            if matches!(family(&from), Family::Text { .. }) {
+                continue;
+            }
+            let got = cannot_become(&from, &to, "\"v\"");
             assert!(
                 got.as_deref().is_some_and(|p| p.contains("length(rtrim")),
-                "`{from}` renders the same in every session, so it keeps its probe: {got:?}"
+                "`{name}` renders as the pins decide, so it keeps its probe: {got:?}"
             );
         }
-        for from in [
-            "bytea",
-            "interval",
-            "date",
-            "timestamp without time zone",
-            "timestamp with time zone",
-            "time without time zone",
-            "real",
-            "double precision",
-        ] {
-            assert_eq!(
-                probe(from),
-                None,
-                "`{from}` renders differently under a setting the framing pins, \
-                 so no length may be measured for it"
+
+        // And the types no pin reaches never get that far: the catalogue is
+        // closed (ADR-0012 §1), so they are refused before any probe is built.
+        for spelling in ["money", "xml", "inet", "cidr", "tsvector"] {
+            assert!(
+                normalize(&ty(spelling)).is_err(),
+                "`{spelling}` must not reach a probe: nothing pins how it renders"
             );
         }
     }
