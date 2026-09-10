@@ -82,7 +82,13 @@ use crate::schema::Schema;
 /// build does not understand, and the remedy is the one that was always
 /// right for a stale artifact — run `plan --db` again and take the new plan
 /// through the gate.
-pub const CURRENT_VERSION: u32 = 6;
+///
+/// Bumped to 7 when intrinsic risk derivation began classifying `DropUnique`
+/// as destructive. A version 6 plan can carry no risk for that change, while
+/// this build derives `destructive`; without this bump, `validate_saved_plan`
+/// would reject it as an edited or broken artifact instead of identifying it as
+/// stale and asking for a new plan.
+pub const CURRENT_VERSION: u32 = 7;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -448,7 +454,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 6);
+        assert_eq!(CURRENT_VERSION, 7);
     }
 
     /// Sorting the keys must not sort away a difference. The same three

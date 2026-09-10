@@ -41,7 +41,8 @@ pub enum RiskClass {
     /// Rename. Views, stored procedures and applications that depend on the
     /// object will break.
     Rename,
-    /// Data loss: DROP COLUMN / TABLE / INDEX.
+    /// Data loss or loss of a uniqueness guarantee: DROP COLUMN / TABLE /
+    /// INDEX / UNIQUE constraint.
     Destructive,
     /// Type narrowing or an incompatible conversion: may truncate or fail.
     Narrowing,
@@ -1715,7 +1716,10 @@ impl Change {
     pub fn intrinsic_risks(&self) -> BTreeSet<RiskClass> {
         let mut r = BTreeSet::new();
         match self {
-            Change::DropTable { .. } | Change::DropColumn { .. } | Change::DropIndex { .. } => {
+            Change::DropTable { .. }
+            | Change::DropColumn { .. }
+            | Change::DropIndex { .. }
+            | Change::DropUnique { .. } => {
                 r.insert(RiskClass::Destructive);
             }
             // What a dropped module destroys is the validity of whatever
@@ -1792,7 +1796,6 @@ impl Change {
             }
             | Change::AlterColumnDefault { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
             | Change::DropCheck { .. }
             // Only the non-unique ones: the arm above has already taken the
@@ -1999,6 +2002,27 @@ mod tests {
         }
     }
 
+    fn drop_unique() -> Change {
+        Change::DropUnique {
+            table: "dbo.customer".parse().unwrap(),
+            name: "uq_customer_email".into(),
+        }
+    }
+
+    fn drop_foreign_key() -> Change {
+        Change::DropForeignKey {
+            table: "dbo.customer".parse().unwrap(),
+            name: "fk_customer_account".into(),
+        }
+    }
+
+    fn drop_check() -> Change {
+        Change::DropCheck {
+            table: "dbo.customer".parse().unwrap(),
+            name: "ck_customer_email".into(),
+        }
+    }
+
     fn add_column() -> Change {
         Change::AddColumn {
             uid: uid("c_p3n8vd"),
@@ -2015,6 +2039,20 @@ mod tests {
                 .intrinsic_risks()
                 .contains(&RiskClass::Destructive)
         );
+    }
+
+    #[test]
+    fn dropping_a_unique_constraint_is_destructive() {
+        assert_eq!(
+            drop_unique().intrinsic_risks(),
+            BTreeSet::from([RiskClass::Destructive])
+        );
+    }
+
+    #[test]
+    fn dropping_foreign_keys_and_checks_remains_ungated() {
+        assert!(drop_foreign_key().intrinsic_risks().is_empty());
+        assert!(drop_check().intrinsic_risks().is_empty());
     }
 
     #[test]
