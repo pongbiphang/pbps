@@ -573,7 +573,13 @@ length the statement takes — measured, a `bytea` prints longer under the
 operator's session and an `interval` prints shorter, so the same probe would
 refuse a valid plan in one case and clear a doomed statement in the other. Only
 sources every session prints alike are measured (389); the ordering itself is
-issue #257, a fourth path for #174.
+issue #257, a fourth path for #174. And a check on a table this plan retypes a
+column of is not probed at all: the conversion runs at rank 9 and the check is
+added at rank 13, so measured, a `numeric(10,2)` holding `1.50` converted to
+`numeric(10,0)` and then given `CHECK (v = round(v))` is accepted by the engine
+and counted as a violation by a probe over the stored value. A retype is the one
+plan change that leaves a probe able to run and quietly wrong, where a rename or
+an added column makes it fail loudly and the runner says so (393).
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a

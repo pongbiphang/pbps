@@ -8564,3 +8564,35 @@ SPEC is in sync with all of these.
     function that can see the rest of the plan. A caller mapping the
     single-change form over a change set would rebuild exactly the estimate
     that cannot be measured, and now cannot write it.
+
+393. **A retype is the one plan change that leaves a probe able to run and
+    wrong, so a probe over a retyped table is skipped rather than allowed to
+    answer.** `AlterColumnType` runs at rank 9 and `AddCheck` at rank 13, so
+    the engine tests a check against the *converted* value while a probe built
+    before any statement tests the stored one. **Measured on 18.6**: a
+    `numeric(10,2)` holding `1.50` and `2.25`, converted to `numeric(10,0)` and
+    then given `CHECK (v = round(v))`, stores `2` and `2` and the engine accepts
+    the constraint — while `WHERE NOT (v = round(v))` over the stored values
+    counts both rows and refuses the plan. A skip and not a projection: the
+    predicate is arbitrary SQL naming its own columns, and supplying converted
+    values would mean rewriting that text by substitution, which this module
+    refuses on principle (DECISIONS 259's neighbourhood). A skip and not a
+    failing probe either, which is how the same probe treats a renamed or an
+    added column: those make the probe *fail to run* and the runner reports
+    them by name, which is the more visible silence. A retype produces no error
+    at all, which is the one outcome no report can catch. The partial-index
+    probe already asked this question; the check probe did not, and one spelling
+    (`AsStored::retypes_in`) now serves both so they cannot drift apart again.
+
+    The rule is **per table, not per column**, and it is the coarser of two
+    answers on purpose. Narrowing it to "does this check's expression name the
+    retyped column" needs a name scan over arbitrary SQL, and that scan's
+    failures run the wrong way: a miss — a name spelled in another case, or
+    quoted with its quotes doubled, both of which the existing scan in
+    `crate::impact` gets wrong today — keeps a probe that refuses a valid plan,
+    while the coarse rule's failure only loses a probe the engine still
+    enforces. AGENTS.md's finding rules make the first mandatory to fix and the
+    second not, so the coarse rule is the safer error, and it is what the
+    partial-index probe beside it already does. The cost is real and is paid
+    knowingly: a plan that retypes any column of a table gets no check probe on
+    that table, even for a check over a column it does not touch.

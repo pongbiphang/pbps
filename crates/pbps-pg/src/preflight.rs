@@ -51,6 +51,15 @@
 //!   not a literal, which has no value until it runs (DECISIONS 124), and a key
 //!   spanning a column this plan *narrows*, whose projection would be a `CAST`
 //!   that can raise (DECISIONS 375).
+//! - **A check on a table this plan retypes a column of.** The conversion runs
+//!   at rank 9 and the check is added at rank 13, so the engine tests the
+//!   converted value while a probe tests the stored one. Measured, a
+//!   `numeric(10,2)` holding `1.50` converted to `numeric(10,0)` and then given
+//!   `CHECK (v = round(v))` is accepted by the engine and counted as a
+//!   violation by a probe over the stored value — a valid plan refused. The
+//!   predicate is arbitrary SQL that names its own columns, so supplying
+//!   converted values would mean rewriting that text by substitution, which
+//!   this module refuses; the answer is no probe (DECISIONS 393).
 //! - **A check whose expression the probe cannot evaluate here.** The text is
 //!   never rewritten for a rename — rewriting SQL by substitution is how a tool
 //!   that promised not to parse SQL starts parsing it badly — and an
@@ -734,6 +743,16 @@ impl AsStored {
             }
         }
         this
+    }
+
+    /// Whether this plan retypes any column of a table.
+    ///
+    /// One spelling, because two probes ask it and they must not drift apart:
+    /// a retype is the one plan change that leaves a probe *able* to run and
+    /// wrong, so whichever probe forgets to ask this is the one that refuses a
+    /// valid plan (DECISIONS 393).
+    fn retypes_in(&self, table: &TableName) -> bool {
+        self.retyped.keys().any(|c| c.table == *table)
     }
 
     /// The name the catalog has for a table this plan names, or `None` where
@@ -2370,7 +2389,7 @@ fn rows_after(
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
                 || names.columns.keys().any(|c| c.table == *table)
                 || names.columns_added.keys().any(|c| c.table == *table)
-                || names.retyped.keys().any(|c| c.table == *table)
+                || names.retypes_in(table)
             {
                 return Ok(None);
             }
@@ -2780,7 +2799,28 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // predicate: evaluating one needs every column of the row, and the
             // plan carries only the cells it sets. Unlike a foreign key, whose
             // columns *are* the constraint, so [`rows_after`] can build them.
-            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty()) {
+            //
+            // And a column this plan **retypes** takes the probe with it. The
+            // conversion runs at rank 9 and the check is added at rank 13, so
+            // the engine tests the converted value and a probe over the stored
+            // one tests a different value. **Measured on 18.6**: a
+            // `numeric(10,2)` holding `1.50` and `2.25`, converted to
+            // `numeric(10,0)` and then given `CHECK (v = round(v))` — the
+            // engine stores `2` and `2` and accepts the constraint, while
+            // `WHERE NOT (v = round(v))` over the stored values counts **both
+            // rows** and refuses the plan.
+            //
+            // A skip and not a projection: the predicate is arbitrary SQL that
+            // names its columns itself, and supplying converted values would
+            // mean rewriting that text by substitution — the thing this module
+            // refuses to do. A skip and not a failing probe, which is how the
+            // rename and added-column cases are handled two comments down:
+            // those make the probe *fail to run*, and the runner says so by
+            // name. A retype leaves the probe able to run and quietly wrong,
+            // which is the one outcome no report can catch (DECISIONS 393).
+            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
+                || names.retypes_in(table)
+            {
                 return Ok(Vec::new());
             }
             let mut sql = format!(
@@ -3132,6 +3172,54 @@ mod tests {
         assert!(
             probes[0].description.contains("app.status row `old`"),
             "{probes:#?}"
+        );
+    }
+
+    /// DECISIONS 393: a check on a table this plan retypes a column of gets no
+    /// probe, because the probe would read the value the conversion is about to
+    /// replace.
+    ///
+    /// The positive half is asserted first and matters as much: a check on a
+    /// table the plan leaves alone must still be probed, or the skip could be a
+    /// rule that switched every check probe off.
+    #[test]
+    fn a_check_on_a_table_this_plan_retypes_is_not_probed_against_the_old_values() {
+        let table: TableName = "app.t".parse().expect("a table name");
+        let check = |t: &TableName| Change::AddCheck {
+            table: t.clone(),
+            name: "t_rounded".to_owned(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "v = round(v)".to_owned(),
+            },
+        };
+        let retype = |t: &TableName| Change::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: t.column("v"),
+            from: "numeric(10,2)".parse().expect("a type"),
+            to: "numeric(10,0)".parse().expect("a type"),
+            from_nullable: true,
+            to_nullable: true,
+        };
+
+        let alone = probes(&set(vec![check(&table)]));
+        assert_eq!(alone.len(), 1, "a check on an untouched table is probed");
+        assert!(alone[0].sql.contains("v = round(v)"), "{}", alone[0].sql);
+
+        let retyped = probes(&set(vec![retype(&table), check(&table)]));
+        assert!(
+            retyped.iter().all(|p| !p.sql.contains("v = round(v)")),
+            "the conversion runs first, so the stored value is not the one the \
+             engine will test: {retyped:#?}"
+        );
+
+        // The retype has to be on *this* table. A conversion elsewhere in the
+        // plan says nothing about this check, and a rule phrased over the plan
+        // rather than the table would silence every probe in a busy plan.
+        let elsewhere: TableName = "app.other".parse().expect("a table name");
+        let split = probes(&set(vec![retype(&elsewhere), check(&table)]));
+        assert!(
+            split.iter().any(|p| p.sql.contains("v = round(v)")),
+            "{split:#?}"
         );
     }
 

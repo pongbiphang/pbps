@@ -16256,6 +16256,11 @@ fn one(counts: &[(String, i64)], needle: &str) -> i64 {
 /// statement the probe is about: the violating fixture is refused, the rows are
 /// repaired, the same probe counts nothing, and the same statement runs. A
 /// probe that passed for the wrong reason would have to survive both halves.
+///
+/// The conversion sits on a **table of its own**, and that is the rule and not
+/// tidiness: a plan that retypes a column of a table gets no check probe on
+/// that table at all (DECISIONS 393), so putting the retype on `customer` would
+/// silently delete the check probe from this test rather than measure it.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
@@ -16266,19 +16271,20 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
         "CREATE TABLE {s}.region (region_id integer PRIMARY KEY);
+         CREATE TABLE {s}.ticket (label text);
+         INSERT INTO {s}.ticket VALUES ('short'), ('far too long');
          CREATE TABLE {s}.customer (
              id integer NOT NULL,
              email text,
              region_id integer,
-             label text,
              amount numeric(10,2) NOT NULL
          );
          INSERT INTO {s}.region VALUES (1);
          INSERT INTO {s}.customer VALUES
-             (1, 'a@example.com', 1,  'short',      10.00),
-             (2, NULL,            1,  'far too long', -5.00),
-             (3, NULL,            99, 'short',      20.00),
-             (1, 'a@example.com', 1,  'short',      30.00);"
+             (1, 'a@example.com', 1,  10.00),
+             (2, NULL,            1,  -5.00),
+             (3, NULL,            99, 20.00),
+             (1, 'a@example.com', 1,  30.00);"
     ))
     .await
     .expect("the fixture");
@@ -16318,7 +16324,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
         },
         Change::AlterColumnType {
             uid: "c_bbbbbb".parse().expect("a uid"),
-            column: table.column("label"),
+            column: TableName::new(&s, "ticket").column("label"),
             from: ty("text"),
             to: ty("varchar(5)"),
             from_nullable: true,
@@ -16364,7 +16370,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
         "UPDATE {s}.customer SET email = 'filled@example.com' WHERE email IS NULL;
          UPDATE {s}.customer SET amount = 0 WHERE amount < 0;
          UPDATE {s}.customer SET region_id = 1 WHERE region_id = 99;
-         UPDATE {s}.customer SET label = 'short' WHERE length(label) > 5;
+         UPDATE {s}.ticket SET label = 'short' WHERE length(label) > 5;
          DELETE FROM {s}.customer WHERE ctid = (SELECT max(ctid) FROM {s}.customer WHERE id = 1);"
     ))
     .await
@@ -17717,6 +17723,100 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
         Rewrite::Yes,
         "and the static answer survives an ordinary table: {alter:#?}"
     );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// DECISIONS 393: a check on a table this plan retypes a column of is not
+/// probed, because the probe would read the value the conversion replaces.
+///
+/// The offline half asserts the absence. This is the half that says what the
+/// probe would have cost: the count it produces, and the engine's own verdict
+/// on the very statements it was about. A plan the engine accepts, refused by
+/// the number standing in front of it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_plan() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("retyped_check");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer PRIMARY KEY, v numeric(10,2));
+         INSERT INTO {s}.t VALUES (1, 1.50), (2, 2.25);"
+    ))
+    .await
+    .expect("the fixture");
+
+    let table = TableName::new(&s, "t");
+    let check = Change::AddCheck {
+        table: table.clone(),
+        name: "t_rounded".to_owned(),
+        constraint: CheckConstraint {
+            expression: "v = round(v)".to_owned(),
+        },
+    };
+    let retype = Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().expect("a uid"),
+        column: table.column("v"),
+        from: ty("numeric(10,2)"),
+        to: ty("numeric(10,0)"),
+        from_nullable: true,
+        to_nullable: true,
+    };
+
+    // The probe this plan would have produced, had the skip not been there.
+    // Run by hand, so the count is the engine's and not the test's opinion.
+    let would_have_counted = counted(
+        &mut conn,
+        &format!("SELECT count(*)::int FROM {s}.t WHERE NOT (v = round(v))"),
+    )
+    .await;
+    assert_eq!(
+        would_have_counted, 2,
+        "both stored values fail the check as they stand"
+    );
+
+    // And the plan the engine actually runs, in the order the plan runs it:
+    // the conversion at rank 9, the check at rank 13.
+    conn.execute(&format!(
+        "ALTER TABLE {s}.t ALTER COLUMN v TYPE numeric(10,0);"
+    ))
+    .await
+    .expect("the conversion");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.t ADD CONSTRAINT t_rounded CHECK (v = round(v));"
+    ))
+    .await
+    .expect("the engine accepts the check against the converted values");
+
+    // So the probe must not be there to say otherwise.
+    let asked = Postgres::new().preflight(&ChangeSet {
+        changes: vec![
+            PlannedChange::new(retype),
+            PlannedChange::new(check.clone()),
+        ],
+    });
+    assert!(
+        asked.iter().all(|p| !p.sql.contains("v = round(v)")),
+        "a probe here counts {would_have_counted} and refuses a plan this engine took: {asked:#?}"
+    );
+
+    // The check alone, on a table nothing retypes, is still probed — and
+    // against the same rows, now converted, it counts nothing.
+    let alone = Postgres::new().preflight(&ChangeSet {
+        changes: vec![PlannedChange::new(check)],
+    });
+    let probed: Vec<&str> = alone
+        .iter()
+        .map(|p| p.sql.as_str())
+        .filter(|sql| sql.contains("v = round(v)"))
+        .collect();
+    assert_eq!(probed.len(), 1, "{alone:#?}");
+    assert_eq!(counted(&mut conn, probed[0]).await, 0, "{}", probed[0]);
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
