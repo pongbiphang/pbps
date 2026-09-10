@@ -566,7 +566,14 @@ sorting greatest, and a float overflow threshold written as the engine's own
 parent rows, declare the key that references them — is not refused for a
 violation the plan itself removes; and the orphan count compares under the
 referenced column's collation, spliced in from the catalog, because two columns
-collated differently cannot be compared at all (376).
+collated differently cannot be compared at all (376). What a probe may
+**measure** is bounded too: probes run before the deployment's framing pins the
+session, so a length taken over a rendering any pinned setting moves is not the
+length the statement takes — measured, a `bytea` prints longer under the
+operator's session and an `interval` prints shorter, so the same probe would
+refuse a valid plan in one case and clear a doomed statement in the other. Only
+sources every session prints alike are measured (389); the ordering itself is
+issue #257, a fourth path for #174.
 
 Rename impact (§7.4) is the inverse of the other engine's, measured:
 `pg_depend` holds an edge for a `BEGIN ATOMIC` function and **none** for a
@@ -578,7 +585,14 @@ the old name and fails the next time anybody calls it. So the advisory list is a
 name scan over the bodies `prosqlbody IS NULL` identifies, the carried objects
 are reported as their own list rather than buried or dropped, and nothing blocks
 a rename on this engine (377–381). What points at a module about to be dropped
-stays `modules`' question, answered there in full.
+stays `modules`' question, answered there in full. Both halves of a renamed
+column's name are taken back to the catalog's spelling, because a `RenameColumn`
+carries the declared, post-rename *table* and asking about it would refuse a
+valid plan (390); and the body scan steps by a character rather than a byte,
+because identifiers here are not ASCII and slicing a string off a character
+boundary panics (391). SQL Server has both defects in its own copy of this
+module, where the first makes the report come back empty rather than erroring:
+issues #256 and #262.
 
 The estimate is ADR-0012 §3's boundary, built: **cost is not risk**, and nothing
 in the module reads or produces a risk class — a test asserts it over the
@@ -595,7 +609,11 @@ foreign key is the one statement that locks a table nobody named — measured,
 anywhere (385). And where the answer is not a function of the declaration the
 estimate says so rather than guessing cheap: an unparsed default expression, a
 partitioned table, an inheritance parent, an indexed column being retyped, and
-`reltuples = -1`, which is "nobody has looked" and not "no rows" (386–388).
+`reltuples = -1`, which is "nobody has looked" and not "no rows" (386–388). An
+estimate names its table twice — as the plan has it, which the operator reads,
+and as the catalog has it, which is the only name the measurement may use — and
+the second is private with no public constructor beside it, so a caller cannot
+build the estimate that cannot be measured (392).
 
 **No SQL Server cost measurements were taken here either.** Whether
 `int -> bigint` is metadata-only there is still the open question ADR-0012's
