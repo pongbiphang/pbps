@@ -176,13 +176,26 @@ fn target_kind(
         .filter(|(id, _)| id.referenced_name().as_ref() == Some(object))
         .map(|(id, m)| (id, m.kind))
         .collect();
-    // Overloading is why `GrantTarget::Routine` exists (ADR-0009 §1), and this
-    // is the case that needs it. Measured: `GRANT EXECUTE ON ROUTINE gr.f` on
-    // an overloaded name is `routine name "gr.f" is not unique`, with the
-    // engine's own hint to name the argument list — a statement that fails
-    // after everything ordered before it has run. Refused here, where the
-    // remedy is a line in a file.
-    if answering.len() > 1 {
+    // Overloading is why `GrantTarget::Routine` exists (ADR-0009 §1), and a
+    // bare name is not that identity — so on this engine a routine is granted
+    // on by signature and by nothing else, however few overloads there are
+    // today.
+    //
+    // **Not only the ambiguous case.** With one overload the engine takes the
+    // bare `GRANT EXECUTE ON ROUTINE gr.f` happily, and the plan still never
+    // converges: `pull` reads every routine grant back out of `pg_proc` as
+    // `app.f(integer)` — the signature is all the catalog has — so a
+    // declaration spelling it `app.f` differs from the state on every
+    // comparison, and each plan revokes the signature and grants the bare name
+    // again for ever. The mirror of this is refused on the other engine, where
+    // nothing overloads and a signature is the spelling its catalog cannot
+    // produce (`pbps_mssql::validate::role`).
+    //
+    // (DECISIONS 381.) The two overloads case says more, because there the
+    // statement fails as well: measured, `GRANT EXECUTE ON ROUTINE gr.f` on an overloaded name is
+    // `routine name "gr.f" is not unique`, with the engine's own hint to name
+    // the argument list — after everything ordered before it has run.
+    if !answering.is_empty() {
         let mut signatures: Vec<String> = answering
             .iter()
             .map(|(id, _)| id.to_string())
@@ -190,20 +203,22 @@ fn target_kind(
             .into_iter()
             .collect();
         signatures.sort();
-        return Err(invalid(format!(
-            "`{object}` names {} overloads, so PostgreSQL cannot tell which one this grant is \
-             on (`routine name \"{object}\" is not unique`); write the signature instead — one \
-             of {}",
-            answering.len(),
-            signatures.join(", ")
-        )));
-    }
-    if let Some((_, kind)) = answering.first() {
-        return Ok(Some(match kind {
-            ModuleKind::Procedure => TargetKind::Procedure,
-            // A trigger has no `referenced_name`, and a view is not a
-            // `ModuleId::Routine`, so neither answers here.
-            ModuleKind::Function | ModuleKind::View | ModuleKind::Trigger => TargetKind::Function,
+        return Err(invalid(if signatures.len() == 1 {
+            format!(
+                "`{object}` is a routine, which this engine identifies by its signature and not \
+                 by its name (ADR-0009 §1): `pull` reads the grant back as `{}`, so a declaration \
+                 spelling it `{object}` would differ from the database on every plan and each \
+                 plan would revoke and re-grant it. Write `{}` instead",
+                signatures[0], signatures[0]
+            )
+        } else {
+            format!(
+                "`{object}` names {} overloads, so PostgreSQL cannot tell which one this grant is \
+                 on (`routine name \"{object}\" is not unique`); write the signature instead — \
+                 one of {}",
+                answering.len(),
+                signatures.join(", ")
+            )
         }));
     }
     // `EXECUTE` on a name the declarations hold only as a relation: the kind
@@ -460,7 +475,7 @@ mod tests {
             ("app.recent", &[Permission::Select]),
             ("app.f(integer)", &[Permission::Execute]),
             ("app.archive(integer)", &[Permission::Execute]),
-            ("app.solo", &[Permission::Execute]),
+            ("app.solo(integer)", &[Permission::Execute]),
         ]);
         let problems = messages("app_reader", &role);
         assert!(problems.is_empty(), "{problems:?}");
@@ -481,19 +496,27 @@ mod tests {
                 ("app.both", permissions),
             ])
         };
-        for permissions in [&[Permission::Execute][..], &[Permission::Select][..]] {
-            let problems = messages("app_reader", &both(permissions));
-            assert!(problems.is_empty(), "{permissions:?}: {problems:?}");
-        }
-        // The kind still decides what the word may be: a set with `execute` in
-        // it is the routine's, and `truncate` is not a routine's word. The
-        // emitter would write one `ON ROUTINE` statement carrying both.
+        // A table word on the bare name is the table's, and there is nothing
+        // wrong with it.
+        let problems = messages("app_reader", &both(&[Permission::Select]));
+        assert!(problems.is_empty(), "{problems:?}");
+        // `execute` chooses the other namespace, and there the bare name is
+        // not an identity at all: refused with the signature `pull` will
+        // write. The message is the routine's, not `execute does not apply to
+        // a table`.
+        let problems = messages("app_reader", &both(&[Permission::Execute]));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("app.both(integer)"), "{}", problems[0]);
+        // And a mixed set is the routine's too — `execute` is what chooses
+        // the namespace — so it is refused as one bare routine target rather
+        // than reported as `truncate does not apply to a function`: the
+        // spelling is what is wrong with it, and the kind check never runs.
         let problems = messages(
             "app_reader",
             &both(&[Permission::Execute, Permission::Truncate]),
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("a function"), "{}", problems[0]);
+        assert!(problems[0].contains("app.both(integer)"), "{}", problems[0]);
     }
 
     /// §1, and it is a refusal because the plan applies cleanly and the role
@@ -614,7 +637,7 @@ mod tests {
             ("app.recent", Permission::Execute, "a view"),
             ("app.f(integer)", Permission::Select, "a function"),
             ("app.archive(integer)", Permission::Truncate, "a procedure"),
-            ("app.solo", Permission::Usage, "a function"),
+            ("app.solo(integer)", Permission::Usage, "a function"),
         ];
         for (target, permission, article) in cases {
             let role = granting(&[
@@ -640,6 +663,34 @@ mod tests {
         let problems = messages("app_reader", &role);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("a function"), "{}", problems[0]);
+    }
+
+    /// ADR-0009 §1 again, and the case the engine itself accepts: with one
+    /// overload `GRANT EXECUTE ON ROUTINE app.solo` runs. The plan still never
+    /// converges — `pull` has only `pg_proc` to read a routine grant out of,
+    /// so it comes back as `app.solo(integer)` every time, differs from a
+    /// declaration spelling it `app.solo`, and every plan revokes the
+    /// signature and grants the bare name again.
+    ///
+    /// The mirror image is refused on the other engine, where nothing
+    /// overloads and the signature is the spelling its catalog cannot produce
+    /// (`pbps_mssql::validate::role`). One spelling per engine, and it is the
+    /// one that survives a round trip.
+    #[test]
+    fn a_bare_routine_name_is_refused_with_the_signature_the_pull_will_write() {
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.solo", &[Permission::Execute]),
+        ]);
+        let problems = messages("app_reader", &role);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("app.solo(integer)"), "{}", problems[0]);
+        // And the signature it names is accepted.
+        let role = granting(&[
+            ("schema::app", &[Permission::Usage]),
+            ("app.solo(integer)", &[Permission::Execute]),
+        ]);
+        assert!(messages("app_reader", &role).is_empty());
     }
 
     /// ADR-0009 §1. A bare name is not an identity where the kind overloads,

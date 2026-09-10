@@ -15070,6 +15070,13 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
     // The declarations the two grants come from. One role cannot hold both:
     // `app.f` is one key in the grant map, and a set with `execute` and
     // `select` in it is the mixed one `validate::role` refuses.
+    //
+    // The two are spelled differently on purpose. The relation takes the bare
+    // name — that is its identity — and the routine takes its signature,
+    // because the bare spelling is not one the catalog can give back
+    // (DECISIONS 381); the last assertion here is that refusal, and what makes
+    // it the *routine's* refusal rather than `execute does not apply to a
+    // table` is the namespace the permissions chose.
     let mut declared = Schema::default();
     declared
         .tables
@@ -15083,24 +15090,27 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
         },
     );
     let pg = Postgres::new();
-    let granting = |permission: Permission| {
+    let granting = |spelled: &str, permission: Permission| {
         let mut role = Role::default();
         role.grants.insert(
             "schema::app".parse().expect("a grant target"),
             [Permission::Usage].into_iter().collect(),
         );
         role.grants.insert(
-            "app.f".parse().expect("a grant target"),
+            spelled.parse().expect("a grant target"),
             [permission].into_iter().collect(),
         );
         role
     };
-    for permission in [Permission::Select, Permission::Execute] {
-        let problems = pg.validate_role(&role, &granting(permission), &declared);
-        assert!(problems.is_empty(), "{permission:?}: {problems:?}");
+    for (spelled, permission) in [
+        ("app.f", Permission::Select),
+        ("app.f(integer)", Permission::Execute),
+    ] {
+        let problems = pg.validate_role(&role, &granting(spelled, permission), &declared);
+        assert!(problems.is_empty(), "{spelled}: {problems:?}");
         let change = Change::Grant {
             role: role.clone(),
-            target: "app.f".parse::<GrantTarget>().expect("a grant target"),
+            target: spelled.parse::<GrantTarget>().expect("a grant target"),
             permissions: [permission].into_iter().collect(),
         };
         for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
@@ -15110,6 +15120,15 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
         }
     }
+    // The bare name with `execute` on it: refused, and refused as the routine
+    // it chose rather than as the table of the same name.
+    let problems = pg.validate_role(&role, &granting("app.f", Permission::Execute), &declared);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].to_string().contains("app.f(integer)"),
+        "{}",
+        problems[0]
+    );
 
     // Each landed on its own object, and on neither the other.
     let relacl = text(
@@ -15127,6 +15146,85 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
     assert!(!relacl.contains(&format!("{role}=X/")), "{relacl}");
     assert!(proacl.contains(&format!("{role}=X/")), "{proacl}");
     assert!(!proacl.contains(&format!("{role}=r/")), "{proacl}");
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+/// The bare spelling this engine accepts and this catalog cannot give back.
+///
+/// Measured here, both halves: `GRANT EXECUTE ON ROUTINE app.solo` runs where
+/// the name is not overloaded, and the pull reads that same grant back as
+/// `app.solo(integer)` — `pg_proc` holds the arguments and nothing remembers
+/// which spelling the statement used. A declaration spelling it `app.solo`
+/// would therefore differ from the database on every comparison, and each plan
+/// would revoke the signature and grant the bare name again for ever.
+///
+/// So `validate_role` refuses the bare form with the signature to write, the
+/// mirror of the refusal on the other engine, where nothing overloads and a
+/// signature is the spelling *its* catalog cannot produce.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_grant_is_read_back_by_signature_whatever_spelling_granted_it() {
+    use pbps_model::{Module, ModuleKind, Permission, Role};
+
+    let mut db = TestDb::create("barename").await;
+    let role = least_privilege_role(&mut db, "barename").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE FUNCTION app.solo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        // The bare spelling, which this engine takes because the name is not
+        // overloaded.
+        format!("GRANT EXECUTE ON ROUTINE app.solo TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["app.solo(integer)", "schema::app"],
+        "the catalog has the signature and only the signature"
+    );
+
+    // And the declaration that spells it the way the statement did is refused
+    // offline, naming what the pull will write.
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        "app.solo(integer)".parse().expect("a module id"),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "SELECT $1".to_owned(),
+        },
+    );
+    let mut bare = Role::default();
+    bare.grants.insert(
+        "schema::app".parse().expect("a grant target"),
+        [Permission::Usage].into_iter().collect(),
+    );
+    bare.grants.insert(
+        "app.solo".parse().expect("a grant target"),
+        [Permission::Execute].into_iter().collect(),
+    );
+    let problems = Postgres::new().validate_role(&role, &bare, &declared);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].to_string().contains("app.solo(integer)"),
+        "{}",
+        problems[0]
+    );
 
     cleanup_role(&mut db, &role).await;
     db.drop().await;
@@ -15237,9 +15335,16 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
         "CREATE SCHEMA app".to_owned(),
         "CREATE TABLE app.bits (b bit(3))".to_owned(),
         "CREATE TABLE app.\"sales(archive)\" (id integer)".to_owned(),
+        // A hidden relation with a *routine* of the same name beside it: the
+        // two are different objects here, so the routine does not answer for
+        // the table that was left out.
+        "CREATE TABLE app.f (b bit(3))".to_owned(),
+        "CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'".to_owned(),
         format!("GRANT USAGE ON SCHEMA app TO {role}"),
         format!("GRANT SELECT ON app.bits TO {role}"),
         format!("GRANT SELECT ON app.\"sales(archive)\" TO {role}"),
+        format!("GRANT SELECT ON app.f TO {role}"),
+        format!("GRANT EXECUTE ON ROUTINE app.f(integer) TO {role}"),
     ] {
         db.conn.execute(&sql).await.expect(&sql);
     }
@@ -15256,7 +15361,7 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
     assert_eq!(
         tables,
         ["app.sales(archive)"],
-        "the `bit(3)` table is left out of the pull and the other one is not"
+        "both `bit(3)` tables are left out of the pull and the other one is not"
     );
     assert_eq!(
         pulled
@@ -15268,8 +15373,8 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
             .keys()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        ["schema::app"],
-        "neither object grant is recorded"
+        ["app.f(integer)", "schema::app"],
+        "the routine stands; no grant on an object the pull left out does"
     );
     let mine: Vec<&str> = pulled
         .unexpressible
@@ -15277,7 +15382,7 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
         .filter(|u| u.role == role)
         .map(|u| u.what.as_str())
         .collect();
-    assert_eq!(mine.len(), 2, "{mine:?}");
+    assert_eq!(mine.len(), 3, "{mine:?}");
     assert!(
         mine.iter().any(|w| w.contains("did not record")),
         "{mine:?}"

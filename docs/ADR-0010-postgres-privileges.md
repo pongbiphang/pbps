@@ -501,6 +501,12 @@ had them.
   *and* a function, measured on 18.6. The offline check reads the namespace off
   the permission set exactly as the emitter does; reading the relation first
   refused a `GRANT EXECUTE` the engine runs.
+- **A routine grant has one spelling here, and it is the signature**
+  (DECISIONS 381). The bare name the engine accepts where nothing overloads is
+  not a spelling the catalog can give back — `pg_proc` holds the arguments and
+  nothing remembers the statement — so a declaration using it would differ from
+  the database on every plan. Refused offline, the mirror of the signature
+  refusal on the engine where nothing overloads.
 - **`maintain` needs two servers to test at all** (DECISIONS 374). The
   amendment above set the rule and this is what obeying it costs: the live
   suite and the `live-pg` CI job now start a pinned PostgreSQL 16 beside the

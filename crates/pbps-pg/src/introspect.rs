@@ -1144,14 +1144,22 @@ fn default_acl_objects(objtype: char) -> &'static str {
 /// their ACL rows arrive here all the same. `pbps_model::role::check` refuses
 /// a grant on a target the project does not declare, so a role written with
 /// one would make the schema `pull` just produced fail its own validation.
+///
+/// **In the target's own namespace.** An `Object` here came from a relation
+/// row — `target_of` builds one for no other kind — and relations and routines
+/// are two namespaces on this engine, so a routine of the same name does not
+/// answer for a table that was left out. Counted, a hidden table `app.f`
+/// beside a surviving routine `app.f(integer)` would put `SELECT ON app.f`
+/// into the role, and `validate::role` reads that bare name in the relation
+/// namespace and finds nothing there — the schema `pull` wrote, refused by
+/// this dialect's own check (DECISIONS 382).
 fn recorded(schema: &pbps_model::Schema, target: &pbps_model::GrantTarget) -> bool {
     match target {
         pbps_model::GrantTarget::Object(o) => {
             schema.tables.contains_key(o)
-                || schema
-                    .modules
-                    .keys()
-                    .any(|id| id.referenced_name().as_ref() == Some(o))
+                || schema.modules.iter().any(|(id, m)| {
+                    m.kind == ModuleKind::View && id.referenced_name().as_ref() == Some(o)
+                })
         }
         pbps_model::GrantTarget::Routine(r) => schema
             .modules
@@ -2930,6 +2938,53 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["schema::app"],
             "the schema grant stands; the one on the missing table does not"
+        );
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("did not record"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// And the object it did not record is looked for in the target's own
+    /// namespace. A relation ACL row becomes an `Object`, and a routine of the
+    /// same name is a different object on this engine — measured, a table
+    /// `co.f` and a function `co.f(integer)` coexist. Counted as an answer,
+    /// the hidden table's grant went into the role and `validate::role` then
+    /// refused the schema this pull had just written, looking for a relation
+    /// `app.f` that is not there.
+    #[test]
+    fn a_relation_left_out_is_not_answered_for_by_a_routine_of_the_same_name() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(Some("app_reader"), None, GrantedKind::Schema, "USAGE"),
+                // The routine `app.f(integer)` is in the pull; a table of that
+                // name would be too, and this fixture leaves it out.
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Routine('f'),
+                    "EXECUTE",
+                ),
+            ],
+            ..declaring('f', &["integer"])
+        });
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["app.f(integer)", "schema::app"],
+            "the routine grant stands; the one on the missing table does not"
         );
         assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
         assert!(

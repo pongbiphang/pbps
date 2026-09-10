@@ -8176,3 +8176,36 @@ SPEC is in sync with all of these.
     managed-set cut still applies to them; dropped instead, `pull` would write
     a role narrower than the database holds and the next plan would revoke what
     nobody removed (105).
+
+381. **One spelling per engine for a routine grant, and it is the one the
+    catalog gives back.** On PostgreSQL that is the signature, whatever the
+    statement used: measured, `GRANT EXECUTE ON ROUTINE app.solo` runs where
+    the name is not overloaded, and the pull reads it back out of `pg_proc` as
+    `app.solo(integer)` — nothing remembers which spelling was granted. A
+    declaration spelling it `app.solo` therefore differs from the database on
+    every comparison, and `diff_roles` compares targets by key: each plan
+    revokes the signature and grants the bare name again, for ever, and no
+    apply converges.
+
+    So `validate::role` refuses a bare `Object` target that names a routine —
+    not only the overloaded one 372 refuses for the engine's own `routine name
+    "app.f" is not unique` — with the signature to write instead. It is the
+    mirror of the refusal on the other engine, where nothing overloads and a
+    signature is the spelling *its* catalog cannot produce
+    (`pbps_mssql::validate::role`). Normalizing the two spellings instead would
+    have had to be repeated at every comparison site — the differ, the
+    post-apply verification, the managed-set cut — and a fold nobody repeats is
+    the drift that returns.
+
+    Which namespace the bare name is in is still 379's question: `select` on a
+    name that is a table and a routine is the table's and is accepted, and only
+    a set that chose the routine namespace reaches the refusal.
+
+382. **The pull's own existence check reads the target's namespace too.** 380
+    accepted any module answering to an `Object` target's name, and a routine
+    is not a relation here (379). A hidden table `app.f` beside a surviving
+    routine `app.f(integer)` therefore had its `SELECT` folded into the role
+    against the routine — and `validate::role` reads that bare relation name in
+    the relation namespace, finds nothing, and refuses the schema `pull` had
+    just written. An `Object` comes from a relation row and nothing else, so it
+    is answered for by a recorded table or view alone.
