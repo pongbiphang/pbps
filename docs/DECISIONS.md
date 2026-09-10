@@ -6534,6 +6534,14 @@ SPEC is in sync with all of these.
     identifier rule; the differ and the emitter's name scans hand it the
     dialect's, and the shared scanner keeps SQL Server's as its own.
 
+    **Amended: a doubled quote does not cost a literal its prefix.** The
+    scanner closed a `U&'…'` at the first quote of a doubled pair and reopened
+    an ordinary literal, which then had no prefix and swallowed no clause.
+    Measured, `U&'a''b' uescape '!'` is the string `a'b` — one literal, one
+    clause — and the word left as code matched a module named `uescape`. A
+    doubled quote is now read as a quote *inside* the literal, which is what
+    the engine reads it as.
+
     **Amended: a prefix letter is a prefix only where a name does not end
     there.** The emitter's own scan guarded `$` against opening a
     dollar-quoted literal in the middle of a name and guarded nothing else.
@@ -6595,6 +6603,18 @@ SPEC is in sync with all of these.
     table is read from the engine, not from memory, and a word a later engine
     reserves is a bare mention the scan still reads — an edge too many, in the
     direction the scan has always erred.
+
+318. **A quoting character doubled inside a name is one character of it.**
+    The name scans dropped every `"` from the lexed definition, so
+    `app."z""q"` read as `app.zq` while the candidate's own name was `z"q`:
+    the needle matched nothing, no edge was drawn, and with the dependent
+    sorting first its `CREATE` came before the view it selects from — a valid
+    plan refused. Measured, `CREATE VIEW dq."z""q"` names the view `z"q` and
+    a view over it is written `FROM dq."z""q"`; `[a]]b]` is the same rule one
+    engine over, and the emitters have always written a name that way
+    (`quote` doubles what it must). The unquoting keeps a doubled delimiter as
+    the single character it stands for, and the needle built from the declared
+    name carries it too.
 
 317. **A bare name is a reference only where the engine would look it up.**
     The scan read a bare word as a mention of a same-named module in *any*

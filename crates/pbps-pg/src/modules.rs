@@ -2179,7 +2179,10 @@ mod tests {
         // the name is written in, no case pass can break the cycle it made.
         let mut views = BTreeMap::new();
         views.insert(id("app.uescape"), module("SELECT * FROM app.z"));
-        views.insert(id("app.z"), module("SELECT U&'d!0061ta' uescape '!' AS s"));
+        views.insert(
+            id("app.z"),
+            module("SELECT U&'d!0061ta' uescape '!' AS s, U&'a''b' uescape '!' AS t"),
+        );
         assert_eq!(
             pbps_model::module::creation_order_with(
                 &views,

@@ -1197,8 +1197,22 @@ fn scannable_code(
     // With `keep_quotes`, every quoting character becomes `"` instead, for
     // the one needle that has to see them: a reserved word, which is a name
     // only where it is quoted (316).
+    //
+    // A *doubled* quoting character is one character of the name and not two
+    // delimiters — measured, `dq."z""q"` names the view `z"q` and `[a]]b]`
+    // names `a]b` — so it survives into the haystack, where the needle built
+    // from the declared name carries the same character (DECISIONS 318).
     let mut unquoted = String::with_capacity(lowered.len());
+    let mut skip_to = 0usize;
     for (i, ch) in lowered.char_indices() {
+        if i < skip_to {
+            continue;
+        }
+        if matches!(ch, '"' | ']') && lowered[i + ch.len_utf8()..].starts_with(ch) {
+            unquoted.push(ch);
+            skip_to = i + 2 * ch.len_utf8();
+            continue;
+        }
         match ch {
             '"' | '`' | '[' | ']' if keep_quotes => unquoted.push('"'),
             '"' | '`' => {}
@@ -1720,6 +1734,35 @@ mod tests {
             creation_order_with(&m, &ModuleDeps::default(), &lexis),
             vec![id("app.z"), id("app.y")]
         );
+    }
+
+    /// A quoting character doubled inside a name is one character of the
+    /// name: measured, `dq."z""q"` names the view `z"q`, and a view over it
+    /// is written `FROM dq."z""q"`. Read as two delimiters, the haystack said
+    /// `dq.zq`, the needle `dq.z"q` matched nothing, and with the dependent
+    /// sorting first its `CREATE` came before the view it selects from.
+    #[test]
+    fn a_quoting_character_doubled_inside_a_name_is_one_character_of_it() {
+        let m = modules(&[
+            ("app.a", "SELECT * FROM app.\"z\"\"q\""),
+            ("app.z\"q", "SELECT 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.z\"q"), id("app.a")]
+        );
+        // The bracket form is the same rule on the other engine.
+        let m = modules(&[
+            ("dbo.a", "SELECT * FROM [dbo].[z]]q]"),
+            ("dbo.z]q", "SELECT 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.z]q"), id("dbo.a")]
+        );
+        // And a name without one still reads as it did.
+        assert!(references("SELECT * FROM [dbo].[v]", &n("dbo.v")));
+        assert!(references("SELECT * FROM app.\"v\"", &n("app.v")));
     }
 
     /// A bare name resolves through the engine's lookup path: measured, on

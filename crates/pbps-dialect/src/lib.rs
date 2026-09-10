@@ -621,10 +621,12 @@ impl Lexicon {
     pub fn code_only(&self, definition: &str) -> String {
         enum At {
             Code,
-            /// Inside `'…'`: a doubled quote is the first closing and the
-            /// second opening again, and everything between is blanked either
-            /// way. `unicode` marks a `U&'…'`, which may carry a `UESCAPE
-            /// 'x'` after its closing quote.
+            /// Inside `'…'`: a doubled quote is a quote *inside* the
+            /// literal, and the literal it resumes is the same one.
+            /// `unicode` marks a `U&'…'`, which may carry a `UESCAPE 'x'`
+            /// after its closing quote — and which a doubled quote must not
+            /// cost it: measured, `U&'a''b' uescape '!'` is the string
+            /// `a'b`, clause and all.
             Literal {
                 unicode: bool,
             },
@@ -656,7 +658,13 @@ impl Lexicon {
             match at {
                 At::Literal { unicode } => {
                     blank(&mut out, ch);
-                    if ch == '\'' {
+                    if ch == '\'' && next == Some(b'\'') {
+                        // A quote inside the literal, not the end of it: the
+                        // prefix it opened with is still the prefix, and its
+                        // clause still follows the real closing quote.
+                        blank(&mut out, '\'');
+                        consumed_to = i + 2;
+                    } else if ch == '\'' {
                         at = At::Code;
                         // The clause belongs to the literal it follows —
                         // measured, `U&'d!0061ta' UESCAPE '!'` is the string
@@ -2456,9 +2464,19 @@ UESCAPE '!' AS s";
                 "{text}"
             );
         }
-        // A doubled quote inside the literal does not open the lookahead.
+        // A doubled quote inside the literal is a quote of its own, and the
+        // clause still follows the real closing quote: measured,
+        // `U&'a''b' uescape '!'` is the string `a'b`.
         let doubled = "SELECT U&'a''b' AS s";
         assert_eq!(PG.code_only(doubled), blanked(doubled, &["U&'a''b'"]));
+        let both = "SELECT U&'a''b' uescape '!' AS s FROM es.z";
+        assert_eq!(PG.code_only(both), blanked(both, &["U&'a''b' uescape '!'"]));
+        // And a plain literal's doubled quote opens no lookahead at all.
+        let plain_doubled = "SELECT 'a''b' uescape '!' AS s";
+        assert_eq!(
+            PG.code_only(plain_doubled),
+            blanked(plain_doubled, &["'a''b'", "'!'"])
+        );
         // SQL Server has no such literal, so the word stays code.
         let tsql = "SELECT N'x' UESCAPE";
         assert_eq!(MSSQL.code_only(tsql), blanked(tsql, &["N'x'"]));

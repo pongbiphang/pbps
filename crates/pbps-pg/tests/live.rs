@@ -7881,6 +7881,55 @@ async fn a_type_name_ending_in_a_prefix_letter_is_not_a_literals_prefix() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// A quote doubled inside a name is one character of the name: measured,
+/// `s."z""q"` names the view `z"q`, and a view over it is written `FROM
+/// s."z""q"`. Read as two delimiters the scan found no edge at all, and with
+/// `a` sorting first its `CREATE` came before the view it selects from.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_quote_inside_a_name_is_read_as_part_of_it() {
+    let s = emit_schema("quoted_name_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.a").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT * FROM {s}.\"z\"\"q\""),
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.z\"q").parse().expect("a module id"),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS x"),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.z\"q"), format!("{s}.a")],
+        "the view that is selected from comes first, quote in its name and all"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT x::text FROM {s}.a")).await,
+        "1"
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
 /// A `UESCAPE` clause is part of the literal it follows: measured,
 /// `U&'d!0061ta' uescape '!'` is the string `data`, in either case. Read as
 /// code, the word
@@ -7905,7 +7954,7 @@ async fn a_uescape_clause_does_not_order_the_view_that_holds_it() {
         format!("{s}.z").parse().expect("a module id"),
         module(
             pbps_model::ModuleKind::View,
-            "SELECT U&'d!0061ta' uescape '!' AS s",
+            "SELECT U&'d!0061ta' uescape '!' AS s, U&'a''b' uescape '!' AS t",
         ),
     );
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
