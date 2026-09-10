@@ -880,8 +880,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // none of this project's business (DECISIONS 176).
         let target = match target_of(g, &signatures) {
             Ok(target) => target,
-            Err(what) => {
-                unexpressible(pulled, None, format!("role {grantee}: {what}"));
+            Err(e) => {
+                unexpressible(pulled, e.target, format!("role {grantee}: {}", e.what));
                 continue;
             }
         };
@@ -1179,10 +1179,38 @@ fn recorded(schema: &pbps_model::Schema, target: &pbps_model::GrantTarget) -> bo
     }
 }
 
+/// A grant this model cannot hold, and the object it is on where there is one.
+///
+/// The target is carried through the refusal because it is what scopes the
+/// report to the managed set (`deploy::unexpressible_permissions`): reported
+/// without one, a `SELECT` on somebody else's materialized view refused every
+/// connected plan, where the ordinary grant beside it on that same object is
+/// dropped as none of this project's business (DECISIONS 176). `None` is kept
+/// for the grants that really have no target a declaration could name.
+struct Unsupported {
+    what: String,
+    target: Option<pbps_model::GrantTarget>,
+}
+
+impl Unsupported {
+    /// A grant on an object this model does not declare, but can name.
+    fn on(target: pbps_model::GrantTarget, what: String) -> Self {
+        Unsupported {
+            what,
+            target: Some(target),
+        }
+    }
+
+    /// A grant whose target no declaration could write down at all.
+    fn nameless(what: String) -> Self {
+        Unsupported { what, target: None }
+    }
+}
+
 fn target_of(
     g: &RawGrant,
     signatures: &BTreeMap<i64, Vec<&str>>,
-) -> Result<pbps_model::GrantTarget, String> {
+) -> Result<pbps_model::GrantTarget, Unsupported> {
     let Some(object) = g.object.as_deref() else {
         return Ok(pbps_model::GrantTarget::Schema(g.schema.clone()));
     };
@@ -1198,20 +1226,26 @@ fn target_of(
         // same insert into an identity column succeeds. The model has no
         // sequence to grant on, so the grant is reported rather than dropped:
         // dropped, `pull` would write a role that cannot insert.
-        GrantedKind::Relation('S') => Err(format!(
-            "{} on sequence `{name}` is a grant on a sequence, which this model does not declare \
-             — an identity column needs no such grant and a `serial` column does, which is why \
-             `serial` is refused at load (ADR-0010 §7)",
-            g.permission
+        GrantedKind::Relation('S') => Err(Unsupported::on(
+            pbps_model::GrantTarget::Object(name.clone()),
+            format!(
+                "{} on sequence `{name}` is a grant on a sequence, which this model does not \
+                 declare — an identity column needs no such grant and a `serial` column does, \
+                 which is why `serial` is refused at load (ADR-0010 §7)",
+                g.permission
+            ),
         )),
         // A relation this model does not hold. **Measured**, a `GRANT SELECT`
         // on a materialized view and on a partitioned table both land in
         // `relacl` — so leaving them out of the read reported the role as
         // holding nothing on them, which is *absent* reading as *empty*.
-        GrantedKind::Relation(other) => Err(format!(
-            "{} on `{name}` is on {}, which this model does not declare",
-            g.permission,
-            relation_kind(other)
+        GrantedKind::Relation(other) => Err(Unsupported::on(
+            pbps_model::GrantTarget::Object(name.clone()),
+            format!(
+                "{} on `{name}` is on {}, which this model does not declare",
+                g.permission,
+                relation_kind(other)
+            ),
         )),
         // A routine, written with its signature: a name is not an identity
         // where the kind overloads (ADR-0009 §1).
@@ -1227,11 +1261,13 @@ fn target_of(
                     // this is a list and not a split string is that an
                     // argument may contain a comma.
                     Err(_) => {
-                        return Err(format!(
+                        // No target: the signature *is* the identity here, and
+                        // this is the argument that cannot be written down.
+                        return Err(Unsupported::nameless(format!(
                             "{} on `{name}` is on a routine whose argument `{spelled}` a \
                              declaration cannot spell",
                             g.permission
-                        ));
+                        )));
                     }
                 }
             }
@@ -1239,18 +1275,34 @@ fn target_of(
                 pbps_model::RoutineId::new(name, args),
             ))
         }
-        GrantedKind::Routine(other) => Err(format!(
-            "{} on `{name}` is on {}, which this model does not declare",
-            g.permission,
-            routine_kind(other)
-        )),
+        // An aggregate or a window function: named by signature like any
+        // other routine, so the managed-set cut can tell one on somebody
+        // else's object from one on this project's.
+        GrantedKind::Routine(other) => {
+            let what = format!(
+                "{} on `{name}` is on {}, which this model does not declare",
+                g.permission,
+                routine_kind(other)
+            );
+            let mut args = Vec::new();
+            for spelled in routine_args(g, signatures) {
+                let Ok(arg) = spelled.parse::<RoutineArg>() else {
+                    return Err(Unsupported::nameless(what));
+                };
+                args.push(arg);
+            }
+            Err(Unsupported::on(
+                pbps_model::GrantTarget::Routine(pbps_model::RoutineId::new(name, args)),
+                what,
+            ))
+        }
         // The schema arm is taken above, where `object` is `None`. A schema
         // row with an object name is a query and a struct that have drifted
         // apart, and it says so rather than picking one.
-        GrantedKind::Schema => Err(format!(
+        GrantedKind::Schema => Err(Unsupported::nameless(format!(
             "{} on `{name}` came back as a grant on a schema that also names an object",
             g.permission
-        )),
+        ))),
     }
 }
 
@@ -2847,6 +2899,55 @@ mod tests {
         ] {
             assert!(what.iter().any(|w| w.contains(named)), "{named}: {what:?}");
         }
+        // Each names the object it is on, because that is what scopes the
+        // report to the managed set: without a target, a `SELECT` on somebody
+        // else's materialized view refused every connected plan, where the
+        // ordinary grant on that same object is dropped (DECISIONS 176).
+        let targets: Vec<String> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| {
+                u.target
+                    .as_ref()
+                    .map_or("-".to_owned(), ToString::to_string)
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            ["app.mv", "app.parent", "app.remote", "app.agg()"],
+            "{:?}",
+            pulled.unexpressible
+        );
+    }
+
+    /// ADR-0010 §7's report names the sequence too, for the same reason: a
+    /// `serial` column's sequence in somebody else's schema is not this
+    /// project's business, and a report with no target is every project's.
+    #[test]
+    fn a_sequence_grant_names_the_sequence_it_is_on() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("ser_id_seq"),
+                GrantedKind::Relation('S'),
+                "USAGE",
+            )],
+            ..RawCatalog::default()
+        });
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert_eq!(
+            pulled.unexpressible[0]
+                .target
+                .as_ref()
+                .map(ToString::to_string),
+            Some("app.ser_id_seq".to_owned())
+        );
+        assert!(
+            pulled.unexpressible[0].what.contains("sequence"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
     }
 
     /// The `relkind` letters and the `prokind` letters overlap, and the
