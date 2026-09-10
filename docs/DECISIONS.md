@@ -8756,3 +8756,19 @@ SPEC is in sync with all of these.
     expression, so a volatile function in a `CHECK` advances a sequence before
     the plan's first statement. That is #274, and pinning a session does
     nothing about a side effect.
+
+416. **SQL Server rename impact takes both halves of a column name back to the
+    catalog's spelling.** `RenameColumn` carries the declared, post-rename
+    table because its statement runs after `RenameTable`; impact runs before
+    either statement. A plan renaming `dbo.client` to `dbo.customer` and
+    `email` to `contact_email` therefore described its impact target as
+    `dbo.customer.email`. `OBJECT_ID` returned NULL for that not-yet-existing
+    table, every dependency query joined against NULL, and even a
+    SCHEMABINDING view that blocks the rename came back as an empty report.
+
+    `RenameTarget::from_changes` builds the complete table-rename map first and
+    translates a column target through it. It does not rely on change order:
+    putting table renames before column renames is the emitter's concern, while
+    this code's concern is the catalog state before the plan begins. This is
+    the SQL Server instance of DECISIONS 407; unlike PostgreSQL's loud missing-
+    name error, SQL Server's NULL lookup made the wrong answer look clean.
