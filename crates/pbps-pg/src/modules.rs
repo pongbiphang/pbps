@@ -1647,7 +1647,7 @@ pub fn callers_by_name(declared: &Schema, id: &ModuleId) -> Vec<ModuleId> {
         .modules
         .iter()
         .filter(|(other, _)| *other != id)
-        .filter(|(_, m)| pbps_model::module::references_with(&m.definition, &name, &code_only))
+        .filter(|(_, m)| pbps_model::module::references_with(&m.definition, &name, &LEXIS))
         .map(|(other, _)| other.clone())
         .collect()
 }
@@ -1713,6 +1713,13 @@ fn code_only(definition: &str) -> String {
     crate::LEXICON.code_only(definition)
 }
 
+/// This engine's lexis for the model's name scans: its `code_only`, and its
+/// rule for where a word ends.
+const LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
+    code_only: &code_only,
+    continues_ident: pbps_dialect::continues_ident,
+};
+
 #[must_use]
 pub fn rebound_by_this_plan(
     declared: &Schema,
@@ -1745,7 +1752,7 @@ pub fn rebound_by_this_plan(
             let Some(name) = new.referenced_name() else {
                 continue;
             };
-            if pbps_model::module::references_with(&definition.definition, &name, &code_only) {
+            if pbps_model::module::references_with(&definition.definition, &name, &LEXIS) {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2111,9 +2118,25 @@ mod tests {
             pbps_model::module::creation_order_with(
                 &views,
                 &pbps_model::ModuleDeps::default(),
-                &code_only
+                &LEXIS
             ),
             vec![id("app.b"), id("app.a")]
+        );
+        // The prefix of a literal is not a name, and a non-breaking space
+        // does not end one: measured, `E'x'` is a literal and `x\u{a0}y` a
+        // three-character alias. Either, read the other way, made a cycle
+        // with the real edge and put the dependent first.
+        let mut views = BTreeMap::new();
+        views.insert(id("app.e"), module("SELECT * FROM APP.Z"));
+        views.insert(id("app.y"), module("SELECT * FROM app.z"));
+        views.insert(id("app.z"), module("SELECT E'x' AS s, 1 AS x\u{a0}y"));
+        assert_eq!(
+            pbps_model::module::creation_order_with(
+                &views,
+                &pbps_model::ModuleDeps::default(),
+                &LEXIS
+            ),
+            vec![id("app.z"), id("app.e"), id("app.y")]
         );
 
         // A trigger arriving is not a shadow, whatever its name: nothing calls

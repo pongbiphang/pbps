@@ -279,7 +279,7 @@ impl Probe {
 /// both answered the same — `SELECT /* a /* b */ c */ 1` returns `1` on either.
 /// A field no implementation varies is a field nobody maintains, and the
 /// abstraction worth having is the one two implementations draw (ADR-0014).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Lexicon {
     /// Every opener of a quoted identifier, with the character that closes it.
     ///
@@ -301,6 +301,30 @@ pub struct Lexicon {
     /// Whether `$tag$…$tag$` is a string literal — closed only by its own tag,
     /// with no escape sequences inside it at all.
     pub dollar_quoted_strings: bool,
+
+    /// The prefixes a string literal may carry, lower-cased and longest
+    /// first: part of the literal's token, not a name before it.
+    ///
+    /// **Measured** on PostgreSQL 18.6, `N'x'`, `B'101'`, `X'1F'`,
+    /// `U&'d\0061ta'` and `E'y'` are all literals, while `note'x'` is the
+    /// type `note` applied to a string — so only these spellings are blanked
+    /// with the literal, and only where nothing continues an identifier
+    /// before them. Left as code, the `E` of an escape string matched a
+    /// module named `e` and drew an edge that was not there (DECISIONS 315).
+    pub string_prefixes: &'static [&'static str],
+
+    /// Whether a character continues an unquoted identifier once one has
+    /// started — where a word ends, for every scan that looks for one.
+    ///
+    /// PostgreSQL's rule admits every non-ASCII byte, so a non-breaking space
+    /// is a name byte and `x\u{a0}y` one alias; SQL Server's is Unicode's
+    /// alphanumerics plus four symbols (DECISIONS 313, 315).
+    pub identifier_continues: fn(char) -> bool,
+}
+
+/// Standard SQL's identifier rule: letters, digits and `_`.
+fn ansi_identifier_continues(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 impl Lexicon {
@@ -311,6 +335,8 @@ impl Lexicon {
         quoted_identifiers: &[('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
+        string_prefixes: &["n"],
+        identifier_continues: ansi_identifier_continues,
     };
 
     /// The comparison form of a module definition, for the dialect this
@@ -700,6 +726,7 @@ impl Lexicon {
                         blank(&mut out, ch);
                     }
                     ('\'', _) => {
+                        self.blank_string_prefix(&mut out);
                         at = if self.escape_strings && opens_escape_string(definition, i) {
                             At::Escape {
                                 after_backslash: false,
@@ -726,6 +753,35 @@ impl Lexicon {
             }
         }
         out
+    }
+}
+
+impl Lexicon {
+    /// Blanks a string prefix that `out` ends with, where it is one: a
+    /// prefix is part of the literal's token, and a name before a literal is
+    /// something else — measured, `note'x'` is the type `note` applied to a
+    /// string, and `áE'a\'` that name applied to `a\` (see
+    /// [`continues_ident`]).
+    fn blank_string_prefix(&self, out: &mut String) {
+        for prefix in self.string_prefixes {
+            let n = prefix.len();
+            if out.len() < n || !out.is_char_boundary(out.len() - n) {
+                continue;
+            }
+            let start = out.len() - n;
+            if out[start..].eq_ignore_ascii_case(prefix)
+                && !out[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(self.identifier_continues)
+            {
+                out.truncate(start);
+                for _ in 0..n {
+                    out.push(' ');
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -1328,6 +1384,8 @@ mod tests {
         quoted_identifiers: &[('[', ']'), ('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
+        string_prefixes: &["n"],
+        identifier_continues: pbps_model::module::is_regular_identifier_continue,
     };
 
     /// PostgreSQL's, as `pbps-pg` states it.
@@ -1335,6 +1393,8 @@ mod tests {
         quoted_identifiers: &[('"', '"')],
         escape_strings: true,
         dollar_quoted_strings: true,
+        string_prefixes: &["u&", "e", "n", "b", "x"],
+        identifier_continues: continues_ident,
     };
 
     /// The row of ADR-0011 Amendment 2's table that points the other way from
@@ -1919,11 +1979,15 @@ mod code_only_tests {
         quoted_identifiers: &[('"', '"')],
         escape_strings: true,
         dollar_quoted_strings: true,
+        string_prefixes: &["u&", "e", "n", "b", "x"],
+        identifier_continues: continues_ident,
     };
     const MSSQL: Lexicon = Lexicon {
         quoted_identifiers: &[('[', ']'), ('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
+        string_prefixes: &["n"],
+        identifier_continues: pbps_model::module::is_regular_identifier_continue,
     };
 
     /// `text` with each of `regions` replaced by spaces, character for
@@ -1941,10 +2005,13 @@ mod code_only_tests {
     #[test]
     fn an_escape_string_is_one_literal_where_the_engine_has_them() {
         let text = "SELECT E'x\\' , es.a' AS s";
-        assert_eq!(PG.code_only(text), blanked(text, &["'x\\' , es.a'"]));
+        assert_eq!(PG.code_only(text), blanked(text, &["E'x\\' , es.a'"]));
         assert_eq!(MSSQL.code_only(text), blanked(text, &["'x\\'", "' AS s"]));
         // A doubled quote inside one does not close it either.
-        assert_eq!(PG.code_only("E'a''b' x"), blanked("E'a''b' x", &["'a''b'"]));
+        assert_eq!(
+            PG.code_only("E'a''b' x"),
+            blanked("E'a''b' x", &["E'a''b'"])
+        );
         // And the prefix has to be a token of its own: `note'x'` is a name
         // followed by a plain literal, whose backslash is a character.
         assert_eq!(
@@ -1960,7 +2027,7 @@ mod code_only_tests {
     #[test]
     fn a_dollar_quoted_string_is_read_as_code_because_a_routines_body_is_one() {
         let body = "() RETURNS int LANGUAGE sql AS $$ SELECT app.f('x', E'y\\'z') $$";
-        assert_eq!(PG.code_only(body), blanked(body, &["'x'", "'y\\'z'"]));
+        assert_eq!(PG.code_only(body), blanked(body, &["'x'", "E'y\\'z'"]));
         let datum = "SELECT $$ es.a $$ AS t";
         assert_eq!(PG.code_only(datum), datum);
         // `$` inside an identifier is a name byte on either engine.
@@ -1974,6 +2041,32 @@ mod code_only_tests {
         assert_eq!(PG.code_only(text), blanked(text, &["'a]b'"]));
         let bracketed = "SELECT [dbo].[a]]b], 'x'";
         assert_eq!(MSSQL.code_only(bracketed), blanked(bracketed, &["'x'"]));
+    }
+
+    /// Measured: `N'x'`, `B'101'`, `X'1F'`, `U&'d\0061ta'` and `E'y'` are
+    /// literals, and `note'x'` is the type `note` applied to a string. The
+    /// prefix goes with its literal; a name before a literal stays.
+    #[test]
+    fn a_literals_prefix_is_blanked_with_it_and_a_name_before_one_is_not() {
+        let text = "SELECT N'x', b'101', X'1F', u&'d\\0061ta', E'y', note'x', áE'a', e";
+        assert_eq!(
+            PG.code_only(text),
+            blanked(
+                text,
+                &[
+                    "N'x'",
+                    "b'101'",
+                    "X'1F'",
+                    "u&'d\\0061ta'",
+                    "E'y'",
+                    "'x'",
+                    "'a'"
+                ]
+            )
+        );
+        // SQL Server has the national prefix and nothing else.
+        let tsql = "SELECT N'x', E'y'";
+        assert_eq!(MSSQL.code_only(tsql), blanked(tsql, &["N'x'", "'y'"]));
     }
 
     #[test]

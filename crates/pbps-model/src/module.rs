@@ -792,14 +792,39 @@ pub struct Hints {
 /// and the environment is unchanged. The escape hatch for the cases it gets
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
-    references_with(definition, name, &code_only)
+    references_with(definition, name, &SHARED)
 }
 
-/// [`references`], with the definition lexed by `lex` rather than by the
-/// shared scanner — a dialect's own `code_only`, where the caller has one
-/// (DECISIONS 315).
-pub fn references_with(definition: &str, name: &ObjectName, lex: &dyn Fn(&str) -> String) -> bool {
-    references_in(&lex(definition), name, Case::Folded)
+/// What the name scans need of an engine's lexis: how a definition is
+/// reduced to code, and which characters continue an identifier.
+///
+/// Both are the engine's rules, and the second decides where a word ends —
+/// on PostgreSQL every non-ASCII byte continues a name, so `x\u{a0}y` is one
+/// alias and not `x` beside `y`; on SQL Server a non-breaking space is
+/// whitespace (DECISIONS 315).
+#[derive(Clone, Copy)]
+pub struct Lexis<'a> {
+    /// The definition with everything that is not code blanked out.
+    pub code_only: &'a dyn Fn(&str) -> String,
+    /// Whether a character continues an unquoted identifier.
+    pub continues_ident: fn(char) -> bool,
+}
+
+/// The shared scanner's own lexis: SQL Server's, which is where it came from.
+pub const SHARED: Lexis<'static> = Lexis {
+    code_only: &code_only,
+    continues_ident: is_regular_identifier_continue,
+};
+
+/// [`references`], with the definition read by `lexis` rather than by the
+/// shared scanner — a dialect's own, where the caller has one (DECISIONS 315).
+pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -> bool {
+    references_in(
+        &(lexis.code_only)(definition),
+        name,
+        Case::Folded,
+        lexis.continues_ident,
+    )
 }
 
 /// How the scan compares letters, narrowest last.
@@ -837,17 +862,23 @@ fn qualified(name: &ObjectName, case: Case) -> String {
 
 #[cfg(test)]
 fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
-    references_in(&code_only(definition), name, case)
+    references_in(
+        &code_only(definition),
+        name,
+        case,
+        is_regular_identifier_continue,
+    )
 }
 
-/// Whether `code` — a definition already lexed to code — mentions `name`.
-fn references_in(code: &str, name: &ObjectName, case: Case) -> bool {
-    let haystack = scannable_code(code, case);
+/// Whether `code` — a definition already lexed to code — mentions `name`,
+/// with words ending where `continues` says they do.
+fn references_in(code: &str, name: &ObjectName, case: Case, continues: fn(char) -> bool) -> bool {
+    let haystack = scannable_code(code, case, continues);
 
     // The qualified form, and the bare one — a definition written inside its
     // own schema very often omits the qualifier.
-    contains_word(&haystack, &qualified(name, case))
-        || contains_word(&haystack, &cased(&name.name, case))
+    contains_word(&haystack, &qualified(name, case), continues)
+        || contains_word(&haystack, &cased(&name.name, case), continues)
 }
 
 /// The definition with everything that is not code blanked out.
@@ -1064,10 +1095,18 @@ fn folded(s: &str) -> String {
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 #[cfg(test)]
 fn scannable(definition: &str, case: Case) -> String {
-    scannable_code(&code_only(definition), case)
+    scannable_code(&code_only(definition), case, is_regular_identifier_continue)
 }
 
-fn scannable_code(code: &str, case: Case) -> String {
+/// Whitespace to the scan: what Unicode calls whitespace **and the engine
+/// does not read as a name byte**. A non-breaking space continues an
+/// identifier on PostgreSQL, and read as a gap it split `x\u{a0}y` into a
+/// word the needle matched.
+fn is_a_gap(ch: char, continues: fn(char) -> bool) -> bool {
+    ch.is_whitespace() && !continues(ch)
+}
+
+fn scannable_code(code: &str, case: Case, continues: fn(char) -> bool) -> String {
     let lowered = cased(code, case);
     // A quoting character goes; a bracket that stood between two identifier
     // characters leaves a space behind. On PostgreSQL `[` is a subscript and
@@ -1081,14 +1120,11 @@ fn scannable_code(code: &str, case: Case) -> String {
         match ch {
             '"' | '`' => {}
             '[' | ']' => {
-                let glued = unquoted
-                    .chars()
-                    .next_back()
-                    .is_some_and(is_regular_identifier_continue)
+                let glued = unquoted.chars().next_back().is_some_and(continues)
                     && lowered[i + ch.len_utf8()..]
                         .chars()
                         .next()
-                        .is_some_and(|c| is_regular_identifier_continue(c) || c == '.');
+                        .is_some_and(|c| continues(c) || c == '.');
                 if glued {
                     unquoted.push(' ');
                 }
@@ -1098,7 +1134,7 @@ fn scannable_code(code: &str, case: Case) -> String {
     }
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
-        if ch.is_whitespace() {
+        if is_a_gap(ch, continues) {
             // From `out`, not from `unquoted`: what precedes this character in
             // the *result* is the dot itself when the whitespace between them
             // has already been dropped. Read from the input it was the first
@@ -1109,7 +1145,7 @@ fn scannable_code(code: &str, case: Case) -> String {
             let before = out.chars().next_back();
             let after = unquoted[i + ch.len_utf8()..]
                 .chars()
-                .find(|c| !c.is_whitespace());
+                .find(|c| !is_a_gap(*c, continues));
             // Whitespace that only separates a qualifier from its dot is
             // noise; everywhere else it is a boundary and must be kept.
             if before == Some('.') || after == Some('.') {
@@ -1122,13 +1158,13 @@ fn scannable_code(code: &str, case: Case) -> String {
 }
 
 /// Whether `needle` occurs with no identifier character on either side.
-fn contains_word(haystack: &str, needle: &str) -> bool {
+fn contains_word(haystack: &str, needle: &str, continues: fn(char) -> bool) -> bool {
     let mut from = 0;
     while let Some(at) = haystack[from..].find(needle) {
         let start = from + at;
         let end = start + needle.len();
-        if !is_ident_char(haystack[..start].chars().next_back())
-            && !is_ident_char(haystack[end..].chars().next())
+        if !is_ident_char(haystack[..start].chars().next_back(), continues)
+            && !is_ident_char(haystack[end..].chars().next(), continues)
         {
             return true;
         }
@@ -1141,8 +1177,8 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 /// `sales.dbo.active_customer`, and `active_customer` must not match inside
 /// `dbo.active_customer` — the qualified needle is tried first and answers that
 /// case properly.
-fn is_ident_char(c: Option<char>) -> bool {
-    c.is_some_and(|c| is_regular_identifier_continue(c) || c == '.')
+fn is_ident_char(c: Option<char>, continues: fn(char) -> bool) -> bool {
+    c.is_some_and(|c| continues(c) || c == '.')
 }
 
 /// Whether a character can continue an unquoted SQL Server identifier.
@@ -1151,7 +1187,7 @@ fn is_ident_char(c: Option<char>) -> bool {
 /// `is_alphanumeric`; SQL Server additionally admits these four symbols after
 /// the first character. Keyword and dependency scans share this boundary so
 /// `seq$null` cannot mean one token to one and two tokens to the other.
-pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
+pub fn is_regular_identifier_continue(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')
 }
 
@@ -1166,7 +1202,7 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 /// One edge the scan cannot supply: between the overloads of one routine name,
 /// which the scan cannot tell apart, only `depends_on:` orders (DECISIONS 212).
 pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
-    creation_order_with(modules, deps, &code_only)
+    creation_order_with(modules, deps, &SHARED)
 }
 
 /// [`creation_order`], with every definition lexed by `lex` — the dialect's
@@ -1181,14 +1217,15 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
 pub fn creation_order_with(
     modules: &BTreeMap<ModuleId, Module>,
     deps: &ModuleDeps,
-    lex: &dyn Fn(&str) -> String,
+    lexis: &Lexis<'_>,
 ) -> Vec<ModuleId> {
     let names: Vec<ModuleId> = modules.keys().cloned().collect();
     // Lexed once each, not once per comparison.
     let lexed: BTreeMap<&ModuleId, String> = modules
         .iter()
-        .map(|(name, module)| (name, lex(&module.definition)))
+        .map(|(name, module)| (name, (lexis.code_only)(&module.definition)))
         .collect();
+    let continues = lexis.continues_ident;
 
     // The edges for one comparison. Only the scanned ones move with it:
     // `depends_on:` and a trigger's target are identities, not text.
@@ -1227,7 +1264,7 @@ pub fn creation_order_with(
                 let referenced = !sibling
                     && other
                         .referenced_name()
-                        .is_some_and(|n| references_in(code, &n, case));
+                        .is_some_and(|n| references_in(code, &n, case, continues));
                 if declared || attached || referenced {
                     set.insert(other.clone());
                 }
@@ -1540,8 +1577,12 @@ mod tests {
         ]);
         let engine_reads_an_escape_string =
             |d: &str| d.replace("E'x\\' , app.a'", "               ");
+        let lexis = Lexis {
+            code_only: &engine_reads_an_escape_string,
+            continues_ident: is_regular_identifier_continue,
+        };
         assert_eq!(
-            creation_order_with(&m, &ModuleDeps::default(), &engine_reads_an_escape_string),
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
             vec![id("app.b"), id("app.a")]
         );
         // The shared scanner's reading: a cycle, broken by name order, which
@@ -1553,8 +1594,36 @@ mod tests {
         assert!(!references_with(
             "SELECT E'x\\' , app.a' AS s",
             &n("app.a"),
-            &engine_reads_an_escape_string
+            &lexis
         ));
+    }
+
+    /// Where a word ends is the engine's rule too: a non-breaking space
+    /// continues an identifier on PostgreSQL, so `x\u{a0}y` is one alias and
+    /// no mention of `y`; read as a gap, it was.
+    #[test]
+    fn a_word_ends_where_the_dialect_says_it_does() {
+        let every_non_ascii_byte_is_a_name_byte =
+            |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
+        let lexis = Lexis {
+            code_only: &code_only,
+            continues_ident: every_non_ascii_byte_is_a_name_byte,
+        };
+        let text = "SELECT 1 AS x\u{a0}y FROM app.z";
+        assert!(!references_with(text, &n("app.y"), &lexis));
+        assert!(references_with(text, &n("app.z"), &lexis));
+        assert!(
+            references(text, &n("app.y")),
+            "the shared scanner's reading"
+        );
+        let m = modules(&[
+            ("app.y", "SELECT * FROM app.z"),
+            ("app.z", "SELECT 1 AS x\u{a0}y"),
+        ]);
+        assert_eq!(
+            creation_order_with(&m, &ModuleDeps::default(), &lexis),
+            vec![id("app.z"), id("app.y")]
+        );
     }
 
     /// The escape hatch has to work where the scan sees nothing — a view

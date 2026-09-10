@@ -46,6 +46,10 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     quoted_identifiers: &[('"', '"')],
     escape_strings: true,
     dollar_quoted_strings: true,
+    // Measured: `N'x'`, `B'101'`, `X'1F'`, `U&'d\0061ta'` and `E'y'` are
+    // literals; `note'x'` is the type `note` applied to a string.
+    string_prefixes: &["u&", "e", "n", "b", "x"],
+    identifier_continues: pbps_dialect::continues_ident,
 };
 pub mod introspect;
 pub mod modules;

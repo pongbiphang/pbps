@@ -1131,7 +1131,53 @@ fn identity_element(element: &str) -> String {
     if let Some((_, identity)) = ROUTINE_ALIASES.iter().find(|(alias, _)| *alias == bare) {
         return (*identity).to_owned();
     }
-    bare
+    quoted_where_the_engine_quotes(&bare)
+}
+
+/// An unquoted name spelled the way the engine spells it in an identity:
+/// quoted where its `quote_identifier` would quote it.
+///
+/// The other half of [`as_the_engine_spells`]. **Measured**, `CREATE
+/// FUNCTION f(a s.Ätype)` and `(v r8.a\u{a0}b)` are accepted unquoted and
+/// identified as `f(s."Ätype")` and `f(r8."a\u{a0}b")` — the byte kept and
+/// the name quoted. Kept bare, the key was one `module_oid` compared against
+/// `format_type` and never matched, so the routine the plan had just created
+/// was not in the catalog to the next plan (313). Only a part that is one
+/// unquoted identifier is touched; a spelling with a modifier or a space in
+/// it is not a name this rule reads.
+fn quoted_where_the_engine_quotes(bare: &str) -> String {
+    let mut out = String::with_capacity(bare.len() + 2);
+    let mut rest = bare;
+    while !rest.is_empty() {
+        let len = if rest.starts_with('"') {
+            quoted_len(rest).unwrap_or(rest.len())
+        } else {
+            rest.find('.').unwrap_or(rest.len())
+        };
+        let part = &rest[..len];
+        // The character class alone, not the keyword table: a keyword
+        // written bare is a built-in the grammar admits — `bit(3)` is `bit` —
+        // never a user name, which the engine would not accept unquoted.
+        if !part.starts_with('"')
+            && !part.is_empty()
+            && part.chars().all(pbps_dialect::continues_ident)
+            && !part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            out.push('"');
+            out.push_str(part);
+            out.push('"');
+        } else {
+            out.push_str(part);
+        }
+        rest = &rest[len..];
+        if let Some(after) = rest.strip_prefix('.') {
+            out.push('.');
+            rest = after;
+        }
+    }
+    out
 }
 
 /// A quoted name spelled the way the engine spells it in an identity: bare
@@ -1536,6 +1582,16 @@ mod tests {
             ("zq.\"my\"\"q\"", "zq.\"my\"\"q\""),
             ("zq.\"1a\"", "zq.\"1a\""),
             ("zq.\"a b\"", "zq.\"a b\""),
+            // And an unquoted name is quoted where the engine quotes it —
+            // measured, `s.Ätype` and `r8.a\u{a0}b` are identified as
+            // `s."Ätype"` and `r8."a\u{a0}b"`; a plain one stays bare.
+            ("s.Ätype", "s.\"Ätype\""),
+            ("Ätype", "\"Ätype\""),
+            ("r8.a\u{a0}b", "r8.\"a\u{a0}b\""),
+            ("r8.x\u{a0}", "r8.\"x\u{a0}\""),
+            ("s.my_type", "s.my_type"),
+            ("S.MyType", "s.mytype"),
+            ("s.Ätype[]", "s.\"Ätype\"[]"),
             ("bpchar(3)", "character"),
             ("nchar(2)", "character"),
             ("national character varying(5)", "character varying"),
@@ -1588,11 +1644,6 @@ mod tests {
             // quoted name with the word inside it: neither is an array.
             "m2.myarray",
             "m2.\"my array\"",
-            // A non-breaking space is a name byte, not the gap before the
-            // keyword, a field qualifier or a modifier.
-            "m2.a\u{a0}array",
-            "m2.x\u{a0}",
-            "interval\u{a0}hour",
             // A pseudo-type, which no column may ever be.
             "anyelement",
             "record",
@@ -1604,6 +1655,16 @@ mod tests {
             "interval",
         ] {
             assert_eq!(arg(text), text, "{text}");
+        }
+        // A non-breaking space is a name byte, not the gap before the
+        // keyword, a field qualifier or a modifier — and a name holding one
+        // is quoted, as the engine quotes it.
+        for (text, spelled) in [
+            ("m2.a\u{a0}array", "m2.\"a\u{a0}array\""),
+            ("m2.x\u{a0}", "m2.\"x\u{a0}\""),
+            ("interval\u{a0}hour", "\"interval\u{a0}hour\""),
+        ] {
+            assert_eq!(arg(text), spelled, "{text}");
         }
     }
 

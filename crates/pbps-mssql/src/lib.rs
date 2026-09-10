@@ -61,6 +61,8 @@ impl Dialect for Mssql {
             quoted_identifiers: &[('[', ']'), ('"', '"')],
             escape_strings: false,
             dollar_quoted_strings: false,
+            string_prefixes: &["n"],
+            identifier_continues: pbps_model::module::is_regular_identifier_continue,
         }
     }
 

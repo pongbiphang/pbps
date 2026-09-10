@@ -5799,7 +5799,12 @@ SPEC is in sync with all of these.
     the grammar reserves in some position — and quoted everywhere else.
     Measured, `zq."my_type"` and `zq."zone"` are `zq.my_type` and `zq.zone`,
     while `zq."select"`, `zq."Order"` and `zq."möney"` keep their quotes; the
-    keyword table is read from `pg_get_keywords()`, not from memory.
+    keyword table is read from `pg_get_keywords()`, not from memory. The
+    same rule runs the other way for an unquoted name: measured, `s.Ätype`
+    and `r8.a\u{a0}b` declared bare are identified as `s."Ätype"` and
+    `r8."a\u{a0}b"`, and the key kept bare was one `module_oid` compared
+    against `format_type` and never matched — so the routine a plan had just
+    created was not in the catalog to the next.
 
 302. **A PostgreSQL trigger's table is in its identity *and* in its
     definition, and a declaration where the two disagree is refused.**
@@ -6460,3 +6465,15 @@ SPEC is in sync with all of these.
     which errs toward an edge that may not be there and never loses one that
     is — the direction the shared scanner already erred in. The body written
     as a plain `'…'` literal stays blanked, which is #228.
+
+    **Amended: the boundaries and the prefixes are the dialect's too.** A
+    literal's prefix is part of its token — measured, `N'x'`, `B'101'`,
+    `X'1F'`, `U&'d\0061ta'` and `E'y'` are literals, while `note'x'` is the
+    type `note` applied to a string — so `Lexicon` names the prefixes and
+    `code_only` blanks one with its literal; left as code, the `E` matched a
+    view named `e`. And where a word ends is the engine's rule: every
+    non-ASCII byte continues an identifier on PostgreSQL, so `x\u{a0}y` is
+    one alias, and the scan that read the byte as a gap found a word `y` in
+    it. The model's `Lexis` carries both the dialect's `code_only` and its
+    identifier rule; the differ and the emitter's name scans hand it the
+    dialect's, and the shared scanner keeps SQL Server's as its own.

@@ -7175,8 +7175,8 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         pbps_dialect::Dialect::normalize_routine_arg(&pg, &ascii_only)
             .expect("normalize")
             .as_str(),
-        "Ätype",
-        "and so does the dialect"
+        "\"Ätype\"",
+        "and so does the dialect, quoting the name as the engine does"
     );
     // And whitespace is ASCII to the engine for the same reason: a
     // non-breaking space is a name byte. Measured here, `a\u{a0}b` unquoted is
@@ -7208,8 +7208,8 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     let kept_folded = pbps_dialect::Dialect::normalize_routine_arg(&pg, &kept).expect("normalize");
     assert_eq!(
         kept_folded.as_str(),
-        format!("{s}.a\u{a0}b"),
-        "the fold leaves the byte alone"
+        format!("{s}.\"a\u{a0}b\""),
+        "the fold leaves the byte alone, and quotes the name as the engine does"
     );
     assert_eq!(
         text(
@@ -7827,6 +7827,67 @@ async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() 
         text(&mut conn, &format!("SELECT s FROM {s}.a")).await,
         format!("x' , {s}.a"),
         "and the literal reached the engine as the one string it is"
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
+/// Two views over a third are ordered after it whatever the third's text
+/// looks like to the other engine's lexer: the `E` of an escape string is not
+/// a name, and a non-breaking space does not end one.
+///
+/// **Measured**: `SELECT E'x' AS s, 1 AS x\u{a0}y` has the columns `s` and
+/// the three-character `x\u{a0}y`. Read with the shared scanner's rules, the
+/// `E` matched a view named `e` and the gap in `x\u{a0}y` exposed a word `y`
+/// — an edge from `z` to each, a cycle with each one's real edge to `z`, and
+/// name order put the dependent first (DECISIONS 315).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_literals_prefix_and_a_non_ascii_byte_are_not_names_the_order_is_decided_by() {
+    let s = emit_schema("prefix_order");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let mut declared = Schema::default();
+    for (name, body) in [
+        ("e", format!("SELECT * FROM {}.Z", s.to_uppercase())),
+        ("y", format!("SELECT * FROM {s}.z")),
+        ("z", "SELECT E'x' AS s, 1 AS x\u{a0}y".to_owned()),
+    ] {
+        declared.modules.insert(
+            format!("{s}.{name}").parse().expect("a module id"),
+            module(pbps_model::ModuleKind::View, &body),
+        );
+    }
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let created: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![format!("{s}.z"), format!("{s}.e"), format!("{s}.y")],
+        "the view both select from comes first"
+    );
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT string_agg(a.attname, ',' ORDER BY a.attnum) FROM pg_catalog.pg_attribute a
+                  WHERE a.attrelid = '{s}.y'::regclass AND a.attnum > 0"
+            ),
+        )
+        .await,
+        "s,x\u{a0}y",
+        "and the alias reached the engine as the one name it is"
     );
     drop_schema(&mut conn, &s).await;
 }
