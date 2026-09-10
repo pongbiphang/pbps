@@ -15429,6 +15429,144 @@ async fn a_least_privilege_role_can_read_the_roles_the_acls_and_the_drop_blocker
     db.drop().await;
 }
 
+/// The catalogs that hold an `aclitem[]`, enumerated **from the engine** and
+/// compared with what this crate reads.
+///
+/// The same shape as `every_catalog_keyed_by_an_object_is_read`, and for the
+/// same reason: a fifteenth column arriving in a later release is a grant a
+/// role holds and this reader never looks at, and a role that gained one out
+/// of band would compare equal on everything else and be called clean
+/// (DECISIONS 105). Enumerated rather than remembered, so the release that
+/// adds one fails here.
+///
+/// Three are deliberately not read as grants, and each says why.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn every_catalog_that_holds_a_grant_is_read() {
+    /// Read as a grant on a target a declaration can name.
+    const AS_A_TARGET: [&str; 3] = ["pg_class.relacl", "pg_namespace.nspacl", "pg_proc.proacl"];
+    /// Read and reported, because the model can name no part of the target.
+    const AS_A_REPORT: [&str; 8] = [
+        "pg_attribute.attacl",
+        "pg_database.datacl",
+        "pg_foreign_data_wrapper.fdwacl",
+        "pg_foreign_server.srvacl",
+        "pg_language.lanacl",
+        "pg_largeobject_metadata.lomacl",
+        "pg_parameter_acl.paracl",
+        "pg_type.typacl",
+    ];
+    /// Read by another query, or not a live grant at all.
+    const ELSEWHERE: [&str; 3] = [
+        // Not a grant on anything that exists: a standing instruction
+        // (ADR-0010 §2), read by its own query and reported as such.
+        "pg_default_acl.defaclacl",
+        // What an extension's objects had at *install*. A record of the past,
+        // not a permission anyone holds now.
+        "pg_init_privs.initprivs",
+        // A tablespace is a cluster object, not this database's; what holds a
+        // role across the cluster is `pg_shdepend`'s question (ADR-0010 §4).
+        "pg_tablespace.spcacl",
+    ];
+
+    let mut conn = connect().await;
+    let found = text(
+        &mut conn,
+        "SELECT string_agg(c.relname || '.' || a.attname, ',' ORDER BY 1)
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+          WHERE c.relnamespace = 'pg_catalog'::regnamespace
+            AND c.relkind = 'r'
+            AND a.atttypid = 'aclitem[]'::regtype",
+    )
+    .await;
+    let found: std::collections::BTreeSet<&str> = found.split(',').collect();
+    let known: std::collections::BTreeSet<&str> = AS_A_TARGET
+        .iter()
+        .chain(AS_A_REPORT.iter())
+        .chain(ELSEWHERE.iter())
+        .copied()
+        .collect();
+    let unread: Vec<&&str> = found.difference(&known).collect();
+    assert!(
+        unread.is_empty(),
+        "this release has an ACL column no part of this crate reads: {unread:?}"
+    );
+    let gone: Vec<&&str> = known.difference(&found).collect();
+    assert!(
+        gone.is_empty(),
+        "this reader names a column the engine does not have: {gone:?}"
+    );
+}
+
+/// The kinds this model does not declare hold real grants, and the pull says
+/// so rather than reporting the role as holding nothing on them.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost() {
+    let mut db = TestDb::create("unnameable").await;
+    let role = least_privilege_role(&mut db, "unnameable").await;
+    for sql in [
+        "CREATE SCHEMA app".to_owned(),
+        "CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS a".to_owned(),
+        "CREATE TABLE app.parent (id integer, at date) PARTITION BY RANGE (at)".to_owned(),
+        // A procedure of the *same name*, which relations and routines may
+        // have: `relkind` `p` is a partitioned table and `prokind` `p` is a
+        // procedure, so a reader that took the letter without the catalog
+        // would file the table's grant under `app.parent(integer)` — a target
+        // the declarations may well have, and therefore one the next plan
+        // would compare and revoke.
+        "CREATE PROCEDURE app.parent(a integer) LANGUAGE sql AS 'SELECT 1'".to_owned(),
+        "CREATE TYPE app.money_amount AS (whole integer, part integer)".to_owned(),
+        "CREATE SEQUENCE app.counter".to_owned(),
+        format!("GRANT USAGE ON SCHEMA app TO {role}"),
+        format!("GRANT SELECT ON app.mv TO {role}"),
+        format!("GRANT SELECT ON app.parent TO {role}"),
+        "REVOKE EXECUTE ON ROUTINE app.parent(integer) FROM PUBLIC".to_owned(),
+        format!("GRANT USAGE ON TYPE app.money_amount TO {role}"),
+        format!("GRANT USAGE ON SEQUENCE app.counter TO {role}"),
+        format!("GRANT USAGE ON LANGUAGE plpgsql TO {role}"),
+    ] {
+        db.conn.execute(&sql).await.expect(&sql);
+    }
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    // Only the schema grant is a grant: everything else is on a target no
+    // declaration can name.
+    assert_eq!(
+        pulled
+            .schema
+            .roles
+            .get(&role)
+            .expect("its own role is in the pull")
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["schema::app"]
+    );
+    let what: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| u.role == role)
+        .map(|u| u.what.as_str())
+        .collect();
+    for named in [
+        "a materialized view",
+        "a partitioned table",
+        "a type",
+        "a procedural language",
+        "sequence",
+    ] {
+        assert!(what.iter().any(|w| w.contains(named)), "{named}: {what:?}");
+    }
+
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
 /// Takes a role's grants back so the cluster will let go of it.
 ///
 /// A role is a cluster object and outlives the throwaway database (§3): left

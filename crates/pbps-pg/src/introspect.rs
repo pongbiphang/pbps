@@ -267,6 +267,7 @@ pub struct RawCatalog {
     pub roles: Vec<RawRole>,
     pub grants: Vec<RawGrant>,
     pub default_acls: Vec<RawDefaultAcl>,
+    pub other_grants: Vec<RawOtherGrant>,
     pub held_elsewhere: Vec<RawSharedDependency>,
 }
 
@@ -329,9 +330,14 @@ pub struct RawGrant {
     pub object: Option<String>,
     /// A routine's identity arguments, where the object is one.
     pub args: Option<String>,
-    /// `pg_class.relkind` for a relation, `f`/`p` for a routine from
-    /// `pg_proc.prokind`, and `n` for a schema.
-    pub kind: char,
+    /// Which catalog the row came from, and that catalog's own kind letter.
+    ///
+    /// A typed pair rather than one `char`, because the two alphabets overlap
+    /// and the overlap is not harmless: `relkind` `f` is a foreign table and
+    /// `prokind` `f` is a function, `relkind` `p` is a partitioned table and
+    /// `prokind` `p` is a procedure. Read as one letter, a grant on a foreign
+    /// table would have been read back as a grant on a function of that name.
+    pub kind: GrantedKind,
     /// The engine's own word: `SELECT`, `EXECUTE`, `MAINTAIN`.
     pub permission: String,
     /// `WITH GRANT OPTION`, which the model does not hold.
@@ -353,6 +359,54 @@ pub struct RawGrant {
     /// The object's owner, for the same reason: the owner's entry is the one
     /// `acldefault` puts there, not one anybody granted.
     pub owner: String,
+}
+
+/// What a grant's target is, by the catalog the row came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrantedKind {
+    /// `pg_class.relkind`: `r` table, `v` view, `S` sequence, `m`
+    /// materialized view, `p` partitioned table, `f` foreign table.
+    Relation(char),
+    /// `pg_proc.prokind`: `f` function, `p` procedure, `a` aggregate, `w`
+    /// window function.
+    Routine(char),
+    #[default]
+    Schema,
+}
+
+/// One grant in a catalog whose target the model cannot name at all
+/// (ADR-0010 §6, and DECISIONS 105 on the other engine).
+///
+/// **Enumerated from the engine rather than from memory**, which this crate has
+/// earned the hard way once already (`crate::modules::ATTACHED_BY_ADDRESS`).
+/// PostgreSQL 18 has fourteen `aclitem[]` columns in `pg_catalog`, and the
+/// query that says so is
+///
+/// ```sql
+/// SELECT c.relname || '.' || a.attname
+///   FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+///  WHERE c.relnamespace = 'pg_catalog'::regnamespace AND c.relkind = 'r'
+///    AND a.atttypid = 'aclitem[]'::regtype;
+/// ```
+///
+/// which `every_catalog_that_holds_a_grant_is_read` runs against the live
+/// server and compares with this reader's list. A fifteenth arriving in a
+/// later release fails that test instead of going unnoticed.
+///
+/// A role that gained `USAGE ON LANGUAGE c`, or `SET ON PARAMETER`, has
+/// changed — and a read that did not look would compare the grants it *did*
+/// see and call the role clean, which is the failure DECISIONS 105 records on
+/// SQL Server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawOtherGrant {
+    /// `None` is PUBLIC.
+    pub grantee: Option<String>,
+    /// The kind of object, in the words a message uses: `a type`,
+    /// `a language`.
+    pub class: String,
+    pub name: String,
+    pub permission: String,
+    pub grantable: bool,
 }
 
 /// One `ALTER DEFAULT PRIVILEGES` entry (ADR-0010 §2).
@@ -738,7 +792,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
     let mut closed_to_public: BTreeSet<String> = raw
         .grants
         .iter()
-        .filter(|g| matches!(g.kind, 'f' | 'p') && !g.defaulted)
+        .filter(|g| matches!(g.kind, GrantedKind::Routine('f' | 'p')) && !g.defaulted)
         .map(target_label)
         .collect();
 
@@ -747,7 +801,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             // PUBLIC. Context, never drift (ADR-0010 §5): it is not a role,
             // it cannot be declared, and comparing it would report every
             // database's default `EXECUTE` on every function as a difference.
-            if matches!(g.kind, 'f' | 'p') && g.permission == "EXECUTE" {
+            if matches!(g.kind, GrantedKind::Routine('f' | 'p')) && g.permission == "EXECUTE" {
                 closed_to_public.remove(&target_label(g));
                 public_executes.push(target_label(g));
             } else {
@@ -871,6 +925,48 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         ));
     }
 
+    // The catalogs whose targets no declaration can name. Grouped, because a
+    // database has as many of these as it has types: one line per
+    // (role, class, permission), naming the objects it covers.
+    let mut others: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    for g in &raw.other_grants {
+        let grantee = match g.grantee.as_deref() {
+            // PUBLIC holds `USAGE` on every built-in type and on `sql` and
+            // `plpgsql` in every database there is. Context, and not even
+            // interesting context: it is the same in every database, and
+            // listing it would bury the rows that are not.
+            None => continue,
+            Some(grantee) => grantee,
+        };
+        if !pulled.schema.roles.contains_key(grantee) {
+            continue;
+        }
+        let permission = if g.grantable {
+            format!("{} WITH GRANT OPTION", g.permission)
+        } else {
+            g.permission.clone()
+        };
+        others
+            .entry((grantee.to_owned(), g.class.clone(), permission))
+            .or_default()
+            .push(g.name.clone());
+    }
+    for ((role, class, permission), names) in others {
+        pulled.unexpressible.push(Unexpressible {
+            role: role.clone(),
+            // No target: the model cannot name one of these at all, which is
+            // the point. A role that gained one out of band has changed even
+            // where every grant the model *does* hold still matches
+            // (DECISIONS 105).
+            target: None,
+            what: format!(
+                "role {role}: {permission} on {class} is not something the declarations can \
+                 name — {}",
+                listed(&names)
+            ),
+        });
+    }
+
     for held in &raw.held_elsewhere {
         // ADR-0010 §4. Reported by the pull because it is the fact this
         // database's catalog hides: everything `pull` otherwise says about a
@@ -960,7 +1056,7 @@ fn target_of(g: &RawGrant) -> Result<pbps_model::GrantTarget, String> {
     match g.kind {
         // A table or a view: the two the model declares, and the two that
         // share `GRANT ... ON TABLE`.
-        'r' | 'v' => Ok(pbps_model::GrantTarget::Object(name)),
+        GrantedKind::Relation('r' | 'v') => Ok(pbps_model::GrantTarget::Object(name)),
         // ADR-0010 §7, and the other half of why `serial` is refused at load
         // (#77). A `serial` column creates a sequence the declaration never
         // named, and inserting into such a column needs a privilege on it —
@@ -968,28 +1064,67 @@ fn target_of(g: &RawGrant) -> Result<pbps_model::GrantTarget, String> {
         // same insert into an identity column succeeds. The model has no
         // sequence to grant on, so the grant is reported rather than dropped:
         // dropped, `pull` would write a role that cannot insert.
-        'S' => Err(format!(
-            "{} on sequence `{}` is a grant on a sequence, which this model does not declare — \
-             an identity column needs no such grant and a `serial` column does, which is why \
+        GrantedKind::Relation('S') => Err(format!(
+            "{} on sequence `{name}` is a grant on a sequence, which this model does not declare \
+             — an identity column needs no such grant and a `serial` column does, which is why \
              `serial` is refused at load (ADR-0010 §7)",
-            g.permission, name
-        )),
-        // A routine. Written with its signature, because a name is not an
-        // identity where the kind overloads (ADR-0009 §1).
-        'f' | 'p' => match g.args.as_deref().unwrap_or_default().parse::<RoutineArgs>() {
-            Ok(args) => Ok(pbps_model::GrantTarget::Routine(
-                pbps_model::RoutineId::new(name, args.0),
-            )),
-            Err(bad) => Err(format!(
-                "{} on `{name}` is on a routine whose argument `{bad}` a declaration cannot \
-                 spell",
-                g.permission
-            )),
-        },
-        other => Err(format!(
-            "{} on `{name}` is on a `{other}`, which this model does not declare",
             g.permission
         )),
+        // A relation this model does not hold. **Measured**, a `GRANT SELECT`
+        // on a materialized view and on a partitioned table both land in
+        // `relacl` — so leaving them out of the read reported the role as
+        // holding nothing on them, which is *absent* reading as *empty*.
+        GrantedKind::Relation(other) => Err(format!(
+            "{} on `{name}` is on {}, which this model does not declare",
+            g.permission,
+            relation_kind(other)
+        )),
+        // A routine, written with its signature: a name is not an identity
+        // where the kind overloads (ADR-0009 §1).
+        GrantedKind::Routine('f' | 'p') => {
+            match g.args.as_deref().unwrap_or_default().parse::<RoutineArgs>() {
+                Ok(args) => Ok(pbps_model::GrantTarget::Routine(
+                    pbps_model::RoutineId::new(name, args.0),
+                )),
+                Err(bad) => Err(format!(
+                    "{} on `{name}` is on a routine whose argument `{bad}` a declaration cannot \
+                     spell",
+                    g.permission
+                )),
+            }
+        }
+        GrantedKind::Routine(other) => Err(format!(
+            "{} on `{name}` is on {}, which this model does not declare",
+            g.permission,
+            routine_kind(other)
+        )),
+        // The schema arm is taken above, where `object` is `None`. A schema
+        // row with an object name is a query and a struct that have drifted
+        // apart, and it says so rather than picking one.
+        GrantedKind::Schema => Err(format!(
+            "{} on `{name}` came back as a grant on a schema that also names an object",
+            g.permission
+        )),
+    }
+}
+
+/// A `pg_class.relkind` in the words a message uses.
+fn relation_kind(relkind: char) -> &'static str {
+    match relkind {
+        'm' => "a materialized view",
+        'p' => "a partitioned table",
+        'f' => "a foreign table",
+        'c' => "a composite type",
+        _ => "a relation of a kind this reader does not know",
+    }
+}
+
+/// A `pg_proc.prokind` in the same words.
+fn routine_kind(prokind: char) -> &'static str {
+    match prokind {
+        'a' => "an aggregate",
+        'w' => "a window function",
+        _ => "a routine of a kind this reader does not know",
     }
 }
 
@@ -2159,14 +2294,14 @@ mod tests {
     fn grant(
         grantee: Option<&str>,
         object: Option<&str>,
-        kind: char,
+        kind: GrantedKind,
         permission: &str,
     ) -> RawGrant {
         RawGrant {
             grantee: grantee.map(str::to_owned),
             schema: "app".to_owned(),
             object: object.map(str::to_owned),
-            args: (kind == 'f' || kind == 'p').then(String::new),
+            args: matches!(kind, GrantedKind::Routine(_)).then(String::new),
             kind,
             permission: permission.to_owned(),
             grantable: false,
@@ -2187,12 +2322,27 @@ mod tests {
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
             grants: vec![
-                grant(Some("app_reader"), None, 'n', "USAGE"),
-                grant(Some("app_reader"), Some("customer"), 'r', "SELECT"),
-                grant(Some("app_reader"), Some("recent"), 'v', "SELECT"),
+                grant(Some("app_reader"), None, GrantedKind::Schema, "USAGE"),
+                grant(
+                    Some("app_reader"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("recent"),
+                    GrantedKind::Relation('v'),
+                    "SELECT",
+                ),
                 RawGrant {
                     args: Some("integer, text".to_owned()),
-                    ..grant(Some("app_reader"), Some("f"), 'f', "EXECUTE")
+                    ..grant(
+                        Some("app_reader"),
+                        Some("f"),
+                        GrantedKind::Routine('f'),
+                        "EXECUTE",
+                    )
                 },
             ],
             ..RawCatalog::default()
@@ -2222,7 +2372,7 @@ mod tests {
     fn the_engines_default_is_reported_and_never_compared_as_a_grant() {
         let defaulted = |grantee: Option<&str>, permission: &str| RawGrant {
             defaulted: true,
-            ..grant(grantee, Some("f"), 'f', permission)
+            ..grant(grantee, Some("f"), GrantedKind::Routine('f'), permission)
         };
         let pulled = assemble(&RawCatalog {
             roles: vec![role("deploy")],
@@ -2253,9 +2403,24 @@ mod tests {
         let pulled = assemble(&RawCatalog {
             roles: vec![role("deploy"), role("app_reader")],
             grants: vec![
-                grant(Some("deploy"), Some("customer"), 'r', "SELECT"),
-                grant(Some("deploy"), Some("customer"), 'r', "MAINTAIN"),
-                grant(Some("app_reader"), Some("customer"), 'r', "SELECT"),
+                grant(
+                    Some("deploy"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("deploy"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "MAINTAIN",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("customer"),
+                    GrantedKind::Relation('r'),
+                    "SELECT",
+                ),
             ],
             ..RawCatalog::default()
         });
@@ -2271,7 +2436,12 @@ mod tests {
     fn execute_revoked_from_public_is_reported_although_it_is_the_absence_of_a_row() {
         let pulled = assemble(&RawCatalog {
             roles: vec![role("deploy")],
-            grants: vec![grant(Some("deploy"), Some("f"), 'f', "EXECUTE")],
+            grants: vec![grant(
+                Some("deploy"),
+                Some("f"),
+                GrantedKind::Routine('f'),
+                "EXECUTE",
+            )],
             ..RawCatalog::default()
         });
         let said = pulled.warnings.join("\n");
@@ -2289,13 +2459,28 @@ mod tests {
             grants: vec![
                 RawGrant {
                     grantable: true,
-                    ..grant(Some("app_reader"), Some("customer"), 'r', "SELECT")
+                    ..grant(
+                        Some("app_reader"),
+                        Some("customer"),
+                        GrantedKind::Relation('r'),
+                        "SELECT",
+                    )
                 },
                 RawGrant {
                     column: Some("email".to_owned()),
-                    ..grant(Some("app_reader"), Some("customer"), 'r', "SELECT")
+                    ..grant(
+                        Some("app_reader"),
+                        Some("customer"),
+                        GrantedKind::Relation('r'),
+                        "SELECT",
+                    )
                 },
-                grant(Some("app_reader"), Some("customer_id_seq"), 'S', "USAGE"),
+                grant(
+                    Some("app_reader"),
+                    Some("customer_id_seq"),
+                    GrantedKind::Relation('S'),
+                    "USAGE",
+                ),
             ],
             ..RawCatalog::default()
         });
@@ -2317,6 +2502,175 @@ mod tests {
         // ADR-0010 §7: the other half of why `serial` is refused at load.
         assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
         assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+    }
+
+    /// The kinds this model does not declare still hold real grants —
+    /// **measured**, a `GRANT SELECT` on a materialized view and on a
+    /// partitioned table both land in `relacl` — so each is reported. Left out
+    /// of the read they would have made the role look as though it held
+    /// nothing there, which is *absent* reading as *empty*.
+    #[test]
+    fn a_grant_on_a_relation_kind_this_model_does_not_declare_is_reported() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(
+                    Some("app_reader"),
+                    Some("mv"),
+                    GrantedKind::Relation('m'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("parent"),
+                    GrantedKind::Relation('p'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("remote"),
+                    GrantedKind::Relation('f'),
+                    "SELECT",
+                ),
+                grant(
+                    Some("app_reader"),
+                    Some("agg"),
+                    GrantedKind::Routine('a'),
+                    "EXECUTE",
+                ),
+            ],
+            ..RawCatalog::default()
+        });
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        let what: Vec<&str> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| u.what.as_str())
+            .collect();
+        assert_eq!(what.len(), 4, "{what:?}");
+        for named in [
+            "a materialized view",
+            "a partitioned table",
+            "a foreign table",
+            "an aggregate",
+        ] {
+            assert!(what.iter().any(|w| w.contains(named)), "{named}: {what:?}");
+        }
+    }
+
+    /// The `relkind` letters and the `prokind` letters overlap, and the
+    /// overlap is not harmless: `f` is a foreign table in one alphabet and a
+    /// function in the other, `p` a partitioned table and a procedure. Read as
+    /// one letter, a grant on a foreign table came back as a grant on a
+    /// function of that name — a target the declarations may well have, and
+    /// therefore a grant the next plan would compare.
+    #[test]
+    fn the_relkind_and_prokind_alphabets_are_not_read_as_one() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![
+                grant(
+                    Some("app_reader"),
+                    Some("f"),
+                    GrantedKind::Relation('f'),
+                    "SELECT",
+                ),
+                RawGrant {
+                    args: Some("integer".to_owned()),
+                    ..grant(
+                        Some("app_reader"),
+                        Some("f"),
+                        GrantedKind::Routine('p'),
+                        "EXECUTE",
+                    )
+                },
+            ],
+            ..RawCatalog::default()
+        });
+        // The foreign table is unexpressible; the procedure is a grant.
+        assert_eq!(
+            pulled_role(&pulled, "app_reader")
+                .grants
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["app.f(integer)"]
+        );
+        assert_eq!(pulled.unexpressible.len(), 1, "{:?}", pulled.unexpressible);
+        assert!(
+            pulled.unexpressible[0].what.contains("a foreign table"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
+    }
+
+    /// A grant in a catalog whose target no declaration can name — a type, a
+    /// language, a parameter. Reported per role, class and permission, because
+    /// a database has as many of these as it has types; a role that gained one
+    /// out of band has changed, and a reader that never looked would compare
+    /// the grants it did see and call it clean (DECISIONS 105).
+    #[test]
+    fn a_grant_on_a_class_the_model_cannot_name_is_reported_grouped() {
+        let other = |grantee: Option<&str>, class: &str, name: &str| RawOtherGrant {
+            grantee: grantee.map(str::to_owned),
+            class: class.to_owned(),
+            name: name.to_owned(),
+            permission: "USAGE".to_owned(),
+            grantable: false,
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            other_grants: vec![
+                other(Some("app_reader"), "a type", "app.money"),
+                other(Some("app_reader"), "a type", "app.code"),
+                other(Some("app_reader"), "a procedural language", "plpgsql"),
+                // PUBLIC holds `USAGE` on every built-in type in every
+                // database there is: the same everywhere, so listing it would
+                // bury the rows that are not.
+                other(None, "a type", "text"),
+                // And a role this project cannot declare is not its business.
+                other(Some("someone_else"), "a type", "app.money"),
+            ],
+            ..RawCatalog::default()
+        });
+        let what: Vec<&str> = pulled
+            .unexpressible
+            .iter()
+            .map(|u| u.what.as_str())
+            .collect();
+        assert_eq!(what.len(), 2, "{what:?}");
+        assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(pulled.unexpressible.iter().all(|u| u.target.is_none()));
+        let types = what
+            .iter()
+            .find(|w| w.contains("a type"))
+            .expect("the type line");
+        assert!(types.contains("app.money"), "{types}");
+        assert!(types.contains("app.code"), "{types}");
+    }
+
+    /// `WITH GRANT OPTION` survives into the message on those classes too: a
+    /// role that can hand `USAGE` on a type onward is not the same as one that
+    /// merely holds it.
+    #[test]
+    fn a_grant_option_on_an_unnameable_class_is_said_rather_than_flattened() {
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            other_grants: vec![RawOtherGrant {
+                grantee: Some("app_reader".to_owned()),
+                class: "a type".to_owned(),
+                name: "app.money".to_owned(),
+                permission: "USAGE".to_owned(),
+                grantable: true,
+            }],
+            ..RawCatalog::default()
+        });
+        assert_eq!(pulled.unexpressible.len(), 1);
+        assert!(
+            pulled.unexpressible[0].what.contains("WITH GRANT OPTION"),
+            "{}",
+            pulled.unexpressible[0].what
+        );
     }
 
     /// A role with no grants is a role with no grants — not a missing one.

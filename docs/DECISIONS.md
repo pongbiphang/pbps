@@ -8068,3 +8068,40 @@ SPEC is in sync with all of these.
     in a source the seam deliberately does not carry (ADR-0014 §1), so a test
     matching on prose would pass on any failure at all — including the wrong
     one.
+
+376. **Every catalog that holds an `aclitem[]` is read, and the two kind
+    alphabets are kept apart by construction.** Two holes, one shape, both
+    found by sweeping the read this step had just written.
+
+    The relation arm filtered `relkind IN ('r','v','S')` — the kinds the model
+    declares. Measured, `GRANT SELECT` on a **materialized view** and on a
+    **partitioned table** both land in `relacl`, so the filter reported a role
+    as holding nothing on either: *absent* reading as *empty*, which is the
+    member of that set that reads as good news. The filter is now "not an index
+    and not a TOAST table" — the two that take no `GRANT` at all — and every
+    other kind is read and reported.
+
+    Widening it exposed the second hole. `pg_class.relkind` and
+    `pg_proc.prokind` overlap: `f` is a foreign table in one alphabet and a
+    function in the other, `p` a partitioned table and a procedure. Carried as
+    one `char`, a grant on a foreign table would have been read back as a grant
+    on a *function* of that name — a target the declarations may well have, and
+    therefore one the next plan would compare and revoke. `RawGrant::kind` is a
+    `GrantedKind` naming the catalog as well as the letter, so the two cannot
+    be read as one.
+
+    And the object catalogs are not the only ones. Enumerated from the engine
+    rather than from memory — the rule `crate::modules::ATTACHED_BY_ADDRESS`
+    already earned here — PostgreSQL 18 has **fourteen** `aclitem[]` columns in
+    `pg_catalog`. Three carry a target a declaration can name; eight more carry
+    a real grant on a target it cannot (a type, a language, a foreign server, a
+    configuration parameter, a large object, this database, a column), and each
+    is reported per role, class and permission rather than dropped: a role that
+    gained `USAGE ON LANGUAGE c` out of band has changed, and a reader that
+    never looked would compare the grants it did see and call it clean
+    (DECISIONS 105). Three are deliberately not read as grants and say why —
+    `pg_default_acl` is a standing instruction rather than a grant,
+    `pg_init_privs` records what an extension's objects had at *install*, and
+    `pg_tablespace` is a cluster object whose question is `pg_shdepend`'s. A
+    live test runs the enumerating query and compares it with that list, so a
+    fifteenth column in a later release fails there instead of going unnoticed.

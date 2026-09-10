@@ -29,8 +29,9 @@ use pbps_db::{Conn, DbError, Row};
 use pbps_model::{Schema, TableName};
 
 use crate::introspect::{
-    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawDefaultAcl, RawGrant, RawIdentity,
-    RawIndex, RawModule, RawModuleArg, RawRole, RawSharedDependency, RawTable, assemble,
+    GrantedKind, Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawDefaultAcl, RawGrant,
+    RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant, RawRole, RawSharedDependency,
+    RawTable, assemble,
 };
 
 /// The schemas that are never a project's.
@@ -871,12 +872,21 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             schema: text(&row, "schema_name")?,
             object: optional_text(&row, "object_name")?,
             args: optional_text(&row, "args")?,
-            kind: first_char(&text(&row, "kind")?).unwrap_or('?'),
+            kind: granted_kind(&text(&row, "source")?, &text(&row, "kind")?),
             permission: text(&row, "privilege_type")?,
             grantable: flag(&row, "is_grantable")?,
             column: optional_text(&row, "column_name")?,
             defaulted: flag(&row, "defaulted")?,
             owner: text(&row, "owner")?,
+        });
+    }
+    for row in conn.query(OTHER_ACLS).await? {
+        raw.other_grants.push(RawOtherGrant {
+            grantee: optional_text(&row, "grantee")?,
+            class: text(&row, "class")?,
+            name: text(&row, "name")?,
+            permission: text(&row, "privilege_type")?,
+            grantable: flag(&row, "is_grantable")?,
         });
     }
     for row in conn.query(HELD_ELSEWHERE).await? {
@@ -968,7 +978,8 @@ SELECT r.rolname AS name, r.rolsuper AS superuser
 /// role as holding nothing on a table it can read a column of.
 fn grants_query() -> String {
     format!(
-        "SELECT n.nspname AS schema_name, c.relname AS object_name, c.relkind::text AS kind,
+        "SELECT n.nspname AS schema_name, c.relname AS object_name,
+                'rel' AS source, c.relkind::text AS kind,
                 NULL::text AS args, NULL::text AS column_name,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
@@ -980,11 +991,11 @@ fn grants_query() -> String {
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(c.relacl, pg_catalog.acldefault(
                     (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))) AS a
-          WHERE c.relkind IN ('r', 'v', 'S')
+          WHERE {NOT_AN_INDEX_OR_TOAST}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {NOT_ONE_OF_OURS}
          UNION ALL
-         SELECT n.nspname, c.relname, c.relkind::text,
+         SELECT n.nspname, c.relname, 'rel', c.relkind::text,
                 NULL::text, at.attname,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
@@ -998,7 +1009,7 @@ fn grants_query() -> String {
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {NOT_ONE_OF_OURS}
          UNION ALL
-         SELECT n.nspname, p.proname, p.prokind::text,
+         SELECT n.nspname, p.proname, 'pro', p.prokind::text,
                 COALESCE((SELECT pg_catalog.string_agg(
                                      pg_catalog.format_type(u.ty, NULL), ', ' ORDER BY u.pos)
                             FROM pg_catalog.unnest(p.proargtypes)
@@ -1013,7 +1024,7 @@ fn grants_query() -> String {
                 COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))) AS a
           WHERE {NOT_A_PROJECTS_SCHEMA}
          UNION ALL
-         SELECT n.nspname, NULL::text, 'n',
+         SELECT n.nspname, NULL::text, 'nsp', '',
                 NULL::text, NULL::text,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
@@ -1023,9 +1034,92 @@ fn grants_query() -> String {
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))) AS a
           WHERE {NOT_A_PROJECTS_SCHEMA}
-         ORDER BY 1, 2, 5, 6, 7"
+         ORDER BY 1, 2, 6, 7, 8"
     )
 }
+
+/// The `pg_class` rows that can carry a grant at all.
+///
+/// An index and a TOAST table cannot: they have no `GRANT` of their own, and
+/// the permission that reaches them is the one on the table they belong to.
+/// Everything else is here — including the three this model does not declare —
+/// because a grant on one of them is a real grant a role really holds, and
+/// **measured**, `GRANT SELECT ON mk.mv` (a materialized view) and
+/// `GRANT SELECT ON mk.parent` (a partitioned table) both land in `relacl`. A
+/// filter that named only the declarable kinds reported the role as holding
+/// nothing there, which is *absent* reading as *empty*.
+const NOT_AN_INDEX_OR_TOAST: &str = "c.relkind NOT IN ('i', 'I', 't')";
+
+/// Every grant in a catalog whose target the model cannot name (see
+/// [`RawOtherGrant`], which lists the fourteen `aclitem[]` columns and why
+/// each is here or is not).
+///
+/// Reported, never compared. A role that gained `USAGE ON LANGUAGE c` out of
+/// band has changed, and a reader that only looked at the catalogs it *can*
+/// name would compare the rest and call it clean — the failure DECISIONS 105
+/// records on the other engine.
+///
+/// `pg_default_acl` is read by [`DEFAULT_ACLS`] instead, because it is not a
+/// grant on anything that exists. `pg_init_privs` is not read at all: it holds
+/// what an extension's objects had at *install*, which is a record of the past
+/// and not a live permission. `pg_tablespace` is not read either — a
+/// tablespace is a cluster object, and what holds a role across the cluster is
+/// [`HELD_ELSEWHERE`]'s question.
+///
+/// `pg_database` is filtered to **this** database: `CONNECT`, `TEMP` or
+/// `CREATE` on the one being deployed to is a fact about this deployment,
+/// while the same on another is that database's business.
+const OTHER_ACLS: &str = "\
+SELECT 'a type' AS class, pg_catalog.format_type(t.oid, NULL) AS name,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_type t
+  CROSS JOIN LATERAL pg_catalog.aclexplode(t.typacl) AS a
+ UNION ALL
+SELECT 'a procedural language', l.lanname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_language l
+  CROSS JOIN LATERAL pg_catalog.aclexplode(l.lanacl) AS a
+ UNION ALL
+SELECT 'a foreign data wrapper', w.fdwname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_foreign_data_wrapper w
+  CROSS JOIN LATERAL pg_catalog.aclexplode(w.fdwacl) AS a
+ UNION ALL
+SELECT 'a foreign server', s.srvname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_foreign_server s
+  CROSS JOIN LATERAL pg_catalog.aclexplode(s.srvacl) AS a
+ UNION ALL
+SELECT 'a configuration parameter', p.parname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_parameter_acl p
+  CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a
+ UNION ALL
+SELECT 'a large object', m.oid::text,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_largeobject_metadata m
+  CROSS JOIN LATERAL pg_catalog.aclexplode(m.lomacl) AS a
+ UNION ALL
+SELECT 'this database', d.datname,
+       CASE WHEN a.grantee = 0 THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+       a.privilege_type, a.is_grantable
+  FROM pg_catalog.pg_database d
+  CROSS JOIN LATERAL pg_catalog.aclexplode(d.datacl) AS a
+ WHERE d.datname = pg_catalog.current_database()
+ ORDER BY 1, 2, 3, 4";
 
 /// What holds a role **outside this database** (ADR-0010 §4).
 ///
@@ -1241,6 +1335,19 @@ fn small(row: &Row, column: &str) -> Result<i32, DbError> {
 
 fn flag(row: &Row, column: &str) -> Result<bool, DbError> {
     row.try_get::<bool>(column)?.ok_or_else(|| missing(column))
+}
+
+/// The catalog a grant row came from, and that catalog's kind letter.
+///
+/// The two alphabets overlap — `relkind` `f` is a foreign table and `prokind`
+/// `f` is a function — so the query says which it is, and this keeps the two
+/// apart by construction rather than by a comment nobody re-reads.
+fn granted_kind(source: &str, kind: &str) -> GrantedKind {
+    match source {
+        "rel" => GrantedKind::Relation(first_char(kind).unwrap_or('?')),
+        "pro" => GrantedKind::Routine(first_char(kind).unwrap_or('?')),
+        _ => GrantedKind::Schema,
+    }
 }
 
 fn first_char(s: &str) -> Option<char> {

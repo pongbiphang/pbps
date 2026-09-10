@@ -522,6 +522,17 @@ counted as grants, the plan after a successful apply would revoke what the
 apply had just produced. `PUBLIC` is context both ways, including the half that
 is the *absence* of a row.
 
+Sweeping that read found two holes of one shape (DECISIONS 376). The relation
+arm filtered to the kinds the model declares, and measured, a `GRANT SELECT` on
+a materialized view or a partitioned table lands in `relacl` all the same — so
+a role read as holding nothing there. Widening it exposed the second:
+`pg_class.relkind` and `pg_proc.prokind` overlap, `f` being a foreign table in
+one alphabet and a function in the other, so a grant on a foreign table would
+have come back as a grant on a *function* of that name. The catalogs are now
+enumerated from the engine — PostgreSQL 18 has fourteen `aclitem[]` columns —
+and the eight whose targets no declaration can name are reported rather than
+dropped, with a live test that fails when a release adds a fifteenth.
+
 Two costs the rules imposed rather than the code: the live suite and the
 `live-pg` CI job now start a pinned PostgreSQL **16** beside the pinned 18,
 because `maintain` arrived in 17 and no single server can show both halves; and

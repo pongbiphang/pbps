@@ -41,7 +41,8 @@ fn invalid(message: impl Into<String>) -> DialectError {
 /// `maintain` **is** in this list. Whether the server has it is a question
 /// about the server, not about the word: it arrived in PostgreSQL 17, the
 /// model holds no server version, and the check therefore belongs to the
-/// connected path ([`crate::doctor`]) rather than here (ADR-0010 amendment).
+/// connected path ([`crate::roles::unsupported_permissions`]) rather than here
+/// (ADR-0010 amendment).
 pub(crate) const PERMISSIONS: [Permission; 11] = [
     Permission::Select,
     Permission::Insert,
