@@ -803,7 +803,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut unmanageable = |why: &str| {
             unmanaged_modules.push(UnmanagedModule {
                 kind: m.kind.as_str(),
-                target: LimitationTarget::Relation(name.clone()),
+                target: LimitationTarget::SharedModule(name.clone()),
                 why: why.to_owned(),
             });
         };

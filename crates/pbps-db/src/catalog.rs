@@ -89,6 +89,9 @@ pub struct Limitation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LimitationTarget {
     Relation(TableName),
+    /// A module in a shared object namespace, even when its declaration also
+    /// carries a trigger parent. The unreadable body cannot supply that parent.
+    SharedModule(ObjectName),
     Module(pbps_model::ModuleId),
     /// No declaration can name this identity. Keep the diagnostic, without
     /// attributing it to a different object that happens to share its name.
@@ -110,6 +113,7 @@ impl LimitationTarget {
     pub fn matches_module(&self, id: &pbps_model::ModuleId) -> bool {
         match self {
             Self::Relation(name) => matches!(id, pbps_model::ModuleId::Named(n) if n == name),
+            Self::SharedModule(name) => *name == id.object_name(),
             Self::Module(module) => module == id,
             Self::UnnameableModule(_) => false,
         }
@@ -117,7 +121,9 @@ impl LimitationTarget {
 
     pub fn object_name(&self) -> ObjectName {
         match self {
-            Self::Relation(name) | Self::UnnameableModule(name) => name.clone(),
+            Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
+                name.clone()
+            }
             Self::Module(id) => id.object_name(),
         }
     }
@@ -126,7 +132,9 @@ impl LimitationTarget {
 impl std::fmt::Display for LimitationTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Relation(name) | Self::UnnameableModule(name) => name.fmt(f),
+            Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
+                name.fmt(f)
+            }
             Self::Module(id) => id.fmt(f),
         }
     }
@@ -138,7 +146,7 @@ pub struct UnmanagedModule {
     pub kind: &'static str,
     /// Kept structured, including routine arguments and trigger parent, so a
     /// same-name object cannot hide this entry from the unmanaged policy.
-    /// SQL Server modules use its shared relation namespace.
+    /// SQL Server modules use `SharedModule` for its shared object namespace.
     pub target: LimitationTarget,
     /// Why it is not managed, in the operator's words.
     pub why: String,

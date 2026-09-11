@@ -9065,3 +9065,13 @@ SPEC is in sync with all of these.
     trigger is safe to execute; that separate policy is tracked in #324.
     Pinned by the live catalog omitted-module and trigger tests, the malformed
     deparse unit test, and `flow_pg::omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload`.
+
+427. **SQL Server's unreadable trigger still occupies a shared module name.**
+    A trigger declaration carries its parent, but an encrypted catalog row
+    cannot supply that parent. `SharedModule` therefore matches by object name
+    across declaration kinds, preserving the SQL Server behavior before 426.
+    PostgreSQL `Relation` remains distinct: a view named `audit` must not match
+    the unrelated trigger `t.audit`. Conflating those namespaces either records
+    a partial SQL Server schema or refuses an unrelated PostgreSQL object.
+    Pinned by `a_declared_unreadable_trigger_is_never_recorded_or_planned_over`
+    and the shared-module versus relation identity test (PR #325 review).

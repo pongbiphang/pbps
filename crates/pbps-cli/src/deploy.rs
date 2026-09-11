@@ -885,6 +885,9 @@ pub(crate) fn managed_limitations(
             pbps_db::catalog::LimitationTarget::Relation(name) => {
                 managed_tables.contains(name) || modules.contains(&ModuleId::Named(name.clone()))
             }
+            target @ pbps_db::catalog::LimitationTarget::SharedModule(_) => {
+                modules.iter().any(|id| target.matches_module(id))
+            }
             pbps_db::catalog::LimitationTarget::Module(id) => modules.contains(id),
             pbps_db::catalog::LimitationTarget::UnnameableModule(_) => false,
         })
@@ -8407,14 +8410,14 @@ mod tests {
             unmanaged_modules: vec![
                 UnmanagedModule {
                     kind: "procedure",
-                    target: pbps_db::catalog::LimitationTarget::Relation(
+                    target: pbps_db::catalog::LimitationTarget::SharedModule(
                         "dbo.declared_secret".parse().unwrap(),
                     ),
                     why: "its definition cannot be read back".into(),
                 },
                 UnmanagedModule {
                     kind: "procedure",
-                    target: pbps_db::catalog::LimitationTarget::Relation(
+                    target: pbps_db::catalog::LimitationTarget::SharedModule(
                         "dbo.stray_secret".parse().unwrap(),
                     ),
                     why: "its definition cannot be read back".into(),
@@ -8478,6 +8481,16 @@ mod tests {
         assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
         assert!(unmanaged.iter().any(|u| u.contains("dbo.stray_secret")));
         assert!(!unmanaged.iter().any(|u| u.contains("dbo.declared_secret")));
+    }
+
+    #[test]
+    fn shared_module_names_match_triggers_but_relation_names_do_not() {
+        use pbps_db::catalog::LimitationTarget;
+        let trigger: ModuleId = "dbo.t.audit".parse().unwrap();
+        let name = trigger.object_name();
+        assert!(LimitationTarget::SharedModule(name.clone()).matches_module(&trigger));
+        assert!(!LimitationTarget::Relation(name.clone()).matches_module(&trigger));
+        assert!(LimitationTarget::Relation(name.clone()).matches_module(&ModuleId::Named(name)));
     }
 
     #[test]

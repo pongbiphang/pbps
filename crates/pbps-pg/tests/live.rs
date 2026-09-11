@@ -7636,6 +7636,7 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
                 name,
             }) => format!("{}.{name}", on.name),
             target @ (pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_)) => target.object_name().name,
         })
