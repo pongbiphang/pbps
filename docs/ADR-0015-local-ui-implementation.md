@@ -958,12 +958,18 @@ locked-copy `update-index` ran it), so every `git` also takes
    entry set either, and is answered the same way; and a target whose
    lock cannot be created has another `git` mid-transaction on it, where
    the UI decides nothing by a tip it cannot hold still and undoes step
-   2 for every path, which asks no tip at all. Step 1 makes an
-   intermediate link unreachable rather than caught: it records the ref
-   `HEAD` names *directly*, not the recursive answer, and refuses the
-   compose outright where that ref is itself symbolic, so no chain ever
-   reaches this step with a link left to retarget — before step 5's
-   checks or after them, before step 6 or after it. The page then names the
+   2 for every path, which asks no tip at all. Step 1 refuses a chain
+   that is already there when it runs, rather than catching one formed
+   afterward: it records the ref `HEAD` names *directly*, not the
+   recursive answer, and refuses the compose outright where that ref is
+   itself symbolic. A chain another worktree forms after step 1 has
+   recorded a direct branch — turning that branch itself into a
+   symbolic ref before step 5 takes its lock — still reaches step 5,
+   and is exactly what this step's own check above already catches, the
+   branch still asked whether it is direct and not symbolic; that
+   guard's reason has not gone, since step 1 only closes the chain that
+   was there to compose on, not the one formed while the UI is working.
+   The page then names the
    commit, the tip the branch actually holds, and every path with what
    became of it, since the user's index is the one they had and only
    they can say which of the two states they want. **Measured** both
@@ -1438,8 +1444,9 @@ What this ADR reasons about and has not measured, in the order the steps of
   the defect. It then builds the same chain, pauses the compose after
   step 5's checks have passed and before step 6 installs the prepared
   index — retargeting any earlier changes what the restored, recursive
-  `symbolic-ref HEAD` answers, and step 5's own compare-and-swap check,
-  unrelated to step 1's fix, catches that and undoes step 2 instead —
+  `symbolic-ref HEAD` answers, and step 5's own check that `HEAD` is
+  still symbolic to the recorded branch, run after the compare-and-swap
+  and unrelated to step 1's fix, catches that and undoes step 2 instead —
   retargets `a` to a branch whose tip lacks the change, resumes, and
   asserts that it installs an index built for `b`'s tip onto a checkout
   `symbolic-ref` has moved to the other
