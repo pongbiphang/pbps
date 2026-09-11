@@ -29,8 +29,8 @@
 //! single table. So the question this module asks about a table pbps manages is
 //! `pg_has_role(current_user, relowner, 'USAGE')` — is this role the owner, or
 //! a member of the role that owns it — and the privileges are asked for where
-//! privileges are what the engine really checks: reading rows, and writing the
-//! ledger.
+//! privileges are what the engine really checks: reading rows, writing data
+//! and the ledger, and delegating each declared role privilege.
 //!
 //! # What the catalog will and will not hide
 //!
@@ -51,6 +51,11 @@ use pbps_model::ObjectName;
 
 use crate::quote;
 use crate::state::{LEDGER_SCHEMA, LOCK_TABLE, STATE_TABLE};
+
+mod data;
+mod grants;
+
+pub use pbps_db::doctor::Ask;
 
 /// Where a permission has to be held for a deployment to succeed.
 ///
@@ -284,6 +289,8 @@ pub struct TableRights {
 /// print a `GRANT` on an object that is not there.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Held {
+    /// Data writes and role grants have declaration-specific requirements.
+    pub declaration_gaps: Vec<Gap>,
     /// Per managed schema that exists, what is held on it.
     pub schemas: BTreeMap<String, SchemaRights>,
 
@@ -336,6 +343,7 @@ pub struct Held {
 pub enum Securable {
     Schema(String),
     Object(ObjectName),
+    Routine(ObjectName, Option<String>),
 }
 
 impl std::fmt::Display for Securable {
@@ -347,6 +355,13 @@ impl std::fmt::Display for Securable {
             // schema `app.a` — a different securable, and the one the reader
             // would grant on.
             Securable::Object(o) => write!(f, "TABLE {}.{}", spelled(&o.schema), spelled(&o.name)),
+            Securable::Routine(o, signature) => {
+                write!(f, "ROUTINE {}.{}", spelled(&o.schema), spelled(&o.name))?;
+                if let Some(signature) = signature {
+                    write!(f, "({signature})")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -391,22 +406,6 @@ pub fn ledger_tables() -> [ObjectName; 2] {
         t.parse()
             .expect("the ledger table names are this crate's own `schema.table` constants")
     })
-}
-
-/// What `doctor` asks about, which is what the project declares.
-///
-/// A borrowed struct rather than three positional arguments: the three lists
-/// are all `&[ObjectName]`-shaped, and a caller that swapped two of them would
-/// compile and ask the wrong questions.
-#[derive(Debug, Clone, Copy)]
-pub struct Ask<'a> {
-    /// Every schema the project manages.
-    pub managed_schemas: &'a [String],
-    /// Every table the project declares, whether or not it exists yet.
-    pub managed_tables: &'a [ObjectName],
-    /// Every table a declared foreign key points at from outside the managed
-    /// schemas.
-    pub referenced: &'a [ObjectName],
 }
 
 /// The server's version, both as a person reads it and as a comparison does.
@@ -548,9 +547,8 @@ fn values_list(rows: usize, columns: usize) -> String {
 
 /// Everything [`missing`] needs, in as few round trips as the questions allow.
 ///
-/// Three reads: the schemas (managed, plus the ledger's), the tables (managed,
-/// plus the ledger's two), and the referenced targets. Each is one statement
-/// with every name bound.
+/// Reads the schemas, managed and ledger tables, referenced targets, and the
+/// declaration-specific data and grant demands. Every requested name is bound.
 pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError> {
     let mut held = Held::default();
 
@@ -616,6 +614,10 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
         }
     }
 
+    held.declaration_gaps
+        .extend(data::missing(conn, ask.data).await?);
+    held.declaration_gaps
+        .extend(grants::missing(conn, ask.granted).await?);
     Ok(held)
 }
 
@@ -806,6 +808,14 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     }
                 }
             }
+        }
+    }
+    for gap in &held.declaration_gaps {
+        if !out
+            .iter()
+            .any(|g| g.permission == gap.permission && g.securable == gap.securable)
+        {
+            out.push(gap.clone());
         }
     }
     out

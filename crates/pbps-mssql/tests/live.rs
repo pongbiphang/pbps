@@ -7371,6 +7371,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     // With a role granted on the table and on the schema: three gaps, each
     // where the grant has to go.
     let targets = pbps_mssql::doctor::GrantTargets {
+        permissions: Default::default(),
         objects: vec!["dbo.customer".parse().unwrap()],
         schemas: vec!["dbo".to_owned()],
         roles: vec![],
@@ -7454,6 +7455,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     .await
     .expect("record the state with the role");
     let managed = pbps_mssql::doctor::GrantTargets {
+        permissions: Default::default(),
         roles: vec!["app_reader".to_owned()],
         ..targets.clone()
     };
@@ -7488,6 +7490,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     // A schema a role is granted on that the database does not have is
     // reported as absent, not silently unasked: the GRANT would fail.
     let nowhere = pbps_mssql::doctor::GrantTargets {
+        permissions: Default::default(),
         schemas: vec!["dbo".to_owned(), "nowhere".to_owned()],
         ..targets.clone()
     };
@@ -8036,6 +8039,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
     let hyphen = pbps_model::ObjectName::new("dbo", "order-items");
     let absent = pbps_model::ObjectName::new("dbo", "nope");
     let targets = pbps_mssql::doctor::GrantTargets {
+        permissions: Default::default(),
         objects: vec![hyphen.clone(), absent.clone()],
         schemas: vec![],
         // The role's own grant on `dbo.[a.b]` reaches the question through
@@ -8110,6 +8114,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
         .map(|i| pbps_model::ObjectName::new("dbo", format!("many_{i}")))
         .collect();
     let targets = pbps_mssql::doctor::GrantTargets {
+        permissions: Default::default(),
         objects: objects.clone(),
         schemas: vec![],
         roles: vec![],

@@ -4696,6 +4696,8 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         name: "customer".to_owned(),
     };
     let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
         managed_schemas: &["app".to_owned()],
         managed_tables: std::slice::from_ref(&customer),
         referenced: &[],
@@ -4757,6 +4759,286 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         "a role granted exactly what the report named must pass"
     );
 
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".to_owned(), Column::new("integer".parse().unwrap()));
+    table
+        .columns
+        .insert("email".to_owned(), Column::new("text".parse().unwrap()));
+    table.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".to_owned()],
+    });
+    with_data(
+        &mut table,
+        DataMode::Ensure,
+        &[("1", row(&[("email", Value::Text("a".to_owned()))]))],
+    );
+    let data = [(
+        customer.clone(),
+        pbps_db::doctor::DataDemand::of(&table).unwrap(),
+    )]
+    .into_iter()
+    .collect();
+    let granted = pbps_db::doctor::GrantTargets {
+        permissions: [
+            (
+                "app.report".parse().unwrap(),
+                [pbps_model::Permission::Select].into_iter().collect(),
+            ),
+            (
+                "app.customer".parse().unwrap(),
+                [pbps_model::Permission::Insert].into_iter().collect(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let demanded = doctor::Ask {
+        data: &data,
+        granted: &granted,
+        ..ask
+    };
+    db.conn
+        .execute(&format!(
+            "CREATE VIEW app.report AS SELECT id FROM app.customer; \
+         GRANT SELECT ON app.report TO {role}; \
+         REVOKE INSERT, UPDATE, DELETE ON app.customer FROM {role}"
+        ))
+        .await
+        .unwrap();
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &demanded).await.unwrap());
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "INSERT" && g.securable() == "TABLE \"app\".\"customer\""),
+        "{gaps:?}"
+    );
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "UPDATE" && g.securable() == "TABLE \"app\".\"customer\""),
+        "{gaps:?}"
+    );
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "SELECT WITH GRANT OPTION"
+                && g.securable() == "TABLE \"app\".\"report\""),
+        "{gaps:?}"
+    );
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| g.permission == "DELETE" || g.permission == doctor::OWNERSHIP),
+        "ensure does not delete, and DDL ownership is already held: {gaps:?}"
+    );
+    assert_eq!(
+        sqlstate(
+            &theirs
+                .execute("INSERT INTO app.customer (id, email) VALUES (1, 'a')")
+                .await
+                .unwrap_err()
+        ),
+        "42501"
+    );
+    db.conn
+        .execute(&format!(
+            "GRANT INSERT (id, email), UPDATE (email) ON app.customer TO {role}; \
+         GRANT SELECT ON app.report TO {role} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &demanded).await.unwrap());
+    assert!(
+        gaps.is_empty(),
+        "column grants cover exactly the data writes, and the view grant can be delegated: {gaps:?}"
+    );
+    theirs.execute("INSERT INTO app.customer (id, email) VALUES (1, 'a'); UPDATE app.customer SET email = 'b' WHERE id = 1").await.unwrap();
+    db.conn
+        .execute(&format!(
+            "REVOKE UPDATE (email) ON app.customer FROM {role}"
+        ))
+        .await
+        .unwrap();
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &demanded).await.unwrap());
+    assert_eq!(
+        gaps.len(),
+        1,
+        "one uncovered write column must not pass: {gaps:?}"
+    );
+    assert_eq!(gaps[0].permission, "UPDATE");
+
+    with_data(&mut table, DataMode::Exact, &[]);
+    let empty_exact = [(
+        customer.clone(),
+        pbps_db::doctor::DataDemand::of(&table).unwrap(),
+    )]
+    .into_iter()
+    .collect();
+    let ask_exact = doctor::Ask {
+        data: &empty_exact,
+        ..demanded
+    };
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask_exact).await.unwrap());
+    assert_eq!(
+        gaps.len(),
+        1,
+        "an empty exact declaration only deletes: {gaps:?}"
+    );
+    assert_eq!(gaps[0].permission, "DELETE");
+    db.conn
+        .execute(&format!(
+            "GRANT DELETE ON app.customer TO {role}; REVOKE SELECT ON app.customer FROM {role}"
+        ))
+        .await
+        .unwrap();
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask_exact).await.unwrap());
+    assert_eq!(
+        gaps.len(),
+        1,
+        "data readback still requires SELECT: {gaps:?}"
+    );
+    assert_eq!(gaps[0].permission, "SELECT");
+
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
+    use pbps_model::Permission;
+    let mut db = TestDb::create("doctor_grants").await;
+    let deployer = least_privilege_role(&mut db, "grant_deployer").await;
+    let authority = least_privilege_role(&mut db, "grant_authority").await;
+    let recipient = least_privilege_role(&mut db, "grant_recipient").await;
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA shared; \
+         CREATE VIEW shared.f AS SELECT 1 AS id; \
+         CREATE FUNCTION shared.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+         CREATE FUNCTION shared.f(text) RETURNS text LANGUAGE sql AS 'SELECT $1'; \
+         REVOKE EXECUTE ON FUNCTION shared.f(integer), shared.f(text) FROM PUBLIC; \
+         CREATE TABLE shared.owner_defaults(id integer); \
+         ALTER TABLE shared.owner_defaults OWNER TO {recipient}; \
+         GRANT USAGE ON SCHEMA shared TO {deployer}; \
+         GRANT SELECT ON shared.f TO {deployer}, {recipient}; \
+         GRANT EXECUTE ON FUNCTION shared.f(text) TO {deployer} WITH GRANT OPTION; \
+         GRANT CREATE ON SCHEMA public TO {deployer}"
+        ))
+        .await
+        .unwrap();
+    let mut theirs = Conn::connect(
+        Driver::Postgres,
+        &conn_str_as(&deployer, "live-test", &db.name),
+    )
+    .await
+    .unwrap();
+    state::ensure_tables(&mut theirs).await.unwrap();
+    let granted = pbps_db::doctor::GrantTargets {
+        permissions: [
+            (
+                "schema::shared".parse().unwrap(),
+                [Permission::Usage].into_iter().collect(),
+            ),
+            (
+                "shared.f".parse().unwrap(),
+                [Permission::Select].into_iter().collect(),
+            ),
+            (
+                "shared.f(integer)".parse().unwrap(),
+                [Permission::Execute].into_iter().collect(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        roles: vec![recipient.clone()],
+        ..Default::default()
+    };
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        granted: &granted,
+        data: &Default::default(),
+    };
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask).await.unwrap());
+    assert_eq!(
+        gaps.len(),
+        3,
+        "ordinary rights and a different overload's grant option are insufficient: {gaps:?}"
+    );
+    for expected in [
+        "SCHEMA \"shared\"",
+        "TABLE \"shared\".\"f\"",
+        "ROUTINE \"shared\".\"f\"(integer)",
+    ] {
+        assert!(gaps.iter().any(|g| g.securable() == expected), "{gaps:?}");
+    }
+    let adopted = pbps_db::doctor::GrantTargets {
+        roles: vec![recipient.clone()],
+        ..Default::default()
+    };
+    let catalog_only = doctor::Ask {
+        granted: &adopted,
+        ..ask
+    };
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &catalog_only)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        gaps.len(),
+        1,
+        "a grant removed from declarations remains a REVOKE demand: {gaps:?}"
+    );
+    assert_eq!(gaps[0].securable(), "TABLE \"shared\".\"f\"");
+    db.conn
+        .execute(&format!(
+            "GRANT USAGE ON SCHEMA shared TO {authority} WITH GRANT OPTION; \
+         GRANT SELECT ON shared.f TO {authority} WITH GRANT OPTION; \
+         GRANT EXECUTE ON FUNCTION shared.f(integer) TO {authority} WITH GRANT OPTION; \
+         GRANT {authority} TO {deployer}"
+        ))
+        .await
+        .unwrap();
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask).await.unwrap());
+    assert!(
+        gaps.is_empty(),
+        "inherited grant authority is effective: {gaps:?}"
+    );
+    theirs
+        .execute(&format!(
+            "GRANT USAGE ON SCHEMA shared TO {recipient}; \
+         GRANT SELECT ON shared.f TO {recipient}; \
+         GRANT EXECUTE ON FUNCTION shared.f(integer) TO {recipient}"
+        ))
+        .await
+        .unwrap();
+    // GRANT can complete with only a warning when nothing was granted, so
+    // assert the recipient's effective rights rather than its command status.
+    let checks = db
+        .conn
+        .query(&format!(
+            "SELECT has_schema_privilege('{recipient}', 'shared', 'USAGE') AS schema_ok, \
+         has_table_privilege('{recipient}', 'shared.f', 'SELECT') AS view_ok, \
+         has_function_privilege('{recipient}', 'shared.f(integer)', 'EXECUTE') AS routine_ok"
+        ))
+        .await
+        .unwrap();
+    for column in ["schema_ok", "view_ok", "routine_ok"] {
+        assert_eq!(checks[0].try_get::<bool>(column).unwrap(), Some(true));
+    }
+    db.conn
+        .execute(&format!("REVOKE {authority} FROM {deployer}"))
+        .await
+        .unwrap();
+    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask).await.unwrap());
+    assert_eq!(
+        gaps.len(),
+        3,
+        "membership removal revokes effective grant authority: {gaps:?}"
+    );
     db.drop().await;
 }
 
@@ -4828,6 +5110,8 @@ async fn a_role_that_may_write_the_ledger_and_not_create_it_deploys() {
     // And `doctor` agrees with the engine about this configuration: nothing
     // missing, with the create-time privilege spent and not asked for.
     let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
         managed_schemas: &[],
         managed_tables: &[],
         referenced: &[],
@@ -4870,6 +5154,8 @@ async fn a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted
         .expect("connect as the least-privilege role");
 
     let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
         managed_schemas: &[],
         managed_tables: &[],
         referenced: &[],
@@ -4939,6 +5225,8 @@ async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_nee
         name: "parent".to_owned(),
     };
     let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
         managed_schemas: &["app".to_owned()],
         managed_tables: &[],
         referenced: std::slice::from_ref(&parent),
@@ -5001,6 +5289,8 @@ async fn a_managed_schema_that_is_absent_is_reported_as_absent_and_not_as_a_gap(
     let mut db = TestDb::create("absent_schema").await;
 
     let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
         managed_schemas: &["not_here".to_owned()],
         managed_tables: &[],
         referenced: &[],

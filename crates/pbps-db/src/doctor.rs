@@ -11,9 +11,9 @@
 //! their securables in their own `GRANT` spelling. So the *ask* lives here and
 //! the *held* stays with the engine (DECISIONS 417).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{ObjectName, Table};
+use pbps_model::{GrantTarget, ObjectName, Permission, Table};
 
 /// Everything the declarations say the deployment will need rights on.
 ///
@@ -41,6 +41,10 @@ pub struct Ask<'a> {
 /// that the declarations no longer have is one the next plan drops.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantTargets {
+    /// Exact targets and privileges: PostgreSQL grant authority is per
+    /// privilege, and a routine's signature distinguishes its overloads.
+    /// The flat lists below remain the SQL Server securable-level demand.
+    pub permissions: BTreeMap<GrantTarget, BTreeSet<Permission>>,
     /// The objects the declarations grant on, as two parts. Joined by the
     /// engine in its own spelling: a name holding a `.` or a `]` joined here
     /// would resolve to nothing and read as a gap the account did not have.
@@ -81,6 +85,8 @@ pub struct DataDemand {
     /// — the question a column-level grant makes different from the
     /// object-level one.
     row_columns: Vec<String>,
+    /// The key and writable cells used by INSERT and data readback.
+    data_columns: Vec<String>,
 }
 
 impl DataDemand {
@@ -103,6 +109,9 @@ impl DataDemand {
             .map(|(name, _)| name.clone())
             .collect();
         let demand = Self {
+            data_columns: std::iter::once(key_column.to_owned())
+                .chain(row_columns.iter().cloned())
+                .collect(),
             inserts: declares_a_row,
             // Both halves are needed: a row to compare, and a cell to compare
             // it in. The differ builds an `UPDATE` only from `row_columns` and
@@ -140,6 +149,12 @@ impl DataDemand {
     #[must_use]
     pub fn row_columns(&self) -> &[String] {
         &self.row_columns
+    }
+
+    /// Columns named by an inserted row and its subsequent readback.
+    #[must_use]
+    pub fn data_columns(&self) -> &[String] {
+        &self.data_columns
     }
 }
 

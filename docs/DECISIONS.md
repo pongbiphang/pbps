@@ -9075,3 +9075,24 @@ SPEC is in sync with all of these.
     a partial SQL Server schema or refuses an unrelated PostgreSQL object.
     Pinned by `a_declared_unreadable_trigger_is_never_recorded_or_planned_over`
     and the shared-module versus relation identity test (PR #325 review).
+
+428. **PostgreSQL doctor distinguishes data privileges from grant authority.**
+    Ownership permits DDL and carries grant options, but an owner can revoke
+    its own INSERT and still own the table. The shared doctor demand therefore
+    carries the data columns and exact grant targets with their permissions;
+    PostgreSQL checks effective DML privileges separately from each required
+    `WITH GRANT OPTION`. Column grants cover INSERT and UPDATE when every
+    emitted column is covered. Ensure, empty exact, and key-only declarations
+    ask only for the writes they can produce, plus SELECT for readback.
+    SQL Server retains its existing object-level CONTROL demand.
+
+    Declared and recorded grants, and current ACLs of managed roles, all supply
+    grant demands: removing a declaration still requires authority to REVOKE.
+    Schema, relation, and routine namespaces remain distinct, and signatures
+    distinguish routine overloads. Queries use catalog OIDs and bound names so
+    an inaccessible schema is reported instead of making name resolution fail.
+    Absent securables have no privilege gap; their absence has a separate remedy.
+    The live doctor tests pin revoked owner DML, column grants, an empty exact
+    block, same-named view/routine overloads, inherited grant options, and catalog
+    grants absent from declarations. The CLI regression pins the complete
+    declaration-to-JSON path and the named remedies (issues #304 and #317).
