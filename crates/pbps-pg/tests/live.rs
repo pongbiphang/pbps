@@ -6609,6 +6609,9 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
         format!("CREATE AGGREGATE {s}.agg(int) (sfunc = int4pl, stype = int)"),
         // The engine's own answer, and the reason the filter exists.
         format!("CREATE VIEW {s}.ordinary AS SELECT id FROM {s}.t"),
+        // The assembler, rather than the catalog filter, leaves this out:
+        // parsing this view's name would turn it into a routine identity.
+        format!("CREATE VIEW {s}.\"bad(int)\" AS SELECT id FROM {s}.t"),
     ] {
         conn.execute(&sql)
             .await
@@ -6646,6 +6649,24 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
                 .any(|w| w.contains(&format!("{s}.{object}")) && w.contains(why)),
             "`{s}.{object}` was not named: {named:#?}"
         );
+    }
+    let inventory: Vec<_> = pulled
+        .unmanaged_modules
+        .iter()
+        .filter(|m| m.target.object_name().schema == s)
+        .collect();
+    assert_eq!(inventory.len(), 3, "{inventory:#?}");
+    for (id, kind) in [
+        (format!("{s}.mv"), "materialized view"),
+        (format!("{s}.agg(integer)"), "aggregate"),
+        (format!("{s}.bad(int)"), "view"),
+    ] {
+        let entry = inventory
+            .iter()
+            .find(|m| m.target.to_string() == id)
+            .unwrap_or_else(|| panic!("missing {id}: {inventory:#?}"));
+        assert_eq!(entry.kind, kind);
+        assert!(pulled.warnings.contains(&entry.why), "{entry:?}");
     }
 }
 
@@ -7572,6 +7593,21 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         triggers,
         vec![format!("{s}.t.audit")],
         "only the trigger whose table the pull holds"
+    );
+
+    let inventory: Vec<_> = pulled
+        .unmanaged_modules
+        .iter()
+        .filter(|m| m.target.object_name().schema == s)
+        .map(|m| m.target.to_string())
+        .collect();
+    assert_eq!(
+        inventory,
+        [
+            format!("{s}.part.audit"),
+            format!("{s}.pg_buffercache.user_tg"),
+            format!("{s}.scratch.audit")
+        ]
     );
 
     // What the trigger without its table broke: the pull's own schema is one

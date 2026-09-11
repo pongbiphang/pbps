@@ -1164,7 +1164,7 @@ fn cmd_pull(
             pulled.unmanaged_modules.len()
         );
         for m in &pulled.unmanaged_modules {
-            eprintln!("  {} {} — {}", m.kind, m.name, m.why);
+            eprintln!("  {} {} — {}", m.kind, m.target, m.why);
         }
         eprintln!(
             "  They are left untouched: pbps will neither change nor drop them, and they do not appear in any plan."

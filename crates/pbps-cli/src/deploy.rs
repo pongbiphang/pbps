@@ -23,8 +23,8 @@ use pbps_config::Project;
 use pbps_db::Conn;
 use pbps_dialect::Dialect;
 use pbps_model::{
-    DataScopes, IdsFile, ModuleId, ObjectName, ObservedRows, RowScope, Schema, StateKind,
-    StateSnapshot, TableName,
+    DataScopes, IdsFile, ModuleId, ObservedRows, RowScope, Schema, StateKind, StateSnapshot,
+    TableName,
 };
 
 use crate::db::{self, Target};
@@ -44,14 +44,14 @@ pub struct Managed {
     /// never ignorable warnings, and no recorder accepts a schema that has any
     /// (see [`managed_limitations`]).
     pub limitations: Vec<String>,
-    /// Every module in the database that introspection cannot express, by name,
+    /// Every module in the database that introspection cannot express, by identity,
     /// with the reason already rendered.
     ///
     /// Returned in full rather than filtered to the managed set, because the
     /// caller that most needs it is asking about a name that has *never* been
     /// recorded: a newly declared module that collides with an encrypted one
     /// already standing there.
-    pub unreadable: Vec<(ObjectName, String)>,
+    pub unreadable: Vec<(pbps_db::catalog::LimitationTarget, String)>,
     /// The rows read back under the read scope the caller asked for. Not yet
     /// placed in the schema: `plan --db` projects two different views out of
     /// one read (see [`pbps_model::data::read_scopes`]).
@@ -368,7 +368,7 @@ fn cut(
     pulled: &pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
-    unreadable: &[(ObjectName, String)],
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules);
@@ -893,12 +893,15 @@ pub(crate) fn managed_limitations(
             pulled
                 .unmanaged_modules
                 .iter()
-                // An unmanageable module is known by the name the catalog
-                // gave it, so the managed set is asked under the same name:
-                // whatever a module's identity holds, that is what it is
-                // called (ADR-0009 §1).
-                .filter(|m| modules.iter().any(|id| id.object_name() == m.name))
-                .map(|m| format!("{} {} is in the managed set, but {}", m.kind, m.name, m.why)),
+                // The inventory preserves the same namespaces as limitations;
+                // matching only the base name would capture another overload.
+                .filter(|m| modules.iter().any(|id| m.target.matches_module(id)))
+                .map(|m| {
+                    format!(
+                        "{} {} is in the managed set, but {}",
+                        m.kind, m.target, m.why
+                    )
+                }),
         )
         .collect()
 }
@@ -1090,17 +1093,17 @@ fn warn_unreleased(label: &str, released: &Result<bool, pbps_db::DbError>) {
 #[error("{0}")]
 pub struct UnmanagedPolicy(String);
 
-/// Converts the dialect's unreadable-module inventory into the common name and
+/// Converts the dialect's unreadable-module inventory into the common identity and
 /// description form used by connected commands.
 pub(crate) fn unreadable_modules(
     modules: &[pbps_db::catalog::UnmanagedModule],
-) -> Vec<(pbps_model::ObjectName, String)> {
+) -> Vec<(pbps_db::catalog::LimitationTarget, String)> {
     modules
         .iter()
         .map(|module| {
             (
-                module.name.clone(),
-                format!("{} {} ({})", module.kind, module.name, module.why),
+                module.target.clone(),
+                format!("{} {} ({})", module.kind, module.target, module.why),
             )
         })
         .collect()
@@ -1111,7 +1114,7 @@ pub(crate) fn unreadable_modules(
 /// policy of SPEC §8.2.
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
-    unreadable: &[(pbps_model::ObjectName, String)],
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     managed_modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
     scoped
@@ -1132,7 +1135,7 @@ pub(crate) fn unmanaged_objects(
         .chain(
             unreadable
                 .iter()
-                .filter(|(name, _)| !managed_modules.iter().any(|id| id.object_name() == *name))
+                .filter(|(name, _)| !managed_modules.iter().any(|id| name.matches_module(id)))
                 .map(|(_, description)| description.clone()),
         )
         .collect()
@@ -1142,7 +1145,7 @@ pub(crate) fn unmanaged_objects(
 /// catalog objects outside the managed set.
 fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
-    unreadable: &[(pbps_model::ObjectName, String)],
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     managed_modules: &std::collections::BTreeSet<ModuleId>,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
@@ -3394,7 +3397,7 @@ pub fn cmd_plan_db(
                     .schema
                     .modules
                     .keys()
-                    .any(|id| &id.object_name() == n)
+                    .any(|id| n.matches_module(id))
             })
             .map(|(_, why)| why.as_str())
             .collect();
@@ -8404,12 +8407,16 @@ mod tests {
             unmanaged_modules: vec![
                 UnmanagedModule {
                     kind: "procedure",
-                    name: "dbo.declared_secret".parse().unwrap(),
+                    target: pbps_db::catalog::LimitationTarget::Relation(
+                        "dbo.declared_secret".parse().unwrap(),
+                    ),
                     why: "its definition cannot be read back".into(),
                 },
                 UnmanagedModule {
                     kind: "procedure",
-                    name: "dbo.stray_secret".parse().unwrap(),
+                    target: pbps_db::catalog::LimitationTarget::Relation(
+                        "dbo.stray_secret".parse().unwrap(),
+                    ),
                     why: "its definition cannot be read back".into(),
                 },
             ],
@@ -8471,6 +8478,43 @@ mod tests {
         assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
         assert!(unmanaged.iter().any(|u| u.contains("dbo.stray_secret")));
         assert!(!unmanaged.iter().any(|u| u.contains("dbo.declared_secret")));
+    }
+
+    #[test]
+    fn unreadable_inventory_keeps_overloads_trigger_parents_and_unnameable_identities_distinct() {
+        use pbps_db::catalog::LimitationTarget;
+        let mut pulled = pulled();
+        pulled.limitations.clear();
+        let held: BTreeSet<ModuleId> = ["app.f(integer)", "app.t.audit"]
+            .into_iter()
+            .map(|id| id.parse().unwrap())
+            .collect();
+        let targets = [
+            LimitationTarget::module("app.f(integer)".parse().unwrap()),
+            LimitationTarget::module("app.f(bigint)".parse().unwrap()),
+            LimitationTarget::module("app.t.audit".parse().unwrap()),
+            LimitationTarget::module("app.other.audit".parse().unwrap()),
+            LimitationTarget::UnnameableModule("app.f".parse().unwrap()),
+        ];
+        pulled.unmanaged_modules = targets
+            .into_iter()
+            .map(|target| UnmanagedModule {
+                kind: "module",
+                target,
+                why: "cannot be represented".into(),
+            })
+            .collect();
+        let scoped = pbps_diff::scope(&pulled.schema, &IdsFile::default(), &held);
+        let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+        let unmanaged = unmanaged_objects(&scoped, &unreadable, &held);
+        assert_eq!(unmanaged.len(), 3, "{unmanaged:?}");
+        assert!(unmanaged.iter().any(|s| s.contains("app.f(bigint)")));
+        assert!(unmanaged.iter().any(|s| s.contains("app.other.audit")));
+        assert!(unmanaged.iter().any(|s| s.contains("module app.f (")));
+        let limited = managed_limitations(&pulled, &IdsFile::default(), &held);
+        assert_eq!(limited.len(), 2, "{limited:?}");
+        assert!(limited.iter().any(|s| s.contains("app.f(integer)")));
+        assert!(limited.iter().any(|s| s.contains("app.t.audit")));
     }
 
     /// A column this plan adds or alters is held to what the plan gives it,
