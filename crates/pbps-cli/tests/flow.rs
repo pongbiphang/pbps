@@ -11629,6 +11629,23 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
             .unwrap()
             .contains("not implemented")
     );
+    for name in ["missing_roles", "rename_evidence", "before_a_rebuild"] {
+        let check = report["data"]["connected_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {report}"));
+        assert_eq!(check["engine"], "SQL Server", "{check}");
+        assert_eq!(check["status"], "not_applicable", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not apply"),
+            "{check}"
+        );
+    }
     let cost = &report["data"]["cost"];
     assert_eq!(cost["status"], "unavailable");
     assert_eq!(cost["engine"], "sqlserver");
