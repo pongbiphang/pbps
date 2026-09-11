@@ -4667,7 +4667,7 @@ async fn apply_staged_under_lock(
         // for. Stopping is the whole remedy a staged run has.
         staged_movement(
             dialect,
-            &plan.changes,
+            &staged_statement_changes(&plan.changes, stmt),
             &previous,
             &recorded,
             &target.label,
@@ -4748,6 +4748,26 @@ enum StagedRead {
     Checkpoint { completed: usize, total: usize },
     /// The read after the last checkpoint, which becomes the closing entry.
     Closing { total: usize },
+}
+
+/// A checkpoint spans one emitted statement, not the whole logical rename.
+/// A schema transfer followed by a rename has an intermediate name absent
+/// from the plan's endpoints. Compare the exact move the emitter recorded so
+/// that table's disappearance is not mistaken for another writer's DROP,
+/// and its unchanged columns, rows and incoming references remain compared.
+fn staged_statement_changes(
+    changes: &pbps_model::ChangeSet,
+    statement: &pbps_dialect::Statement,
+) -> pbps_model::ChangeSet {
+    let mut at_statement = changes.clone();
+    if let [change] = at_statement.changes.as_mut_slice()
+        && let pbps_model::Change::RenameTable { from, to, .. } = &mut change.change
+        && let [(statement_from, statement_to)] = statement.renames.as_slice()
+    {
+        *from = statement_from.clone();
+        *to = statement_to.clone();
+    }
+    at_statement
 }
 
 fn staged_movement(

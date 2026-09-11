@@ -9561,3 +9561,20 @@ SPEC is in sync with all of these.
     denied, never as malformed and never with tables/modules silently
     reading zero, and another pins the projected path's version gate
     directly against `pbps_model::CURRENT_VERSION`/`OLDEST_READABLE_VERSION`.
+
+436. **A staged checkpoint compares the rename that its statement performed.**
+    A PostgreSQL cross-schema rename emits a schema transfer and then a name
+    change. The checkpoint between them correctly retained the intermediate
+    identity, but its movement check still used the original-to-final logical
+    rename. On resume, the final rename therefore reported the intermediate
+    table as unexpectedly gone and refused an otherwise valid deployment.
+
+    The checkpoint comparison now substitutes the emitted statement's exact
+    `renames` endpoints for that one logical table rename. It still compares
+    the table's untouched shape, rows, grants and incoming references; it does
+    not exempt intermediate names from checking. The closing read keeps the
+    full plan. Live CLI tests force a second-statement failure, read the first
+    checkpoint back on another connection, reject changes made while paused,
+    and resume to the declared destination. A companion test adds an unplanned
+    column during the first transfer and requires refusal at that checkpoint,
+    rather than letting the name change hide it (#299).
