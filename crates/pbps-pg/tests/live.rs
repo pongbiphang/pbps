@@ -93,6 +93,75 @@ async fn number(conn: &mut Conn, sql: &str) -> i32 {
         .expect("not null")
 }
 
+/// A plain-or-scientific decimal that names an integer, expanded into a
+/// canonical `(negative, digits)` form with no leading zeros — arbitrary
+/// precision, and never through `f64`.
+///
+/// `f64::parse` is the wrong tool for comparing two decimal strings for
+/// equality: once an integer is 16-17 digits long, distinct integers share a
+/// nearest double (`9007199254740992` and `9007199254740993`, `2^53` and
+/// `2^53 + 1`, both parse to the same `f64`). Comparing that way would call a
+/// value "survived" exactly when it is the specific corruption this suite
+/// exists to catch (#138 review). Comparing the digits themselves has no such
+/// blind spot, and still treats `90000000` and `9e+07` as the same number —
+/// the two spellings a binary float and an exact type choose for it.
+///
+/// Panics on a genuine fraction (a nonzero digit past the decimal point after
+/// applying the exponent): every value this helper is asked to compare is a
+/// whole number by construction, since the dialect's `numeric`-into-float
+/// classification only calls a change `Safe` for `scale <= 0`.
+fn canonical_integer(s: &str) -> (bool, String) {
+    let negative = s.starts_with('-');
+    let s = s.trim_start_matches(['-', '+']);
+    let (mantissa, exponent) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().expect("a valid exponent")),
+        None => (s, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits: String = int_part.chars().chain(frac_part.chars()).collect();
+    let frac_len = i32::try_from(frac_part.len()).expect("a reasonable fraction");
+    let shift = exponent - frac_len;
+    if shift >= 0 {
+        digits.extend(std::iter::repeat_n('0', shift as usize));
+    } else {
+        let point = digits.len() as i32 + shift;
+        let point = usize::try_from(point).unwrap_or_else(|_| panic!("`{s}` is not an integer"));
+        assert!(
+            digits[point..].bytes().all(|b| b == b'0'),
+            "`{s}` is not an integer"
+        );
+        digits.truncate(point);
+    }
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    (negative && digits != "0", digits.to_owned())
+}
+
+#[test]
+fn canonical_integer_reads_scientific_and_plain_spellings_as_the_same_number() {
+    // The same value, two spellings a `numeric` source and a float target
+    // choose for it.
+    assert_eq!(canonical_integer("90000000"), canonical_integer("9e+07"));
+    assert_eq!(
+        canonical_integer("9000000000000000000000"),
+        canonical_integer("9e+21")
+    );
+    // `2^53` and `2^53 + 1` are the same `f64` and must not be the same
+    // canonical integer — the exact case the review named.
+    assert_ne!(
+        canonical_integer("9007199254740993"),
+        canonical_integer("9.007199254740992e+15")
+    );
+    assert_eq!(
+        canonical_integer("9007199254740992"),
+        canonical_integer("9.007199254740992e+15")
+    );
+    // A sign, and a leading zero from a widened `real` (`0.0` renders as `0`,
+    // never `-0`, and the framework tolerates a stray leading zero).
+    assert_eq!(canonical_integer("-32767"), canonical_integer("-3.2767e4"));
+    assert_eq!(canonical_integer("007"), canonical_integer("7"));
+}
+
 /// The connection works at all, before anything else here means anything.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
@@ -934,20 +1003,22 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         if Postgres::new().type_change_risk(&normalize(from), &normalize(to))
             == TypeChangeRisk::Safe
         {
-            // A binary float target is compared as the number its text
-            // spells, not as the characters: the same exact value may be
-            // spelled `90000000` coming from `numeric` and `9e+07` coming
-            // back out of `real` or `double precision`, since both engine
-            // printers choose whichever is shorter. Every other target in
-            // this matrix keeps the literal comparison, where a spelling
-            // change **is** the finding (padding, a rendered date, a decimal
-            // point moving).
+            // A binary float target is compared as the integer its text
+            // spells, not as the characters and not through `f64`: the same
+            // exact value may be spelled `90000000` coming from `numeric` and
+            // `9e+07` coming back out of `real` or `double precision`, since
+            // both engine printers choose whichever is shorter — but
+            // `f64::parse` collapses distinct integers onto the same nearest
+            // double once they are 16-17 digits long (`9007199254740992` and
+            // `9007199254740993`, `2^53` and `2^53 + 1`, are the same `f64`),
+            // which is exactly the loss this test exists to catch (#138
+            // review). `canonical_integer` reads both sides as arbitrary-
+            // precision integers instead. Every other target in this matrix
+            // keeps the literal comparison, where a spelling change **is**
+            // the finding (padding, a rendered date, a decimal point moving).
             let survived = match (to, after.as_deref()) {
                 ("real" | "double precision", Some(after)) => {
-                    match (before.parse::<f64>(), after.parse::<f64>()) {
-                        (Ok(b), Ok(a)) => b == a,
-                        _ => false,
-                    }
+                    canonical_integer(&before) == canonical_integer(after)
                 }
                 (_, Some(after)) => after == before,
                 (_, None) => false,
