@@ -1234,6 +1234,23 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
             assert!(message.contains("`unmanaged: error`"), "{message}");
             assert!(message.contains("aggregate app.t(bigint)"), "{message}");
             assert!(message.contains("view app.bad(int)"), "{message}");
+            let verified = d.run(&["verify", "--db", connection, "--format", "json"]);
+            let report: serde_json::Value = serde_json::from_str(&stdout(&verified)).unwrap();
+            assert_eq!(code(&verified), 2, "{report}: {}", stderr(&verified));
+            assert!(
+                report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["id"] == "state.unmanaged-refused"
+                            && finding["message"].as_str().is_some_and(|message| {
+                                message.contains("aggregate app.t(bigint)")
+                                    && message.contains("view app.bad(int)")
+                            })
+                    }),
+                "{report}"
+            );
         } else {
             let message = stderr(&result);
             assert_eq!(
