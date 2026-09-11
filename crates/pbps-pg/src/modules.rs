@@ -866,7 +866,7 @@ fn signature(id: &ModuleId) -> String {
     })
 }
 
-async fn module_oid(
+pub(crate) async fn module_oid(
     conn: &mut Conn,
     id: &ModuleId,
     kind: ModuleKind,

@@ -38,6 +38,7 @@ use pbps_model::{
 
 pub mod catalog;
 pub mod doctor;
+mod drop_impact;
 mod emit;
 
 /// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):

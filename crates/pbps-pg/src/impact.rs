@@ -85,6 +85,7 @@ use crate::emit::qualified;
 // changes in a plan are rename targets stays this engine's question —
 // `rename_targets` below — and `RenameTarget::Module` is never one of them
 // here: the module documentation says whose question a dropped module is.
+pub use crate::drop_impact::drop_blockers;
 pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
 /// Every rename in a plan, as the objects they are renamed **from** — the

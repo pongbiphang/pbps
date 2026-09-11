@@ -1,4 +1,4 @@
-//! What a rename-impact query returns, on every engine (SPEC §7.4).
+//! What connected rename and drop impact queries return (SPEC §7.4–7.5).
 //!
 //! The question is the same on both engines — what still refers to the name a
 //! plan is about to change — and so is the shape of the answer. How the
@@ -9,11 +9,23 @@
 //! (ADR-0002) and only one engine asks the drop side here (the other answers
 //! it in `pbps_pg::modules`), so the builder stays with the engine and only
 //! the target it builds lives here (DECISIONS 417).
+//! Table/column DROP RESTRICT has its own report: an engine carrying a rename
+//! into a dependent does not imply that it permits deleting the target.
 
 use pbps_dialect::DialectError;
 use pbps_model::{ColumnRef, ObjectName, TableName};
 
 use crate::DbError;
+
+/// Existing catalog dependencies of a table or column the typed plan drops.
+/// A replacement may introduce new dependencies; this reports the objects the
+/// catalog contains now and whether the plan removes them in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropReport {
+    pub change_index: usize,
+    pub target: String,
+    pub blocking: Vec<String>,
+}
 
 /// What is being renamed.
 #[derive(Debug, Clone, PartialEq, Eq)]

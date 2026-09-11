@@ -11619,6 +11619,16 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
     assert_eq!(check["engine"], "SQL Server");
     assert_eq!(check["status"], "not_applicable");
     assert!(check["message"].as_str().unwrap().contains("PostgreSQL"));
+    let drop_check = &report["data"]["connected_checks"][1];
+    assert_eq!(drop_check["name"], "drop_blockers");
+    assert_eq!(drop_check["engine"], "SQL Server");
+    assert_eq!(drop_check["status"], "unavailable");
+    assert!(
+        drop_check["message"]
+            .as_str()
+            .unwrap()
+            .contains("not implemented")
+    );
     let cost = &report["data"]["cost"];
     assert_eq!(cost["status"], "unavailable");
     assert_eq!(cost["engine"], "sqlserver");
