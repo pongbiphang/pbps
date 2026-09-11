@@ -861,10 +861,21 @@ pub async fn permissions(
         database.insert(name.trim().to_ascii_uppercase());
     }
 
+    // Recorded tables remain managed until their drop is applied, even when
+    // the declarations no longer name their schema (decision 69). Tombstones
+    // are permanent history and must not keep these requirements switched on.
+    let recorded = match crate::state::latest(conn).await {
+        Ok(Some(entry)) => entry.snapshot.schema,
+        // An unreadable ledger is reported by the ledger permission rows.
+        _ => pbps_model::Schema::default(),
+    };
+    let mut managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
+    managed.extend(recorded.tables.keys().map(|table| table.schema.as_str()));
+
     // The ledger's schema is queried alongside the managed ones because it is
     // the fallback for the ledger requirements before those tables exist — but
     // its answer is kept in its own field, not folded into the managed set.
-    let mut wanted: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
+    let mut wanted = managed.clone();
     wanted.insert(LEDGER_SCHEMA);
     let wanted: Vec<&str> = wanted.into_iter().collect();
 
@@ -893,7 +904,7 @@ pub async fn permissions(
         .collect();
 
     // Both lists are bound, not pasted. The permission names are this crate's
-    // own constants and the schema names come from the declarations, but SQL
+    // own constants and the schema names come from declarations or state, but SQL
     // built by concatenation is the habit this codebase does not have.
     let mut params: Vec<Param<'_>> = Vec::new();
     let mut perm_slots = Vec::new();
@@ -1029,14 +1040,8 @@ pub async fn permissions(
     // it from the ids file before the plan that drops it runs). Tombstones
     // are not consulted: they are permanent, and a drop applied long ago
     // would keep the role requirements switched on forever.
-    let recorded = match crate::state::latest(conn).await {
-        Ok(Some(entry)) => entry.snapshot.schema.roles,
-        // Nothing recorded, or a ledger this account cannot read — the
-        // latter is a gap of its own, reported by the ledger rows.
-        _ => BTreeMap::new(),
-    };
     let mut roles: BTreeSet<String> = granted.roles.iter().cloned().collect();
-    roles.extend(recorded.keys().cloned());
+    roles.extend(recorded.roles.keys().cloned());
     // Any role-shaped demand switches the role requirements on: a managed
     // role by name, or a grant target the caller asks about.
     let roles_declared =
@@ -1060,7 +1065,7 @@ pub async fn permissions(
         // read is a gap of its own, reported by the ledger rows.
         let mut objects: BTreeSet<ObjectName> = targets.objects.iter().cloned().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
-        for role in recorded.values() {
+        for role in recorded.roles.values() {
             for target in role.grants.keys() {
                 match target {
                     pbps_model::GrantTarget::Object(o) => {
@@ -1166,15 +1171,13 @@ pub async fn permissions(
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
     // somehow did not, that is not a declaration problem.
-    let mut absent_schemas: BTreeSet<String> = schemas
+    let mut absent_schemas: BTreeSet<String> = managed
         .iter()
-        .filter(|name| name.as_str() != LEDGER_SCHEMA && !per_schema.contains_key(*name))
-        .cloned()
+        .filter(|name| **name != LEDGER_SCHEMA && !per_schema.contains_key(**name))
+        .map(|name| (*name).to_owned())
         .collect();
     absent_schemas.extend(absent_granted);
-    // Managed means declared. `dbo` stays only if the project actually declares
-    // something in it.
-    let managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
+    // `dbo` stays only if declared or recorded tables make it managed.
     per_schema.retain(|name, _| managed.contains(name.as_str()));
 
     Ok(Held {
