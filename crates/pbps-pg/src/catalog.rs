@@ -39,6 +39,16 @@ use crate::introspect::{
     RawRole, RawSharedDependency, RawTable, assemble,
 };
 
+/// The emitter quotes both parts of every table name. PostgreSQL compares
+/// those identifiers exactly, independently of text-column collations.
+pub fn matching_table_names(wanted: &[TableName], observed: &[TableName]) -> Vec<TableName> {
+    wanted
+        .iter()
+        .filter(|name| observed.contains(name))
+        .cloned()
+        .collect()
+}
+
 /// The schemas that are never a project's.
 ///
 /// `pg_catalog` and `information_schema` are the engine's; `pg_toast` and the

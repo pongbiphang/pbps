@@ -469,6 +469,47 @@ pub async fn principals_holding(
     Ok(out)
 }
 
+/// Compare captured table names under the database's identifier collation,
+/// part by part (DECISIONS 119, 142). Only values from the caller's read are
+/// compared: a second catalog lookup could miss a name that read already saw.
+pub async fn matching_table_names(
+    conn: &mut Conn,
+    wanted: &[TableName],
+    observed: &[TableName],
+) -> Result<Vec<TableName>, DbError> {
+    if wanted.is_empty() || observed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = |names: &[TableName]| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                format!(
+                    "({i}, {}, {})",
+                    crate::ident::literal(&n.schema),
+                    crate::ident::literal(&n.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let sql = format!(
+        "SELECT DISTINCT a.i FROM (VALUES {}) AS a(i, schema_name, table_name)
+         JOIN (VALUES {}) AS b(i, schema_name, table_name)
+           ON a.schema_name = b.schema_name COLLATE DATABASE_DEFAULT
+          AND a.table_name = b.table_name COLLATE DATABASE_DEFAULT ORDER BY a.i;",
+        values(wanted),
+        values(observed)
+    );
+    let mut found = Vec::new();
+    for row in conn.query(&sql).await? {
+        let i = get::<i32>(&row, "i")? as usize;
+        found.push(wanted[i].clone());
+    }
+    Ok(found)
+}
+
 /// Among `names`, the pairs the database reads as one name — `Reader` and
 /// `reader` under a case-insensitive collation — each as `(earlier, later)`
 /// in the order given. A plan that creates both passes every check against

@@ -305,6 +305,20 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
     )
 }
 
+/// Which requested names occur in an already captured table inventory.
+pub async fn matching_table_names(
+    conn: &mut Conn,
+    wanted: &[TableName],
+    observed: &[TableName],
+) -> anyhow::Result<Vec<TableName>> {
+    match conn.driver() {
+        Driver::Mssql => {
+            Ok(pbps_mssql::catalog::matching_table_names(conn, wanted, observed).await?)
+        }
+        Driver::Postgres => Ok(pbps_pg::catalog::matching_table_names(wanted, observed)),
+    }
+}
+
 /// Among `names`, the pairs the database reads as one name (DECISIONS 123).
 pub async fn names_alike(conn: &mut Conn, names: &[&str]) -> anyhow::Result<Vec<(String, String)>> {
     match conn.driver() {

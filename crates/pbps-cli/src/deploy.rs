@@ -56,6 +56,9 @@ pub struct Managed {
     /// placed in the schema: `plan --db` projects two different views out of
     /// one read (see [`pbps_model::data::read_scopes`]).
     pub rows: ObservedRows,
+    /// Names outside the managed set whose relation definitions were omitted.
+    /// An unsupported temporal table still occupies its name (SPEC §7.6).
+    pub unmanaged_relations: Vec<TableName>,
 }
 
 /// The scoped state alone, with the rows of every table in `scopes` read back
@@ -168,6 +171,12 @@ async fn managed_state_once(
         managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes), read).await?;
     refuse_managed_limitations(&managed.limitations)?;
     let mut scoped = managed.scoped;
+    // Definition projection must not manufacture absence. Keep the same
+    // read's omitted relation names for final endpoint checks, without
+    // recording an unsupported definition in the schema (SPEC §7.6).
+    scoped.unmanaged.extend(managed.unmanaged_relations);
+    scoped.unmanaged.sort();
+    scoped.unmanaged.dedup();
     scoped.schema = scoped
         .schema
         .with_observed_rows(&managed.rows, scopes, reference)?;
@@ -332,6 +341,22 @@ async fn managed_state_full(
     let pulled = pull(conn, read).await?;
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
     let limitations = managed_limitations(&pulled, ids, modules);
+    let unmanaged_relations = pulled
+        .limitations
+        .iter()
+        .filter_map(|limitation| match &limitation.target {
+            pbps_db::catalog::LimitationTarget::Relation(name)
+                if !ids.tables.values().any(|managed| managed == name)
+                    && !modules.contains(&ModuleId::Named(name.clone())) =>
+            {
+                Some(name.clone())
+            }
+            pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::SharedModule(_)
+            | pbps_db::catalog::LimitationTarget::Module(_)
+            | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
+        })
+        .collect();
     let scoped = cut(&pulled, ids, modules, &unreadable, unmanaged)?;
     let rows = crate::engine::read_rows(conn, &scoped.schema, rows, read)
         .await
@@ -341,6 +366,7 @@ async fn managed_state_full(
         limitations,
         unreadable,
         rows,
+        unmanaged_relations,
     })
 }
 
@@ -4271,6 +4297,13 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             crate::engine::Read::InsideOwnTransaction,
         )
         .await?;
+        refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{e:#}\n\nNothing has been applied — the transaction was rolled back."
+                )
+            })?;
         // Everything this plan does not touch has to be what the baseline
         // held, down to the rows of a table it does touch that no change of
         // it names (DECISIONS 150, 153). The read above is what gets
@@ -4667,7 +4700,7 @@ async fn apply_staged_under_lock(
         // for. Stopping is the whole remedy a staged run has.
         staged_movement(
             dialect,
-            &plan.changes,
+            &staged_statement_changes(&plan.changes, stmt),
             &previous,
             &recorded,
             &target.label,
@@ -4693,6 +4726,17 @@ async fn apply_staged_under_lock(
         crate::engine::Read::Snapshot,
     )
     .await?;
+    refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\n\n\
+             All {total} statement(s) completed, but the staged deployment cannot close. \
+             Nothing was rolled back; the ledger retains the last checkpoint. \
+             Remove the recreated table and run `pbps apply --staged --resume`, \
+             or accept the database with `pbps baseline --reason ...` and plan from there."
+            )
+        })?;
     // And the last window of all: between the final checkpoint and this read.
     // Refused *before* the ordinary entry is written, because that entry is
     // what says the deployment finished — leaving the environment on its last
@@ -4748,6 +4792,74 @@ enum StagedRead {
     Checkpoint { completed: usize, total: usize },
     /// The read after the last checkpoint, which becomes the closing entry.
     Closing { total: usize },
+}
+
+/// Ids follow a renamed table and omit a dropped one, so a recreated name
+/// falls outside the managed schema. Its absence remains a plan promise
+/// (SPEC §7.6). Use the same read's inventory without adopting unrelated
+/// unmanaged tables into the guard (SPEC §8.2); the net promise also permits
+/// a plan that deliberately reuses a name.
+async fn refuse_recreated_tables(
+    conn: &mut Conn,
+    changes: &pbps_model::ChangeSet,
+    statements: &[pbps_dialect::Statement],
+    unmanaged: &[TableName],
+) -> anyhow::Result<()> {
+    let absent = removed_table_names(changes, statements);
+    if let Some(name) = crate::engine::matching_table_names(conn, &absent, unmanaged)
+        .await?
+        .first()
+    {
+        anyhow::bail!("{name} is still there, and this plan removes it");
+    }
+    Ok(())
+}
+
+/// The logical rename omits its intermediate names (DECISIONS 436). Their
+/// emitted moves still promise absence at closing (SPEC §7.6), unless a
+/// later move or the logical plan deliberately gives the name to a table.
+fn removed_table_names(
+    changes: &pbps_model::ChangeSet,
+    statements: &[pbps_dialect::Statement],
+) -> Vec<TableName> {
+    let mut expected = BTreeMap::new();
+    for statement in statements {
+        for (from, to) in &statement.renames {
+            expected.insert(from, pbps_model::Presence::Absent);
+            expected.insert(to, pbps_model::Presence::Present);
+        }
+    }
+    expected.extend(
+        changes
+            .changes
+            .iter()
+            .flat_map(|change| change.change.tables_after()),
+    );
+    expected
+        .into_iter()
+        .filter(|(_, presence)| *presence == pbps_model::Presence::Absent)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// A checkpoint spans one emitted statement, not the whole logical rename.
+/// A schema transfer followed by a rename has an intermediate name absent
+/// from the plan's endpoints. Compare the exact move the emitter recorded so
+/// that table's disappearance is not mistaken for another writer's DROP,
+/// and its unchanged columns, rows and incoming references remain compared.
+fn staged_statement_changes(
+    changes: &pbps_model::ChangeSet,
+    statement: &pbps_dialect::Statement,
+) -> pbps_model::ChangeSet {
+    let mut at_statement = changes.clone();
+    if let [change] = at_statement.changes.as_mut_slice()
+        && let pbps_model::Change::RenameTable { from, to, .. } = &mut change.change
+        && let [(statement_from, statement_to)] = statement.renames.as_slice()
+    {
+        *from = statement_from.clone();
+        *to = statement_to.clone();
+    }
+    at_statement
 }
 
 fn staged_movement(
@@ -5528,6 +5640,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn intermediate_names_are_absent_unless_the_plan_deliberately_reuses_them() {
+        use pbps_dialect::Statement;
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let rename = |uid: &str, from: &str, to: &str| {
+            PlannedChange::new(Change::RenameTable {
+                uid: uid.parse().unwrap(),
+                from: from.parse().unwrap(),
+                to: to.parse().unwrap(),
+            })
+        };
+        let mut changes = ChangeSet {
+            changes: vec![rename("t_aaaaaa", "app.t", "moved.u")],
+        };
+        let mut statements = vec![
+            Statement::new("").renaming("app.t".parse().unwrap(), "moved.t".parse().unwrap()),
+            Statement::new("").renaming("moved.t".parse().unwrap(), "moved.u".parse().unwrap()),
+        ];
+        assert_eq!(
+            removed_table_names(&changes, &statements),
+            vec![
+                "app.t".parse::<TableName>().unwrap(),
+                "moved.t".parse().unwrap()
+            ]
+        );
+        changes
+            .changes
+            .push(rename("t_bbbbbb", "app.other", "moved.t"));
+        statements.push(
+            Statement::new("").renaming("app.other".parse().unwrap(), "moved.t".parse().unwrap()),
+        );
+        assert_eq!(
+            removed_table_names(&changes, &statements),
+            vec![
+                "app.other".parse::<TableName>().unwrap(),
+                "app.t".parse().unwrap()
+            ]
+        );
+    }
+
     use pbps_db::catalog::{Limitation, Pulled, UnmanagedModule};
     use pbps_model::{DataMode, DataScope};
 

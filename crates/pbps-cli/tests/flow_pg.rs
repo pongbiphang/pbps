@@ -186,6 +186,81 @@ fn succeeds(o: Output) -> Output {
     o
 }
 
+fn json_output(o: Output) -> serde_json::Value {
+    let text = stdout(&o);
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}\n{}", stderr(&o)))
+}
+
+fn scalar(connection: &str, sql: &str) -> i64 {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            c.query(sql).await.unwrap()[0]
+                .try_get_at::<i64>(0)
+                .unwrap()
+                .unwrap()
+        })
+}
+
+fn latest_snapshot(connection: &str) -> pbps_model::StateSnapshot {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            pbps_pg::state::latest(&mut c)
+                .await
+                .unwrap()
+                .unwrap()
+                .snapshot
+        })
+}
+
+fn connected_artifact(d: &Demo, connection: &str, staged: bool) -> PathBuf {
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let path = d.dir.join("invariant-plan.json");
+    let mut args = vec!["plan", "--db", connection, "--out", path.to_str().unwrap()];
+    if staged {
+        args.push("--staged");
+    }
+    succeeds(d.run(&args));
+    path
+}
+
+fn approved_apply(d: &Demo, connection: &str, plan: &std::path::Path, extra: &[&str]) -> Output {
+    let checksum = plan_checksum(plan);
+    let mut args = vec![
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ];
+    args.extend_from_slice(extra);
+    d.run(&args)
+}
+
+fn bootstrapped_demo(connection: &str, slug: &str, table: &str) -> Demo {
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    d.table(table);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    d
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
@@ -2053,5 +2128,943 @@ fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
         "--staged",
         "--resume",
     ]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn the_cli_ledger_preserves_history_and_distinguishes_absent_empty_and_unreadable() {
+    let own = OwnDatabase::new(&server(), "invariant_ledger");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("invariant-ledger");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let history = || {
+        json_output(succeeds(
+            d.run(&["state", "list", "--db", connection, "--format", "json"]),
+        ))
+    };
+    let absent = history();
+    assert_eq!(absent["data"]["initialized"], false, "{absent}");
+    assert_eq!(absent["data"]["entries"], serde_json::json!([]));
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopting an empty schema",
+    ]));
+    let recorded = latest_snapshot(connection);
+    assert!(recorded.schema.tables.is_empty());
+    assert_eq!(
+        latest_snapshot(connection),
+        recorded,
+        "separate connections read the same snapshot"
+    );
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    let v = history();
+    let entries = v["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{v}");
+    assert_eq!(entries[0]["kind"], "bootstrap");
+    assert_eq!(entries[0]["tables"], 1);
+    assert_eq!(entries[1]["kind"], "baseline");
+    assert_eq!(entries[1]["tables"], 0);
+    assert_eq!(entries[1]["reason"], "adopting an empty schema");
+    assert!(entries[0]["id"].as_i64().unwrap() > entries[1]["id"].as_i64().unwrap());
+    let limited = json_output(succeeds(d.run(&[
+        "state", "list", "--db", connection, "--format", "json", "--limit", "1",
+    ])));
+    assert_eq!(limited["data"]["entries"], serde_json::json!([entries[0]]));
+    // Missing query columns are unreadable, never an empty successful history.
+    on_server(
+        connection,
+        "ALTER TABLE public.__pbps_state RENAME COLUMN kind TO hidden_kind",
+    );
+    let broken = d.run(&["state", "list", "--db", connection, "--format", "json"]);
+    assert_eq!(code(&broken), 1, "{}", stderr(&broken));
+    let broken = json_output(broken);
+    assert_eq!(broken["result"], "unanswerable");
+    assert!(broken.get("data").is_none(), "{broken}");
+    on_server(
+        connection,
+        "ALTER TABLE public.__pbps_state RENAME COLUMN hidden_kind TO kind; DELETE FROM public.__pbps_state",
+    );
+    let empty = history();
+    assert_eq!(empty["data"]["initialized"], true);
+    assert_eq!(empty["data"]["entries"], serde_json::json!([]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate() {
+    let own = OwnDatabase::new(&server(), "invariant_lock");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-lock", ONE_COLUMN);
+    on_server(
+        connection,
+        "INSERT INTO public.__pbps_lock (id, locked_by) VALUES (1, 'invariant-first-holder')",
+    );
+    let before = latest_snapshot(connection);
+    for args in [
+        vec!["baseline", "--db", connection, "--reason", "second holder"],
+        vec!["snapshot", "--db", connection],
+    ] {
+        let denied = d.run(&args);
+        assert_eq!(code(&denied), 1, "{}{}", stdout(&denied), stderr(&denied));
+        assert!(
+            stderr(&denied).contains("invariant-first-holder"),
+            "{}",
+            stderr(&denied)
+        );
+    }
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM public.__pbps_lock WHERE locked_by = 'invariant-first-holder'"
+        ),
+        1
+    );
+    assert_eq!(latest_snapshot(connection), before);
+    let diagnosis = d.run(&["doctor", "--db", connection, "--format", "json"]);
+    assert_eq!(code(&diagnosis), 2);
+    let diagnosis = json_output(diagnosis);
+    assert!(
+        diagnosis["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked")
+    );
+    succeeds(d.run(&["unlock", "--db", connection]));
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM public.__pbps_lock"),
+        0
+    );
+    assert_eq!(latest_snapshot(connection), before);
+    succeeds(d.run(&["unlock", "--db", connection]));
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "after unlock"]));
+    assert_eq!(
+        latest_snapshot(connection).reason.as_deref(),
+        Some("after unlock")
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_second_statement_failure_rolls_back_the_first_and_records_only_a_failed_attempt() {
+    let own = OwnDatabase::new(&server(), "invariant_atomic");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-atomic", ONE_COLUMN);
+    d.table(&ONE_COLUMN.replace(
+        "  id:",
+        "  first: {type: text}\n  second: {type: text}\n  id:",
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(saved.changes.changes.len(), 2);
+    // An event trigger fails the second DDL after the first really executed.
+    // Sequence increments survive rollback, so this cannot pass by refusing
+    // in preflight before either statement ran.
+    on_server(
+        connection,
+        r#"
+        CREATE SCHEMA witness;
+        CREATE SEQUENCE witness.executed;
+        CREATE FUNCTION witness.fail_second() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname IN ('first', 'second') AND NOT attisdropped) THEN
+            PERFORM nextval('witness.executed');
+          END IF;
+          IF (SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname IN ('first', 'second') AND NOT attisdropped) = 2 THEN
+            RAISE EXCEPTION 'invariant second statement failed';
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER fail_second ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.fail_second();
+    "#,
+    );
+    let failed = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM witness.executed"
+        ),
+        2,
+        "{}{}",
+        stdout(&failed),
+        stderr(&failed)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname IN ('first', 'second') AND NOT attisdropped"
+        ),
+        0
+    );
+    let after = latest_snapshot(connection);
+    assert_eq!(after.kind, pbps_model::StateKind::Failed);
+    assert_eq!(
+        after.plan_checksum.as_deref(),
+        Some(plan_checksum(&plan).as_str())
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+        ),
+        0
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(connection, "DROP EVENT TRIGGER fail_second");
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(
+        latest_snapshot(connection).kind,
+        pbps_model::StateKind::Apply
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn the_cli_probe_counts_real_null_rows_before_any_statement_and_then_accepts_clean_data() {
+    let own = OwnDatabase::new(&server(), "invariant_probe");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-probe", TWO_COLUMNS);
+    on_server(
+        connection,
+        "INSERT INTO app.t (id, label) VALUES (1, NULL), (2, NULL), (3, 'present')",
+    );
+    d.table(&TWO_COLUMNS.replace(
+        "label: {type: varchar(50)}",
+        "label: {type: varchar(50), nullable: false}",
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "not-null"]);
+    assert_eq!(code(&refused), 1);
+    assert!(
+        stderr(&refused).contains("2 existing NULLs in"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("nothing has been changed"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'label' AND attnotnull"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM app.t WHERE label IS NULL"),
+        2
+    );
+    on_server(
+        connection,
+        "UPDATE app.t SET label = 'filled' WHERE label IS NULL",
+    );
+    let applied = succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "not-null"],
+    ));
+    assert!(
+        stdout(&applied).contains("probe(s) passed"),
+        "{}",
+        stdout(&applied)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'label' AND attnotnull"
+        ),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn modules_apply_then_pull_round_trip_and_changed_bodies_are_drift() {
+    let own = OwnDatabase::new(&server(), "invariant_modules");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-modules", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/v.yml"),
+        "view: app.v\ndefinition: SELECT id FROM app.t WHERE id > 0\n",
+    )
+    .unwrap();
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n + 1 $$\n").unwrap();
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let fresh = Demo::new("invariant-modules-pull");
+    succeeds(fresh.run(&["pull", "--db", connection]));
+    let loaded = pbps_load::load_schema_dir(&fresh.dir.join("schema")).unwrap();
+    assert_eq!(loaded.schema.modules.len(), 2);
+    assert!(
+        loaded
+            .schema
+            .modules
+            .contains_key(&"app.v".parse().unwrap())
+    );
+    assert!(
+        loaded
+            .schema
+            .modules
+            .contains_key(&"app.f(integer)".parse().unwrap())
+    );
+    // Pull serializes the engine's canonical body, which may differ from
+    // the original SQL spelling tracked in declared-state metadata.
+    assert_eq!(
+        loaded.schema.modules,
+        latest_snapshot(connection).schema.modules
+    );
+    on_server(
+        connection,
+        "CREATE OR REPLACE VIEW app.v AS SELECT id FROM app.t WHERE id > 1",
+    );
+    let drift = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&drift), 2, "{}{}", stdout(&drift), stderr(&drift));
+    assert!(stdout(&drift).contains("app.v"), "{}", stdout(&drift));
+    let overwrite = fresh.run(&["pull", "--db", connection]);
+    assert_eq!(code(&overwrite), 1);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name() {
+    let own = OwnDatabase::new(&server(), "invariant_checkpoint");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-checkpoint", ONE_COLUMN);
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.stop_rename() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.u') IS NOT NULL THEN RAISE EXCEPTION 'invariant stop after schema transfer'; END IF;
+        END $$;
+        CREATE EVENT TRIGGER stop_rename ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.stop_rename();
+    "#,
+    );
+    let failed = approved_apply(&d, connection, &plan, &["--allow", "rename", "--staged"]);
+    assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+    let checkpoint = latest_snapshot(connection);
+    let progress = checkpoint
+        .staged
+        .as_ref()
+        .expect("a durable checkpoint, not a transactional rollback");
+    assert_eq!((progress.completed, progress.total), (1, 2));
+    assert!(
+        progress.last_statement.contains("SET SCHEMA"),
+        "{progress:?}"
+    );
+    assert!(
+        checkpoint
+            .schema
+            .tables
+            .contains_key(&"moved.t".parse().unwrap()),
+        "{checkpoint:?}"
+    );
+    assert!(
+        !checkpoint
+            .schema
+            .tables
+            .contains_key(&"moved.u".parse().unwrap())
+    );
+    assert_eq!(
+        latest_snapshot(connection),
+        checkpoint,
+        "the checkpoint round-trips on a fresh connection"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('moved.t')"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('moved.u')"
+        ),
+        0
+    );
+    let listed = json_output(succeeds(
+        d.run(&["state", "list", "--db", connection, "--format", "json"]),
+    ));
+    assert_eq!(
+        listed["data"]["entries"][0]["staged"]["completed"], 1,
+        "{listed}"
+    );
+    // Movement after the saved checkpoint is not silently adopted by resume.
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER stop_rename; ALTER TABLE moved.t ADD COLUMN rogue text",
+    );
+    let refused = approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--staged", "--resume"],
+    );
+    assert_eq!(code(&refused), 1);
+    assert!(
+        stderr(&refused).contains("has moved since the checkpoint"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        latest_snapshot(connection)
+            .staged
+            .as_ref()
+            .unwrap()
+            .completed,
+        1
+    );
+    on_server(connection, "ALTER TABLE moved.t DROP COLUMN rogue");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--staged", "--resume"],
+    ));
+    let closed = latest_snapshot(connection);
+    assert_eq!(closed.kind, pbps_model::StateKind::Apply);
+    assert!(closed.staged.is_none());
+    assert!(
+        closed
+            .schema
+            .tables
+            .contains_key(&"moved.u".parse().unwrap())
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('moved.t')"
+        ),
+        0
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_cross_schema_cli_rename_requires_approval_and_records_only_its_declared_destination() {
+    let own = OwnDatabase::new(&server(), "invariant_cross_schema");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-cross-schema", ONE_COLUMN);
+    on_server(
+        connection,
+        "CREATE SCHEMA moved; INSERT INTO app.t VALUES (42)",
+    );
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, false);
+    let denied = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&denied), 1);
+    assert!(stderr(&denied).contains("--allow"), "{}", stderr(&denied));
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM app.t WHERE id = 42"),
+        1
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM moved.u WHERE id = 42"),
+        1
+    );
+    for name in ["app.t", "app.u", "moved.t"] {
+        assert_eq!(
+            scalar(
+                connection,
+                &format!("SELECT count(*) FROM pg_class WHERE oid = to_regclass('{name}')")
+            ),
+            0,
+            "no intermediate alias {name}"
+        );
+    }
+    let recorded = latest_snapshot(connection);
+    assert_eq!(
+        recorded.schema.tables.keys().collect::<Vec<_>>(),
+        vec![&"moved.u".parse::<pbps_model::TableName>().unwrap()]
+    );
+    assert_eq!(
+        recorded.ids.tables.values().collect::<Vec<_>>(),
+        vec![&"moved.u".parse::<pbps_model::TableName>().unwrap()]
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval() {
+    let own = OwnDatabase::new(&server(), "invariant_impact");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-impact", TWO_COLUMNS);
+    on_server(
+        connection,
+        r#"
+        CREATE SCHEMA outside;
+        CREATE VIEW outside.carried AS SELECT label FROM app.t;
+        CREATE FUNCTION outside.text_body() RETURNS text LANGUAGE plpgsql AS $$
+          BEGIN RETURN (SELECT label FROM app.t LIMIT 1); END $$;
+        INSERT INTO app.t VALUES (1, 'kept');
+    "#,
+    );
+    d.table(&TWO_COLUMNS.replace(
+        "  label: {type: varchar(50)}",
+        "  note: {type: varchar(50), renamed_from: label}",
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let denied = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&denied), 1);
+    assert!(stderr(&denied).contains("--allow"));
+    // PostgreSQL carries catalog dependencies instead of refusing them as
+    // SCHEMABINDING. A text body is advisory, printed by apply's preflight.
+    let applied = succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    assert!(
+        stdout(&applied).contains("outside.text_body"),
+        "{}",
+        stdout(&applied)
+    );
+    assert!(
+        stdout(&applied).contains("Nothing outside the database is visible"),
+        "{}",
+        stdout(&applied)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM outside.carried WHERE label = 'kept'"
+        ),
+        1
+    );
+    let broken = try_on_server(connection, "SELECT outside.text_body()");
+    assert!(
+        broken.is_err(),
+        "the advisory names a text body the rename really breaks"
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_exercises_a_real_non_superuser_and_names_the_permission_removed_from_it() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_invariant_doctor_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "invariant_doctor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'invariant-test'; CREATE SCHEMA app AUTHORIZATION {}; GRANT CREATE ON SCHEMA public TO {}",
+            role.1, role.1, role.1
+        ),
+    );
+    let login = format!(
+        "{} user={} password=invariant-test",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+    let d = Demo::new("invariant-doctor");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &login]));
+    assert_eq!(
+        scalar(
+            &login,
+            "SELECT count(*) FROM pg_roles WHERE rolname = current_user AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication)"
+        ),
+        0
+    );
+    let ready = json_output(succeeds(
+        d.run(&["doctor", "--db", &login, "--format", "json"]),
+    ));
+    assert_eq!(
+        ready["data"]["environments"][0]["missing_permissions"],
+        serde_json::json!([]),
+        "{ready}"
+    );
+    on_server(
+        connection,
+        &format!("REVOKE SELECT ON app.t FROM {}", role.1),
+    );
+    let refused = d.run(&["doctor", "--db", &login, "--format", "json"]);
+    assert_eq!(
+        code(&refused),
+        2,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    let refused = json_output(refused);
+    let missing = refused["data"]["environments"][0]["missing_permissions"]
+        .as_array()
+        .unwrap();
+    assert!(
+        missing.iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.contains("SELECT") && s.contains("app"))),
+        "{refused}"
+    );
+    assert!(!refused.to_string().contains("invariant-test"));
+    on_server(connection, &format!("GRANT SELECT ON app.t TO {}", role.1));
+    succeeds(d.run(&["doctor", "--db", &login]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan() {
+    let own = OwnDatabase::new(&server(), "invariant_data");
+    let connection = own.connection();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: text, nullable: false, default: \"'Unlabelled'\"}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    let d = bootstrapped_demo(connection, "invariant-data", declared);
+    d.table(&format!(
+        "{declared}data:\n  mode: exact\n  rows:\n    new: {{label: New}}\n    old: {{}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    on_server(connection, "INSERT INTO app.t (code) VALUES ('rogue')");
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&refused), 1);
+    assert!(
+        stderr(&refused).contains("no longer the database this plan was computed against"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE code IN ('new', 'old')"
+        ),
+        0
+    );
+    on_server(connection, "DELETE FROM app.t WHERE code = 'rogue'");
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE (code = 'new' AND label = 'New') OR (code = 'old' AND label = 'Unlabelled')"
+        ),
+        2
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
+    on_server(
+        connection,
+        "UPDATE app.t SET label = 'changed' WHERE code = 'old'",
+    );
+    let drift = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&drift), 2);
+    assert!(stdout(&drift).contains("row old"), "{}", stdout(&drift));
+    on_server(
+        connection,
+        "UPDATE app.t SET label = 'Unlabelled' WHERE code = 'old'",
+    );
+    let fresh = Demo::new("invariant-data-pull");
+    succeeds(fresh.run(&["pull", "--db", connection, "--data", "app.t"]));
+    let file = std::fs::read_to_string(fresh.dir.join("schema/app.t.yml")).unwrap();
+    assert!(file.contains("mode: exact"), "{file}");
+    assert!(file.contains("new: {label: New}"), "{file}");
+    assert!(file.contains("old: {}"), "{file}");
+    assert!(!file.contains("rogue"), "{file}");
+    let missing = fresh.run(&["pull", "--db", connection, "--data", "app.nope", "--force"]);
+    assert_eq!(code(&missing), 1);
+    assert!(stderr(&missing).contains("app.nope"));
+    assert_eq!(
+        std::fs::read_to_string(fresh.dir.join("schema/app.t.yml")).unwrap(),
+        file
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_schema_transfer_does_not_hide_an_unplanned_column_at_the_intermediate_name() {
+    let own = OwnDatabase::new(&server(), "invariant_checkpoint_movement");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-checkpoint-movement", ONE_COLUMN);
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    // This lands inside the first emitted statement. The next checkpoint
+    // must catch it even though that statement also moved the table's name.
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.add_rogue() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.t') IS NOT NULL AND NOT EXISTS (
+            SELECT FROM pg_attribute WHERE attrelid = 'moved.t'::regclass AND attname = 'rogue' AND NOT attisdropped
+          ) THEN ALTER TABLE moved.t ADD COLUMN rogue text; END IF;
+        END $$;
+        CREATE EVENT TRIGGER add_rogue ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.add_rogue();
+    "#,
+    );
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "rename", "--staged"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("rogue"), "{}", stderr(&refused));
+    let checkpoint = latest_snapshot(connection);
+    assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 1);
+    assert!(
+        checkpoint.schema.tables[&"moved.t".parse().unwrap()]
+            .columns
+            .contains_key("rogue")
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('moved.u')"
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_rename_refuses_a_recreated_source_even_when_resuming_only_the_closing_read() {
+    let own = OwnDatabase::new(&server(), "invariant_recreated_source");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-recreated-source", ONE_COLUMN);
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.recreate_source() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.t') IS NOT NULL AND to_regclass('app.t') IS NULL THEN
+            CREATE TABLE app.t (impostor text);
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER recreate_source ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.recreate_source();
+    "#,
+    );
+    for resume in [false, true] {
+        let mut flags = vec!["--allow", "rename", "--staged"];
+        if resume {
+            flags.push("--resume");
+        }
+        let refused = approved_apply(&d, connection, &plan, &flags);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+        let checkpoint = latest_snapshot(connection);
+        assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 2);
+        assert!(
+            checkpoint
+                .schema
+                .tables
+                .contains_key(&"moved.u".parse().unwrap())
+        );
+        assert!(
+            !checkpoint
+                .schema
+                .tables
+                .contains_key(&"app.t".parse().unwrap())
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            0
+        );
+    }
+    // An unrelated unmanaged table does not become drift when the source is repaired.
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER recreate_source; DROP TABLE app.t; CREATE TABLE witness.unrelated (id bigint)",
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--staged", "--resume"],
+    ));
+    assert_eq!(
+        latest_snapshot(connection).kind,
+        pbps_model::StateKind::Apply
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_transactional_rename_rolls_back_when_a_trigger_recreates_its_source() {
+    let own = OwnDatabase::new(&server(), "invariant_recreated_transaction");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-recreated-transaction", ONE_COLUMN);
+    on_server(
+        connection,
+        "CREATE SCHEMA moved; CREATE SCHEMA witness; INSERT INTO app.t VALUES (42)",
+    );
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, false);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.recreate_source() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.t') IS NOT NULL AND to_regclass('app.t') IS NULL THEN
+            CREATE TABLE app.t (impostor text);
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER recreate_source ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.recreate_source();
+    "#,
+    );
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "rename"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM app.t WHERE id = 42"),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid IN (to_regclass('moved.t'), to_regclass('moved.u'))"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+        ),
+        0
+    );
+    assert_eq!(
+        latest_snapshot(connection).kind,
+        pbps_model::StateKind::Failed
+    );
+    on_server(connection, "DROP EVENT TRIGGER recreate_source");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_rename_refuses_a_recreated_intermediate_name_at_closing_and_resume() {
+    let own = OwnDatabase::new(&server(), "invariant_recreated_intermediate");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-recreated-intermediate", ONE_COLUMN);
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.recreate_intermediate() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.u') IS NOT NULL AND to_regclass('moved.t') IS NULL THEN
+            CREATE TABLE moved.t (impostor text);
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER recreate_intermediate ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.recreate_intermediate();
+    "#,
+    );
+    for resume in [false, true] {
+        let mut flags = vec!["--allow", "rename", "--staged"];
+        if resume {
+            flags.push("--resume");
+        }
+        let refused = approved_apply(&d, connection, &plan, &flags);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(stderr(&refused).contains("moved.t"), "{}", stderr(&refused));
+        let checkpoint = latest_snapshot(connection);
+        assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 2);
+        assert!(
+            checkpoint
+                .schema
+                .tables
+                .contains_key(&"moved.u".parse().unwrap())
+        );
+        assert!(
+            !checkpoint
+                .schema
+                .tables
+                .contains_key(&"moved.t".parse().unwrap())
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            0
+        );
+    }
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER recreate_intermediate; DROP TABLE moved.t",
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--staged", "--resume"],
+    ));
     succeeds(d.run(&["verify", "--db", connection]));
 }
