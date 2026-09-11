@@ -494,14 +494,20 @@ fn grant_targets(project: &Project) -> pbps_db::doctor::GrantTargets {
     roles.extend(ids.roles.values().cloned());
     let mut objects = std::collections::BTreeSet::new();
     let mut schemas = std::collections::BTreeSet::new();
+    let mut permissions: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> =
+        std::collections::BTreeMap::new();
     for role in loaded.schema.roles.values() {
-        for target in role.grants.keys() {
+        for (target, rights) in &role.grants {
+            permissions
+                .entry(target.clone())
+                .or_default()
+                .extend(rights);
             match target {
                 pbps_model::GrantTarget::Object(o) => {
                     objects.insert(o.clone());
                 }
-                // The engine knows a routine by its bare name; the signature
-                // only says which overload the declaration meant.
+                // SQL Server asks about the object; PostgreSQL uses the exact
+                // target retained in `permissions` above.
                 pbps_model::GrantTarget::Routine(r) => {
                     objects.insert(r.name.clone());
                 }
@@ -512,6 +518,7 @@ fn grant_targets(project: &Project) -> pbps_db::doctor::GrantTargets {
         }
     }
     pbps_db::doctor::GrantTargets {
+        permissions,
         objects: objects.into_iter().collect(),
         schemas: schemas.into_iter().collect(),
         roles: roles.into_iter().collect(),

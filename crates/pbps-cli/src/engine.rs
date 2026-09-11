@@ -412,21 +412,8 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Permissions, 
                 absent_schemas: held.absent_schemas,
             })
         }
-        // Asked about the schemas and the tables. What the managed roles are
-        // granted on and what the declared rows would write are not yet
-        // questions that engine's `doctor` answers (`pbps_pg::doctor`
-        // documents the set it checks); they are handed over so that the day
-        // it does, no caller has to change.
         Driver::Postgres => {
-            let held = pbps_pg::doctor::permissions(
-                conn,
-                &pbps_pg::doctor::Ask {
-                    managed_schemas: ask.managed_schemas,
-                    managed_tables: ask.managed_tables,
-                    referenced: ask.referenced,
-                },
-            )
-            .await?;
+            let held = pbps_pg::doctor::permissions(conn, ask).await?;
             Ok(Permissions {
                 gaps: pbps_pg::doctor::missing(&held)
                     .into_iter()

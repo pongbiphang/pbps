@@ -1038,6 +1038,117 @@ fn doctor_examines_a_postgres_environment() {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_reports_data_and_role_grant_gaps_from_the_declarations() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for role in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {role}"));
+            }
+        }
+    }
+    let server = server();
+    let roles = Roles(
+        server.clone(),
+        vec![
+            format!("pbps_doctor_deployer_{}", std::process::id()),
+            format!("pbps_doctor_reader_{}", std::process::id()),
+        ],
+    );
+    let deployer = &roles.1[0];
+    let reader = &roles.1[1];
+    let own = OwnDatabase::new(&server, "doctor-demand");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN PASSWORD 'doctor-test'; CREATE ROLE {reader}; \
+         CREATE SCHEMA app AUTHORIZATION {deployer}; \
+         CREATE TABLE app.t (id bigint NOT NULL PRIMARY KEY); \
+         ALTER TABLE app.t OWNER TO {deployer}; \
+         REVOKE INSERT ON app.t FROM {deployer}; \
+         CREATE SCHEMA shared; CREATE VIEW shared.v AS SELECT 1 AS id; \
+         CREATE FUNCTION shared.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+         CREATE FUNCTION shared.f(text) RETURNS text LANGUAGE sql AS 'SELECT $1'; \
+         GRANT USAGE ON SCHEMA shared TO {deployer}; \
+         GRANT SELECT ON shared.v TO {deployer}; \
+         GRANT EXECUTE ON FUNCTION shared.f(text) TO {deployer} WITH GRANT OPTION; \
+         GRANT CREATE ON SCHEMA public TO {deployer}"
+        ),
+    );
+    let login = format!(
+        "{} user={deployer} password=doctor-test",
+        connection
+            .split_whitespace()
+            .filter(|word| !word.starts_with("user=") && !word.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let d = Demo::new("doctor-demand");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_FLOW_PG_DEV\n",
+    )
+    .unwrap();
+    d.table(&format!(
+        "{ONE_COLUMN}data:\n  mode: ensure\n  rows:\n    1: {{}}\n"
+    ));
+    std::fs::write(d.dir.join("schema/reader.yml"), format!(
+        "role: {reader}\ngrants:\n  schema::shared: [usage]\n  shared.v: [select]\n  shared.f(integer): [execute]\n"
+    )).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let diagnose = || {
+        let output = d.run_with_env(
+            &["doctor", "--format", "json"],
+            &[("PBPS_FLOW_PG_DEV", login.as_str())],
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        (output, json)
+    };
+    let (output, json) = diagnose();
+    assert_eq!(code(&output), 2, "{json}");
+    let gaps = json["data"]["environments"][0]["missing_permissions"]
+        .as_array()
+        .unwrap();
+    for expected in [
+        "INSERT on TABLE \"app\".\"t\"",
+        "USAGE WITH GRANT OPTION on SCHEMA \"shared\"",
+        "SELECT WITH GRANT OPTION on TABLE \"shared\".\"v\"",
+        "EXECUTE WITH GRANT OPTION on ROUTINE \"shared\".\"f\"(integer)",
+    ] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.as_str().unwrap().starts_with(expected)),
+            "missing {expected}: {json}"
+        );
+    }
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().starts_with("DELETE")
+                || g.as_str().unwrap().starts_with("UPDATE")),
+        "a key-only ensure block never updates or deletes: {json}"
+    );
+    on_server(
+        connection,
+        &format!(
+            "GRANT INSERT (id) ON app.t TO {deployer}; \
+         GRANT USAGE ON SCHEMA shared TO {deployer} WITH GRANT OPTION; \
+         GRANT SELECT ON shared.v TO {deployer} WITH GRANT OPTION; \
+         GRANT EXECUTE ON FUNCTION shared.f(integer) TO {deployer} WITH GRANT OPTION"
+        ),
+    );
+    let (_, json) = diagnose();
+    assert_eq!(
+        json["data"]["environments"][0]["missing_permissions"],
+        serde_json::json!([]),
+        "the named remedies remove every permission gap: {json}"
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     let server = server();
     let own = OwnDatabase::new(&server, "overload-rebind");
