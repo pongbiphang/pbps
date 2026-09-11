@@ -699,8 +699,17 @@ async fn introspect_in(conn: &mut Conn, scope: Scope) -> Result<Pulled, DbError>
     let mut limitations = raw.1;
     limitations.append(&mut pulled.limitations);
     pulled.limitations = limitations;
+    pulled.unmanaged_modules.extend(raw.2);
+    pulled.unmanaged_modules.sort();
+    pulled.unmanaged_modules.dedup();
     Ok(pulled)
 }
+
+type CatalogRead = (
+    RawCatalog,
+    Vec<Limitation>,
+    Vec<pbps_db::catalog::UnmanagedModule>,
+);
 
 type CatalogBatch = BTreeMap<String, Vec<serde_json::Value>>;
 
@@ -748,12 +757,13 @@ async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
     Ok(batch)
 }
 
-async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbError> {
+async fn read_all(conn: &mut Conn) -> Result<CatalogRead, DbError> {
     conn.query(CANONICAL_PATH).await?;
     decode_batch(&read_batch(conn).await?)
 }
 
-fn decode_batch(batch: &CatalogBatch) -> Result<(RawCatalog, Vec<Limitation>), DbError> {
+fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
+    let mut unmanaged_modules = Vec::new();
     let mut warnings = Vec::new();
     for row in batch
         .get("partitioned")
@@ -1068,23 +1078,27 @@ fn decode_batch(batch: &CatalogBatch) -> Result<(RawCatalog, Vec<Limitation>), D
                 )));
             }
         };
-        let display = match &target {
-            LimitationTarget::Module(id) => id.to_string(),
-            LimitationTarget::Relation(name) | LimitationTarget::UnnameableModule(name) => {
-                name.to_string()
-            }
+        let kind = match text(row, "kind")?.as_str() {
+            "m" => "materialized view",
+            "a" => "aggregate",
+            "w" => "window function",
+            "t" => "trigger",
+            _ => unreachable!("unknown kinds were refused above"),
         };
-        warnings.push(Limitation {
-            target,
-            detail: format!(
-                "`{display}` is {}, which this model does not hold. It is left out of the \
-                 pull entirely — not read back as an ordinary module, which would make a plan \
-                 that recreates it as something else.",
-                text(row, "detail")?
-            ),
+        let detail = format!(
+            "`{target}` is {}, which this model does not hold. It is left out of the \
+             pull entirely — not read back as an ordinary module, which would make a plan \
+             that recreates it as something else.",
+            text(row, "detail")?
+        );
+        unmanaged_modules.push(pbps_db::catalog::UnmanagedModule {
+            kind,
+            target: target.clone(),
+            why: detail.clone(),
         });
+        warnings.push(Limitation { target, detail });
     }
-    Ok((raw, warnings))
+    Ok((raw, warnings, unmanaged_modules))
 }
 
 /// The principals that could hold a grant in this database (ADR-0005).

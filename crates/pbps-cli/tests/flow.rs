@@ -11536,3 +11536,67 @@ fn the_connected_envelopes_match_the_published_schema() {
         "the healthy case is the one that omits them: {v}"
     );
 }
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_declared_unreadable_trigger_is_never_recorded_or_planned_over() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "unreadable_trigger");
+    let connection = own.connection();
+    let d = Demo::new("unreadable-trigger");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    on_server(connection, "CREATE TABLE dbo.t (id int NOT NULL)");
+    let adopted = d.run(&["baseline", "--db", connection, "--reason", "adopt table"]);
+    assert_eq!(code(&adopted), 0, "{}", stderr(&adopted));
+    let before = d.run(&["state", "list", "--db", connection, "--format", "json"]);
+    assert_eq!(code(&before), 0, "{}", stderr(&before));
+
+    d.module(
+        "audit.yml",
+        "trigger: dbo.audit\non: dbo.t\ndefinition: AFTER INSERT AS SELECT 1\n",
+    );
+    d.commit();
+    on_server(
+        connection,
+        "CREATE TRIGGER dbo.audit ON dbo.t WITH ENCRYPTION AFTER INSERT AS SELECT 1;",
+    );
+    // No unmanaged policy supplies the refusal: recording a schema without a
+    // declared trigger is wrong even with the default `unmanaged: ignore`.
+    for args in [
+        vec!["baseline", "--db", connection, "--reason", "must refuse"],
+        vec!["snapshot", "--db", connection, "--force"],
+        vec!["plan", "--db", connection],
+    ] {
+        let refused = d.run(&args);
+        assert_eq!(code(&refused), 1, "{args:?}: {}", stderr(&refused));
+        assert!(
+            stderr(&refused).contains("trigger dbo.audit")
+                && stderr(&refused).contains("ENCRYPTION"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    let after = d.run(&["state", "list", "--db", connection, "--format", "json"]);
+    assert_eq!(code(&after), 0, "{}", stderr(&after));
+    assert_eq!(
+        stdout(&after),
+        stdout(&before),
+        "a refusal changed the ledger"
+    );
+
+    // The readable form is manageable under the same name and trigger parent.
+    on_server(
+        connection,
+        "ALTER TRIGGER dbo.audit ON dbo.t AFTER INSERT AS SELECT 1;",
+    );
+    let adopted = d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopt readable trigger",
+    ]);
+    assert_eq!(code(&adopted), 0, "{}", stderr(&adopted));
+}

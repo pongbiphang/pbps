@@ -200,7 +200,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
             prepared.unmanaged.len()
         );
         for module in &prepared.unmanaged {
-            eprintln!("  {} {} — {}", module.kind, module.name, module.why);
+            eprintln!("  {} {} — {}", module.kind, module.target, module.why);
         }
         eprintln!("  They are left untouched and do not appear in any plan.");
     }

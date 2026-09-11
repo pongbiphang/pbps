@@ -53,15 +53,8 @@ pub struct Pulled {
     /// they are an inventory of what is left alone, and the user needs the
     /// count and the names.
     ///
-    /// **Empty from PostgreSQL, always.** That engine's pull keeps no such
-    /// inventory: a routine the model cannot hold — one with no identity the
-    /// model can name, one whose deparsed body is not a statement the emitter
-    /// writes — is *left out of the pull* and said in `warnings`, like every
-    /// other fact that engine cannot express. So on that engine an empty list
-    /// here means "reported elsewhere", not "none"; a caller that exempts an
-    /// unreadable module from `unmanaged: error` by this list exempts nothing
-    /// there, and the object is not in the pulled schema for the policy to
-    /// see either.
+    /// PostgreSQL also inventories modules it omits, including unsupported
+    /// catalog kinds and definitions or identities the declaration cannot hold.
     pub unmanaged_modules: Vec<UnmanagedModule>,
 }
 
@@ -96,6 +89,9 @@ pub struct Limitation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LimitationTarget {
     Relation(TableName),
+    /// A module in a shared object namespace, even when its declaration also
+    /// carries a trigger parent. The unreadable body cannot supply that parent.
+    SharedModule(ObjectName),
     Module(pbps_model::ModuleId),
     /// No declaration can name this identity. Keep the diagnostic, without
     /// attributing it to a different object that happens to share its name.
@@ -112,10 +108,34 @@ impl LimitationTarget {
         }
     }
 
+    /// Whether a declaration names this module, without discarding overloads
+    /// or trigger parents. An unnameable identity cannot be declared.
+    pub fn matches_module(&self, id: &pbps_model::ModuleId) -> bool {
+        match self {
+            Self::Relation(name) => matches!(id, pbps_model::ModuleId::Named(n) if n == name),
+            Self::SharedModule(name) => *name == id.object_name(),
+            Self::Module(module) => module == id,
+            Self::UnnameableModule(_) => false,
+        }
+    }
+
     pub fn object_name(&self) -> ObjectName {
         match self {
-            Self::Relation(name) | Self::UnnameableModule(name) => name.clone(),
+            Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
+                name.clone()
+            }
             Self::Module(id) => id.object_name(),
+        }
+    }
+}
+
+impl std::fmt::Display for LimitationTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
+                name.fmt(f)
+            }
+            Self::Module(id) => id.fmt(f),
         }
     }
 }
@@ -124,10 +144,10 @@ impl LimitationTarget {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnmanagedModule {
     pub kind: &'static str,
-    /// Kept structured because a legal quoted identifier can itself contain a
-    /// period. Formatting and parsing it again would turn `[audit.v1]` into an
-    /// apparent third name component and silently lose the inventory entry.
-    pub name: ObjectName,
+    /// Kept structured, including routine arguments and trigger parent, so a
+    /// same-name object cannot hide this entry from the unmanaged policy.
+    /// SQL Server modules use `SharedModule` for its shared object namespace.
+    pub target: LimitationTarget,
     /// Why it is not managed, in the operator's words.
     pub why: String,
 }

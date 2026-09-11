@@ -803,7 +803,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut unmanageable = |why: &str| {
             unmanaged_modules.push(UnmanagedModule {
                 kind: m.kind.as_str(),
-                name: name.clone(),
+                target: LimitationTarget::SharedModule(name.clone()),
                 why: why.to_owned(),
             });
         };
@@ -1991,7 +1991,7 @@ mod module_tests {
         assert_eq!(
             p.unmanaged_modules
                 .iter()
-                .map(|m| m.name.to_string())
+                .map(|m| m.target.to_string())
                 .collect::<Vec<_>>(),
             ["app.aaa".to_owned(), "dbo.zzz".to_owned()]
         );
@@ -2007,7 +2007,7 @@ mod module_tests {
         )]));
         assert_eq!(p.unmanaged_modules.len(), 1);
         assert_eq!(
-            p.unmanaged_modules[0].name,
+            p.unmanaged_modules[0].target.object_name(),
             ObjectName::new("dbo", "audit.v1")
         );
     }

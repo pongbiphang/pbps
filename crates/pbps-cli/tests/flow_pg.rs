@@ -1191,3 +1191,83 @@ fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
         stderr(&refused)
     );
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
+    let own = OwnDatabase::new(&server(), "unmanaged-modules");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("unmanaged-modules");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.t(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    // Roles are cluster-wide: this database still sees principals left by
+    // other live tests. Keep their refusal as a control rather than assuming
+    // an own database means an empty unmanaged inventory.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nunmanaged: error\n",
+    )
+    .unwrap();
+    d.commit();
+    let control = d.run(&["plan", "--db", connection]);
+
+    on_server(
+        connection,
+        "CREATE AGGREGATE app.t(bigint) (SFUNC = int8pl, STYPE = bigint, INITCOND = '0'); CREATE VIEW app.\"bad(int)\" AS SELECT id FROM app.t",
+    );
+
+    for policy in ["ignore", "warn", "error"] {
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("dialect: postgres\nunmanaged: {policy}\n"),
+        )
+        .unwrap();
+        d.commit();
+        let result = d.run(&["plan", "--db", connection]);
+        if policy == "error" {
+            assert_ne!(code(&result), 0, "{}", stdout(&result));
+            let message = stderr(&result);
+            assert!(message.contains("`unmanaged: error`"), "{message}");
+            assert!(message.contains("aggregate app.t(bigint)"), "{message}");
+            assert!(message.contains("view app.bad(int)"), "{message}");
+            let verified = d.run(&["verify", "--db", connection, "--format", "json"]);
+            let report: serde_json::Value = serde_json::from_str(&stdout(&verified)).unwrap();
+            assert_eq!(code(&verified), 2, "{report}: {}", stderr(&verified));
+            assert!(
+                report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["id"] == "state.unmanaged-refused"
+                            && finding["message"].as_str().is_some_and(|message| {
+                                message.contains("aggregate app.t(bigint)")
+                                    && message.contains("view app.bad(int)")
+                            })
+                    }),
+                "{report}"
+            );
+        } else {
+            let message = stderr(&result);
+            assert_eq!(
+                message.contains("are not declared and are left alone"),
+                policy == "warn",
+                "{message}"
+            );
+            succeeds(result);
+        }
+    }
+    // Removing only our omitted modules restores the original policy answer;
+    // the same-name managed function must not become an unmanaged object.
+    on_server(
+        connection,
+        "DROP AGGREGATE app.t(bigint); DROP VIEW app.\"bad(int)\"",
+    );
+    let restored = d.run(&["plan", "--db", connection]);
+    assert_eq!(code(&restored), code(&control));
+    assert_eq!(stderr(&restored), stderr(&control));
+}

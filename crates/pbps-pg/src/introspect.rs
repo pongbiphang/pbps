@@ -69,10 +69,9 @@ use crate::types;
 
 // The shapes a pull returns are `pbps-db`'s, filled here from `pg_catalog` and
 // re-exported under the paths this crate's callers and tests have always used
-// (DECISIONS 417). `unmanaged_modules` is SQL Server's inventory and stays
-// empty from this engine: what this pull cannot hold is left out and reported
-// in `warnings` and typed `limitations` (DECISIONS 425).
-pub use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, Unexpressible};
+// (DECISIONS 417). Omitted modules have both a typed limitation and an
+// unmanaged inventory entry, so policy readers see the same objects (426).
+pub use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, Unexpressible, UnmanagedModule};
 
 /// One ordinary table, as `pg_class` has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1339,8 +1338,9 @@ fn add_module(
                 match arg.ty.parse::<RoutineArg>() {
                     Ok(parsed) => args.push(parsed),
                     Err(e) => {
-                        return note_target(
+                        return note_module(
                             pulled,
+                            "routine",
                             LimitationTarget::UnnameableModule(here.clone()),
                             format!(
                                 "`{here}` is a routine whose argument {} this model cannot hold as \
@@ -1377,8 +1377,9 @@ fn add_module(
             after_the_name(&raw.definition, "CREATE TRIGGER "),
         ),
         other => {
-            return note_target(
+            return note_module(
                 pulled,
+                "module",
                 LimitationTarget::UnnameableModule(here.clone()),
                 format!(
                     "`{here}` is a module of a kind this reader does not know (`{other}`). It is \
@@ -1389,8 +1390,9 @@ fn add_module(
     };
 
     let Some(definition) = definition.filter(|d| !d.is_empty()) else {
-        return note_target(
+        return note_module(
             pulled,
+            kind.as_str(),
             LimitationTarget::module(id.clone()),
             format!(
                 "`{here}` is a module whose definition this reader could not separate from the \
@@ -1405,8 +1407,9 @@ fn add_module(
     // text and read back by parsing it, and PostgreSQL will give a name that
     // does not survive that — a view called `f(int)`, a schema called `a.b`.
     if ModuleId::from_str(&id.to_string()).as_ref() != Ok(&id) {
-        return note_target(
+        return note_module(
             pulled,
+            kind.as_str(),
             LimitationTarget::module(id.clone()),
             format!(
                 "`{id}` is a module whose identity the declaration format cannot write back: it \
@@ -1602,6 +1605,15 @@ fn note_false(pulled: &mut Pulled, table: &TableName, detail: String) -> bool {
 
 fn note(pulled: &mut Pulled, table: &TableName, detail: String) {
     note_target(pulled, LimitationTarget::Relation(table.clone()), detail);
+}
+
+fn note_module(pulled: &mut Pulled, kind: &'static str, target: LimitationTarget, detail: String) {
+    pulled.unmanaged_modules.push(UnmanagedModule {
+        kind,
+        target: target.clone(),
+        why: detail.clone(),
+    });
+    note_target(pulled, target, detail);
 }
 
 fn note_target(pulled: &mut Pulled, target: LimitationTarget, detail: String) {
@@ -3336,6 +3348,13 @@ mod tests {
                 "`{definition}` produced a module"
             );
             assert_eq!(pulled.warnings.len(), 1, "`{definition}`");
+            assert_eq!(pulled.unmanaged_modules.len(), 1, "`{definition}`");
+            let omitted = &pulled.unmanaged_modules[0];
+            assert_eq!(
+                omitted.target,
+                LimitationTarget::module("app.f()".parse().unwrap())
+            );
+            assert_eq!(omitted.why, pulled.warnings[0]);
             assert!(
                 pulled.warnings[0].contains("app.f"),
                 "{}",

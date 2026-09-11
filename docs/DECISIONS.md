@@ -9051,3 +9051,27 @@ SPEC is in sync with all of these.
     filter restores the false refusal. The broader unmanaged module inventory
     work remains #303; this change scopes limitations rather than completing
     that policy integration.
+
+426. **An omitted PostgreSQL module is still in the unmanaged inventory.**
+    Both the catalog filter (materialized views, aggregates, window functions,
+    triggers on omitted relations) and the assembler (unrepresentable identity
+    or deparsed definition) return an `UnmanagedModule` alongside the warning
+    and limitation. Otherwise `unmanaged: error` treats the omitted object as
+    absent (issue #303). Inventory targets retain the namespaces from 425:
+    routine arguments, trigger parent, or the shared relation namespace; an
+    unnameable identity never matches a declaration. The CLI uses those targets
+    for unmanaged policy and unreadable-module matching. SQL Server keeps its
+    existing shared-name behavior. This inventory does not assess whether a
+    trigger is safe to execute; that separate policy is tracked in #324.
+    Pinned by the live catalog omitted-module and trigger tests, the malformed
+    deparse unit test, and `flow_pg::omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload`.
+
+427. **SQL Server's unreadable trigger still occupies a shared module name.**
+    A trigger declaration carries its parent, but an encrypted catalog row
+    cannot supply that parent. `SharedModule` therefore matches by object name
+    across declaration kinds, preserving the SQL Server behavior before 426.
+    PostgreSQL `Relation` remains distinct: a view named `audit` must not match
+    the unrelated trigger `t.audit`. Conflating those namespaces either records
+    a partial SQL Server schema or refuses an unrelated PostgreSQL object.
+    Pinned by `a_declared_unreadable_trigger_is_never_recorded_or_planned_over`
+    and the shared-module versus relation identity test (PR #325 review).

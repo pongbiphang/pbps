@@ -1156,7 +1156,7 @@ async fn pull_reads_every_kind_of_module_back() {
     let unmanaged: Vec<String> = pulled
         .unmanaged_modules
         .iter()
-        .map(|m| m.name.to_string())
+        .map(|m| m.target.to_string())
         .collect();
     assert_eq!(
         unmanaged,
