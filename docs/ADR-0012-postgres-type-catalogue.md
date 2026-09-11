@@ -315,21 +315,32 @@ replacement is a declared transformation with its own ADR, not a flag.
 
 ## Limits
 
-- **No SQL Server cost measurements were taken.** Whether `int → bigint` is
-  metadata-only there is an open question, and the live suite is where it gets
-  answered — not this document.
-- **Rewrite detection by `relfilenode` is exact for "was the table rebuilt" and
-  says nothing about a full scan.** `SET NOT NULL` rewrites nothing and still
-  reads every row; that cost is invisible to this method and must not be read as
-  free.
-- **Partitioned tables, inheritance and `ALTER TYPE … USING` on indexed columns
-  were not measured**, and each can change the answer.
-- **Everything here was proposed when it was written**, and falsifiable by the
-  PostgreSQL live suite. Amendments 1 and 2 record what building it changed;
-  the two limits above are the two Amendment 2 measured rather than removed —
-  the scan `relfilenode` cannot see is now a fact the estimate carries in its
-  own right, and the three unmeasured shapes take the answer back to `unknown`
-  rather than being answered from measurements that never covered them.
+- **SQL Server's `int → bigint` cost remains unmeasured.** The PostgreSQL
+  matrix in [`the_estimate_says_what_the_engine_does_about_rebuilding_the_table`](../crates/pbps-pg/tests/live.rs)
+  does not answer whether SQL Server performs a metadata-only change. #255
+  tracks that engine's measurements and estimator; neither a successful ALTER
+  nor a PostgreSQL `relfilenode` result supplies the missing answer.
+- **A stable `relfilenode` still does not mean “no scan.”**
+  [`a_change_that_rebuilds_nothing_may_still_read_every_row`](../crates/pbps-pg/tests/live.rs)
+  measures no rewrite for both `SET NOT NULL` and `varchar(10) → varchar(20)`,
+  but 100,000 rows read for the former and zero for the latter. The estimate
+  therefore carries scans separately. A validated `CHECK (v IS NOT NULL)` can
+  avoid that scan: [`a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown`](../crates/pbps-pg/tests/live.rs)
+  measures zero rows with the validated proof and 100,000 without it or with
+  a `NOT VALID` check; the connected estimate reports that proof-dependent
+  case as unknown rather than parsing arbitrary checks.
+- **Partitioned tables, inheritance parents and type changes on indexed
+  columns remain outside the measured cost matrix**, including the original
+  `ALTER TYPE … USING` question. DECISIONS 403–405 keep uncertainty explicit.
+  [`a_shape_the_measurements_never_covered_is_not_answered_from_them`](../crates/pbps-pg/tests/live.rs)
+  verifies the connected estimator withdraws its static rewrite answer for
+  those catalog shapes and distinguishes never-analyzed rows from an analyzed
+  count. It tests the uncertainty boundary; it does **not** execute those
+  type changes and measure their costs. Ordinary indexed type changes are
+  excluded too, not only changes with `USING`.
+- **These are scoped PostgreSQL measurements, not a universal cost guarantee.**
+  Amendment 2 records the measured matrix and locks; unmeasured expressions,
+  shapes and engines must keep their unknown answer.
 
 ## Amendment 1: what building it added to §1
 

@@ -418,25 +418,33 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
 
 ## Limits
 
-- **Column-level grants stay deferred**, as in ADR-0005, and are reported as
-  unexpressible. PostgreSQL estates use them more than SQL Server ones, so this
-  deferral costs more here; it is still not Phase 5 work.
+- **Column-level grants stay deferred**, as in ADR-0005. The carried-state
+  reader's refusal is measured for a view whose column grant lives in `attacl`,
+  not its object ACL, by
+  [`a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it`](../crates/pbps-pg/tests/live.rs).
+  This protects that rebuild; it does not make column grants declarable.
 - **Row-level security, `SET ROLE` chaining, `pg_hba.conf`, `CONNECT` and
-  database-level privileges are out of scope** — the first is a policy engine of
-  its own, the rest are cluster or connection concerns.
-- **Sequence, type, domain and foreign-data-wrapper grants are unmodelled** and
-  reported, not folded.
-- **What `PUBLIC` holds cannot be declared** (§5). Every function arrives
-  executable by everyone; hardening that is a step taken outside the tool, which
-  the tool cannot mention — and, without ADR-0009 §3's two-directional refusal,
-  would silently undo on the next rebuild. Until the model has a grantee for it,
-  hardening a managed function and managing it are mutually exclusive. This is
-  the largest gap in this document and it should close before PostgreSQL
-  privileges are called finished.
-- **The `MAINTAIN` privilege is PostgreSQL 17+**; the dialect must gate it on the
-  server version the way `plan --db` already gates on SQL Server's edition.
-- **Everything here is proposed.** No PostgreSQL dialect exists, and every
-  decision above is falsifiable by the live suite that has to accompany it.
+  database-level privileges remain outside the declaration model** — the first
+  is a policy engine of its own, the rest are cluster or connection concerns.
+  A diagnostic or preflight check is not support for managing those policies.
+- **Sequence, type, domain and foreign-data-wrapper grants remain unmodelled.**
+  [`a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost`](../crates/pbps-pg/tests/live.rs)
+  measures reporting for sequence, type and procedural-language grants, plus
+  grants on materialized views and partitioned tables. It does not measure a
+  foreign-data-wrapper grant or close the declaration gap.
+- **`PUBLIC` still cannot be a declared grantee** (§5), but it is no longer
+  invisible to the reader.
+  [`a_null_acl_is_the_engines_default_and_is_reported_rather_than_compared`](../crates/pbps-pg/tests/live.rs)
+  measures default execution and reporting of both that access and its later
+  revocation. [`routine_rebuilds_do_not_restore_revoked_public_execute`](../crates/pbps-cli/tests/flow_pg.rs)
+  requires planning and apply to refuse a rebuild after revocation, preserving
+  the closed function. Declaring the hardening remains unsupported.
+- **The `MAINTAIN` version gate is now measured on both sides of PostgreSQL 17.**
+  [`maintain_is_taken_at_seventeen_and_up_and_refused_below_it`](../crates/pbps-pg/tests/live.rs)
+  compares the gate with real grants on pinned PostgreSQL 18.6 and 16.15.
+  [`permission_versions_are_checked_before_planning_bootstrap_apply_and_resume`](../crates/pbps-cli/tests/flow_pg.rs)
+  covers the CLI gate. This answers the version-gating requirement, not the
+  unmodelled privilege classes above.
 
 ## Placement
 
