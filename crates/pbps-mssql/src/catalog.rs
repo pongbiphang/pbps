@@ -147,7 +147,8 @@ SELECT i.object_id, i.name, i.is_unique, i.type AS index_type,
 /// `parent_object_id` gives a trigger its table. `is_ms_shipped = 0` drops the
 /// system objects.
 const MODULES: &str = "\
-SELECT o.object_id, s.name AS schema_name, o.name AS object_name, o.type AS type_code,
+SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
+       s.name AS schema_name, o.name AS object_name, o.type AS type_code,
        m.definition AS definition,
        ps.name AS parent_schema, pt.name AS parent_table,
        -- Persisted with the module and re-applied on every execution, so they
@@ -328,6 +329,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         let ansi_nulls: bool = get(&row, "ansi_nulls")?;
         raw.modules.push(RawModule {
             object_id: get(&row, "object_id")?,
+            parent_object_id: opt(&row, "parent_object_id")?,
             default_set_options: quoted && ansi_nulls,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "object_name")?.to_owned(),

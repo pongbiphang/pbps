@@ -160,6 +160,8 @@ pub struct RawIndexColumn {
 #[derive(Debug, Clone)]
 pub struct RawModule {
     pub object_id: i32,
+    /// A trigger's parent object ID; zero-valued catalog parents are absent.
+    pub parent_object_id: Option<i32>,
     pub schema: String,
     pub name: String,
     pub kind: ModuleKind,
@@ -920,12 +922,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // Keep the temporal table's dependent trigger in the same inventory
         // instead of writing a declaration that validation cannot load.
         if m.kind == ModuleKind::Trigger
-            && on
-                .as_ref()
-                .is_some_and(|parent| unsupported_temporal_tables.contains(parent))
+            && (m
+                .parent_object_id
+                .is_some_and(|parent| unavailable_object_ids.contains(&parent))
+                || on
+                    .as_ref()
+                    .is_some_and(|parent| unsupported_temporal_tables.contains(parent)))
         {
             unmanageable(
-                "its parent table uses system versioning or PERIOD FOR SYSTEM_TIME, which pbps cannot express",
+                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, or another omitted module, which pbps cannot express",
             );
             continue;
         }
@@ -1990,6 +1995,7 @@ mod module_tests {
     fn module(schema: &str, name: &str, kind: ModuleKind, definition: Option<&str>) -> RawModule {
         RawModule {
             object_id: 100,
+            parent_object_id: None,
             schema: schema.into(),
             name: name.into(),
             kind,
@@ -2126,7 +2132,18 @@ mod module_tests {
             Some("CREATE PROCEDURE dbo.p_deferred AS SELECT id FROM dbo.t"),
         );
         deferred.object_id = 12;
-        raw.modules = vec![direct, transitive, deferred];
+        let mut trigger = module(
+            "dbo",
+            "tr_transitive",
+            ModuleKind::Trigger,
+            Some(
+                "CREATE TRIGGER dbo.tr_transitive ON dbo.v_transitive INSTEAD OF INSERT AS SELECT 1",
+            ),
+        );
+        trigger.object_id = 13;
+        trigger.parent_object_id = Some(11);
+        trigger.parent = Some(("dbo".into(), "v_transitive".into()));
+        raw.modules = vec![direct, transitive, deferred, trigger];
         raw.module_dependencies = vec![
             RawModuleDependency {
                 module_object_id: 10,
@@ -2157,6 +2174,10 @@ mod module_tests {
                     && module.why.contains("create-time-bound dependency")
             }));
         }
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", "tr_transitive")
+                && module.why.contains("another omitted module")
+        }));
     }
 
     /// A module whose definition cannot be read, or whose shape the emitter

@@ -996,6 +996,13 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .await
             .expect("create temporal-dependent view");
     }
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.tr_v_versioned_chain ON dbo.v_versioned_chain
+             INSTEAD OF INSERT AS SELECT 1;",
+        )
+        .await
+        .expect("create trigger on temporal-dependent view");
     for table in ["versioned", "disabled", "plain"] {
         db.conn
             .execute(&format!(
@@ -1030,7 +1037,7 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .modules
             .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
     );
-    assert_eq!(pulled.unmanaged_modules.len(), 4);
+    assert_eq!(pulled.unmanaged_modules.len(), 5);
     for trigger in ["tr_disabled", "tr_versioned"] {
         assert!(pulled.unmanaged_modules.iter().any(|module| {
             module.target.object_name() == TableName::new("dbo", trigger)
@@ -1043,6 +1050,10 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
                 && module.why.contains("create-time-bound dependency")
         }));
     }
+    assert!(pulled.unmanaged_modules.iter().any(|module| {
+        module.target.object_name() == TableName::new("dbo", "tr_v_versioned_chain")
+            && module.why.contains("another omitted module")
+    }));
     for name in ["disabled", "versioned", "versioned_history"] {
         assert!(
             pulled.limitations.iter().any(|l| {
