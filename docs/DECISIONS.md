@@ -9193,19 +9193,46 @@ SPEC is in sync with all of these.
 
     `has_required_add_value_source_with` takes the identifier boundary as a
     parameter, the same split ADR-0011 Amendment 2 made for
-    `normalize_definition` and DECISIONS 315 made for the dependency scan.
-    The no-argument form keeps SQL Server's rule as its default: right for
-    `pbps-mssql`'s own preflight, because it is SQL Server, and right for the
-    model's dialect-free `Change::intrinsic_risks`, which classifies risk
-    before any dialect is chosen and has no other rule to ask. `pbps-pg`'s
-    preflight is the one caller with a dialect and a different answer, and it
-    now asks with `Lexicon::identifier_continues`.
+    `normalize_definition` and DECISIONS 315 made for the dependency and
+    reference scans. The no-argument form keeps SQL Server's rule as its
+    default: right for `pbps-mssql`'s own preflight, because that caller is
+    SQL Server. The model's dialect-free `Change::intrinsic_risks` also keeps
+    the no-argument form, but not because SQL Server's rule is right for it —
+    it classifies risk before any dialect is chosen, across many risk classes
+    besides this one, and still reads every dialect's defaults by SQL
+    Server's boundary. That is a known gap, not a decision that it is
+    correct; threading a boundary through it is a larger, differently shaped
+    change than this one, and it is tracked separately as issue #343.
+    `pbps-pg`'s preflight is the caller this decision closes: it now asks
+    with `Lexicon::identifier_continues`, PostgreSQL's own byte rule.
 
     The model's dependency and reference scans (`creation_order_with`,
-    `references_with`) already took this shape; this closes the one caller
-    of `is_regular_identifier_continue` in production code that had not
-    (issue #128). Pinned by
+    `references_with`) already took this shape. Of the two production
+    callers of `is_regular_identifier_continue` this issue named, `pbps-pg`'s
+    preflight is now closed; `Change::intrinsic_risks` is not, and is #343's
+    to close (issue #128).
+
+    **The `pbps-pg` wiring is unpinnable today.** The row-count probe this
+    arm builds is also gated by `constant_default`/`rows::is_constant`, which
+    recognizes only a closed set of literal shapes — `NULL`, a boolean, a
+    quoted string (its content already blanked before the keyword scan
+    runs), a typed literal, a signed number — and refuses every bare
+    identifier or function call, `null\u{301}x()` included. Every shape
+    `is_constant` accepts either carries no unquoted letters or has its
+    lettered content quoted and blanked before the keyword scan sees it, so
+    the two boundary rules can never disagree on a default that reaches the
+    inner check: `NULL` itself is unambiguous under both. The outer guard's
+    answer therefore never moves this arm's output, for any default.
+    Reverting only `crates/pbps-pg/src/preflight.rs`'s guard to the
+    no-argument form, with the model's fix left in place, left every
+    existing test green — measured, not assumed. The wiring stands as
+    defence-in-depth against that inner gate ever being relaxed, not
+    something a test can fail today.
+
+    Pinned by
     `a_combining_mark_is_read_as_a_name_byte_under_postgresqls_boundary_and_a_gap_under_the_shared_one`
     in the model, which holds SQL Server's own answer unchanged, and by
-    `a_combining_mark_in_a_default_is_not_read_as_the_bare_null_keyword` in
-    `pbps-pg`, against the arm that builds the probe.
+    `the_required_add_guard_reads_a_combining_mark_by_this_engines_own_boundary`
+    in `pbps-pg`, which pins the guard's own answer over the boundary this
+    crate actually wires in (`crate::LEXICON.identifier_continues`) — not
+    `build()`'s output, which the paragraph above explains cannot move.

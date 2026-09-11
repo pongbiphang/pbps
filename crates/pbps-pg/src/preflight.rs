@@ -2742,7 +2742,11 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         // (SQL Server's): measured, a combining mark continues a PostgreSQL
         // name, and the model's own rule does not agree — `null\u{301}x()`
         // is a function call there and, read by the default rule, an
-        // expression that "explicitly invokes NULL" (DECISIONS 433).
+        // expression that "explicitly invokes NULL". Unpinnable today:
+        // `constant_default`, just below, already screens every default this
+        // distinction could move out of the probe it builds, so this is
+        // defence-in-depth against that inner screen ever being relaxed, not
+        // a change this arm's own output can prove (DECISIONS 433).
         } if !column.nullable
             && !column.has_required_add_value_source_with(crate::LEXICON.identifier_continues) =>
         {
