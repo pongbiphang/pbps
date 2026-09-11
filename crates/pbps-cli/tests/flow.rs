@@ -11748,3 +11748,132 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
         &plan_checksum(&artifact),
     ]));
 }
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn a_staged_rename_checks_recreated_names_under_the_database_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    for (slug, collation, refuses) in [
+        ("recreated_ci", "Latin1_General_100_CI_AS", true),
+        ("recreated_cs", "Latin1_General_100_CS_AS", false),
+    ] {
+        let own = OwnDatabase::new(&server, slug);
+        on_server(
+            &server,
+            &format!("ALTER DATABASE [{}] COLLATE {collation}", own.name),
+        );
+        let connection = own.connection();
+        let d = Demo::new(slug);
+        d.table(&ONE_COLUMN.replace("table: dbo.t", "table: dbo.T"));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let bootstrap = d.run(&["bootstrap", "--db", connection]);
+        assert_eq!(code(&bootstrap), 0, "{}", stderr(&bootstrap));
+        on_server(connection, "CREATE SCHEMA moved");
+        d.table(&ONE_COLUMN.replace("table: dbo.t", "table: moved.u\nrenamed_from: dbo.T"));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let plan = d.dir.join("staged.json");
+        let planned = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--staged",
+            "--out",
+            plan.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code(&planned),
+            0,
+            "{}{}",
+            stdout(&planned),
+            stderr(&planned)
+        );
+        on_server(
+            connection,
+            r#"
+            CREATE TRIGGER recreate_source ON DATABASE FOR RENAME, ALTER_SCHEMA AS
+            BEGIN
+              SET NOCOUNT ON;
+              IF OBJECT_ID(N'dbo.T', N'U') IS NULL AND OBJECT_ID(N'dbo.t', N'U') IS NULL
+                EXEC(N'CREATE TABLE dbo.t (impostor int)');
+            END
+        "#,
+        );
+        let apply = |resume| {
+            let checksum = plan_checksum(&plan);
+            let mut args = vec![
+                "apply",
+                "--db",
+                connection,
+                "--plan",
+                plan.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "rename",
+                "--staged",
+            ];
+            if resume {
+                args.push("--resume");
+            }
+            d.run(&args)
+        };
+        let applied = apply(false);
+        if refuses {
+            assert_eq!(
+                code(&applied),
+                1,
+                "{}{}",
+                stdout(&applied),
+                stderr(&applied)
+            );
+            assert!(stderr(&applied).contains("dbo.T"), "{}", stderr(&applied));
+            let resumed = apply(true);
+            assert_eq!(
+                code(&resumed),
+                1,
+                "{}{}",
+                stdout(&resumed),
+                stderr(&resumed)
+            );
+            on_server(
+                connection,
+                "IF EXISTS (SELECT 1 FROM dbo.__pbps_state WHERE kind = 'apply') THROW 51000, 'recreated source was recorded as success', 1;",
+            );
+            on_server(
+                connection,
+                "DROP TRIGGER recreate_source ON DATABASE; DROP TABLE dbo.t;",
+            );
+            let repaired = apply(true);
+            assert_eq!(
+                code(&repaired),
+                0,
+                "{}{}",
+                stdout(&repaired),
+                stderr(&repaired)
+            );
+        } else {
+            // Under CS these are distinct names: dbo.t is legitimately unmanaged.
+            assert_eq!(
+                code(&applied),
+                0,
+                "{}{}",
+                stdout(&applied),
+                stderr(&applied)
+            );
+            on_server(
+                connection,
+                "IF OBJECT_ID(N'dbo.t', N'U') IS NULL THROW 51000, 'missing independent lowercase table', 1;",
+            );
+        }
+        let verified = d.run(&["verify", "--db", connection]);
+        assert_eq!(
+            code(&verified),
+            0,
+            "{}{}",
+            stdout(&verified),
+            stderr(&verified)
+        );
+    }
+}
