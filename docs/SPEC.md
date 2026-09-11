@@ -829,7 +829,7 @@ CREATE TABLE dbo.__pbps_state (
                                                 -- identity mapping as of that moment
     operator         NVARCHAR(128)  NOT NULL,
     reason           NVARCHAR(1000) NULL,
-    -- The timeline's own projection (issue #103, DECISIONS 432): the same move
+    -- The timeline's own projection (issue #103, DECISIONS 433): the same move
     -- this table already makes for kind/git_sha/plan_checksum/operator/reason,
     -- so `state list` can read counts without parsing `state_json`. Nullable
     -- because a row recorded before these existed has none; the reader falls
@@ -859,7 +859,7 @@ so they cannot come to disagree with it. They exist only so `state list` can
 answer `state_version`, a table count, a module count and staged progress
 without transferring or parsing the whole snapshot for every row it lists; a
 ledger from before they existed keeps working via a fallback that parses
-`state_json` for exactly the rows that still need it (DECISIONS 432).
+`state_json` for exactly the rows that still need it (DECISIONS 433).
 
 `__pbps_lock` stops two pipelines applying at once.
 

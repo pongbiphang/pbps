@@ -93,7 +93,7 @@ pub struct TimelineEntry {
     /// of the two is true of every row, and a struct able to hold both — or
     /// neither — needs a comment where a type does the same work.
     ///
-    /// [`TimelineState`], not [`StateSnapshot`] (DECISIONS 432): the common
+    /// [`TimelineState`], not [`StateSnapshot`] (DECISIONS 433): the common
     /// path reads `state_version`, `tables_count`, `modules_count`,
     /// `staged_completed` and `staged_total` straight off the row and never
     /// touches `state_json`, so it never has the schema or the identity
@@ -108,7 +108,7 @@ pub struct TimelineEntry {
 ///
 /// Read straight from the ledger's projected columns for a row recorded after
 /// they existed; read out of a full [`StateSnapshot`] parse for one recorded
-/// before (DECISIONS 432) — either way the timeline needs only these, never
+/// before (DECISIONS 433) — either way the timeline needs only these, never
 /// the schema or the identity mapping the full snapshot also carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineState {
@@ -129,7 +129,7 @@ pub struct TimelineState {
 impl TimelineState {
     /// Reads the four numbers off a fully-parsed snapshot — the fallback path
     /// for a row recorded before the projected columns existed, or written by
-    /// hand (DECISIONS 432).
+    /// hand (DECISIONS 433).
     pub fn from_snapshot(snapshot: &StateSnapshot) -> Self {
         TimelineState {
             version: snapshot.version,
@@ -140,6 +140,37 @@ impl TimelineState {
                 total: s.total,
             }),
         }
+    }
+
+    /// Builds from the ledger's own projected columns — the fast path for a
+    /// row recorded after they existed (DECISIONS 433) — refusing first if
+    /// `version` is not one this build reads.
+    ///
+    /// The only constructor that takes a bare `version: u32` rather than a
+    /// parsed [`StateSnapshot`], and the only place
+    /// [`pbps_model::check_readable_version`] is called from this crate: a
+    /// row a newer pbps wrote populates these columns like any other, so
+    /// without this check a reader on the projected path would present its
+    /// counts as ordinary data instead of refusing it the way
+    /// [`StateSnapshot::read_json`]'s fallback already does (a round-1 review
+    /// finding on #103's own PR — the two paths had come to disagree about
+    /// what "readable" means). Routing every projected row through this one
+    /// function, rather than checking the version and calling a plain
+    /// constructor beside it, is what keeps a third path from skipping the
+    /// check the same way.
+    pub fn from_projected(
+        version: u32,
+        tables: usize,
+        modules: usize,
+        staged: Option<TimelineStaged>,
+    ) -> Result<Self, pbps_model::Unreadable> {
+        pbps_model::check_readable_version(version)?;
+        Ok(TimelineState {
+            version,
+            tables,
+            modules,
+            staged,
+        })
     }
 }
 
@@ -227,5 +258,35 @@ mod tests {
     fn pruning_never_removes_the_current_baseline() {
         assert_eq!(ids_to_prune(&[9, 8, 7], 0), vec![8, 7]);
         assert_eq!(ids_to_prune(&[9], 0), Vec::<i64>::new());
+    }
+
+    /// A row a newer pbps wrote reaches the projected path as ordinary
+    /// columns — `state_version` populated like any other row's — so
+    /// `from_projected` is the one place standing between it and being
+    /// presented as data this build understands. Refused identically to the
+    /// JSON path's `StateSnapshot::read_json` (round-1 review finding on
+    /// #103's own PR: the projected path had no version check at all).
+    #[test]
+    fn a_projected_version_this_build_does_not_read_is_refused_not_presented() {
+        let too_new = pbps_model::state::CURRENT_VERSION + 1;
+        let err = TimelineState::from_projected(too_new, 3, 1, None)
+            .expect_err("a future version must be refused");
+        assert!(matches!(err, pbps_model::Unreadable::UnsupportedVersion(_)));
+
+        let too_old = pbps_model::state::OLDEST_READABLE_VERSION - 1;
+        let err = TimelineState::from_projected(too_old, 3, 1, None)
+            .expect_err("a version older than this build reads must be refused too");
+        assert!(matches!(err, pbps_model::Unreadable::UnsupportedVersion(_)));
+    }
+
+    /// The negative case beside it: a row at a version this build reads is
+    /// not refused, and its numbers come through unchanged.
+    #[test]
+    fn a_projected_version_this_build_reads_is_not_refused() {
+        let state = TimelineState::from_projected(pbps_model::state::CURRENT_VERSION, 3, 1, None)
+            .expect("a supported version must not be refused");
+        assert_eq!(state.tables, 3);
+        assert_eq!(state.modules, 1);
+        assert_eq!(state.staged, None);
     }
 }

@@ -1405,7 +1405,7 @@
       ]
     },
     "Unreadable": {
-      "description": "Why one row's recorded state is missing from the timeline.\n\nA tagged object rather than a string: a consumer that renders \"upgrade pbps\"\nmust not draw it for a row whose JSON is damaged, and reading that out of a\nmessage is not something a schema can promise. Three variants, not two\n(DECISIONS 432): a row this reader was refused is neither a build this\ntool has outgrown nor a row that is damaged, and a consumer that offered\n\"upgrade pbps\" for a permission problem would send an operator chasing a\nfix that does nothing.",
+      "description": "Why one row's recorded state is missing from the timeline.\n\nA tagged object rather than a string: a consumer that renders \"upgrade pbps\"\nmust not draw it for a row whose JSON is damaged, and reading that out of a\nmessage is not something a schema can promise. Three variants, not two\n(DECISIONS 433): a row this reader was refused is neither a build this\ntool has outgrown nor a row that is damaged, and a consumer that offered\n\"upgrade pbps\" for a permission problem would send an operator chasing a\nfix that does nothing.",
       "oneOf": [
         {
           "description": "The state names a format this build does not read. `detail` is\n`StateSnapshot::check_version`'s own message, which names the direction\nand what to do about it.",

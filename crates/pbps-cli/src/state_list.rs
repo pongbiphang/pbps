@@ -85,7 +85,7 @@ pub struct LedgerRow {
 /// A tagged object rather than a string: a consumer that renders "upgrade pbps"
 /// must not draw it for a row whose JSON is damaged, and reading that out of a
 /// message is not something a schema can promise. Three variants, not two
-/// (DECISIONS 432): a row this reader was refused is neither a build this
+/// (DECISIONS 433): a row this reader was refused is neither a build this
 /// tool has outgrown nor a row that is damaged, and a consumer that offered
 /// "upgrade pbps" for a permission problem would send an operator chasing a
 /// fix that does nothing.

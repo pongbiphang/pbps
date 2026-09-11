@@ -9304,3 +9304,326 @@ async fn a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json
         ))
         .await;
 }
+
+/// Builds a login that can read and write `dbo.__pbps_state` and
+/// `dbo.__pbps_lock` — the ordinary deployment grant, per `doctor` today —
+/// but deliberately holds no `ALTER` anywhere, and returns a connection
+/// string for it. The caller creates both tables (in whatever shape it wants
+/// migrated) before calling this, so `CREATE_STATE`/`CREATE_LOCK`'s
+/// `IF OBJECT_ID(...) IS NULL` guards see an existing object and never ask
+/// this login for `CREATE TABLE`.
+async fn login_without_alter(db: &mut TestDb, login: &str, password: &str) -> String {
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT SELECT, INSERT, DELETE ON dbo.__pbps_state TO [{login}]; \
+             GRANT SELECT, INSERT, DELETE ON dbo.__pbps_lock TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant SELECT/INSERT/DELETE, and nothing wider");
+    let base_no_credentials = conn_str()
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "{base_no_credentials};User Id={login};Password={password};Database={}",
+        db.name
+    )
+}
+
+async fn drop_login(login: &str) {
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
+/// Condition 4's ruling, pinned: a login that can read and write the ledger
+/// but cannot `ALTER` it meets a pre-#103 `__pbps_state` and is refused by
+/// name, not by a bare driver error. `doctor` does not yet ask for `ALTER` on
+/// an existing ledger (`Needed::LedgerCreation` is spent once the tables
+/// exist) — see `pbps_mssql::state::migrate_timeline_columns`'s own doc
+/// comment and the gap tracked beside this PR — so the only thing standing
+/// between this login and a confusing Msg 1088 is the wrapping under test.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_login_without_alter_is_refused_by_name_on_a_pre_migration_ledger() {
+    let mut db = TestDb::create("noaltermigrate103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+    // Pre-create the lock table too, in the shape `ensure_tables` itself
+    // would create it, so `CREATE_LOCK`'s guard sees it and never asks this
+    // login for `CREATE TABLE` — the failure under test is the migration
+    // ALTER, not a different permission this test did not mean to exercise.
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.__pbps_lock (\
+                 id INT NOT NULL CONSTRAINT pk___pbps_lock PRIMARY KEY \
+                     CONSTRAINT ck___pbps_lock_single CHECK (id = 1), \
+                 locked_by NVARCHAR(256) NOT NULL, \
+                 locked_at DATETIME2(3) NOT NULL \
+                     CONSTRAINT df___pbps_lock_locked_at DEFAULT SYSUTCDATETIME());",
+        )
+        .await
+        .expect("create the lock table");
+
+    let login = format!("pbps_noalter103_{}", std::process::id());
+    let password = "pbpsNoAlter103!1";
+    let as_login = login_without_alter(&mut db, &login, password).await;
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+
+    let err = pbps_mssql::state::ensure_tables(&mut lp)
+        .await
+        .expect_err("a login without ALTER cannot migrate a pre-#103 ledger");
+    let message = err.to_string();
+    assert!(
+        message.contains("dbo.__pbps_state is missing the timeline columns"),
+        "the error must name the ledger: {message}"
+    );
+    assert!(
+        message.contains("state_version")
+            && message.contains("tables_count")
+            && message.contains("modules_count")
+            && message.contains("staged_completed")
+            && message.contains("staged_total"),
+        "the error must name the columns: {message}"
+    );
+    assert!(
+        message.contains("needs ALTER on dbo.__pbps_state"),
+        "the error must name the right needed: {message}"
+    );
+
+    drop(lp);
+    db.drop().await;
+    drop_login(&login).await;
+}
+
+/// The other half of condition 4's ruling: the same login, meeting a ledger
+/// that is already migrated, succeeds — because `ADD_TIMELINE_COLUMNS`'s
+/// `IF COL_LENGTH(...) IS NULL` guard is false and `ALTER` is never asked
+/// for. This is what stops the ruling above from demanding a right nobody
+/// needs once the one-time migration has already run.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_login_without_alter_succeeds_on_an_already_migrated_ledger() {
+    let mut db = TestDb::create("noalterok103").await;
+    // An owner-run `ensure_tables` first, so both tables exist and already
+    // carry the timeline columns before the low-privilege login ever
+    // connects.
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate as the owner");
+
+    let login = format!("pbps_noalterok103_{}", std::process::id());
+    let password = "pbpsNoAlterOk103!1";
+    let as_login = login_without_alter(&mut db, &login, password).await;
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+
+    pbps_mssql::state::ensure_tables(&mut lp)
+        .await
+        .expect("a login without ALTER succeeds once the ledger is already migrated");
+
+    drop(lp);
+    db.drop().await;
+    drop_login(&login).await;
+}
+
+/// Finding 1 from #353's round-1 review: `state list` is a read and must
+/// succeed against a ledger nobody has migrated yet, without ever calling
+/// `ensure_tables` — the same path `engine::timeline` actually takes. The
+/// condition-3 test above (`a_pre_issue_103_ledger_is_migrated_in_place...`)
+/// calls `ensure_tables` before `timeline`, which is exactly why the original
+/// version of this change never caught the bug this test pins: the first
+/// `SELECT_TIMELINE` against a table with none of the five new columns dies
+/// outright with "invalid column name", not per-row through the fallback.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_tables() {
+    let mut db = TestDb::create("nevermigrated103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+    db.conn
+        .execute_with(
+            "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, \
+             reason) VALUES (@P1, @P2, @P3, @P4, @P5, @P6);",
+            &[
+                "apply".into(),
+                None::<&str>.into(),
+                None::<&str>.into(),
+                legacy_json.as_str().into(),
+                "pre-103-operator".into(),
+                None::<&str>.into(),
+            ],
+        )
+        .await
+        .expect("write a row the way a pre-#103 build would, on a table it never migrated");
+
+    // No `ensure_tables` call anywhere above this line — that omission is
+    // the whole point of the test.
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("state list must succeed against a ledger nobody has migrated yet");
+    assert_eq!(rows.len(), 1);
+    let state = rows[0]
+        .state
+        .as_ref()
+        .expect("the row parses through the fallback");
+    assert_eq!(state.tables, schema.tables.len());
+    assert_eq!(state.modules, schema.modules.len());
+    assert_eq!(state.version, legacy.version);
+
+    db.drop().await;
+}
+
+/// Finding 2 from #353's round-1 review: a row a newer pbps wrote populates
+/// the projected columns like any other row, and the projected path must
+/// refuse it exactly as [`pbps_model::StateSnapshot::read_json`]'s JSON
+/// fallback already refuses the same version — never present it as ordinary
+/// data with counts. The positive case sits beside it: a row at a version
+/// this build reads is not refused.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data() {
+    let mut db = TestDb::create("futureversion103").await;
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+
+    let ok = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record(&mut db.conn, &ok)
+        .await
+        .expect("record a row at a version this build reads");
+
+    let mut future = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    future.version = pbps_model::state::CURRENT_VERSION + 1;
+    pbps_mssql::state::record(&mut db.conn, &future)
+        .await
+        .expect("record a row a newer pbps wrote — writing never checks the version");
+
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("timeline itself must still succeed; only the one row is refused");
+    assert_eq!(rows.len(), 2);
+
+    let future_row = rows
+        .iter()
+        .find(|r| r.state.as_ref().is_err())
+        .expect("the future-version row is the one that is refused");
+    assert!(matches!(
+        future_row.state,
+        Err(pbps_model::Unreadable::UnsupportedVersion(_))
+    ));
+
+    let ok_row = rows
+        .iter()
+        .find(|r| r.state.as_ref().is_ok())
+        .expect("the supported-version row is not refused");
+    let state = ok_row.state.as_ref().unwrap();
+    assert_eq!(state.tables, schema.tables.len());
+    assert_eq!(state.modules, schema.modules.len());
+
+    db.drop().await;
+}
+
+/// Finding 4 from #353's round-1 review: `select_legacy_state_json` binds
+/// one parameter per legacy id, and SQL Server refuses more than
+/// [`pbps_mssql::doctor`]'s measured `MAX_PARAMETERS` (2,098) in one request.
+/// Until a deployer has run a deployment after upgrading, every row on a
+/// long-lived ledger is legacy, so `state list --limit` above that ceiling
+/// against such a ledger is the realistic case, not an exotic one — this
+/// inserts enough legacy rows to cross it in a single bulk statement, and
+/// asks for more than the ceiling in one `timeline` call.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn the_legacy_fallback_batches_past_sql_servers_parameter_ceiling() {
+    let mut db = TestDb::create("manylegacy103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+
+    // One row's worth of `state_json`, reused for every row: this test is
+    // about the count of legacy ids the fallback has to ask for, not about
+    // what each row's recorded state says.
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+
+    // More than SQL Server's 2,098-user-parameter ceiling, so the setup
+    // itself is inserted in chunks well under that same ceiling (one bound
+    // parameter per row here) — this loop is not what the test is about, and
+    // must not trip the very limit the assertion below exists to cross.
+    const ROWS: usize = 2200;
+    const INSERT_CHUNK: usize = 1000;
+    let mut inserted = 0;
+    while inserted < ROWS {
+        let chunk = INSERT_CHUNK.min(ROWS - inserted);
+        let mut sql = String::from(
+            "INSERT INTO dbo.__pbps_state \
+             (kind, git_sha, plan_checksum, state_json, operator, reason) VALUES ",
+        );
+        let mut params: Vec<pbps_db::Param<'_>> = Vec::with_capacity(chunk);
+        for i in 0..chunk {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let p = i + 1;
+            sql.push_str(&format!(
+                "('apply', NULL, NULL, @P{p}, 'bulk-legacy-operator', NULL)"
+            ));
+            params.push(legacy_json.as_str().into());
+        }
+        sql.push(';');
+        db.conn
+            .execute_with(&sql, &params)
+            .await
+            .expect("bulk-insert a chunk of legacy rows");
+        inserted += chunk;
+    }
+
+    // No `ensure_tables` call: every one of these rows is legacy on a table
+    // that has never been migrated, exactly like the case above.
+    let rows = pbps_mssql::state::timeline(&mut db.conn, ROWS as u32)
+        .await
+        .expect("state list must succeed past the parameter ceiling, batched or not");
+    assert_eq!(rows.len(), ROWS);
+    assert!(
+        rows.iter().all(|r| r.state.is_ok()),
+        "every legacy row must parse, not just the ones inside one batch"
+    );
+
+    db.drop().await;
+}

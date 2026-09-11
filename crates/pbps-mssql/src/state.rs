@@ -45,7 +45,7 @@ pub const LOCK_TABLE: &str = "dbo.__pbps_lock";
 /// disturb the rows already there.
 ///
 /// The last five columns are `state list`'s own projection (issue #103,
-/// DECISIONS 432) — the same move SPEC §8.1 already made for
+/// DECISIONS 433) — the same move SPEC §8.1 already made for
 /// `kind`/`git_sha`/`plan_checksum`/`operator`/`reason`, so a reader of the
 /// timeline can get counts without parsing `state_json`. Nullable, because a
 /// row recorded before they existed has none; [`timeline`] falls back to
@@ -173,6 +173,47 @@ fn select_legacy_state_json(count: usize) -> String {
         "SELECT id, state_json FROM dbo.__pbps_state WHERE id IN ({});",
         slots.join(", ")
     )
+}
+
+/// [`SELECT_TIMELINE`] without the five columns a `__pbps_state` from before
+/// issue #103 does not have.
+///
+/// `state list` is a read and must never require `ALTER` or ownership to run
+/// (that is [`crate::doctor::Needed::LedgerCreation`]'s territory, and
+/// widening a read into a migration would collide with the gap tracked beside
+/// this change), so it cannot call [`ensure_tables`] to make the columns
+/// appear. An unmigrated ledger is a known shape instead — "absent, empty and
+/// unreadable are three different things," and this is a fourth `timeline`
+/// already knows how to serve: every row on it is legacy, by construction, so
+/// [`timeline`] sends this query rather than [`SELECT_TIMELINE`] and then asks
+/// [`select_legacy_state_json`] for every id it got back, exactly as it
+/// already does for the legacy rows a partly-migrated ledger has (a round-1
+/// review finding on #103's own PR: the first version of this change only
+/// tested the migrated and the partly-migrated shapes, never the one a real
+/// upgrade meets first).
+const SELECT_TIMELINE_UNMIGRATED: &str = "\
+SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at,
+       kind, git_sha, plan_checksum, operator, reason
+  FROM dbo.__pbps_state
+ ORDER BY id DESC;";
+
+/// Whether `dbo.__pbps_state` carries the five columns issue #103 added, read
+/// without needing anything wider than what an ordinary read already needs.
+///
+/// The same `COL_LENGTH` expression [`ADD_TIMELINE_COLUMNS`]'s own guard
+/// uses, in a bare `SELECT` rather than inside an `ALTER`'s `IF`: a metadata
+/// function, not a statement that touches the table's rows, so it needs
+/// nothing beyond what letting a login see the object at all already needs —
+/// the same `SELECT`/`INSERT`/`DELETE` login [`ADD_TIMELINE_COLUMNS`]'s own
+/// doc comment measures evaluating the identical expression with no `ALTER`
+/// held.
+const TIMELINE_COLUMNS_PROBE: &str = "SELECT CASE WHEN COL_LENGTH('dbo.__pbps_state', 'state_version') IS NULL \
+     THEN 0 ELSE 1 END AS present;";
+
+async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
+    let rows = conn.query(TIMELINE_COLUMNS_PROBE).await?;
+    let present: i32 = get(&rows[0], "present")?;
+    Ok(present != 0)
 }
 
 /// `OUTPUT INSERTED.id` rather than `SCOPE_IDENTITY()`: it is one round trip,
@@ -326,7 +367,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
 /// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
 /// one of them must not erase the history above it (DECISIONS 218).
 ///
-/// [`SELECT_TIMELINE`] never asks for `state_json` (DECISIONS 432): a second
+/// [`SELECT_TIMELINE`] never asks for `state_json` (DECISIONS 433): a second
 /// query, [`select_legacy_state_json`], asks for it only for the rows that
 /// predate the migration — `state_version IS NULL` — and only for those ids.
 /// In the common case, once a ledger's rows are all migrated, that second
@@ -337,10 +378,26 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
     if !is_initialized(conn).await? {
         return Err(LedgerError::NotInitialized);
     }
-    let rows = conn
-        .query_with(SELECT_TIMELINE, &[top(limit).into()])
-        .await?;
-    let projected: Vec<ProjectedRow> = rows.iter().map(projected_row).collect::<Result<_, _>>()?;
+    // `state list` is a read and must not require `ALTER` to run, so it
+    // cannot call `ensure_tables` to make an unmigrated ledger's columns
+    // appear — it asks the shape instead, with a probe that needs nothing
+    // wider than an ordinary read already needs, and sends the query that
+    // matches (round-1 review finding on #103's own PR: `timeline` is the
+    // only reader of `dbo.__pbps_state`'s shape, and both branches meet at
+    // `legacy_ids` below whichever one ran).
+    let projected: Vec<ProjectedRow> = if timeline_columns_present(conn).await? {
+        let rows = conn
+            .query_with(SELECT_TIMELINE, &[top(limit).into()])
+            .await?;
+        rows.iter().map(projected_row).collect::<Result<_, _>>()?
+    } else {
+        let rows = conn
+            .query_with(SELECT_TIMELINE_UNMIGRATED, &[top(limit).into()])
+            .await?;
+        rows.iter()
+            .map(projected_row_unmigrated)
+            .collect::<Result<_, _>>()?
+    };
 
     let legacy_ids: Vec<i64> = projected
         .iter()
@@ -349,9 +406,16 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
         .collect();
     let mut legacy: std::collections::HashMap<i64, Result<TimelineState, Unreadable>> =
         std::collections::HashMap::new();
-    if !legacy_ids.is_empty() {
-        let sql = select_legacy_state_json(legacy_ids.len());
-        let params: Vec<Param<'_>> = legacy_ids.iter().map(|&id| id.into()).collect();
+    // In pieces of at most `crate::doctor::MAX_PARAMETERS` ids, not one
+    // statement for every legacy id: this query binds one parameter per id,
+    // and until a deployer has run a deployment after upgrading, every row
+    // is legacy, so a long-lived ledger's ordinary `state list` is exactly
+    // the case that could reach the server's own ceiling in a single
+    // request (a round-1 review finding on #103's own PR — the pre-#103
+    // query needed only its `@P1` limit parameter and had no such ceiling).
+    for chunk in legacy_ids.chunks(crate::doctor::MAX_PARAMETERS) {
+        let sql = select_legacy_state_json(chunk.len());
+        let params: Vec<Param<'_>> = chunk.iter().map(|&id| id.into()).collect();
         match conn.query_with(&sql, &params).await {
             Ok(rows) => {
                 for row in &rows {
@@ -370,11 +434,13 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
             // never has, and DECISIONS 218's promise — a row this build
             // cannot read is carried, not thrown — extends to a row this
             // build was refused, not only one it could not parse (DECISIONS
-            // 432). Every legacy id in this batch shares one answer, because
-            // a column-level DENY is not sensitive to which row is read.
+            // 433). Every legacy id in this chunk shares one answer, because
+            // a column-level DENY is not sensitive to which row is read; a
+            // later chunk still asks for itself; a `DENY` on the table does
+            // not change between one statement and the next.
             Err(e) if is_select_denied(&e) => {
                 let denied = Err(Unreadable::Denied(e.to_string()));
-                for id in &legacy_ids {
+                for id in chunk {
                     legacy.insert(*id, denied.clone());
                 }
             }
@@ -393,7 +459,11 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
             operator: r.operator,
             reason: r.reason,
             state: match r.state {
-                Some(state) => Ok(state),
+                // A version this build does not read, refused before the
+                // JSON fallback ever runs — see [`ProjectedRow`]'s doc
+                // comment on why this is neither `Some(Ok(_))` nor `None`.
+                Some(Err(e)) => Err(e),
+                Some(Ok(state)) => Ok(state),
                 // The fallback query answered for every id it was asked
                 // about; a legacy id missing from its answer means the row
                 // left the ledger between the two queries (a concurrent
@@ -432,7 +502,7 @@ fn saturating_i32(n: u64) -> i32 {
 /// The columns beside `state_json` are projected from the snapshot rather than
 /// passed separately: they exist so `status` can filter without parsing JSON,
 /// and a caller able to set them independently could make them lie. The five
-/// issue #103 added follow the same rule (DECISIONS 432).
+/// issue #103 added follow the same rule (DECISIONS 433).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     ensure_tables(conn).await?;
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
@@ -611,10 +681,18 @@ fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
     })
 }
 
-/// A ledger row's projected columns, without `state_json` (DECISIONS 432):
+/// A ledger row's projected columns, without `state_json` (DECISIONS 433):
 /// [`SELECT_TIMELINE`] never asks for it. `state` is `None` exactly when this
 /// row predates issue #103's migration — `state_version IS NULL` — and
 /// [`timeline`] must still ask [`select_legacy_state_json`] for it.
+///
+/// `Some(Err(_))` is a third shape, distinct from `None`: a row whose columns
+/// *are* populated but whose version this build does not read — a row a
+/// newer pbps wrote. That is not "legacy" and must never reach the JSON
+/// fallback, which would find nothing wrong with a `state_json` this build
+/// simply has not been asked to parse; refusing it here, before the fallback
+/// even runs, is what [`pbps_db::ledger::TimelineState::from_projected`]
+/// makes unavoidable (a round-1 review finding on #103's own PR).
 struct ProjectedRow {
     id: i64,
     applied_at: String,
@@ -623,7 +701,7 @@ struct ProjectedRow {
     plan_checksum: Option<String>,
     operator: String,
     reason: Option<String>,
-    state: Option<TimelineState>,
+    state: Option<Result<TimelineState, Unreadable>>,
 }
 
 /// A count or a version read back from an `INT` column. Negative is
@@ -666,15 +744,35 @@ fn projected_row(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
                 // (`pbps_model::StagedProgress`'s own doc comment).
                 _ => None,
             };
-            Some(TimelineState {
-                version: as_version(version, "state_version")?,
+            Some(TimelineState::from_projected(
+                as_version(version, "state_version")?,
                 tables,
                 modules,
                 staged,
-            })
+            ))
         }
     };
 
+    ledger_row(row, id, state)
+}
+
+/// A row from [`SELECT_TIMELINE_UNMIGRATED`]: the six columns a `__pbps_state`
+/// from before issue #103 has, and nothing else — `state` is always `None`,
+/// because a table with no timeline columns has no row that could be
+/// anything but legacy.
+fn projected_row_unmigrated(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
+    let id: i64 = get(row, "id")?;
+    ledger_row(row, id, None)
+}
+
+/// The six columns every shape of `__pbps_state` this crate reads has, shared
+/// by [`projected_row`] and [`projected_row_unmigrated`] so the two never
+/// drift on how one of them is read.
+fn ledger_row(
+    row: &pbps_db::Row,
+    id: i64,
+    state: Option<Result<TimelineState, Unreadable>>,
+) -> Result<ProjectedRow, LedgerError> {
     Ok(ProjectedRow {
         id,
         applied_at: opt::<&str>(row, "applied_at")?
@@ -757,9 +855,11 @@ mod tests {
         for sql in [
             CREATE_STATE,
             ADD_TIMELINE_COLUMNS,
+            TIMELINE_COLUMNS_PROBE,
             SELECT_LATEST,
             SELECT_HISTORY,
             SELECT_TIMELINE,
+            SELECT_TIMELINE_UNMIGRATED,
             INSERT_STATE_STAGED,
             INSERT_STATE_NOT_STAGED,
             SELECT_IDS,
@@ -780,6 +880,7 @@ mod tests {
         for sql in [
             SELECT_HISTORY,
             SELECT_TIMELINE,
+            SELECT_TIMELINE_UNMIGRATED,
             INSERT_STATE_STAGED,
             INSERT_STATE_NOT_STAGED,
             DELETE_UP_TO,

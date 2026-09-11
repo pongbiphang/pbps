@@ -67,7 +67,7 @@ pub use schema::{
     CheckConstraint, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
     ReferentialAction, Schema, Table, UniqueConstraint,
 };
-pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable};
+pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
 pub use types::{ColumnType, TypeArg, TypeParseError};
 pub use uid::{Uid, UidError, UidKind};

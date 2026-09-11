@@ -19690,3 +19690,227 @@ async fn a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json
     let mut admin = connect().await;
     let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
 }
+
+/// Builds a role that can read and write `public.__pbps_state` and
+/// `public.__pbps_lock` — the ordinary deployment grant, per `doctor` today —
+/// but does not own either, and returns a connection to it. The caller
+/// creates both tables (in whatever shape it wants migrated) before calling
+/// this, as the admin connection, so this role is never their owner.
+async fn role_without_ownership(db: &mut TestDb, role: &str, password: &str) -> Conn {
+    let _ = db
+        .conn
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
+    db.conn
+        .execute(&format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        .await
+        .expect("create role");
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT, INSERT, DELETE ON public.__pbps_state TO {role}; \
+             GRANT SELECT, INSERT, DELETE ON public.__pbps_lock TO {role};"
+        ))
+        .await
+        .expect("grant SELECT/INSERT/DELETE, and nothing wider");
+    Conn::connect(Driver::Postgres, &conn_str_as(role, password, &db.name))
+        .await
+        .expect("connect as the role")
+}
+
+/// Condition 4's ruling, pinned: a role that can read and write the ledger
+/// but does not own it meets a pre-#103 `public.__pbps_state` and is refused
+/// by name, not by a bare "must be owner of table" driver error. `doctor`
+/// does not yet ask for ownership of an *existing* ledger
+/// (`Needed::LedgerCreation` is spent once the tables exist) — see
+/// `pbps_pg::state::migrate_timeline_columns`'s own doc comment and the gap
+/// tracked beside this PR — so the only thing standing between this role and
+/// that bare error is the wrapping under test.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger() {
+    let mut db = TestDb::create("noaltermigrate103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+    // Pre-create the lock table too, in the shape `ensure_tables` itself
+    // would create it, so its `ledger_present` check sees both tables and
+    // never runs `CREATE_STATE`/`CREATE_LOCK` at all — the failure under
+    // test is the migration `ALTER`, not a different permission this test
+    // did not mean to exercise.
+    db.conn
+        .execute(
+            "CREATE TABLE public.__pbps_lock (\
+                 id integer NOT NULL CONSTRAINT pk___pbps_lock PRIMARY KEY \
+                     CONSTRAINT ck___pbps_lock_single CHECK (id = 1), \
+                 locked_by varchar(256) NOT NULL, \
+                 locked_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'))",
+        )
+        .await
+        .expect("create the lock table");
+
+    let role = format!("pbps_noalter103_{}", std::process::id());
+    let password = "pbpsNoAlter103!1";
+    let mut lp = role_without_ownership(&mut db, &role, password).await;
+
+    let err = state::ensure_tables(&mut lp)
+        .await
+        .expect_err("a role without ownership cannot migrate a pre-#103 ledger");
+    let message = err.to_string();
+    assert!(
+        message.contains("public.__pbps_state is missing the timeline columns"),
+        "the error must name the ledger: {message}"
+    );
+    assert!(
+        message.contains("state_version")
+            && message.contains("tables_count")
+            && message.contains("modules_count")
+            && message.contains("staged_completed")
+            && message.contains("staged_total"),
+        "the error must name the columns: {message}"
+    );
+    assert!(
+        message.contains("needs ownership of public.__pbps_state"),
+        "the error must name the right needed: {message}"
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect().await;
+    let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+}
+
+/// The other half of condition 4's ruling: the same role, meeting a ledger
+/// that is already migrated, succeeds — because
+/// [`state::timeline_columns_present`]'s catalog probe says the columns are
+/// already there and `ALTER TABLE` is never sent. This is what stops the
+/// ruling above from demanding ownership nobody needs once the one-time
+/// migration has already run.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_role_without_ownership_succeeds_on_an_already_migrated_ledger() {
+    let mut db = TestDb::create("noalterok103").await;
+    // An owner-run `ensure_tables` first, so both tables exist and already
+    // carry the timeline columns before the low-privilege role ever
+    // connects.
+    state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate as the owner");
+
+    let role = format!("pbps_noalterok103_{}", std::process::id());
+    let password = "pbpsNoAlterOk103!1";
+    let mut lp = role_without_ownership(&mut db, &role, password).await;
+
+    state::ensure_tables(&mut lp)
+        .await
+        .expect("a role without ownership succeeds once the ledger is already migrated");
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect().await;
+    let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+}
+
+/// Finding 1 from #353's round-1 review: `state list` is a read and must
+/// succeed against a ledger nobody has migrated yet, without ever calling
+/// `ensure_tables` — the same path `engine::timeline` actually takes. The
+/// condition-3 test above
+/// (`a_pre_issue_103_ledger_is_migrated_in_place_and_legacy_rows_still_list_their_counts`)
+/// calls `ensure_tables` before `timeline`, which is exactly why the original
+/// version of this change never caught the bug this test pins: the first
+/// `select_timeline` against a table with none of the five new columns dies
+/// outright, not per-row through the fallback.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_tables() {
+    let mut db = TestDb::create("nevermigrated103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+
+    let schema = schema_103(2, 1);
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "pre-103-operator");
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+    db.conn
+        .execute_with(
+            "INSERT INTO public.__pbps_state (kind, git_sha, plan_checksum, state_json, \
+             operator, reason) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                "apply".into(),
+                None::<&str>.into(),
+                None::<&str>.into(),
+                legacy_json.as_str().into(),
+                "pre-103-operator".into(),
+                None::<&str>.into(),
+            ],
+        )
+        .await
+        .expect("write a row the way a pre-#103 build would, on a table it never migrated");
+
+    // No `ensure_tables` call anywhere above this line — that omission is
+    // the whole point of the test.
+    let rows = state::timeline(&mut db.conn, 10)
+        .await
+        .expect("state list must succeed against a ledger nobody has migrated yet");
+    assert_eq!(rows.len(), 1);
+    let state = rows[0]
+        .state
+        .as_ref()
+        .expect("the row parses through the fallback");
+    assert_eq!(state.tables, schema.tables.len());
+    assert_eq!(state.modules, schema.modules.len());
+    assert_eq!(state.version, legacy.version);
+
+    db.drop().await;
+}
+
+/// Finding 2 from #353's round-1 review: a row a newer pbps wrote populates
+/// the projected columns like any other row, and the projected path must
+/// refuse it exactly as `StateSnapshot::read_json`'s JSON fallback already
+/// refuses the same version — never present it as ordinary data with counts.
+/// The positive case sits beside it: a row at a version this build reads is
+/// not refused.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data() {
+    let mut db = TestDb::create("futureversion103").await;
+    let schema = schema_103(2, 1);
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+
+    let ok = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "live-test");
+    state::record(&mut db.conn, &ok)
+        .await
+        .expect("record a row at a version this build reads");
+
+    let mut future = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "live-test");
+    future.version = pbps_model::state::CURRENT_VERSION + 1;
+    state::record(&mut db.conn, &future)
+        .await
+        .expect("record a row a newer pbps wrote — writing never checks the version");
+
+    let rows = state::timeline(&mut db.conn, 10)
+        .await
+        .expect("timeline itself must still succeed; only the one row is refused");
+    assert_eq!(rows.len(), 2);
+
+    let future_row = rows
+        .iter()
+        .find(|r| r.state.as_ref().is_err())
+        .expect("the future-version row is the one that is refused");
+    assert!(matches!(
+        future_row.state,
+        Err(pbps_model::Unreadable::UnsupportedVersion(_))
+    ));
+
+    let ok_row = rows
+        .iter()
+        .find(|r| r.state.as_ref().is_ok())
+        .expect("the supported-version row is not refused");
+    let read_back = ok_row.state.as_ref().unwrap();
+    assert_eq!(read_back.tables, schema.tables.len());
+    assert_eq!(read_back.modules, schema.modules.len());
+
+    db.drop().await;
+}

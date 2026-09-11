@@ -9418,6 +9418,50 @@ SPEC is in sync with all of these.
     catalog probe first and sends the `ALTER` only when it says the columns
     are actually missing.
 
+    **`timeline` asks the ledger's shape before it asks for a row.** A
+    round-1 review finding caught what the first version of this entry's own
+    promise did not yet keep: the columns above are nullable so a row
+    recorded before they existed is still listed, but `state list` is a read
+    and must not require `ALTER` or ownership to run — it cannot call
+    `ensure_tables` to make an *unmigrated table's* columns appear, only a
+    *row's* NULL columns were ever handled. `SELECT_TIMELINE` naming five
+    columns that do not exist at all failed the whole call outright, not
+    per-row, on exactly the ledger a real upgrade meets first — the
+    development tests only ever exercised a table `ensure_tables` had
+    already touched, which is why the gap shipped. The fix treats "the
+    columns are not there yet" as a fourth known ledger shape rather than an
+    error: `timeline` probes for the columns first (`COL_LENGTH` on SQL
+    Server, the same world-readable catalog probe `migrate_timeline_columns`
+    already uses on PostgreSQL — neither needs anything wider than an
+    ordinary read), and an unmigrated table sends the pre-#103 six-column
+    query instead, with every row routed through the same legacy fallback a
+    partly-migrated ledger's NULL rows already use. One code path serves
+    both shapes; nothing about the fallback itself changed.
+
+    **The version gate is unavoidable, not merely present.** A second
+    round-1 finding: the projected path parsed `state_version` into a
+    `TimelineState` directly, so a row a newer pbps wrote — its columns
+    populated like any other row's — was presented as ordinary data with
+    counts, where the JSON fallback's `StateSnapshot::read_json` would have
+    refused the same version as `Unreadable::UnsupportedVersion`. The two
+    paths had come to disagree about what "readable" means. Fixed by giving
+    `pbps_db::ledger::TimelineState` one constructor for the projected path,
+    `from_projected`, that calls the new `pbps_model::check_readable_version`
+    before it will build the value at all — checking and constructing are
+    the same call, so a third path built later cannot skip the check either
+    (the shape AGENTS.md asks for: prefer a failure unrepresentable over a
+    branch that tests for it).
+
+    **The legacy fallback asks in pieces, not one statement.**
+    A third: `select_legacy_state_json` bound one parameter per legacy id
+    with no ceiling, and until a deployer runs a deployment after upgrading,
+    every row on a ledger is legacy — the normal case immediately after this
+    ships, not an exotic one. SQL Server refuses more than 2,098 user
+    parameters in one bound statement (`pbps_mssql::doctor::MAX_PARAMETERS`,
+    measured and already shared with the object-permission queries there);
+    `timeline`'s fallback now asks in chunks of that size. PostgreSQL has no
+    comparable ceiling for this shape and needed no change.
+
     **A fourth `Unreadable` case, not a third `Malformed`.** A row a fallback
     query cannot read because a principal was denied `state_json` is neither a
     build too old to read the format (`UnsupportedVersion`) nor a damaged row
@@ -9445,8 +9489,16 @@ SPEC is in sync with all of these.
     Pinned by live tests on both engines: a `__pbps_state` created with the
     pre-#103 DDL is migrated in place by `ensure_tables`, a legacy row keeps
     listing its counts through the JSON fallback, and a row recorded
-    afterwards reads them from the columns; and the sharp test the issue
-    names — a fully-migrated ledger whose `state_json` the reader's principal
-    may not see still answers `state list` — on both dialects. A unit test
-    pins a denied row rendering as denied, never as malformed and never with
-    tables/modules silently reading zero.
+    afterwards reads them from the columns; the sharp test the issue names —
+    a fully-migrated ledger whose `state_json` the reader's principal may not
+    see still answers `state list` — on both dialects; `timeline` answers a
+    ledger nobody has ever migrated, through the same path `engine::timeline`
+    calls, never through `ensure_tables`; and a row a newer pbps wrote is
+    `Unreadable::UnsupportedVersion` on the projected path exactly as an
+    older pbps's JSON fallback already refuses it, beside the positive case
+    that a supported version is not refused. SQL Server also pins the
+    legacy fallback succeeding past its parameter ceiling. A unit test pins
+    a denied row rendering as denied, never as malformed and never with
+    tables/modules silently reading zero, and another pins the projected
+    path's version gate directly against `pbps_model::CURRENT_VERSION`/
+    `OLDEST_READABLE_VERSION`.
