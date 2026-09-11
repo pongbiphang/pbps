@@ -1048,9 +1048,12 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
         .changes
         .changes
         .iter()
-        .filter_map(|p| match &p.change {
-            pbps_model::Change::AlterModule { id, .. } => Some(id.to_string()),
-            _ => None,
+        .filter_map(|p| {
+            if let pbps_model::Change::AlterModule { id, .. } = &p.change {
+                Some(id.to_string())
+            } else {
+                None
+            }
         })
         .collect();
     assert_eq!(rebuilt, ["app.caller()"]);

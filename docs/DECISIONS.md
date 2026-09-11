@@ -8987,3 +8987,26 @@ SPEC is in sync with all of these.
     old runtime binding despite a successful apply. The prior engine test
     retains that bad middle state by deliberately omitting the synthesized
     alteration, then executes the alteration from the actual typed plan.
+
+423. **A transactional PostgreSQL catalog read has one statement snapshot
+    and its managed recording is revalidated.** The caller remains READ
+    COMMITTED so a closing read sees concurrent commits and its own DDL.
+    A savepoint does not give separate catalog queries a common snapshot: a
+    constraint committed after its query could be absent from a successful
+    recording. All catalog relations now travel in one UNION ALL statement,
+    as checked JSON row batches decoded into the existing catalog model.
+    This is internal transport; declarations and saved plans do not change.
+
+    Before bootstrap or transactional apply records the result, the CLI
+    captures the managed schema and rows again. A changed managed projection
+    refuses rather than recording an unstable view (SPEC §7.6). Unmanaged
+    inventory is excluded under §8.2, and both captures reject unsupported
+    managed facts. This is optimistic revalidation, not a lock on arbitrary
+    DDL after the last observation. Owned reads retain their read-only framing;
+    the shared framing also protects multi-statement row reads.
+
+    A live two-connection regression commits a CHECK on an untouched managed
+    table between captures and observes refusal, then commits unrelated
+    unmanaged DDL and observes acceptance. It also proves the reader sees
+    its own uncommitted table, preserves the caller transaction, and rolls
+    that table back while the independent writer's constraint remains.

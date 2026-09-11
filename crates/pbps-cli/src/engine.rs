@@ -135,6 +135,15 @@ pub enum Read {
     InsideOwnTransaction,
 }
 
+/// A PostgreSQL closing catalog view is one statement, while declared rows
+/// are read separately. Revalidate their managed projection before recording.
+pub fn needs_readback_revalidation(driver: Driver, read: Read) -> bool {
+    matches!(
+        (driver, read),
+        (Driver::Postgres, Read::InsideOwnTransaction)
+    )
+}
+
 pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> {
     match (conn.driver(), read) {
         (Driver::Mssql, _) => pbps_mssql::catalog::introspect(conn).await,

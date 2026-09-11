@@ -89,6 +89,81 @@ async fn managed_state(
     reference: &Schema,
     read: crate::engine::Read,
 ) -> anyhow::Result<pbps_diff::Scoped> {
+    let request = ManagedRead {
+        ids,
+        modules,
+        unmanaged,
+        scopes,
+        reference,
+        read,
+    };
+    managed_state_then(conn, &request, || std::future::ready(Ok(()))).await
+}
+
+struct ManagedRead<'a> {
+    ids: &'a IdsFile,
+    modules: &'a BTreeSet<ModuleId>,
+    unmanaged: pbps_config::Unmanaged,
+    scopes: &'a DataScopes,
+    reference: &'a Schema,
+    read: crate::engine::Read,
+}
+
+impl ManagedRead<'_> {
+    async fn capture(&self, conn: &mut Conn) -> anyhow::Result<pbps_diff::Scoped> {
+        managed_state_once(
+            conn,
+            self.ids,
+            self.modules,
+            self.unmanaged,
+            self.scopes,
+            self.reference,
+            self.read,
+        )
+        .await
+    }
+}
+
+// An internal test callback places a second connection's DDL between the two
+// real reads. The production caller supplies no work and no user hook exists.
+async fn managed_state_then<F, Fut>(
+    conn: &mut Conn,
+    request: &ManagedRead<'_>,
+    after_capture: F,
+) -> anyhow::Result<pbps_diff::Scoped>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let captured = request.capture(conn).await?;
+    if crate::engine::needs_readback_revalidation(conn.driver(), request.read) {
+        after_capture().await?;
+        let checked = request.capture(conn).await?;
+        // An unrelated unmanaged object is outside SPEC §8.2. Compare the
+        // facts that can enter this recording, not the ambient inventory.
+        if captured.schema != checked.schema
+            || captured.missing != checked.missing
+            || captured.missing_roles != checked.missing_roles
+            || captured.unexpressible != checked.unexpressible
+        {
+            bail!(
+                "the managed state changed during the transactional read-back; refusing to record an unstable schema. Retry after the concurrent change settles"
+            );
+        }
+        return Ok(checked);
+    }
+    Ok(captured)
+}
+
+async fn managed_state_once(
+    conn: &mut Conn,
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+    unmanaged: pbps_config::Unmanaged,
+    scopes: &DataScopes,
+    reference: &Schema,
+    read: crate::engine::Read,
+) -> anyhow::Result<pbps_diff::Scoped> {
     let managed =
         managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes), read).await?;
     refuse_managed_limitations(&managed.limitations)?;
@@ -5206,6 +5281,108 @@ mod tests {
             "the probe refused a plan this engine takes: {probed:?}"
         );
         cleanup.expect("drop");
+    }
+
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+    fn transactional_read_back_refuses_concurrent_managed_ddl_but_ignores_unmanaged_ddl() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(read_back_under_concurrent_ddl());
+    }
+
+    async fn read_back_under_concurrent_ddl() {
+        let connection = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+        let mut reader = Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        let mut writer = Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        let schema = format!("pbps_capture_{}", std::process::id());
+        writer.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; CREATE TABLE {schema}.untouched (id integer)")).await.unwrap();
+        reader.execute("BEGIN").await.unwrap();
+        reader
+            .execute(&format!("CREATE TABLE {schema}.own_write (id integer)"))
+            .await
+            .unwrap();
+        let read = crate::engine::Read::InsideOwnTransaction;
+        let mut watched = crate::engine::introspect(&mut reader, read)
+            .await
+            .unwrap()
+            .schema;
+        watched.tables.retain(|name, _| name.schema == schema);
+        watched.modules.clear();
+        watched.roles.clear();
+        let ids = pbps_diff::observed_ids(&watched, &IdsFile::default());
+        let modules = BTreeSet::new();
+        let scopes = DataScopes::default();
+        let reference = Schema::default();
+        let request = ManagedRead {
+            ids: &ids,
+            modules: &modules,
+            unmanaged: pbps_config::Unmanaged::Ignore,
+            scopes: &scopes,
+            reference: &reference,
+            read,
+        };
+        let result = managed_state_then(&mut reader, &request, || async {
+            writer
+                .execute(&format!(
+                    "ALTER TABLE {schema}.untouched ADD CONSTRAINT concurrent_check CHECK (id > 0)"
+                ))
+                .await?;
+            Ok(())
+        })
+        .await;
+        // The second capture now includes the independently committed check;
+        // unrelated objects remain outside the comparison's managed scope.
+        let stable = managed_state_then(&mut reader, &request, || async {
+            writer
+                .execute(&format!("CREATE TABLE {schema}.unmanaged (id integer)"))
+                .await?;
+            Ok(())
+        })
+        .await;
+        let still_open = pbps_pg::catalog::in_transaction(&mut reader).await.unwrap();
+        reader.execute("ROLLBACK").await.unwrap();
+        let after = pbps_pg::catalog::introspect(&mut writer).await.unwrap();
+        writer
+            .execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("managed state changed during")),
+            "{result:?}"
+        );
+        let stable = stable.expect("unmanaged DDL does not invalidate this recording");
+        assert!(
+            stable
+                .schema
+                .tables
+                .contains_key(&TableName::new(&schema, "own_write"))
+        );
+        assert!(
+            stable.schema.tables[&TableName::new(&schema, "untouched")]
+                .checks
+                .contains_key("concurrent_check")
+        );
+        assert!(still_open, "read-back must preserve the caller transaction");
+        assert!(
+            after.schema.tables[&TableName::new(&schema, "untouched")]
+                .checks
+                .contains_key("concurrent_check")
+        );
+        assert!(
+            !after
+                .schema
+                .tables
+                .contains_key(&TableName::new(&schema, "own_write"))
+        );
     }
 
     /// `scope` drops a managed role's *plain* grant on an object nobody
