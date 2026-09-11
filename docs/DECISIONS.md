@@ -9134,3 +9134,32 @@ SPEC is in sync with all of these.
     survive into both formats. The existing global-strategy estimator API keeps
     its contract; the command uses the per-change API. Cost never enters
     SavedPlan, its checksum, risk classification, or an apply approval (#305).
+
+431. **Table and column drop impact follows catalog object addresses and removal order.**
+    PostgreSQL's `pg_depend` has several edges for one object: a table CHECK
+    can depend both normally and automatically on the column it checks.
+    `impact::drop_blockers` walks reverse edges and internal owners, preserving
+    view rules, row types, domain constraints and catalog classes with no
+    hand-written classifier. Automatic removal wins over a normal edge for the
+    same dependent. An earlier typed removal also removes its automatic parts,
+    so dropping a child table first clears its foreign key into the parent.
+    Dependencies of a removed dependent must themselves be removed in time;
+    merely appearing somewhere in the plan does not establish that order.
+
+    The read sees the current catalog. Earlier table/column renames project
+    statement-time names back to stored identities; an earlier creation is
+    distinguished from a missing existing target, which is an error. Module
+    replacements and default/key replacements remove their old dependencies;
+    dependencies introduced by new definitions remain the engine's execution
+    check. No speculative DDL, CASCADE, extra privilege-demanding locks or
+    stronger concurrency guarantee is introduced by this reader.
+
+    The engine facade runs the check inside connected planning and again before
+    apply writes, including pending staged statements. A closing-only staged
+    resume has no remaining drop to inspect. Blockers name the target and its
+    dependents; successful connected reports name the check. SQL Server names
+    its missing table/column reader as unavailable instead of borrowing the
+    rename reader's answer. Live tests pair the report with DROP RESTRICT's
+    refusal and with valid earlier removal; CLI tests pin refusal before a
+    saved artifact or DDL; failed applies retain their ordinary failed-attempt
+    audit entry without recording a successful deployment (#254, #305).

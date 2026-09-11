@@ -19055,3 +19055,265 @@ async fn a_read_back_outside_a_transaction_is_refused_not_answered() {
             .expect("probe")
     );
 }
+
+fn drop_changes(changes: Vec<pbps_model::Change>) -> pbps_model::ChangeSet {
+    pbps_model::ChangeSet {
+        changes: changes
+            .into_iter()
+            .map(pbps_model::PlannedChange::new)
+            .collect(),
+    }
+}
+
+fn dropping_column(s: &str, name: &str) -> pbps_model::Change {
+    pbps_model::Change::DropColumn {
+        uid: "c_aaaaaa".parse().unwrap(),
+        column: TableName::new(s, "t").column(name),
+    }
+}
+
+fn dropping_table(s: &str, name: &str) -> pbps_model::Change {
+    pbps_model::Change::DropTable {
+        uid: "t_aaaaaa".parse().unwrap(),
+        name: TableName::new(s, name),
+    }
+}
+
+fn dropping_view(s: &str, name: &str) -> pbps_model::Change {
+    pbps_model::Change::DropModule {
+        id: format!("{s}.{name}").parse().unwrap(),
+        kind: pbps_model::ModuleKind::View,
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_parts() {
+    let s = emit_schema("drop_read");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id int PRIMARY KEY CHECK (id>0), keep int, d int DEFAULT 1);
+        CREATE INDEX expression_idx ON {s}.t ((id+1));
+        CREATE TABLE {s}.child (id int REFERENCES {s}.t(id));
+        CREATE VIEW {s}.v AS SELECT id FROM {s}.t;
+        CREATE VIEW {s}.w AS SELECT id FROM {s}.v;"
+    ))
+    .await
+    .unwrap();
+    let alone = drop_changes(vec![dropping_column(&s, "id")]);
+    let outside = pbps_pg::impact::drop_blockers(&mut conn, &alone)
+        .await
+        .unwrap_err();
+    assert!(
+        outside.to_string().contains("caller's transaction"),
+        "{outside}"
+    );
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &alone)
+        .await
+        .unwrap();
+    assert_eq!(report.len(), 1);
+    for name in ["child_id_fkey", ".v", ".w"] {
+        assert!(
+            report[0].blocking.iter().any(|s| s.contains(name)),
+            "{report:?}"
+        );
+    }
+    assert!(
+        !report[0].blocking.iter().any(|s| s.contains("t_id_check")
+            || s.contains("expression_idx")
+            || s.contains("t_pkey")),
+        "{report:?}"
+    );
+    let error = conn
+        .execute(&format!("ALTER TABLE {s}.t DROP COLUMN id"))
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&error), "2BP01");
+    rollback(&mut conn).await;
+
+    in_a_transaction(&mut conn).await;
+    let unrelated =
+        pbps_pg::impact::drop_blockers(&mut conn, &drop_changes(vec![dropping_column(&s, "d")]))
+            .await
+            .unwrap();
+    assert!(unrelated[0].blocking.is_empty(), "{unrelated:?}");
+    conn.execute(&format!("ALTER TABLE {s}.t DROP COLUMN d"))
+        .await
+        .unwrap();
+    rollback(&mut conn).await;
+
+    // A child's own FK is automatic when the whole child goes, even though
+    // that table is not in the reverse walk starting at the parent column.
+    let ordered = drop_changes(vec![
+        dropping_view(&s, "w"),
+        dropping_view(&s, "v"),
+        dropping_table(&s, "child"),
+        dropping_column(&s, "id"),
+    ]);
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &ordered)
+        .await
+        .unwrap();
+    assert!(report.iter().all(|r| r.blocking.is_empty()), "{report:?}");
+    apply(&mut conn, &Postgres::new(), &ordered).await;
+    rollback(&mut conn).await;
+
+    let wrong = drop_changes(vec![
+        dropping_view(&s, "v"),
+        dropping_view(&s, "w"),
+        dropping_column(&s, "id"),
+    ]);
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &wrong)
+        .await
+        .unwrap();
+    assert!(
+        report[0].blocking.iter().any(|s| s.contains(".w")),
+        "{report:?}"
+    );
+    rollback(&mut conn).await;
+
+    // Exact constraint identity, not an assumed generated name.
+    let ordered = drop_changes(vec![
+        dropping_view(&s, "w"),
+        dropping_view(&s, "v"),
+        pbps_model::Change::DropForeignKey {
+            table: TableName::new(&s, "child"),
+            name: "child_id_fkey".into(),
+        },
+        dropping_table(&s, "t"),
+    ]);
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &ordered)
+        .await
+        .unwrap();
+    assert!(report.iter().all(|r| r.blocking.is_empty()), "{report:?}");
+    apply(&mut conn, &Postgres::new(), &ordered).await;
+    rollback(&mut conn).await;
+    drop_schema(&mut conn, &s).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn drop_blockers_keep_row_type_domain_rule_and_unenumerated_catalog_paths() {
+    let s = emit_schema("drop_paths");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id int, keep int);
+        CREATE TABLE {s}.sink (id int);
+        CREATE RULE relay AS ON INSERT TO {s}.sink DO ALSO INSERT INTO {s}.t(id) VALUES (new.id);
+        CREATE FUNCTION {s}.reads() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT id FROM {s}.t; END;
+        CREATE DOMAIN {s}.positive AS int CHECK (VALUE > {s}.reads());
+        CREATE FUNCTION {s}.takes_array({s}.t[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        CREATE STATISTICS {s}.stats (dependencies) ON id, keep FROM {s}.t;"
+    ))
+    .await
+    .unwrap();
+    let cs = drop_changes(vec![dropping_table(&s, "t")]);
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &cs)
+        .await
+        .unwrap();
+    for name in ["rule relay", "reads()", "positive_check", "takes_array"] {
+        assert!(
+            report[0].blocking.iter().any(|s| s.contains(name)),
+            "missing {name}: {report:?}"
+        );
+    }
+    // pg_statistic_ext has no hand-written class arm and is automatically
+    // removed with its table; its mere presence must not become a blocker.
+    assert!(
+        !report[0].blocking.iter().any(|s| s.contains("stats")),
+        "{report:?}"
+    );
+    assert_eq!(
+        sqlstate(
+            &conn
+                .execute(&format!("DROP TABLE {s}.t"))
+                .await
+                .unwrap_err()
+        ),
+        "2BP01"
+    );
+    rollback(&mut conn).await;
+    drop_schema(&mut conn, &s).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets() {
+    use pbps_model::{Change, Module, ModuleKind};
+    let s = emit_schema("drop_names");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id int, keep int);
+        CREATE VIEW {s}.v AS SELECT id FROM {s}.t;"
+    ))
+    .await
+    .unwrap();
+    let cs = drop_changes(vec![
+        Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: TableName::new(&s, "t"),
+            to: TableName::new(&s, "renamed"),
+        },
+        Change::RenameColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: TableName::new(&s, "renamed"),
+            from: "id".into(),
+            to: "ident".into(),
+        },
+        Change::DropColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: TableName::new(&s, "renamed").column("ident"),
+        },
+    ]);
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &cs)
+        .await
+        .unwrap();
+    assert!(
+        report[0].blocking.iter().any(|s| s.contains(".v")),
+        "{report:?}"
+    );
+    rollback(&mut conn).await;
+
+    // Replacing a view to cease reading the column removes its old edges.
+    // A blanket rule that excludes only DropModule refuses this valid plan.
+    let cs = drop_changes(vec![
+        Change::AlterModule {
+            id: format!("{s}.v").parse().unwrap(),
+            module: Box::new(Module {
+                kind: ModuleKind::View,
+                definition: "SELECT 1 AS id".into(),
+                description: None,
+            }),
+        },
+        dropping_column(&s, "id"),
+    ]);
+    in_a_transaction(&mut conn).await;
+    let report = pbps_pg::impact::drop_blockers(&mut conn, &cs)
+        .await
+        .unwrap();
+    assert!(report[0].blocking.is_empty(), "{report:?}");
+    apply(&mut conn, &Postgres::new(), &cs).await;
+    rollback(&mut conn).await;
+
+    in_a_transaction(&mut conn).await;
+    let absent = pbps_pg::impact::drop_blockers(
+        &mut conn,
+        &drop_changes(vec![dropping_column(&s, "absent")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        absent.to_string().contains("absent from the catalog"),
+        "{absent}"
+    );
+    rollback(&mut conn).await;
+    drop_schema(&mut conn, &s).await;
+}

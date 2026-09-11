@@ -697,6 +697,13 @@ environment at once: last apply, git sha, drift state, last verified. It is a
 report and not a gate — it exits `0` whatever it finds (see the contract
 above), so a watch built on it reads the JSON.
 
+Connected planning also reports `drop_blockers` in `data.connected_checks`.
+On PostgreSQL, table and column drops are checked against current catalog
+dependencies, accounting for dependents removed earlier by the plan. A blocker
+produces a named `plan.failed` finding and no saved artifact; apply reads again
+before writing. SQL Server reports this reader as `unavailable`. This check
+cannot see dependencies outside the catalog or predict a new module definition.
+
 ## Things that will bite
 
 - **Shallow clones.** `plan --since <base>` needs that base revision in the

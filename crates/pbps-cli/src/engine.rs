@@ -464,6 +464,48 @@ pub struct ConnectedCheck {
     pub message: String,
 }
 
+/// Predict existing table/column DROP dependencies in the caller's transaction.
+/// The other engine's rename reader does not answer this question (issue 254).
+pub async fn check_drop_blockers(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<ConnectedCheck> {
+    match conn.driver() {
+        Driver::Mssql => Ok(ConnectedCheck {
+            name: "drop_blockers",
+            engine: "SQL Server",
+            status: "unavailable",
+            message: "The table/column drop dependency reader is not implemented for SQL Server"
+                .to_owned(),
+        }),
+        Driver::Postgres => {
+            let reports = pbps_pg::impact::drop_blockers(conn, changes).await?;
+            let blocked: Vec<_> = reports
+                .iter()
+                .filter(|r| !r.blocking.is_empty())
+                .map(|r| format!("{}: {}", r.target, r.blocking.join("; ")))
+                .collect();
+            if !blocked.is_empty() {
+                anyhow::bail!(
+                    "drop_blockers (PostgreSQL): {}.\n\
+                    Remove these dependencies before the drop, through earlier declared changes \
+                    or a separately reviewed deployment, then recompute the plan.",
+                    blocked.join("\n")
+                );
+            }
+            Ok(ConnectedCheck {
+                name: "drop_blockers",
+                engine: "PostgreSQL",
+                status: "passed",
+                message: format!(
+                    "{} table/column drop(s) checked against current catalog dependencies",
+                    reports.len()
+                ),
+            })
+        }
+    }
+}
+
 /// Check the permissions this deployment will grant, not every permission in
 /// its recorded snapshot. A removal must not be refused for a grant it no
 /// longer issues. The server version is checked again on apply because a

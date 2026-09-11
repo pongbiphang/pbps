@@ -3538,11 +3538,12 @@ pub fn cmd_plan_db(
         let checks = async {
             crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
                 .await?;
-            crate::engine::check_module_rebuilds(&mut conn, &cs, false).await
+            crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
+            crate::engine::check_drop_blockers(&mut conn, &cs).await
         }
         .await;
         let rollback = conn.rollback(dialect.transaction_framing()).await;
-        checks?;
+        let drop_blockers = checks?;
         rollback?;
 
         // The keys were matched to the rows under the type the key column has
@@ -3683,7 +3684,7 @@ pub fn cmd_plan_db(
             cs,
             baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
-            vec![permission_support],
+            vec![permission_support, drop_blockers],
             findings,
             cost,
         ))
@@ -4246,6 +4247,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         conn.begin(dialect.transaction_framing()).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
+        crate::engine::check_drop_blockers(conn, &plan.changes).await?;
         execute_statements(conn, statements).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
@@ -4562,6 +4564,11 @@ async fn apply_staged_under_lock(
     pin_session(conn, dialect).await?;
 
     let total = statements.len();
+    // Staged plans carry one logical change. A completed DROP has no catalog
+    // target left; a closing-only resume must not ask for that old target.
+    if start < total {
+        drop_preflight(conn, dialect, &plan.changes).await?;
+    }
     // The names the catalog has right now. It starts at whatever the newest
     // entry recorded — the last ordinary state on a fresh run, the checkpoint
     // on a resume — and each statement moves it, using what the emitter said
@@ -4926,6 +4933,19 @@ async fn pin_session(conn: &mut Conn, dialect: &dyn pbps_dialect::Dialect) -> an
     Ok(())
 }
 
+async fn drop_preflight(
+    conn: &mut Conn,
+    dialect: &dyn pbps_dialect::Dialect,
+    changes: &pbps_model::ChangeSet,
+) -> anyhow::Result<()> {
+    conn.begin(dialect.transaction_framing()).await?;
+    let result = crate::engine::check_drop_blockers(conn, changes).await;
+    let rollback = conn.rollback(dialect.transaction_framing()).await;
+    result?;
+    rollback?;
+    Ok(())
+}
+
 async fn preflight(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
@@ -4944,6 +4964,7 @@ async fn preflight(
     // caller that gets the old bug back, and this function is the one whose
     // answers depend on it.
     pin_session(conn, dialect).await?;
+    drop_preflight(conn, dialect, &plan.changes).await?;
     // The edition, asked again. `plan --db` checked it, but nothing binds a
     // saved plan to an environment: the same file can be applied to a different
     // server, or to the same one after an edition change, and an `ONLINE = ON`

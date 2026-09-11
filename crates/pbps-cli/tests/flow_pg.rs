@@ -1764,3 +1764,225 @@ fn permission_versions_are_checked_before_planning_bootstrap_apply_and_resume() 
         "revoke",
     ]));
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn drop_blockers_are_named_in_planning_and_rechecked_before_apply_writes() {
+    for (target, slug) in [("app.t.label", "drop_column"), ("app.t", "drop_table")] {
+        let db = OwnDatabase::new(&server(), slug);
+        let connection = db.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(slug);
+        d.table(TWO_COLUMNS);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        if target == "app.t" {
+            std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+        } else {
+            d.table(ONE_COLUMN);
+        }
+        let command = if target == "app.t" {
+            "drop-table"
+        } else {
+            "drop"
+        };
+        succeeds(d.run(&[command, target, "--reason", "no longer retained"]));
+        d.commit();
+        on_server(
+            connection,
+            "CREATE VIEW app.external_v AS SELECT label FROM app.t",
+        );
+        let plan = d.dir.join("drop.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--format",
+            "json",
+            "--out",
+            plan.to_str().unwrap(),
+        ]);
+        assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        assert_eq!(report["result"], "unanswerable", "{report}");
+        let message = report["findings"][0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("drop_blockers (PostgreSQL)") && message.contains("external_v"),
+            "{report}"
+        );
+        assert!(!plan.exists(), "refused plans must not be saved");
+        on_server(connection, "DROP VIEW app.external_v");
+        let out = succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--format",
+            "json",
+            "--out",
+            plan.to_str().unwrap(),
+        ]));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        let checks = report["data"]["connected_checks"].as_array().unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|c| c["name"] == "drop_blockers" && c["status"] == "passed"),
+            "{report}"
+        );
+        let human = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        assert!(
+            human.contains("drop_blockers") && human.contains("catalog dependencies"),
+            "{human}"
+        );
+        let staged = d.dir.join("drop-staged.json");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--staged",
+            "--out",
+            staged.to_str().unwrap(),
+        ]));
+        on_server(
+            connection,
+            "CREATE VIEW app.external_v AS SELECT label FROM app.t",
+        );
+        for (artifact, is_staged) in [(&plan, false), (&staged, true)] {
+            let checksum = plan_checksum(artifact);
+            let mut args = vec![
+                "apply",
+                "--db",
+                connection,
+                "--plan",
+                artifact.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "destructive",
+            ];
+            if is_staged {
+                args.push("--staged");
+            }
+            let out = d.run(&args);
+            assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+            assert!(
+                stderr(&out).contains("drop_blockers (PostgreSQL)")
+                    && stderr(&out).contains("external_v"),
+                "{}",
+                stderr(&out)
+            );
+            let listing =
+                succeeds(d.run(&["state", "list", "--db", connection, "--format", "json"]));
+            let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
+            let entries = listing["data"]["entries"].as_array().unwrap();
+            assert_eq!(
+                entries.iter().filter(|e| e["kind"] != "failed").count(),
+                1,
+                "{listing}"
+            );
+            assert_eq!(
+                entries[0]["kind"], "failed",
+                "failed attempts retain their audit entry"
+            );
+            on_server(connection, "SELECT label FROM app.t");
+        }
+        on_server(connection, "DROP VIEW app.external_v");
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--allow",
+            "destructive",
+        ]));
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
+    use pbps_dialect::Dialect;
+    let db = OwnDatabase::new(&server(), "drop_resume");
+    let connection = db.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("drop-resume");
+    d.table(TWO_COLUMNS);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["drop", "app.t.label", "--reason", "no longer retained"]));
+    d.commit();
+    let artifact = d.dir.join("staged.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        artifact.to_str().unwrap(),
+    ]));
+    let plan: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
+    assert_eq!(plan.changes.changes.len(), 1);
+    let pg = pbps_pg::Postgres::new();
+    let p = &plan.changes.changes[0];
+    let statements = pg.emit(&p.change, p.strategy).unwrap();
+    assert_eq!(
+        statements.len(),
+        1,
+        "a pending DROP cannot follow a prior statement of this change"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let mut checkpoint = pbps_pg::state::latest(&mut conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        conn.execute(&statements[0].sql).await.unwrap();
+        checkpoint
+            .schema
+            .tables
+            .get_mut(&pbps_model::TableName::new("app", "t"))
+            .unwrap()
+            .columns
+            .shift_remove("label");
+        checkpoint.ids = plan.ids.clone();
+        checkpoint.kind = pbps_model::StateKind::Staged;
+        checkpoint.plan_checksum = Some(plan.checksum());
+        checkpoint.staged = Some(pbps_model::StagedProgress {
+            completed: 1,
+            total: 1,
+            last_statement: statements[0].sql.clone(),
+        });
+        pbps_pg::state::record(&mut conn, &checkpoint)
+            .await
+            .unwrap();
+    });
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        artifact.to_str().unwrap(),
+        "--checksum",
+        &plan.checksum(),
+        "--allow",
+        "destructive",
+        "--staged",
+        "--resume",
+    ]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
