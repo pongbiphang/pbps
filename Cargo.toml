@@ -80,7 +80,7 @@ rustls-native-certs = "0.8"
 # tree: `socket2` is already resolved through `tokio`'s own `net` feature and
 # `rand` through `tokio-postgres`'s `postgres-protocol`, both at the version
 # named here, so this adds a direct edge to an already-audited node rather
-# than a new one (DECISIONS 429).
+# than a new one (DECISIONS 434).
 socket2    = { version = "0.6", features = ["all"] }
 rand       = "0.10"
 

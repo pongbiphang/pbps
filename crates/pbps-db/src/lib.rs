@@ -209,12 +209,16 @@ pub(crate) async fn open_socket(
     }
     let addresses = order_addresses(addresses, shuffle, &mut rand::rng());
     let left = budget.checked_sub(started.elapsed()).unwrap_or_default();
-    // `after: budget` here, not `left`: `connect_any` only knows the share of
-    // the budget resolution left it, which is always a little less than
-    // `budget` — even a numeric address resolves in some nonzero time — and
-    // `Duration::as_secs()` truncates rather than rounds, so a report of the
-    // reduced number could read a whole second short of what was actually
-    // asked for. The caller asked for `budget`; that is what ran out.
+    // `after: budget` here, not `left` — DECISIONS 232's own budget-division
+    // rule turned against a first draft of this function: `connect_any` only
+    // knows the share of the budget resolution left it (`left`), which is
+    // always a little less than `budget` — even a numeric address resolves in
+    // some nonzero time — and `Duration::as_secs()` truncates rather than
+    // rounds, so reporting `left` could read a whole second short of what was
+    // actually asked for. Caught by the live suite on this branch's first
+    // run (`29.999979671s` reported where the string asked for `30s`), fixed
+    // by reporting what the caller asked for — `budget` — rather than what
+    // one sub-step of it was left holding.
     connect_any(addr, addresses, left)
         .await
         .map_err(|error| match error {

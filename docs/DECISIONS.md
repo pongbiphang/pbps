@@ -9248,6 +9248,24 @@ SPEC is in sync with all of these.
     connects and works today; refusing a valid input is the failure this
     project's review rules put first (issue #113).
 
+    `DbError::ConnectTimeout`'s message was `"...did not answer within {}s...",
+    CONNECT_TIMEOUT.as_secs()` — the constant, interpolated at every call site,
+    not a field. The moment a connection string can set its own budget that
+    becomes a false statement: an operator who asked for `connect_timeout=10`
+    and waited 10 seconds would be told the seam waited 30. So the variant
+    gained an `after: Duration` field carried per instance — required to keep
+    the message honest once `connect_timeout` is a real input, not a
+    convenience added for its test. That field is new to this branch, and so
+    was a bug in it: a first draft reported `connect_any`'s own reduced
+    sub-budget (`budget` minus whatever `open_socket`'s DNS resolution had
+    already spent) rather than the original request, which — because
+    `Duration::as_secs()` truncates rather than rounds — read a whole second
+    short of the true budget even for a numeric address resolving in
+    microseconds. The live suite caught it on this branch's first run
+    (`29.999979671s` reported where the string asked for `30s`); the fix
+    reports `budget`, the total the caller actually asked for, rather than the
+    remainder one sub-step of it was left holding.
+
     `socket2` and `rand` are new direct dependencies of `pbps-db`, and cost
     nothing `cargo deny` had not already priced: both are already resolved in
     the tree at the versions named here — `socket2` through `tokio`'s own
@@ -9282,11 +9300,17 @@ SPEC is in sync with all of these.
     reports it while someone is still watching" — an operational bound pbps
     enforces for itself, stated unconditionally, not "the default when the
     string doesn't say". A request at or below 30s is honoured exactly, fed
-    into `open_socket`/`connect_any`'s existing shared budget — the same
-    per-address division 232 already established, not `tokio-postgres`'s own
-    per-address-attempt application, which would let a dual-stack name's
-    `connect_timeout=10` run up to 20s and quietly contradict the number in
-    the string. A request above 30s is refused by name, naming the ceiling,
+    into `open_socket`/`connect_any` as the shared total budget — 232's own
+    rule, "the budget is divided as it is spent... so the total is still
+    `CONNECT_TIMEOUT` however many [addresses] there are", applied unchanged
+    to a value that now comes from the string instead of the constant. Not
+    `tokio-postgres`'s own per-address-attempt application (its own doc
+    comment: "this timeout will apply to each address of each host
+    separately"), which would let a dual-stack name's `connect_timeout=10`
+    run up to 20s and quietly contradict the number in the string — 232
+    already ruled that shape out for the constant, and nothing about the
+    value coming from a string instead changes the reason. A request above
+    30s is refused by name, naming the ceiling,
     rather than silently capped — silent capping is the same "neither applied
     nor refused" shape this decision exists to remove, just relocated instead
     of fixed. `connect_timeout=0` and a negative value are `tokio_postgres`'s
