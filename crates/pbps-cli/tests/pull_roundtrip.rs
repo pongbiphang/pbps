@@ -138,6 +138,7 @@ fn raw_table(object_id: i32, schema: &str, name: &str) -> RawTable {
         object_id,
         schema: schema.into(),
         name: name.into(),
+        temporal_type: 0,
     }
 }
 

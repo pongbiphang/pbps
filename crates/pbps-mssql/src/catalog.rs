@@ -31,7 +31,7 @@ use crate::introspect::{
 /// The PostgreSQL pull lists the same two names unqualified, because the schema
 /// its ledger will live in is not decided until Phase 5 step 8 (#185).
 const TABLES: &str = "\
-SELECT t.object_id, s.name AS schema_name, t.name AS table_name
+SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
@@ -196,6 +196,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             object_id: get(&row, "object_id")?,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "table_name")?.to_owned(),
+            temporal_type: get(&row, "temporal_type")?,
         });
     }
 

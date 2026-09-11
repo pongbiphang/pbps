@@ -38,6 +38,8 @@ pub struct RawTable {
     pub object_id: i32,
     pub schema: String,
     pub name: String,
+    /// `sys.tables.temporal_type`: zero is ordinary, one history, two versioned.
+    pub temporal_type: u8,
 }
 
 /// One row of `sys.columns`, joined with its type, identity and default.
@@ -600,6 +602,21 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
 
     for t in &raw.tables {
+        // Both halves must stay unmanaged: declaring either as an ordinary
+        // table loses the system-versioning relationship on bootstrap.
+        if t.temporal_type != 0 {
+            let name = TableName::new(t.schema.clone(), t.name.clone());
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                Some(&name),
+                format!(
+                    "{name}: system versioning (temporal_type = {}) is not supported yet; the table was left out of the declarations",
+                    t.temporal_type
+                ),
+            );
+            continue;
+        }
         names.insert(
             t.object_id,
             TableName::new(t.schema.clone(), t.name.clone()),
@@ -1117,6 +1134,38 @@ mod tests {
             object_id: id,
             schema: schema.into(),
             name: name.into(),
+            temporal_type: 0,
+        }
+    }
+
+    #[test]
+    fn system_versioning_and_history_are_reported_instead_of_managed() {
+        let mut raw = RawCatalog::default();
+        for (id, name, temporal_type) in [(1, "current", 2), (2, "history", 1), (3, "plain", 0)] {
+            let mut table = raw_table(id, "dbo", name);
+            table.temporal_type = temporal_type;
+            raw.tables.push(table);
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")]
+                .columns
+                .contains_key("id")
+        );
+        assert_eq!(pulled.limitations.len(), 2);
+        for name in ["current", "history"] {
+            assert!(pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name)
+                    && l.detail.contains("system versioning")
+            }));
+            assert!(
+                pulled
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(name) && w.contains("system versioning"))
+            );
         }
     }
 
@@ -1790,6 +1839,7 @@ mod module_tests {
                 object_id: 1,
                 schema: "dbo".into(),
                 name: "t".into(),
+                temporal_type: 0,
             }],
             columns: vec![RawColumn {
                 object_id: 1,

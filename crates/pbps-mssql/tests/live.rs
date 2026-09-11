@@ -957,6 +957,47 @@ async fn pull_warns_about_what_it_cannot_express() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
+    let mut db = TestDb::create("temporal").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.plain (id int NOT NULL);
+         CREATE TABLE dbo.versioned (
+             id int NOT NULL PRIMARY KEY,
+             valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+        )
+        .await
+        .expect("create temporal table and history");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect temporal catalog");
+    db.drop().await;
+
+    assert_eq!(pulled.schema.tables.len(), 1);
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("dbo", "plain"))
+    );
+    assert_eq!(pulled.limitations.len(), 2);
+    for name in ["versioned", "versioned_history"] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name)
+                    && l.detail.contains("system versioning")
+            }),
+            "{:?}",
+            pulled.limitations
+        );
+    }
+}
+
 /// A columnstore or XML index has the same catalog shape as a rowstore one and
 /// is not `type = 1`, so the clustered flag alone called it an ordinary index
 /// and `pull` wrote it into the declarations as one — bootstrapping a B-tree
