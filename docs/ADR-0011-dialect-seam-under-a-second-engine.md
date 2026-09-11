@@ -258,8 +258,26 @@ Each amendment ships with the test that fails without it, and each of those
 tests is reverted and watched to fail before the fix is kept — the rule in
 CLAUDE.md that has already caught tests passing for the wrong reason here. Two
 of the three are testable offline; the `serial` contract needs the PostgreSQL
-live suite, which does not exist yet and is Phase 5's first deliverable rather
-than its last.
+live suite. That suite now exists; the Limits section names the engine tests
+that pin the delivered amendments.
+
+## Limits
+
+- **The scanner and type-contract amendments now have engine evidence.**
+  [`the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition`](../crates/pbps-pg/tests/live.rs)
+  checks dollar quotes, escape strings, nested comments and array subscripts
+  against PostgreSQL 18.6. It is a finite lexical fixture, not an exhaustive SQL
+  grammar proof. [`a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns`](../crates/pbps-pg/tests/live.rs)
+  pins the serial macro's read-back and refusal.
+- **Multiple emitted statements have a measured use beyond the original
+  type/nullability rationale.**
+  [`a_rename_across_schemas_is_two_statements_that_each_say_where_the_table_went`](../crates/pbps-pg/tests/live.rs)
+  checks a schema transfer followed by a rename and both emitted moves;
+  [`a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name`](../crates/pbps-cli/tests/flow_pg.rs)
+  checks checkpoint persistence and resume through the binary.
+- **These results test the PostgreSQL seam, not a third dialect or a major
+  version upgrade.** The deparser-version question in ADR-0009 remains open;
+  two working dialects do not establish another engine's lexical rules.
 
 ## Placement
 

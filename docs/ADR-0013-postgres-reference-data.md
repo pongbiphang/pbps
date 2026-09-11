@@ -1572,36 +1572,37 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 ## Limits
 
-- **Composite keys are still deferred**, as in ADR-0004.
-- **`READ ONLY` bounds the database, not the world.** It refuses writes to this
-  database's tables and sequences, which is what §3 needs; a function that a
-  planning read happens to invoke and that calls out through `dblink`, raises a
-  `NOTIFY`, or writes a file is not stopped by it and is not stopped by anything
-  else pbps can do. The guard is exact for the failure that was found and
-  honest about the one it does not cover.
-- **§4's expression-comparison finding was, when this was written, not measured
-  against SQL Server.** The differ is shared, and all three expressions are read
-  raw with no normalizer anywhere in the workspace, so the same loops could
-  exist on the shipped dialect. **Since measured, while landing §4's fields
-  (DECISIONS 208): they did.** SQL Server reads `GETDATE()` back as
-  `(getdate())` and `n > 0 AND label <> 'none'` as `([n]>(0) AND
-  [label]<>'none')`, and `plan --db` straight after a `bootstrap` restated the
-  default, dropped and re-added the check and dropped and rebuilt the filtered
-  index — marked destructive — on every run. The fix is the one §4 asks for,
-  with one refinement: where no declared text was recorded the differ falls back
-  to the read-back, so an adopted environment behaves as it did and a version 6
-  state stays readable. The live suite pins it
-  (`a_declared_expression_the_engine_respells_is_not_restated`).
-- **A typed literal inside a check expression or an index filter is folded
-  under the operator's settings** — measured, `CHECK (d > '01/02/2026')`
-  created under DMY is stored as `'2026-02-01'::date` — and §3's resolution
-  does not reach it, because it is an expression and resolving one means
-  parsing it. Two operators with different `DateStyle` get two constraints from
-  one declaration, and §4's declared-text comparison cannot see it. This is the
-  opaque-DDL rule's stated gap arriving in a shape the model does hold.
-- **Nondeterministic collations are now measured** (§5), and the flag turned out
-  not to mean what this document first assumed.
-- **Everything here is proposed**, and falsifiable by the PostgreSQL live suite.
+- **Composite keys remain deferred**, as in ADR-0004.
+- **`READ ONLY` bounds database writes, not external effects.**
+  [`the_read_back_savepoint_is_read_only_and_gives_the_transaction_back_writable`](../crates/pbps-pg/tests/live.rs)
+  measures a write refused with SQLSTATE `25006` inside the read-back savepoint
+  and accepted after it is unwound. It does not measure or sandbox a function's
+  external connections or filesystem effects; those remain outside this
+  guarantee.
+- **The SQL Server expression-comparison question was answered** while landing
+  §4's fields (DECISIONS 208).
+  [`a_declared_expression_the_engine_respells_is_not_restated`](../crates/pbps-cli/tests/flow.rs)
+  checks that unchanged defaults, checks and a filtered index are not restated
+  after bootstrap, a real check edit is planned alone, and apply returns to no
+  changes and no drift. This replaces the original unmeasured cross-dialect
+  concern for that fixture.
+- **The ambiguous temporal-literal example now has a measured framing fix.**
+  [`the_framing_pins_what_an_ambiguous_temporal_literal_means`](../crates/pbps-pg/tests/live.rs)
+  creates the same CHECK declarations under hostile operator settings and
+  under the dialect's framing, then compares their stored values. The framing
+  fixes the measured date, timestamp, interval, abbreviation and NULL-rewrite
+  cases. This is a session-setting fix, not expression parsing; the fixture
+  does not separately establish every typed-literal form in an index filter,
+  and externally created objects are not made canonical by it.
+- **Nondeterministic collation key collisions are now measured** (§5).
+  [`two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offline`](../crates/pbps-pg/tests/live.rs)
+  distinguishes the ICU case-insensitive key from a plain key, reports the
+  connected collision and observes the second insert fail. Offline validation
+  still cannot infer a live column's collation.
+- **Reference-data behavior is now exercised through the CLI.**
+  [`reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan`](../crates/pbps-cli/tests/flow_pg.rs)
+  covers apply/pull, default cells and arriving rows. Its scope does not close
+  the composite-key or external-effect limits above.
 
 ## Placement
 

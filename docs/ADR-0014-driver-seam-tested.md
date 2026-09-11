@@ -240,16 +240,30 @@ never answered:   Some("ConnectTimeout")
 
 ## Limits
 
-- **The spike uses `NoTls`.** A real PostgreSQL dialect needs a TLS stack, which
-  is where open question 10's supply-chain story rejoins — and `tokio-postgres`
-  leaves that choice to the caller rather than pinning it, which is the property
-  `tiberius 0.12` lacks.
-- **It does not implement the ledger, the lock, prune policy, pooling,
-  cancellation or long-running statements.** It tests the seam's shape, not
-  `pbps-postgres`.
-- **It proves the shape absorbs a second driver. It does not prove a second
-  dialect is cheap** — ADR-0007 measured that at ~7,000 lines and this changes
-  none of it.
+- **The spike's `NoTls` result is still not a TLS measurement.** The live
+  connection fixture [`a_live_server_answers_through_the_shared_connection_type`](../crates/pbps-pg/tests/live.rs)
+  establishes connectivity through `Conn`, not certificate validation or an
+  authenticated TLS handshake. Those claims need their own live fixture;
+  this ADR does not infer them from a successful connection.
+- **The production ledger, lock and prune paths are now measured beyond the
+  spike.** [`the_ledger_returns_exactly_what_was_recorded`](../crates/pbps-pg/tests/live.rs)
+  checks snapshot round-trip, append-only history and pruning the older row;
+  [`the_lock_admits_one_holder_and_names_it_to_the_second`](../crates/pbps-pg/tests/live.rs)
+  checks exclusion and release. The binary's
+  [`a_second_statement_failure_rolls_back_the_first_and_records_only_a_failed_attempt`](../crates/pbps-cli/tests/flow_pg.rs)
+  checks both DDL statements ran, neither survives rollback and only the failed
+  attempt is recorded. The old spike's omissions no longer describe these
+  production paths.
+- **Connection timeout is not statement cancellation.**
+  [`a_dropped_connection_times_out_rather_than_reading_as_a_typo`](../crates/pbps-pg/tests/live.rs)
+  is a Linux live fixture for a socket that accepts and never answers. It does
+  not establish pooling, cancellation or long-running statement behavior;
+  those remain outside the measurements claimed here.
+- **Two drivers now serve the CLI, but “a second dialect is cheap” remains
+  unproved.** [`modules_apply_then_pull_round_trip_and_changed_bodies_are_drift`](../crates/pbps-cli/tests/flow_pg.rs)
+  and the SQL Server [`a_declared_expression_the_engine_respells_is_not_restated`](../crates/pbps-cli/tests/flow.rs)
+  exercise both engine paths from the same binary target. They prove behavior,
+  not implementation effort or the cost of adding a third engine.
 
 ## Placement
 

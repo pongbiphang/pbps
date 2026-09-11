@@ -1265,25 +1265,33 @@ earlier claim is the point: "we checked" is not the same claim as "it held".
 ## Limits
 
 - **Materialized views, aggregates, operators, domains, casts and extensions
-  are out of scope**, as their SQL Server analogues are. They matter for `pull`,
-  which must inventory them as unmanaged rather than ignore them.
-- **`serial` is not a type** — measured: a `serial` column reads back as
-  `integer` plus an owned sequence. It cannot round-trip and the loader must
-  refuse it, pointing at `GENERATED … AS IDENTITY`. Recorded here because it is
-  discovered through the same read-back path; it belongs to the type catalogue,
-  not to modules.
-- **The deparser-version hazard (§2.3) is unmeasured** and needs two engine
-  versions in the live suite.
-- **The model cannot hold a view's options** (§3) — `security_invoker`,
-  `security_barrier`, `check_option`. They are preserved verbatim across the
-  statements pbps writes and reported as unexpressible, which keeps them from
-  being destroyed but not from being changed behind the tool's back. This and
-  `PUBLIC` ([ADR-0010](ADR-0010-postgres-privileges.md) §5) are the two places
-  where PostgreSQL holds security-relevant state the declarations cannot say.
-- **Everything here is proposed.** No PostgreSQL dialect exists; this document
-  is a set of decisions taken in advance so that the emitter has something to be
-  written against, and each is falsifiable by the live suite that must come with
-  it.
+  remain outside the declaration model.** Reporting is now measured for
+  materialized views and aggregates by
+  [`a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_still_runs`](../crates/pbps-pg/tests/live.rs):
+  they are named in the unmanaged inventory while an ordinary view still pulls.
+  That fixture does not establish coverage of every excluded object kind.
+- **`serial` remains a macro, not a round-trippable type.**
+  [`a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns`](../crates/pbps-pg/tests/live.rs)
+  measures all three serial spellings returning integer types, the ordinary
+  serial's owned sequence, and the dialect refusing those spellings. The type
+  catalogue's identity alternative remains the supported declaration.
+- **The deparser-version hazard (§2.3) remains unmeasured.** The two-version
+  privilege fixtures do not compare one module's deparsed definition across
+  an upgrade; no upgrade-safety conclusion follows from them.
+- **View options remain unmodelled** (§3): `security_invoker`,
+  `security_barrier`, and `check_option` cannot be declared. The rebuild guard
+  now has a measured `security_invoker` refusal in
+  [`a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it`](../crates/pbps-pg/tests/live.rs),
+  alongside an ordinary view that may be rebuilt. This is refusal to lose
+  carried state, not support for expressing the options or proof that drift
+  tracks every option change (see #227).
+- **The module implementation now has live coverage.**
+  [`a_module_of_every_kind_survives_the_round_trip_as_the_same_object`](../crates/pbps-pg/tests/live.rs)
+  exercises the supported module kinds, and
+  [`modules_apply_then_pull_round_trip_and_changed_bodies_are_drift`](../crates/pbps-cli/tests/flow_pg.rs)
+  checks the CLI apply/pull path and manual-body drift. Those measured paths
+  replace the original “no PostgreSQL dialect exists” limit; they do not remove
+  the excluded kinds or the upgrade question above.
 
 ## Placement
 
