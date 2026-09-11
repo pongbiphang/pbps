@@ -7297,6 +7297,102 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
+    let mut db = TestDb::create("doctorrecordedtable").await;
+    db.conn.execute("EXEC('CREATE SCHEMA legacy'); CREATE TABLE legacy.t (id int NOT NULL); CREATE USER deployer WITHOUT LOGIN; GRANT VIEW DEFINITION TO deployer;").await.unwrap();
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .unwrap();
+    db.conn
+        .execute("GRANT SELECT ON SCHEMA::dbo TO deployer;")
+        .await
+        .unwrap();
+    let mut recorded = Schema::default();
+    recorded
+        .tables
+        .insert(TableName::new("legacy", "t"), Table::default());
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            recorded,
+            IdsFile::default(),
+            "live-test",
+        ),
+    )
+    .await
+    .unwrap();
+
+    db.conn
+        .execute("EXECUTE AS USER = 'deployer';")
+        .await
+        .unwrap();
+    let held = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &[],
+        &[],
+        &Default::default(),
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    db.conn.execute("REVERT;").await.unwrap();
+    assert!(
+        pbps_mssql::doctor::missing(&held)
+            .iter()
+            .any(|gap| gap.permission == "ALTER" && gap.securable() == "SCHEMA::[legacy]"),
+        "{held:?}"
+    );
+    assert!(held.absent_schemas.is_empty());
+
+    // Once the last table's drop is recorded, its surviving schema is no
+    // longer managed and must not keep demanding ALTER forever.
+    db.conn.execute("DROP TABLE legacy.t;").await.unwrap();
+    let mut ids = IdsFile::default();
+    ids.tombstones.insert(
+        "t_aaaaaa".parse().unwrap(),
+        pbps_model::Tombstone {
+            was: "legacy.t".to_owned(),
+            dropped_at: "2026-01-01".to_owned(),
+            reason: "retired".to_owned(),
+            operator: "live-test".to_owned(),
+        },
+    );
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            Schema::default(),
+            ids,
+            "live-test",
+        ),
+    )
+    .await
+    .unwrap();
+    db.conn
+        .execute("EXECUTE AS USER = 'deployer';")
+        .await
+        .unwrap();
+    let held = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &[],
+        &[],
+        &Default::default(),
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    db.conn.execute("REVERT;").await.unwrap();
+    assert!(!held.schemas.contains_key("legacy"), "{held:?}");
+    assert!(
+        !held.schemas.contains_key("dbo"),
+        "ledger schema alone is not managed"
+    );
+    db.drop().await;
+}
+
 /// `doctor` and roles (ADR-0005): a least-privilege login that can deploy
 /// tables is not ready to deploy a role — and the gaps are reported where the
 /// grants have to go, at the database for the role itself and on the securable
