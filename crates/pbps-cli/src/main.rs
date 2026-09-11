@@ -1,6 +1,7 @@
 //! `pbps` — declarative database schema version control.
 
 mod baseline;
+mod cost;
 mod db;
 mod declaration_file;
 mod deploy;
@@ -2238,6 +2239,8 @@ pub struct PlanData {
     risks: Vec<&'static str>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     connected_checks: Vec<engine::ConnectedCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<cost::CostReport>,
 }
 
 /// What an offline `plan` was asked to do.
@@ -2707,6 +2710,7 @@ fn cmd_plan(
                 roles: report::touched_roles(&cs),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
                 connected_checks: Vec::new(),
+                cost: None,
             }),
         );
         // A non-converging rehearsal is an error finding, so `outcome` exits 2

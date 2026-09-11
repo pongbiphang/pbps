@@ -186,6 +186,173 @@ fn succeeds(o: Output) -> Output {
     o
 }
 
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
+    let own = OwnDatabase::new(&server(), "cost");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("cost");
+    let before = "table: app.t\ncolumns:\n  i: {type: integer}\n  w: {type: varchar(10)}\n  j: {type: integer}\n  n: {type: integer}\nindexes:\n  ix_j: {columns: [j]}\nchecks:\n  ck_n: n > 0\n";
+    d.table(before);
+    let other = d.dir.join("schema/u.yml");
+    std::fs::write(&other, "table: app.u\ncolumns:\n  v: {type: integer}\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        "INSERT INTO app.t SELECT v, 'ok', v, v FROM generate_series(1,3) AS v; ANALYZE app.t",
+    );
+    d.table(
+        &before
+            .replace("i: {type: integer}", "i: {type: bigint}")
+            .replace("varchar(10)", "varchar(20)")
+            .replace("j: {type: integer}", "j: {type: bigint}")
+            .replace("n: {type: integer}", "n: {type: integer, nullable: false}"),
+    );
+    std::fs::write(&other, "table: app.u\ncolumns:\n  v: {type: bigint}\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/new.yml"),
+        "table: app.new_table\ncolumns:\n  id: {type: integer}\n",
+    )
+    .unwrap();
+    let offline = succeeds(d.run(&["plan", "--format", "json"]));
+    let offline: serde_json::Value = serde_json::from_str(&stdout(&offline)).unwrap();
+    assert!(offline["data"].get("cost").is_none());
+    d.commit();
+    let artifact = d.dir.join("deployment.json");
+    let out = succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--format",
+        "json",
+        "--out",
+        artifact.to_str().unwrap(),
+    ]));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/envelope.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&report)
+        .unwrap();
+    let cost = &report["data"]["cost"];
+    assert_eq!(cost["engine"], "postgres");
+    assert_eq!(cost["status"], "available");
+    let changes = cost["changes"].as_array().unwrap();
+    let saved_text = std::fs::read_to_string(&artifact).unwrap();
+    let saved: pbps_model::SavedPlan = serde_json::from_str(&saved_text).unwrap();
+    let saved_json: serde_json::Value = serde_json::from_str(&saved_text).unwrap();
+    assert!(saved_json.get("cost").is_none());
+    assert_eq!(changes.len(), saved.changes.changes.len());
+    let mut checked = 0;
+    for (index, p) in saved.changes.changes.iter().enumerate() {
+        let c = &changes[index];
+        assert_eq!(c["change_index"], index);
+        match &p.change {
+            pbps_model::Change::CreateTable { .. } => {
+                assert_eq!(c["status"], "unavailable");
+                assert!(c["reason"].as_str().unwrap().contains("no measurement"));
+                checked += 1;
+            }
+            pbps_model::Change::AlterColumnType { column, .. } => {
+                assert_eq!(c["lock"], "AccessExclusiveLock");
+                assert_eq!(c["blocks"], "reads and writes");
+                match column.name.as_str() {
+                    "i" => {
+                        assert_eq!(c["rewrite"]["value"], "yes");
+                        assert_eq!(c["reads"]["value"], "every_row");
+                    }
+                    "w" => {
+                        assert_eq!(c["rewrite"]["value"], "no");
+                        assert_eq!(c["reads"]["value"], "nothing");
+                    }
+                    "j" => {
+                        assert_eq!(c["rewrite"]["value"], "unknown");
+                        assert!(c["rewrite"]["reason"].as_str().unwrap().contains("index"));
+                    }
+                    "v" => assert_eq!(c["rows"]["status"], "never_analyzed"),
+                    name => panic!("unexpected column {name}"),
+                }
+                if column.name != "v" {
+                    assert_eq!(c["rows"]["status"], "estimated");
+                    assert_eq!(c["rows"]["count"], 3);
+                }
+                checked += 1;
+            }
+            pbps_model::Change::AlterColumnNullability { .. } => {
+                assert_eq!(c["rewrite"]["value"], "no");
+                assert_eq!(c["reads"]["value"], "unknown");
+                assert!(c["reads"]["reason"].as_str().unwrap().contains("ck_n"));
+                checked += 1;
+            }
+            change @ pbps_model::Change::DropTable { .. }
+            | change @ pbps_model::Change::RenameTable { .. }
+            | change @ pbps_model::Change::AddColumn { .. }
+            | change @ pbps_model::Change::DropColumn { .. }
+            | change @ pbps_model::Change::RenameColumn { .. }
+            | change @ pbps_model::Change::AlterColumnDefault { .. }
+            | change @ pbps_model::Change::SetColumnDeprecated { .. }
+            | change @ pbps_model::Change::SetPrimaryKey { .. }
+            | change @ pbps_model::Change::AddUnique { .. }
+            | change @ pbps_model::Change::DropUnique { .. }
+            | change @ pbps_model::Change::AddForeignKey { .. }
+            | change @ pbps_model::Change::DropForeignKey { .. }
+            | change @ pbps_model::Change::AddCheck { .. }
+            | change @ pbps_model::Change::DropCheck { .. }
+            | change @ pbps_model::Change::AddIndex { .. }
+            | change @ pbps_model::Change::DropIndex { .. }
+            | change @ pbps_model::Change::InsertRow { .. }
+            | change @ pbps_model::Change::UpdateRow { .. }
+            | change @ pbps_model::Change::DeleteRow { .. }
+            | change @ pbps_model::Change::SetDataMode { .. }
+            | change @ pbps_model::Change::CreateModule { .. }
+            | change @ pbps_model::Change::AlterModule { .. }
+            | change @ pbps_model::Change::DropModule { .. }
+            | change @ pbps_model::Change::CreateRole { .. }
+            | change @ pbps_model::Change::DropRole { .. }
+            | change @ pbps_model::Change::RenameRole { .. }
+            | change @ pbps_model::Change::Grant { .. }
+            | change @ pbps_model::Change::Revoke { .. } => panic!("unexpected change {change:?}"),
+        }
+    }
+    assert_eq!(checked, 6);
+    let human = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+    for text in [
+        "Operational cost estimate",
+        "Rewrite: yes",
+        "Rewrite: no",
+        "unknown",
+        "approximately 3",
+        "never analyzed",
+        "ck_n",
+        "AccessExclusiveLock",
+        "no measurement",
+    ] {
+        assert!(human.contains(text), "missing {text}: {human}");
+    }
+    let risks: Vec<_> = saved.changes.risks().iter().map(|r| r.as_str()).collect();
+    assert_eq!(report["data"]["risks"], serde_json::json!(risks));
+    // Tightening nullability still requires its ordinary approval; cost never
+    // grants it. The widening-only changes keep their existing risk classes.
+    let applied = apply_plan(&d, connection, &artifact, false);
+    assert_ne!(
+        code(&applied),
+        0,
+        "{}{}",
+        stdout(&applied),
+        stderr(&applied)
+    );
+    assert!(stderr(&applied).contains("--allow"), "{}", stderr(&applied));
+}
+
 fn apply_plan(d: &Demo, connection: &str, plan: &std::path::Path, staged: bool) -> Output {
     let checksum = plan_checksum(plan);
     let mut args = vec![

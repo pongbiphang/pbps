@@ -305,6 +305,23 @@ fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
 /// module, a role, a grant and a row change are not about a table's stored
 /// rows, and `estimate` says which.
 pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
+    estimates_with(changes, |_| strategy)
+        .into_iter()
+        .map(|(_, estimate)| estimate)
+        .collect()
+}
+
+/// Estimate the strategy each planned statement will actually use. Indices
+/// refer to the original change set: unmeasured changes must not shift the
+/// column supplied to the connected half (DECISIONS 430).
+pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
+    estimates_with(changes, |p| p.strategy)
+}
+
+fn estimates_with(
+    changes: &ChangeSet,
+    strategy: impl Fn(&pbps_model::PlannedChange) -> Strategy,
+) -> Vec<(usize, Estimate)> {
     // Built over the whole plan before anything is estimated, because the
     // order that puts a table rename ahead of what follows it is `order_key`'s
     // guarantee and not this function's to lean on.
@@ -321,13 +338,14 @@ pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
     changes
         .changes
         .iter()
-        .filter_map(|p| {
-            let mut e = estimate(&p.change, strategy)?;
+        .enumerate()
+        .filter_map(|(index, p)| {
+            let mut e = estimate(&p.change, strategy(p))?;
             if let Some(catalog) = stored.get(&e.table) {
                 e.stored = (*catalog).clone();
             }
             e.created = created.contains(&e.table);
-            Some(e)
+            Some((index, e))
         })
         .collect()
 }
@@ -699,6 +717,51 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().expect("a table name")
+    }
+
+    #[test]
+    fn planned_estimates_keep_change_indices_and_each_statements_strategy() {
+        use pbps_model::PlannedChange;
+        let index = |online| {
+            let mut p = PlannedChange::new(Change::AddIndex {
+                table: tname("app.t"),
+                name: "ix".into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "v".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                }),
+            });
+            p.strategy = Strategy { online };
+            p
+        };
+        let cs = ChangeSet {
+            changes: vec![
+                index(false),
+                PlannedChange::new(Change::DropIndex {
+                    table: tname("app.t"),
+                    name: "old".into(),
+                }),
+                index(true),
+            ],
+        };
+        let got = planned_estimates(&cs);
+        assert_eq!(
+            got.iter().map(|(i, e)| (*i, e.lock)).collect::<Vec<_>>(),
+            [(0, Lock::Share), (2, Lock::ShareUpdateExclusive)]
+        );
+        assert_eq!(
+            estimates(&cs, Strategy::default())
+                .iter()
+                .map(|e| e.lock)
+                .collect::<Vec<_>>(),
+            [Lock::Share, Lock::Share],
+            "the legacy global-strategy API keeps its contract"
+        );
     }
 
     /// DECISIONS 409: a table this plan renames is described by its new name
