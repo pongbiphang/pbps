@@ -70,7 +70,9 @@ SELECT c.object_id, c.name, ty.name AS type_name,
        CONVERT(bit, CASE WHEN ty.is_user_defined = 1 THEN 1 ELSE 0 END) AS is_udt,
        CONVERT(bigint, ic.seed_value) AS seed,
        CONVERT(bigint, ic.increment_value) AS increment,
-       dc.definition AS default_definition
+       dc.definition AS default_definition,
+       dc.object_id AS default_constraint_object_id,
+       dc.name AS default_constraint_name
   FROM sys.columns c
   JOIN sys.types ty ON ty.user_type_id = c.user_type_id
   LEFT JOIN sys.identity_columns ic
@@ -271,6 +273,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             is_user_defined_type: get(&row, "is_udt")?,
             identity: seed.zip(increment),
             default: opt::<&str>(&row, "default_definition")?.map(str::to_owned),
+            default_constraint: opt::<i32>(&row, "default_constraint_object_id")?
+                .zip(opt::<&str>(&row, "default_constraint_name")?.map(str::to_owned)),
         });
     }
 

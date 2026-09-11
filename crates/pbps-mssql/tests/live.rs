@@ -1017,11 +1017,13 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
     }
     db.conn
         .execute(
-            "ALTER TABLE dbo.plain ADD CONSTRAINT ck_plain_temporal_fn
+            "ALTER TABLE dbo.plain ADD CONSTRAINT df_plain_temporal_fn
+             DEFAULT dbo.fn_versioned() FOR versioned_id;
+             ALTER TABLE dbo.plain ADD CONSTRAINT ck_plain_temporal_fn
              CHECK (dbo.fn_versioned() >= 0);",
         )
         .await
-        .expect("create check constraint calling omitted function");
+        .expect("create constraints calling omitted function");
     for table in ["versioned", "disabled", "plain"] {
         db.conn
             .execute(&format!(
@@ -1048,7 +1050,7 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .tables
             .contains_key(&TableName::new("dbo", "disabled_history"))
     );
-    assert_eq!(pulled.limitations.len(), 6);
+    assert_eq!(pulled.limitations.len(), 7);
     assert_eq!(pulled.schema.modules.len(), 1);
     assert!(
         pulled
@@ -1105,6 +1107,13 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
                 .detail
                 .contains("omitted temporal object or module")
     }));
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "plain")
+            && limitation.detail.contains("df_plain_temporal_fn")
+            && limitation
+                .detail
+                .contains("omitted temporal object or module")
+    }));
     assert!(
         pulled.schema.tables[&TableName::new("dbo", "plain")]
             .foreign_keys
@@ -1114,6 +1123,11 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         pulled.schema.tables[&TableName::new("dbo", "plain")]
             .checks
             .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")].columns["versioned_id"]
+            .default
+            .is_none()
     );
 }
 

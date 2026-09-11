@@ -26,6 +26,7 @@ fn full_catalog() -> RawCatalog {
         is_user_defined_type: false,
         identity: None,
         default: None,
+        default_constraint: None,
     };
 
     let mut id = col(1, "id", "bigint");

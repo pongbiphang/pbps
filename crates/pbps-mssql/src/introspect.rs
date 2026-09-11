@@ -63,6 +63,8 @@ pub struct RawColumn {
     pub identity: Option<(i64, i64)>,
     /// The default definition as stored, wrapped in parentheses.
     pub default: Option<String>,
+    /// The backing `sys.default_constraints` row, when a default exists.
+    pub default_constraint: Option<(i32, String)>,
 }
 
 /// One column of a PRIMARY KEY or UNIQUE constraint, in key order.
@@ -722,10 +724,35 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         column.identity = c
             .identity
             .map(|(seed, increment)| Identity { seed, increment });
-        column.default = c
-            .default
-            .as_deref()
-            .map(|d| strip_stored_parens(d).to_owned());
+        let unavailable_default =
+            c.default_constraint
+                .as_ref()
+                .is_some_and(|(constraint_object_id, _)| {
+                    raw.object_dependencies.iter().any(|dependency| {
+                        dependency.referencing_object_id == *constraint_object_id
+                            && unavailable_object_ids.contains(&dependency.referenced_object_id)
+                    })
+                });
+        if unavailable_default {
+            let (_, constraint_name) = c
+                .default_constraint
+                .as_ref()
+                .expect("an unavailable default has a constraint");
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal object or module; the default was left out too",
+                    c.name
+                ),
+            );
+        } else {
+            column.default = c
+                .default
+                .as_deref()
+                .map(|d| strip_stored_parens(d).to_owned());
+        }
         table.columns.insert(c.name.clone(), column);
     }
 
@@ -1301,6 +1328,7 @@ mod tests {
             is_user_defined_type: false,
             identity: None,
             default: None,
+            default_constraint: None,
         }
     }
 
@@ -2005,6 +2033,7 @@ mod module_tests {
                 is_user_defined_type: false,
                 identity: None,
                 default: None,
+                default_constraint: None,
             }],
             ..Default::default()
         }
@@ -2248,6 +2277,58 @@ mod module_tests {
         assert!(pulled.limitations.iter().any(|limitation| {
             limitation.target.object_name() == TableName::new("dbo", "plain")
                 && limitation.detail.contains("ck_plain_temporal_fn")
+                && limitation
+                    .detail
+                    .contains("omitted temporal object or module")
+        }));
+    }
+
+    #[test]
+    fn a_default_calling_an_unavailable_function_is_inventoried() {
+        let mut raw = raw_one_table();
+        let mut plain = raw.tables[0].clone();
+        plain.object_id = 2;
+        plain.name = "plain".into();
+        raw.tables.push(plain);
+        let mut column = raw.columns[0].clone();
+        column.object_id = 2;
+        column.default = Some("(dbo.fn_temporal())".into());
+        column.default_constraint = Some((20, "df_plain_temporal_fn".into()));
+        raw.columns.push(column);
+        raw.tables[0].temporal_type = 2;
+
+        let mut function = module(
+            "dbo",
+            "fn_temporal",
+            ModuleKind::Function,
+            Some(
+                "CREATE FUNCTION dbo.fn_temporal() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT MAX(id) FROM dbo.t); END",
+            ),
+        );
+        function.object_id = 10;
+        function.requires_bound_references = true;
+        raw.modules.push(function);
+        raw.object_dependencies = vec![
+            RawObjectDependency {
+                referencing_object_id: 10,
+                referenced_object_id: 1,
+            },
+            RawObjectDependency {
+                referencing_object_id: 20,
+                referenced_object_id: 10,
+            },
+        ];
+
+        let pulled = assemble(&raw);
+
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")].columns["id"]
+                .default
+                .is_none()
+        );
+        assert!(pulled.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == TableName::new("dbo", "plain")
+                && limitation.detail.contains("df_plain_temporal_fn")
                 && limitation
                     .detail
                     .contains("omitted temporal object or module")
