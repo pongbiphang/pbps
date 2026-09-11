@@ -38,6 +38,10 @@ pub struct RawTable {
     pub object_id: i32,
     pub schema: String,
     pub name: String,
+    /// `sys.tables.temporal_type`: zero is ordinary, one history, two versioned.
+    pub temporal_type: u8,
+    /// Whether `sys.periods` still defines `PERIOD FOR SYSTEM_TIME` on the table.
+    pub has_period: bool,
 }
 
 /// One row of `sys.columns`, joined with its type, identity and default.
@@ -59,6 +63,8 @@ pub struct RawColumn {
     pub identity: Option<(i64, i64)>,
     /// The default definition as stored, wrapped in parentheses.
     pub default: Option<String>,
+    /// The backing `sys.default_constraints` row, when a default exists.
+    pub default_constraint: Option<(i32, String)>,
 }
 
 /// One column of a PRIMARY KEY or UNIQUE constraint, in key order.
@@ -88,6 +94,7 @@ pub struct RawForeignKeyColumn {
 #[derive(Debug, Clone)]
 pub struct RawCheck {
     pub object_id: i32,
+    pub constraint_object_id: i32,
     pub name: String,
     pub definition: String,
 }
@@ -155,6 +162,9 @@ pub struct RawIndexColumn {
 /// `sys.sql_modules` report it (ADR-0002).
 #[derive(Debug, Clone)]
 pub struct RawModule {
+    pub object_id: i32,
+    /// A trigger's parent object ID; zero-valued catalog parents are absent.
+    pub parent_object_id: Option<i32>,
     pub schema: String,
     pub name: String,
     pub kind: ModuleKind,
@@ -165,6 +175,9 @@ pub struct RawModule {
     pub definition: Option<String>,
     /// A trigger's table, as `(schema, table)`.
     pub parent: Option<(String, String)>,
+    /// Views and inline table-valued functions bind referenced objects when
+    /// they are created; other T-SQL modules permit deferred name resolution.
+    pub requires_bound_references: bool,
     /// Whether the module was created with `QUOTED_IDENTIFIER` and `ANSI_NULLS`
     /// both ON, which is what a `CREATE OR ALTER` sent by pbps will run under.
     ///
@@ -175,6 +188,13 @@ pub struct RawModule {
     /// them (they are options, not definition), so such a module is inventoried
     /// rather than claimed to round-trip (ADR-0002).
     pub default_set_options: bool,
+}
+
+/// One resolved same-database dependency from `sys.sql_expression_dependencies`.
+#[derive(Debug, Clone)]
+pub struct RawObjectDependency {
+    pub referencing_object_id: i32,
+    pub referenced_object_id: i32,
 }
 
 /// One user-defined database role, as `sys.database_principals` reports it
@@ -263,6 +283,7 @@ pub struct RawCatalog {
     pub checks: Vec<RawCheck>,
     pub index_columns: Vec<RawIndexColumn>,
     pub modules: Vec<RawModule>,
+    pub object_dependencies: Vec<RawObjectDependency>,
     pub roles: Vec<RawRole>,
     pub permissions: Vec<RawPermission>,
 }
@@ -598,8 +619,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
+    let mut unsupported_temporal_tables = BTreeSet::new();
+    let mut unavailable_object_ids = BTreeSet::new();
 
     for t in &raw.tables {
+        // Both halves of active versioning, and a current table whose period
+        // remains after versioning is disabled, must stay unmanaged. Declaring
+        // any of them as ordinary loses temporal semantics on bootstrap.
+        if t.temporal_type != 0 || t.has_period {
+            let name = TableName::new(t.schema.clone(), t.name.clone());
+            unsupported_temporal_tables.insert(name.clone());
+            unavailable_object_ids.insert(t.object_id);
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                Some(&name),
+                format!(
+                    "{name}: system versioning or PERIOD FOR SYSTEM_TIME (temporal_type = {}, has_period = {}) is not supported yet; the table was left out of the declarations",
+                    t.temporal_type, t.has_period
+                ),
+            );
+            continue;
+        }
         names.insert(
             t.object_id,
             TableName::new(t.schema.clone(), t.name.clone()),
@@ -612,6 +653,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("object {id}"))
     };
+
+    // Grow the unavailable set before assembling either constraints or
+    // modules. Both can bind an object that was omitted from the declarations.
+    loop {
+        let mut changed = false;
+        for module in &raw.modules {
+            if module.requires_bound_references
+                && raw.object_dependencies.iter().any(|dependency| {
+                    dependency.referencing_object_id == module.object_id
+                        && unavailable_object_ids.contains(&dependency.referenced_object_id)
+                })
+            {
+                changed |= unavailable_object_ids.insert(module.object_id);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
     for c in &raw.columns {
         let Some(table) = tables.get_mut(&c.object_id) else {
@@ -664,10 +724,35 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         column.identity = c
             .identity
             .map(|(seed, increment)| Identity { seed, increment });
-        column.default = c
-            .default
-            .as_deref()
-            .map(|d| strip_stored_parens(d).to_owned());
+        let unavailable_default =
+            c.default_constraint
+                .as_ref()
+                .is_some_and(|(constraint_object_id, _)| {
+                    raw.object_dependencies.iter().any(|dependency| {
+                        dependency.referencing_object_id == *constraint_object_id
+                            && unavailable_object_ids.contains(&dependency.referenced_object_id)
+                    })
+                });
+        if unavailable_default {
+            let (_, constraint_name) = c
+                .default_constraint
+                .as_ref()
+                .expect("an unavailable default has a constraint");
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal object or module; the default was left out too",
+                    c.name
+                ),
+            );
+        } else {
+            column.default = c
+                .default
+                .as_deref()
+                .map(|d| strip_stored_parens(d).to_owned());
+        }
         table.columns.insert(c.name.clone(), column);
     }
 
@@ -693,10 +778,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
     }
 
+    let mut unsupported_temporal_foreign_keys = BTreeSet::new();
     for f in &raw.foreign_key_columns {
-        let Some(table) = tables.get_mut(&f.object_id) else {
+        if !tables.contains_key(&f.object_id) {
             continue;
-        };
+        }
+        let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
+        if unsupported_temporal_tables.contains(&referenced) {
+            if unsupported_temporal_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
+                let table_name = name_of(f.object_id, &names);
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&f.object_id),
+                    format!(
+                        "{table_name}: foreign key `{}` references temporal table {referenced}, which is outside the declarations; the foreign key was left out too",
+                        f.constraint_name
+                    ),
+                );
+            }
+            continue;
+        }
+        let table = tables.get_mut(&f.object_id).unwrap();
         let fk = table
             .foreign_keys
             .entry(f.constraint_name.clone())
@@ -715,6 +818,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&c.object_id) else {
             continue;
         };
+        if raw.object_dependencies.iter().any(|dependency| {
+            dependency.referencing_object_id == c.constraint_object_id
+                && unavailable_object_ids.contains(&dependency.referenced_object_id)
+        }) {
+            let table_name = name_of(c.object_id, &names);
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}: check constraint `{}` depends on an omitted temporal object or module; the check constraint was left out too",
+                    c.name
+                ),
+            );
+            continue;
+        }
         table.checks.insert(
             c.name.clone(),
             CheckConstraint {
@@ -808,6 +927,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             });
         };
 
+        if unavailable_object_ids.contains(&m.object_id) {
+            unmanageable(
+                "it has a create-time-bound dependency on a temporal table or another omitted module",
+            );
+            continue;
+        }
+
         let Some(stored) = &m.definition else {
             unmanageable(
                 "its definition cannot be read back (a CLR object, or created WITH ENCRYPTION)",
@@ -835,6 +961,23 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .as_ref()
             .map(|(s, t)| ObjectName::new(s.clone(), t.clone()))
             .or(on);
+
+        // A trigger declaration requires its parent in the managed schema.
+        // Keep the temporal table's dependent trigger in the same inventory
+        // instead of writing a declaration that validation cannot load.
+        if m.kind == ModuleKind::Trigger
+            && (m
+                .parent_object_id
+                .is_some_and(|parent| unavailable_object_ids.contains(&parent))
+                || on
+                    .as_ref()
+                    .is_some_and(|parent| unsupported_temporal_tables.contains(parent)))
+        {
+            unmanageable(
+                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, or another omitted module, which pbps cannot express",
+            );
+            continue;
+        }
 
         // The identity, which for a trigger is its table and its own name
         // (ADR-0009 §1). Nothing on this engine overloads, so no read-back
@@ -1117,7 +1260,59 @@ mod tests {
             object_id: id,
             schema: schema.into(),
             name: name.into(),
+            temporal_type: 0,
+            has_period: false,
         }
+    }
+
+    #[test]
+    fn system_versioning_and_history_are_reported_instead_of_managed() {
+        let mut raw = RawCatalog::default();
+        for (id, name, temporal_type) in [(1, "current", 2), (2, "history", 1), (3, "plain", 0)] {
+            let mut table = raw_table(id, "dbo", name);
+            table.temporal_type = temporal_type;
+            raw.tables.push(table);
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")]
+                .columns
+                .contains_key("id")
+        );
+        assert_eq!(pulled.limitations.len(), 2);
+        for name in ["current", "history"] {
+            assert!(pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name)
+                    && l.detail.contains("system versioning")
+            }));
+            assert!(
+                pulled
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(name) && w.contains("system versioning"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_period_definition_without_active_versioning_is_reported_instead_of_managed() {
+        let mut raw = RawCatalog::default();
+        let mut table = raw_table(1, "dbo", "disabled");
+        table.has_period = true;
+        raw.tables.push(table);
+        raw.columns.push(raw_column(1, "id", "int"));
+
+        let pulled = assemble(&raw);
+
+        assert!(pulled.schema.tables.is_empty());
+        assert_eq!(pulled.limitations.len(), 1);
+        assert!(
+            pulled.limitations[0]
+                .detail
+                .contains("PERIOD FOR SYSTEM_TIME")
+        );
     }
 
     fn raw_column(id: i32, name: &str, type_name: &str) -> RawColumn {
@@ -1133,6 +1328,7 @@ mod tests {
             is_user_defined_type: false,
             identity: None,
             default: None,
+            default_constraint: None,
         }
     }
 
@@ -1623,6 +1819,37 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_key_to_a_temporal_table_is_reported_instead_of_declared() {
+        let mut raw = one_table_catalog();
+        let mut temporal = raw_table(11, "dbo", "versioned");
+        temporal.temporal_type = 2;
+        raw.tables.push(temporal);
+        raw.foreign_key_columns.push(RawForeignKeyColumn {
+            object_id: 10,
+            constraint_name: "fk_customer_versioned".into(),
+            ref_schema: "dbo".into(),
+            ref_table: "versioned".into(),
+            column: "id".into(),
+            ref_column: "id".into(),
+            on_delete: 0,
+            on_update: 0,
+        });
+
+        let pulled = assemble(&raw);
+
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "customer")]
+                .foreign_keys
+                .is_empty()
+        );
+        assert!(pulled.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == TableName::new("dbo", "customer")
+                && limitation.detail.contains("fk_customer_versioned")
+                && limitation.detail.contains("dbo.versioned")
+        }));
+    }
+
+    #[test]
     fn index_key_and_include_columns_are_kept_apart() {
         let mut raw = one_table_catalog();
         let base = RawIndexColumn {
@@ -1766,6 +1993,7 @@ mod tests {
         raw.columns.push(raw_column(99, "ghost", "int"));
         raw.checks.push(RawCheck {
             object_id: 99,
+            constraint_object_id: 199,
             name: "ck_ghost".into(),
             definition: "(1=1)".into(),
         });
@@ -1790,6 +2018,8 @@ mod module_tests {
                 object_id: 1,
                 schema: "dbo".into(),
                 name: "t".into(),
+                temporal_type: 0,
+                has_period: false,
             }],
             columns: vec![RawColumn {
                 object_id: 1,
@@ -1803,6 +2033,7 @@ mod module_tests {
                 is_user_defined_type: false,
                 identity: None,
                 default: None,
+                default_constraint: None,
             }],
             ..Default::default()
         }
@@ -1810,11 +2041,14 @@ mod module_tests {
 
     fn module(schema: &str, name: &str, kind: ModuleKind, definition: Option<&str>) -> RawModule {
         RawModule {
+            object_id: 100,
+            parent_object_id: None,
             schema: schema.into(),
             name: name.into(),
             kind,
             definition: definition.map(str::to_owned),
             parent: None,
+            requires_bound_references: kind == ModuleKind::View,
             default_set_options: true,
         }
     }
@@ -1874,6 +2108,231 @@ mod module_tests {
             Some("dbo.customer")
         );
         assert_eq!(m.definition, "AFTER INSERT AS SELECT 1;");
+    }
+
+    #[test]
+    fn a_trigger_on_a_temporal_table_is_inventoried_with_its_parent() {
+        let mut raw = raw_one_table();
+        let mut plain = raw.tables[0].clone();
+        plain.object_id = 2;
+        plain.name = "plain".into();
+        raw.tables.push(plain);
+        let mut column = raw.columns[0].clone();
+        column.object_id = 2;
+        raw.columns.push(column);
+        raw.tables[0].temporal_type = 2;
+        for table in ["t", "plain"] {
+            let mut trigger = module(
+                "dbo",
+                &format!("tr_{table}"),
+                ModuleKind::Trigger,
+                Some(&format!(
+                    "CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"
+                )),
+            );
+            trigger.parent = Some(("dbo".into(), table.into()));
+            raw.modules.push(trigger);
+        }
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.modules.len(), 1);
+        assert!(
+            pulled
+                .schema
+                .modules
+                .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
+        );
+        assert_eq!(pulled.unmanaged_modules.len(), 1);
+        assert_eq!(
+            pulled.unmanaged_modules[0].target.object_name(),
+            TableName::new("dbo", "tr_t")
+        );
+        assert!(
+            pulled.unmanaged_modules[0]
+                .why
+                .contains("system versioning")
+        );
+    }
+
+    #[test]
+    fn create_time_bound_modules_follow_temporal_dependencies_transitively() {
+        let mut raw = raw_one_table();
+        raw.tables[0].temporal_type = 2;
+
+        let mut direct = module(
+            "dbo",
+            "v_direct",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_direct AS SELECT id FROM dbo.t"),
+        );
+        direct.object_id = 10;
+        let mut transitive = module(
+            "dbo",
+            "v_transitive",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_transitive AS SELECT id FROM dbo.v_direct"),
+        );
+        transitive.object_id = 11;
+        let mut deferred = module(
+            "dbo",
+            "p_deferred",
+            ModuleKind::Procedure,
+            Some("CREATE PROCEDURE dbo.p_deferred AS SELECT id FROM dbo.t"),
+        );
+        deferred.object_id = 12;
+        let mut trigger = module(
+            "dbo",
+            "tr_transitive",
+            ModuleKind::Trigger,
+            Some(
+                "CREATE TRIGGER dbo.tr_transitive ON dbo.v_transitive INSTEAD OF INSERT AS SELECT 1",
+            ),
+        );
+        trigger.object_id = 13;
+        trigger.parent_object_id = Some(11);
+        trigger.parent = Some(("dbo".into(), "v_transitive".into()));
+        raw.modules = vec![direct, transitive, deferred, trigger];
+        raw.object_dependencies = vec![
+            RawObjectDependency {
+                referencing_object_id: 10,
+                referenced_object_id: 1,
+            },
+            RawObjectDependency {
+                referencing_object_id: 11,
+                referenced_object_id: 10,
+            },
+            RawObjectDependency {
+                referencing_object_id: 12,
+                referenced_object_id: 1,
+            },
+        ];
+
+        let pulled = assemble(&raw);
+
+        assert_eq!(pulled.schema.modules.len(), 1);
+        assert!(
+            pulled
+                .schema
+                .modules
+                .contains_key(&"dbo.p_deferred".parse().unwrap())
+        );
+        for name in ["v_direct", "v_transitive"] {
+            assert!(pulled.unmanaged_modules.iter().any(|module| {
+                module.target.object_name() == TableName::new("dbo", name)
+                    && module.why.contains("create-time-bound dependency")
+            }));
+        }
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", "tr_transitive")
+                && module.why.contains("another omitted module")
+        }));
+    }
+
+    #[test]
+    fn a_check_calling_an_unavailable_function_is_inventoried() {
+        let mut raw = raw_one_table();
+        let mut plain = raw.tables[0].clone();
+        plain.object_id = 2;
+        plain.name = "plain".into();
+        raw.tables.push(plain);
+        let mut column = raw.columns[0].clone();
+        column.object_id = 2;
+        raw.columns.push(column);
+        raw.tables[0].temporal_type = 2;
+
+        let mut function = module(
+            "dbo",
+            "fn_temporal",
+            ModuleKind::Function,
+            Some(
+                "CREATE FUNCTION dbo.fn_temporal() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT MAX(id) FROM dbo.t); END",
+            ),
+        );
+        function.object_id = 10;
+        function.requires_bound_references = true;
+        raw.modules.push(function);
+        raw.checks.push(RawCheck {
+            object_id: 2,
+            constraint_object_id: 20,
+            name: "ck_plain_temporal_fn".into(),
+            definition: "(dbo.fn_temporal()>=(0))".into(),
+        });
+        raw.object_dependencies = vec![
+            RawObjectDependency {
+                referencing_object_id: 10,
+                referenced_object_id: 1,
+            },
+            RawObjectDependency {
+                referencing_object_id: 20,
+                referenced_object_id: 10,
+            },
+        ];
+
+        let pulled = assemble(&raw);
+
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")]
+                .checks
+                .is_empty()
+        );
+        assert!(pulled.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == TableName::new("dbo", "plain")
+                && limitation.detail.contains("ck_plain_temporal_fn")
+                && limitation
+                    .detail
+                    .contains("omitted temporal object or module")
+        }));
+    }
+
+    #[test]
+    fn a_default_calling_an_unavailable_function_is_inventoried() {
+        let mut raw = raw_one_table();
+        let mut plain = raw.tables[0].clone();
+        plain.object_id = 2;
+        plain.name = "plain".into();
+        raw.tables.push(plain);
+        let mut column = raw.columns[0].clone();
+        column.object_id = 2;
+        column.default = Some("(dbo.fn_temporal())".into());
+        column.default_constraint = Some((20, "df_plain_temporal_fn".into()));
+        raw.columns.push(column);
+        raw.tables[0].temporal_type = 2;
+
+        let mut function = module(
+            "dbo",
+            "fn_temporal",
+            ModuleKind::Function,
+            Some(
+                "CREATE FUNCTION dbo.fn_temporal() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT MAX(id) FROM dbo.t); END",
+            ),
+        );
+        function.object_id = 10;
+        function.requires_bound_references = true;
+        raw.modules.push(function);
+        raw.object_dependencies = vec![
+            RawObjectDependency {
+                referencing_object_id: 10,
+                referenced_object_id: 1,
+            },
+            RawObjectDependency {
+                referencing_object_id: 20,
+                referenced_object_id: 10,
+            },
+        ];
+
+        let pulled = assemble(&raw);
+
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")].columns["id"]
+                .default
+                .is_none()
+        );
+        assert!(pulled.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == TableName::new("dbo", "plain")
+                && limitation.detail.contains("df_plain_temporal_fn")
+                && limitation
+                    .detail
+                    .contains("omitted temporal object or module")
+        }));
     }
 
     /// A module whose definition cannot be read, or whose shape the emitter

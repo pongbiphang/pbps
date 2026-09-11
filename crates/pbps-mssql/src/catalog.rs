@@ -11,7 +11,7 @@ use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
     IndexKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawTable, Securable, assemble,
+    RawKeyColumn, RawModule, RawObjectDependency, RawTable, Securable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the name list drops this tool's
@@ -31,12 +31,38 @@ use crate::introspect::{
 /// The PostgreSQL pull lists the same two names unqualified, because the schema
 /// its ledger will live in is not decided until Phase 5 step 8 (#185).
 const TABLES: &str = "\
-SELECT t.object_id, s.name AS schema_name, t.name AS table_name
+SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
+       CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period
+  FROM sys.tables t
+  JOIN sys.schemas s ON s.schema_id = t.schema_id
+  LEFT JOIN sys.periods p ON p.object_id = t.object_id
+ WHERE t.is_ms_shipped = 0
+   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
+ ORDER BY s.name, t.name;";
+
+// SQL Server added both `sys.tables.temporal_type` and `sys.periods` in 2016.
+// Keep the whole legacy query free of those names: replacing only the selected
+// column would still make an older server compile a join to a view it lacks.
+const LEGACY_TABLES: &str = "\
+SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
+       CONVERT(tinyint, 0) AS temporal_type, CONVERT(bit, 0) AS has_period
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
    AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
  ORDER BY s.name, t.name;";
+
+fn tables_query(product_version: &str, edition: &str) -> String {
+    let major = product_version
+        .split('.')
+        .next()
+        .and_then(|v| v.parse::<u32>().ok());
+    if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 13) {
+        LEGACY_TABLES.to_owned()
+    } else {
+        TABLES.to_owned()
+    }
+}
 
 const COLUMNS: &str = "\
 SELECT c.object_id, c.name, ty.name AS type_name,
@@ -44,7 +70,9 @@ SELECT c.object_id, c.name, ty.name AS type_name,
        CONVERT(bit, CASE WHEN ty.is_user_defined = 1 THEN 1 ELSE 0 END) AS is_udt,
        CONVERT(bigint, ic.seed_value) AS seed,
        CONVERT(bigint, ic.increment_value) AS increment,
-       dc.definition AS default_definition
+       dc.definition AS default_definition,
+       dc.object_id AS default_constraint_object_id,
+       dc.name AS default_constraint_name
   FROM sys.columns c
   JOIN sys.types ty ON ty.user_type_id = c.user_type_id
   LEFT JOIN sys.identity_columns ic
@@ -81,7 +109,8 @@ SELECT fk.parent_object_id AS object_id, fk.name,
  ORDER BY fk.parent_object_id, fk.name, fkc.constraint_column_id;";
 
 const CHECKS: &str = "\
-SELECT cc.parent_object_id AS object_id, cc.name, cc.definition
+SELECT cc.parent_object_id AS object_id, cc.object_id AS constraint_object_id,
+       cc.name, cc.definition
   FROM sys.check_constraints cc
  WHERE cc.is_ms_shipped = 0
  ORDER BY cc.parent_object_id, cc.name;";
@@ -121,14 +150,16 @@ SELECT i.object_id, i.name, i.is_unique, i.type AS index_type,
 /// `parent_object_id` gives a trigger its table. `is_ms_shipped = 0` drops the
 /// system objects.
 const MODULES: &str = "\
-SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
+SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
+       s.name AS schema_name, o.name AS object_name, o.type AS type_code,
        m.definition AS definition,
        ps.name AS parent_schema, pt.name AS parent_table,
        -- Persisted with the module and re-applied on every execution, so they
        -- are part of what it does. NULL for a module with no readable
        -- definition, which is refused for its own reason first.
        CONVERT(bit, ISNULL(m.uses_quoted_identifier, 1)) AS quoted_identifier,
-       CONVERT(bit, ISNULL(m.uses_ansi_nulls, 1)) AS ansi_nulls
+       CONVERT(bit, ISNULL(m.uses_ansi_nulls, 1)) AS ansi_nulls,
+       CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
   FROM sys.objects o
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
@@ -140,6 +171,19 @@ SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
  WHERE o.is_ms_shipped = 0
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
  ORDER BY s.name, o.name;";
+
+// Only dependencies the engine resolved to an object in this database can
+// name a temporal table read above. Unresolved and cross-database references
+// have no `referenced_id` and cannot be matched safely by text.
+const MODULE_DEPENDENCIES: &str = "\
+SELECT DISTINCT d.referencing_id, d.referenced_id
+  FROM sys.sql_expression_dependencies d
+ WHERE d.referenced_id IS NOT NULL
+ ORDER BY d.referencing_id, d.referenced_id;";
+
+fn requires_bound_references(type_code: &str, schema_bound: bool) -> bool {
+    matches!(type_code.trim(), "V" | "IF") || schema_bound
+}
 
 /// User-defined database roles (ADR-0005). `is_fixed_role = 0` drops
 /// `db_owner` and friends; `public` is type `R` and not fixed, so it is
@@ -191,11 +235,26 @@ pub(crate) fn opt<'a, T: FromColumn<'a>>(row: &'a Row, col: &str) -> Result<Opti
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     let mut raw = RawCatalog::default();
 
-    for row in conn.query(TABLES).await? {
+    // Temporal metadata arrived in 2016; merely referencing the column fails
+    // on older servers. Azure's 12.x banner is not SQL Server 2014, and an
+    // unreadable version must not silently classify temporal tables as plain.
+    let versions = conn
+        .query(
+            "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
+                CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition;",
+        )
+        .await?;
+    let version = versions
+        .first()
+        .ok_or_else(|| DbError::BadRow("the server version query returned no row".into()))?;
+    let tables = tables_query(get(version, "version")?, get(version, "edition")?);
+    for row in conn.query(&tables).await? {
         raw.tables.push(RawTable {
             object_id: get(&row, "object_id")?,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "table_name")?.to_owned(),
+            temporal_type: get(&row, "temporal_type")?,
+            has_period: get(&row, "has_period")?,
         });
     }
 
@@ -214,6 +273,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             is_user_defined_type: get(&row, "is_udt")?,
             identity: seed.zip(increment),
             default: opt::<&str>(&row, "default_definition")?.map(str::to_owned),
+            default_constraint: opt::<i32>(&row, "default_constraint_object_id")?
+                .zip(opt::<&str>(&row, "default_constraint_name")?.map(str::to_owned)),
         });
     }
 
@@ -242,6 +303,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     for row in conn.query(CHECKS).await? {
         raw.checks.push(RawCheck {
             object_id: get(&row, "object_id")?,
+            constraint_object_id: get(&row, "constraint_object_id")?,
             name: get::<&str>(&row, "name")?.to_owned(),
             definition: get::<&str>(&row, "definition")?.to_owned(),
         });
@@ -272,13 +334,24 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             .map(|(s, t)| (s.to_owned(), t.to_owned()));
         let quoted: bool = get(&row, "quoted_identifier")?;
         let ansi_nulls: bool = get(&row, "ansi_nulls")?;
+        let schema_bound: bool = get(&row, "schema_bound")?;
         raw.modules.push(RawModule {
+            object_id: get(&row, "object_id")?,
+            parent_object_id: opt(&row, "parent_object_id")?,
             default_set_options: quoted && ansi_nulls,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "object_name")?.to_owned(),
             kind,
             definition: opt::<&str>(&row, "definition")?.map(str::to_owned),
             parent,
+            requires_bound_references: requires_bound_references(code, schema_bound),
+        });
+    }
+
+    for row in conn.query(MODULE_DEPENDENCIES).await? {
+        raw.object_dependencies.push(RawObjectDependency {
+            referencing_object_id: get(&row, "referencing_id")?,
+            referenced_object_id: get(&row, "referenced_id")?,
         });
     }
 
@@ -797,6 +870,40 @@ pub async fn misspelt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_servers_are_not_asked_for_a_temporal_catalog_column() {
+        for version in ["10.50.6000.34", "11.0.7001.0", "12.0.6024.0"] {
+            let query = tables_query(version, "Developer Edition");
+            assert!(!query.contains("t.temporal_type"), "{query}");
+            assert!(!query.contains("sys.periods"), "{query}");
+            assert!(query.contains("CONVERT(tinyint, 0) AS temporal_type"));
+            assert!(query.contains("CONVERT(bit, 0) AS has_period"));
+        }
+        for (version, edition) in [
+            ("13.0.1601.5", "Developer Edition"),
+            ("17.0.4075.5", "Developer Edition"),
+            ("12.0.2000.8", "SQL Azure"),
+            ("unknown", "Developer Edition"),
+        ] {
+            let query = tables_query(version, edition);
+            assert!(query.contains("t.temporal_type"));
+            assert!(query.contains("sys.periods"));
+        }
+    }
+
+    #[test]
+    fn views_inline_table_functions_and_schema_bound_modules_require_bound_references() {
+        for code in ["V", "IF"] {
+            assert!(requires_bound_references(code, false), "{code}");
+        }
+        for code in ["P", "PC", "FN", "TF", "FS", "FT", "TR"] {
+            assert!(!requires_bound_references(code, false), "{code}");
+        }
+        for code in ["FN", "TF"] {
+            assert!(requires_bound_references(code, true), "{code}");
+        }
+    }
 
     /// An engine without a view answers with the classes it has; one with
     /// every view is asked about every class.

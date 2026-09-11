@@ -26,6 +26,7 @@ fn full_catalog() -> RawCatalog {
         is_user_defined_type: false,
         identity: None,
         default: None,
+        default_constraint: None,
     };
 
     let mut id = col(1, "id", "bigint");
@@ -81,6 +82,7 @@ fn full_catalog() -> RawCatalog {
         }],
         checks: vec![RawCheck {
             object_id: 1,
+            constraint_object_id: 12,
             name: "ck_price".into(),
             definition: "([price]>(0))".into(),
         }],
@@ -108,6 +110,8 @@ fn full_catalog() -> RawCatalog {
         ],
         modules: vec![
             RawModule {
+                object_id: 20,
+                parent_object_id: None,
                 schema: "dbo".into(),
                 name: "v_active".into(),
                 kind: ModuleKind::View,
@@ -116,9 +120,12 @@ fn full_catalog() -> RawCatalog {
                         .into(),
                 ),
                 parent: None,
+                requires_bound_references: true,
                 default_set_options: true,
             },
             RawModule {
+                object_id: 21,
+                parent_object_id: Some(1),
                 schema: "dbo".into(),
                 name: "tr_customer".into(),
                 kind: ModuleKind::Trigger,
@@ -127,9 +134,11 @@ fn full_catalog() -> RawCatalog {
                         .into(),
                 ),
                 parent: Some(("dbo".into(), "customer".into())),
+                requires_bound_references: false,
                 default_set_options: true,
             },
         ],
+        object_dependencies: Vec::new(),
     }
 }
 
@@ -138,6 +147,8 @@ fn raw_table(object_id: i32, schema: &str, name: &str) -> RawTable {
         object_id,
         schema: schema.into(),
         name: name.into(),
+        temporal_type: 0,
+        has_period: false,
     }
 }
 

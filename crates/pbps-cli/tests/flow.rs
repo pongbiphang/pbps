@@ -1280,6 +1280,45 @@ fn a_narrowing_change_is_flagged_in_the_plan() {
     assert!(out.contains("--allow narrowing"), "{out}");
 }
 
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal_pull");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.plain (id int NOT NULL);
+         CREATE TABLE dbo.versioned (
+             id int NOT NULL PRIMARY KEY,
+             valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+    );
+    let d = Demo::new("temporal-pull");
+    for table in ["versioned", "plain"] {
+        on_server(
+            own.connection(),
+            &format!("CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"),
+        );
+    }
+    let output = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let warnings = stderr(&output);
+    for name in ["dbo.versioned", "dbo.versioned_history"] {
+        assert!(
+            warnings
+                .lines()
+                .any(|line| line.contains(name) && line.contains("system versioning")),
+            "{warnings}"
+        );
+        assert!(!d.dir.join("schema").join(format!("{name}.yml")).exists());
+    }
+    assert!(d.dir.join("schema/dbo.plain.yml").is_file());
+    let validate = d.run(&["validate"]);
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
+}
+
 // ---- pull (the paths that need no database) ----
 
 /// pull must never clobber an existing project by accident: the connection is

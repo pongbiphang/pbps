@@ -957,6 +957,180 @@ async fn pull_warns_about_what_it_cannot_express() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
+    let mut db = TestDb::create("temporal").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.plain (
+             id int NOT NULL,
+             versioned_id int NULL
+         );
+         CREATE TABLE dbo.versioned (
+             id int NOT NULL PRIMARY KEY,
+             valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));
+         CREATE TABLE dbo.disabled (
+             id int NOT NULL PRIMARY KEY,
+             valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.disabled_history));
+         ALTER TABLE dbo.disabled SET (SYSTEM_VERSIONING = OFF);
+         ALTER TABLE dbo.plain ADD CONSTRAINT fk_plain_versioned
+             FOREIGN KEY (versioned_id) REFERENCES dbo.versioned(id);",
+        )
+        .await
+        .expect("create temporal table and history");
+    for (view, source) in [
+        ("v_versioned", "versioned"),
+        ("v_versioned_chain", "v_versioned"),
+    ] {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW dbo.{view} AS SELECT id FROM dbo.{source};"
+            ))
+            .await
+            .expect("create temporal-dependent view");
+    }
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.tr_v_versioned_chain ON dbo.v_versioned_chain
+             INSTEAD OF INSERT AS SELECT 1;",
+        )
+        .await
+        .expect("create trigger on temporal-dependent view");
+    for definition in [
+        "CREATE FUNCTION dbo.fn_versioned() RETURNS int WITH SCHEMABINDING
+         AS BEGIN RETURN (SELECT MAX(id) FROM dbo.versioned); END;",
+        "CREATE FUNCTION dbo.tf_versioned() RETURNS @rows TABLE (id int)
+         WITH SCHEMABINDING AS BEGIN
+         INSERT @rows SELECT id FROM dbo.versioned; RETURN; END;",
+    ] {
+        db.conn
+            .execute(definition)
+            .await
+            .expect("create schema-bound temporal-dependent function");
+    }
+    db.conn
+        .execute(
+            "ALTER TABLE dbo.plain ADD CONSTRAINT df_plain_temporal_fn
+             DEFAULT dbo.fn_versioned() FOR versioned_id;
+             ALTER TABLE dbo.plain ADD CONSTRAINT ck_plain_temporal_fn
+             CHECK (dbo.fn_versioned() >= 0);",
+        )
+        .await
+        .expect("create constraints calling omitted function");
+    for table in ["versioned", "disabled", "plain"] {
+        db.conn
+            .execute(&format!(
+                "CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"
+            ))
+            .await
+            .expect("create trigger");
+    }
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect temporal catalog");
+    db.drop().await;
+
+    assert_eq!(pulled.schema.tables.len(), 2);
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("dbo", "plain"))
+    );
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("dbo", "disabled_history"))
+    );
+    assert_eq!(pulled.limitations.len(), 7);
+    assert_eq!(pulled.schema.modules.len(), 1);
+    assert!(
+        pulled
+            .schema
+            .modules
+            .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
+    );
+    assert_eq!(pulled.unmanaged_modules.len(), 7);
+    for trigger in ["tr_disabled", "tr_versioned"] {
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", trigger)
+                && module.why.contains("system versioning")
+        }));
+    }
+    for view in ["v_versioned", "v_versioned_chain"] {
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", view)
+                && module.why.contains("create-time-bound dependency")
+        }));
+    }
+    assert!(pulled.unmanaged_modules.iter().any(|module| {
+        module.target.object_name() == TableName::new("dbo", "tr_v_versioned_chain")
+            && module.why.contains("another omitted module")
+    }));
+    for function in ["fn_versioned", "tf_versioned"] {
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", function)
+                && module.why.contains("create-time-bound dependency")
+        }));
+    }
+    for name in ["disabled", "versioned", "versioned_history"] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name)
+                    && l.detail.contains("system versioning")
+            }),
+            "{:?}",
+            pulled.limitations
+        );
+    }
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "disabled")
+            && limitation.detail.contains("PERIOD FOR SYSTEM_TIME")
+    }));
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "plain")
+            && limitation.detail.contains("fk_plain_versioned")
+            && limitation.detail.contains("dbo.versioned")
+    }));
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "plain")
+            && limitation.detail.contains("ck_plain_temporal_fn")
+            && limitation
+                .detail
+                .contains("omitted temporal object or module")
+    }));
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "plain")
+            && limitation.detail.contains("df_plain_temporal_fn")
+            && limitation
+                .detail
+                .contains("omitted temporal object or module")
+    }));
+    assert!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")]
+            .foreign_keys
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")]
+            .checks
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")].columns["versioned_id"]
+            .default
+            .is_none()
+    );
+}
+
 /// A columnstore or XML index has the same catalog shape as a rowstore one and
 /// is not `type = 1`, so the clustered flag alone called it an ordinary index
 /// and `pull` wrote it into the declarations as one — bootstrapping a B-tree
