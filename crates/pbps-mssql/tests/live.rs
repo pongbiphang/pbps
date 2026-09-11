@@ -1003,6 +1003,18 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         )
         .await
         .expect("create trigger on temporal-dependent view");
+    for definition in [
+        "CREATE FUNCTION dbo.fn_versioned() RETURNS int WITH SCHEMABINDING
+         AS BEGIN RETURN (SELECT MAX(id) FROM dbo.versioned); END;",
+        "CREATE FUNCTION dbo.tf_versioned() RETURNS @rows TABLE (id int)
+         WITH SCHEMABINDING AS BEGIN
+         INSERT @rows SELECT id FROM dbo.versioned; RETURN; END;",
+    ] {
+        db.conn
+            .execute(definition)
+            .await
+            .expect("create schema-bound temporal-dependent function");
+    }
     for table in ["versioned", "disabled", "plain"] {
         db.conn
             .execute(&format!(
@@ -1037,7 +1049,7 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .modules
             .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
     );
-    assert_eq!(pulled.unmanaged_modules.len(), 5);
+    assert_eq!(pulled.unmanaged_modules.len(), 7);
     for trigger in ["tr_disabled", "tr_versioned"] {
         assert!(pulled.unmanaged_modules.iter().any(|module| {
             module.target.object_name() == TableName::new("dbo", trigger)
@@ -1054,6 +1066,12 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         module.target.object_name() == TableName::new("dbo", "tr_v_versioned_chain")
             && module.why.contains("another omitted module")
     }));
+    for function in ["fn_versioned", "tf_versioned"] {
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", function)
+                && module.why.contains("create-time-bound dependency")
+        }));
+    }
     for name in ["disabled", "versioned", "versioned_history"] {
         assert!(
             pulled.limitations.iter().any(|l| {

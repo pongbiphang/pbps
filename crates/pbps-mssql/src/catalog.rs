@@ -155,7 +155,8 @@ SELECT o.object_id, NULLIF(o.parent_object_id, 0) AS parent_object_id,
        -- are part of what it does. NULL for a module with no readable
        -- definition, which is refused for its own reason first.
        CONVERT(bit, ISNULL(m.uses_quoted_identifier, 1)) AS quoted_identifier,
-       CONVERT(bit, ISNULL(m.uses_ansi_nulls, 1)) AS ansi_nulls
+       CONVERT(bit, ISNULL(m.uses_ansi_nulls, 1)) AS ansi_nulls,
+       CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
   FROM sys.objects o
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
@@ -177,8 +178,8 @@ SELECT DISTINCT d.referencing_id, d.referenced_id
  WHERE d.referenced_id IS NOT NULL
  ORDER BY d.referencing_id, d.referenced_id;";
 
-fn requires_bound_references(type_code: &str) -> bool {
-    matches!(type_code.trim(), "V" | "IF")
+fn requires_bound_references(type_code: &str, schema_bound: bool) -> bool {
+    matches!(type_code.trim(), "V" | "IF") || schema_bound
 }
 
 /// User-defined database roles (ADR-0005). `is_fixed_role = 0` drops
@@ -327,6 +328,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             .map(|(s, t)| (s.to_owned(), t.to_owned()));
         let quoted: bool = get(&row, "quoted_identifier")?;
         let ansi_nulls: bool = get(&row, "ansi_nulls")?;
+        let schema_bound: bool = get(&row, "schema_bound")?;
         raw.modules.push(RawModule {
             object_id: get(&row, "object_id")?,
             parent_object_id: opt(&row, "parent_object_id")?,
@@ -336,7 +338,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             kind,
             definition: opt::<&str>(&row, "definition")?.map(str::to_owned),
             parent,
-            requires_bound_references: requires_bound_references(code),
+            requires_bound_references: requires_bound_references(code, schema_bound),
         });
     }
 
@@ -885,12 +887,15 @@ mod tests {
     }
 
     #[test]
-    fn only_views_and_inline_table_functions_require_bound_references() {
+    fn views_inline_table_functions_and_schema_bound_modules_require_bound_references() {
         for code in ["V", "IF"] {
-            assert!(requires_bound_references(code), "{code}");
+            assert!(requires_bound_references(code, false), "{code}");
         }
         for code in ["P", "PC", "FN", "TF", "FS", "FT", "TR"] {
-            assert!(!requires_bound_references(code), "{code}");
+            assert!(!requires_bound_references(code, false), "{code}");
+        }
+        for code in ["FN", "TF"] {
+            assert!(requires_bound_references(code, true), "{code}");
         }
     }
 
