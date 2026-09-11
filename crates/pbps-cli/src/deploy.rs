@@ -4271,7 +4271,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             crate::engine::Read::InsideOwnTransaction,
         )
         .await?;
-        refuse_recreated_tables(conn, &plan.changes, &after.unmanaged)
+        refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -4700,7 +4700,7 @@ async fn apply_staged_under_lock(
         crate::engine::Read::Snapshot,
     )
     .await?;
-    refuse_recreated_tables(conn, &plan.changes, &after.unmanaged)
+    refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
         .await
         .map_err(|e| {
             anyhow::anyhow!(
@@ -4776,18 +4776,10 @@ enum StagedRead {
 async fn refuse_recreated_tables(
     conn: &mut Conn,
     changes: &pbps_model::ChangeSet,
+    statements: &[pbps_dialect::Statement],
     unmanaged: &[TableName],
 ) -> anyhow::Result<()> {
-    let expected: BTreeMap<_, _> = changes
-        .changes
-        .iter()
-        .flat_map(|change| change.change.tables_after())
-        .collect();
-    let absent: Vec<_> = expected
-        .into_iter()
-        .filter(|(_, presence)| *presence == pbps_model::Presence::Absent)
-        .map(|(name, _)| name.clone())
-        .collect();
+    let absent = removed_table_names(changes, statements);
     if let Some(name) = crate::engine::matching_table_names(conn, &absent, unmanaged)
         .await?
         .first()
@@ -4795,6 +4787,33 @@ async fn refuse_recreated_tables(
         anyhow::bail!("{name} is still there, and this plan removes it");
     }
     Ok(())
+}
+
+/// The logical rename omits its intermediate names (DECISIONS 435). Their
+/// emitted moves still promise absence at closing (SPEC §7.6), unless a
+/// later move or the logical plan deliberately gives the name to a table.
+fn removed_table_names(
+    changes: &pbps_model::ChangeSet,
+    statements: &[pbps_dialect::Statement],
+) -> Vec<TableName> {
+    let mut expected = BTreeMap::new();
+    for statement in statements {
+        for (from, to) in &statement.renames {
+            expected.insert(from, pbps_model::Presence::Absent);
+            expected.insert(to, pbps_model::Presence::Present);
+        }
+    }
+    expected.extend(
+        changes
+            .changes
+            .iter()
+            .flat_map(|change| change.change.tables_after()),
+    );
+    expected
+        .into_iter()
+        .filter(|(_, presence)| *presence == pbps_model::Presence::Absent)
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// A checkpoint spans one emitted statement, not the whole logical rename.
@@ -5595,6 +5614,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn intermediate_names_are_absent_unless_the_plan_deliberately_reuses_them() {
+        use pbps_dialect::Statement;
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let rename = |uid: &str, from: &str, to: &str| {
+            PlannedChange::new(Change::RenameTable {
+                uid: uid.parse().unwrap(),
+                from: from.parse().unwrap(),
+                to: to.parse().unwrap(),
+            })
+        };
+        let mut changes = ChangeSet {
+            changes: vec![rename("t_aaaaaa", "app.t", "moved.u")],
+        };
+        let mut statements = vec![
+            Statement::new("").renaming("app.t".parse().unwrap(), "moved.t".parse().unwrap()),
+            Statement::new("").renaming("moved.t".parse().unwrap(), "moved.u".parse().unwrap()),
+        ];
+        assert_eq!(
+            removed_table_names(&changes, &statements),
+            vec![
+                "app.t".parse::<TableName>().unwrap(),
+                "moved.t".parse().unwrap()
+            ]
+        );
+        changes
+            .changes
+            .push(rename("t_bbbbbb", "app.other", "moved.t"));
+        statements.push(
+            Statement::new("").renaming("app.other".parse().unwrap(), "moved.t".parse().unwrap()),
+        );
+        assert_eq!(
+            removed_table_names(&changes, &statements),
+            vec![
+                "app.other".parse::<TableName>().unwrap(),
+                "app.t".parse().unwrap()
+            ]
+        );
+    }
+
     use pbps_db::catalog::{Limitation, Pulled, UnmanagedModule};
     use pbps_model::{DataMode, DataScope};
 

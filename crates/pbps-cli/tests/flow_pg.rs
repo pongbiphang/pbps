@@ -2998,3 +2998,73 @@ fn a_transactional_rename_rolls_back_when_a_trigger_recreates_its_source() {
     ));
     succeeds(d.run(&["verify", "--db", connection]));
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_rename_refuses_a_recreated_intermediate_name_at_closing_and_resume() {
+    let own = OwnDatabase::new(&server(), "invariant_recreated_intermediate");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-recreated-intermediate", ONE_COLUMN);
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.recreate_intermediate() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.u') IS NOT NULL AND to_regclass('moved.t') IS NULL THEN
+            CREATE TABLE moved.t (impostor text);
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER recreate_intermediate ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.recreate_intermediate();
+    "#,
+    );
+    for resume in [false, true] {
+        let mut flags = vec!["--allow", "rename", "--staged"];
+        if resume {
+            flags.push("--resume");
+        }
+        let refused = approved_apply(&d, connection, &plan, &flags);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(stderr(&refused).contains("moved.t"), "{}", stderr(&refused));
+        let checkpoint = latest_snapshot(connection);
+        assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 2);
+        assert!(
+            checkpoint
+                .schema
+                .tables
+                .contains_key(&"moved.u".parse().unwrap())
+        );
+        assert!(
+            !checkpoint
+                .schema
+                .tables
+                .contains_key(&"moved.t".parse().unwrap())
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            0
+        );
+    }
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER recreate_intermediate; DROP TABLE moved.t",
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--staged", "--resume"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
