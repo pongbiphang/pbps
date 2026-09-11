@@ -3745,6 +3745,257 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
     db.drop().await;
 }
 
+/// The collision the resolution above has to refuse, not just the resolution
+/// itself: a rename frees the name the departing identity carried, and the
+/// same plan can declare a *new* table under that freed name before the
+/// rename has reached this environment. Both declared names — `app.new_name`
+/// (the rename's destination) and `app.old_name` (the fresh declaration
+/// reusing what the rename frees) — resolve through the project's own ids to
+/// `app.old_name`, the one physical table this environment actually has.
+///
+/// Asking under the shared name and keying the answer by it once collapsed
+/// one of the two declarations' distinct DML demands into the other's map
+/// entry (issue #133 round 2, `Preserve distinct demands when a rename
+/// source is reused`); this test pins that `app.new_name`'s demand is
+/// answered by the object it resolves to, and `app.old_name`'s own demand —
+/// which this resolution cannot safely ask about, since the name is already
+/// confirmed to be a different identity's object — still falls back to the
+/// schema and is still reported, not silently dropped.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_renamed_and_a_reused_name_keep_their_own_distinct_demands() {
+    let mut db = TestDb::create("doctorreuse").await;
+    let login = format!("pbps_ru_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+
+    // The one physical table this environment has, still under its current
+    // name — the rename this test is about has not been applied here, and
+    // there never was a second physical table under the name it frees.
+    db.conn
+        .execute(
+            "CREATE TABLE app.old_name (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NOT NULL);",
+        )
+        .await
+        .expect("create the table under its current name");
+
+    // Object-level INSERT alone — not UPDATE, not DELETE, and nothing on the
+    // schema — so a gap reported against the wrong securable or read from
+    // the wrong identity's answer is distinguishable from one reported
+    // correctly.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT INSERT ON app.old_name TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant INSERT on the object's current name");
+
+    let uid1: Uid = "t_renam1".parse().expect("a well-formed table uid");
+    let uid2: Uid = "t_frees2".parse().expect("a well-formed table uid");
+    let mut recorded_ids = IdsFile::default();
+    recorded_ids
+        .tables
+        .insert(uid1.clone(), "app.old_name".parse().unwrap());
+    let mut project_ids = IdsFile::default();
+    project_ids
+        .tables
+        .insert(uid1, "app.new_name".parse().unwrap());
+    project_ids
+        .tables
+        .insert(uid2, "app.old_name".parse().unwrap());
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(
+            pbps_model::StateKind::Apply,
+            &Schema::default(),
+            &recorded_ids,
+        ),
+    )
+    .await
+    .expect("record the environment's own state");
+
+    // Both declared, under their own names: the rename's destination, and
+    // the fresh declaration reusing the name it frees.
+    let data: pbps_mssql::doctor::DataTables = [
+        ("app.new_name".parse().unwrap(), seeded_table()),
+        ("app.old_name".parse().unwrap(), seeded_table()),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &data,
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        held.schemas["app"].is_disjoint(
+            &["INSERT", "UPDATE", "DELETE"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        ),
+        "the premise: nothing is held on the schema: {held:?}"
+    );
+
+    let mut named: Vec<String> = pbps_mssql::doctor::missing(&held)
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        [
+            // `app.new_name`'s own demand, answered by the object it
+            // actually resolves to — proof it was not collapsed into
+            // `app.old_name`'s entry or lost to it. Only INSERT was granted
+            // on the object, so UPDATE and DELETE are its gaps here.
+            "DELETE on OBJECT::[app].[old_name]",
+            // `app.old_name`'s own demand, which could not be asked about
+            // at object scope at all — the name is already confirmed to be
+            // `app.new_name`'s current object — so all three fall back to
+            // the schema instead of silently vanishing or reading the other
+            // identity's INSERT as if it were its own.
+            "DELETE on SCHEMA::[app]",
+            "INSERT on SCHEMA::[app]",
+            "UPDATE on OBJECT::[app].[old_name]",
+            "UPDATE on SCHEMA::[app]",
+        ],
+        "{:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    drop(lp);
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
+/// The same collision, reachable through a declared grant target instead of
+/// a declared data table: `grant_targets()` resolves `granted.objects`
+/// exactly the way `data` is resolved above, and the same rename-frees-a-
+/// name-a-new-declaration-reuses shape can collide there too. GRANTED has no
+/// schema-scope fallback the way the data requirements do, so the target
+/// this resolution cannot safely ask about must be an unconditional gap —
+/// not silently dropped, and not answered from the other identity's object.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
+    let mut db = TestDb::create("doctorgtreuse").await;
+    let login = format!("pbps_gr_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+
+    db.conn
+        .execute(
+            "CREATE TABLE app.old_name (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NOT NULL); \
+             CREATE ROLE app_writer;",
+        )
+        .await
+        .expect("create the table and the managed role");
+    // The role holds CONTROL on the one physical object, under its current
+    // name — a careful DBA's grant, on the object the rename has not
+    // reached here yet.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             GRANT CONTROL ON app.old_name TO app_writer; \
+             GRANT CREATE ROLE, ALTER ANY ROLE TO [{login}]; \
+             ALTER ROLE app_writer ADD MEMBER [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant CONTROL on the object's current name and add the login");
+
+    let uid1: Uid = "t_renam3".parse().expect("a well-formed table uid");
+    let uid2: Uid = "t_frees4".parse().expect("a well-formed table uid");
+    let mut recorded_ids = IdsFile::default();
+    recorded_ids
+        .tables
+        .insert(uid1.clone(), "app.old_name".parse().unwrap());
+    let mut project_ids = IdsFile::default();
+    project_ids
+        .tables
+        .insert(uid1, "app.new_name".parse().unwrap());
+    project_ids
+        .tables
+        .insert(uid2, "app.old_name".parse().unwrap());
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(
+            pbps_model::StateKind::Apply,
+            &Schema::default(),
+            &recorded_ids,
+        ),
+    )
+    .await
+    .expect("record the environment's own state");
+
+    // Both declared as grant targets, under their own names: the rename's
+    // destination, and the fresh declaration reusing the name it frees.
+    let targets = pbps_mssql::doctor::GrantTargets {
+        permissions: Default::default(),
+        objects: vec![
+            "app.new_name".parse().unwrap(),
+            "app.old_name".parse().unwrap(),
+        ],
+        schemas: vec![],
+        roles: vec!["app_writer".to_owned()],
+    };
+
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &targets,
+        &pbps_mssql::doctor::DataTables::new(),
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+
+    let mut named: Vec<String> = pbps_mssql::doctor::missing(&held)
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        // `app.new_name`'s own target is answered by the object it actually
+        // resolves to and is fully granted there, so it reports no gap.
+        // `app.old_name`'s own target could not be safely asked about at
+        // all, so it is an unconditional CONTROL gap under its own declared
+        // name — not silently dropped, and not answered by `app.new_name`'s
+        // CONTROL as if it were its own.
+        ["CONTROL on OBJECT::[app].[old_name]"],
+        "{:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    drop(lp);
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
 /// The base a least-privilege login needs before any of the questions this
 /// file asks about reference data: the managed permissions on `app`, the
 /// ledger's own on `dbo`, and the four database `CREATE`s. Everything the

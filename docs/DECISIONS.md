@@ -9651,7 +9651,7 @@ SPEC is in sync with all of these.
     `Narrowing` into a float and the probe that should catch a rounding row
     does not; that is a preflight-contract gap, not a risk-classification one.
 
-440. **`doctor`'s object-scope permission questions are resolved against the
+439. **`doctor`'s object-scope permission questions are resolved against the
     environment's own recorded name, not the declared one.** `managed_schemas`,
     `referenced_tables`, `grant_targets` and `data_tables`
     (`crates/pbps-cli/src/doctor.rs`) build every object name `doctor` asks

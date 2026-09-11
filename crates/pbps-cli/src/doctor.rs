@@ -187,7 +187,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // being asked about. What changes per environment is which physical name
     // each uid currently has *there* — that half comes from each
     // environment's own recorded state, read where the permission question is
-    // actually asked (DECISIONS 440).
+    // actually asked (DECISIONS 439).
     let ids = crate::read_ids(project).unwrap_or_default();
     let declared = Declared {
         referenced: referenced_tables(project, &managed_schemas),
@@ -574,7 +574,7 @@ struct Declared {
     /// is the other half of resolving it to the name an environment actually
     /// has: the permission question reads that environment's own recorded ids
     /// (uid -> its name there) and looks the two maps up together (DECISIONS
-    /// 440).
+    /// 439).
     ids: pbps_model::IdsFile,
 }
 

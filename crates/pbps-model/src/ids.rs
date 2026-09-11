@@ -161,7 +161,7 @@ impl IdsFile {
     /// "could not be read" that it has no way to tell apart.
     ///
     /// Shared by `apply`'s staged-resume bookkeeping (`deploy::live_name`,
-    /// historically) and `doctor`'s readiness questions (DECISIONS 440): both
+    /// historically) and `doctor`'s readiness questions (DECISIONS 439): both
     /// need "what does the object I mean by this name answer to right now",
     /// and both get it from the same two maps.
     pub fn resolved_in(&self, wanted: &TableName, recorded: &IdsFile) -> TableName {

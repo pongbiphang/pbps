@@ -868,7 +868,7 @@ fn tables_under(schema: &Schema, final_ids: &IdsFile, live_ids: &IdsFile) -> Sch
 /// each table, re-keyed by the names `live_ids` gives the same uids.
 ///
 /// The lookup itself is [`IdsFile::resolved_in`] — shared with `doctor`'s
-/// readiness questions (DECISIONS 440), which resolve a declared object to
+/// readiness questions (DECISIONS 439), which resolve a declared object to
 /// the name an environment currently has it under for the same reason this
 /// does: a name only the declarations have moved to is not yet a name the
 /// database answers to.
