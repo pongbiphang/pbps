@@ -969,11 +969,18 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
              valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
              valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
              PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
-         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));
+         CREATE TABLE dbo.disabled (
+             id int NOT NULL PRIMARY KEY,
+             valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+         ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.disabled_history));
+         ALTER TABLE dbo.disabled SET (SYSTEM_VERSIONING = OFF);",
         )
         .await
         .expect("create temporal table and history");
-    for table in ["versioned", "plain"] {
+    for table in ["versioned", "disabled", "plain"] {
         db.conn
             .execute(&format!(
                 "CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"
@@ -986,14 +993,20 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         .expect("introspect temporal catalog");
     db.drop().await;
 
-    assert_eq!(pulled.schema.tables.len(), 1);
+    assert_eq!(pulled.schema.tables.len(), 2);
     assert!(
         pulled
             .schema
             .tables
             .contains_key(&TableName::new("dbo", "plain"))
     );
-    assert_eq!(pulled.limitations.len(), 2);
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("dbo", "disabled_history"))
+    );
+    assert_eq!(pulled.limitations.len(), 4);
     assert_eq!(pulled.schema.modules.len(), 1);
     assert!(
         pulled
@@ -1001,17 +1014,14 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .modules
             .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
     );
-    assert_eq!(pulled.unmanaged_modules.len(), 1);
-    assert_eq!(
-        pulled.unmanaged_modules[0].target.object_name(),
-        TableName::new("dbo", "tr_versioned")
-    );
-    assert!(
-        pulled.unmanaged_modules[0]
-            .why
-            .contains("system versioning")
-    );
-    for name in ["versioned", "versioned_history"] {
+    assert_eq!(pulled.unmanaged_modules.len(), 2);
+    for trigger in ["tr_disabled", "tr_versioned"] {
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", trigger)
+                && module.why.contains("system versioning")
+        }));
+    }
+    for name in ["disabled", "versioned", "versioned_history"] {
         assert!(
             pulled.limitations.iter().any(|l| {
                 l.target.object_name() == TableName::new("dbo", name)
@@ -1021,6 +1031,10 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             pulled.limitations
         );
     }
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "disabled")
+            && limitation.detail.contains("PERIOD FOR SYSTEM_TIME")
+    }));
 }
 
 /// A columnstore or XML index has the same catalog shape as a rowstore one and

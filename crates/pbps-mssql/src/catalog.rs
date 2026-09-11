@@ -31,7 +31,21 @@ use crate::introspect::{
 /// The PostgreSQL pull lists the same two names unqualified, because the schema
 /// its ledger will live in is not decided until Phase 5 step 8 (#185).
 const TABLES: &str = "\
-SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
+SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
+       CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period
+  FROM sys.tables t
+  JOIN sys.schemas s ON s.schema_id = t.schema_id
+  LEFT JOIN sys.periods p ON p.object_id = t.object_id
+ WHERE t.is_ms_shipped = 0
+   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
+ ORDER BY s.name, t.name;";
+
+// SQL Server added both `sys.tables.temporal_type` and `sys.periods` in 2016.
+// Keep the whole legacy query free of those names: replacing only the selected
+// column would still make an older server compile a join to a view it lacks.
+const LEGACY_TABLES: &str = "\
+SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
+       CONVERT(tinyint, 0) AS temporal_type, CONVERT(bit, 0) AS has_period
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
@@ -44,7 +58,7 @@ fn tables_query(product_version: &str, edition: &str) -> String {
         .next()
         .and_then(|v| v.parse::<u32>().ok());
     if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 13) {
-        TABLES.replace("t.temporal_type", "CONVERT(tinyint, 0) AS temporal_type")
+        LEGACY_TABLES.to_owned()
     } else {
         TABLES.to_owned()
     }
@@ -222,6 +236,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "table_name")?.to_owned(),
             temporal_type: get(&row, "temporal_type")?,
+            has_period: get(&row, "has_period")?,
         });
     }
 
@@ -829,7 +844,9 @@ mod tests {
         for version in ["10.50.6000.34", "11.0.7001.0", "12.0.6024.0"] {
             let query = tables_query(version, "Developer Edition");
             assert!(!query.contains("t.temporal_type"), "{query}");
+            assert!(!query.contains("sys.periods"), "{query}");
             assert!(query.contains("CONVERT(tinyint, 0) AS temporal_type"));
+            assert!(query.contains("CONVERT(bit, 0) AS has_period"));
         }
         for (version, edition) in [
             ("13.0.1601.5", "Developer Edition"),
@@ -837,7 +854,9 @@ mod tests {
             ("12.0.2000.8", "SQL Azure"),
             ("unknown", "Developer Edition"),
         ] {
-            assert!(tables_query(version, edition).contains("t.temporal_type"));
+            let query = tables_query(version, edition);
+            assert!(query.contains("t.temporal_type"));
+            assert!(query.contains("sys.periods"));
         }
     }
 

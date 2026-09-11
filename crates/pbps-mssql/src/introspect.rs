@@ -40,6 +40,8 @@ pub struct RawTable {
     pub name: String,
     /// `sys.tables.temporal_type`: zero is ordinary, one history, two versioned.
     pub temporal_type: u8,
+    /// Whether `sys.periods` still defines `PERIOD FOR SYSTEM_TIME` on the table.
+    pub has_period: bool,
 }
 
 /// One row of `sys.columns`, joined with its type, identity and default.
@@ -600,21 +602,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
-    let mut temporal_tables = BTreeSet::new();
+    let mut unsupported_temporal_tables = BTreeSet::new();
 
     for t in &raw.tables {
-        // Both halves must stay unmanaged: declaring either as an ordinary
-        // table loses the system-versioning relationship on bootstrap.
-        if t.temporal_type != 0 {
+        // Both halves of active versioning, and a current table whose period
+        // remains after versioning is disabled, must stay unmanaged. Declaring
+        // any of them as ordinary loses temporal semantics on bootstrap.
+        if t.temporal_type != 0 || t.has_period {
             let name = TableName::new(t.schema.clone(), t.name.clone());
-            temporal_tables.insert(name.clone());
+            unsupported_temporal_tables.insert(name.clone());
             push_limitation(
                 &mut warnings,
                 &mut limitations,
                 Some(&name),
                 format!(
-                    "{name}: system versioning (temporal_type = {}) is not supported yet; the table was left out of the declarations",
-                    t.temporal_type
+                    "{name}: system versioning or PERIOD FOR SYSTEM_TIME (temporal_type = {}, has_period = {}) is not supported yet; the table was left out of the declarations",
+                    t.temporal_type, t.has_period
                 ),
             );
             continue;
@@ -861,9 +864,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if m.kind == ModuleKind::Trigger
             && on
                 .as_ref()
-                .is_some_and(|parent| temporal_tables.contains(parent))
+                .is_some_and(|parent| unsupported_temporal_tables.contains(parent))
         {
-            unmanageable("its parent table uses system versioning, which pbps cannot express");
+            unmanageable(
+                "its parent table uses system versioning or PERIOD FOR SYSTEM_TIME, which pbps cannot express",
+            );
             continue;
         }
 
@@ -1149,6 +1154,7 @@ mod tests {
             schema: schema.into(),
             name: name.into(),
             temporal_type: 0,
+            has_period: false,
         }
     }
 
@@ -1181,6 +1187,25 @@ mod tests {
                     .any(|w| w.contains(name) && w.contains("system versioning"))
             );
         }
+    }
+
+    #[test]
+    fn a_period_definition_without_active_versioning_is_reported_instead_of_managed() {
+        let mut raw = RawCatalog::default();
+        let mut table = raw_table(1, "dbo", "disabled");
+        table.has_period = true;
+        raw.tables.push(table);
+        raw.columns.push(raw_column(1, "id", "int"));
+
+        let pulled = assemble(&raw);
+
+        assert!(pulled.schema.tables.is_empty());
+        assert_eq!(pulled.limitations.len(), 1);
+        assert!(
+            pulled.limitations[0]
+                .detail
+                .contains("PERIOD FOR SYSTEM_TIME")
+        );
     }
 
     fn raw_column(id: i32, name: &str, type_name: &str) -> RawColumn {
@@ -1854,6 +1879,7 @@ mod module_tests {
                 schema: "dbo".into(),
                 name: "t".into(),
                 temporal_type: 0,
+                has_period: false,
             }],
             columns: vec![RawColumn {
                 object_id: 1,
