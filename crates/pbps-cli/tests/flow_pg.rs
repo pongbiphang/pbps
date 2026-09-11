@@ -223,6 +223,79 @@ fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// The principal belongs to the cluster; bootstrap creates its managed grants
+/// in this database, not the role itself (DECISIONS 211).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+fn bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants() {
+    struct Role {
+        server: String,
+        name: String,
+    }
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.server, &format!("DROP ROLE {}", self.name));
+        }
+    }
+
+    let server = server();
+    let role = Role {
+        server: server.clone(),
+        name: format!("pbps_cli_bootstrap_reader_{}", std::process::id()),
+    };
+    on_server(&server, &format!("CREATE ROLE {}", role.name));
+    // Declared after the role so the database (and its grants) drops first.
+    let own = OwnDatabase::new(&server, "role-bootstrap");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+
+    let d = Demo::new("role-bootstrap");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!(
+            "role: {}\ngrants:\n  app.t: [select]\n  schema::app: [usage]\n",
+            role.name
+        ),
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    // Grants already in the managed set still make bootstrap refuse.
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA app TO {}", role.name),
+    );
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("already has"), "{}", stderr(&o));
+    on_server(
+        connection,
+        &format!("REVOKE USAGE ON SCHEMA app FROM {}", role.name),
+    );
+
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    on_server(
+        connection,
+        &format!(
+            "DO $$ BEGIN IF NOT has_table_privilege('{}', 'app.t', 'SELECT') OR \
+         NOT has_schema_privilege('{}', 'app', 'USAGE') THEN \
+         RAISE EXCEPTION 'bootstrap did not apply the declared grants'; END IF; END $$",
+            role.name, role.name
+        ),
+    );
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The existing table must remain protected by the ordinary empty check.
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("already has"), "{}", stderr(&o));
+}
+
 /// The deployment loop, end to end, on PostgreSQL: an empty database is
 /// bootstrapped, verified clean, planned against, applied to, verified clean
 /// again, and its ledger listed. Every connected command the loop touches

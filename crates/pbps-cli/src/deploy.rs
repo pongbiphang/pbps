@@ -2974,11 +2974,23 @@ pub fn cmd_bootstrap(
             )
             .await?;
 
-            // Every declared role is created here, and a user of the same name
-            // would refuse the `CREATE ROLE` after the tables went in
-            // (DECISIONS 118).
-            let declared_roles: Vec<String> = loaded.schema.roles.keys().cloned().collect();
-            refuse_taken_role_names(&mut conn, &declared_roles, &[]).await?;
+            // Only names the plan creates need to be free (DECISIONS 118).
+            // PostgreSQL grants use existing cluster roles; their existence
+            // is outside this database's ownership (DECISIONS 211).
+            let (wanted, vacated) = role_name_expectations(&cs, dialect.as_ref(), 0)?;
+            refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
+
+            // A cluster role with no managed grants is not an object this
+            // bootstrap creates. Existing managed grants still make the
+            // target nonempty: bootstrap must not silently adopt them.
+            let existing_roles: Vec<_> = existing
+                .scoped
+                .schema
+                .roles
+                .iter()
+                .filter(|(_, role)| dialect.manages_roles() || !role.grants.is_empty())
+                .map(|(name, _)| format!("role {name}"))
+                .collect();
 
             // Bootstrap means "into an empty database". Running it over an
             // existing managed set would fail halfway through on the first
@@ -2998,7 +3010,7 @@ pub fn cmd_bootstrap(
             // ignore` believed.
             if !existing.scoped.schema.tables.is_empty()
                 || !existing.scoped.schema.modules.is_empty()
-                || !existing.scoped.schema.roles.is_empty()
+                || !existing_roles.is_empty()
                 || !existing.limitations.is_empty()
             {
                 let names: Vec<String> = existing
@@ -3015,14 +3027,7 @@ pub fn cmd_bootstrap(
                             .keys()
                             .map(ToString::to_string),
                     )
-                    .chain(
-                        existing
-                            .scoped
-                            .schema
-                            .roles
-                            .keys()
-                            .map(|r| format!("role {r}")),
-                    )
+                    .chain(existing_roles)
                     .chain(existing.limitations.iter().cloned())
                     .collect();
                 bail!(
