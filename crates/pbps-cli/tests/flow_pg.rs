@@ -859,14 +859,28 @@ fn bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 fn the_deployment_loop_runs_end_to_end_on_postgres() {
-    let server = server();
-    let own = OwnDatabase::new(&server, "loop");
+    deployment_loop(&server(), "loop");
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn the_deployment_loop_reads_constraints_before_postgres_18() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 180000 THEN RAISE EXCEPTION 'this regression needs a pre-18 server'; END IF; END $$",
+    );
+    deployment_loop(&server, "old-loop");
+}
+
+fn deployment_loop(server: &str, slug: &str) {
+    let own = OwnDatabase::new(server, slug);
     let connection = own.connection().to_owned();
     // The tool never creates a schema (`doctor` says so); the environment has
     // to bring it, exactly as on the other engine.
     on_server(&connection, "CREATE SCHEMA app");
 
-    let d = Demo::new("loop");
+    let d = Demo::new(slug);
     d.table(ONE_COLUMN);
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -916,6 +930,20 @@ fn the_deployment_loop_runs_end_to_end_on_postgres() {
     assert_eq!(entries.len(), 2, "{v}");
     assert_eq!(entries[0]["kind"], "apply", "{v}");
     assert_eq!(entries[1]["kind"], "bootstrap", "{v}");
+    // Older servers lack the new flags, not constraints themselves. The
+    // fallback must still observe an independently added ordinary CHECK.
+    on_server(
+        &connection,
+        "ALTER TABLE app.t ADD CONSTRAINT positive_id CHECK (id > 0)",
+    );
+    let drift = d.run(&["verify", "--db", &connection]);
+    assert_ne!(code(&drift), 0, "{}{}", stdout(&drift), stderr(&drift));
+    assert!(
+        stdout(&drift).contains("positive_id"),
+        "{}{}",
+        stdout(&drift),
+        stderr(&drift)
+    );
 }
 
 /// Drift is drift on this engine too: a column added by hand is reported,

@@ -9010,3 +9010,20 @@ SPEC is in sync with all of these.
     unmanaged DDL and observes acceptance. It also proves the reader sees
     its own uncommitted table, preserves the caller transaction, and rolls
     that table back while the independent writer's constraint remains.
+
+424. **Read absent PostgreSQL constraint flags under their older semantics.**
+    `conenforced` and `conperiod` arrived in PostgreSQL 18. Direct column
+    references made every catalog-backed CLI command fail on PostgreSQL 16,
+    including an otherwise valid bootstrap. Looking them up in the catalog
+    row's JSON representation keeps one query across these versions: an
+    absent enforcement flag means enforced, and an absent period flag means
+    non-temporal. PostgreSQL 18 still supplies its actual flags, so unsupported
+    NOT ENFORCED and temporal constraints remain refusals.
+
+    The ordinary CLI deployment loop now also runs on the pinned PostgreSQL
+    16 server: bootstrap, connected plan, apply, clean verify, and ledger
+    entries. A manually added CHECK must then appear as drift on both
+    versions. Removing the compatible lookup makes the older-server test
+    fail at bootstrap. This measures that path, not every feature on every
+    PostgreSQL release; the separate permission-version preflight remains
+    deferred in #321.

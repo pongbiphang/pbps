@@ -453,6 +453,9 @@ fn columns_query() -> String {
 /// know: the assembler decides what to do with each, and a kind it has never
 /// seen is reported rather than dropped in a `WHERE` nobody re-reads.
 fn constraints_query() -> String {
+    // These flags arrived in PostgreSQL 18. JSON field lookup can represent
+    // their absence on older catalogs without making the SQL fail to parse;
+    // pre-18 constraints are enforced and have no temporal period (424).
     format!(
         "SELECT con.conrelid::int8 AS table_oid, con.conname AS name, con.contype::text AS kind,
             pg_catalog.array_to_string(con.conkey, ',') AS conkey,
@@ -466,7 +469,8 @@ fn constraints_query() -> String {
             con.confmatchtype::text AS match_type,
             pg_catalog.array_to_string(con.confdelsetcols, ',') AS delete_set_columns,
             con.conindid::int8 AS index_oid,
-            con.conenforced AS enforced, con.conperiod AS period,
+            COALESCE((to_jsonb(con)->>'conenforced')::boolean, true) AS enforced,
+            COALESCE((to_jsonb(con)->>'conperiod')::boolean, false) AS period,
             con.connoinherit AS no_inherit,
             EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
                      WHERE tg.tgconstraint = con.oid AND tg.tgenabled <> 'O')
