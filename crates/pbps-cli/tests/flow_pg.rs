@@ -1382,3 +1382,218 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     assert_eq!(code(&restored), code(&control));
     assert_eq!(stderr(&restored), stderr(&control));
 }
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn permission_versions_are_checked_before_planning_bootstrap_apply_and_resume() {
+    struct Roles(Vec<(String, String)>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for (server, name) in &self.0 {
+                let _ = try_on_server(server, &format!("DROP ROLE IF EXISTS {name}"));
+            }
+        }
+    }
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    let new_server = server();
+    let role = format!("pbps_version_{}", std::process::id());
+    let _roles = Roles(vec![
+        (old_server.clone(), role.clone()),
+        (new_server.clone(), role.clone()),
+    ]);
+    for server in [&old_server, &new_server] {
+        on_server(server, &format!("CREATE ROLE {role}"));
+    }
+    on_server(
+        &old_server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'needs pre-17'; END IF; END $$",
+    );
+    on_server(
+        &new_server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer < 170000 THEN RAISE EXCEPTION 'needs 17+'; END IF; END $$",
+    );
+    let old = OwnDatabase::new(&old_server, "permission_version");
+    let new = OwnDatabase::new(&new_server, "permission_version");
+    let bootstrap_target = OwnDatabase::new(&old_server, "permission_bootstrap");
+    for db in [&old, &new, &bootstrap_target] {
+        on_server(db.connection(), "CREATE SCHEMA app");
+    }
+    let d = Demo::new("permission-version");
+    d.table(ONE_COLUMN);
+    let role_file = d.dir.join("schema/reader.yml");
+    let declare = |permissions: &str| {
+        std::fs::write(
+            &role_file,
+            format!("role: {role}\ngrants:\n  app.t: [{permissions}]\n  schema::app: [usage]\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    declare("select");
+    for db in [&old, &new] {
+        succeeds(d.run(&["bootstrap", "--db", db.connection()]));
+    }
+    declare("select, maintain");
+    let refuses_version = |o: Output| {
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("permission_support (PostgreSQL)"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).contains("PostgreSQL 17 or later"),
+            "{}",
+            stderr(&o)
+        );
+    };
+    refuses_version(d.run(&["bootstrap", "--db", bootstrap_target.connection()]));
+    on_server(
+        bootstrap_target.connection(),
+        "DO $$ BEGIN IF to_regclass('app.t') IS NOT NULL OR to_regclass('public.__pbps_state') IS NOT NULL THEN RAISE EXCEPTION 'bootstrap wrote before refusing'; END IF; END $$",
+    );
+
+    let plan = d.dir.join("version-plan.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        old.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(report["result"], "unanswerable", "{report}");
+    assert!(
+        report["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("permission_support (PostgreSQL)"),
+        "{report}"
+    );
+    assert!(
+        !plan.exists(),
+        "refused planning must not write an artifact"
+    );
+    let o = succeeds(d.run(&[
+        "plan",
+        "--db",
+        new.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        report["data"]["connected_checks"][0]["name"],
+        "permission_support"
+    );
+    assert_eq!(report["data"]["connected_checks"][0]["status"], "passed");
+    assert_eq!(
+        report["data"]["connected_checks"][0]["engine"],
+        "PostgreSQL"
+    );
+    refuses_version(apply_plan(&d, old.connection(), &plan, false));
+    let staged = d.dir.join("version-staged.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        new.connection(),
+        "--out",
+        staged.to_str().unwrap(),
+        "--staged",
+        "--format",
+        "json",
+    ]));
+    refuses_version(apply_plan(&d, old.connection(), &staged, true));
+    refuses_version(d.run(&[
+        "apply",
+        "--db",
+        old.connection(),
+        "--plan",
+        staged.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&staged),
+        "--staged",
+        "--resume",
+    ]));
+    let listing = succeeds(d.run(&[
+        "state",
+        "list",
+        "--db",
+        old.connection(),
+        "--format",
+        "json",
+    ]));
+    let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
+    assert_eq!(
+        listing["data"]["entries"].as_array().unwrap().len(),
+        1,
+        "a capability refusal must not write a ledger entry: {listing}"
+    );
+    succeeds(apply_plan(&d, new.connection(), &plan, false));
+    on_server(
+        new.connection(),
+        &format!(
+            "DO $$ BEGIN IF NOT has_table_privilege('{role}', 'app.t', 'MAINTAIN') THEN RAISE EXCEPTION 'grant missing'; END IF; END $$"
+        ),
+    );
+
+    // Reference-data adoption also remains a single JSON document, carrying
+    // the notice that the human plan prints before its summary.
+    d.table(&format!(
+        "{ONE_COLUMN}data:\n  mode: ensure\n  rows:\n    1: {{}}\n"
+    ));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let adoption = succeeds(d.run(&["plan", "--db", new.connection(), "--format", "json"]));
+    let adoption: serde_json::Value = serde_json::from_str(&stdout(&adoption)).unwrap();
+    assert!(
+        adoption["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "data.adoption"),
+        "{adoption}"
+    );
+    d.table(ONE_COLUMN);
+
+    // A revoke-only plan still works on the old server. The guard is about
+    // permissions the plan grants, not permissions mentioned in a declaration.
+    std::fs::write(&role_file, format!("role: {role}\n")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        old.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .all(|p| matches!(p.change, pbps_model::Change::Revoke { .. }))
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        old.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+}

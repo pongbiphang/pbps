@@ -363,6 +363,74 @@ pub async fn edition_verdict(
     }
 }
 
+/// A connected capability answer, separate from the saved, checksum-pinned plan.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct ConnectedCheck {
+    pub name: &'static str,
+    pub engine: &'static str,
+    pub status: &'static str,
+    pub message: String,
+}
+
+/// Check the permissions this deployment will grant, not every permission in
+/// its recorded snapshot. A removal must not be refused for a grant it no
+/// longer issues. The server version is checked again on apply because a
+/// saved plan can travel between environments (DECISIONS 429).
+pub async fn permission_support(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<ConnectedCheck> {
+    match conn.driver() {
+        Driver::Mssql => Ok(ConnectedCheck {
+            name: "permission_support",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server permissions are validated by its dialect; the PostgreSQL \
+                      permission-version check does not apply"
+                .to_owned(),
+        }),
+        Driver::Postgres => {
+            let version = pbps_pg::roles::server_version_num(conn).await?;
+            let mut roles: BTreeMap<String, pbps_model::Role> = BTreeMap::new();
+            for planned in &changes.changes {
+                if let pbps_model::Change::Grant {
+                    role,
+                    target,
+                    permissions,
+                } = &planned.change
+                {
+                    roles
+                        .entry(role.clone())
+                        .or_default()
+                        .grants
+                        .entry(target.clone())
+                        .or_default()
+                        .extend(permissions.iter().copied());
+                }
+            }
+            let errors: Vec<String> = roles
+                .iter()
+                .flat_map(|(name, role)| {
+                    pbps_pg::roles::unsupported_permissions(version, name, role)
+                })
+                .map(|error| error.to_string())
+                .collect();
+            if !errors.is_empty() {
+                anyhow::bail!("permission_support (PostgreSQL): {}", errors.join("\n"));
+            }
+            Ok(ConnectedCheck {
+                name: "permission_support",
+                engine: "PostgreSQL",
+                status: "passed",
+                message: format!(
+                    "PostgreSQL server_version_num {version} supports the permissions \
+                                  this plan grants"
+                ),
+            })
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `doctor`: what the connected account may do
 // ---------------------------------------------------------------------------

@@ -9096,3 +9096,23 @@ SPEC is in sync with all of these.
     block, same-named view/routine overloads, inherited grant options, and catalog
     grants absent from declarations. The CLI regression pins the complete
     declaration-to-JSON path and the named remedies (issues #304 and #317).
+
+429. **Permission support is checked on the server that will execute the plan.**
+    PostgreSQL's MAINTAIN grant arrived in 17. The connected engine facade asks
+    `roles::unsupported_permissions` about the typed plan's Grant changes,
+    before `plan --db` writes an artifact and before bootstrap or apply takes
+    the ledger lock. This also covers staged execution and resume: a saved
+    plan can move from a newer server to an older one, and a permission that
+    fails after preceding DDL is not an acceptable preflight. Revoke-only and
+    unrelated plans are not refused for permissions they do not grant.
+    SQL Server explicitly reports this PostgreSQL version check as inapplicable;
+    its own dialect still validates its permission vocabulary.
+
+    Connected `plan --format json` now reports the same count summary as the
+    offline command, plus named connected checks and adoption/policy findings.
+    This supersedes decision 47's refusal of that flag: operational answers
+    need a machine-readable surface, but the summary never duplicates the typed
+    ChangeSet. `--out` remains the only saved artifact accepted by apply; the
+    report is not stored in the plan or included in its risk or checksum.
+    The two-version CLI regression pins rejection before writes and successful
+    ordinary/revoke-only execution on 16 and MAINTAIN execution on 18 (#305, #321).

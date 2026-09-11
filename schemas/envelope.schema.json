@@ -151,6 +151,12 @@
           "items": {
             "type": "string"
           }
+        },
+        "connected_checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConnectedCheck"
+          }
         }
       },
       "required": [
@@ -160,6 +166,30 @@
         "modules",
         "roles",
         "risks"
+      ]
+    },
+    "ConnectedCheck": {
+      "description": "A connected capability answer, separate from the saved, checksum-pinned plan.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "engine": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "engine",
+        "status",
+        "message"
       ]
     },
     "envelope.plan": {

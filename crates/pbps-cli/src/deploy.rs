@@ -3033,6 +3033,7 @@ pub fn cmd_bootstrap(
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        crate::engine::permission_support(&mut conn, &cs).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
         let result = async {
@@ -3288,6 +3289,7 @@ pub fn cmd_plan_db(
     out: Option<&std::path::Path>,
     sql_out: Option<&std::path::Path>,
     staged: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
     let loaded = crate::load(project, dialect.as_ref())?;
@@ -3316,8 +3318,9 @@ pub fn cmd_plan_db(
         );
     }
 
-    let (cs, baseline_checksum, baseline_description) = db::runtime()?.block_on(async {
+    let (cs, baseline_checksum, baseline_description, connected_checks, findings) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        let mut findings = Vec::new();
 
         let Some(mut entry) = crate::engine::latest(&mut conn).await? else {
             bail!(
@@ -3473,17 +3476,19 @@ pub fn cmd_plan_db(
             if recorded_data.contains_key(name) {
                 continue;
             }
-            match managed.rows.get(name) {
-                Some(observed) => println!(
+            let message = match managed.rows.get(name) {
+                Some(observed) => format!(
                     "Reference data: the declarations take over the rows of {name} ({}); it holds \
                      {} row(s) now.",
                     scope.mode,
                     observed.rows.len()
                 ),
-                None => println!(
+                None => format!(
                     "Reference data: {name} does not exist yet; its declared rows go in with it."
                 ),
-            }
+            };
+            if !json { println!("{message}"); }
+            findings.push(crate::output::Finding::note("data.adoption", message));
         }
         let base = pbps_model::data::plan_base(
             &scoped.schema,
@@ -3635,6 +3640,9 @@ pub fn cmd_plan_db(
             );
         }
 
+        findings.extend(policy);
+        let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
+
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
         // honestly: whether ONLINE will be accepted at all, and whether an
@@ -3654,6 +3662,7 @@ pub fn cmd_plan_db(
         }
         for w in &verdict.warnings {
             eprintln!("warning: {w}");
+            findings.push(crate::output::Finding::warning("plan.edition", w));
         }
 
         // What the plan is pinned to is wider than what the drift check
@@ -3673,6 +3682,8 @@ pub fn cmd_plan_db(
             cs,
             baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
+            vec![permission_support],
+            findings,
         ))
     })?;
 
@@ -3700,8 +3711,23 @@ pub fn cmd_plan_db(
         reject_non_transactional(&statements)?;
     }
 
-    println!("Baseline: {baseline_description}");
-    print!("{}", crate::report::plan(&cs));
+    let (tables, modules) = crate::report::touched(&cs);
+    let data = crate::PlanData {
+        baseline: baseline_description.clone(),
+        changes: cs.changes.len(),
+        tables,
+        modules,
+        roles: crate::report::touched_roles(&cs),
+        risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
+        connected_checks,
+    };
+    if !json {
+        println!("Baseline: {baseline_description}");
+        print!("{}", crate::report::plan(&cs));
+        for check in &data.connected_checks {
+            println!("{}: {}", check.name, check.message);
+        }
+    }
 
     let mut plan = pbps_model::SavedPlan::new(
         pbps_model::PlanOrigin::Database,
@@ -3721,19 +3747,23 @@ pub fn cmd_plan_db(
     plan.data = loaded.schema.data_scopes();
     if staged {
         plan = plan.staged();
-        println!(
-            "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
+        if !json {
+            println!(
+                "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
              recorded in the ledger as it completes. Apply it with `pbps apply --staged \n\
              --checksum {}`, and continue an interrupted run with \n\
              `--staged --resume`.",
-            statements.len(),
-            crate::report::placeholder("approved-checksum")
-        );
+                statements.len(),
+                crate::report::placeholder("approved-checksum")
+            );
+        }
     }
 
     if let Some(path) = out {
         crate::write_plan(path, &plan)?;
-        println!("\nwrote {} (checksum {})", path.display(), plan.checksum());
+        if !json {
+            println!("\nwrote {} (checksum {})", path.display(), plan.checksum());
+        }
     }
     if let Some(path) = sql_out {
         let script = format!(
@@ -3743,12 +3773,17 @@ pub fn cmd_plan_db(
         );
         std::fs::write(path, script)
             .with_context(|| format!("cannot write `{}`", path.display()))?;
-        println!("wrote {}", path.display());
+        if !json {
+            println!("wrote {}", path.display());
+        }
     }
-    if out.is_none() {
+    if out.is_none() && !json {
         println!(
             "\nThis plan was not saved. `--out plan.json` writes the artifact `pbps apply` takes."
         );
+    }
+    if json {
+        return crate::output::Report::new("plan", findings, Some(data)).emit_json();
     }
     Ok(())
 }
@@ -4010,6 +4045,10 @@ fn apply_identified(
 
     let (result, released) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+
+        // This capability is constant for the connection and needs no ledger
+        // lock. Check before any writes, including staged resumes.
+        crate::engine::permission_support(&mut conn, &plan.changes).await?;
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
