@@ -42,9 +42,9 @@ pbps-policy  = { path = "crates/pbps-policy" }
 
 serde      = { version = "1", features = ["derive"] }
 
-# The driver is pure Rust: no ODBC to install, which matters on air-gapped
-# hosts (SPEC §11.3). tokio is pulled for the driver, not embraced: only
-# pbps-db and the mssql introspection are async, and the CLI block_on's them.
+# Both database drivers are pure Rust: no ODBC or database client library to
+# install on air-gapped hosts (SPEC §11.3). Async work is confined to connected
+# operations; the model, differ and SQL emitters stay synchronous.
 #
 # `tiberius-ng` is a waypoint, not the destination (SPEC open question 10).
 # The original crate is community-maintained again at tiberius-rs/tiberius, but
@@ -58,11 +58,10 @@ tiberius   = { package = "tiberius-ng", version = "0.13", default-features = fal
 tokio      = { version = "1", features = ["net", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
-# PostgreSQL (Phase 5, ADR-0007 decision 5 / ADR-0014). Pure Rust like the SQL
+# PostgreSQL (ADR-0007 decision 5 / ADR-0014). Pure Rust like the SQL
 # Server driver, so §11.3's single static binary still needs nothing installed
-# on the host. TLS is the caller's choice here rather than pinned by the driver
-# — the property ADR-0014's Limits names `tiberius 0.12` as lacking — so it is
-# made explicitly, against the one `rustls` already in this tree.
+# on the host. TLS is the caller's choice here rather than pinned by the driver,
+# so it is made explicitly against the one `rustls` already in this tree.
 tokio-postgres = { version = "0.7", default-features = false }
 # `aws-lc-rs`, not `ring`, and the reason is measured rather than preferred:
 # `tiberius-ng` resolves `rustls` with its default provider, so asking for

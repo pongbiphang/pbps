@@ -6,10 +6,10 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
-**Phases 0-4 complete** (0, 1, 2, 3, 3.1, 3.5 and 4) for SQL Server. The test
-and clippy bar is in CLAUDE.md's "Development environment"; counts change too
-often to record here. The copy-pastable pipelines SPEC 14.1 lists as P1 are in
-[CI.md](CI.md).
+**Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
+and PostgreSQL supported through the CLI. The test and clippy bar is in
+AGENTS.md's "Taking an issue"; counts change too often to record here. The
+copy-pastable pipelines SPEC 14.1 lists as P1 are in [CI.md](CI.md).
 
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
@@ -169,11 +169,17 @@ surface every later feature is built twice for, and does it while the first
 engine still cannot express an organization's own rules. The reasoning is in
 SPEC 12 and open question 9.
 
-**Phase 5** is the PostgreSQL dialect, the touchstone for the `Dialect`
-abstraction. Its design is recorded, grounded in measurements taken on a real
-PostgreSQL before any dialect code exists — each ADR's "Limits" section names
-what was not measured, and the PostgreSQL live suite is Phase 5's first
-deliverable:
+**Phase 5, the PostgreSQL dialect, is complete as scoped.** The CLI drives
+both engines. PostgreSQL now has connected ledger operations, transactional
+and staged apply, reference data, grants, probes, rename impact and cost
+estimates. The PostgreSQL CLI
+live suite checks the §11.5 invariants, and the follow-ups split from step 10
+are complete. Deferred review findings and unsupported constructs remain
+tracked separately; phase completion does not remove those limits.
+
+The design was grounded in measurements on a real PostgreSQL before dialect
+implementation. The ADRs now distinguish what the completed live suites
+measure from the remaining limits:
 [ADR-0009](ADR-0009-postgres-modules.md) (modules — overloading makes the
 identity name plus argument types, which ADR-0002 anticipated),
 [ADR-0010](ADR-0010-postgres-privileges.md) (privileges — the role is not the
@@ -209,11 +215,12 @@ table in `validate`, `emit` and the read-back, role existence is a dialect
 capability SQL Server answers `true` to, and the editor schema lists the words
 (schema version 7). With that, the three model-format steps of Phase 5 are in.
 
-The crate itself has started: step 1 of ten (issue #75) makes the **connected**
-boundary polymorphic — `pbps_db::Conn` is an enum over `tiberius` and
+The following step record describes how Phase 5 landed, including limitations
+that later steps or follow-ups addressed. Step 1 of ten (issue #75) made the
+**connected** boundary polymorphic — `pbps_db::Conn` is an enum over `tiberius` and
 `tokio_postgres`, one module per driver, and the 22 `pbps-mssql` functions that
-take `&mut Conn` are untouched (DECISIONS 225). `pbps-pg` exists, holds no
-driver, and refuses by name for every part not yet built. Two long-standing
+take `&mut Conn` are untouched (DECISIONS 225). `pbps-pg` was introduced without a
+driver dependency, initially refusing every part not yet built. Two long-standing
 seam defects landed with it: `normalize_definition` now takes each engine's own
 lexis instead of inheriting SQL Server's scanner (DECISIONS 226), and
 `normalize_type` has a stated contract under which `serial` is refused rather
@@ -373,8 +380,8 @@ never written, and a caller only a name scan can see is **reported** — a name 
 not an identity where routines overload. And a same-named object this plan
 introduces on a module's write path rebuilds that module in the same plan rather
 than one plan late, on a name and a path rather than a position (DECISIONS 307).
-None of this is reached by a command yet: the CLI still refuses the dialect, so
-the live suite is what exercises it.
+These paths initially ran only through the dialect live suite; step 10 and
+its connected-check follow-ups now exercise them through the CLI too.
 
 **Step 8 is in**: the ledger, the lock and `doctor` (DECISIONS 284–292). The
 two tables live in `public` — the schema every database is created with, and
@@ -545,8 +552,8 @@ Two costs the rules imposed rather than the code: the live suite and the
 `live-pg` CI job now start a pinned PostgreSQL **16** beside the pinned 18,
 because `maintain` arrived in 17 and no single server can show both halves; and
 every test in that section acts through a `LOGIN` role, because a superuser
-does not consult an ACL at all. None of it is reached by a command yet — the
-CLI still refuses the dialect.
+does not consult an ACL at all. Step 10 subsequently connected these paths
+to the CLI.
 
 Step 9 of ten (issue #84) is **pre-flight, rename impact and the estimate**,
 and each of the three found the same thing in a different place: the construct
@@ -653,11 +660,12 @@ build the estimate that cannot be measured (409).
 Limits record, and this step did not answer it.
 
 Not in this step: at the time the CLI still refused the `postgres` dialect, so
-none of the three was reached by a command. Step 10 wired two of them — the
-probes run through `Dialect::preflight` under `plan --db` and `apply`, and the
-rename impact is asked through `pbps-cli::engine` — while the cost estimate is
-still a free function the live suite exercises, and wiring it into `plan --db`
-is an issue of its own.
+none of the three was reached by a command. Step 10 wired the probes through
+`Dialect::preflight` under `plan --db` and `apply`, and rename impact through
+`pbps-cli::engine`. The cost follow-up now includes PostgreSQL estimates in
+connected plan output, with explicit unknowns where the measured catalogue
+cannot give an answer. Cost stays outside the saved deployment artifact and
+the approval gate (DECISIONS 430).
 
 **Step 10 is in**: the connected seam (issue #85, DECISIONS 417–418). The
 CLI no longer refuses the `postgres` dialect: `bootstrap`, `verify`,
@@ -674,14 +682,16 @@ command now names the kind of read it wants and PostgreSQL's read-back runs
 under a savepoint (418). A serial CLI flow suite, `flow_pg`, runs the loop
 end to end against the real engine and is part of `scripts/live-tests-pg.sh`.
 
-What step 10 did not do is filed as issues, not carried here: the §11.5
-invariant set run through the CLI on PostgreSQL, the ADR "Limits" revisits, the
-docs that still describe the tool as SQL Server only, the `spikes/` decision,
-and what the seam exposed — a PostgreSQL pull with no unmanaged-module inventory, a PostgreSQL
-`doctor` that does not ask about DML or grant rights, the cost estimate no
-command asks for, and the remaining PostgreSQL-only connected checks. The SQL
-Server rename-target mapping landed in DECISIONS 416. Review fixes now connect
-PostgreSQL role-rename evidence and module rebuild checks (419–420), including
+The step 10 follow-ups are complete: CLI invariant coverage (#299), the ADR
+Limits revisit (#300), the two-engine documentation (#301), and historical
+spike retention (#302, DECISIONS 437). PostgreSQL pull now reports unmanaged
+modules (#303), `doctor` checks DML and grant rights (#304), connected module
+checks and cost reporting are wired (#305), and connected commands enforce
+version-specific permissions (#321). The drop report is also available on
+PostgreSQL (#254). The ADR Limits sections and
+open `deferred-review` issues retain the remaining constraints and findings.
+The SQL Server rename-target mapping landed in DECISIONS 416. Review fixes now
+connect PostgreSQL role-rename evidence and module rebuild checks (419–420), including
 the empty-SQL identity recording and the transactional before/after checks.
 The typed diff also includes PostgreSQL caller rebuilds for newly arriving
 names on their write path, before ordering and approval (422).
