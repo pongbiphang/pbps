@@ -207,8 +207,14 @@ fn resolve_with_provenance(
         .flatten()
         .collect();
 
-    for (i, intent) in intents.iter().enumerate() {
-        if !used.contains(&i) && !contested.contains(intent) && !intent_is_absorbed(intent, &r.ids)
+    // Repeated statements share the matched statement's disposition. Absorption
+    // itself must use the input: newly minted identities cannot validate a typo,
+    // and reusing a retired name cannot invalidate an already applied annotation.
+    let accounted: BTreeSet<&Intent> = used.iter().map(|&i| &intents[i]).collect();
+    for intent in intents {
+        if !accounted.contains(intent)
+            && !contested.contains(intent)
+            && !intent_is_absorbed(intent, ids)
         {
             blockers.push(Blocker::UnusedIntent {
                 intent: intent.clone(),
@@ -400,8 +406,8 @@ fn resolve_roles(
     // may defer to another matchable claim for that source; an appended current
     // decision must be judged on its own, or the annotation's match can make a
     // different command report success. A leading annotation paired with a
-    // drop is stale provenance: the drop consumes the reused source, after
-    // which the final sweep recognizes the annotation as absorbed. Deduplicate
+    // drop is stale provenance. Account for these recognized annotations here,
+    // since the final absorption check describes the input identities. Deduplicate
     // by target so two statements against one occupied name describe one
     // collision rather than repeating the same diagnosis.
     let mut occupied_targets = BTreeSet::new();
@@ -414,13 +420,11 @@ fn resolve_roles(
             && intents.iter().any(
                 |candidate| matches!(candidate, Intent::DropRole { role, .. } if role == from),
             );
-        if disappeared.contains(from)
-            && (current_decision || !claims.iter().any(|claim| claim.source == from))
-            && declared_names.contains(&to)
-            && known.contains_key(to)
-            && !stale_annotation
-        {
-            if occupied_targets.insert(to.clone()) {
+        if disappeared.contains(from) && declared_names.contains(&to) && known.contains_key(to) {
+            if (current_decision || !claims.iter().any(|claim| claim.source == from))
+                && !stale_annotation
+                && occupied_targets.insert(to.clone())
+            {
                 blockers.push(Blocker::RenameTargetExists { target: to.clone() });
             }
             used.insert(i);
@@ -541,9 +545,9 @@ fn resolve_tables(
     // annotation may defer to another matchable claim for that source; an
     // appended current decision must be judged on its own, or the annotation's
     // match can make a different command report success. A leading annotation
-    // paired with a drop is stale provenance: the drop consumes the reused
-    // source, after which the final sweep recognizes the annotation as
-    // absorbed. Deduplicate by target so two statements against one occupied
+    // paired with a drop is stale provenance. Account for these recognized
+    // annotations here, since the final absorption check describes the input
+    // identities. Deduplicate by target so two statements against one occupied
     // name describe one collision rather than repeating the diagnosis.
     let mut occupied_targets = BTreeSet::new();
     for (i, intent) in intents.iter().enumerate() {
@@ -555,13 +559,11 @@ fn resolve_tables(
             && intents.iter().any(
                 |candidate| matches!(candidate, Intent::DropTable { table, .. } if table == from),
             );
-        if disappeared.contains(from)
-            && (current_decision || !claims.iter().any(|claim| claim.source == from))
-            && declared_names.contains(&to)
-            && known.contains_key(to)
-            && !stale_annotation
-        {
-            if occupied_targets.insert(to.clone()) {
+        if disappeared.contains(from) && declared_names.contains(&to) && known.contains_key(to) {
+            if (current_decision || !claims.iter().any(|claim| claim.source == from))
+                && !stale_annotation
+                && occupied_targets.insert(to.clone())
+            {
                 blockers.push(Blocker::RenameTargetExists {
                     target: to.clone().to_string(),
                 });
@@ -632,6 +634,8 @@ fn resolve_columns(
     // tombstones for its columns are handled in drop_table_in_ids.
     for (table_name, table) in &declared.tables {
         let declared_cols: BTreeSet<&String> = table.columns.keys().collect();
+        // Table resolution has already moved column owners to their new names;
+        // this stage deliberately reads that output, before changing columns.
         let known: BTreeMap<String, Uid> = r
             .ids
             .columns
@@ -678,8 +682,8 @@ fn resolve_columns(
         // defer to another matchable claim for that source; an appended current
         // decision must be judged on its own, or the annotation's match can
         // make a different command report success. A leading annotation paired
-        // with a drop is stale provenance: the drop consumes the reused source,
-        // after which the final sweep recognizes the annotation as absorbed.
+        // with a drop is stale provenance. Account for these recognized
+        // annotations here, since absorption describes the input identities.
         // Deduplicate by target to keep one diagnosis per name.
         let mut occupied_targets = BTreeSet::new();
         for (i, intent) in intents.iter().enumerate() {
@@ -694,12 +698,13 @@ fn resolve_columns(
                 });
             if table == table_name
                 && disappeared.contains(from)
-                && (current_decision || !claims.iter().any(|claim| claim.source.name == *from))
                 && declared_cols.contains(&to)
                 && known.contains_key(to)
-                && !stale_annotation
             {
-                if occupied_targets.insert(to.clone()) {
+                if (current_decision || !claims.iter().any(|claim| claim.source.name == *from))
+                    && !stale_annotation
+                    && occupied_targets.insert(to.clone())
+                {
                     blockers.push(Blocker::RenameTargetExists {
                         target: table_name.column(to).to_string(),
                     });
@@ -837,4 +842,70 @@ fn sort_resolution(r: &mut Resolution) {
     r.created_roles.sort();
     r.dropped_roles.sort();
     r.renamed_roles.sort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{Column, Table};
+
+    fn schema(columns: &[&str]) -> Schema {
+        let mut table = Table::default();
+        for name in columns {
+            table
+                .columns
+                .insert((*name).into(), Column::new("int".parse().unwrap()));
+        }
+        let mut schema = Schema::default();
+        schema.tables.insert("dbo.customer".parse().unwrap(), table);
+        schema
+    }
+
+    fn ctx() -> Context {
+        Context {
+            operator: "test".into(),
+            today: "2026-09-11".into(),
+        }
+    }
+
+    #[test]
+    fn an_absorbed_column_rename_allows_reusing_its_source_name() {
+        let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let table: TableName = "dbo.customer".parse().unwrap();
+        let intent = Intent::RenameColumn {
+            table: table.clone(),
+            from: "code".into(),
+            to: "code_v1".into(),
+        };
+        let result = resolve(&schema(&["code_v1", "code"]), &before, &[intent], &ctx()).unwrap();
+        assert!(result.renamed_columns.is_empty());
+        assert_eq!(result.added_columns.len(), 1);
+        assert_eq!(result.added_columns[0].1, table.column("code"));
+        assert_eq!(
+            result.ids.column_uid(&table.column("code_v1")),
+            before.column_uid(&table.column("code_v1"))
+        );
+    }
+
+    #[test]
+    fn a_typo_in_a_new_columns_rename_source_is_not_absorbed() {
+        let before = resolve(&schema(&["id"]), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intent = Intent::RenameColumn {
+            table: "dbo.customer".parse().unwrap(),
+            from: "custmer_name".into(),
+            to: "full_name".into(),
+        };
+        let errors = resolve(
+            &schema(&["id", "full_name"]),
+            &before,
+            std::slice::from_ref(&intent),
+            &ctx(),
+        )
+        .unwrap_err();
+        assert_eq!(errors, vec![Blocker::UnusedIntent { intent }]);
+    }
 }
