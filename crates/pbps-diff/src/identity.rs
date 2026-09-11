@@ -212,9 +212,38 @@ fn resolve_with_provenance(
     // and reusing a retired name cannot invalidate an already applied annotation.
     let accounted: BTreeSet<&Intent> = used.iter().map(|&i| &intents[i]).collect();
     for intent in intents {
+        // Column annotations use the declared table name. A table rename moves
+        // their scope, but does not make newly added columns prior identities.
+        let original_intent = match intent {
+            Intent::RenameColumn { table, from, to } => {
+                r.renamed_tables
+                    .iter()
+                    .find_map(|(_, old_table, new_table)| {
+                        (table == new_table).then(|| Intent::RenameColumn {
+                            table: old_table.clone(),
+                            from: from.clone(),
+                            to: to.clone(),
+                        })
+                    })
+            }
+            Intent::DropColumn { column, reason } => {
+                r.renamed_tables
+                    .iter()
+                    .find_map(|(_, old_table, new_table)| {
+                        (&column.table == new_table).then(|| Intent::DropColumn {
+                            column: old_table.column(&column.name),
+                            reason: reason.clone(),
+                        })
+                    })
+            }
+            Intent::RenameTable { .. }
+            | Intent::DropTable { .. }
+            | Intent::RenameRole { .. }
+            | Intent::DropRole { .. } => None,
+        };
         if !accounted.contains(intent)
             && !contested.contains(intent)
-            && !intent_is_absorbed(intent, ids)
+            && !intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids)
         {
             blockers.push(Blocker::UnusedIntent {
                 intent: intent.clone(),
@@ -907,5 +936,49 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors, vec![Blocker::UnusedIntent { intent }]);
+    }
+
+    #[test]
+    fn a_table_rename_preserves_absorbed_column_intents_without_absorbing_typos() {
+        let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let old_table: TableName = "dbo.customer".parse().unwrap();
+        let new_table: TableName = "dbo.clients".parse().unwrap();
+        let mut declared = schema(&["code_v1", "code"]);
+        let table = declared.tables.remove(&old_table).unwrap();
+        declared.tables.insert(new_table.clone(), table);
+        let rename_table = Intent::RenameTable {
+            from: old_table.clone(),
+            to: new_table.clone(),
+        };
+        let annotation = Intent::RenameColumn {
+            table: new_table.clone(),
+            from: "code".into(),
+            to: "code_v1".into(),
+        };
+        let result = resolve(
+            &declared,
+            &before,
+            &[rename_table.clone(), annotation],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(result.renamed_tables.len(), 1);
+        assert!(result.renamed_columns.is_empty());
+        assert_eq!(result.added_columns.len(), 1);
+        assert_eq!(
+            result.ids.column_uid(&new_table.column("code_v1")),
+            before.column_uid(&old_table.column("code_v1"))
+        );
+
+        let typo = Intent::RenameColumn {
+            table: new_table,
+            from: "custmer_code".into(),
+            to: "code".into(),
+        };
+        let errors =
+            resolve(&declared, &before, &[rename_table, typo.clone()], &ctx()).unwrap_err();
+        assert_eq!(errors, vec![Blocker::UnusedIntent { intent: typo }]);
     }
 }
