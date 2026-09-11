@@ -9180,3 +9180,32 @@ SPEC is in sync with all of these.
     map and its successful report travel together; a failed check produces no
     success report. CLI regressions pin named JSON refusals and successful
     answers for all three existing checks, alongside their apply paths (#305).
+
+433. **The required-add-value scan's identifier boundary is the caller's, not
+    always SQL Server's.** `Column::has_required_add_value_source` split a
+    default's text on `is_regular_identifier_continue` — SQL Server's rule —
+    to look for a bare `NULL`-producing word, and PostgreSQL's preflight
+    called it unchanged. Measured on 18.6, a combining mark (`\u{301}`)
+    continues a PostgreSQL identifier and is not alphanumeric, so
+    `null\u{301}x()` — a plain call to one name the engine accepts unquoted —
+    split at the mark under the shared rule into the bare word `null`, and a
+    column with a perfectly good default was read as having none.
+
+    `has_required_add_value_source_with` takes the identifier boundary as a
+    parameter, the same split ADR-0011 Amendment 2 made for
+    `normalize_definition` and DECISIONS 315 made for the dependency scan.
+    The no-argument form keeps SQL Server's rule as its default: right for
+    `pbps-mssql`'s own preflight, because it is SQL Server, and right for the
+    model's dialect-free `Change::intrinsic_risks`, which classifies risk
+    before any dialect is chosen and has no other rule to ask. `pbps-pg`'s
+    preflight is the one caller with a dialect and a different answer, and it
+    now asks with `Lexicon::identifier_continues`.
+
+    The model's dependency and reference scans (`creation_order_with`,
+    `references_with`) already took this shape; this closes the one caller
+    of `is_regular_identifier_continue` in production code that had not
+    (issue #128). Pinned by
+    `a_combining_mark_is_read_as_a_name_byte_under_postgresqls_boundary_and_a_gap_under_the_shared_one`
+    in the model, which holds SQL Server's own answer unchanged, and by
+    `a_combining_mark_in_a_default_is_not_read_as_the_bare_null_keyword` in
+    `pbps-pg`, against the arm that builds the probe.

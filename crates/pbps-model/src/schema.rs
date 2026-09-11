@@ -196,32 +196,57 @@ impl Column {
         self.deprecated.is_some()
     }
 
-    /// Whether SQL Server has a declared source for existing rows when this is
-    /// added as a required column.
+    /// Whether the engine has a declared source for existing rows when this
+    /// is added as a required column.
     ///
     /// Expressions stay opaque everywhere else, but a default that explicitly
-    /// invokes SQL Server's NULL-producing constructs is not a trustworthy
-    /// value source. This is deliberately a conservative lexical check rather
-    /// than an attempt to evaluate or normalize SQL.
+    /// invokes a NULL-producing construct is not a trustworthy value source.
+    /// This is deliberately a conservative lexical check rather than an
+    /// attempt to evaluate or normalize SQL.
+    ///
+    /// Boundaries an identifier by [`crate::module::is_regular_identifier_continue`]
+    /// — SQL Server's own rule. That is right for SQL Server's own caller and
+    /// for the model's dialect-free risk classification
+    /// (`Change::intrinsic_risks`), which runs before a dialect is chosen and
+    /// has no other rule to ask for. A caller that does have a dialect uses
+    /// [`Self::has_required_add_value_source_with`] instead, the same split
+    /// ADR-0011 Amendment 2 made for `normalize_definition` (DECISIONS 226,
+    /// 433).
     pub fn has_required_add_value_source(&self) -> bool {
+        self.has_required_add_value_source_with(crate::module::is_regular_identifier_continue)
+    }
+
+    /// [`Self::has_required_add_value_source`], with an identifier's end
+    /// decided by `continues_ident` instead of assumed to be SQL Server's.
+    ///
+    /// PostgreSQL's rule is over bytes, so every non-ASCII byte continues a
+    /// name there and the shared default's `char::is_alphanumeric` does not
+    /// agree with it on all of them — **measured**, a combining mark
+    /// (`\u{301}`) is not alphanumeric, so `null\u{301}x` — one PostgreSQL
+    /// identifier, accepted unquoted — splits at the mark under the shared
+    /// rule into the bare word `null`, and a function call is misread as an
+    /// explicit `NULL`.
+    pub fn has_required_add_value_source_with(&self, continues_ident: fn(char) -> bool) -> bool {
         self.identity.is_some()
             || self
                 .default
                 .as_deref()
-                .is_some_and(|default| !has_explicit_null_semantics(default))
+                .is_some_and(|default| !has_explicit_null_semantics(default, continues_ident))
     }
 }
 
-fn has_explicit_null_semantics(expression: &str) -> bool {
+fn has_explicit_null_semantics(expression: &str, continues_ident: fn(char) -> bool) -> bool {
     // String literals and comments are not SQL expressions. Blanking them
     // keeps a harmless default such as 'NULL' from being mistaken for the NULL
     // keyword while still finding it inside CAST(NULL AS int), arithmetic, and
     // other expression shapes.
     crate::module::code_without_quoted_identifiers(expression)
-        // SQL Server regular identifiers use Unicode letters and decimal
-        // digits, plus these four continuation characters. Treating `$`, `@`,
-        // or `#` as punctuation would turn `seq$null` into a false NULL token.
-        .split(|ch: char| !crate::module::is_regular_identifier_continue(ch))
+        // Where a word ends is the caller's rule, not always SQL Server's
+        // (`is_regular_identifier_continue`) — treating `$`, `@`, or `#` as
+        // punctuation there would turn `seq$null` into a false NULL token,
+        // and treating a byte PostgreSQL reads as a name as a boundary
+        // instead turns a name into one.
+        .split(|ch: char| !continues_ident(ch))
         .any(|word| {
             word.eq_ignore_ascii_case("null")
                 || word.eq_ignore_ascii_case("nullif")
@@ -402,6 +427,46 @@ mod tests {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
         }
+    }
+
+    /// The keyword scan's word boundary is the caller's rule, not always SQL
+    /// Server's. **Measured on PostgreSQL 18.6**, `null\u{301}x` — `null`
+    /// followed by a combining acute accent, then `x` — is one identifier:
+    /// `CREATE FUNCTION zz.null\u{301}x() ...` is accepted and names the
+    /// routine `nulĺx`, callable unquoted. `\u{301}` is not alphanumeric, so
+    /// the shared rule (`is_regular_identifier_continue`, `char::is_alphanumeric`)
+    /// splits it from `null` and reads a bare `null` where the engine reads
+    /// one name — misclassifying a plain function call as an explicit NULL
+    /// and, under [`Change::intrinsic_risks`] or an mssql-shaped preflight
+    /// probe, the column as having no trustworthy value source.
+    #[test]
+    fn a_combining_mark_is_read_as_a_name_byte_under_postgresqls_boundary_and_a_gap_under_the_shared_one()
+     {
+        // PostgreSQL's own rule (`pbps_dialect::continues_ident`, not
+        // imported here: the model stays dialect-free by constraint) — every
+        // non-ASCII byte continues a name, so the mark stays glued to `null`
+        // and the whole thing reads as the one word `null\u{301}x`, which
+        // does not match the keyword list.
+        fn postgresql_boundary(ch: char) -> bool {
+            ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
+        }
+
+        let mut column = Column::new(ty("int"));
+        column.default = Some("zz.null\u{301}x()".into());
+
+        assert!(
+            column.has_required_add_value_source_with(postgresql_boundary),
+            "a plain call to a name PostgreSQL reads as one identifier"
+        );
+
+        // Negative: unparametrized, the answer is unchanged — SQL Server's
+        // rule still splits at the mark and still reads the bare word
+        // `null`, exactly as it did before `has_required_add_value_source_with`
+        // existed.
+        assert!(
+            !column.has_required_add_value_source(),
+            "the shared default keeps SQL Server's answer"
+        );
     }
 
     /// Column order affects CREATE TABLE output, so it has to be preserved.

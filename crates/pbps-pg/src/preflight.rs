@@ -2738,7 +2738,14 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             name,
             column,
             ..
-        } if !column.nullable && !column.has_required_add_value_source() => {
+        // This engine's own identifier boundary, not the model's default
+        // (SQL Server's): measured, a combining mark continues a PostgreSQL
+        // name, and the model's own rule does not agree — `null\u{301}x()`
+        // is a function call there and, read by the default rule, an
+        // expression that "explicitly invokes NULL" (DECISIONS 433).
+        } if !column.nullable
+            && !column.has_required_add_value_source_with(crate::LEXICON.identifier_continues) =>
+        {
             let Some(stored) = names.table(table) else {
                 return Ok(Vec::new());
             };
@@ -3378,6 +3385,32 @@ mod tests {
             asked[0].sql.contains("r.k0 IS NOT NULL"),
             "{}",
             asked[0].sql
+        );
+    }
+
+    /// This arm's guard asks with this engine's own identifier boundary, not
+    /// the model's default (SQL Server's). **Measured on 18.6**, a combining
+    /// mark continues a PostgreSQL name, so `zz.null\u{301}x()` is a call to
+    /// one identifier and not the bare keyword `null` split from an `x` that
+    /// follows it — read by the model's SQL-Server-shaped default instead,
+    /// the mark is a boundary and the call misreads as an explicit NULL
+    /// (issue #128, DECISIONS 433).
+    ///
+    /// The probe list itself does not move for this particular default:
+    /// `constant_default`, just below, already screens every non-literal
+    /// expression out of the row-count probe — which is what keeps
+    /// `NULLIF(1, 2)` from one above this test from being counted either.
+    /// What this pins is the guard's own answer, over the boundary this crate
+    /// actually wires in (`crate::LEXICON.identifier_continues`), so that a
+    /// future loosening of that inner screen inherits the right boundary
+    /// rather than silently inheriting SQL Server's.
+    #[test]
+    fn the_required_add_guard_reads_a_combining_mark_by_this_engines_own_boundary() {
+        let mut column = pbps_model::Column::new("int".parse().expect("a type")).not_null();
+        column.default = Some("zz.null\u{301}x()".to_owned());
+        assert!(
+            column.has_required_add_value_source_with(crate::LEXICON.identifier_continues),
+            "a plain call PostgreSQL reads as one name is a trustworthy value source"
         );
     }
 
