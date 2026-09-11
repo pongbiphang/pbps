@@ -134,6 +134,7 @@ fn full_catalog() -> RawCatalog {
                 default_set_options: true,
             },
         ],
+        module_dependencies: Vec::new(),
     }
 }
 
