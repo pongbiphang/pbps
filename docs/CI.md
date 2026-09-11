@@ -63,12 +63,11 @@ Add `--format json` to a read-only command for the same findings as typed data
 the binary** (SPEC 14.3): the JSON is the stable surface, and a converter can be
 rewritten for a platform the binary has never heard of.
 
-One command refuses it, on purpose: a **connected** plan. `pbps plan --env prod
---format json` exits `1` with `flags.conflicting` — measured — because
-`--format json` describes findings while `plan --db` produces a plan, and the
-two are different artifacts. The tool says what to do instead, and so does this
-file: write the plan with `--out plan.json`, then read it with
-`pbps explain --plan plan.json --format json`.
+A connected plan also accepts `--format json`. Its envelope reports the change
+counts and connected capability checks; `--out plan.json` writes the separate,
+checksum-pinned artifact that `apply` accepts. Use `pbps explain --plan plan.json
+--format json` to inspect that artifact's full change list. A connection or
+planning failure produces an `unanswerable` envelope and exits `1`.
 
 ## Credentials
 

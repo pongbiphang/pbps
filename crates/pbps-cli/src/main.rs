@@ -684,41 +684,24 @@ fn run() -> anyhow::Result<()> {
                          environment; run them separately",
                     )?;
                 }
-                if json {
-                    // Refused rather than ignored. `--format json` was accepted
-                    // here and then dropped: `cmd_plan_db` prints human text, so
-                    // a consumer that asked for JSON got prose on success and an
-                    // *empty stdout* on every failure — while the flag
-                    // validations a few lines above, in the same invocation,
-                    // answered it properly. Silently honouring a flag in some
-                    // branches of one command is worse than not having it.
-                    //
-                    // Refused rather than implemented, because `plan --db` is
-                    // not a findings command: its output *is* an artifact. The
-                    // typed form of this plan already exists and is better than
-                    // an envelope would be — `--out plan.json`, which is the
-                    // file the deployment gate approves, read back by `explain
-                    // --plan --format json`. Adding a second typed rendering
-                    // would give a reviewer two documents to disagree about.
-                    let plan = report::placeholder("plan.json");
-                    refuse(&format!(
-                        "--format json describes findings, and `plan --db` produces a plan.\n\
-                         Write it with --out {plan} and read it with \
-                         `pbps explain --plan {plan} --format json`"
-                    ))?;
-                }
                 let target = output::or_unanswerable(
                     "plan",
                     json,
                     "environment.unconfigured",
                     target.resolve(&project),
                 )?;
-                return deploy::cmd_plan_db(
-                    &project,
-                    &target,
-                    out.as_deref(),
-                    sql.as_deref(),
-                    staged,
+                return output::or_unanswerable(
+                    "plan",
+                    json,
+                    "plan.failed",
+                    deploy::cmd_plan_db(
+                        &project,
+                        &target,
+                        out.as_deref(),
+                        sql.as_deref(),
+                        staged,
+                        json,
+                    ),
                 );
             }
             if staged {
@@ -2253,6 +2236,8 @@ pub struct PlanData {
     modules: usize,
     roles: usize,
     risks: Vec<&'static str>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    connected_checks: Vec<engine::ConnectedCheck>,
 }
 
 /// What an offline `plan` was asked to do.
@@ -2721,6 +2706,7 @@ fn cmd_plan(
                 modules,
                 roles: report::touched_roles(&cs),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
+                connected_checks: Vec::new(),
             }),
         );
         // A non-converging rehearsal is an error finding, so `outcome` exits 2
