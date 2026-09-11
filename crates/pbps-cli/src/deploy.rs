@@ -56,6 +56,9 @@ pub struct Managed {
     /// placed in the schema: `plan --db` projects two different views out of
     /// one read (see [`pbps_model::data::read_scopes`]).
     pub rows: ObservedRows,
+    /// Names outside the managed set whose relation definitions were omitted.
+    /// An unsupported temporal table still occupies its name (SPEC §7.6).
+    pub unmanaged_relations: Vec<TableName>,
 }
 
 /// The scoped state alone, with the rows of every table in `scopes` read back
@@ -168,6 +171,12 @@ async fn managed_state_once(
         managed_state_full(conn, ids, modules, unmanaged, &rows_to_read(scopes), read).await?;
     refuse_managed_limitations(&managed.limitations)?;
     let mut scoped = managed.scoped;
+    // Definition projection must not manufacture absence. Keep the same
+    // read's omitted relation names for final endpoint checks, without
+    // recording an unsupported definition in the schema (SPEC §7.6).
+    scoped.unmanaged.extend(managed.unmanaged_relations);
+    scoped.unmanaged.sort();
+    scoped.unmanaged.dedup();
     scoped.schema = scoped
         .schema
         .with_observed_rows(&managed.rows, scopes, reference)?;
@@ -332,6 +341,22 @@ async fn managed_state_full(
     let pulled = pull(conn, read).await?;
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
     let limitations = managed_limitations(&pulled, ids, modules);
+    let unmanaged_relations = pulled
+        .limitations
+        .iter()
+        .filter_map(|limitation| match &limitation.target {
+            pbps_db::catalog::LimitationTarget::Relation(name)
+                if !ids.tables.values().any(|managed| managed == name)
+                    && !modules.contains(&ModuleId::Named(name.clone())) =>
+            {
+                Some(name.clone())
+            }
+            pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::SharedModule(_)
+            | pbps_db::catalog::LimitationTarget::Module(_)
+            | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
+        })
+        .collect();
     let scoped = cut(&pulled, ids, modules, &unreadable, unmanaged)?;
     let rows = crate::engine::read_rows(conn, &scoped.schema, rows, read)
         .await
@@ -341,6 +366,7 @@ async fn managed_state_full(
         limitations,
         unreadable,
         rows,
+        unmanaged_relations,
     })
 }
 
@@ -4789,7 +4815,7 @@ async fn refuse_recreated_tables(
     Ok(())
 }
 
-/// The logical rename omits its intermediate names (DECISIONS 435). Their
+/// The logical rename omits its intermediate names (DECISIONS 436). Their
 /// emitted moves still promise absence at closing (SPEC §7.6), unless a
 /// later move or the logical plan deliberately gives the name to a table.
 fn removed_table_names(

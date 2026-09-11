@@ -11753,9 +11753,10 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 fn a_staged_rename_checks_recreated_names_under_the_database_collation() {
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
-    for (slug, collation, refuses) in [
-        ("recreated_ci", "Latin1_General_100_CI_AS", true),
-        ("recreated_cs", "Latin1_General_100_CS_AS", false),
+    for (slug, collation, refuses, temporal) in [
+        ("recreated_ci", "Latin1_General_100_CI_AS", true, false),
+        ("recreated_cs", "Latin1_General_100_CS_AS", false, false),
+        ("recreated_temporal", "Latin1_General_100_CI_AS", true, true),
     ] {
         let own = OwnDatabase::new(&server, slug);
         on_server(
@@ -11789,16 +11790,24 @@ fn a_staged_rename_checks_recreated_names_under_the_database_collation() {
             stdout(&planned),
             stderr(&planned)
         );
+        let columns = if temporal {
+            "impostor int, starts_at datetime2 GENERATED ALWAYS AS ROW START NOT NULL DEFAULT SYSUTCDATETIME(), ends_at datetime2 GENERATED ALWAYS AS ROW END NOT NULL DEFAULT CONVERT(datetime2, '9999-12-31 23:59:59.9999999'), PERIOD FOR SYSTEM_TIME (starts_at, ends_at)"
+        } else {
+            "impostor int"
+        };
+        let create = format!("CREATE TABLE dbo.t ({columns})").replace('\'', "''");
         on_server(
             connection,
-            r#"
+            &format!(
+                r#"
             CREATE TRIGGER recreate_source ON DATABASE FOR RENAME, ALTER_SCHEMA AS
             BEGIN
               SET NOCOUNT ON;
               IF OBJECT_ID(N'dbo.T', N'U') IS NULL AND OBJECT_ID(N'dbo.t', N'U') IS NULL
-                EXEC(N'CREATE TABLE dbo.t (impostor int)');
+                EXEC(N'{create}');
             END
-        "#,
+        "#
+            ),
         );
         let apply = |resume| {
             let checksum = plan_checksum(&plan);
