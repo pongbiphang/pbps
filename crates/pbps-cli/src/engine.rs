@@ -458,9 +458,135 @@ pub async fn rename_impact(
     }
 }
 
+/// Cluster-owned identities move before pbps plans their database grants.
+/// SQL Server moves its database roles through the typed statements instead.
+pub async fn external_role_renames(
+    conn: &mut Conn,
+    recorded: &pbps_model::IdsFile,
+    declared: &pbps_model::IdsFile,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    match conn.driver() {
+        Driver::Mssql => Ok(BTreeMap::new()),
+        Driver::Postgres => {
+            let mut renames = BTreeMap::new();
+            for (uid, from) in &recorded.roles {
+                let Some(to) = declared.roles.get(uid).filter(|to| *to != from) else {
+                    continue;
+                };
+                let evidence = pbps_pg::roles::rename_evidence(conn, from, to).await?;
+                if let Some(error) = pbps_pg::roles::refuse_rename(from, to, evidence) {
+                    return Err(error.into());
+                }
+                renames.insert(from.clone(), to.clone());
+            }
+            Ok(renames)
+        }
+    }
+}
+
+/// A replacement may be explicit or synthesized as a drop and create.
+/// Ordinary drops intentionally discard the object; they are not rebuilds.
+// The complement is intentionally every change that does not write a module.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn rebuilt_modules(
+    changes: &ChangeSet,
+) -> BTreeMap<pbps_model::ModuleId, (pbps_model::ModuleKind, pbps_model::ModuleKind)> {
+    use pbps_model::Change;
+    let dropped: BTreeMap<_, _> = changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropModule { id, kind } => Some((id, *kind)),
+            _ => None,
+        })
+        .collect();
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::AlterModule { id, module } => Some((id.clone(), (module.kind, module.kind))),
+            Change::CreateModule { id, module } => dropped
+                .get(id)
+                .map(|kind| (id.clone(), (*kind, module.kind))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// PostgreSQL rebuilds must keep their locks, checks and DDL in one transaction.
+pub fn require_transactional_rebuilds(
+    driver: Driver,
+    changes: &ChangeSet,
+    staged: bool,
+) -> anyhow::Result<()> {
+    if driver == Driver::Postgres && staged && !rebuilt_modules(changes).is_empty() {
+        anyhow::bail!(
+            "PostgreSQL module rebuilds require a transaction to preserve their catalog state \
+             (ADR-0009 §3); remove --staged and plan again"
+        );
+    }
+    Ok(())
+}
+
+/// Called inside the transaction before the DROP and after the CREATE.
+/// SQL Server's CREATE OR ALTER preserves this state without a rebuild.
+pub async fn check_module_rebuilds(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    after: bool,
+) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Mssql => Ok(()),
+        Driver::Postgres => {
+            for (id, (before_kind, after_kind)) in rebuilt_modules(changes) {
+                let found = pbps_pg::modules::before_a_rebuild(
+                    conn,
+                    &id,
+                    if after { after_kind } else { before_kind },
+                )
+                .await?;
+                if let Some(reason) = found.refusal() {
+                    anyhow::bail!("{reason}");
+                }
+                if !after && let pbps_pg::modules::Serialized::Not(reason) = found.serialized {
+                    eprintln!("warning: {id}: {reason}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_checks_include_paired_drops_but_not_ordinary_drops() {
+        use pbps_model::{Change, Module, ModuleKind, PlannedChange};
+        let id: pbps_model::ModuleId = "app.v".parse().unwrap();
+        let mut cs = ChangeSet::default();
+        cs.changes.push(PlannedChange::new(Change::DropModule {
+            id: id.clone(),
+            kind: ModuleKind::View,
+        }));
+        assert!(rebuilt_modules(&cs).is_empty());
+        cs.changes.push(PlannedChange::new(Change::CreateModule {
+            id: id.clone(),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "SELECT 1".into(),
+            }),
+        }));
+        assert_eq!(
+            rebuilt_modules(&cs)[&id],
+            (ModuleKind::View, ModuleKind::Function)
+        );
+        assert!(require_transactional_rebuilds(Driver::Mssql, &cs, true).is_ok());
+        assert!(require_transactional_rebuilds(Driver::Postgres, &cs, true).is_err());
+        assert!(require_transactional_rebuilds(Driver::Postgres, &cs, false).is_ok());
+    }
 
     /// A runtime for the live tests below, built by hand because the
     /// workspace `tokio` has no `macros` feature.

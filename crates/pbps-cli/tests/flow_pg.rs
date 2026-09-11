@@ -181,6 +181,259 @@ const TWO_COLUMNS: &str = "table: app.t\ncolumns:\n  id: {type: bigint, nullable
                            label: {type: varchar(50)}\n\
                            primary_key: {name: pk_t, columns: [id]}\n";
 
+fn succeeds(o: Output) -> Output {
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    o
+}
+
+fn apply_plan(d: &Demo, connection: &str, plan: &std::path::Path, staged: bool) -> Output {
+    let checksum = plan_checksum(plan);
+    let mut args = vec![
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ];
+    if staged {
+        args.push("--staged");
+    }
+    d.run(&args)
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "module-rebuild");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("module-rebuild");
+    d.table(ONE_COLUMN);
+    let view = d.dir.join("schema/v.yml");
+    std::fs::write(&view, "view: app.v\ndefinition: SELECT id FROM app.t\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    std::fs::write(
+        &view,
+        "view: app.v\ndefinition: SELECT id FROM app.t WHERE id > 0\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
+
+    on_server(connection, "ALTER VIEW app.v SET (security_invoker = true)");
+    let o = d.run(&planning);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("security_invoker"), "{}", stderr(&o));
+    assert!(!plan.exists());
+    on_server(connection, "ALTER VIEW app.v RESET (security_invoker)");
+    succeeds(d.run(&planning));
+
+    let staged = d.run(&["plan", "--db", connection, "--staged"]);
+    assert_eq!(code(&staged), 1, "{}{}", stdout(&staged), stderr(&staged));
+    assert!(stderr(&staged).contains("module rebuilds require a transaction"));
+
+    // This attribute is outside the baseline checksum. Apply must ask again.
+    on_server(
+        connection,
+        "COMMENT ON VIEW app.v IS 'keep this operator note'",
+    );
+    let o = apply_plan(&d, connection, &plan, false);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("keep this operator note"),
+        "{}",
+        stderr(&o)
+    );
+    on_server(
+        connection,
+        "DO $$ BEGIN IF obj_description('app.v'::regclass) IS DISTINCT FROM 'keep this operator note' THEN RAISE EXCEPTION 'note was lost'; END IF; END $$",
+    );
+    on_server(connection, "COMMENT ON VIEW app.v IS NULL");
+
+    // The replacement itself can acquire state that the precheck never saw.
+    on_server(
+        connection,
+        "CREATE FUNCTION public.note_rebuilt_view() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN COMMENT ON VIEW app.v IS 'injected after create'; END $$",
+    );
+    on_server(
+        connection,
+        "CREATE EVENT TRIGGER note_rebuilt_view ON ddl_command_end WHEN TAG IN ('CREATE VIEW') EXECUTE FUNCTION public.note_rebuilt_view()",
+    );
+    let o = apply_plan(&d, connection, &plan, false);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("injected after create"),
+        "{}",
+        stderr(&o)
+    );
+    on_server(
+        connection,
+        "DO $$ BEGIN IF obj_description('app.v'::regclass) IS NOT NULL OR pg_get_viewdef('app.v'::regclass) LIKE '%WHERE%' THEN RAISE EXCEPTION 'failed rebuild committed'; END IF; END $$",
+    );
+    on_server(connection, "DROP EVENT TRIGGER note_rebuilt_view");
+    on_server(connection, "DROP FUNCTION public.note_rebuilt_view()");
+    succeeds(apply_plan(&d, connection, &plan, false));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn routine_rebuilds_do_not_restore_revoked_public_execute() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-rebuild");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-rebuild");
+    let file = d.dir.join("schema/secret.yml");
+    let declaration = |value| {
+        format!(
+            "function: app.secret()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT {value} $$\n"
+        )
+    };
+    std::fs::write(&file, declaration(1)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    std::fs::write(&file, declaration(2)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
+    succeeds(d.run(&planning));
+    on_server(
+        connection,
+        "REVOKE EXECUTE ON FUNCTION app.secret() FROM PUBLIC",
+    );
+    for o in [d.run(&planning), apply_plan(&d, connection, &plan, false)] {
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("PUBLIC"), "{}", stderr(&o));
+    }
+    on_server(
+        connection,
+        "DO $$ BEGIN IF app.secret() <> 1 OR EXISTS (SELECT 1 FROM pg_proc p, LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a WHERE p.oid = 'app.secret()'::regprocedure AND a.grantee = 0 AND a.privilege_type = 'EXECUTE') THEN RAISE EXCEPTION 'routine rebuild restored public access'; END IF; END $$",
+    );
+    // An explicit ACL remains carried state even if its entries resemble the
+    // default. Recreate the original default-only fixture for the safe case.
+    on_server(connection, "DROP FUNCTION app.secret()");
+    on_server(
+        connection,
+        "CREATE FUNCTION app.secret() RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$",
+    );
+    succeeds(apply_plan(&d, connection, &plan, false));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn completed_cluster_role_renames_are_pinned_and_recorded_without_role_sql() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for name in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {name}"));
+            }
+        }
+    }
+    let server = server();
+    let old = format!("pbps_old_{}", std::process::id());
+    let new = format!("pbps_new_{}", std::process::id());
+    let parked = format!("pbps_parked_{}", std::process::id());
+    let _roles = Roles(
+        server.clone(),
+        vec![old.clone(), new.clone(), parked.clone()],
+    );
+    on_server(&server, &format!("CREATE ROLE {old}"));
+    let own = OwnDatabase::new(&server, "role-rename");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("role-rename");
+    d.table(ONE_COLUMN);
+    let role_file = d.dir.join("schema/reader.yml");
+    let declaration =
+        |name: &str| format!("role: {name}\ngrants:\n  app.t: [select]\n  schema::app: [usage]\n");
+    std::fs::write(&role_file, declaration(&old)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    std::fs::write(&role_file, declaration(&new)).unwrap();
+    succeeds(d.run(&["rename-role", &old, &new]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
+    let refused = |o: Output| {
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("ALTER ROLE"), "{}", stderr(&o));
+    };
+    refused(d.run(&planning)); // NotRunYet
+    on_server(&server, &format!("CREATE ROLE {new}"));
+    refused(d.run(&planning)); // BothPresent
+    on_server(&server, &format!("DROP ROLE {new}"));
+    on_server(&server, &format!("ALTER ROLE {old} RENAME TO {parked}"));
+    refused(d.run(&planning)); // NeitherPresent
+    on_server(&server, &format!("ALTER ROLE {parked} RENAME TO {new}"));
+    succeeds(d.run(&planning)); // Done; no SQL is needed to move the grants.
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(saved.changes.is_empty());
+    on_server(&server, &format!("CREATE ROLE {old}"));
+    refused(apply_plan(&d, connection, &plan, false));
+    on_server(&server, &format!("DROP ROLE {old}"));
+    succeeds(apply_plan(&d, connection, &plan, false));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let listing = succeeds(d.run(&["state", "list", "--db", connection, "--format", "json"]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap()["data"]["entries"][0]
+            ["kind"],
+        "apply"
+    );
+
+    // Done also covers drop-and-create: plan its missing grants (377), while
+    // unrelated drift still refuses. Exercise the staged baseline as well.
+    std::fs::write(&role_file, declaration(&old)).unwrap();
+    succeeds(d.run(&["rename-role", &new, &old]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    on_server(connection, &format!("REVOKE SELECT ON app.t FROM {new}"));
+    on_server(
+        connection,
+        &format!("REVOKE USAGE ON SCHEMA app FROM {new}"),
+    );
+    on_server(&server, &format!("DROP ROLE {new}"));
+    on_server(&server, &format!("CREATE ROLE {old}"));
+    on_server(connection, "ALTER TABLE app.t ADD COLUMN stray integer");
+    let o = d.run(&planning);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("drifted"), "{}", stderr(&o));
+    on_server(connection, "ALTER TABLE app.t DROP COLUMN stray");
+    on_server(connection, &format!("GRANT USAGE ON SCHEMA app TO {old}"));
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    succeeds(apply_plan(&d, connection, &plan, true));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(
+        connection,
+        &format!(
+            "DO $$ BEGIN IF NOT has_table_privilege('{old}', 'app.t', 'SELECT') THEN RAISE EXCEPTION 'grant was not restored'; END IF; END $$"
+        ),
+    );
+}
+
 /// An unavailable rehearsal is not evidence that the PostgreSQL plan is
 /// invalid, and must be refused before SQL Server setup sees either backend.
 #[test]

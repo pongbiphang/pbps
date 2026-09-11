@@ -677,11 +677,12 @@ end to end against the real engine and is part of `scripts/live-tests-pg.sh`.
 What step 10 did not do is filed as issues, not carried here: the §11.5
 invariant set run through the CLI on PostgreSQL, the ADR "Limits" revisits, the
 docs that still describe the tool as SQL Server only, the `spikes/` decision,
-and what the seam exposed — the SQL Server rename-target builder without 407's
-mapping, a PostgreSQL pull with no unmanaged-module inventory, a PostgreSQL
+and what the seam exposed — a PostgreSQL pull with no unmanaged-module inventory, a PostgreSQL
 `doctor` that does not ask about DML or grant rights, the cost estimate no
-command asks for, and the PostgreSQL-only connected checks no command reaches
-yet.
+command asks for, and the remaining PostgreSQL-only connected checks. The SQL
+Server rename-target mapping landed in DECISIONS 416. Review fixes now connect
+PostgreSQL role-rename evidence and module rebuild checks (419–420), including
+the empty-SQL identity recording and the transactional before/after checks.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

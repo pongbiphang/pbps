@@ -8862,10 +8862,11 @@ SPEC is in sync with all of these.
     `unmanaged: error` as well as to the plan; PostgreSQL's `doctor` does not
     yet ask about the rights a `data:` block or a `role:` grant needs, and the
     seam hands them over so that the day it does no caller changes; and the
-    PostgreSQL-only connected checks — `roles::missing_roles`,
+    PostgreSQL-only connected checks initially left unwired — `roles::missing_roles`,
     `rename_evidence`, `drop_blockers`, `unsupported_permissions`,
-    `modules::before_a_rebuild` — are reached by that crate's live suite and
-    by no command. Each is an issue, not this step. The one thing the seam
+    `modules::before_a_rebuild` — were reached only by that crate's live suite.
+    Follow-ups track them; the review fixes in 419–420 wire role-rename
+    evidence and module rebuild checks into the CLI. The first thing the seam
     taught that *was* this step is 418: the first end-to-end `bootstrap` on
     PostgreSQL was refused by the engine's own pull, and the CLI now says
     where each catalog read runs.
@@ -8907,3 +8908,44 @@ SPEC is in sync with all of these.
     own uncommitted `CREATE TABLE` and the row it inserted, which is the
     whole reason it exists. Reverting the CLI's two `InsideOwnTransaction`
     sites to `Snapshot` brings the original refusal back in both flow tests.
+
+419. **A completed cluster role rename changes the connected baseline's names,
+    before its drift gate.** 377's four-state evidence now runs through the
+    CLI seam. The old and new names are paired only by the reviewed role UID;
+    only old-gone/new-present passes. The planner scopes the catalog under
+    those new names and the checkout-free apply repeats that projection from
+    the ledger and the plan's pinned ids. Neither alters a cluster role.
+
+    Done cannot distinguish rename from drop-and-create, as 377 records. For
+    these roles the planner compares the actual grants with the declarations
+    and plans what is missing; it still refuses unexpressible grants and drift
+    on every other object. The actual grants participate in the saved baseline
+    checksum, so changes after planning still refuse at apply. Evidence is
+    checked again inside the transactional apply, before execution and before
+    recording. The staged baseline and its checkpoints use the same names.
+
+    A pure rename emits no SQL, but is not an empty deployment: its identity
+    mapping must reach the ledger or every later verify reports the old name
+    missing. An empty PostgreSQL plan carrying roles therefore connects and
+    checks under the deployment lock; it records only if the mapping moved.
+    Other empty plans keep their connection-free path. No plan or ledger format
+    change is needed: the approved plan already carries the final role UIDs.
+
+420. **PostgreSQL module rebuilds reach the carried-state check, on both sides
+    of the DDL.** The connected planner checks explicit alterations and
+    synthesized drop/create replacements in a transaction it rolls back. Apply
+    checks before dropping and after creating, inside the transaction that
+    also records the result. The second check catches an event trigger or new
+    default privilege that changes what the new object carries. Every carried
+    item still refuses under ADR-0009 §3; grant restoration remains #248.
+    A staged rebuild refuses because its checkpoints cannot preserve the
+    check/lock/DDL transaction. Ordinary module drops are not rebuilds.
+
+    The successful live rebuild also exposed a false refusal: its PostgreSQL
+    deparsed definition differed from the declaration, and 160's comparison
+    assumed SQL Server's preserved text. The pure dialect now answers whether
+    a read-back matches a written module. PostgreSQL checks kind and existence,
+    not deparsed text or repository descriptions (SPEC §7.6's explicit limit);
+    SQL Server keeps its exact comparison. Untouched modules still compare two
+    catalog reads exactly. This does not claim to detect another writer's
+    change to the text of a module this plan itself writes.

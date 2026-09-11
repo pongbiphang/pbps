@@ -1205,6 +1205,14 @@ pub trait Dialect {
         self.lexicon().normalize_definition(definition)
     }
 
+    /// Whether a module read back after a write holds what that write promised.
+    /// Engines preserving the body can compare it; deparsed text is outside
+    /// SPEC §7.6's promise and cannot be predicted by a lexical normalizer.
+    /// Unchanged modules still compare two catalog reads exactly.
+    fn module_matches_declaration(&self, wrote: &Module, now: &Module) -> bool {
+        wrote == now
+    }
+
     /// The definition with everything that is not code blanked out, by this
     /// engine's lexis: the text the dependency scan reads (DECISIONS 315).
     fn code_only(&self, definition: &str) -> String {

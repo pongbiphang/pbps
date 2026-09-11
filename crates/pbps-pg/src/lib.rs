@@ -832,6 +832,14 @@ impl Dialect for Postgres {
     /// Returns every problem rather than the first, for the reason
     /// [`Dialect::validate_table`] does: a schema with three unspellable
     /// modules should need one pass.
+    fn module_matches_declaration(&self, wrote: &Module, now: &Module) -> bool {
+        // pg_get_viewdef/pg_get_functiondef reconstruct text from the catalog;
+        // added qualification and rendering are not an out-of-band rewrite.
+        // Descriptions are not database state. Kind and presence still are
+        // (SPEC §7.6); unchanged bodies compare catalog text against itself.
+        wrote.kind == now.kind
+    }
+
     fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {
         emit::validate_module(id, module)
     }
@@ -890,6 +898,24 @@ impl Dialect for Postgres {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deparsed_module_keeps_its_kind_without_predicting_its_text() {
+        let pg = Postgres::new();
+        let wrote = Module {
+            kind: ModuleKind::View,
+            description: Some("a repository annotation".into()),
+            definition: "SELECT id FROM app.t".into(),
+        };
+        let mut read = Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: " SELECT t.id\n   FROM app.t;".into(),
+        };
+        assert!(pg.module_matches_declaration(&wrote, &read));
+        read.kind = ModuleKind::Function;
+        assert!(!pg.module_matches_declaration(&wrote, &read));
+    }
 
     /// A bare name resolves through the write path — the object's own schema
     /// first, then the extras in the order they were configured — and

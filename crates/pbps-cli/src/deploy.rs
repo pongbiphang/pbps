@@ -1938,7 +1938,8 @@ fn refuse_unplanned_movement(
             break;
         }
         match (expected, after.modules.get(name)) {
-            (pbps_model::ModuleAfter::Standing(wrote), Some(now)) if now == wrote => {}
+            (pbps_model::ModuleAfter::Standing(wrote), Some(now))
+                if dialect.module_matches_declaration(wrote, now) => {}
             (pbps_model::ModuleAfter::Standing(_), Some(_)) => moved.push(format!(
                 "{name} does not hold the definition this plan wrote"
             )),
@@ -3226,7 +3227,7 @@ pub fn cmd_plan_db(
     let (cs, baseline_checksum, baseline_description) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
 
-        let Some(entry) = crate::engine::latest(&mut conn).await? else {
+        let Some(mut entry) = crate::engine::latest(&mut conn).await? else {
             bail!(
                 "`{}` has a ledger but no entries; there is nothing to plan against.\n\
                  Record one with `pbps baseline --reason ...`.",
@@ -3234,6 +3235,11 @@ pub fn cmd_plan_db(
             );
         };
         refuse_mid_deployment(&entry, &target.label)?;
+        let role_renames =
+            crate::engine::external_role_renames(&mut conn, &entry.snapshot.ids, &resolved.ids)
+                .await?;
+        let recorded_snapshot = entry.snapshot.clone();
+        rename_snapshot_roles(&mut entry.snapshot, &role_renames);
         let recorded_ids = entry.snapshot.ids.clone();
         // The baseline's module scope is the **recorded** state's, never the
         // declarations': `apply` has only the plan file and the ledger, so a
@@ -3341,7 +3347,18 @@ pub fn cmd_plan_db(
             &entry.snapshot.schema,
         )?;
         let live = pbps_model::state_checksum(&as_recorded, &recorded_ids);
-        let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
+        let mut expected = entry.snapshot.schema.clone();
+        // Done also permits drop-and-create (377). Grants lost with the old
+        // principal must be planned onto the new one, not rejected as drift.
+        // Only the explicitly renamed roles receive this treatment; their
+        // actual grants remain in the pinned baseline and the differ's input.
+        for to in role_renames.values() {
+            let Some(role) = as_recorded.roles.get(to) else {
+                bail!("renamed role `{to}` disappeared while reading the catalog; plan again");
+            };
+            expected.roles.insert(to.clone(), role.clone());
+        }
+        let recorded = pbps_model::state_checksum(&expected, &recorded_ids);
         if live != recorded {
             bail!(
                 "`{}` has drifted from the state recorded at {} (entry #{}).\n\
@@ -3415,6 +3432,18 @@ pub fn cmd_plan_db(
             }
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
+
+        crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
+        conn.begin(dialect.transaction_framing()).await?;
+        let checks = async {
+            crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
+                .await?;
+            crate::engine::check_module_rebuilds(&mut conn, &cs, false).await
+        }
+        .await;
+        let rollback = conn.rollback(dialect.transaction_framing()).await;
+        checks?;
+        rollback?;
 
         // The keys were matched to the rows under the type the key column has
         // now (71); a plan that changes that type would carry the mapping
@@ -3830,7 +3859,10 @@ fn apply_identified(
         bail!("--resume continues a staged apply; pass --staged as well");
     }
 
-    if plan.changes.is_empty() {
+    // A cluster role's rename has no SQL, but its approved identity mapping
+    // still has to be checked and recorded. Other empty plans keep the
+    // connection-free path; empty PostgreSQL role plans decide under the lock.
+    if plan.changes.is_empty() && (dialect.manages_roles() || plan.ids.roles.is_empty()) {
         println!("The plan is empty; nothing to apply.");
         return Ok(Attempt::Empty);
     }
@@ -3856,6 +3888,7 @@ fn apply_identified(
     }
 
     let statements = crate::statements(&plan.changes, dialect)?;
+    crate::engine::require_transactional_rebuilds(target.driver(), &plan.changes, staged)?;
     // Only for a transactional plan. A staged one exists *because* its
     // statement cannot run inside a transaction (ADR-0003): `plan --db
     // --staged` accepts it deliberately, and rejecting it here would leave
@@ -3887,7 +3920,9 @@ fn apply_identified(
         // have been answered about a database that is already moving.
         crate::engine::lock(&mut conn, operator).await?;
         let result = if staged {
-            apply_staged_under_lock(&mut conn, &deployment, resume).await
+            apply_staged_under_lock(&mut conn, &deployment, resume)
+                .await
+                .map(Some)
         } else {
             apply_under_lock(&mut conn, &deployment).await
         };
@@ -3901,7 +3936,12 @@ fn apply_identified(
     })?;
 
     Ok(match result {
-        Ok(entry) => Attempt::Applied { entry, released },
+        Ok(Some(entry)) => Attempt::Applied { entry, released },
+        Ok(None) => {
+            released.context("the empty plan's deployment lock could not be released")?;
+            println!("The plan is empty; nothing to apply.");
+            Attempt::Empty
+        }
         Err(error) => Attempt::Failed { error, released },
     })
 }
@@ -3991,7 +4031,7 @@ struct Deployment<'a> {
 }
 
 /// Everything between taking the lock and releasing it. Returns the ledger id.
-async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result<i64> {
+async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result<Option<i64>> {
     // Destructured straight back into the names the body below already uses:
     // every field is a shared reference, so this copies nothing.
     let Deployment {
@@ -4004,13 +4044,19 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         dialect,
         operator,
     } = *d;
-    let Some(entry) = crate::engine::latest(conn).await? else {
+    let Some(mut entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
             target.label
         );
     };
     refuse_mid_deployment(&entry, &target.label)?;
+    let original_ids = entry.snapshot.ids.clone();
+    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+    if plan.changes.is_empty() && role_renames.is_empty() {
+        return Ok(None);
+    }
+    rename_snapshot_roles(&mut entry.snapshot, &role_renames);
     let recorded_ids = entry.snapshot.ids.clone();
     let recorded_modules = managed_modules(Some(&entry.snapshot), None);
     // The scopes the closing read-back will use, expressed in the names the
@@ -4055,7 +4101,12 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
 
     println!("Applying {} statement(s)...", statements.len());
     let result = async {
-        execute_transaction_body(conn, dialect, statements).await?;
+        conn.begin(dialect.transaction_framing()).await?;
+        crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+        crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
+        execute_statements(conn, statements).await?;
+        crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
+        crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
 
         // What gets recorded is the database read back, not the plan applied to
         // the old state. Expressions come back in the engine's stored form, and
@@ -4121,7 +4172,18 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         Ok::<_, anyhow::Error>(crate::engine::record(conn, &snapshot).await?)
     }
     .await;
-    finish_transaction(conn, dialect, result).await
+    finish_transaction(conn, dialect, result).await.map(Some)
+}
+
+/// The cluster already moved these identities. Both the planner and the
+/// checkout-free apply must scope and pin the same names (DECISIONS 377).
+fn rename_snapshot_roles(snapshot: &mut StateSnapshot, renames: &BTreeMap<String, String>) {
+    for (from, to) in renames {
+        snapshot.ids.rename_role(from, to);
+        if let Some(role) = snapshot.schema.roles.remove(from) {
+            snapshot.schema.roles.insert(to.clone(), role);
+        }
+    }
 }
 
 /// A staged apply: one logical change, run statement by statement outside a
@@ -4156,12 +4218,16 @@ async fn apply_staged_under_lock(
         dialect,
         operator,
     } = *d;
-    let Some(entry) = crate::engine::latest(conn).await? else {
+    let Some(mut entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
             target.label
         );
     };
+
+    let original_ids = entry.snapshot.ids.clone();
+    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+    rename_snapshot_roles(&mut entry.snapshot, &role_renames);
 
     // Both branches read once and hand back what they validated: the
     // statement to start at, and the state the checkpoints are measured
@@ -4937,6 +5003,13 @@ async fn execute_transaction_body(
     conn.begin(dialect.transaction_framing())
         .await
         .context("cannot open a transaction")?;
+    execute_statements(conn, statements).await
+}
+
+async fn execute_statements(
+    conn: &mut Conn,
+    statements: &[pbps_dialect::Statement],
+) -> anyhow::Result<()> {
     for stmt in statements {
         if let Err(e) = conn.execute(&stmt.sql).await {
             return Err(anyhow::anyhow!(

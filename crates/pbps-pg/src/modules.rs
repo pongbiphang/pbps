@@ -39,12 +39,12 @@
 //! restores the default, so that case stays on the refusing side for good
 //! (DECISIONS 306).
 //!
-//! # Nothing here is called by a command yet
+//! # The connected caller
 //!
-//! `pbps-cli` refuses this dialect outright (`main.rs`), so the caller these
-//! answers are for arrives with the CLI's side of Phase 5. They are exercised
-//! by the crate's own live suite, against a real server, which is the bar every
-//! step of #76 is held to.
+//! `pbps-cli::engine` calls the rebuild check during connected planning and
+//! before and after the transactional rebuild (DECISIONS 420). The remaining
+//! dependency helpers are exercised by this crate's live suite; their CLI
+//! integration is tracked separately.
 
 use std::collections::{BTreeMap, BTreeSet};
 
