@@ -92,6 +92,7 @@ pub struct RawForeignKeyColumn {
 #[derive(Debug, Clone)]
 pub struct RawCheck {
     pub object_id: i32,
+    pub constraint_object_id: i32,
     pub name: String,
     pub definition: String,
 }
@@ -189,8 +190,8 @@ pub struct RawModule {
 
 /// One resolved same-database dependency from `sys.sql_expression_dependencies`.
 #[derive(Debug, Clone)]
-pub struct RawModuleDependency {
-    pub module_object_id: i32,
+pub struct RawObjectDependency {
+    pub referencing_object_id: i32,
     pub referenced_object_id: i32,
 }
 
@@ -280,7 +281,7 @@ pub struct RawCatalog {
     pub checks: Vec<RawCheck>,
     pub index_columns: Vec<RawIndexColumn>,
     pub modules: Vec<RawModule>,
-    pub module_dependencies: Vec<RawModuleDependency>,
+    pub object_dependencies: Vec<RawObjectDependency>,
     pub roles: Vec<RawRole>,
     pub permissions: Vec<RawPermission>,
 }
@@ -651,6 +652,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .unwrap_or_else(|| format!("object {id}"))
     };
 
+    // Grow the unavailable set before assembling either constraints or
+    // modules. Both can bind an object that was omitted from the declarations.
+    loop {
+        let mut changed = false;
+        for module in &raw.modules {
+            if module.requires_bound_references
+                && raw.object_dependencies.iter().any(|dependency| {
+                    dependency.referencing_object_id == module.object_id
+                        && unavailable_object_ids.contains(&dependency.referenced_object_id)
+                })
+            {
+                changed |= unavailable_object_ids.insert(module.object_id);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     for c in &raw.columns {
         let Some(table) = tables.get_mut(&c.object_id) else {
             continue;
@@ -771,6 +791,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&c.object_id) else {
             continue;
         };
+        if raw.object_dependencies.iter().any(|dependency| {
+            dependency.referencing_object_id == c.constraint_object_id
+                && unavailable_object_ids.contains(&dependency.referenced_object_id)
+        }) {
+            let table_name = name_of(c.object_id, &names);
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}: check constraint `{}` depends on an omitted temporal object or module; the check constraint was left out too",
+                    c.name
+                ),
+            );
+            continue;
+        }
         table.checks.insert(
             c.name.clone(),
             CheckConstraint {
@@ -854,25 +890,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // the same reason a computed column is not: a module missing from the
     // declarations is a module the next plan would propose destroying.
     let mut unmanaged_modules: Vec<UnmanagedModule> = Vec::new();
-    // A view (or inline TVF) that directly or transitively binds an omitted
-    // object cannot be recreated in an empty database. Grow the unavailable
-    // set to a fixed point so a view over an omitted view goes with it too.
-    loop {
-        let mut changed = false;
-        for module in &raw.modules {
-            if module.requires_bound_references
-                && raw.module_dependencies.iter().any(|dependency| {
-                    dependency.module_object_id == module.object_id
-                        && unavailable_object_ids.contains(&dependency.referenced_object_id)
-                })
-            {
-                changed |= unavailable_object_ids.insert(module.object_id);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
     for m in &raw.modules {
         let name = ObjectName::new(m.schema.clone(), m.name.clone());
         let mut unmanageable = |why: &str| {
@@ -1948,6 +1965,7 @@ mod tests {
         raw.columns.push(raw_column(99, "ghost", "int"));
         raw.checks.push(RawCheck {
             object_id: 99,
+            constraint_object_id: 199,
             name: "ck_ghost".into(),
             definition: "(1=1)".into(),
         });
@@ -2144,17 +2162,17 @@ mod module_tests {
         trigger.parent_object_id = Some(11);
         trigger.parent = Some(("dbo".into(), "v_transitive".into()));
         raw.modules = vec![direct, transitive, deferred, trigger];
-        raw.module_dependencies = vec![
-            RawModuleDependency {
-                module_object_id: 10,
+        raw.object_dependencies = vec![
+            RawObjectDependency {
+                referencing_object_id: 10,
                 referenced_object_id: 1,
             },
-            RawModuleDependency {
-                module_object_id: 11,
+            RawObjectDependency {
+                referencing_object_id: 11,
                 referenced_object_id: 10,
             },
-            RawModuleDependency {
-                module_object_id: 12,
+            RawObjectDependency {
+                referencing_object_id: 12,
                 referenced_object_id: 1,
             },
         ];
@@ -2177,6 +2195,62 @@ mod module_tests {
         assert!(pulled.unmanaged_modules.iter().any(|module| {
             module.target.object_name() == TableName::new("dbo", "tr_transitive")
                 && module.why.contains("another omitted module")
+        }));
+    }
+
+    #[test]
+    fn a_check_calling_an_unavailable_function_is_inventoried() {
+        let mut raw = raw_one_table();
+        let mut plain = raw.tables[0].clone();
+        plain.object_id = 2;
+        plain.name = "plain".into();
+        raw.tables.push(plain);
+        let mut column = raw.columns[0].clone();
+        column.object_id = 2;
+        raw.columns.push(column);
+        raw.tables[0].temporal_type = 2;
+
+        let mut function = module(
+            "dbo",
+            "fn_temporal",
+            ModuleKind::Function,
+            Some(
+                "CREATE FUNCTION dbo.fn_temporal() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT MAX(id) FROM dbo.t); END",
+            ),
+        );
+        function.object_id = 10;
+        function.requires_bound_references = true;
+        raw.modules.push(function);
+        raw.checks.push(RawCheck {
+            object_id: 2,
+            constraint_object_id: 20,
+            name: "ck_plain_temporal_fn".into(),
+            definition: "(dbo.fn_temporal()>=(0))".into(),
+        });
+        raw.object_dependencies = vec![
+            RawObjectDependency {
+                referencing_object_id: 10,
+                referenced_object_id: 1,
+            },
+            RawObjectDependency {
+                referencing_object_id: 20,
+                referenced_object_id: 10,
+            },
+        ];
+
+        let pulled = assemble(&raw);
+
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")]
+                .checks
+                .is_empty()
+        );
+        assert!(pulled.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == TableName::new("dbo", "plain")
+                && limitation.detail.contains("ck_plain_temporal_fn")
+                && limitation
+                    .detail
+                    .contains("omitted temporal object or module")
         }));
     }
 

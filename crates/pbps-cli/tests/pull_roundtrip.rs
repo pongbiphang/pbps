@@ -81,6 +81,7 @@ fn full_catalog() -> RawCatalog {
         }],
         checks: vec![RawCheck {
             object_id: 1,
+            constraint_object_id: 12,
             name: "ck_price".into(),
             definition: "([price]>(0))".into(),
         }],
@@ -136,7 +137,7 @@ fn full_catalog() -> RawCatalog {
                 default_set_options: true,
             },
         ],
-        module_dependencies: Vec::new(),
+        object_dependencies: Vec::new(),
     }
 }
 

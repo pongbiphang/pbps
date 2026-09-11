@@ -11,7 +11,7 @@ use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
     IndexKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawModuleDependency, RawTable, Securable, assemble,
+    RawKeyColumn, RawModule, RawObjectDependency, RawTable, Securable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the name list drops this tool's
@@ -107,7 +107,8 @@ SELECT fk.parent_object_id AS object_id, fk.name,
  ORDER BY fk.parent_object_id, fk.name, fkc.constraint_column_id;";
 
 const CHECKS: &str = "\
-SELECT cc.parent_object_id AS object_id, cc.name, cc.definition
+SELECT cc.parent_object_id AS object_id, cc.object_id AS constraint_object_id,
+       cc.name, cc.definition
   FROM sys.check_constraints cc
  WHERE cc.is_ms_shipped = 0
  ORDER BY cc.parent_object_id, cc.name;";
@@ -298,6 +299,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     for row in conn.query(CHECKS).await? {
         raw.checks.push(RawCheck {
             object_id: get(&row, "object_id")?,
+            constraint_object_id: get(&row, "constraint_object_id")?,
             name: get::<&str>(&row, "name")?.to_owned(),
             definition: get::<&str>(&row, "definition")?.to_owned(),
         });
@@ -343,8 +345,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     }
 
     for row in conn.query(MODULE_DEPENDENCIES).await? {
-        raw.module_dependencies.push(RawModuleDependency {
-            module_object_id: get(&row, "referencing_id")?,
+        raw.object_dependencies.push(RawObjectDependency {
+            referencing_object_id: get(&row, "referencing_id")?,
             referenced_object_id: get(&row, "referenced_id")?,
         });
     }
