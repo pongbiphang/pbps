@@ -1007,3 +1007,104 @@ fn doctor_examines_a_postgres_environment() {
     assert_eq!(absent["remedy"], "CREATE SCHEMA \"app\";", "{v}");
     assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "overload-rebind");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("overload-rebind");
+    std::fs::write(d.dir.join("schema/f-bigint.yml"),
+        "function: app.f(bigint)\ndefinition: (n bigint) RETURNS text LANGUAGE sql AS $$ SELECT 'old' $$\n").unwrap();
+    std::fs::write(d.dir.join("schema/caller.yml"),
+        "function: app.caller()\ndefinition: () RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT f(1); END\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF app.caller() <> 'old' THEN RAISE EXCEPTION 'wrong initial binding'; END IF; END $$",
+    );
+
+    std::fs::write(d.dir.join("schema/f-integer.yml"),
+        "function: app.f(integer)\ndefinition: (n integer) RETURNS text LANGUAGE sql AS $$ SELECT 'new' $$\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
+    succeeds(d.run(&planning));
+    // Run the real plan before inspecting its shape: an omitted rebuild must
+    // fail on the engine's observed binding, not merely a mirrored assertion.
+    succeeds(apply_plan(&d, connection, &plan, false));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF app.caller() <> 'new' THEN RAISE EXCEPTION 'successful apply retained the old overload binding'; END IF; END $$",
+    );
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let rebuilt: Vec<_> = saved
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            pbps_model::Change::AlterModule { id, .. } => Some(id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rebuilt, ["app.caller()"]);
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&planning));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A second new signature still reaches the ordinary carried-state guard.
+    // The scanner is intentionally conservative about overload applicability.
+    std::fs::write(d.dir.join("schema/f-smallint.yml"),
+        "function: app.f(smallint)\ndefinition: (n smallint) RETURNS text LANGUAGE sql AS $$ SELECT 'small' $$\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    on_server(connection, "COMMENT ON FUNCTION app.caller() IS 'keep me'");
+    let refused = d.run(&planning);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("comment"), "{}", stderr(&refused));
+    on_server(connection, "COMMENT ON FUNCTION app.caller() IS NULL");
+    succeeds(d.run(&planning));
+    let staged = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&staged), 1, "{}{}", stdout(&staged), stderr(&staged));
+    assert!(
+        stderr(&staged).contains("require a transaction"),
+        "{}",
+        stderr(&staged)
+    );
+    on_server(
+        connection,
+        "COMMENT ON FUNCTION app.caller() IS 'arrived after planning'",
+    );
+    let refused = apply_plan(&d, connection, &plan, false);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("comment"), "{}", stderr(&refused));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF to_regprocedure('app.f(smallint)') IS NOT NULL OR app.caller() <> 'new' THEN RAISE EXCEPTION 'refused rebuild changed the database'; END IF; END $$",
+    );
+}

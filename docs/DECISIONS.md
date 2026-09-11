@@ -8965,3 +8965,25 @@ SPEC is in sync with all of these.
     previously managed objects. At the read-back a removed cluster role is
     outside the managed set, as its declaration requests; it is not dropped
     from the cluster. Staged checkpoints adopt the same final role scope.
+
+422. **Rebinding is part of the typed diff, before ordering and approval.**
+    The connected seam reached the carried-state guard but not the pure
+    `modules::rebound_by_this_plan` rule (307). Measured through the CLI:
+    a parsed caller of `f(1)` stayed bound to `f(bigint)` after a plan added
+    `f(integer)`; apply recorded success and verify was clean.
+
+    The pure dialect trait now supplies the unchanged modules to rebuild for
+    arriving module names, new table names, and table-rename destinations.
+    PostgreSQL uses the existing write-path/name scan; the default adds none.
+    The differ deduplicates those modules and adds ordinary `AlterModule`
+    changes before risk classification and dependency ordering. Offline and
+    connected plans therefore agree on the rebuild, and the approved plan
+    carries it through the existing transactional carried-state checks. No
+    SQL or new state field is added outside the dialect's existing emitter.
+
+    A live CLI regression observes the new overload's result in the same
+    apply, no repeated rebuild on the next plan, and refusal for carried
+    comments or staged execution. Removing the diff integration restores the
+    old runtime binding despite a successful apply. The prior engine test
+    retains that bad middle state by deliberately omitting the synthesized
+    alteration, then executes the alteration from the actual typed plan.

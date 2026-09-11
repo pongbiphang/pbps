@@ -683,6 +683,8 @@ command asks for, and the remaining PostgreSQL-only connected checks. The SQL
 Server rename-target mapping landed in DECISIONS 416. Review fixes now connect
 PostgreSQL role-rename evidence and module rebuild checks (419–420), including
 the empty-SQL identity recording and the transactional before/after checks.
+The typed diff also includes PostgreSQL caller rebuilds for newly arriving
+names on their write path, before ordering and approval (422).
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

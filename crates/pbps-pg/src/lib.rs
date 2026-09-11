@@ -782,6 +782,23 @@ impl Dialect for Postgres {
             .map(|at| at + 1)
     }
 
+    fn rebound_modules(
+        &self,
+        declared: &Schema,
+        arriving: &[ModuleId],
+        already_changed: &std::collections::BTreeSet<ModuleId>,
+    ) -> std::collections::BTreeSet<ModuleId> {
+        modules::rebound_by_this_plan(
+            declared,
+            self.write_path_extras(),
+            arriving,
+            already_changed,
+        )
+        .into_iter()
+        .map(|rebound| rebound.module)
+        .collect()
+    }
+
     /// The spelling this engine puts in a routine's identity (ADR-0009 §1).
     ///
     /// The canonical form is what `format_type` prints **under the empty
@@ -898,6 +915,45 @@ impl Dialect for Postgres {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_rebuilds_each_caller_once_and_leaves_other_paths_alone() {
+        use std::collections::BTreeSet;
+        let mut declared = Schema::default();
+        let caller: ModuleId = "app.caller()".parse().unwrap();
+        declared.modules.insert(
+            caller.clone(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT f(1); END".into(),
+            },
+        );
+        let arrivals: Vec<ModuleId> = ["app.f(integer)", "app.f(smallint)"]
+            .into_iter()
+            .map(|id| id.parse().unwrap())
+            .collect();
+        let pg = Postgres::new();
+        assert_eq!(
+            pg.rebound_modules(&declared, &arrivals, &BTreeSet::new()),
+            [caller.clone()].into_iter().collect()
+        );
+        assert!(
+            pg.rebound_modules(&declared, &arrivals, &[caller].into_iter().collect())
+                .is_empty()
+        );
+        for arrival in ["other.f(integer)", "app.unrelated()", "app.t.f"] {
+            assert!(
+                pg.rebound_modules(&declared, &[arrival.parse().unwrap()], &BTreeSet::new())
+                    .is_empty(),
+                "{arrival}"
+            );
+        }
+        assert!(
+            pg.rebound_modules(&declared, &[], &BTreeSet::new())
+                .is_empty()
+        );
+    }
 
     #[test]
     fn a_deparsed_module_keeps_its_kind_without_predicting_its_text() {

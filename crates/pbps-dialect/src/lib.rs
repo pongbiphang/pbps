@@ -37,7 +37,7 @@
 //! drawn in the wrong place.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
@@ -1266,6 +1266,20 @@ pub trait Dialect {
     /// erred, and never an edge too few.
     fn bare_name_rank(&self, _from: &str, _to: &str) -> Option<usize> {
         Some(0)
+    }
+
+    /// Unchanged modules whose binding can move when this plan introduces
+    /// names on their write path. The differ adds these as ordinary typed
+    /// alterations before risk classification and dependency ordering, so
+    /// approval and connected rebuild guards cover them too (DECISIONS 422).
+    /// Dialects without this binding rule return no additional alterations.
+    fn rebound_modules(
+        &self,
+        _declared: &Schema,
+        _arriving: &[ModuleId],
+        _already_changed: &BTreeSet<ModuleId>,
+    ) -> BTreeSet<ModuleId> {
+        BTreeSet::new()
     }
 
     /// This argument type as the engine spells it *in a routine's identity*.

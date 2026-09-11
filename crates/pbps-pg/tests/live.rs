@@ -6516,17 +6516,13 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         ),
     );
     let cs = plan(&a, &ids, &b, &ids);
-    // The differ finds one change, because the caller's declaration did not
-    // move — which is the whole difficulty: nothing in this plan mentions the
-    // module whose meaning it is about to alter.
-    assert_eq!(cs.changes.len(), 1, "{cs:#?}");
-    let pbps_model::Change::CreateModule { id: created, .. } = &cs.changes[0].change else {
-        panic!(
-            "the one change is the overload's creation: {:#?}",
-            cs.changes[0]
-        )
-    };
-    assert_eq!(created, &shadow);
+    // The typed differ now includes the dialect's conservative rebind rule.
+    // Both operations are ordered and approved in the same change set.
+    assert_eq!(cs.changes.len(), 2, "{cs:#?}");
+    assert!(matches!(&cs.changes[0].change,
+        pbps_model::Change::CreateModule { id, .. } if id == &shadow));
+    assert!(matches!(&cs.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &caller));
     let changed: std::collections::BTreeSet<pbps_model::ModuleId> =
         [shadow.clone()].into_iter().collect();
 
@@ -6545,9 +6541,13 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         "the caller has to be rebuilt by this plan"
     );
 
-    // The plan as it must be applied: the change the differ found, and the
-    // rebuild this answer synthesized.
-    apply(&mut conn, &pg, &cs).await;
+    // Deliberately omit the approved rebuild first to measure the bad middle
+    // state; the actual CLI regression applies the whole plan atomically.
+    let mut without_rebuild = cs.clone();
+    without_rebuild
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut conn, &pg, &without_rebuild).await;
     assert_eq!(
         text(&mut conn, &format!("SELECT {s}.caller()")).await,
         "shared",
@@ -6555,13 +6555,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
          that costs a whole plan cycle"
     );
     for stmt in pg
-        .emit(
-            &pbps_model::Change::AlterModule {
-                id: caller.clone(),
-                module: Box::new(module(pbps_model::ModuleKind::Function, caller_body)),
-            },
-            pbps_model::Strategy::default(),
-        )
+        .emit(&cs.changes[1].change, cs.changes[1].strategy)
         .expect("emit the synthesized rebuild")
     {
         conn.execute(&stmt.sql)

@@ -273,6 +273,38 @@ pub fn diff_partial(
     }
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
+    // A module declaration can stay byte-for-byte identical while a new
+    // overload or shadow changes what it should bind to. Ask the dialect
+    // before sorting, rather than appending unreviewed SQL at apply time.
+    let arriving: Vec<ModuleId> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::CreateModule { id, .. } => Some(id.clone()),
+            Change::CreateTable { name, .. } => Some(ModuleId::Named(name.clone())),
+            Change::RenameTable { to, .. } => Some(ModuleId::Named(to.clone())),
+            _ => None,
+        })
+        .collect();
+    let changed: BTreeSet<ModuleId> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::CreateModule { id, .. }
+            | Change::AlterModule { id, .. }
+            | Change::DropModule { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    for id in dialect.rebound_modules(declared.schema, &arriving, &changed) {
+        if !changed.contains(&id)
+            && base.schema.modules.contains_key(&id)
+            && let Some(module) = declared.schema.modules.get(&id)
+        {
+            changes.push(Change::AlterModule {
+                id,
+                module: Box::new(module.clone()),
+            });
+        }
+    }
     diff_roles(base, declared, dialect, &mut changes);
 
     // The ordering and risk pass below runs whether or not there are errors:
