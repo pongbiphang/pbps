@@ -9367,6 +9367,7 @@ SPEC is in sync with all of these.
     The live suite adds a smaller-`connect_timeout` test
     (`a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling`) beside the
     existing 30-second black-hole test in `crates/pbps-pg/tests/live.rs`.
+
 435. **`state list`'s timeline reads five new ledger columns, never
     `state_json`, in the steady state (issue #103).** Measured before
     choosing: a 300-table snapshot recorded 50 times and read back through
@@ -9474,6 +9475,23 @@ SPEC is in sync with all of these.
     the two checks cannot disagree — the second one is guaranteed to
     succeed, which is what its `.expect` documents rather than skips.
 
+    **`(None, None)` is the only pair that means "not staged."** A round-4
+    finding: `staged_completed`/`staged_total` are two independently
+    nullable columns, but `record` only ever writes both together or
+    neither — the JSON side's `Option<StagedProgress>` makes the pair one
+    field, not two, so it cannot come apart on any path this crate writes.
+    `projected_row`'s catch-all arm read `(Some, None)` and `(None, Some)`
+    the same as a genuine `(None, None)`, silently reinterpreting a row
+    that had gone out of step as one that was simply never mid-deployment —
+    exactly the "unreadable read as nothing there" AGENTS.md names, and on
+    columns this PR itself introduces. `as_count`'s own doc comment states
+    the rule this row breaks: a value `record` would never produce means
+    "the row and this reader have gone out of step," reported rather than
+    silently reinterpreted. A half-populated pair is that same rule, one
+    column over — fixed by refusing it as `Unreadable::Malformed`, naming
+    which column is present and which is NULL, rather than folding it into
+    the `_ => None` arm.
+
     **The legacy fallback asks in pieces, not one statement, on both
     dialects.** A third: `select_legacy_state_json` bound one parameter per
     legacy id with no ceiling, and until a deployer runs a deployment after
@@ -9535,8 +9553,11 @@ SPEC is in sync with all of these.
     both an unsupported version and a count this build cannot parse being
     refused by its version — the whole `timeline()` call still succeeding —
     with its own revert-and-watch-fail cycle confirming the unfixed ordering
-    fails the whole call on the count instead. A unit test pins a denied row
-    rendering as denied, never as malformed and never with tables/modules
-    silently reading zero, and another pins the projected path's version
-    gate directly against `pbps_model::CURRENT_VERSION`/
-    `OLDEST_READABLE_VERSION`.
+    fails the whole call on the count instead. Both dialects also pin a
+    hand-written row with `staged_completed` set and `staged_total` NULL
+    being refused as `Malformed`, the whole call still succeeding, with its
+    own revert-and-watch-fail cycle confirming the unfixed catch-all reads
+    it as "not staged" instead. A unit test pins a denied row rendering as
+    denied, never as malformed and never with tables/modules silently
+    reading zero, and another pins the projected path's version gate
+    directly against `pbps_model::CURRENT_VERSION`/`OLDEST_READABLE_VERSION`.

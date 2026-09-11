@@ -303,7 +303,7 @@ impl StateSnapshot {
 /// fine and the row is not damaged, and folding it into `Malformed` would
 /// report "this build cannot parse the snapshot" about a snapshot it was
 /// never allowed to look at — a false statement in the tool's own audit
-/// output (DECISIONS 433).
+/// output (DECISIONS 435).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreadable {
     /// The state named a version outside
@@ -319,7 +319,7 @@ pub enum Unreadable {
     /// The engine refused to let this reader see the recorded state at all —
     /// a permission denied on the column or the row, not a parse failure and
     /// not a version this build does not understand. The message names what
-    /// was refused, in the engine's own words (DECISIONS 433).
+    /// was refused, in the engine's own words (DECISIONS 435).
     Denied(String),
 }
 
@@ -376,7 +376,7 @@ fn check_version_number(version: u32) -> Result<(), String> {
 /// [`check_version_number`], wrapped as the [`Unreadable`] a caller with no
 /// [`StateSnapshot`] in hand can return directly.
 ///
-/// A ledger's projected columns (issue #103, DECISIONS 433) give a timeline
+/// A ledger's projected columns (issue #103, DECISIONS 435) give a timeline
 /// reader a version and three counts without ever building a snapshot or
 /// parsing `state_json` — so without this, that path had no way to ask the
 /// same question [`StateSnapshot::read_json`] already asks of the JSON

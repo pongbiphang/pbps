@@ -19963,6 +19963,48 @@ async fn an_unparseable_count_beside_an_unsupported_version_is_still_refused_by_
     db.drop().await;
 }
 
+/// Round-4 review finding on #103's own PR: `record` only ever writes
+/// `staged_completed`/`staged_total` together or leaves both NULL together —
+/// driven from the JSON side's `Option<StagedProgress>`, where the pair is
+/// one field, not two, and cannot come apart. The two ledger columns are
+/// independently nullable and can still represent a pair no write path
+/// produces; this pins that such a row is refused as `Malformed`, not
+/// silently read as "not staged" the same as a genuine `(NULL, NULL)`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_half_populated_staged_pair_is_malformed_not_silently_unstaged() {
+    let mut db = TestDb::create("halfstaged103").await;
+    state::ensure_tables(&mut db.conn).await.expect("migrate");
+
+    // Written by hand: no write path in this crate ever leaves exactly one
+    // of the pair NULL.
+    db.conn
+        .execute_with(
+            "INSERT INTO public.__pbps_state \
+             (kind, git_sha, plan_checksum, state_json, operator, reason, \
+              state_version, tables_count, modules_count, staged_completed, staged_total) \
+             VALUES ('apply', NULL, NULL, $1, 'live-test', NULL, $2, 2, 1, $3, NULL)",
+            &[
+                "{}".into(),
+                (pbps_model::state::CURRENT_VERSION as i32).into(),
+                3_i32.into(),
+            ],
+        )
+        .await
+        .expect("write a row with a half-populated staged pair, by hand");
+
+    let rows = state::timeline(&mut db.conn, 10)
+        .await
+        .expect("the whole call must still succeed — only the one row is refused");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        matches!(rows[0].state, Err(pbps_model::Unreadable::Malformed(_))),
+        "an inconsistent staged pair must be refused, never read as \"not staged\""
+    );
+
+    db.drop().await;
+}
+
 /// The most parameters one bound PostgreSQL statement may carry, measured
 /// against the pinned image rather than assumed from the protocol's own
 /// documentation of itself.

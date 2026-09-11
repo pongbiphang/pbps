@@ -93,7 +93,7 @@ pub struct TimelineEntry {
     /// of the two is true of every row, and a struct able to hold both — or
     /// neither — needs a comment where a type does the same work.
     ///
-    /// [`TimelineState`], not [`StateSnapshot`] (DECISIONS 433): the common
+    /// [`TimelineState`], not [`StateSnapshot`] (DECISIONS 435): the common
     /// path reads `state_version`, `tables_count`, `modules_count`,
     /// `staged_completed` and `staged_total` straight off the row and never
     /// touches `state_json`, so it never has the schema or the identity
@@ -108,7 +108,7 @@ pub struct TimelineEntry {
 ///
 /// Read straight from the ledger's projected columns for a row recorded after
 /// they existed; read out of a full [`StateSnapshot`] parse for one recorded
-/// before (DECISIONS 433) — either way the timeline needs only these, never
+/// before (DECISIONS 435) — either way the timeline needs only these, never
 /// the schema or the identity mapping the full snapshot also carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineState {
@@ -129,7 +129,7 @@ pub struct TimelineState {
 impl TimelineState {
     /// Reads the four numbers off a fully-parsed snapshot — the fallback path
     /// for a row recorded before the projected columns existed, or written by
-    /// hand (DECISIONS 433).
+    /// hand (DECISIONS 435).
     pub fn from_snapshot(snapshot: &StateSnapshot) -> Self {
         TimelineState {
             version: snapshot.version,
@@ -143,7 +143,7 @@ impl TimelineState {
     }
 
     /// Builds from the ledger's own projected columns — the fast path for a
-    /// row recorded after they existed (DECISIONS 433) — refusing first if
+    /// row recorded after they existed (DECISIONS 435) — refusing first if
     /// `version` is not one this build reads.
     ///
     /// The only constructor that takes a bare `version: u32` rather than a

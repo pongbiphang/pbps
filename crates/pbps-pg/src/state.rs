@@ -494,7 +494,7 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     // Both tables exist by this point, freshly created or already there —
     // either way a `__pbps_state` from before issue #103 still needs its
     // five timeline columns, and one just created by [`CREATE_STATE`] above
-    // already has them, so this is cheap in the common case (DECISIONS 433).
+    // already has them, so this is cheap in the common case (DECISIONS 435).
     migrate_timeline_columns(conn).await
 }
 
@@ -661,7 +661,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
 /// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
 /// one of them must not erase the history above it (DECISIONS 218).
 ///
-/// [`select_timeline`] never asks for `state_json` (DECISIONS 433): a second
+/// [`select_timeline`] never asks for `state_json` (DECISIONS 435): a second
 /// query, [`select_legacy_state_json`], asks for it only for the rows that
 /// predate the migration — `state_version IS NULL` — and only for those ids.
 /// In the common case, once a ledger's rows are all migrated, that second
@@ -799,7 +799,7 @@ fn saturating_i32(n: u64) -> i32 {
 /// The columns beside `state_json` are projected from the snapshot rather than
 /// passed separately: they exist so `status` can filter without parsing JSON,
 /// and a caller able to set them independently could make them lie. The five
-/// issue #103 added follow the same rule (DECISIONS 433).
+/// issue #103 added follow the same rule (DECISIONS 435).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     ensure_tables(conn).await?;
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
@@ -1007,7 +1007,7 @@ fn entry_from_row(row: &Row) -> Result<LedgerEntry, LedgerError> {
     })
 }
 
-/// A ledger row's projected columns, without `state_json` (DECISIONS 433):
+/// A ledger row's projected columns, without `state_json` (DECISIONS 435):
 /// [`select_timeline`] never asks for it. `state` is `None` exactly when this
 /// row predates issue #103's migration — `state_version IS NULL` — and
 /// [`timeline`] must still ask [`select_legacy_state_json`] for it.
@@ -1080,24 +1080,38 @@ fn projected_row(row: &Row) -> Result<ProjectedRow, LedgerError> {
                 Ok(()) => {
                     let tables = as_count(required_i32(row, "tables_count")?, "tables_count")?;
                     let modules = as_count(required_i32(row, "modules_count")?, "modules_count")?;
+                    // `(Some, Some)` and `(None, None)` are the only two pairs
+                    // `record` ever writes — see `pbps_mssql::state::projected_row`
+                    // for why (a round-4 review finding on #103's own PR).
+                    // Refused as `Malformed` rather than silently read as "not
+                    // staged" the same as a genuine `(None, None)`.
                     let staged = match (
                         optional_i32(row, "staged_completed")?,
                         optional_i32(row, "staged_total")?,
                     ) {
-                        (Some(completed), Some(total)) => Some(TimelineStaged {
+                        (Some(completed), Some(total)) => Ok(Some(TimelineStaged {
                             completed: as_count(completed, "staged_completed")?,
                             total: as_count(total, "staged_total")?,
-                        }),
+                        })),
                         // A migrated row that is not a staged checkpoint: both
                         // are NULL together, which is what "not
                         // mid-deployment" means (`pbps_model::StagedProgress`'s
                         // own doc comment).
-                        _ => None,
+                        (None, None) => Ok(None),
+                        (Some(completed), None) => Err(Unreadable::Malformed(format!(
+                            "`staged_completed` is {completed} but `staged_total` is NULL"
+                        ))),
+                        (None, Some(total)) => Err(Unreadable::Malformed(format!(
+                            "`staged_total` is {total} but `staged_completed` is NULL"
+                        ))),
                     };
-                    Ok(
-                        TimelineState::from_projected(version, tables, modules, staged)
-                            .expect("the version was already checked as readable above"),
-                    )
+                    match staged {
+                        Ok(staged) => Ok(TimelineState::from_projected(
+                            version, tables, modules, staged,
+                        )
+                        .expect("the version was already checked as readable above")),
+                        Err(e) => Err(e),
+                    }
                 }
             })
         }
