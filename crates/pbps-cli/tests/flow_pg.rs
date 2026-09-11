@@ -263,6 +263,27 @@ fn bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     d.commit();
 
+    // WITH GRANT OPTION is outside role.grants, but must still refuse before
+    // the build and must not produce any ledger snapshot.
+    on_server(
+        connection,
+        &format!(
+            "GRANT USAGE ON SCHEMA app TO {} WITH GRANT OPTION",
+            role.name
+        ),
+    );
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("WITH GRANT OPTION"), "{}", stderr(&o));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF to_regclass('app.t') IS NOT NULL OR EXISTS (SELECT 1 FROM public.__pbps_state) THEN RAISE EXCEPTION 'refused bootstrap wrote state'; END IF; END $$",
+    );
+    on_server(
+        connection,
+        &format!("REVOKE USAGE ON SCHEMA app FROM {}", role.name),
+    );
+
     // Grants already in the managed set still make bootstrap refuse.
     on_server(
         connection,
@@ -274,6 +295,44 @@ fn bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants
     on_server(
         connection,
         &format!("REVOKE USAGE ON SCHEMA app FROM {}", role.name),
+    );
+
+    // A single deployer's CREATE TABLE can trigger an unsupported grant.
+    // The read-back must refuse and roll the whole build back, too.
+    on_server(
+        connection,
+        &format!(
+            "CREATE FUNCTION public.inject_grant() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF to_regclass('app.t') IS NOT NULL THEN \
+         GRANT SELECT ON app.t TO {} WITH GRANT OPTION; END IF; END $$; \
+         CREATE EVENT TRIGGER inject_grant ON ddl_command_end WHEN TAG IN ('CREATE TABLE') \
+         EXECUTE FUNCTION public.inject_grant()",
+            role.name
+        ),
+    );
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("WITH GRANT OPTION"), "{}", stderr(&o));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF to_regclass('app.t') IS NOT NULL THEN RAISE EXCEPTION 'refused bootstrap committed its table'; END IF; END $$",
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let latest = pbps_pg::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
+        assert!(latest.snapshot.schema.tables.is_empty());
+        assert!(latest.snapshot.schema.roles.is_empty());
+    });
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER inject_grant; DROP FUNCTION public.inject_grant()",
     );
 
     let o = d.run(&["bootstrap", "--db", connection]);
