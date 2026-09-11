@@ -3240,7 +3240,7 @@ pub fn cmd_plan_db(
                 .await?;
         let recorded_snapshot = entry.snapshot.clone();
         rename_snapshot_roles(&mut entry.snapshot, &role_renames);
-        let recorded_ids = entry.snapshot.ids.clone();
+        let recorded_ids = role_scope(&entry.snapshot.ids, &resolved.ids, dialect.as_ref());
         // The baseline's module scope is the **recorded** state's, never the
         // declarations': `apply` has only the plan file and the ledger, so a
         // scope that needed a checkout would make the two checksums disagree on
@@ -3350,11 +3350,14 @@ pub fn cmd_plan_db(
         let mut expected = entry.snapshot.schema.clone();
         // Done also permits drop-and-create (377). Grants lost with the old
         // principal must be planned onto the new one, not rejected as drift.
-        // Only the explicitly renamed roles receive this treatment; their
-        // actual grants remain in the pinned baseline and the differ's input.
-        for to in role_renames.values() {
+        // Newly managed roles also start from their actual grants. Both sets
+        // remain in the pinned baseline and the differ's input (421).
+        for to in recorded_ids.roles.values().filter(|name| {
+            role_renames.values().any(|to| to == *name)
+                || !recorded_snapshot.ids.roles.values().any(|old| old == *name)
+        }) {
             let Some(role) = as_recorded.roles.get(to) else {
-                bail!("renamed role `{to}` disappeared while reading the catalog; plan again");
+                bail!("declared cluster role `{to}` is missing; create or rename it first, then plan again");
             };
             expected.roles.insert(to.clone(), role.clone());
         }
@@ -3860,9 +3863,10 @@ fn apply_identified(
     }
 
     // A cluster role's rename has no SQL, but its approved identity mapping
-    // still has to be checked and recorded. Other empty plans keep the
-    // connection-free path; empty PostgreSQL role plans decide under the lock.
-    if plan.changes.is_empty() && (dialect.manages_roles() || plan.ids.roles.is_empty()) {
+    // still has to be checked and recorded. Additions and removal of the last
+    // role need the same check (421). SQL Server keeps its connection-free
+    // empty path; PostgreSQL decides whether the role map moved under the lock.
+    if plan.changes.is_empty() && dialect.manages_roles() {
         println!("The plan is empty; nothing to apply.");
         return Ok(Attempt::Empty);
     }
@@ -4053,17 +4057,17 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     refuse_mid_deployment(&entry, &target.label)?;
     let original_ids = entry.snapshot.ids.clone();
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
-    if plan.changes.is_empty() && role_renames.is_empty() {
+    if plan.changes.is_empty() && original_ids.roles == plan.ids.roles {
         return Ok(None);
     }
     rename_snapshot_roles(&mut entry.snapshot, &role_renames);
-    let recorded_ids = entry.snapshot.ids.clone();
+    let recorded_ids = role_scope(&entry.snapshot.ids, &plan.ids, dialect);
     let recorded_modules = managed_modules(Some(&entry.snapshot), None);
     // The scopes the closing read-back will use, expressed in the names the
     // database has *now* — the second projection is compared against that
     // read, so it has to ask it the same question.
     let planned_scopes = scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids);
-    let (scoped, before) = baseline_state(
+    let (scoped, mut before) = baseline_state(
         conn,
         &recorded_ids,
         &recorded_modules,
@@ -4073,6 +4077,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &planned_scopes,
     )
     .await?;
+    retain_managed_roles(&mut before, &plan.ids, dialect);
 
     // The drift check, and the whole reason a coarse `--allow` is safe: this
     // plan is only valid against the environment it was computed against, down
@@ -4183,6 +4188,31 @@ fn rename_snapshot_roles(snapshot: &mut StateSnapshot, renames: &BTreeMap<String
         if let Some(role) = snapshot.schema.roles.remove(from) {
             snapshot.schema.roles.insert(to.clone(), role);
         }
+    }
+}
+
+/// Incoming cluster roles belong in the queried and pinned baseline even
+/// before their UIDs have reached the ledger. Existing names keep their
+/// baseline UID; only their post-apply identity changes when a UID is replaced.
+fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
+    let mut scoped = recorded.clone();
+    if !dialect.manages_roles() {
+        for (uid, name) in &declared.roles {
+            if !scoped.roles.values().any(|old| old == name) {
+                scoped.roles.insert(uid.clone(), name.clone());
+            }
+        }
+    }
+    scoped
+}
+
+/// A role removed from a PostgreSQL declaration becomes unmanaged, rather
+/// than being dropped from the cluster. Closing comparisons use that scope.
+fn retain_managed_roles(schema: &mut Schema, ids: &IdsFile, dialect: &dyn Dialect) {
+    if !dialect.manages_roles() {
+        schema
+            .roles
+            .retain(|name, _| ids.roles.values().any(|kept| kept == name));
     }
 }
 
@@ -4340,13 +4370,13 @@ async fn apply_staged_under_lock(
                 entry.snapshot.staged.as_ref().map_or(0, |p| p.total)
             );
         }
-        let recorded_ids = entry.snapshot.ids.clone();
+        let recorded_ids = role_scope(&entry.snapshot.ids, &plan.ids, dialect);
         let recorded_modules = managed_modules(Some(&entry.snapshot), None);
         // Two cuts of one read: the checksum over the managed set the plan was
         // pinned to, and beside it the state the checkpoints are measured
         // against, which watches every module the plan names as well
         // (DECISIONS 174).
-        let (scoped, watching) = staged_baseline(
+        let (scoped, mut watching) = staged_baseline(
             conn,
             &recorded_ids,
             &recorded_modules,
@@ -4360,6 +4390,7 @@ async fn apply_staged_under_lock(
             &scopes_at(plan, &recorded_ids),
         )
         .await?;
+        retain_managed_roles(&mut watching, &plan.ids, dialect);
 
         let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
         if live != plan.baseline.checksum {
@@ -4399,6 +4430,9 @@ async fn apply_staged_under_lock(
     // on a resume — and each statement moves it, using what the emitter said
     // that statement does (`Statement::renames`).
     let mut live_ids = entry.snapshot.ids.clone();
+    if !dialect.manages_roles() {
+        live_ids.roles = plan.ids.roles.clone();
+    }
     // The state each checkpoint is measured against, read in the shape a
     // checkpoint is read in so the two compare like with like — the newest
     // entry's own schema is spelled by whichever command wrote it, and a cell

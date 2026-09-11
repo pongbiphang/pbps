@@ -334,6 +334,161 @@ fn routine_rebuilds_do_not_restore_revoked_public_execute() {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn grantless_cluster_role_additions_and_removals_update_the_recorded_scope() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_grantless_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "grantless-role");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("grantless-role");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    let file = d.dir.join("schema/reader.yml");
+    std::fs::write(&file, format!("role: {}\n", role.1)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
+    let missing = d.run(&planning);
+    assert_eq!(
+        code(&missing),
+        1,
+        "{}{}",
+        stdout(&missing),
+        stderr(&missing)
+    );
+    assert!(
+        stderr(&missing).contains("is missing"),
+        "{}",
+        stderr(&missing)
+    );
+    on_server(&server, &format!("CREATE ROLE {}", role.1));
+    succeeds(d.run(&planning));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(saved.changes.is_empty());
+    // The incoming role's grants are pinned even before its UID is recorded.
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA app TO {}", role.1),
+    );
+    let changed = apply_plan(&d, connection, &plan, false);
+    assert_eq!(
+        code(&changed),
+        1,
+        "{}{}",
+        stdout(&changed),
+        stderr(&changed)
+    );
+    assert!(
+        stderr(&changed).contains("no longer the database"),
+        "{}",
+        stderr(&changed)
+    );
+    on_server(
+        connection,
+        &format!("REVOKE USAGE ON SCHEMA app FROM {}", role.1),
+    );
+    succeeds(apply_plan(&d, connection, &plan, false));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA app TO {}", role.1),
+    );
+    let drift = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&drift), 2, "{}{}", stdout(&drift), stderr(&drift));
+    on_server(
+        connection,
+        &format!("REVOKE USAGE ON SCHEMA app FROM {}", role.1),
+    );
+    on_server(&server, &format!("DROP ROLE {}", role.1));
+    let missing = d.run(&["verify", "--db", connection]);
+    assert_eq!(
+        code(&missing),
+        2,
+        "{}{}",
+        stdout(&missing),
+        stderr(&missing)
+    );
+    on_server(&server, &format!("CREATE ROLE {}", role.1));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    std::fs::remove_file(file).unwrap();
+    succeeds(d.run(&[
+        "drop-role",
+        &role.1,
+        "--reason",
+        "stop managing this cluster role",
+    ]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&planning));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(saved.changes.is_empty());
+    assert!(saved.ids.roles.is_empty());
+    succeeds(apply_plan(&d, connection, &plan, false));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let last = pbps_pg::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(last.snapshot.kind, pbps_model::StateKind::Apply);
+        assert!(last.snapshot.ids.roles.is_empty());
+        assert!(last.snapshot.schema.roles.is_empty());
+    });
+    on_server(&server, &format!("DROP ROLE {}", role.1));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // A nonempty staged plan must adopt an incoming grantless role in its
+    // first checkpoint too, not only at the final identity recording.
+    on_server(&server, &format!("CREATE ROLE {}", role.1));
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    d.table(TWO_COLUMNS);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    succeeds(apply_plan(&d, connection, &plan, true));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(&server, &format!("DROP ROLE {}", role.1));
+    let missing = d.run(&["verify", "--db", connection]);
+    assert_eq!(
+        code(&missing),
+        2,
+        "{}{}",
+        stdout(&missing),
+        stderr(&missing)
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn completed_cluster_role_renames_are_pinned_and_recorded_without_role_sql() {
     struct Roles(String, Vec<String>);
     impl Drop for Roles {

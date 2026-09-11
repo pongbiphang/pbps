@@ -8949,3 +8949,19 @@ SPEC is in sync with all of these.
     SQL Server keeps its exact comparison. Untouched modules still compare two
     catalog reads exactly. This does not claim to detect another writer's
     change to the text of a module this plan itself writes.
+
+421. **An identity-only PostgreSQL deployment includes role additions and
+    removals, not only renames.** 419's rename-only condition left an added
+    grantless role outside the ledger forever: apply called it empty, and
+    verify never watched the newly declared role. Removing the last such role
+    has the same problem with an empty final role map. Every empty PostgreSQL
+    plan therefore checks the role mapping under the deployment lock, and
+    records a read-back when it changed. SQL Server retains its empty fast path.
+
+    A newly managed role's actual grants participate in both the connected
+    diff and its pinned baseline, even before the UID is in the ledger. Missing
+    roles refuse, extra grants can be planned away, and a grant changed after
+    planning invalidates the checksum. The drift gate still compares all
+    previously managed objects. At the read-back a removed cluster role is
+    outside the managed set, as its declaration requests; it is not dropped
+    from the cluster. Staged checkpoints adopt the same final role scope.
