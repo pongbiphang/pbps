@@ -64,13 +64,14 @@ or a bug in shipped code. It is a hazard.
 ## Two things this is not
 
 It is **not a live suite**. It asserts nothing, gates nothing, and runs in no
-pipeline. When `pbps-postgres` exists, its live suite is the descendant of this
-file and should replace it — the SPEC §11.5 invariants first, the way
-`crates/pbps-mssql/tests/live.rs` does, with these behaviours as the cases that
-suite already knows are worth covering.
+pipeline. The production PostgreSQL suite now lives in
+`crates/pbps-pg/tests/live.rs`, with CLI invariants in
+`crates/pbps-cli/tests/flow_pg.rs`. Those tests gate the current implementation;
+these scripts retain the original observations and how they were obtained.
 
-It is **not product code**. Like `spikes/yaml-span` and `spikes/pg-driver`, it
-goes when what it was built to decide has been decided.
+It is **not product code**. All three experiments remain outside the production
+workspace as historical evidence (DECISIONS 437; [retention policy](../README.md)).
+A settled decision is not a reason to discard the experiment that supports it.
 
 ## The 2026-09-05 additions
 

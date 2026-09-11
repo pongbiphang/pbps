@@ -14,8 +14,10 @@ members = [
     "crates/pbps-cli",
 ]
 
-# spike: the Phase 0 YAML crate evaluation; removed once the choice is settled
-exclude = ["spikes/yaml-span"]
+# Historical experiments stay available for reproducing the ADR evidence,
+# outside product builds and workspace checks (DECISIONS 437; spikes/README.md).
+# pg-measurements contains SQL/scripts, not a Cargo package.
+exclude = ["spikes/yaml-span", "spikes/pg-driver"]
 
 
 [workspace.package]

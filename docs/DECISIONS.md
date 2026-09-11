@@ -9578,3 +9578,22 @@ SPEC is in sync with all of these.
     and resume to the declared destination. A companion test adds an unplanned
     column during the first transfer and requires refusal at that checkpoint,
     rather than letting the name change hide it (#299).
+
+437. **Retain settled spikes as evidence outside the production workspace.**
+    `spikes/yaml-span`, `spikes/pg-driver` and `spikes/pg-measurements` stay in
+    the tree together (#302). The ADRs preserve the conclusions, but the
+    experiments also preserve the inputs, method and original observations
+    needed to challenge or reproduce them. Recovering those pieces from old
+    commits is possible; keeping the small evidence directories beside their
+    live ADR links makes that audit direct.
+
+    Retention does not promote the spikes to product code or CI gates. The
+    root workspace explicitly excludes both Rust experiments; `pg-driver`
+    keeps its independent workspace and `pg-measurements` is not a Cargo
+    package. Their historical dependencies are not added to the production
+    workspace. Current behavior is verified by the production crates' tests
+    and live suites. Re-running old measurements is a deliberate investigation,
+    with changed observations and versions recorded rather than silently
+    replacing the evidence. This supersedes the deletion promises in the
+    spike manifests and ADR-0001/ADR-0014; `spikes/README.md` states the common
+    policy for all three.
