@@ -9597,3 +9597,56 @@ SPEC is in sync with all of these.
     replacing the evidence. This supersedes the deletion promises in the
     spike manifests and ADR-0001/ADR-0014; `spikes/README.md` states the common
     policy for all three.
+
+438. **A `numeric` with a negative scale is judged by its granularity, not its
+    magnitude alone, when the target is a binary float.** 244 already carries
+    the shape "`Safe` is decided by what a type *holds*, not by how many
+    digits it has" for the integer-and-`NaN` cases; `exact_in_float`
+    (`pbps-pg`'s `types.rs`) had one more instance of the same mistake, found
+    by review (#138).
+
+    `numeric(p, s)` with `s <= 0` holds `m * 10^|s|` for `|m| < 10^p`, and the
+    classification asked only whether the *magnitude* `10^(p - s) - 1` fit
+    under the float's mantissa gap — treating a negative scale as if it meant
+    "round to a whole number and then judge the size." It does not:
+    `10^|s| = 2^|s| * 5^|s|`, and the `2^|s|` half is free — a binary float's
+    exponent carries any power of two at no mantissa cost. So the question is
+    whether `m * 5^|s|` fits, not `m * 10^|s|`. Measured on 18.6,
+    `numeric(1,-7) -> real` was called `Narrowing` (its largest value,
+    `90000000`, is above `real`'s 2^24) although every one of its ten values
+    is exactly representable:
+    `SELECT bool_and((k*10000000)::numeric(1,-7)::real::double precision =
+    (k*10000000)::double precision) FROM generate_series(-9,9) k` is `t`.
+
+    No separate check against the float's own exponent range is needed
+    alongside the mantissa one. `max_exact_int` is at most 2^53, and the
+    `pow10`/`pow5` arithmetic is checked against `i128` (~1.7e38) rather than
+    against where the engine actually overflows (~3.4e38 for `real`, far
+    larger for `double precision`), so an `i128` overflow already refuses
+    everything anywhere near where overflow could matter. And short of that,
+    the mantissa test is strictly the tighter one: by exhaustive search over
+    `p` and `|s|`, the largest total magnitude that can still pass it at all
+    is nine orders of magnitude below either float's overflow point.
+
+    Pinned by a unit test on both directions and both float widths —
+    `numeric(1,-7)`/`numeric(1,-8)` Safe into `real`, `numeric(1,-9)`/
+    `numeric(9,-7)` Narrowing, and the matching boundary pair for
+    `double precision`'s 2^53 at `numeric(1,-21)`/`numeric(1,-22)` — and by
+    three rows in the live suite's
+    `a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value`. That
+    live comparison needed its own correction: a `real`'s own shortest
+    round-trip printing only promises to re-parse to the same bits at
+    `real`'s own precision (measured, a `real` actually holding `8999999488`
+    still prints `9e+09`, since that is shorter and still parses back to the
+    same `real`), so the test now widens a `real` result through `double
+    precision` before reading it as text, and compares a binary float target
+    as the number its text spells rather than as the characters — the same
+    value may be spelled `90000000` coming out of `numeric` and `9e+07`
+    coming out of a float, and that difference is not the finding.
+
+    The two other open issues touching this catalogue at the time — #233
+    (`_int4[]` folding to `integer[][]`) and #281 (a narrowing that rounds
+    rather than raises drops the preflight probe) — are untouched here: #281
+    in particular already owns the case where a `numeric` remains genuinely
+    `Narrowing` into a float and the probe that should catch a rounding row
+    does not; that is a preflight-contract gap, not a risk-classification one.
