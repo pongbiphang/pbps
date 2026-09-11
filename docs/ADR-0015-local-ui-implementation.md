@@ -1423,15 +1423,20 @@ What this ADR reasons about and has not measured, in the order the steps of
   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (Linux 5.6+) closes it.
 - **The case decision 5's step 1 now refuses.** No compose exists yet to
   test — there is no UI crate, and #64 is still open — so the refusal
-  itself is unverified in code. Step 4 pins it beside the existing
-  `symbolic-ref`-in-the-gap case: build `HEAD -> a -> b`, run the compose
-  to where step 5's checks would sit, retarget `a` to a branch whose tip
-  lacks the change, and assert the compose is refused at step 1 with the
-  chain named, never reaching step 5. Reverting the refusal must make
-  that same setup install an index built for `b`'s tip onto a checkout
-  `symbolic-ref` has moved to the other branch, and `git status` must
-  then report the composed paths staged — the difference nobody made
-  that the refusal exists to prevent.
+  itself is unverified in code, and it takes two executions to pin, not
+  one: with the refusal in place, step 1 exits on `HEAD -> a -> b`
+  before the compose gets anywhere near step 5, so the same run cannot
+  also reach step 5's checkpoint to retarget `a` there. Step 4 pins it
+  beside the existing `symbolic-ref`-in-the-gap case as a guarded run and
+  a reverted one: the guarded run builds `HEAD -> a -> b` and asserts the
+  compose is refused at step 1 with the chain named; the reverted run —
+  the refusal removed, everything else as committed — builds the same
+  chain, pauses the compose where step 5's checks would sit, retargets
+  `a` to a branch whose tip lacks the change, resumes, and asserts that
+  it installs an index built for `b`'s tip onto a checkout `symbolic-ref`
+  has moved to the other branch, with `git status` then reporting the
+  composed paths staged — the difference nobody made that the refusal
+  exists to prevent.
 - **DNS rebinding through browsers that pass a numeric `Host` unchanged.**
   Decision 3's `Host` check is the standard answer; step 3's tests send the
   cross-origin `POST`, the rebinding `Host`, the foreign peer and a request to
