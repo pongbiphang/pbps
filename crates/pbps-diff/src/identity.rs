@@ -211,10 +211,13 @@ fn resolve_with_provenance(
     // itself must use the input: newly minted identities cannot validate a typo,
     // and reusing a retired name cannot invalidate an already applied annotation.
     let accounted: BTreeSet<&Intent> = used.iter().map(|&i| &intents[i]).collect();
-    for intent in intents {
+    for (i, intent) in intents.iter().enumerate() {
         // Column annotations use the declared table name. A table rename moves
         // their scope, but does not make newly added columns prior identities.
         let original_intent = match intent {
+            // A current command is a new identity decision, not a retained
+            // annotation whose scope moved with its declaration.
+            _ if annotation_count.is_some_and(|count| i >= count) => None,
             Intent::RenameColumn { table, from, to } => {
                 r.renamed_tables
                     .iter()
@@ -980,5 +983,37 @@ mod tests {
         let errors =
             resolve(&declared, &before, &[rename_table, typo.clone()], &ctx()).unwrap_err();
         assert_eq!(errors, vec![Blocker::UnusedIntent { intent: typo }]);
+    }
+
+    #[test]
+    fn a_current_column_command_is_not_absorbed_through_a_table_rename() {
+        let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let old_table: TableName = "dbo.customer".parse().unwrap();
+        let new_table: TableName = "dbo.clients".parse().unwrap();
+        let mut declared = schema(&["code_v1"]);
+        let table = declared.tables.remove(&old_table).unwrap();
+        declared.tables.insert(new_table.clone(), table);
+        let intents = [
+            Intent::RenameTable {
+                from: old_table,
+                to: new_table.clone(),
+            },
+            Intent::RenameColumn {
+                table: new_table,
+                from: "missing_code".into(),
+                to: "code_v1".into(),
+            },
+        ];
+        let errors = resolve_with_annotations(&declared, &before, &intents, 1, &ctx()).unwrap_err();
+        assert_eq!(
+            errors,
+            vec![Blocker::UnusedIntent {
+                intent: intents[1].clone()
+            }]
+        );
+        resolve_with_annotations(&declared, &before, &intents, 2, &ctx())
+            .expect("the same retained annotation remains harmless after its table moves");
     }
 }
