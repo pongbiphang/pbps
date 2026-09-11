@@ -28,7 +28,7 @@ use pbps_db::Conn;
 use pbps_dialect::Dialect;
 use pbps_model::{
     Column, ColumnType, ForeignKey, Identity, IdsFile, Index, IndexColumn, Intent, PrimaryKey,
-    ReferentialAction, Schema, StateSnapshot, Table, TableName, UniqueConstraint,
+    ReferentialAction, Schema, StateSnapshot, Table, TableName, Uid, UniqueConstraint,
 };
 use pbps_mssql::Mssql;
 
@@ -2975,6 +2975,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3009,6 +3010,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3041,6 +3043,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3078,6 +3081,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3108,6 +3112,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3168,6 +3173,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3198,6 +3204,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3221,6 +3228,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3293,6 +3301,7 @@ async fn data_permissions(
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         data,
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions")
@@ -3310,6 +3319,7 @@ async fn referenced_permissions(
         referenced,
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions")
@@ -3548,6 +3558,178 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
             "UPDATE on SCHEMA::[app]",
         ],
         "{held:?}"
+    );
+
+    drop(lp);
+    // Best-effort, like the other login tests here: the server may still count
+    // a just-closed session as logged in, and a tidy-up that failed must not
+    // be reported as this test failing. The container is throwaway.
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
+/// Every object name `doctor` asks about is the *declared* one
+/// (`crates/pbps-cli/src/doctor.rs`), and a pending rename has not
+/// necessarily reached a given environment yet. `sp_rename` keeps a `GRANT`
+/// or a `DENY` with the object rather than with the name it was asked under
+/// (measured on the pinned image, issue #133) — so a question asked under the
+/// declared name finds nothing there and silently falls back to the schema: a
+/// careful DBA's object-level grant reads as a gap it does not have, and an
+/// object-level `DENY` that really blocks the deployment does not.
+///
+/// This environment holds `app.old_name`; the project's own ids file already
+/// calls the same uid `app.new_name` — the rename a `plan` would emit, not
+/// yet applied here. `doctor` reads the declared side and asks about
+/// `app.new_name`; the login's grant and deny below are on `app.old_name`, so
+/// only the resolution this test measures can connect the two.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_one() {
+    let mut db = TestDb::create("doctorrename").await;
+    let login = format!("pbps_rn_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+
+    // The physical table this environment actually has, still under its
+    // current name: the rename this test is about has not been applied here.
+    db.conn
+        .execute(
+            "CREATE TABLE app.old_name (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NOT NULL);",
+        )
+        .await
+        .expect("create the table under its current name");
+
+    // The environment's own recorded ids say this uid is `app.old_name`
+    // here. The project's ids file already moved the same uid to
+    // `app.new_name` — a plan applied to some other environment, or simply
+    // staged and not yet run against this one.
+    let uid: Uid = "t_renam1".parse().expect("a well-formed table uid");
+    let mut recorded_ids = IdsFile::default();
+    recorded_ids
+        .tables
+        .insert(uid.clone(), "app.old_name".parse().unwrap());
+    let mut project_ids = IdsFile::default();
+    project_ids
+        .tables
+        .insert(uid, "app.new_name".parse().unwrap());
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(
+            pbps_model::StateKind::Apply,
+            &Schema::default(),
+            &recorded_ids,
+        ),
+    )
+    .await
+    .expect("record the environment's own state");
+
+    // Declared under the *new* name — the way `doctor` reads it off the
+    // declarations, which already name the rename's destination.
+    let data: pbps_mssql::doctor::DataTables = [("app.new_name".parse().unwrap(), seeded_table())]
+        .into_iter()
+        .collect();
+
+    // Granted on the table alone, under its *current* name — the shape a
+    // careful DBA reaches for, and the only name this environment has ever
+    // had for the object.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT INSERT, UPDATE, DELETE ON app.old_name TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the DML on the object's current name");
+
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &data,
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        !held.schemas["app"].contains("INSERT"),
+        "the premise: nothing is held on the schema: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.is_empty(),
+        "a grant on the object's current name must be seen, though the \
+         declarations already call it something else: {gaps:?}"
+    );
+
+    // The converse, and the worse direction: the whole schema granted, with a
+    // `DENY` on the object's current name. Asked under the declared name —
+    // which the object does not answer to here — the question would find
+    // nothing to deny and fall back to the schema, reporting ready while the
+    // statement really fails.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             REVOKE INSERT, UPDATE, DELETE ON app.old_name FROM [{login}]; \
+             GRANT INSERT, UPDATE, DELETE ON SCHEMA::app TO [{login}]; \
+             DENY INSERT ON app.old_name TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the schema and deny the object's current name");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &data,
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        held.schemas["app"].contains("INSERT"),
+        "the premise: the schema grant stands: {held:?}"
+    );
+    assert!(
+        lp.execute("INSERT INTO app.old_name (code, label) VALUES ('a', N'A');")
+            .await
+            .is_err(),
+        "the premise: the DENY on the object's current name really refuses the statement"
+    );
+    assert_eq!(
+        named_gaps(&held),
+        ["INSERT on OBJECT::[app].[old_name]"],
+        "a DENY on the object's current name must be a gap on that object, resolved \
+         from the declared one, not silently answered by the schema grant: {held:?}"
+    );
+
+    // And the rename really happens: `sp_rename` keeps the `DENY` with the
+    // object, not with the name, so the same statement is refused under the
+    // new name too — the failure `doctor` exists to catch before `apply`
+    // gets there, not after.
+    db.conn
+        .execute("EXEC sp_rename 'app.old_name', 'new_name';")
+        .await
+        .expect("rename the table");
+    let mut lp = connect_live(&as_login)
+        .await
+        .expect("reconnect after the rename");
+    assert!(
+        lp.execute("INSERT INTO app.new_name (code, label) VALUES ('a', N'A');")
+            .await
+            .is_err(),
+        "sp_rename keeps the DENY with the object: the INSERT must still be \
+         refused under its new name"
     );
 
     drop(lp);
@@ -3946,6 +4128,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -3970,6 +4153,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -4332,6 +4516,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -4348,6 +4533,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -4375,6 +4561,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -7509,6 +7696,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         &[],
         &Default::default(),
         &Default::default(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .unwrap();
@@ -7555,6 +7743,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         &[],
         &Default::default(),
         &Default::default(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .unwrap();
@@ -7629,6 +7818,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -7652,6 +7842,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &[],
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -7735,6 +7926,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &[],
         &managed,
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -7770,6 +7962,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &[],
         &nowhere,
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -7797,6 +7990,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &[],
         &managed,
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -8322,6 +8516,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
         std::slice::from_ref(&bracket),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("read permissions");
@@ -8395,6 +8590,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
         &objects,
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &pbps_model::IdsFile::default(),
     )
     .await
     .expect("a list past one statement's worth of parameters must still be read");

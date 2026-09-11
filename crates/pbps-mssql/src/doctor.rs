@@ -437,6 +437,11 @@ pub struct Held {
     /// Per object a declared role is granted on, the permissions effective on
     /// it — asked about every named object, absent or invisible included, for
     /// the same reason `referenced_objects` is.
+    ///
+    /// A declared target is keyed by the name this environment currently has
+    /// it under, resolved the same way `data_tables`/`data_objects` are
+    /// (issue #133); a target sourced from this environment's own recorded
+    /// grants is already in that name, unresolved.
     pub granted_objects: BTreeMap<ObjectName, BTreeSet<String>>,
 
     /// Per schema a declared role is granted on (`schema::x`), the
@@ -452,6 +457,14 @@ pub struct Held {
     /// not exist yet. A table that declares no row at all is absent, and so is
     /// one whose declaration can produce no statement — `mode: ensure` with no
     /// declared row manages nothing, so it is asked for nothing.
+    ///
+    /// Keyed by the name this environment currently has the table under, not
+    /// necessarily the declared one: a pending rename this environment has
+    /// not caught up to yet still answers to its old name here, resolved
+    /// through the project's and the environment's own identity mappings
+    /// before either map in this struct is built (issue #133). This is the
+    /// same key [`Held::data_objects`] uses, which is what lets `data_gaps`
+    /// look the two up together.
     pub data_tables: DataTables,
 
     /// Per declared data table that the catalog shows, the permissions
@@ -851,12 +864,35 @@ async fn object_permissions(
 /// schemas are not there yet. Joining against `sys.schemas` leaves those
 /// unasked rather than reported as gaps — the alternative would fire on the
 /// most common first run there is.
+///
+/// # Why the declared data and grant targets are resolved before they are asked
+///
+/// `data` and `granted.objects` name their objects the way the declarations
+/// do. Until a pending rename reaches *this* environment, the object there
+/// still answers to its old name, and `sp_rename` keeps a `GRANT` or a `DENY`
+/// with the object rather than with the name (measured on the pinned image,
+/// issue #133). Asking `HAS_PERMS_BY_NAME` under the declared name finds
+/// nothing there, so the object question silently falls back to the schema —
+/// a careful DBA's object-level `GRANT` reads as a gap, and an object-level
+/// `DENY` that really blocks the deployment does not.
+///
+/// `project_ids` is the project's own identity mapping (declared name ->
+/// uid); `recorded_ids`, read below alongside `recorded` for the same reason
+/// the role question already reads it, is this **environment's** own
+/// mapping (uid -> the name it currently has). Resolving through both, per
+/// object, turns "the name the declarations call it" into "the name this
+/// database calls it right now" — which is what a `GRANT` issued today has
+/// to name (DECISIONS 440).
+///
+/// `referenced` is deliberately left unresolved: those tables lie outside the
+/// managed schemas, and pbps never renames an object it does not manage.
 pub async fn permissions(
     conn: &mut Conn,
     schemas: &[String],
     referenced: &[ObjectName],
     granted: &GrantTargets,
     data: &DataTables,
+    project_ids: &pbps_model::IdsFile,
 ) -> Result<Held, DbError> {
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
@@ -870,10 +906,20 @@ pub async fn permissions(
     // Recorded tables remain managed until their drop is applied, even when
     // the declarations no longer name their schema (decision 69). Tombstones
     // are permanent history and must not keep these requirements switched on.
-    let recorded = match crate::state::latest(conn).await {
-        Ok(Some(entry)) => entry.snapshot.schema,
-        // An unreadable ledger is reported by the ledger permission rows.
-        _ => pbps_model::Schema::default(),
+    //
+    // `recorded_ids` comes from the same read: an unreadable ledger must not
+    // be papered over by inventing a resolution from the declarations, so a
+    // failed or empty read leaves it as `IdsFile::default()` — which has no
+    // uid for anything, so every resolution below falls through to the name
+    // it was asked with, exactly like an environment that never had the
+    // object. The permission gap this read's own failure causes is reported
+    // by the ledger permission rows, not by this fallback.
+    let (recorded, recorded_ids) = match crate::state::latest(conn).await {
+        Ok(Some(entry)) => (entry.snapshot.schema, entry.snapshot.ids),
+        _ => (
+            pbps_model::Schema::default(),
+            pbps_model::IdsFile::default(),
+        ),
     };
     let mut managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
     managed.extend(recorded.tables.keys().map(|table| table.schema.as_str()));
@@ -991,11 +1037,23 @@ pub async fn permissions(
         })
         .map(|r| r.name)
         .collect();
-    let data_names: Vec<ObjectName> = data.keys().cloned().collect();
+    // Resolved to the name this environment currently has, per object — see
+    // the module-level note above. A table a rename has not reached here yet
+    // is asked about under the name it still carries; one this deployment has
+    // still to create has no uid recorded anywhere and keeps its declared
+    // name, which is the object-does-not-exist-yet path this whole question
+    // already falls back from.
+    let resolved_data: DataTables = data
+        .iter()
+        .map(|(name, demand)| (project_ids.resolved_in(name, &recorded_ids), demand.clone()))
+        .collect();
+    let data_names: Vec<ObjectName> = resolved_data.keys().cloned().collect();
     // The declared row columns, not the catalog's: see `Columns::Declared`.
     // `UPDATE` is the only one of the three the engine takes at column scope,
-    // so it is the only one this list can change the answer for.
-    let data_columns: BTreeMap<ObjectName, Vec<String>> = data
+    // so it is the only one this list can change the answer for. Keyed by the
+    // same resolved name as `data_names`: `Columns::Declared` matches a
+    // column to its object by that list's position.
+    let data_columns: BTreeMap<ObjectName, Vec<String>> = resolved_data
         .iter()
         .map(|(table, demand)| (table.clone(), demand.row_columns().to_vec()))
         .collect();
@@ -1069,7 +1127,18 @@ pub async fn permissions(
         // some permission on (metadata visibility), which is precisely not
         // the ones a readiness check is for. A ledger this account cannot
         // read is a gap of its own, reported by the ledger rows.
-        let mut objects: BTreeSet<ObjectName> = targets.objects.iter().cloned().collect();
+        // Resolved like the data tables above, and for the same reason: a
+        // declared grant target is a table this project manages, and a
+        // pending rename this environment has not caught up to yet leaves it
+        // answering to its old name. `recorded.roles`' own targets, added
+        // below, need no such resolution — they are read back from this
+        // environment's own last-recorded state, so they already name
+        // whatever it currently calls the object.
+        let mut objects: BTreeSet<ObjectName> = targets
+            .objects
+            .iter()
+            .map(|o| project_ids.resolved_in(o, &recorded_ids))
+            .collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
         for role in recorded.roles.values() {
             for target in role.grants.keys() {
@@ -1196,7 +1265,9 @@ pub async fn permissions(
         roles_declared,
         granted_objects,
         granted_schemas,
-        data_tables: data.clone(),
+        // Resolved, like `data_objects`: `data_gaps` looks the two up by the
+        // same key, and that key is the name this environment currently has.
+        data_tables: resolved_data,
         data_objects,
     })
 }

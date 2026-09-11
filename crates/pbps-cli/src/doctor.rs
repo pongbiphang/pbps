@@ -182,12 +182,20 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // about (the ledger lives there) and the declarations themselves are
     // already reported as findings above.
     let managed_schemas = managed_schemas(project);
+    // Read once for the whole estate, like the declarations: it is the
+    // project's own identity mapping, unaffected by which environment is
+    // being asked about. What changes per environment is which physical name
+    // each uid currently has *there* — that half comes from each
+    // environment's own recorded state, read where the permission question is
+    // actually asked (DECISIONS 440).
+    let ids = crate::read_ids(project).unwrap_or_default();
     let declared = Declared {
         referenced: referenced_tables(project, &managed_schemas),
         tables: managed_tables(project),
-        granted: grant_targets(project),
+        granted: grant_targets(project, &ids),
         data: data_tables(project),
         schemas: managed_schemas,
+        ids,
     };
 
     if !project.ids_file().exists() {
@@ -484,11 +492,10 @@ fn data_tables_of(schema: &pbps_model::Schema) -> pbps_db::doctor::DataTables {
 /// exists in the database, and the next plan revokes what it holds there —
 /// needing `CONTROL` on securables the declarations no longer name and
 /// `ALTER ANY ROLE` for a role they no longer have.
-fn grant_targets(project: &Project) -> pbps_db::doctor::GrantTargets {
+fn grant_targets(project: &Project, ids: &pbps_model::IdsFile) -> pbps_db::doctor::GrantTargets {
     let Ok(loaded) = crate::load_quiet(project) else {
         return pbps_db::doctor::GrantTargets::default();
     };
-    let ids = crate::read_ids(project).unwrap_or_default();
     let mut roles: std::collections::BTreeSet<String> =
         loaded.schema.roles.keys().cloned().collect();
     roles.extend(ids.roles.values().cloned());
@@ -560,6 +567,15 @@ struct Declared {
     granted: pbps_db::doctor::GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
     data: pbps_db::doctor::DataTables,
+    /// The project's own identity mapping (declared name -> uid), read once.
+    ///
+    /// Every object name above is the declared one — the name a pending
+    /// rename has not necessarily reached in any given environment yet. This
+    /// is the other half of resolving it to the name an environment actually
+    /// has: the permission question reads that environment's own recorded ids
+    /// (uid -> its name there) and looks the two maps up together (DECISIONS
+    /// 440).
+    ids: pbps_model::IdsFile,
 }
 
 /// Everything one environment can be asked without writing to it.
@@ -617,7 +633,7 @@ async fn examine(
         granted: &declared.granted,
         data: &declared.data,
     };
-    match crate::engine::permissions(&mut conn, &ask).await {
+    match crate::engine::permissions(&mut conn, &declared.ids, &ask).await {
         Ok(held) => {
             d.missing_permissions = held
                 .gaps

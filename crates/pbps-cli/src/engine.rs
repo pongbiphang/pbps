@@ -36,7 +36,7 @@ use pbps_db::catalog::{CatalogNames, Pulled, RowsError, Spellings};
 use pbps_db::doctor::Ask;
 use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
-use pbps_model::{ChangeSet, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
+use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
@@ -605,7 +605,16 @@ pub struct Permissions {
 /// The gaps are rendered by the engine because the securable's spelling is
 /// the engine's: `OBJECT::[dbo].[t]` on one, `TABLE "app"."t"` on the other,
 /// and the report offers each as the securable a `GRANT` names.
-pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Permissions, DbError> {
+///
+/// `project_ids` is the project's own identity mapping — every name in `ask`
+/// is the declared one, and only SQL Server's own permission questions (see
+/// `pbps_mssql::doctor::permissions`) need to resolve it against a pending
+/// rename this environment may not have caught up to yet (issue #133).
+pub async fn permissions(
+    conn: &mut Conn,
+    project_ids: &IdsFile,
+    ask: &Ask<'_>,
+) -> Result<Permissions, DbError> {
     match conn.driver() {
         Driver::Mssql => {
             let held = pbps_mssql::doctor::permissions(
@@ -614,6 +623,7 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Permissions, 
                 ask.referenced,
                 ask.granted,
                 ask.data,
+                project_ids,
             )
             .await?;
             Ok(Permissions {

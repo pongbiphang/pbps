@@ -9650,3 +9650,56 @@ SPEC is in sync with all of these.
     in particular already owns the case where a `numeric` remains genuinely
     `Narrowing` into a float and the probe that should catch a rounding row
     does not; that is a preflight-contract gap, not a risk-classification one.
+
+440. **`doctor`'s object-scope permission questions are resolved against the
+    environment's own recorded name, not the declared one.** `managed_schemas`,
+    `referenced_tables`, `grant_targets` and `data_tables`
+    (`crates/pbps-cli/src/doctor.rs`) build every object name `doctor` asks
+    about from the declarations. Until `apply` reaches a given environment, a
+    table this plan renames still carries its *old* name there, and SQL
+    Server keeps a `GRANT` or a `DENY` with the object through `sp_rename`
+    (measured on the pinned image, matching `deploy.rs`'s own reliance on
+    that fact) — keyed by `object_id`, not by name. Asking `HAS_PERMS_BY_NAME`
+    under the declared name therefore found nothing there: `Needed::DataInsert`
+    /`DataUpdate`/`DataDelete` and `Needed::Granted` silently fell back to the
+    schema, reporting a gap a careful DBA's object-level grant did not have,
+    and missing an object-level `DENY` that really blocked the deployment
+    (#133).
+
+    The fix resolves per uid, not per file. The **project's ids file** is the
+    identity of the *declared* world and says nothing about how far any one
+    environment has got — two environments routinely sit at different
+    points — so it is the wrong side to resolve *against*. The
+    **environment's own recorded `StateSnapshot::ids`**, read from the same
+    `state::latest` call `pbps_mssql::doctor::permissions` already makes for
+    the role question, is the right one: declared name -> uid comes from the
+    project's ids file, uid -> this environment's current name comes from its
+    own recorded ids. `IdsFile::resolved_in` (`pbps-model`) does the lookup
+    and is shared with `deploy.rs`'s own resume-time name resolution
+    (formerly a private `live_name`), which already depended on exactly the
+    same two-map shape.
+
+    Three cases fall through to the name asked with, deliberately, rather
+    than reading as "holds nothing": no uid for the declared name (an object
+    added since the last `plan` — nothing has been applied for it anywhere),
+    a uid the project has but the environment's recorded ids does not (this
+    environment has never had the object), and an unreadable ledger (already
+    a gap of its own, reported by the ledger permission rows; the empty
+    `IdsFile` this falls back to has no uid for anything, so it takes the
+    same path as "never had it" rather than this resolution inventing a
+    distinction it cannot tell apart). `referenced` is left unresolved: those
+    tables lie outside the managed schemas, and pbps never renames an object
+    it does not manage. This PR is scoped to `pbps-mssql`, the dialect the
+    issue measured; the same shape may recur in `pbps-pg`'s doctor, which is
+    tracked separately rather than fixed here unmeasured.
+
+    A live test grants `INSERT` on a table's current name alone (nothing
+    wider) against declarations naming its rename destination with the
+    project's ids file already pointing there, and requires the account read
+    ready rather than gapped; the converse grants the whole schema with a
+    `DENY` on the current name and requires the gap land on that object, the
+    `DENY` really refusing the statement, and the refusal surviving the
+    `sp_rename` itself. A unit test on `IdsFile::resolved_in` pins the
+    resolution preferring the environment's recorded name over the declared
+    one and falling back to the declared name when it cannot resolve, for
+    each of the three reasons above.
