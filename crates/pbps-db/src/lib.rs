@@ -38,7 +38,9 @@ pub mod ledger;
 mod mssql;
 mod postgres;
 
-pub use ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry};
+pub use ledger::{
+    LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineStaged, TimelineState,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {

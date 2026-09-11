@@ -820,15 +820,25 @@ See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
 
 ```sql
 CREATE TABLE dbo.__pbps_state (
-    id            BIGINT IDENTITY PRIMARY KEY,
-    applied_at    DATETIME2(3)   NOT NULL,
-    kind          VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap | staged | failed
-    git_sha       VARCHAR(40)    NULL,
-    plan_checksum CHAR(64)       NULL,
-    state_json    NVARCHAR(MAX)  NOT NULL,   -- the whole schema snapshot plus the
-                                             -- identity mapping as of that moment
-    operator      NVARCHAR(128)  NOT NULL,
-    reason        NVARCHAR(1000) NULL
+    id               BIGINT IDENTITY PRIMARY KEY,
+    applied_at       DATETIME2(3)   NOT NULL,
+    kind             VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap | staged | failed
+    git_sha          VARCHAR(40)    NULL,
+    plan_checksum    CHAR(64)       NULL,
+    state_json       NVARCHAR(MAX)  NOT NULL,   -- the whole schema snapshot plus the
+                                                -- identity mapping as of that moment
+    operator         NVARCHAR(128)  NOT NULL,
+    reason           NVARCHAR(1000) NULL,
+    -- The timeline's own projection (issue #103, DECISIONS 435): the same move
+    -- this table already makes for kind/git_sha/plan_checksum/operator/reason,
+    -- so `state list` can read counts without parsing `state_json`. Nullable
+    -- because a row recorded before these existed has none; the reader falls
+    -- back to `state_json` for exactly that row rather than refusing the call.
+    state_version    INT NULL,
+    tables_count     INT NULL,
+    modules_count    INT NULL,
+    staged_completed INT NULL,
+    staged_total     INT NULL
 );
 
 CREATE TABLE dbo.__pbps_lock (
@@ -842,6 +852,14 @@ The **whole snapshot** is stored rather than a delta or a checksum: drift
 detection can then compare in full, the snapshot doubles as a backup, and it can
 answer "what did this table look like three months ago?". `pbps state prune --keep
 50` handles cleanup.
+
+The last five columns hold no fact `state_json` does not already carry — they
+are read back out of the snapshot at `record` time, never set independently,
+so they cannot come to disagree with it. They exist only so `state list` can
+answer `state_version`, a table count, a module count and staged progress
+without transferring or parsing the whole snapshot for every row it lists; a
+ledger from before they existed keeps working via a fallback that parses
+`state_json` for exactly the rows that still need it (DECISIONS 435).
 
 `__pbps_lock` stops two pipelines applying at once.
 

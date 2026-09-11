@@ -9367,3 +9367,197 @@ SPEC is in sync with all of these.
     The live suite adds a smaller-`connect_timeout` test
     (`a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling`) beside the
     existing 30-second black-hole test in `crates/pbps-pg/tests/live.rs`.
+
+435. **`state list`'s timeline reads five new ledger columns, never
+    `state_json`, in the steady state (issue #103).** Measured before
+    choosing: a 300-table snapshot recorded 50 times and read back through
+    `SELECT_TIMELINE` transferred and deserialized ~28.4 MB of `state_json` on
+    SQL Server (8.39s) and ~9.9 MB on PostgreSQL (609ms), against ~1.1 KB and
+    ~700 B respectively for the columns the command actually prints — the
+    issue's claim was reasoned, not measured, and the engines confirmed it on
+    both dialects, not only the one the issue named.
+
+    Two shapes were on the table, and the choice was architectural, not about
+    which measured faster — nothing here measures a `JSON_VALUE`/`OPENJSON` or
+    `jsonb` projection, so no performance claim is made against it:
+
+    - **Columns** (chosen): `state_version`, `tables_count`, `modules_count`,
+      `staged_completed`, `staged_total` beside `state_json`, written from the
+      snapshot at `record` time. This is the third time `__pbps_state` makes
+      this move — `kind`/`git_sha`/`plan_checksum`/`operator`/`reason` already
+      exist so a reader can filter and count without parsing JSON (SPEC §8.1)
+      — and it keeps that principle rather than making an exception to it.
+    - **SQL projection** (not chosen): `JSON_VALUE`/`OPENJSON` on SQL Server,
+      `jsonb` operators on PostgreSQL. Smaller PR, no migration — and it
+      contradicts the reason the five existing columns exist, once per
+      dialect, forever: every future field `StateSnapshot` gains at a new path
+      would need two hand-written query fragments kept in step with Rust
+      structs the compiler does not check, the exact coupling the projected
+      columns were introduced to avoid.
+
+    **The JSON snapshot format is untouched.** `CURRENT_VERSION` and
+    `OLDEST_READABLE_VERSION` (`pbps-model::state`) do not move: the five new
+    columns are a `__pbps_state` **table** change, not a `StateSnapshot`
+    format change, exactly as the five existing projected columns never bumped
+    it either. `record` writes them from the snapshot; nothing in `state_json`
+    itself changed shape.
+
+    **Nullable, because a row recorded before this shipped must still be
+    listed** (DECISIONS 218: an entry this build cannot read is carried, not
+    thrown — extended here to a row it has not yet been given the columns
+    for). `timeline` reads the projected columns first; a row whose
+    `state_version` is NULL is legacy, and its id is asked for in a second
+    query, `SELECT id, state_json FROM __pbps_state WHERE id IN (...)`, sent
+    only for those ids. A ledger with no legacy rows never sends it. Migration
+    is idempotent and runs from `ensure_tables`: **measured**, SQL Server's
+    `IF COL_LENGTH(...) IS NULL BEGIN ALTER TABLE ... END` evaluates the guard
+    before it would need `ALTER` to act on the `THEN`, so a login holding only
+    `SELECT`/`INSERT`/`DELETE` never needs it once migrated; PostgreSQL's
+    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` is refused by ownership
+    *before* the `IF NOT EXISTS` is looked at, even when every column already
+    exists, so `pbps_pg::state::migrate_timeline_columns` asks a world-readable
+    catalog probe first and sends the `ALTER` only when it says the columns
+    are actually missing.
+
+    **`timeline` asks the ledger's shape before it asks for a row.** A
+    round-1 review finding caught what the first version of this entry's own
+    promise did not yet keep: the columns above are nullable so a row
+    recorded before they existed is still listed, but `state list` is a read
+    and must not require `ALTER` or ownership to run — it cannot call
+    `ensure_tables` to make an *unmigrated table's* columns appear, only a
+    *row's* NULL columns were ever handled. `SELECT_TIMELINE` naming five
+    columns that do not exist at all failed the whole call outright, not
+    per-row, on exactly the ledger a real upgrade meets first — the
+    development tests only ever exercised a table `ensure_tables` had
+    already touched, which is why the gap shipped. The fix treats "the
+    columns are not there yet" as a fourth known ledger shape rather than an
+    error: `timeline` probes for the columns first (`COL_LENGTH` on SQL
+    Server, the same world-readable catalog probe `migrate_timeline_columns`
+    already uses on PostgreSQL — neither needs anything wider than an
+    ordinary read), and an unmigrated table sends the pre-#103 six-column
+    query instead, with every row routed through the same legacy fallback a
+    partly-migrated ledger's NULL rows already use. One code path serves
+    both shapes; nothing about the fallback itself changed.
+
+    **The version gate is unavoidable, not merely present.** A second
+    round-1 finding: the projected path parsed `state_version` into a
+    `TimelineState` directly, so a row a newer pbps wrote — its columns
+    populated like any other row's — was presented as ordinary data with
+    counts, where the JSON fallback's `StateSnapshot::read_json` would have
+    refused the same version as `Unreadable::UnsupportedVersion`. The two
+    paths had come to disagree about what "readable" means. Fixed by giving
+    `pbps_db::ledger::TimelineState` one constructor for the projected path,
+    `from_projected`, that calls the new `pbps_model::check_readable_version`
+    before it will build the value at all — checking and constructing are
+    the same call, so a third path built later cannot skip the check either
+    (the shape AGENTS.md asks for: prefer a failure unrepresentable over a
+    branch that tests for it).
+
+    **The version is checked before the other columns are decoded, not only
+    before `TimelineState` is built from them.** A round-3 finding on the
+    previous paragraph's own fix: `from_projected`'s check runs when it is
+    called, but `projected_row` on both dialects computed `tables`/`modules`
+    — decoding `tables_count`/`modules_count` out of the row — *before*
+    calling it, as ordinary function-call arguments. A row a newer pbps
+    wrote populating those two columns in a shape this build cannot parse
+    (bound by construction from a version this build wrote, per
+    `as_count`'s own doc comment — never true of *this* build's own rows,
+    but nothing here controls what a newer one writes) failed the whole
+    `timeline()` call on that decode, before `from_projected` was ever
+    reached to refuse the row by version instead. The JSON fallback never
+    had this gap: `read_json` checks the version before it touches the rest
+    of the document at all, and it is exactly that ordering the projected
+    path did not yet keep. Fixed by checking
+    `pbps_model::check_readable_version` first, immediately after
+    `state_version` is read and before `tables_count`/`modules_count` are
+    touched at all; `from_projected` remains the only constructor and is
+    still called to build the value once the check has already passed, so
+    the two checks cannot disagree — the second one is guaranteed to
+    succeed, which is what its `.expect` documents rather than skips.
+
+    **`(None, None)` is the only pair that means "not staged."** A round-4
+    finding: `staged_completed`/`staged_total` are two independently
+    nullable columns, but `record` only ever writes both together or
+    neither — the JSON side's `Option<StagedProgress>` makes the pair one
+    field, not two, so it cannot come apart on any path this crate writes.
+    `projected_row`'s catch-all arm read `(Some, None)` and `(None, Some)`
+    the same as a genuine `(None, None)`, silently reinterpreting a row
+    that had gone out of step as one that was simply never mid-deployment —
+    exactly the "unreadable read as nothing there" AGENTS.md names, and on
+    columns this PR itself introduces. `as_count`'s own doc comment states
+    the rule this row breaks: a value `record` would never produce means
+    "the row and this reader have gone out of step," reported rather than
+    silently reinterpreted. A half-populated pair is that same rule, one
+    column over — fixed by refusing it as `Unreadable::Malformed`, naming
+    which column is present and which is NULL, rather than folding it into
+    the `_ => None` arm.
+
+    **The legacy fallback asks in pieces, not one statement, on both
+    dialects.** A third: `select_legacy_state_json` bound one parameter per
+    legacy id with no ceiling, and until a deployer runs a deployment after
+    upgrading, every row on a ledger is legacy — the normal case immediately
+    after this ships, not an exotic one. SQL Server refuses more than 2,098
+    user parameters in one bound statement (`pbps_mssql::doctor::MAX_PARAMETERS`,
+    measured and already shared with the object-permission queries there);
+    `timeline`'s fallback there now asks in chunks of that size. A round-2
+    review finding caught that the fix stopped one dialect short:
+    PostgreSQL's extended protocol writes a Bind message's parameter count as
+    an `int16`, so it has the same shape of ceiling, just a different number
+    — **measured** against the pinned image (`pbps_pg::state::MAX_PARAMETERS`,
+    the live test `a_query_may_bind_the_most_parameters_the_extended_protocol_represents`):
+    65,535 bound parameters succeed, 65,536 are refused with "error parsing
+    response from server". `pbps_pg::state::timeline`'s fallback now chunks
+    by that measured number too, the same shape as SQL Server's fix, one
+    dialect apart, with its own constant rather than the other engine's
+    2,098 — a different protocol, not a reused number.
+
+    **A fourth `Unreadable` case, not a third `Malformed`.** A row a fallback
+    query cannot read because a principal was denied `state_json` is neither a
+    build too old to read the format (`UnsupportedVersion`) nor a damaged row
+    (`Malformed`) — reporting a permission gap as either sends an operator to
+    upgrade a build that is fine or hunt for damage that is not there. A third
+    `pbps_model::Unreadable::Denied(String)` variant, threaded through
+    `pbps_db::TimelineEntry` (now typed `Result<TimelineState, Unreadable>`,
+    not `Result<StateSnapshot, Unreadable>` — a timeline row reading only the
+    projected columns never has the schema or the identity mapping in hand,
+    and a type claiming to be a `StateSnapshot` while routinely holding neither
+    would be lying about what it carries) and into `state list`'s own
+    `Unreadable` schema as `denied`.
+
+    **`doctor` does not yet ask for the right this migration needs** — SQL
+    Server's `ALTER` on an existing ledger, PostgreSQL's ownership of it —
+    because today's `Needed::Ledger` demands only `SELECT`/`INSERT`/`DELETE`
+    once the ledger exists, and `Needed::LedgerCreation` covers `ALTER` only
+    while it does not. A login or role holding exactly what `doctor` reports
+    ready meets a driver error on its first `ensure_tables` after upgrading;
+    both dialects now rewrite that failure to name the ledger, the five
+    columns and the right needed rather than pass through the driver's own
+    words (SQL Server's Msg 1088, PostgreSQL's "must be owner"). Closing the
+    `doctor` gap itself is out of this PR's scope and tracked separately.
+
+    Pinned by live tests on both engines: a `__pbps_state` created with the
+    pre-#103 DDL is migrated in place by `ensure_tables`, a legacy row keeps
+    listing its counts through the JSON fallback, and a row recorded
+    afterwards reads them from the columns; the sharp test the issue names —
+    a fully-migrated ledger whose `state_json` the reader's principal may not
+    see still answers `state list` — on both dialects; `timeline` answers a
+    ledger nobody has ever migrated, through the same path `engine::timeline`
+    calls, never through `ensure_tables`; and a row a newer pbps wrote is
+    `Unreadable::UnsupportedVersion` on the projected path exactly as an
+    older pbps's JSON fallback already refuses it, beside the positive case
+    that a supported version is not refused. Both dialects also pin the
+    legacy fallback succeeding past their own measured parameter ceiling —
+    2,098 on SQL Server, 65,535 on PostgreSQL — each with a revert-and-watch-
+    fail cycle confirming the failure the fix removes names the protocol
+    limit, not something incidental. Both dialects also pin a row carrying
+    both an unsupported version and a count this build cannot parse being
+    refused by its version — the whole `timeline()` call still succeeding —
+    with its own revert-and-watch-fail cycle confirming the unfixed ordering
+    fails the whole call on the count instead. Both dialects also pin a
+    hand-written row with `staged_completed` set and `staged_total` NULL
+    being refused as `Malformed`, the whole call still succeeding, with its
+    own revert-and-watch-fail cycle confirming the unfixed catch-all reads
+    it as "not staged" instead. A unit test pins a denied row rendering as
+    denied, never as malformed and never with tables/modules silently
+    reading zero, and another pins the projected path's version gate
+    directly against `pbps_model::CURRENT_VERSION`/`OLDEST_READABLE_VERSION`.

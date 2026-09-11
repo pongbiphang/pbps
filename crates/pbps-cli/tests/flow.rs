@@ -11066,10 +11066,16 @@ fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
     d.table(ONE_COLUMN);
     d.commit();
 
-    // The tool's own path to a real ledger, then one column renamed out from
-    // under the reader: the table resolves and the principal may read it, so
-    // this is "present and unreadable" rather than absent or denied — the case
-    // a test can build without a second login.
+    // The tool's own path to a real ledger, a row written the way a build
+    // from before issue #103 wrote it — the six original columns, none of
+    // the five timeline columns this build now reads first — and then
+    // `state_json` renamed out from under the reader. The row has to be a
+    // legacy one: `state list`'s fast path no longer names `state_json` at
+    // all, so it would not notice the rename by itself, and the fallback it
+    // takes for exactly this row is what has to break instead. The table
+    // resolves and the principal may read it, so this is "present and
+    // unreadable" rather than absent or denied — the case a test can build
+    // without a second login.
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11077,10 +11083,23 @@ fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
             .unwrap();
         rt.block_on(async {
             let mut conn = connect_live(&connection).await.expect("connect");
-            pbps_mssql::state::lock(&mut conn, "state-list-broken")
+            pbps_mssql::state::ensure_tables(&mut conn)
                 .await
-                .expect("lock");
-            pbps_mssql::state::unlock(&mut conn).await.expect("unlock");
+                .expect("ensure tables");
+            conn.execute_with(
+                "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, \
+                 operator, reason) VALUES (@P1, @P2, @P3, @P4, @P5, @P6);",
+                &[
+                    "apply".into(),
+                    None::<&str>.into(),
+                    None::<&str>.into(),
+                    r#"{"version":1}"#.into(),
+                    "state-list-broken".into(),
+                    None::<&str>.into(),
+                ],
+            )
+            .await
+            .expect("write a legacy row by hand");
             conn.execute(
                 "EXEC sp_rename 'dbo.__pbps_state.state_json', 'was_state_json', 'COLUMN';",
             )

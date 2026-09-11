@@ -295,11 +295,15 @@ impl StateSnapshot {
 
 /// Why a recorded state could not be read.
 ///
-/// Two failures with two different remedies, and a message that flattened them
-/// sent an operator with a damaged ledger looking for a newer pbps. A state
-/// outside the readable version range is read by changing the build; a state
-/// that does not parse is damage, and there is no version of this tool that
-/// reads it (DECISIONS 222).
+/// Three failures with three different remedies, and a message that flattened
+/// any two of them sent an operator to the wrong one. A state outside the
+/// readable version range is read by changing the build; a state that does
+/// not parse is damage, and there is no version of this tool that reads it
+/// (DECISIONS 222). A state this reader was refused is neither: the build is
+/// fine and the row is not damaged, and folding it into `Malformed` would
+/// report "this build cannot parse the snapshot" about a snapshot it was
+/// never allowed to look at — a false statement in the tool's own audit
+/// output (DECISIONS 435).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreadable {
     /// The state named a version outside
@@ -311,13 +315,19 @@ pub enum Unreadable {
     /// can ask about the version, or — within a version it does read — the
     /// strict parse that refuses an unknown field.
     Malformed(String),
+
+    /// The engine refused to let this reader see the recorded state at all —
+    /// a permission denied on the column or the row, not a parse failure and
+    /// not a version this build does not understand. The message names what
+    /// was refused, in the engine's own words (DECISIONS 435).
+    Denied(String),
 }
 
 impl Unreadable {
     /// The failure's own words, whichever it is.
     pub fn detail(&self) -> &str {
         match self {
-            Self::UnsupportedVersion(m) | Self::Malformed(m) => m,
+            Self::UnsupportedVersion(m) | Self::Malformed(m) | Self::Denied(m) => m,
         }
     }
 }
@@ -325,11 +335,13 @@ impl Unreadable {
 impl std::fmt::Display for Unreadable {
     /// The one sentence [`StateSnapshot::from_json`] has always given, so that
     /// telling the two apart changed no message a reader of a single state
-    /// sees.
+    /// sees — and `Denied`, added later, follows the same shape rather than a
+    /// new one.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedVersion(m) => write!(f, "{m}"),
             Self::Malformed(m) => write!(f, "malformed: {m}"),
+            Self::Denied(m) => write!(f, "denied: {m}"),
         }
     }
 }
@@ -359,6 +371,22 @@ fn check_version_number(version: u32) -> Result<(), String> {
              partially."
         }
     ))
+}
+
+/// [`check_version_number`], wrapped as the [`Unreadable`] a caller with no
+/// [`StateSnapshot`] in hand can return directly.
+///
+/// A ledger's projected columns (issue #103, DECISIONS 435) give a timeline
+/// reader a version and three counts without ever building a snapshot or
+/// parsing `state_json` — so without this, that path had no way to ask the
+/// same question [`StateSnapshot::read_json`] already asks of the JSON
+/// fallback, and a row a newer pbps wrote could reach a reader as ordinary
+/// counts instead of [`Unreadable::UnsupportedVersion`] (a round-1 review
+/// finding on #103's own PR). `pbps_db::ledger::TimelineState::from_projected`
+/// is the one place that calls this, so a third path built later cannot skip
+/// it either — the check is unavoidable rather than merely present twice.
+pub fn check_readable_version(version: u32) -> Result<(), Unreadable> {
+    check_version_number(version).map_err(Unreadable::UnsupportedVersion)
 }
 
 #[cfg(test)]

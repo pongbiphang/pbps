@@ -748,7 +748,13 @@ fn object_permissions_sql<'a>(
 /// here rather than read off the driver, which documents the server's
 /// number, because the limit is the server's and the driver is not this
 /// crate's to name (constraint 9).
-const MAX_PARAMETERS: usize = 2098;
+///
+/// `pub(crate)`, not private: `crate::state`'s legacy-row fallback query
+/// binds one parameter per id with the same `sp_executesql` overhead and
+/// shares this ceiling rather than re-deriving it (a round-1 review finding
+/// on #103's own PR — the two callers must not drift onto two different
+/// numbers for the one thing the server actually enforces).
+pub(crate) const MAX_PARAMETERS: usize = 2098;
 
 /// The object list cut into pieces each of which fits one statement.
 ///

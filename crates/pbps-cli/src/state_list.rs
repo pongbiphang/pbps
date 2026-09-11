@@ -84,7 +84,11 @@ pub struct LedgerRow {
 ///
 /// A tagged object rather than a string: a consumer that renders "upgrade pbps"
 /// must not draw it for a row whose JSON is damaged, and reading that out of a
-/// message is not something a schema can promise.
+/// message is not something a schema can promise. Three variants, not two
+/// (DECISIONS 435): a row this reader was refused is neither a build this
+/// tool has outgrown nor a row that is damaged, and a consumer that offered
+/// "upgrade pbps" for a permission problem would send an operator chasing a
+/// fix that does nothing.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Unreadable {
@@ -96,6 +100,11 @@ pub enum Unreadable {
     /// The state did not parse. The row is damaged, and no version of this tool
     /// reads it; the ledger's own columns are all there is.
     Malformed { detail: String },
+
+    /// The engine refused this reader's principal the recorded state. `detail`
+    /// is what the engine said was refused — a permission to grant, not a
+    /// build to change and not damage to repair.
+    Denied { detail: String },
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -157,20 +166,23 @@ fn row(entry: pbps_db::TimelineEntry) -> LedgerRow {
         modules: None,
     };
     match entry.state {
-        Ok(snapshot) => {
-            out.state_version = Some(snapshot.version);
-            out.staged = snapshot.staged.map(|s| StagedRow {
+        Ok(state) => {
+            out.state_version = Some(state.version);
+            out.staged = state.staged.map(|s| StagedRow {
                 completed: s.completed,
                 total: s.total,
             });
-            out.tables = Some(snapshot.schema.tables.len());
-            out.modules = Some(snapshot.schema.modules.len());
+            out.tables = Some(state.tables);
+            out.modules = Some(state.modules);
         }
         Err(pbps_model::Unreadable::UnsupportedVersion(detail)) => {
             out.unreadable = Some(Unreadable::UnsupportedVersion { detail });
         }
         Err(pbps_model::Unreadable::Malformed(detail)) => {
             out.unreadable = Some(Unreadable::Malformed { detail });
+        }
+        Err(pbps_model::Unreadable::Denied(detail)) => {
+            out.unreadable = Some(Unreadable::Denied { detail });
         }
     }
     out
@@ -218,10 +230,10 @@ pub fn cmd_state_list(target: &db::Target, limit: u32, json: bool) -> anyhow::Re
         let mut findings = Vec::new();
         // Named one by one, and as a warning rather than a note: a row this
         // build cannot read is a gap in what the page can show, and a reader
-        // who is told nothing would take the missing counts for zero. Two ids,
-        // because the two failures are two different jobs for whoever reads
-        // them — one is a build to change, the other a damaged row
-        // (DECISIONS 222).
+        // who is told nothing would take the missing counts for zero. Three
+        // ids, because the three failures are three different jobs for
+        // whoever reads them — a build to change, a damaged row, or a
+        // permission to grant (DECISIONS 222, 429).
         for e in &entries {
             let (id, what) = match &e.state {
                 Ok(_) => continue,
@@ -236,6 +248,13 @@ pub fn cmd_state_list(target: &db::Target, limit: u32, json: bool) -> anyhow::Re
                     "state.entry-malformed",
                     format!(
                         "has a recorded state that does not parse, so the row is damaged ({})",
+                        one_line(detail)
+                    ),
+                ),
+                Err(pbps_model::Unreadable::Denied(detail)) => (
+                    "state.entry-denied",
+                    format!(
+                        "has a recorded state this reader is not authorized to see ({})",
                         one_line(detail)
                     ),
                 ),
@@ -359,6 +378,9 @@ fn render(data: &StateListData) -> String {
                     }
                     (None, Some(Unreadable::Malformed { .. })) => {
                         "(recorded state is damaged)".to_owned()
+                    }
+                    (None, Some(Unreadable::Denied { .. })) => {
+                        "(recorded state: permission denied)".to_owned()
                     }
                     (None, None) => String::new(),
                 },
@@ -510,6 +532,18 @@ mod tests {
             "{old}"
         );
 
+        let denied = render(&unreadable(Unreadable::Denied {
+            detail: "permission denied for column state_json".to_owned(),
+        }));
+        assert!(
+            denied.contains("(recorded state: permission denied)"),
+            "{denied}"
+        );
+        assert!(
+            !denied.contains("damaged") && !denied.contains("format not read"),
+            "a denied row is neither damaged nor a format problem: {denied}"
+        );
+
         // A row that has a reason of its own keeps it: the placeholder stands
         // in for nothing, never over something.
         let mut data = unreadable(Unreadable::Malformed {
@@ -528,5 +562,38 @@ mod tests {
     fn an_unprintable_character_is_shown_rather_than_dropped() {
         assert_eq!(one_line("a\u{7}b"), "a\\u{7}b");
         assert_eq!(one_line("plain"), "plain");
+    }
+
+    /// A row this reader was refused shows as refused — never as damaged, and
+    /// never with the counts silently reading zero, which would say "no
+    /// tables" about an environment nobody could actually see (DECISIONS
+    /// 429). This is `row`'s own mapping, not `render`'s text: the JSON
+    /// envelope must carry the same distinction the table draws.
+    #[test]
+    fn a_denied_entry_is_denied_not_malformed_and_not_zero_counts() {
+        let entry = pbps_db::TimelineEntry {
+            id: 9,
+            applied_at: "2026-09-06T10:00:00.000".to_owned(),
+            kind: "apply".to_owned(),
+            git_sha: None,
+            plan_checksum: None,
+            operator: "someone".to_owned(),
+            reason: None,
+            state: Err(pbps_model::Unreadable::Denied(
+                "permission denied for column state_json".to_owned(),
+            )),
+        };
+        let out = row(entry);
+        assert!(matches!(out.unreadable, Some(Unreadable::Denied { .. })));
+        assert!(out.state_version.is_none());
+        assert!(
+            out.tables.is_none(),
+            "a denied row must not read as zero tables"
+        );
+        assert!(
+            out.modules.is_none(),
+            "a denied row must not read as zero modules"
+        );
+        assert!(out.staged.is_none());
     }
 }

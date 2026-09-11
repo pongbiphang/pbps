@@ -1405,7 +1405,7 @@
       ]
     },
     "Unreadable": {
-      "description": "Why one row's recorded state is missing from the timeline.\n\nA tagged object rather than a string: a consumer that renders \"upgrade pbps\"\nmust not draw it for a row whose JSON is damaged, and reading that out of a\nmessage is not something a schema can promise.",
+      "description": "Why one row's recorded state is missing from the timeline.\n\nA tagged object rather than a string: a consumer that renders \"upgrade pbps\"\nmust not draw it for a row whose JSON is damaged, and reading that out of a\nmessage is not something a schema can promise. Three variants, not two\n(DECISIONS 435): a row this reader was refused is neither a build this\ntool has outgrown nor a row that is damaged, and a consumer that offered\n\"upgrade pbps\" for a permission problem would send an operator chasing a\nfix that does nothing.",
       "oneOf": [
         {
           "description": "The state names a format this build does not read. `detail` is\n`StateSnapshot::check_version`'s own message, which names the direction\nand what to do about it.",
@@ -1434,6 +1434,23 @@
             "kind": {
               "type": "string",
               "const": "malformed"
+            }
+          },
+          "required": [
+            "kind",
+            "detail"
+          ]
+        },
+        {
+          "description": "The engine refused this reader's principal the recorded state. `detail`\nis what the engine said was refused — a permission to grant, not a\nbuild to change and not damage to repair.",
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "denied"
             }
           },
           "required": [
