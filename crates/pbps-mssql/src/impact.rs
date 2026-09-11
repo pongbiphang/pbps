@@ -25,148 +25,81 @@
 
 use std::collections::BTreeMap;
 
-use pbps_db::{Conn, DbError};
+use pbps_db::Conn;
 use pbps_dialect::DialectError;
-use pbps_model::{Change, ColumnRef, ObjectName, TableName};
+use pbps_model::{Change, TableName};
 
 use crate::catalog::{get, opt};
 use crate::emit::qualified;
 
-/// What is being renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RenameTarget {
-    Table(TableName),
-    Column(ColumnRef),
-    /// A module about to be dropped. Not a rename — but a module rename *is* a
-    /// drop plus a create (ADR-0002), and the question the catalog is asked is
-    /// the same one: what still refers to this name. Without it the referrers
-    /// of a dropped view are never reported and are simply left broken.
-    Module(ObjectName),
-}
+// The target, the referrer, the report and its error are `pbps-db`'s: one
+// shape, filled by each engine's own catalog queries (DECISIONS 417). Which
+// changes in a plan are rename targets stays this engine's question —
+// `rename_targets` below — because only this engine asks the drop side of a
+// module rename here.
+pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
-impl RenameTarget {
-    /// The table whose dependencies have to be queried. For a column rename it
-    /// is the column's table: SQL Server records the dependency against the
-    /// object, and a module that names the table is a module that may name this
-    /// column.
-    pub fn table(&self) -> &TableName {
-        match self {
-            RenameTarget::Table(t) => t,
-            RenameTarget::Column(c) => &c.table,
-            // A module has no table; it *is* the object the dependency rows
-            // point at, and tables and modules share one namespace.
-            RenameTarget::Module(m) => m,
+/// Every rename in a plan, as the objects they are renamed *from* — which is
+/// the name the catalog still knows them by.
+pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
+    // A RenameColumn carries the declared, post-rename table because its
+    // statement runs after RenameTable. Impact runs before either one, so
+    // translate through a map built over the whole plan rather than rely on
+    // the changes' current ordering (DECISIONS 416).
+    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for p in &changes.changes {
+        if let Change::RenameTable { from, to, .. } = &p.change {
+            stored.insert(to, from);
         }
     }
-
-    /// The verb to use when reporting the impact.
-    pub fn verb(&self) -> &'static str {
-        match self {
-            RenameTarget::Table(_) | RenameTarget::Column(_) => "Renaming",
-            RenameTarget::Module(_) => "Dropping",
-        }
-    }
-
-    /// Every rename in a plan, as the objects they are renamed *from* — which is
-    /// the name the catalog still knows them by.
-    pub fn from_changes(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
-        // A RenameColumn carries the declared, post-rename table because its
-        // statement runs after RenameTable. Impact runs before either one, so
-        // translate through a map built over the whole plan rather than rely on
-        // the changes' current ordering (DECISIONS 416).
-        let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
-        for p in &changes.changes {
-            if let Change::RenameTable { from, to, .. } = &p.change {
-                stored.insert(to, from);
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
+            Change::RenameColumn { table, from, .. } => {
+                let table = stored.get(table).map_or(table, |t| *t);
+                Some(RenameTarget::Column(table.column(from)))
             }
-        }
-        changes
-            .changes
-            .iter()
-            .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(RenameTarget::Table(from.clone())),
-                Change::RenameColumn { table, from, .. } => {
-                    let table = stored.get(table).map_or(table, |t| *t);
-                    Some(RenameTarget::Column(table.column(from)))
-                }
-                // A module rename reaches the plan as this drop plus a create,
-                // so the drop side is where the catalog has to be asked what
-                // still points at the old name.
-                Change::DropModule { id, .. } => Some(RenameTarget::Module(id.object_name())),
-                // Exhaustive rather than `_`: a change added later that also
-                // moves a name must be considered here, and a catch-all would
-                // let it through silently.
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                // Row changes move no name: a row's identity is its key, and a
-                // changed key is a delete plus an insert, not a rename.
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. } => None,
-            })
-            .collect()
-    }
-}
-
-impl std::fmt::Display for RenameTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RenameTarget::Table(t) => write!(f, "table {t}"),
-            RenameTarget::Column(c) => write!(f, "column {c}"),
-            RenameTarget::Module(m) => write!(f, "module {m}"),
-        }
-    }
-}
-
-/// One object that refers to the thing being renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Referrer {
-    /// `view`, `procedure`, `function`, `trigger`, `computed column`, ...
-    pub kind: String,
-    pub name: String,
-    /// Why this one matters, when the kind alone does not say it.
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ImpactReport {
-    pub target: String,
-
-    /// SCHEMABINDING referrers. The engine refuses the rename outright, so this
-    /// is not a warning: it is the reason the apply cannot start.
-    pub blocking: Vec<Referrer>,
-
-    /// Objects that will break but that the engine will not stop.
-    pub advisory: Vec<Referrer>,
-}
-
-impl ImpactReport {
-    pub fn is_empty(&self) -> bool {
-        self.blocking.is_empty() && self.advisory.is_empty()
-    }
+            // A module rename reaches the plan as this drop plus a create,
+            // so the drop side is where the catalog has to be asked what
+            // still points at the old name.
+            Change::DropModule { id, .. } => Some(RenameTarget::Module(id.object_name())),
+            // Exhaustive rather than `_`: a change added later that also
+            // moves a name must be considered here, and a catch-all would
+            // let it through silently.
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            // Row changes move no name: a row's identity is its key, and a
+            // changed key is a delete plus an insert, not a rename.
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect()
 }
 
 /// `DISTINCT` is not tidiness: the catalog holds one row per referenced
@@ -236,22 +169,6 @@ UNION ALL
 SELECT 'foreign key', fk.name
   FROM sys.foreign_keys fk WHERE fk.parent_object_id = OBJECT_ID(@P1)
 ORDER BY kind, name;";
-
-/// Why a rename's impact could not be reported.
-///
-/// Two failures, kept apart, because the whole point of this module is that an
-/// empty report means "nothing depends on this". A name that cannot be quoted
-/// and a query that could not run are both *unknown*, and neither may arrive
-/// at the caller wearing the shape of "no dependants".
-#[derive(Debug, thiserror::Error)]
-pub enum ImpactError {
-    #[error(transparent)]
-    Query(#[from] DbError),
-
-    /// The target's own name cannot be written as an identifier.
-    #[error(transparent)]
-    Name(#[from] DialectError),
-}
 
 /// The name every one of these queries hands to `OBJECT_ID`.
 ///
@@ -428,7 +345,7 @@ fn mentions(definition: &str, column: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::{ChangeSet, PlannedChange};
+    use pbps_model::{ChangeSet, PlannedChange, TableName};
 
     fn tname(s: &str) -> TableName {
         s.parse().unwrap()
@@ -506,7 +423,7 @@ mod tests {
                 }),
             ],
         };
-        let targets = RenameTarget::from_changes(&changes);
+        let targets = rename_targets(&changes);
         assert_eq!(
             targets,
             vec![RenameTarget::Module("dbo.active_customer".parse().unwrap())]
@@ -546,7 +463,7 @@ mod tests {
                 }),
             ],
         };
-        let targets = RenameTarget::from_changes(&cs);
+        let targets = rename_targets(&cs);
         assert_eq!(
             targets,
             [
@@ -571,7 +488,7 @@ mod tests {
         };
 
         assert_eq!(
-            RenameTarget::from_changes(&cs),
+            rename_targets(&cs),
             [RenameTarget::Column("dbo.customer.email".parse().unwrap())]
         );
     }

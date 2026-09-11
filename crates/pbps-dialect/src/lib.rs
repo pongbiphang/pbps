@@ -37,7 +37,7 @@
 //! drawn in the wrong place.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
@@ -1205,6 +1205,14 @@ pub trait Dialect {
         self.lexicon().normalize_definition(definition)
     }
 
+    /// Whether a module read back after a write holds what that write promised.
+    /// Engines preserving the body can compare it; deparsed text is outside
+    /// SPEC §7.6's promise and cannot be predicted by a lexical normalizer.
+    /// Unchanged modules still compare two catalog reads exactly.
+    fn module_matches_declaration(&self, wrote: &Module, now: &Module) -> bool {
+        wrote == now
+    }
+
     /// The definition with everything that is not code blanked out, by this
     /// engine's lexis: the text the dependency scan reads (DECISIONS 315).
     fn code_only(&self, definition: &str) -> String {
@@ -1258,6 +1266,20 @@ pub trait Dialect {
     /// erred, and never an edge too few.
     fn bare_name_rank(&self, _from: &str, _to: &str) -> Option<usize> {
         Some(0)
+    }
+
+    /// Unchanged modules whose binding can move when this plan introduces
+    /// names on their write path. The differ adds these as ordinary typed
+    /// alterations before risk classification and dependency ordering, so
+    /// approval and connected rebuild guards cover them too (DECISIONS 422).
+    /// Dialects without this binding rule return no additional alterations.
+    fn rebound_modules(
+        &self,
+        _declared: &Schema,
+        _arriving: &[ModuleId],
+        _already_changed: &BTreeSet<ModuleId>,
+    ) -> BTreeSet<ModuleId> {
+        BTreeSet::new()
     }
 
     /// This argument type as the engine spells it *in a routine's identity*.

@@ -6,6 +6,7 @@ mod declaration_file;
 mod deploy;
 mod dev;
 mod doctor;
+mod engine;
 mod explain;
 mod hooks;
 mod init;
@@ -909,17 +910,17 @@ fn run() -> anyhow::Result<()> {
                     "environment.unresolved",
                     target.resolve(&project),
                 )?;
-                state_list::cmd_state_list(&project, &target, limit, json)
+                state_list::cmd_state_list(&target, limit, json)
             }
             StateCommand::Prune { target, keep } => {
                 let target = target.resolve(&project)?;
-                deploy::cmd_prune(&project, &target, keep)
+                deploy::cmd_prune(&target, keep)
             }
         },
         Command::Status { format } => status::cmd_status(&project, format == OutputFormat::Json),
         Command::Unlock { target } => {
             let target = target.resolve(&project)?;
-            deploy::cmd_unlock(&project, &target)
+            deploy::cmd_unlock(&target)
         }
     }
 }
@@ -964,7 +965,6 @@ fn cmd_pull(
     force: bool,
     data: &[String],
 ) -> anyhow::Result<()> {
-    db::require_mssql(project, "pull")?;
     // Parsed before anything connects: a misspelt table name is a fact about
     // the command line, and it should not cost a round trip to find out.
     let data: Vec<TableName> = data
@@ -1020,9 +1020,11 @@ fn cmd_pull(
     // it carries the "cannot connect to the database" context every other
     // plain-propagating command gets, and `introspect`'s own `DbError` cannot
     // hold that.
+    let dialect = dialect(project)?;
     let pulled = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let mut pulled = pbps_mssql::catalog::introspect(&mut conn).await?;
+        let mut pulled =
+            crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
         // `--data`: the table's rows become a `data: exact` block (ADR-0004),
         // in the engine's own spelling — which is the spelling a declaration
         // has to use to compare equal against this database from now on.
@@ -1042,7 +1044,13 @@ fn cmd_pull(
                 )
             })
             .collect();
-        let rows = pbps_mssql::catalog::read_rows(&mut conn, &pulled.schema, &read).await?;
+        let rows = crate::engine::read_rows(
+            &mut conn,
+            &pulled.schema,
+            &read,
+            crate::engine::Read::Snapshot,
+        )
+        .await?;
         for (name, rows) in rows {
             if let Some(table) = pulled.schema.tables.get_mut(&name) {
                 table.data = Some(pbps_model::TableData {
@@ -1064,7 +1072,8 @@ fn cmd_pull(
                 // and the dialect's.
                 let mut problems: Vec<String> = pbps_model::data::check(&name, table);
                 problems.extend(
-                    pbps_mssql::validate::table(&name, table)
+                    dialect
+                        .validate_table(&name, table)
                         .iter()
                         .map(ToString::to_string),
                 );
@@ -1317,20 +1326,21 @@ pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
 }
 
 /// The dialect implementation this project is configured for.
+///
+/// Still a `Result`, though nothing refuses today: every caller threads it
+/// through `or_unanswerable` under `project.unsupported-dialect`, and that is
+/// the finding a third dialect gets while its crate is being built.
 fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
-    match project.config.dialect {
-        DialectName::Mssql => Ok(Box::new(pbps_mssql::Mssql)),
-        // The crate exists (`pbps-pg`) and the connection seam can reach a
-        // PostgreSQL server, but the parts a command needs — the type
-        // catalogue, introspection, the emitter — arrive in Phase 5 steps 2 to
-        // 4. Refused here, as one answer about the project, rather than let
-        // every table produce a finding of its own further down: what is
-        // missing is the tool's, and a finding named `dbo.t` says it is the
-        // declaration's.
-        DialectName::Postgres => bail!(
-            "the postgres dialect is not implemented yet (it is Phase 5; docs/STATUS.md names the \
-             current phase); this project's pbps.yml selects it"
-        ),
+    Ok(dialect_for(project.config.dialect))
+}
+
+/// The dialect implementation for a configured name. One of two places in
+/// this crate that names an engine to choose it; `db::driver_for` is the
+/// other, and `engine` routes by what the connection turned out to be.
+pub(crate) fn dialect_for(name: DialectName) -> Box<dyn Dialect> {
+    match name {
+        DialectName::Mssql => Box::new(pbps_mssql::Mssql),
+        DialectName::Postgres => Box::new(pbps_pg::Postgres::new()),
     }
 }
 
@@ -2654,7 +2664,6 @@ fn cmd_plan(
             json,
             "rehearsal.unavailable",
             dev::rehearse(
-                project,
                 &spec,
                 &base.schema,
                 &base.ids,

@@ -69,7 +69,9 @@ script also runs `pbps-cli`'s ignored tests, which include the `plan --dev`
 rehearsal. They are `#[ignore]`d so the ordinary suite stays offline; CI has a
 dedicated job. PostgreSQL has its own suite and its own job:
 `scripts/live-tests-pg.sh` (set `PBPS_TEST_PG_PORT` if 54320 is taken), or set
-`PBPS_TEST_PG_DB` and `cargo test -p pbps-pg --test live -- --ignored`. Its
+`PBPS_TEST_PG_DB` and `cargo test -p pbps-pg --test live -- --ignored`. The
+script also runs `pbps-cli`'s PostgreSQL flow suite (`flow_pg`, serially: each
+test creates and drops a database of its own on the same server). Its
 ledger tests each work in a database of their own, created and dropped by the
 test: the ledger is one pair of tables in `public`, so two tests sharing a
 database would take each other's lock. They cover the same §11.5 invariants —
@@ -489,11 +491,12 @@ reading it would refuse a valid declaration — and offline `validate` therefore
 **says it did not check** rather than reporting clean, through a new
 `Dialect::declaration_notes` (DECISIONS 327).
 
-Not in this step: the CLI still refuses the `postgres` dialect outright
-(`main.rs`'s `dialect()`), so the end-to-end path through `bootstrap`,
-`verify`, `plan --db`, `apply` and `pull --data` cannot be exercised through the
-binary until step 10 wires it. Everything above is covered by the dialect's own
-live suite instead. Composite keys remain deferred, as in ADR-0004.
+Not in this step: at the time the CLI still refused the `postgres` dialect
+outright (`main.rs`'s `dialect()`), so the end-to-end path through
+`bootstrap`, `verify`, `plan --db`, `apply` and `pull --data` could not be
+exercised through the binary until step 10 wired it. Everything above is
+covered by the dialect's own live suite. Composite keys remain deferred, as in
+ADR-0004.
 
 **Step 6 is in**: roles and privileges (issue #81, DECISIONS 370–375). The
 principal is the *cluster's*, so `manages_roles` answers `false` and the differ
@@ -649,12 +652,39 @@ build the estimate that cannot be measured (409).
 `int -> bigint` is metadata-only there is still the open question ADR-0012's
 Limits record, and this step did not answer it.
 
-Not in this step: the CLI still refuses the `postgres` dialect, so none of the
-three is reached by a command yet — the probes run through `Dialect::preflight`
-and the other two are free functions the live suite exercises. Wiring them into
-`plan --db` and `apply` is step 10.
+Not in this step: at the time the CLI still refused the `postgres` dialect, so
+none of the three was reached by a command. Step 10 wired two of them — the
+probes run through `Dialect::preflight` under `plan --db` and `apply`, and the
+rename impact is asked through `pbps-cli::engine` — while the cost estimate is
+still a free function the live suite exercises, and wiring it into `plan --db`
+is an issue of its own.
 
-What remains is step 10: the suite in full.
+**Step 10 is in**: the connected seam (issue #85, DECISIONS 417–418). The
+CLI no longer refuses the `postgres` dialect: `bootstrap`, `verify`,
+`plan --db`, `apply`, `pull`, `status`, `state list` and `doctor` run against a
+PostgreSQL target through `pbps-cli::engine`, a `match` on the connection's
+driver with no trait between the CLI and the two engine crates. The connected
+result shapes both engines return live in `pbps-db` as one struct each with the
+union of fields, and an engine-only question is answered by name on the other
+engine — a fact (one edition, online index builds on every release) or a
+refusal (the role questions, citing 211) — never with an empty answer. The
+first end-to-end run refused itself: the apply's read-back must run inside the
+apply transaction (147) and the pull refuses to run inside one (253), so the
+command now names the kind of read it wants and PostgreSQL's read-back runs
+under a savepoint (418). A serial CLI flow suite, `flow_pg`, runs the loop
+end to end against the real engine and is part of `scripts/live-tests-pg.sh`.
+
+What step 10 did not do is filed as issues, not carried here: the §11.5
+invariant set run through the CLI on PostgreSQL, the ADR "Limits" revisits, the
+docs that still describe the tool as SQL Server only, the `spikes/` decision,
+and what the seam exposed — a PostgreSQL pull with no unmanaged-module inventory, a PostgreSQL
+`doctor` that does not ask about DML or grant rights, the cost estimate no
+command asks for, and the remaining PostgreSQL-only connected checks. The SQL
+Server rename-target mapping landed in DECISIONS 416. Review fixes now connect
+PostgreSQL role-rename evidence and module rebuild checks (419–420), including
+the empty-SQL identity recording and the transactional before/after checks.
+The typed diff also includes PostgreSQL caller rebuilds for newly arriving
+names on their write path, before ordering and approval (422).
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

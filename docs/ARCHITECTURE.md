@@ -15,25 +15,37 @@ pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL. Also owns
                the managed-set scope and observed identity
 pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
                probes. Connection-bound work is free async fns in the dialect
-               crate, not trait methods
+               crate, not trait methods; pbps-cli::engine routes to them
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a change becomes SQL), catalog introspection,
                the ledger/lock statements, rename impact
 pbps-pg        PostgreSQL: the same responsibilities as pbps-mssql, as far as
                Phase 5 has built them. Everything unbuilt refuses by name
 pbps-db        Connections plus transaction framing. Owns "there is a network";
-               ledger types and prune policy, no engine's SQL. One module per
-               driver, and nothing outside them names one.
-               Driver isolation: see constraint 9
+               the shapes a connected command consumes — ledger types and
+               prune policy, what a pull found (`catalog`), what a rename
+               touches (`impact`), what `doctor` asks (`doctor`) — and no
+               engine's SQL. One module per driver, and nothing outside them
+               names one. Driver isolation: see constraint 9
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
 pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
                output is the one typed findings envelope every read-only
-               command speaks; prompt is the TTY intent channel of SPEC 6.3
+               command speaks; prompt is the TTY intent channel of SPEC 6.3.
+               engine is the connected seam: one function per question a
+               command asks a database, routed to pbps-mssql or pbps-pg by
+               the connection's driver (DECISIONS 417)
 ```
 
-- Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
-  `state`, `impact`, `edition`) are async; the CLI `block_on`s them per command.
+- Only `pbps-db` and the engine modules that take a `Conn` (`catalog`, `state`,
+  `impact`, `doctor`, `edition` on SQL Server; `catalog`, `state`, `impact`,
+  `doctor`, `roles`, `modules` on PostgreSQL) are async; the CLI `block_on`s
+  them per command, through `engine`.
+- Two places in `pbps-cli` name an engine to *choose* it: `dialect_for` (the
+  pure `Dialect`) and `db::driver_for` (the driver). `engine` names both to
+  *route*, by what the connection turned out to be, and nothing else in the
+  crate names either. A third engine is a compile error in every `engine`
+  function until it has an answer for each.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
 - The dialect supplies transaction statements; `pbps-db` owns the transaction
   framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)

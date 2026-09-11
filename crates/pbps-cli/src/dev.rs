@@ -110,7 +110,6 @@ impl Rehearsal {
 /// Builds the baseline, applies the plan, and compares against the declarations.
 #[allow(clippy::too_many_arguments)]
 pub fn rehearse(
-    project: &Project,
     spec: &Spec,
     baseline: &Schema,
     baseline_ids: &IdsFile,
@@ -121,8 +120,16 @@ pub fn rehearse(
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
-    db::require_mssql(project, "plan --dev")?;
-
+    // The scratch-database lifecycle and container setup below are SQL
+    // Server-specific (SPEC §9.3). Dispatching catalog reads by connection
+    // cannot make that lifecycle safe for another dialect.
+    if dialect.name() != "mssql" {
+        bail!(
+            "dev rehearsal is not supported for dialect `{}`; it currently requires SQL Server. \
+             Remove --dev and the dev block in pbps.yml to generate an offline preview.",
+            dialect.name()
+        );
+    }
     // Building the baseline is the same operation as `bootstrap`: the plan from
     // nothing. Reusing the differ rather than a second code path is what keeps
     // the rehearsal a rehearsal of the real thing.
@@ -280,7 +287,7 @@ async fn rehearse_in(
         })?;
     }
 
-    let built = pbps_mssql::catalog::introspect(conn)
+    let built = crate::engine::introspect(conn, crate::engine::Read::Snapshot)
         .await
         .context("cannot read the dev database back")?;
     let modules: std::collections::BTreeSet<_> = declared.modules.keys().cloned().collect();
@@ -308,7 +315,7 @@ async fn rehearse_in(
         .iter()
         .map(|(n, s)| (n.clone(), s.rows_to_read()))
         .collect();
-    let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, &read)
+    let rows = crate::engine::read_rows(conn, &scoped.schema, &read, crate::engine::Read::Snapshot)
         .await
         .context("cannot read the declared rows back from the dev database")?;
     let engine = scoped

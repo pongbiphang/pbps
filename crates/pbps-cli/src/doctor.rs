@@ -22,7 +22,6 @@
 
 use pbps_config::Project;
 use pbps_db::Conn;
-use pbps_mssql::edition::Edition;
 
 use crate::{db, output};
 
@@ -185,6 +184,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     let managed_schemas = managed_schemas(project);
     let declared = Declared {
         referenced: referenced_tables(project, &managed_schemas),
+        tables: managed_tables(project),
         granted: grant_targets(project),
         data: data_tables(project),
         schemas: managed_schemas,
@@ -228,12 +228,6 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
 
     let mut environments = Vec::new();
     if let Some(Requested { name, target }) = one {
-        output::or_unanswerable(
-            "doctor",
-            json,
-            "project.unsupported-dialect",
-            db::require_mssql(project, "doctor"),
-        )?;
         let d = match target {
             Ok(target) => {
                 // Named by the environment when there is one, and by the
@@ -259,7 +253,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 format!("{e:#}"),
             ),
         };
-        findings.extend(env_findings(&d, counts.modules > 0));
+        findings.extend(env_findings(&d, counts.modules > 0, dialect.as_ref()));
         environments.push(d);
     } else if project.config.environments.is_empty() {
         findings.push(
@@ -274,12 +268,6 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         // Refused before connecting rather than after: the failure is about the
         // project, not the environment, and reporting it once beats reporting it
         // per environment.
-        output::or_unanswerable(
-            "doctor",
-            json,
-            "project.unsupported-dialect",
-            db::require_mssql(project, "doctor"),
-        )?;
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
@@ -300,7 +288,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     EnvDiagnosis::unconfigured(name.clone(), Some(name.clone()), e.to_string())
                 }
             };
-            findings.extend(env_findings(&d, counts.modules > 0));
+            findings.extend(env_findings(&d, counts.modules > 0, dialect.as_ref()));
             environments.push(d);
         }
     }
@@ -414,6 +402,20 @@ fn managed_schemas(project: &Project) -> Vec<String> {
 /// Targets *inside* the managed schemas are left out: the schema-scoped
 /// `REFERENCES` and `SELECT` already cover them, and asking twice would report
 /// the same gap at two securables.
+/// Every table the declarations hold, for the engines that authorize DML
+/// and ownership on the table rather than on its schema.
+fn managed_tables(project: &Project) -> Vec<pbps_model::ObjectName> {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return Vec::new();
+    };
+    loaded
+        .schema
+        .tables
+        .keys()
+        .map(|t| pbps_model::ObjectName::new(t.schema.clone(), t.name.clone()))
+        .collect()
+}
+
 fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::ObjectName> {
     let Ok(loaded) = crate::load_quiet(project) else {
         return Vec::new();
@@ -444,9 +446,9 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::O
 /// Declarations that do not load give an empty map, for the reason
 /// [`managed_schemas`] gives: the load failure is a finding of its own, and a
 /// project with nothing declared is a real state rather than an error.
-fn data_tables(project: &Project) -> pbps_mssql::doctor::DataTables {
+fn data_tables(project: &Project) -> pbps_db::doctor::DataTables {
     let Ok(loaded) = crate::load_quiet(project) else {
-        return pbps_mssql::doctor::DataTables::new();
+        return pbps_db::doctor::DataTables::new();
     };
     data_tables_of(&loaded.schema)
 }
@@ -457,10 +459,10 @@ fn data_tables(project: &Project) -> pbps_mssql::doctor::DataTables {
 /// The reading itself is `DataDemand::of`'s, in one place: a table whose
 /// declaration could emit no statement answers `None` and is left out
 /// entirely, so this is the naming and nothing else.
-fn data_tables_of(schema: &pbps_model::Schema) -> pbps_mssql::doctor::DataTables {
-    let mut out = pbps_mssql::doctor::DataTables::new();
+fn data_tables_of(schema: &pbps_model::Schema) -> pbps_db::doctor::DataTables {
+    let mut out = pbps_db::doctor::DataTables::new();
     for (name, table) in &schema.tables {
-        if let Some(demand) = pbps_mssql::doctor::DataDemand::of(table) {
+        if let Some(demand) = pbps_db::doctor::DataDemand::of(table) {
             out.insert(
                 pbps_model::ObjectName::new(name.schema.clone(), name.name.clone()),
                 demand,
@@ -474,7 +476,7 @@ fn data_tables_of(schema: &pbps_model::Schema) -> pbps_mssql::doctor::DataTables
 /// files can say. Empty when the project declares no role and its ids file
 /// names none — which is not yet "no role": the environment's recorded state
 /// may still hold one a `drop-role` is about to remove, and the connected
-/// check adds those (see `pbps_mssql::doctor::permissions`). Tombstones are
+/// check adds those (see the engine's `doctor::permissions`). Tombstones are
 /// deliberately not read here: they are permanent audit records, and a drop
 /// applied years ago must not keep asking for `CREATE ROLE`.
 ///
@@ -482,9 +484,9 @@ fn data_tables_of(schema: &pbps_model::Schema) -> pbps_mssql::doctor::DataTables
 /// exists in the database, and the next plan revokes what it holds there —
 /// needing `CONTROL` on securables the declarations no longer name and
 /// `ALTER ANY ROLE` for a role they no longer have.
-fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
+fn grant_targets(project: &Project) -> pbps_db::doctor::GrantTargets {
     let Ok(loaded) = crate::load_quiet(project) else {
-        return pbps_mssql::doctor::GrantTargets::default();
+        return pbps_db::doctor::GrantTargets::default();
     };
     let ids = crate::read_ids(project).unwrap_or_default();
     let mut roles: std::collections::BTreeSet<String> =
@@ -509,7 +511,7 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
             }
         }
     }
-    pbps_mssql::doctor::GrantTargets {
+    pbps_db::doctor::GrantTargets {
         objects: objects.into_iter().collect(),
         schemas: schemas.into_iter().collect(),
         roles: roles.into_iter().collect(),
@@ -543,12 +545,14 @@ fn append_cause(slot: &mut Option<String>, cause: String) {
 struct Declared {
     /// The schemas this project manages.
     schemas: Vec<String>,
+    /// Every table the declarations hold.
+    tables: Vec<pbps_model::ObjectName>,
     /// Foreign-key targets outside them.
     referenced: Vec<pbps_model::ObjectName>,
     /// What the managed roles are granted on (ADR-0005).
-    granted: pbps_mssql::doctor::GrantTargets,
+    granted: pbps_db::doctor::GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
-    data: pbps_mssql::doctor::DataTables,
+    data: pbps_db::doctor::DataTables,
 }
 
 /// Everything one environment can be asked without writing to it.
@@ -578,52 +582,45 @@ async fn examine(
     };
 
     // `.ok()` and `if let Ok` would be the third instance in this function of
-    // an error read as good news: with the version or the edition unread,
-    // `supports_create_or_alter` is never computed, so the 2016-SP1 gate does
-    // not run — and `doctor` could still say `ready` for a server that will
-    // reject every module statement in the plan.
-    match pbps_mssql::doctor::server_version(&mut conn).await {
+    // an error read as good news: with the version or the capabilities
+    // unread, `supports_create_or_alter` is never computed, so the 2016-SP1
+    // gate does not run — and `doctor` could still say `ready` for a server
+    // that will reject every module statement in the plan.
+    match crate::engine::server_version(&mut conn).await {
         Ok(v) => d.server_version = Some(v),
         Err(e) => append_cause(&mut d.server_capabilities_unknown, format!("{e}")),
     }
-    match pbps_mssql::edition::edition(&mut conn).await {
+    // The version is handed on because on one engine the version *and* the
+    // edition together decide `supports_create_or_alter` (see the seam).
+    match crate::engine::capabilities(&mut conn, d.server_version.as_deref()).await {
         Err(e) => append_cause(&mut d.server_capabilities_unknown, format!("{e}")),
-        Ok(ed) => {
-            d.supports_online = Some(ed.supports_online());
-            // Asked of the version *and* the edition together: Azure reports
-            // 12.0.x and supports the syntax regardless (see the dialect
-            // function).
-            d.supports_create_or_alter = d
-                .server_version
-                .as_deref()
-                .map(|v| pbps_mssql::doctor::supports_create_or_alter(v, ed.name()));
-            d.edition = Some(match &ed {
-                // Named as unrecognised rather than passed through: the tool is
-                // about to treat it as limited, and an operator reading their
-                // own edition string back without comment would not know that.
-                Edition::Unknown(raw) => format!("{raw} (unrecognised; treated as limited)"),
-                known @ (Edition::Full(_) | Edition::Limited(_)) => known.name().to_owned(),
-            });
+        Ok(caps) => {
+            d.supports_online = Some(caps.supports_online);
+            d.supports_create_or_alter = caps.supports_create_or_alter;
+            // `None` is an engine with one edition, and the report then
+            // simply has no edition line; a read that failed is the `Err`
+            // above, with its cause.
+            d.edition = caps.edition;
         }
     }
-    match pbps_mssql::doctor::permissions(
-        &mut conn,
-        &declared.schemas,
-        &declared.referenced,
-        &declared.granted,
-        &declared.data,
-    )
-    .await
-    {
+    let ask = pbps_db::doctor::Ask {
+        managed_schemas: &declared.schemas,
+        managed_tables: &declared.tables,
+        referenced: &declared.referenced,
+        granted: &declared.granted,
+        data: &declared.data,
+    };
+    match crate::engine::permissions(&mut conn, &ask).await {
         Ok(held) => {
-            d.missing_permissions = pbps_mssql::doctor::missing(&held)
+            d.missing_permissions = held
+                .gaps
                 .into_iter()
                 // The securable is part of the answer, not decoration: "you
                 // lack ALTER" sends someone to ask for it on the database,
                 // which is the over-grant this check exists to avoid.
-                .map(|g| format!("{} on {} — {}", g.permission, g.securable(), g.why))
+                .map(|g| format!("{} on {} — {}", g.permission, g.securable, g.why))
                 .collect();
-            d.absent_schemas = held.absent_schemas.iter().cloned().collect();
+            d.absent_schemas = held.absent_schemas.into_iter().collect();
         }
         // Not merely noted in `detail`: with the list left empty, a successful
         // ledger read could go on to set `ready`, and `doctor` would print
@@ -648,7 +645,7 @@ async fn examine(
     // `dbo.__pbps_state` dropped by hand while a live lock survives. `doctor`
     // called that "uninitialized" and could exit 0, with the next apply blocked
     // by a lock nothing had mentioned.
-    let lock = pbps_mssql::state::lock_holder(&mut conn).await;
+    let lock = crate::engine::lock_holder(&mut conn).await;
     d.state = match lock {
         // A lock this could not read is not an absent lock. Falling through
         // here let a denied or damaged `__pbps_lock` be reported as `ready` —
@@ -666,9 +663,9 @@ async fn examine(
             ));
             "locked"
         }
-        Ok(None) => match pbps_mssql::state::is_initialized(&mut conn).await {
+        Ok(None) => match crate::engine::is_initialized(&mut conn).await {
             Ok(false) => "uninitialized",
-            Ok(true) => match pbps_mssql::state::latest(&mut conn).await {
+            Ok(true) => match crate::engine::latest(&mut conn).await {
                 Ok(Some(entry)) if entry.snapshot.staged.is_some() => {
                     let p = entry.snapshot.staged.as_ref().expect("just matched");
                     d.note(format!(
@@ -712,7 +709,11 @@ fn target_arg(d: &EnvDiagnosis) -> String {
     }
 }
 
-fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding> {
+fn env_findings(
+    d: &EnvDiagnosis,
+    declares_modules: bool,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> Vec<output::Finding> {
     let mut out = Vec::new();
     match d.state {
         // Unreachable and unconfigured are errors: this is the command whose
@@ -856,7 +857,7 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
         // learned three times, in SQL instead of a shell. Where the name cannot
         // be quoted at all, no command is offered rather than a broken one: the
         // message already names the schema.
-        if let Ok(quoted) = pbps_mssql::ident::quote(schema) {
+        if let Ok(quoted) = dialect.quote_ident(schema) {
             finding = finding.remedy(format!("CREATE SCHEMA {quoted};"));
         }
         out.push(finding);
@@ -952,7 +953,7 @@ mod tests {
     }
 
     fn remedy(schema: &str) -> Option<String> {
-        env_findings(&absent(schema), false)
+        env_findings(&absent(schema), false, &pbps_mssql::Mssql)
             .into_iter()
             .find(|f| f.id == "schema.absent")
             .and_then(|f| f.remedy)
@@ -1030,7 +1031,7 @@ mod tests {
             let key = pbps_model::ObjectName::new(name.schema.clone(), name.name.clone());
             assert_eq!(
                 out.get(&key).cloned(),
-                pbps_mssql::doctor::DataDemand::of(table),
+                pbps_db::doctor::DataDemand::of(table),
                 "{name}"
             );
         }
@@ -1058,7 +1059,7 @@ mod tests {
             detail.find("sys.schemas") < detail.find("__pbps_lock"),
             "{detail}"
         );
-        let findings = env_findings(&d, false);
+        let findings = env_findings(&d, false, &pbps_mssql::Mssql);
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"permission.unknown"), "{ids:?}");
         assert!(ids.contains(&"state.lock-unknown"), "{ids:?}");
@@ -1101,7 +1102,7 @@ mod tests {
         assert!(why.contains("'Edition'"), "{why}");
         assert!(why.find("ProductVersion") < why.find("'Edition'"), "{why}");
 
-        let findings = env_findings(&d, false);
+        let findings = env_findings(&d, false, &pbps_mssql::Mssql);
         let unknown: Vec<&output::Finding> = findings
             .iter()
             .filter(|f| f.id == "server.capabilities-unknown")
@@ -1159,7 +1160,7 @@ mod tests {
         assert_eq!(remedy("with\0nul"), None);
         // And the finding itself is still reported.
         assert!(
-            env_findings(&absent("with\0nul"), false)
+            env_findings(&absent("with\0nul"), false, &pbps_mssql::Mssql)
                 .iter()
                 .any(|f| f.id == "schema.absent")
         );
@@ -1174,7 +1175,7 @@ mod tests {
     /// offered `pbps baseline --env "localhost,14330/master" --reason ...`
     /// (DECISIONS 197).
     fn remedies(d: &EnvDiagnosis) -> Vec<String> {
-        env_findings(d, true)
+        env_findings(d, true, &pbps_mssql::Mssql)
             .into_iter()
             .filter_map(|f| f.remedy)
             .collect()

@@ -24,14 +24,19 @@
 //! pin the empty path — the one value that does not move with the project's
 //! shape — and put back whatever the session had.
 
-use pbps_db::{Conn, DbError, Row};
+use std::collections::BTreeMap;
+
+use pbps_db::{Conn, DbError, Param, Row};
 
 use pbps_model::{Schema, TableName};
 
+// What the spelling checks found is `pbps-db`'s shape (DECISIONS 417).
+pub use pbps_db::catalog::Spellings;
+
 use crate::introspect::{
-    GrantedKind, Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawDefaultAcl, RawGrant,
-    RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant, RawRole, RawSharedDependency,
-    RawTable, assemble,
+    GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
+    RawDefaultAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant,
+    RawRole, RawSharedDependency, RawTable, assemble,
 };
 
 /// The schemas that are never a project's.
@@ -285,7 +290,8 @@ fn unheld_modules_query() -> String {
     let held = on_a_relation_the_pull_holds();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS name,
-                'a materialized view, which holds rows a plan would have to refresh' AS detail
+                'a materialized view, which holds rows a plan would have to refresh' AS detail,
+                'm' AS kind, c.oid::int8 AS oid, '' AS on_table
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE c.relkind = 'm'
@@ -294,16 +300,16 @@ fn unheld_modules_query() -> String {
           UNION ALL
          SELECT n.nspname, p.proname,
                 CASE p.prokind WHEN 'a' THEN 'an aggregate function'
-                               ELSE 'a window function' END
+                               ELSE 'a window function' END, p.prokind::text, p.oid::int8, ''
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
           WHERE p.prokind IN ('a', 'w')
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {proc_not_extension}
           UNION ALL
-         SELECT n.nspname, c.relname || '.' || tg.tgname,
+         SELECT n.nspname, tg.tgname,
                 'a trigger on `' || n.nspname || '.' || c.relname
-                  || '` (not a table or a view this pull holds)'
+                  || '` (not a table or a view this pull holds)', 't', tg.oid::int8, c.relname
            FROM pg_catalog.pg_trigger tg
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -448,6 +454,9 @@ fn columns_query() -> String {
 /// know: the assembler decides what to do with each, and a kind it has never
 /// seen is reported rather than dropped in a `WHERE` nobody re-reads.
 fn constraints_query() -> String {
+    // These flags arrived in PostgreSQL 18. JSON field lookup can represent
+    // their absence on older catalogs without making the SQL fail to parse;
+    // pre-18 constraints are enforced and have no temporal period (424).
     format!(
         "SELECT con.conrelid::int8 AS table_oid, con.conname AS name, con.contype::text AS kind,
             pg_catalog.array_to_string(con.conkey, ',') AS conkey,
@@ -461,7 +470,8 @@ fn constraints_query() -> String {
             con.confmatchtype::text AS match_type,
             pg_catalog.array_to_string(con.confdelsetcols, ',') AS delete_set_columns,
             con.conindid::int8 AS index_oid,
-            con.conenforced AS enforced, con.conperiod AS period,
+            COALESCE((to_jsonb(con)->>'conenforced')::boolean, true) AS enforced,
+            COALESCE((to_jsonb(con)->>'conperiod')::boolean, false) AS period,
             con.connoinherit AS no_inherit,
             EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
                      WHERE tg.tgconstraint = con.oid AND tg.tgenabled <> 'O')
@@ -630,14 +640,9 @@ const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', tr
 
 /// Reads the whole managed set back: one snapshot, one search path, no writes.
 ///
-/// **All of it inside one transaction**, and each word of `BEGIN ISOLATION
-/// LEVEL REPEATABLE READ READ ONLY` is load-bearing.
-///
-/// *Repeatable read*, because five autocommit statements are five snapshots. A
-/// table dropped after the tables query and before the columns query comes back
-/// as a live table with no columns at all — which assembles cleanly, compares
-/// as a table whose every column was deleted, and plans accordingly. Under one
-/// snapshot the five reads cannot disagree about what exists.
+/// The catalog is one statement snapshot (DECISIONS 423). The owned read
+/// retains `REPEATABLE READ READ ONLY`, shared with the row reader whose
+/// table and alias queries must also agree on one snapshot.
 ///
 /// *Read only*, because introspection has no business writing and the engine
 /// can say so rather than this code promising it. Measured, `CREATE TABLE` in
@@ -650,21 +655,35 @@ const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', tr
 /// makes "a read that failed halfway leaves the session changed" not a case to
 /// handle but a case that cannot arise.
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
-    refuse_a_caller_owned_transaction(conn).await?;
-    conn.execute(BEGIN).await?;
-    let raw = match read_all(conn).await {
-        Ok(raw) => {
-            conn.execute("COMMIT").await?;
-            raw
-        }
-        // `ROLLBACK` rather than `COMMIT`, and its own error is dropped: a
-        // transaction the server has already killed must not replace the
-        // failure that killed it.
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK").await;
-            return Err(schema_changed_underneath(e));
-        }
-    };
+    introspect_in(conn, Scope::Own).await
+}
+
+/// Reads the managed set back **inside the transaction the caller holds**,
+/// seeing what it has written and not yet committed.
+///
+/// For one caller: the apply's read-back, which records what a plan built in
+/// the same transaction as the build, so that the ledger entry is as atomic as
+/// the change it describes and a read that failed undoes the statements too
+/// (`pbps-cli`, DECISIONS 147). [`introspect`] refuses that transaction (253)
+/// because it cannot tell whose it is; this function is the caller saying
+/// "mine, and read what I have done".
+///
+/// Under a savepoint, so that the canonical scope goes back when the read
+/// ends and the caller's transaction is left exactly as deep, as writable and
+/// under the same settings as it was found (see [`SAVEPOINT`]). The caller
+/// remains READ COMMITTED so its closing view is not frozen before the DDL.
+/// All catalog queries now share one statement snapshot; the CLI revalidates
+/// the managed projection before recording it (DECISIONS 423).
+pub async fn introspect_within_transaction(conn: &mut Conn) -> Result<Pulled, DbError> {
+    introspect_in(conn, Scope::CallersTransaction).await
+}
+
+async fn introspect_in(conn: &mut Conn, scope: Scope) -> Result<Pulled, DbError> {
+    open(conn, scope).await?;
+    let outcome = read_all(conn).await;
+    let raw = close(conn, scope, outcome)
+        .await
+        .map_err(schema_changed_underneath)?;
 
     let mut pulled = assemble(&raw.0);
     // Prepended: a table the model cannot hold at all is the thing a reader
@@ -683,25 +702,77 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     Ok(pulled)
 }
 
+type CatalogBatch = BTreeMap<String, Vec<serde_json::Value>>;
+
+/// All catalog relations are sampled by one statement, even when the caller
+/// has already written under READ COMMITTED. JSON is only the internal row
+/// transport; the checked decoder below still constructs the same RawCatalog.
+fn batch_query() -> String {
+    // Aggregation must preserve semantic position order: sorting the JSON
+    // itself would reorder columns and routine arguments (pinned live).
+    [
+        ("partitioned", partitioned_query(), "schema_name, table_name"),
+        ("tables", tables_query(), "schema_name, table_name"),
+        ("columns", columns_query(), "table_oid, attnum"),
+        ("constraints", constraints_query(), "table_oid, name"),
+        ("indexes", indexes_query(), "table_oid, name"),
+        ("modules", modules_query(), "schema_name, name, oid"),
+        ("module_args", module_args_query(), "oid, pos"),
+        ("roles", ROLES.to_owned(), "name"),
+        ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
+        ("routine_args", grant_routine_args_query(), "oid, pos"),
+        ("other_acls", OTHER_ACLS.to_owned(), "class, name, grantee, privilege_type"),
+        ("held_elsewhere", HELD_ELSEWHERE.to_owned(), "role_name, in_database, deptype"),
+        ("default_acls", DEFAULT_ACLS.to_owned(), "grantor, in_schema, objtype"),
+        ("unheld_modules", unheld_modules_query(), "schema_name, name"),
+    ]
+    .into_iter()
+    .map(|(part, query, order)| format!(
+        "SELECT '{part}'::text AS part, COALESCE(jsonb_agg(to_jsonb(r) ORDER BY {order}), '[]'::jsonb)::text AS payload FROM ({query}) r"
+    ))
+    .collect::<Vec<_>>()
+    .join(" UNION ALL ")
+}
+
+async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
+    let mut batch = CatalogBatch::new();
+    for row in conn.query(&batch_query()).await? {
+        let part = text(&row, "part")?;
+        let payload = text(&row, "payload")?;
+        let rows = serde_json::from_str(&payload)
+            .map_err(|e| DbError::BadRow(format!("invalid catalog batch {part}: {e}")))?;
+        if batch.insert(part.clone(), rows).is_some() {
+            return Err(DbError::BadRow(format!("duplicate catalog batch {part}")));
+        }
+    }
+    Ok(batch)
+}
+
 async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbError> {
     conn.query(CANONICAL_PATH).await?;
+    decode_batch(&read_batch(conn).await?)
+}
 
+fn decode_batch(batch: &CatalogBatch) -> Result<(RawCatalog, Vec<Limitation>), DbError> {
     let mut warnings = Vec::new();
-    for row in conn.query(&partitioned_query()).await? {
-        let schema = text(&row, "schema_name")?;
-        let name = text(&row, "table_name")?;
+    for row in batch
+        .get("partitioned")
+        .ok_or_else(|| missing("partitioned"))?
+    {
+        let schema = text(row, "schema_name")?;
+        let name = text(row, "table_name")?;
         // An `r` reaches here for one of three reasons, and the message has to
         // say which: none of them is visible in `relkind`.
-        let kind = match text(&row, "kind")?.as_str() {
+        let kind = match text(row, "kind")?.as_str() {
             "p" => "a partitioned table",
             "f" => "a foreign table",
-            "r" if flag(&row, "row_security")? => {
+            "r" if flag(row, "row_security")? => {
                 "a table with row-level security enabled, whose policies this model does not hold"
             }
             // `FORCE` makes the policies apply to the table's owner too, and
             // it is a separate flag: measured, a table can carry it with row
             // level security not enabled at all.
-            "r" if flag(&row, "force_row_security")? => {
+            "r" if flag(row, "force_row_security")? => {
                 "a table with `FORCE ROW LEVEL SECURITY`, which decides whether its own owner is \
                  subject to the policies"
             }
@@ -709,43 +780,43 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             // the trap: a rebuild drops them, and whoever turns row-level
             // security on afterwards gets a table with no policies — open,
             // where this one was about to be closed.
-            "r" if number(&row, "policies")? > 0 => {
+            "r" if number(row, "policies")? > 0 => {
                 "a table with row-level security policies that are not in force, which this model \
                  does not hold. They do nothing while the switch is off, so a rebuild would drop \
                  them silently and enabling row-level security afterwards would leave the table \
                  open"
             }
-            "r" if text(&row, "persistence")? == "u" => "an UNLOGGED table",
-            "r" if text(&row, "persistence")? == "t" => "a temporary table",
+            "r" if text(row, "persistence")? == "u" => "an UNLOGGED table",
+            "r" if text(row, "persistence")? == "t" => "a temporary table",
             // Which old-row data logical replication publishes, and whether a
             // replicated `UPDATE` or `DELETE` is allowed at all. `d` is the
             // default — the primary key — and is the only one the model can
             // read back, because it is the only one that is not a choice.
-            "r" if text(&row, "replica_identity")? == "f" => {
+            "r" if text(row, "replica_identity")? == "f" => {
                 "a table with `REPLICA IDENTITY FULL`, which publishes every old column"
             }
-            "r" if text(&row, "replica_identity")? == "n" => {
+            "r" if text(row, "replica_identity")? == "n" => {
                 "a table with `REPLICA IDENTITY NOTHING`, which no replicated `UPDATE` or \
                  `DELETE` may touch"
             }
-            "r" if text(&row, "replica_identity")? == "i" => {
+            "r" if text(row, "replica_identity")? == "i" => {
                 "a table whose `REPLICA IDENTITY` is a named index rather than its primary key"
             }
             // `CREATE TABLE ... OF t`: the row shape is the composite type's,
             // and `ALTER TYPE` changes the table. Read back as an ordinary
             // table it is an independent one that no longer follows anything.
-            "r" if optional_text(&row, "of_type")?.as_deref() != Some("-") => &format!(
+            "r" if optional_text(row, "of_type")?.as_deref() != Some("-") => &format!(
                 "a table of the composite type `{}`, whose shape follows it",
-                optional_text(&row, "of_type")?.unwrap_or_default()
+                optional_text(row, "of_type")?.unwrap_or_default()
             ),
             // A `DO INSTEAD` rule decides what an `INSERT` on this table
             // actually does — including nothing at all.
-            "r" if flag(&row, "has_rules")? => {
+            "r" if flag(row, "has_rules")? => {
                 "a table with rewrite rules, which decide what a write to it does"
             }
             // Not heap: how the rows are stored, and what the table can do
             // with them. The model has one kind of table.
-            "r" if optional_text(&row, "access_method")?.as_deref() != Some("heap") => {
+            "r" if optional_text(row, "access_method")?.as_deref() != Some("heap") => {
                 "a table on a table access method other than `heap`"
             }
             // Both ends of an inheritance, because both are unusable and for
@@ -753,7 +824,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             // returns the children's rows too, and `ALTER TABLE parent ADD
             // COLUMN` gives the column to every child — so a plan that changes
             // a managed parent changes tables nobody declared.
-            "r" if flag(&row, "inherited_from")? => {
+            "r" if flag(row, "inherited_from")? => {
                 "a table other tables inherit from, whose reads return their rows and whose \
                  changes recurse into them"
             }
@@ -761,7 +832,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             other => &format!("a relation of kind `{other}`"),
         };
         warnings.push(Limitation {
-            table: TableName::new(&schema, &name),
+            target: LimitationTarget::Relation(TableName::new(&schema, &name)),
             detail: format!(
                 "`{schema}.{name}` is {kind}, which this model does not hold. It is left out of \
                  the pull entirely — not read back as an ordinary table, which would make a plan \
@@ -771,190 +842,245 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
     }
 
     let mut raw = RawCatalog::default();
-    for row in conn.query(&tables_query()).await? {
+    for row in batch.get("tables").ok_or_else(|| missing("tables"))? {
         raw.tables.push(RawTable {
-            oid: number(&row, "oid")?,
-            schema: text(&row, "schema_name")?,
-            name: text(&row, "table_name")?,
+            oid: number(row, "oid")?,
+            schema: text(row, "schema_name")?,
+            name: text(row, "table_name")?,
         });
     }
-    for row in conn.query(&columns_query()).await? {
-        let identity = match first_char(&text(&row, "identity_kind")?) {
+    for row in batch.get("columns").ok_or_else(|| missing("columns"))? {
+        let identity = match first_char(&text(row, "identity_kind")?) {
             Some(kind @ ('a' | 'd')) => Some(RawIdentity {
                 always: kind == 'a',
                 // A column the catalog calls an identity always has a sequence
                 // behind it. Defaulting rather than failing here would invent
                 // `GENERATED ... (START WITH 0)`, which is not a thing this
                 // engine will accept back (see `types::identity_seed_range`).
-                seed: number(&row, "seq_start")?,
-                increment: number(&row, "seq_increment")?,
-                min: number(&row, "seq_min")?,
-                max: number(&row, "seq_max")?,
-                cycles: flag(&row, "seq_cycle")?,
-                cache: number(&row, "seq_cache")?,
+                seed: number(row, "seq_start")?,
+                increment: number(row, "seq_increment")?,
+                min: number(row, "seq_min")?,
+                max: number(row, "seq_max")?,
+                cycles: flag(row, "seq_cycle")?,
+                cache: number(row, "seq_cache")?,
             }),
             _ => None,
         };
         // The `serial` case: a sequence the column defaults from and does not
         // contain. The identity's own sequence is the other join and never
         // reaches here.
-        let owned_sequence = optional_text(&row, "sequence_name")?;
+        let owned_sequence = optional_text(row, "sequence_name")?;
         raw.columns.push(RawColumn {
-            table_oid: number(&row, "table_oid")?,
-            attnum: small(&row, "attnum")?,
-            name: text(&row, "name")?,
-            ty: text(&row, "ty")?,
-            nullable: flag(&row, "nullable")?,
-            default: optional_text(&row, "default_expr")?,
+            table_oid: number(row, "table_oid")?,
+            attnum: small(row, "attnum")?,
+            name: text(row, "name")?,
+            ty: text(row, "ty")?,
+            nullable: flag(row, "nullable")?,
+            default: optional_text(row, "default_expr")?,
             identity,
-            generated: first_char(&text(&row, "generated")?).is_some(),
+            generated: first_char(&text(row, "generated")?).is_some(),
             owned_sequence,
-            default_sequences: optional_text(&row, "default_sequences")?,
-            collation: optional_text(&row, "collation")?,
+            default_sequences: optional_text(row, "default_sequences")?,
+            collation: optional_text(row, "collation")?,
         });
     }
-    for row in conn.query(&constraints_query()).await? {
-        let ref_table = number(&row, "ref_table")?;
+    for row in batch
+        .get("constraints")
+        .ok_or_else(|| missing("constraints"))?
+    {
+        let ref_table = number(row, "ref_table")?;
         raw.constraints.push(RawConstraint {
-            table_oid: number(&row, "table_oid")?,
-            name: text(&row, "name")?,
-            kind: first_char(&text(&row, "kind")?).unwrap_or('?'),
-            columns: numbers(&optional_text(&row, "conkey")?.unwrap_or_default()),
-            ref_columns: numbers(&optional_text(&row, "confkey")?.unwrap_or_default()),
+            table_oid: number(row, "table_oid")?,
+            name: text(row, "name")?,
+            kind: first_char(&text(row, "kind")?).unwrap_or('?'),
+            columns: numbers(&optional_text(row, "conkey")?.unwrap_or_default()),
+            ref_columns: numbers(&optional_text(row, "confkey")?.unwrap_or_default()),
             // 0 is `pg_constraint`'s "no referenced table", not an oid.
             ref_table: (ref_table != 0).then_some(ref_table),
-            on_delete: first_char(&text(&row, "on_delete")?).unwrap_or(' '),
-            on_update: first_char(&text(&row, "on_update")?).unwrap_or(' '),
-            validated: flag(&row, "validated")?,
-            deferrable: flag(&row, "deferrable")?,
-            deferred: flag(&row, "deferred")?,
-            definition: text(&row, "definition")?,
-            expression: optional_text(&row, "expression")?,
-            match_type: first_char(&text(&row, "match_type")?).unwrap_or(' '),
+            on_delete: first_char(&text(row, "on_delete")?).unwrap_or(' '),
+            on_update: first_char(&text(row, "on_update")?).unwrap_or(' '),
+            validated: flag(row, "validated")?,
+            deferrable: flag(row, "deferrable")?,
+            deferred: flag(row, "deferred")?,
+            definition: text(row, "definition")?,
+            expression: optional_text(row, "expression")?,
+            match_type: first_char(&text(row, "match_type")?).unwrap_or(' '),
             delete_set_columns: numbers(
-                &optional_text(&row, "delete_set_columns")?.unwrap_or_default(),
+                &optional_text(row, "delete_set_columns")?.unwrap_or_default(),
             ),
             index_oid: {
-                let oid = number(&row, "index_oid")?;
+                let oid = number(row, "index_oid")?;
                 (oid != 0).then_some(oid)
             },
-            enforced: flag(&row, "enforced")?,
-            period: flag(&row, "period")?,
-            no_inherit: flag(&row, "no_inherit")?,
-            triggers_not_ordinary: flag(&row, "triggers_not_ordinary")?,
+            enforced: flag(row, "enforced")?,
+            period: flag(row, "period")?,
+            no_inherit: flag(row, "no_inherit")?,
+            triggers_not_ordinary: flag(row, "triggers_not_ordinary")?,
         });
     }
-    for row in conn.query(&indexes_query()).await? {
+    for row in batch.get("indexes").ok_or_else(|| missing("indexes"))? {
         raw.indexes.push(RawIndex {
-            oid: number(&row, "oid")?,
-            table_oid: number(&row, "table_oid")?,
-            name: text(&row, "name")?,
-            unique: flag(&row, "is_unique")?,
-            primary: flag(&row, "is_primary")?,
-            exclusion: flag(&row, "is_exclusion")?,
-            valid: flag(&row, "is_valid")?,
-            nulls_not_distinct: flag(&row, "nulls_not_distinct")?,
-            key_count: small(&row, "key_count")?.max(0) as usize,
-            columns: numbers(&text(&row, "keys")?),
-            options: numbers(&text(&row, "options")?),
-            filter: optional_text(&row, "filter")?,
-            has_expressions: flag(&row, "has_expressions")?,
-            method: text(&row, "method")?,
-            nondefault_column_options: flag(&row, "nondefault_column_options")?,
+            oid: number(row, "oid")?,
+            table_oid: number(row, "table_oid")?,
+            name: text(row, "name")?,
+            unique: flag(row, "is_unique")?,
+            primary: flag(row, "is_primary")?,
+            exclusion: flag(row, "is_exclusion")?,
+            valid: flag(row, "is_valid")?,
+            nulls_not_distinct: flag(row, "nulls_not_distinct")?,
+            key_count: small(row, "key_count")?.max(0) as usize,
+            columns: numbers(&text(row, "keys")?),
+            options: numbers(&text(row, "options")?),
+            filter: optional_text(row, "filter")?,
+            has_expressions: flag(row, "has_expressions")?,
+            method: text(row, "method")?,
+            nondefault_column_options: flag(row, "nondefault_column_options")?,
         });
     }
-    for row in conn.query(&modules_query()).await? {
-        let kind = first_char(&text(&row, "kind")?).unwrap_or('?');
-        let schema = text(&row, "schema_name")?;
-        let name = text(&row, "name")?;
+    for row in batch.get("modules").ok_or_else(|| missing("modules"))? {
+        let kind = first_char(&text(row, "kind")?).unwrap_or('?');
+        let schema = text(row, "schema_name")?;
+        let name = text(row, "name")?;
         // Not `text`: a `NULL` here is not a column this reader has lost track
         // of, and saying so sends the reader to the one place that is right.
-        let Some(definition) = optional_text(&row, "definition")? else {
+        let Some(definition) = optional_text(row, "definition")? else {
             return Err(deparsed_away(kind, &schema, &name));
         };
         raw.modules.push(RawModule {
-            oid: number(&row, "oid")?,
+            oid: number(row, "oid")?,
             kind,
             schema,
             name,
-            on_table: text(&row, "on_table")?,
+            on_table: text(row, "on_table")?,
             definition,
         });
     }
-    for row in conn.query(&module_args_query()).await? {
+    for row in batch
+        .get("module_args")
+        .ok_or_else(|| missing("module_args"))?
+    {
         raw.module_args.push(RawModuleArg {
-            routine_oid: number(&row, "oid")?,
-            position: number(&row, "pos")?,
-            ty: text(&row, "ty")?,
+            routine_oid: number(row, "oid")?,
+            position: number(row, "pos")?,
+            ty: text(row, "ty")?,
         });
     }
-    for row in conn.query(ROLES).await? {
+    for row in batch.get("roles").ok_or_else(|| missing("roles"))? {
         raw.roles.push(RawRole {
-            name: text(&row, "name")?,
-            superuser: flag(&row, "superuser")?,
+            name: text(row, "name")?,
+            superuser: flag(row, "superuser")?,
         });
     }
-    for row in conn.query(&grants_query()).await? {
+    for row in batch.get("grants").ok_or_else(|| missing("grants"))? {
         raw.grants.push(RawGrant {
             // `None` is PUBLIC, which the query spells as a NULL rather than
             // letting `pg_get_userbyid(0)` render its own `unknown (OID=0)`:
             // that string is a name a role could in principle have, and this
             // one distinction must not be a string comparison.
-            grantee: optional_text(&row, "grantee")?,
-            schema: text(&row, "schema_name")?,
-            object: optional_text(&row, "object_name")?,
-            kind: granted_kind(&text(&row, "source")?, &text(&row, "kind")?),
-            routine_oid: row.try_get::<i64>("routine_oid")?,
-            permission: text(&row, "privilege_type")?,
-            grantable: flag(&row, "is_grantable")?,
-            column: optional_text(&row, "column_name")?,
-            defaulted: flag(&row, "defaulted")?,
-            owner: text(&row, "owner")?,
+            grantee: optional_text(row, "grantee")?,
+            schema: text(row, "schema_name")?,
+            object: optional_text(row, "object_name")?,
+            kind: granted_kind(&text(row, "source")?, &text(row, "kind")?),
+            routine_oid: row.integer("routine_oid")?,
+            permission: text(row, "privilege_type")?,
+            grantable: flag(row, "is_grantable")?,
+            column: optional_text(row, "column_name")?,
+            defaulted: flag(row, "defaulted")?,
+            owner: text(row, "owner")?,
         });
     }
-    for row in conn.query(&grant_routine_args_query()).await? {
+    for row in batch
+        .get("routine_args")
+        .ok_or_else(|| missing("routine_args"))?
+    {
         raw.routine_args.push(RawModuleArg {
-            routine_oid: number(&row, "oid")?,
-            position: number(&row, "pos")?,
-            ty: text(&row, "ty")?,
+            routine_oid: number(row, "oid")?,
+            position: number(row, "pos")?,
+            ty: text(row, "ty")?,
         });
     }
-    for row in conn.query(OTHER_ACLS).await? {
+    for row in batch
+        .get("other_acls")
+        .ok_or_else(|| missing("other_acls"))?
+    {
         raw.other_grants.push(RawOtherGrant {
-            grantee: optional_text(&row, "grantee")?,
-            class: text(&row, "class")?,
-            name: text(&row, "name")?,
-            permission: text(&row, "privilege_type")?,
-            grantable: flag(&row, "is_grantable")?,
-            owner: optional_text(&row, "owner")?,
+            grantee: optional_text(row, "grantee")?,
+            class: text(row, "class")?,
+            name: text(row, "name")?,
+            permission: text(row, "privilege_type")?,
+            grantable: flag(row, "is_grantable")?,
+            owner: optional_text(row, "owner")?,
         });
     }
-    for row in conn.query(HELD_ELSEWHERE).await? {
+    for row in batch
+        .get("held_elsewhere")
+        .ok_or_else(|| missing("held_elsewhere"))?
+    {
         raw.held_elsewhere.push(RawSharedDependency {
-            role: text(&row, "role_name")?,
-            database: optional_text(&row, "in_database")?,
-            deptype: first_char(&text(&row, "deptype")?).unwrap_or('?'),
-            objects: number(&row, "objects")?,
+            role: text(row, "role_name")?,
+            database: optional_text(row, "in_database")?,
+            deptype: first_char(&text(row, "deptype")?).unwrap_or('?'),
+            objects: number(row, "objects")?,
         });
     }
-    for row in conn.query(DEFAULT_ACLS).await? {
+    for row in batch
+        .get("default_acls")
+        .ok_or_else(|| missing("default_acls"))?
+    {
         raw.default_acls.push(RawDefaultAcl {
-            grantor: text(&row, "grantor")?,
-            in_schema: optional_text(&row, "in_schema")?,
-            objtype: first_char(&text(&row, "objtype")?).unwrap_or('?'),
-            acl: text(&row, "acl")?,
+            grantor: text(row, "grantor")?,
+            in_schema: optional_text(row, "in_schema")?,
+            objtype: first_char(&text(row, "objtype")?).unwrap_or('?'),
+            acl: text(row, "acl")?,
         });
     }
-    for row in conn.query(&unheld_modules_query()).await? {
-        let schema = text(&row, "schema_name")?;
-        let name = text(&row, "name")?;
+    for row in batch
+        .get("unheld_modules")
+        .ok_or_else(|| missing("unheld_modules"))?
+    {
+        let schema = text(row, "schema_name")?;
+        let name = text(row, "name")?;
+        let here = TableName::new(&schema, &name);
+        let target = match text(row, "kind")?.as_str() {
+            "m" => LimitationTarget::Relation(here),
+            "a" | "w" => {
+                let oid = number(row, "oid")?;
+                let args = raw
+                    .routine_args
+                    .iter()
+                    .filter(|arg| arg.routine_oid == oid)
+                    .map(|arg| arg.ty.parse::<pbps_model::RoutineArg>())
+                    .collect::<Result<Vec<_>, _>>();
+                match args {
+                    Ok(args) => LimitationTarget::Module(pbps_model::ModuleId::Routine(
+                        pbps_model::RoutineId::new(here, args),
+                    )),
+                    Err(_) => LimitationTarget::UnnameableModule(here),
+                }
+            }
+            "t" => LimitationTarget::Module(pbps_model::ModuleId::Trigger {
+                on: TableName::new(&schema, text(row, "on_table")?),
+                name,
+            }),
+            other => {
+                return Err(DbError::BadRow(format!(
+                    "unknown unsupported module kind {other}"
+                )));
+            }
+        };
+        let display = match &target {
+            LimitationTarget::Module(id) => id.to_string(),
+            LimitationTarget::Relation(name) | LimitationTarget::UnnameableModule(name) => {
+                name.to_string()
+            }
+        };
         warnings.push(Limitation {
-            table: TableName::new(&schema, &name),
+            target,
             detail: format!(
-                "`{schema}.{name}` is {}, which this model does not hold. It is left out of the \
+                "`{display}` is {}, which this model does not hold. It is left out of the \
                  pull entirely — not read back as an ordinary module, which would make a plan \
                  that recreates it as something else.",
-                text(&row, "detail")?
+                text(row, "detail")?
             ),
         });
     }
@@ -1255,6 +1381,98 @@ SELECT pg_catalog.pg_get_userbyid(da.defaclrole) AS grantor,
   LEFT JOIN pg_catalog.pg_namespace n ON n.oid = da.defaclnamespace
  ORDER BY 1, 2, 3";
 
+/// Whether this connection is inside a transaction block, asked the one way
+/// that reads differently in the two states through this driver (DECISIONS
+/// 253): a `SET LOCAL` on this tool's own GUC, read back in a second
+/// statement. The setting is left behind inside a caller's transaction, under
+/// this tool's prefix, and ends with it.
+pub async fn in_transaction(conn: &mut Conn) -> Result<bool, DbError> {
+    let token = probe_token();
+    conn.query(&probe_set(&token)).await?;
+    let rows = conn.query(PROBE_READ).await?;
+    let row = rows.first().ok_or_else(|| missing("probe"))?;
+    Ok(text(row, "probe")? == token)
+}
+
+/// Where a canonical-scope read runs (DECISIONS 253, 418).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Its own `REPEATABLE READ READ ONLY` transaction (250). Refused inside
+    /// a caller's transaction, which it would otherwise commit (253).
+    Own,
+    /// Inside the transaction the caller already holds, under a savepoint,
+    /// reading what that transaction has written and not yet committed. For
+    /// one caller: the apply's read-back, which records what a plan built in
+    /// the same transaction as the build (`pbps-cli`, DECISIONS 147). Refused
+    /// outside a transaction: "nothing uncommitted to see" is [`Scope::Own`]'s
+    /// answer, not this one's (418).
+    CallersTransaction,
+}
+
+/// The savepoint an in-transaction read runs under, and what it sets there.
+///
+/// `SET LOCAL transaction_read_only = on` keeps the promise `READ ONLY` makes
+/// for the other scope, for exactly as long as the savepoint: measured, a
+/// `CREATE TABLE` under it is `cannot execute CREATE TABLE in a read-only
+/// transaction`, and after `ROLLBACK TO SAVEPOINT` the caller's transaction is
+/// writable again. The canonical settings are `set_config(…, is_local)` and
+/// come back the same way — measured, the caller's `search_path` is what it
+/// was — which is why the savepoint is rolled back on success too: there is
+/// nothing a read has to keep, and everything it set has to go.
+const SAVEPOINT: &str = "SAVEPOINT pbps_read; SET LOCAL transaction_read_only = on";
+const UNWIND: &str = "ROLLBACK TO SAVEPOINT pbps_read; RELEASE SAVEPOINT pbps_read";
+
+async fn open(conn: &mut Conn, scope: Scope) -> Result<(), DbError> {
+    match scope {
+        Scope::Own => {
+            refuse_a_caller_owned_transaction(conn).await?;
+            conn.execute(BEGIN).await
+        }
+        Scope::CallersTransaction => {
+            if !in_transaction(conn).await? {
+                return Err(DbError::Driver {
+                    code: None,
+                    message: "this connection has no open transaction, and a read-back of one \
+                              cannot run outside it.\nThe read exists to see what the \
+                              caller's transaction has written and not yet committed; outside \
+                              a transaction there is nothing of the kind, and the plain read \
+                              takes its own snapshot instead."
+                        .to_owned(),
+                });
+            }
+            conn.execute(SAVEPOINT).await
+        }
+    }
+}
+
+/// Ends the scope the way its outcome requires. The scope's own failure to end
+/// is dropped on the error path: a transaction the server has already killed
+/// must not replace the failure that killed it.
+async fn close<T>(
+    conn: &mut Conn,
+    scope: Scope,
+    outcome: Result<T, DbError>,
+) -> Result<T, DbError> {
+    match (scope, outcome) {
+        (Scope::Own, Ok(value)) => {
+            conn.execute("COMMIT").await?;
+            Ok(value)
+        }
+        (Scope::Own, Err(e)) => {
+            let _ = conn.execute("ROLLBACK").await;
+            Err(e)
+        }
+        (Scope::CallersTransaction, Ok(value)) => {
+            conn.execute(UNWIND).await?;
+            Ok(value)
+        }
+        (Scope::CallersTransaction, Err(e)) => {
+            let _ = conn.execute(UNWIND).await;
+            Err(e)
+        }
+    }
+}
+
 /// The one failure the snapshot cannot prevent, named so that it does not
 /// arrive as a mystery.
 ///
@@ -1293,16 +1511,12 @@ SELECT pg_catalog.pg_get_userbyid(da.defaclrole) AS grantor,
 /// transaction would answer from their uncommitted writes, which is not what
 /// "what the database looks like" means.
 async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
-    let token = probe_token();
-    conn.query(&probe_set(&token)).await?;
-    let rows = conn.query(PROBE_READ).await?;
-    let row = rows.first().ok_or_else(|| missing("probe"))?;
-    if text(row, "probe")? == token {
+    if in_transaction(conn).await? {
         return Err(DbError::Driver {
             code: None,
             message: "this connection already has an open transaction, and a pull cannot run \
                       inside one.\nThe read takes its own `REPEATABLE READ READ ONLY` \
-                      transaction so that its five queries cannot disagree about what exists. \
+                      transaction to own its snapshot and restore its local settings. \
                       PostgreSQL does not nest transactions, so running here would neither get \
                       that snapshot nor be able to end without committing yours. Commit or roll \
                       back first."
@@ -1402,24 +1616,69 @@ fn missing(column: &str) -> DbError {
     ))
 }
 
-fn text(row: &Row, column: &str) -> Result<String, DbError> {
+trait CatalogFields {
+    fn string(&self, column: &str) -> Result<Option<String>, DbError>;
+    fn integer(&self, column: &str) -> Result<Option<i64>, DbError>;
+    fn boolean(&self, column: &str) -> Result<Option<bool>, DbError>;
+}
+
+impl CatalogFields for Row {
+    fn string(&self, column: &str) -> Result<Option<String>, DbError> {
+        Ok(self.try_get::<&str>(column)?.map(str::to_owned))
+    }
+    fn integer(&self, column: &str) -> Result<Option<i64>, DbError> {
+        self.try_get::<i64>(column)
+    }
+    fn boolean(&self, column: &str) -> Result<Option<bool>, DbError> {
+        self.try_get::<bool>(column)
+    }
+}
+
+fn json_field<T>(
+    row: &serde_json::Value,
+    column: &str,
+    read: impl FnOnce(&serde_json::Value) -> Option<T>,
+) -> Result<Option<T>, DbError> {
+    match row.get(column) {
+        None => Err(missing(column)),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => read(value).map(Some).ok_or_else(|| {
+            DbError::BadRow(format!("catalog column `{column}` has the wrong JSON type"))
+        }),
+    }
+}
+
+impl CatalogFields for serde_json::Value {
+    fn string(&self, column: &str) -> Result<Option<String>, DbError> {
+        json_field(self, column, |v| v.as_str().map(str::to_owned))
+    }
+    fn integer(&self, column: &str) -> Result<Option<i64>, DbError> {
+        json_field(self, column, serde_json::Value::as_i64)
+    }
+    fn boolean(&self, column: &str) -> Result<Option<bool>, DbError> {
+        json_field(self, column, serde_json::Value::as_bool)
+    }
+}
+
+fn text(row: &impl CatalogFields, column: &str) -> Result<String, DbError> {
     optional_text(row, column)?.ok_or_else(|| missing(column))
 }
 
-fn optional_text(row: &Row, column: &str) -> Result<Option<String>, DbError> {
-    Ok(row.try_get::<&str>(column)?.map(str::to_owned))
+fn optional_text(row: &impl CatalogFields, column: &str) -> Result<Option<String>, DbError> {
+    row.string(column)
 }
 
-fn number(row: &Row, column: &str) -> Result<i64, DbError> {
-    row.try_get::<i64>(column)?.ok_or_else(|| missing(column))
+fn number(row: &impl CatalogFields, column: &str) -> Result<i64, DbError> {
+    row.integer(column)?.ok_or_else(|| missing(column))
 }
 
-fn small(row: &Row, column: &str) -> Result<i32, DbError> {
-    row.try_get::<i32>(column)?.ok_or_else(|| missing(column))
+fn small(row: &impl CatalogFields, column: &str) -> Result<i32, DbError> {
+    i32::try_from(number(row, column)?)
+        .map_err(|_| DbError::BadRow(format!("catalog column `{column}` does not fit an i32")))
 }
 
-fn flag(row: &Row, column: &str) -> Result<bool, DbError> {
-    row.try_get::<bool>(column)?.ok_or_else(|| missing(column))
+fn flag(row: &impl CatalogFields, column: &str) -> Result<bool, DbError> {
+    row.boolean(column)?.ok_or_else(|| missing(column))
 }
 
 /// The catalog a grant row came from, and that catalog's kind letter.
@@ -1451,9 +1710,355 @@ fn numbers(s: &str) -> Vec<i32> {
         .collect()
 }
 
+/// Reads the rows of every scoped table the schema has (ADR-0004).
+///
+/// The scope decides *which* rows — every row of an `exact` table, the declared
+/// keys of an `ensure` one — and it is supplied by the caller, because a
+/// database holds rows, not a notion of which of them are declared. A scoped
+/// table the schema does not have gets no entry: it is missing, which the
+/// managed-set check reports, and "missing" must not come back as "empty".
+///
+/// A table whose rows cannot be read (no single-column key, or a value the
+/// model cannot hold) fails the whole read rather than being skipped: a state
+/// recorded without it would say the table declares no rows, and the next drift
+/// check would be blind to the rows it exists to watch.
+///
+/// **It takes its own transaction**, for the reason [`introspect`] does and one
+/// more. `read_rows` is where this dialect's value spellings are fixed: the
+/// canonical settings are `set_config(…, is_local)` and therefore belong to a
+/// transaction, so a read outside one would render every date, interval,
+/// `bytea` and float under whatever the caller's session has (ADR-0013 §3, and
+/// [`crate::rows::read_expr`] for what that costs).
+pub async fn read_rows(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    read_rows_in(conn, schema, scopes, Scope::Own).await
+}
+
+/// [`read_rows`] inside the transaction the caller holds, for the reason and
+/// under the terms of [`introspect_within_transaction`]: the rows a plan's
+/// statements just wrote, read back before the commit that makes them so
+/// (DECISIONS 147, 418).
+pub async fn read_rows_within_transaction(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    read_rows_in(conn, schema, scopes, Scope::CallersTransaction).await
+}
+
+async fn read_rows_in(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+    scope: Scope,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
+        table: table.clone(),
+        source: Box::new(source),
+    };
+    let any = TableName::new("", "");
+    open(conn, scope).await.map_err(|e| read(&any, e))?;
+    // The scope's own error is a read error of no table in particular; the
+    // read's is already one.
+    let outcome = read_every_scoped_table(conn, schema, scopes).await;
+    match outcome {
+        Ok(out) => close(conn, scope, Ok(out)).await.map_err(|e| read(&any, e)),
+        Err(e) => {
+            // The scope is unwound for the read's error, which is the one
+            // returned; the unwinding's own outcome is not it.
+            let _: Result<(), DbError> =
+                close(conn, scope, Err(DbError::BadRow(String::new()))).await;
+            Err(e)
+        }
+    }
+}
+
+async fn read_every_scoped_table(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
+) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
+    let mut out = pbps_model::ObservedRows::new();
+    let any = TableName::new("", "");
+    conn.query(CANONICAL_PATH)
+        .await
+        .map_err(|e| crate::rows::RowsError::Read {
+            table: any,
+            source: Box::new(e),
+        })?;
+    for (name, scope) in scopes {
+        let Some(table) = schema.tables.get(name) else {
+            continue;
+        };
+        let mut observed = pbps_model::ObservedTable::default();
+        if let Some(query) = crate::rows::query(name, table, scope)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            for row in &conn.query(&query.sql).await.map_err(read)? {
+                let (key, cells) = crate::rows::decode(name, &query, row)?;
+                observed.rows.insert(key, cells);
+            }
+            if let Some(sql) = &query.aliases {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    // A requested key the table does not hold has no alias to
+                    // record — the row is simply not there, which is what an
+                    // `InsertRow` is for.
+                    if let (requested, Some(canonical)) = crate::rows::decode_alias(name, row)? {
+                        observed.aliases.insert(requested, canonical);
+                    }
+                }
+            }
+        }
+        out.insert(name.clone(), observed);
+    }
+    Ok(out)
+}
+
+/// Every declared value the engine would not read back as written, and every
+/// pair of declared keys it reads as one row (DECISIONS 101, 106; ADR-0013 §5).
+///
+/// Asked before anything is written, and asked of the engine: neither the model
+/// nor this crate can spell a value the engine's way without becoming the
+/// engine.
+///
+/// Inside the canonical scope, because the answer *is* a spelling and the
+/// spelling is what the settings decide. The comparison it feeds is against a
+/// state read under those same settings, and a check run under the operator's
+/// would report a date as misspelt on one machine and clean on the next.
+///
+/// The key columns' collations are read here, by [`key_collations`], under
+/// the names `at` carries: they decide which two keys are one row, and a
+/// caller cannot know them without asking this catalog.
+pub async fn misspelt(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let any = TableName::new("", "");
+    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
+        table: table.clone(),
+        source: Box::new(source),
+    };
+    refuse_a_caller_owned_transaction(conn)
+        .await
+        .map_err(|e| read(&any, e))?;
+    // The one input the checks read from the catalog rather than take from
+    // the declaration, read here so that the question is answered whole: a
+    // caller that hands in the names and forgets the collations gets the
+    // database default silently, which is the fallback DECISIONS 148 exists
+    // to refuse. `at` is the caller's under the names it knows; the copy
+    // carries what the catalog adds.
+    let mut at = at.clone();
+    key_collations(conn, &mut at, schema)
+        .await
+        .map_err(|e| read(&any, e))?;
+    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
+    let out = ask_about_every_spelling(conn, schema, &at).await;
+    match out {
+        Ok(out) => {
+            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+async fn ask_about_every_spelling(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let any = TableName::new("", "");
+    conn.query(CANONICAL_PATH)
+        .await
+        .map_err(|e| crate::rows::RowsError::Read {
+            table: any,
+            source: Box::new(e),
+        })?;
+    let mut out = Spellings::default();
+    let as_declared = crate::rows::Catalogued::default();
+    for (name, table) in &schema.tables {
+        let at = at.get(name).unwrap_or(&as_declared);
+        for q in crate::rows::spelling_queries(name, table, at)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            if let Some(sql) = &q.collisions {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
+                    let (Some((first, _)), Some((second, _))) =
+                        (q.literals.get(a), q.literals.get(b))
+                    else {
+                        continue;
+                    };
+                    // The key column's own type and collation decide it; the
+                    // second insert would fail on the primary key.
+                    out.conflicts.push(pbps_model::RowConflict {
+                        table: name.clone(),
+                        first: first.clone(),
+                        second: second.clone(),
+                        canonical: pbps_model::RowKey::from(canonical.as_str()),
+                    });
+                }
+            }
+            for row in &conn.query(&q.sql).await.map_err(read)? {
+                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
+                let Some((key, declared)) = q.literals.get(i) else {
+                    continue;
+                };
+                if canonical.as_deref() == Some(declared.as_str()) {
+                    continue;
+                }
+                out.misspelt.push(crate::rows::Misspelt {
+                    table: name.clone(),
+                    key: key.clone(),
+                    column: q.column.clone(),
+                    declared: declared.clone(),
+                    ty: q.ty.clone(),
+                    canonical,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// How the database spells each of the schema names a declaration grants on:
+/// `None` where it has no schema of that name at all.
+///
+/// The SQL Server question (DECISIONS 142), asked of this engine for the same
+/// reason and answered the only way it can be here. An identifier the emitter
+/// writes is always quoted, and a quoted name is compared byte for byte, so
+/// the one spelling this database can have for a declared schema is the
+/// declared one: `App` and `app` are two schemas, not two spellings. The query
+/// therefore answers presence — `nspname` equal to the text, exactly — and can
+/// never answer a different spelling. Asked rather than assumed, so that "the
+/// schema is there under this name" and "there is no such schema" stay two
+/// answers the caller receives from the engine (DECISIONS 417).
+pub async fn schema_spellings(
+    conn: &mut Conn,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, Option<String>>, DbError> {
+    let mut out = std::collections::BTreeMap::new();
+    if names.is_empty() {
+        return Ok(out);
+    }
+    let wanted: Vec<&String> = names.iter().collect();
+    let params: Vec<Param<'_>> = wanted.iter().map(|n| Param::Str(n.as_str())).collect();
+    let values: Vec<String> = (1..=wanted.len())
+        .map(|i| format!("(${i}::text)"))
+        .collect();
+    let sql = format!(
+        "WITH wanted(schema_name) AS (VALUES {})\n\
+         SELECT w.schema_name, n.nspname AS spelled\n  \
+           FROM wanted w\n  \
+           LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name",
+        values.join(", ")
+    );
+    for row in &conn.query_with(&sql, &params).await? {
+        let name: &str = row.try_get("schema_name")?.ok_or_else(|| {
+            DbError::BadRow("the schema spelling query returned a NULL name".to_owned())
+        })?;
+        let spelled: Option<&str> = row.try_get("spelled")?;
+        out.insert(name.to_owned(), spelled.map(ToOwned::to_owned));
+    }
+    Ok(out)
+}
+
+/// What the catalog calls each declared table's key column collation *now*.
+///
+/// The one input to the spelling checks that is read from the database rather
+/// than declared, and the one that decides whether two keys are one row. A
+/// table this plan creates has none — the emitter writes no `COLLATE`, so its
+/// column will take the database default — and that is what `None` means.
+///
+/// Read under the names the catalog has now, which is the caller's to supply:
+/// the checks run before the plan's first statement, so a table this revision
+/// renames is still under its old name (DECISIONS 148).
+pub async fn key_collations(
+    conn: &mut Conn,
+    at: &mut crate::rows::CatalogNames,
+    schema: &Schema,
+) -> Result<(), DbError> {
+    let as_declared = crate::rows::Catalogued::default();
+    let mut wanted: Vec<(TableName, TableName, String)> = Vec::new();
+    for (name, table) in &schema.tables {
+        if table.data.is_none() {
+            continue;
+        }
+        let entry = at.get(name).unwrap_or(&as_declared);
+        let Some(key) = table
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.columns.len() == 1)
+            .map(|pk| pk.columns[0].clone())
+        else {
+            continue;
+        };
+        wanted.push((
+            name.clone(),
+            entry.table.clone().unwrap_or_else(|| name.clone()),
+            entry.key_column.clone().unwrap_or(key),
+        ));
+    }
+    for (declared, stored, column) in wanted {
+        // `to_regclass` and not a cast: a table this plan creates does not
+        // exist yet, and `'s.t'::regclass` is an error where this is a NULL.
+        let sql = format!(
+            "SELECT co.collname AS collation_name, ns.nspname AS collation_schema\n  \
+               FROM pg_catalog.pg_attribute a\n  \
+               JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation\n  \
+               JOIN pg_catalog.pg_namespace ns ON ns.oid = co.collnamespace\n \
+              WHERE a.attrelid = pg_catalog.to_regclass({})\n                \
+                AND a.attname = {}",
+            crate::emit::value_literal(&format!(
+                "{}.{}",
+                quote_for_regclass(&stored.schema),
+                quote_for_regclass(&stored.name)
+            )),
+            crate::emit::value_literal(&column),
+        );
+        let rows = conn.query(&sql).await?;
+        let Some(row) = rows.first() else { continue };
+        let entry = at.entry(declared).or_default();
+        entry.key_collation = Some((text(row, "collation_schema")?, text(row, "collation_name")?));
+    }
+    Ok(())
+}
+
+/// One half of a name for `to_regclass`, which parses its argument as SQL
+/// rather than taking it literally: a name with a `"` or a `.` in it has to
+/// arrive quoted or the function reads it as two.
+fn quote_for_regclass(part: &str) -> String {
+    format!("\"{}\"", part.replace('"', "\"\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_batch_fields_distinguish_null_missing_and_wrong_types() {
+        let row = serde_json::json!({"text": "held", "none": null, "large": 9223372036854775807_i64, "flag": false});
+        assert_eq!(text(&row, "text").unwrap(), "held");
+        assert_eq!(optional_text(&row, "none").unwrap(), None);
+        assert!(optional_text(&row, "absent").is_err());
+        assert!(optional_text(&row, "flag").is_err());
+        assert_eq!(number(&row, "large").unwrap(), i64::MAX);
+        assert!(small(&row, "large").is_err());
+        assert!(!flag(&row, "flag").unwrap());
+        assert!(flag(&row, "none").is_err());
+        assert!(decode_batch(&CatalogBatch::new()).is_err());
+    }
 
     /// The two catalog spellings this file has to read, and the shapes that
     /// are not numbers at all.
@@ -1500,10 +2105,9 @@ mod tests {
         }
     }
 
-    /// Each word of the framing is load-bearing and none of them is visible in
-    /// a passing test, so they are asserted here: without `REPEATABLE READ` the
-    /// five reads are five snapshots, without `READ ONLY` nothing but this
-    /// comment stops a future query from writing, and with `false` for
+    /// The shared framing also serves multi-statement row reads, which need
+    /// `REPEATABLE READ`. Without `READ ONLY` nothing but this comment stops
+    /// a future owned read from writing, and with `false` for
     /// `is_local` the search path outlives the transaction that set it.
     #[test]
     fn the_read_is_framed_as_one_snapshot_that_cannot_write_or_outlive_itself() {
@@ -1684,270 +2288,4 @@ mod tests {
             "the two names, and the `r` that says which kind: {NOT_ONE_OF_OUR_TABLES}"
         );
     }
-}
-
-/// Reads the rows of every scoped table the schema has (ADR-0004).
-///
-/// The scope decides *which* rows — every row of an `exact` table, the declared
-/// keys of an `ensure` one — and it is supplied by the caller, because a
-/// database holds rows, not a notion of which of them are declared. A scoped
-/// table the schema does not have gets no entry: it is missing, which the
-/// managed-set check reports, and "missing" must not come back as "empty".
-///
-/// A table whose rows cannot be read (no single-column key, or a value the
-/// model cannot hold) fails the whole read rather than being skipped: a state
-/// recorded without it would say the table declares no rows, and the next drift
-/// check would be blind to the rows it exists to watch.
-///
-/// **It takes its own transaction**, for the reason [`introspect`] does and one
-/// more. `read_rows` is where this dialect's value spellings are fixed: the
-/// canonical settings are `set_config(…, is_local)` and therefore belong to a
-/// transaction, so a read outside one would render every date, interval,
-/// `bytea` and float under whatever the caller's session has (ADR-0013 §3, and
-/// [`crate::rows::read_expr`] for what that costs).
-pub async fn read_rows(
-    conn: &mut Conn,
-    schema: &Schema,
-    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
-) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
-    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
-        table: table.clone(),
-        source: Box::new(source),
-    };
-    let any = TableName::new("", "");
-    refuse_a_caller_owned_transaction(conn)
-        .await
-        .map_err(|e| read(&any, e))?;
-    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
-    let out = read_every_scoped_table(conn, schema, scopes).await;
-    match out {
-        Ok(out) => {
-            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
-            Ok(out)
-        }
-        Err(e) => {
-            // `ROLLBACK` rather than `COMMIT`, and its own error is dropped: a
-            // transaction the server has already killed must not replace the
-            // failure that killed it.
-            let _ = conn.execute("ROLLBACK").await;
-            Err(e)
-        }
-    }
-}
-
-async fn read_every_scoped_table(
-    conn: &mut Conn,
-    schema: &Schema,
-    scopes: &std::collections::BTreeMap<TableName, pbps_model::RowScope>,
-) -> Result<pbps_model::ObservedRows, crate::rows::RowsError> {
-    let mut out = pbps_model::ObservedRows::new();
-    let any = TableName::new("", "");
-    conn.query(CANONICAL_PATH)
-        .await
-        .map_err(|e| crate::rows::RowsError::Read {
-            table: any,
-            source: Box::new(e),
-        })?;
-    for (name, scope) in scopes {
-        let Some(table) = schema.tables.get(name) else {
-            continue;
-        };
-        let mut observed = pbps_model::ObservedTable::default();
-        if let Some(query) = crate::rows::query(name, table, scope)? {
-            let read = |source| crate::rows::RowsError::Read {
-                table: name.clone(),
-                source: Box::new(source),
-            };
-            for row in &conn.query(&query.sql).await.map_err(read)? {
-                let (key, cells) = crate::rows::decode(name, &query, row)?;
-                observed.rows.insert(key, cells);
-            }
-            if let Some(sql) = &query.aliases {
-                for row in &conn.query(sql).await.map_err(read)? {
-                    // A requested key the table does not hold has no alias to
-                    // record — the row is simply not there, which is what an
-                    // `InsertRow` is for.
-                    if let (requested, Some(canonical)) = crate::rows::decode_alias(name, row)? {
-                        observed.aliases.insert(requested, canonical);
-                    }
-                }
-            }
-        }
-        out.insert(name.clone(), observed);
-    }
-    Ok(out)
-}
-
-/// Every declared value the engine would not read back as written, and every
-/// pair of declared keys it reads as one row (DECISIONS 101, 106; ADR-0013 §5).
-///
-/// Asked before anything is written, and asked of the engine: neither the model
-/// nor this crate can spell a value the engine's way without becoming the
-/// engine.
-///
-/// Inside the canonical scope, because the answer *is* a spelling and the
-/// spelling is what the settings decide. The comparison it feeds is against a
-/// state read under those same settings, and a check run under the operator's
-/// would report a date as misspelt on one machine and clean on the next.
-pub async fn misspelt(
-    conn: &mut Conn,
-    schema: &Schema,
-    at: &crate::rows::CatalogNames,
-) -> Result<Spellings, crate::rows::RowsError> {
-    let any = TableName::new("", "");
-    let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
-        table: table.clone(),
-        source: Box::new(source),
-    };
-    refuse_a_caller_owned_transaction(conn)
-        .await
-        .map_err(|e| read(&any, e))?;
-    conn.execute(BEGIN).await.map_err(|e| read(&any, e))?;
-    let out = ask_about_every_spelling(conn, schema, at).await;
-    match out {
-        Ok(out) => {
-            conn.execute("COMMIT").await.map_err(|e| read(&any, e))?;
-            Ok(out)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK").await;
-            Err(e)
-        }
-    }
-}
-
-/// What the spelling checks found.
-#[derive(Debug, Default)]
-pub struct Spellings {
-    /// Declared texts the engine reads back differently, or not at all.
-    pub misspelt: Vec<crate::rows::Misspelt>,
-    /// Two declared keys the engine reads as one row, rendered as the message
-    /// a caller shows.
-    pub conflicts: Vec<String>,
-}
-
-async fn ask_about_every_spelling(
-    conn: &mut Conn,
-    schema: &Schema,
-    at: &crate::rows::CatalogNames,
-) -> Result<Spellings, crate::rows::RowsError> {
-    let any = TableName::new("", "");
-    conn.query(CANONICAL_PATH)
-        .await
-        .map_err(|e| crate::rows::RowsError::Read {
-            table: any,
-            source: Box::new(e),
-        })?;
-    let mut out = Spellings::default();
-    let as_declared = crate::rows::Catalogued::default();
-    for (name, table) in &schema.tables {
-        let at = at.get(name).unwrap_or(&as_declared);
-        for q in crate::rows::spelling_queries(name, table, at)? {
-            let read = |source| crate::rows::RowsError::Read {
-                table: name.clone(),
-                source: Box::new(source),
-            };
-            if let Some(sql) = &q.collisions {
-                for row in &conn.query(sql).await.map_err(read)? {
-                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
-                    let (Some((first, _)), Some((second, _))) =
-                        (q.literals.get(a), q.literals.get(b))
-                    else {
-                        continue;
-                    };
-                    out.conflicts.push(format!(
-                        "{name} declares row keys `{first}` and `{second}`, and this engine reads \
-                         both as the one row `{canonical}` — the key column's own type and \
-                         collation decide it. The second insert would fail on the primary key."
-                    ));
-                }
-            }
-            for row in &conn.query(&q.sql).await.map_err(read)? {
-                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
-                let Some((key, declared)) = q.literals.get(i) else {
-                    continue;
-                };
-                if canonical.as_deref() == Some(declared.as_str()) {
-                    continue;
-                }
-                out.misspelt.push(crate::rows::Misspelt {
-                    table: name.clone(),
-                    key: key.clone(),
-                    column: q.column.clone(),
-                    declared: declared.clone(),
-                    ty: q.ty.clone(),
-                    canonical,
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// What the catalog calls each declared table's key column collation *now*.
-///
-/// The one input to the spelling checks that is read from the database rather
-/// than declared, and the one that decides whether two keys are one row. A
-/// table this plan creates has none — the emitter writes no `COLLATE`, so its
-/// column will take the database default — and that is what `None` means.
-///
-/// Read under the names the catalog has now, which is the caller's to supply:
-/// the checks run before the plan's first statement, so a table this revision
-/// renames is still under its old name (DECISIONS 148).
-pub async fn key_collations(
-    conn: &mut Conn,
-    at: &mut crate::rows::CatalogNames,
-    schema: &Schema,
-) -> Result<(), DbError> {
-    let as_declared = crate::rows::Catalogued::default();
-    let mut wanted: Vec<(TableName, TableName, String)> = Vec::new();
-    for (name, table) in &schema.tables {
-        if table.data.is_none() {
-            continue;
-        }
-        let entry = at.get(name).unwrap_or(&as_declared);
-        let Some(key) = table
-            .primary_key
-            .as_ref()
-            .filter(|pk| pk.columns.len() == 1)
-            .map(|pk| pk.columns[0].clone())
-        else {
-            continue;
-        };
-        wanted.push((
-            name.clone(),
-            entry.table.clone().unwrap_or_else(|| name.clone()),
-            entry.key_column.clone().unwrap_or(key),
-        ));
-    }
-    for (declared, stored, column) in wanted {
-        // `to_regclass` and not a cast: a table this plan creates does not
-        // exist yet, and `'s.t'::regclass` is an error where this is a NULL.
-        let sql = format!(
-            "SELECT co.collname AS collation_name, ns.nspname AS collation_schema\n  \
-               FROM pg_catalog.pg_attribute a\n  \
-               JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation\n  \
-               JOIN pg_catalog.pg_namespace ns ON ns.oid = co.collnamespace\n \
-              WHERE a.attrelid = pg_catalog.to_regclass({})\n                \
-                AND a.attname = {}",
-            crate::emit::value_literal(&format!(
-                "{}.{}",
-                quote_for_regclass(&stored.schema),
-                quote_for_regclass(&stored.name)
-            )),
-            crate::emit::value_literal(&column),
-        );
-        let rows = conn.query(&sql).await?;
-        let Some(row) = rows.first() else { continue };
-        let entry = at.entry(declared).or_default();
-        entry.key_collation = Some((text(row, "collation_schema")?, text(row, "collation_name")?));
-    }
-    Ok(())
-}
-
-/// One half of a name for `to_regclass`, which parses its argument as SQL
-/// rather than taking it literally: a name with a `"` or a `.` in it has to
-/// arrive quoted or the function reads it as two.
-fn quote_for_regclass(part: &str) -> String {
-    format!("\"{}\"", part.replace('"', "\"\""))
 }

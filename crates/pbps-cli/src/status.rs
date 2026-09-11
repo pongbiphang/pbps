@@ -131,12 +131,6 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    output::or_unanswerable(
-        "status",
-        json,
-        "project.unsupported-dialect",
-        db::require_mssql(project, "status"),
-    )?;
     let checked_at = crate::now();
 
     let rt = output::or_unanswerable("status", json, "runtime.unavailable", db::runtime())?;
@@ -192,7 +186,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
 /// two points in `one` and the copies would have to stay identical about which
 /// of the two failure readings is the safe one.
 async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
-    match pbps_mssql::state::lock_holder(conn).await {
+    match crate::engine::lock_holder(conn).await {
         Ok(held) => (
             held.map(|l| format!("{} since {}", l.locked_by, l.locked_at)),
             None,
@@ -213,7 +207,7 @@ async fn one(
         Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
     };
 
-    let entry = match pbps_mssql::state::latest(&mut conn).await {
+    let entry = match crate::engine::latest(&mut conn).await {
         Ok(Some(entry)) => entry,
         // The ledger exists and is empty, which is exactly what a *first*
         // `bootstrap` looks like while it runs: `state::lock` calls
@@ -300,7 +294,7 @@ async fn one(
     // The drift verdict is the checksum, computed exactly as `verify` computes
     // it. Two commands that disagreed about whether an environment has drifted
     // would be worse than one of them not existing.
-    let pulled = match pbps_mssql::catalog::introspect(&mut conn).await {
+    let pulled = match crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await {
         Ok(p) => p,
         Err(e) => {
             record_unreachable(&mut row, e.to_string());
@@ -322,9 +316,14 @@ async fn one(
         .iter()
         .map(|(n, s)| (n.clone(), s.rows_to_read()))
         .collect();
-    let rows = pbps_mssql::catalog::read_rows(&mut conn, &scoped.schema, &read)
-        .await
-        .map_err(|e| format!("the declared rows could not be read back: {e}"));
+    let rows = crate::engine::read_rows(
+        &mut conn,
+        &scoped.schema,
+        &read,
+        crate::engine::Read::Snapshot,
+    )
+    .await
+    .map_err(|e| format!("the declared rows could not be read back: {e}"));
     record_catalog_findings(&mut row, &entry, &pulled, &scoped, rows, unmanaged);
     row
 }
@@ -353,7 +352,7 @@ fn recorded_modules(
 fn record_catalog_findings(
     row: &mut EnvStatus,
     entry: &pbps_db::LedgerEntry,
-    pulled: &pbps_mssql::introspect::Pulled,
+    pulled: &pbps_db::catalog::Pulled,
     scoped: &pbps_diff::Scoped,
     rows: Result<pbps_model::ObservedRows, String>,
     unmanaged: pbps_config::Unmanaged,
@@ -824,7 +823,7 @@ mod tests {
     /// table the entry never named.
     fn stray_table() -> (
         pbps_db::LedgerEntry,
-        pbps_mssql::introspect::Pulled,
+        pbps_db::catalog::Pulled,
         pbps_diff::Scoped,
     ) {
         let entry = pbps_db::LedgerEntry {
@@ -842,7 +841,7 @@ mod tests {
             "dbo.surprise".parse().unwrap(),
             pbps_model::Table::default(),
         );
-        let pulled = pbps_mssql::introspect::Pulled {
+        let pulled = pbps_db::catalog::Pulled {
             schema: live,
             warnings: Vec::new(),
             unexpressible: Vec::new(),

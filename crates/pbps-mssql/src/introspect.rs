@@ -27,6 +27,11 @@ use pbps_model::{
 
 use crate::types;
 
+// The shapes a pull returns are `pbps-db`'s, filled here from `sys.*` and
+// re-exported under the paths this crate's callers and tests have always used
+// (DECISIONS 417).
+pub use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, Unexpressible, UnmanagedModule};
+
 /// One row of `sys.tables`.
 #[derive(Debug, Clone)]
 pub struct RawTable {
@@ -262,92 +267,19 @@ pub struct RawCatalog {
     pub permissions: Vec<RawPermission>,
 }
 
-/// The result of a pull: the schema, plus everything that could not be said.
-#[derive(Debug, Clone)]
-pub struct Pulled {
-    pub schema: Schema,
-    /// Facts about the database the model cannot express. Never empty silence:
-    /// the caller must show these, because each one is a difference that would
-    /// otherwise surface as phantom drift or a destructive plan later.
-    pub warnings: Vec<String>,
-    /// Permissions the model cannot hold and a drift check must not call
-    /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
-    /// permission outside the closed set, a grant on an object the model does
-    /// not hold: each is left out of the role's set — folded in or merely
-    /// warned about, `verify` compared the sets that remained equal and said
-    /// "no drift" about a role that had changed — and reported here for the
-    /// caller to put beside the other unexpressible differences
-    /// (DECISIONS 95, 97).
-    pub unexpressible: Vec<Unexpressible>,
-    /// Unsupported facts associated with a table. Callers use the parent name
-    /// to distinguish a limitation inside the managed set (unexpressible
-    /// drift) from one on somebody else's table.
-    ///
-    /// The same argument as `unexpressible` above, on the other half of the
-    /// model: one is about a role's permissions, the other about a table's
-    /// features, and neither may be folded into the comparison or dropped
-    /// from it.
-    pub limitations: Vec<IntrospectionLimitation>,
-    /// Modules the database has that pbps cannot manage: a CLR object, one
-    /// created `WITH ENCRYPTION`, or one whose stored text does not have the
-    /// shape the emitter can reproduce.
-    ///
-    /// Separate from `warnings` because these are not defects in the pull —
-    /// they are an inventory of what is left alone, and the user needs the
-    /// count and the names.
-    pub unmanaged_modules: Vec<UnmanagedModule>,
-}
-
-/// One permission the model cannot hold, and enough about it for the caller
-/// to decide whether it is any of this project's business.
-///
-/// The securable travels with it. Filtered by role alone, a `DENY` or a
-/// column-level grant on somebody else's table stopped every command — while
-/// the *plain* grant on that same table was dropped by `scope`, whose recorded
-/// reason is that it is that table's business (DECISIONS 176).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unexpressible {
-    pub role: String,
-    /// The securable, where the permission names one a declaration could.
-    /// `None` for a permission on the database itself and for a class the
-    /// model cannot name at all — neither is any object's business, and a
-    /// role that gained one has changed (DECISIONS 105).
-    pub target: Option<pbps_model::GrantTarget>,
-    /// The difference, already rendered.
-    pub what: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntrospectionLimitation {
-    pub table: TableName,
-    pub detail: String,
-}
-
 fn push_limitation(
     warnings: &mut Vec<String>,
-    limitations: &mut Vec<IntrospectionLimitation>,
+    limitations: &mut Vec<Limitation>,
     table: Option<&TableName>,
     detail: String,
 ) {
     warnings.push(detail.clone());
     if let Some(table) = table {
-        limitations.push(IntrospectionLimitation {
-            table: table.clone(),
+        limitations.push(Limitation {
+            target: LimitationTarget::Relation(table.clone()),
             detail,
         });
     }
-}
-
-/// One module the database has and `pbps` does not manage.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct UnmanagedModule {
-    pub kind: &'static str,
-    /// Kept structured because a legal quoted identifier can itself contain a
-    /// period. Formatting and parsing it again would turn `[audit.v1]` into an
-    /// apparent third name component and silently lose the inventory entry.
-    pub name: ObjectName,
-    /// Why it is not managed, in the operator's words.
-    pub why: String,
 }
 
 /// Splits a stored definition back into the body a declaration carries.
@@ -1609,7 +1541,8 @@ mod tests {
         assert!(
             p.limitations
                 .iter()
-                .all(|limitation| limitation.table == TableName::new("dbo", "customer"))
+                .all(|limitation| limitation.target.object_name()
+                    == TableName::new("dbo", "customer"))
         );
         assert!(p.warnings[0].contains("computed"), "{:?}", p.warnings);
         assert!(p.warnings[1].contains("my_udt"), "{:?}", p.warnings);
@@ -1633,7 +1566,10 @@ mod tests {
         };
         let p = assemble(&raw);
         assert!(p.schema.tables.is_empty());
-        assert_eq!(p.limitations[0].table, TableName::new("dbo", "shapes"));
+        assert_eq!(
+            p.limitations[0].target.object_name(),
+            TableName::new("dbo", "shapes")
+        );
         assert!(
             p.warnings.iter().any(|w| w.contains("whole table")),
             "{:?}",
@@ -1756,7 +1692,7 @@ mod tests {
         assert_eq!(
             p.limitations
                 .iter()
-                .map(|limitation| limitation.table.clone())
+                .map(|limitation| limitation.target.object_name())
                 .collect::<Vec<_>>(),
             [
                 TableName::new("dbo", "customer"),

@@ -8772,3 +8772,282 @@ SPEC is in sync with all of these.
     this code's concern is the catalog state before the plan begins. This is
     the SQL Server instance of DECISIONS 407; unlike PostgreSQL's loud missing-
     name error, SQL Server's NULL lookup made the wrong answer look clean.
+
+417. **The connected seam is a `match` on the connection's driver in
+    `pbps-cli`, and the answers it routes are `pbps-db`'s types.** Step 10 of
+    Phase 5 (#85) had to remove `dialect()`'s refusal of `postgres`, and the
+    refusal was the least of it: `pbps-cli` named `pbps_mssql` at every
+    connected call site — the ledger, the catalog, the rename impact, the
+    edition, `doctor`'s permission read — 206 times, so the CLI *was* the SQL
+    Server implementation with a `Dialect` bolted on for the pure half. Two
+    shapes were weighed for the seam.
+
+    A trait in `pbps-dialect` was the obvious one and is not possible:
+    `pbps-db` already depends on `pbps-dialect` for `TransactionFraming`
+    (ADR-0014 §2), so a trait method taking a `Conn` is a dependency cycle.
+    And it would have bound the pure half — `validate`, offline `plan`, which
+    take only `pbps-dialect` — to the connection crate, for the benefit of the
+    other half. The engines therefore keep their connected work as free
+    `async fn`s over `pbps_db::Conn`, as ARCHITECTURE already said, and the
+    CLI's `engine` module routes to them: one function per question, an
+    exhaustive `match` on `Conn::driver()` in each, native `async fn` with no
+    `dyn` and no new dependency. A third engine is a compile error in every
+    one of those functions until it has an answer for each, which is the same
+    completeness a trait gives, in the place the engine's author would look.
+
+    **The types moved to `pbps-db`, beside the ledger's, for the reason the
+    ledger's are there** ("one definition each, filled by whichever engine").
+    `Pulled`, `Unexpressible`, `Limitation`, `UnmanagedModule`, `Catalogued`,
+    `Misspelt`, `Spellings`, `RowsError`, `RenameTarget`, `Referrer`,
+    `ImpactReport`, `ImpactError`, `GrantTargets`, `DataDemand` and the
+    `doctor::Ask` were each defined twice, and the pairs had drifted:
+
+    ```text
+    Pulled          mssql +unmanaged_modules       pg +limitations (both now)
+    Catalogued      pg +key_collation
+    RenameTarget    mssql +Module
+    ImpactReport    pg +carried
+    Spellings       mssql Vec<RowConflict>         pg Vec<String>
+    Limitation      mssql IntrospectionLimitation  pg Limitation
+    ```
+
+    Each is one struct now, with the union of fields, and every field one
+    engine never fills says so on the field — `unmanaged_modules` is empty
+    from PostgreSQL because that pull *leaves out* what it cannot hold and says
+    so in `warnings`, `carried` is empty from SQL Server because text carries
+    nothing, `Module` is never built by PostgreSQL's target builder and is
+    refused by name by its `rename_impact`. They could not have gone to
+    `pbps-dialect`: `RowsError` and `ImpactError` wrap a `DbError`, and the
+    same cycle applies. Each engine re-exports them under its old paths, so
+    its own code and tests did not move.
+
+    What stayed with the engine is what only the engine can spell: `Held`,
+    `Gap` and `Securable` (a gap's securable is rendered in that engine's
+    `GRANT` spelling, `OBJECT::[dbo].[t]` against `TABLE "app"."t"`, so the
+    seam hands the CLI the rendered text), the rename-target builder (only
+    SQL Server asks the drop side of a module rename through the impact query;
+    PostgreSQL answers it in `modules`), `truncate_reason` (UTF-16 units on
+    one, characters on the other), and PostgreSQL's `key_collations`, which
+    its `misspelt` now reads itself rather than trusting a caller to have
+    asked — the collation is the one input to the spelling check that is the
+    catalog's, and a caller that forgot it got the database default without a
+    word (DECISIONS 148).
+
+    **An engine-only question is answered by name on the other engine, never
+    with an empty answer.** `capabilities` on PostgreSQL is a fact —
+    `edition: None` means one edition, `supports_online: true` because every
+    release the emitter targets builds an index `CONCURRENTLY` — and a read
+    that failed is the `Err`, so `doctor` cannot confuse the two.
+    `edition_verdict` refuses nothing there for the same reason. The four role
+    questions (`names_alike`, `principals_holding`, `role_members`,
+    `role_owned_securables`) *refuse* on PostgreSQL, citing 211: each exists
+    to clear a `CREATE ROLE`, `RENAME ROLE` or `DROP ROLE` that dialect never
+    plans, so an answer would be one to a question nobody asked, and "none"
+    would be the empty answer this tool refuses everywhere else. The schema
+    spelling question (142) got a PostgreSQL implementation because it *can*
+    be asked there honestly: a quoted identifier is compared byte for byte, so
+    `App` and `app` are two schemas and never two spellings, and the query
+    answers presence — measured, the present name comes back as itself, the
+    upper-cased one as absent.
+
+    What the seam taught, recorded here because the third engine will read
+    this before any code (SPEC §12): the `pbps_mssql` rename-target builder
+    never received 407's table-name mapping, so on that engine a column rename
+    on a table the same plan renames is asked about under a name the catalog
+    does not have yet, and `OBJECT_ID` answers NULL — an empty impact report
+    for a rename that has referrers. That mapping landed separately in 416
+    and is preserved in the engine's `rename_targets` function here.
+    PostgreSQL's pull keeps no
+    unmanaged-module inventory, so an object it leaves out is invisible to
+    `unmanaged: error` as well as to the plan; PostgreSQL's `doctor` does not
+    yet ask about the rights a `data:` block or a `role:` grant needs, and the
+    seam hands them over so that the day it does no caller changes; and the
+    PostgreSQL-only connected checks initially left unwired — `roles::missing_roles`,
+    `rename_evidence`, `drop_blockers`, `unsupported_permissions`,
+    `modules::before_a_rebuild` — were reached only by that crate's live suite.
+    Follow-ups track them; the review fixes in 419–420 wire role-rename
+    evidence and module rebuild checks into the CLI. The first thing the seam
+    taught that *was* this step is 418: the first end-to-end `bootstrap` on
+    PostgreSQL was refused by the engine's own pull, and the CLI now says
+    where each catalog read runs.
+
+418. **The apply's read-back on PostgreSQL runs inside the apply transaction
+    under a savepoint, and the command says which kind of read it wants.** 147
+    puts the read-back and the ledger record inside the transaction that
+    built what they record, and 253 makes the pull refuse to run inside a
+    caller's transaction. Both are right, and together they refused every
+    `bootstrap` and `apply` on PostgreSQL through the binary — the first
+    end-to-end run through the seam of 417 ended in `this connection already
+    has an open transaction, and a pull cannot run inside one`. SQL Server
+    never asked the question: its catalog reads the same inside and outside
+    a transaction, so the CLI had never had to say.
+
+    The resolution is two entry points, not a flag on the pull, and a `Read`
+    the command names at every catalog read: `Snapshot`, the pull of 250,
+    which takes its own `REPEATABLE READ READ ONLY` transaction and keeps
+    refusing inside anybody else's; and `InsideOwnTransaction`, which
+    *requires* an open transaction and reads under a savepoint. They answer
+    different questions — "what does the database look like" against "what
+    did this transaction build" — and 253's point stands: the second is not
+    an accommodation of the first, and a caller that asks it outside a
+    transaction is refused by name, because "nothing uncommitted to see" is
+    the first question's answer and not this one's. The CLI passes
+    `InsideOwnTransaction` at exactly two sites, the read-backs of
+    `bootstrap` and `apply`, and `Snapshot` everywhere else, including the
+    baseline read the apply takes *before* its transaction opens.
+
+    Measured on 18.6: the savepoint carries `SET LOCAL transaction_read_only
+    = on`, and a `CREATE TABLE` under it fails with SQLSTATE 25006; after
+    `ROLLBACK TO SAVEPOINT` the caller's transaction is writable again, its
+    `search_path` is what the caller set, `transaction_read_only` is `off`,
+    and `txid_current_if_assigned()` is still non-null — the read left
+    nothing behind and ended nothing. The canonical settings 250 and 254 pin
+    are `set_config(…, is_local)` and go back with the savepoint, which is why
+    the savepoint is rolled back on the success path too: a read has nothing
+    to keep and everything it set has to go. The read sees the transaction's
+    own uncommitted `CREATE TABLE` and the row it inserted, which is the
+    whole reason it exists. Reverting the CLI's two `InsideOwnTransaction`
+    sites to `Snapshot` brings the original refusal back in both flow tests.
+
+419. **A completed cluster role rename changes the connected baseline's names,
+    before its drift gate.** 377's four-state evidence now runs through the
+    CLI seam. The old and new names are paired only by the reviewed role UID;
+    only old-gone/new-present passes. The planner scopes the catalog under
+    those new names and the checkout-free apply repeats that projection from
+    the ledger and the plan's pinned ids. Neither alters a cluster role.
+
+    Done cannot distinguish rename from drop-and-create, as 377 records. For
+    these roles the planner compares the actual grants with the declarations
+    and plans what is missing; it still refuses unexpressible grants and drift
+    on every other object. The actual grants participate in the saved baseline
+    checksum, so changes after planning still refuse at apply. Evidence is
+    checked again inside the transactional apply, before execution and before
+    recording. The staged baseline and its checkpoints use the same names.
+
+    A pure rename emits no SQL, but is not an empty deployment: its identity
+    mapping must reach the ledger or every later verify reports the old name
+    missing. An empty PostgreSQL plan carrying roles therefore connects and
+    checks under the deployment lock; it records only if the mapping moved.
+    Other empty plans keep their connection-free path. No plan or ledger format
+    change is needed: the approved plan already carries the final role UIDs.
+
+420. **PostgreSQL module rebuilds reach the carried-state check, on both sides
+    of the DDL.** The connected planner checks explicit alterations and
+    synthesized drop/create replacements in a transaction it rolls back. Apply
+    checks before dropping and after creating, inside the transaction that
+    also records the result. The second check catches an event trigger or new
+    default privilege that changes what the new object carries. Every carried
+    item still refuses under ADR-0009 §3; grant restoration remains #248.
+    A staged rebuild refuses because its checkpoints cannot preserve the
+    check/lock/DDL transaction. Ordinary module drops are not rebuilds.
+
+    The successful live rebuild also exposed a false refusal: its PostgreSQL
+    deparsed definition differed from the declaration, and 160's comparison
+    assumed SQL Server's preserved text. The pure dialect now answers whether
+    a read-back matches a written module. PostgreSQL checks kind and existence,
+    not deparsed text or repository descriptions (SPEC §7.6's explicit limit);
+    SQL Server keeps its exact comparison. Untouched modules still compare two
+    catalog reads exactly. This does not claim to detect another writer's
+    change to the text of a module this plan itself writes.
+
+421. **An identity-only PostgreSQL deployment includes role additions and
+    removals, not only renames.** 419's rename-only condition left an added
+    grantless role outside the ledger forever: apply called it empty, and
+    verify never watched the newly declared role. Removing the last such role
+    has the same problem with an empty final role map. Every empty PostgreSQL
+    plan therefore checks the role mapping under the deployment lock, and
+    records a read-back when it changed. SQL Server retains its empty fast path.
+
+    A newly managed role's actual grants participate in both the connected
+    diff and its pinned baseline, even before the UID is in the ledger. Missing
+    roles refuse, extra grants can be planned away, and a grant changed after
+    planning invalidates the checksum. The drift gate still compares all
+    previously managed objects. At the read-back a removed cluster role is
+    outside the managed set, as its declaration requests; it is not dropped
+    from the cluster. Staged checkpoints adopt the same final role scope.
+
+422. **Rebinding is part of the typed diff, before ordering and approval.**
+    The connected seam reached the carried-state guard but not the pure
+    `modules::rebound_by_this_plan` rule (307). Measured through the CLI:
+    a parsed caller of `f(1)` stayed bound to `f(bigint)` after a plan added
+    `f(integer)`; apply recorded success and verify was clean.
+
+    The pure dialect trait now supplies the unchanged modules to rebuild for
+    arriving module names, new table names, and table-rename destinations.
+    PostgreSQL uses the existing write-path/name scan; the default adds none.
+    The differ deduplicates those modules and adds ordinary `AlterModule`
+    changes before risk classification and dependency ordering. Offline and
+    connected plans therefore agree on the rebuild, and the approved plan
+    carries it through the existing transactional carried-state checks. No
+    SQL or new state field is added outside the dialect's existing emitter.
+
+    A live CLI regression observes the new overload's result in the same
+    apply, no repeated rebuild on the next plan, and refusal for carried
+    comments or staged execution. Removing the diff integration restores the
+    old runtime binding despite a successful apply. The prior engine test
+    retains that bad middle state by deliberately omitting the synthesized
+    alteration, then executes the alteration from the actual typed plan.
+
+423. **A transactional PostgreSQL catalog read has one statement snapshot
+    and its managed recording is revalidated.** The caller remains READ
+    COMMITTED so a closing read sees concurrent commits and its own DDL.
+    A savepoint does not give separate catalog queries a common snapshot: a
+    constraint committed after its query could be absent from a successful
+    recording. All catalog relations now travel in one UNION ALL statement,
+    as checked JSON row batches decoded into the existing catalog model.
+    This is internal transport; declarations and saved plans do not change.
+
+    Before bootstrap or transactional apply records the result, the CLI
+    captures the managed schema and rows again. A changed managed projection
+    refuses rather than recording an unstable view (SPEC §7.6). Unmanaged
+    inventory is excluded under §8.2, and both captures reject unsupported
+    managed facts. This is optimistic revalidation, not a lock on arbitrary
+    DDL after the last observation. Owned reads retain their read-only framing;
+    the shared framing also protects multi-statement row reads.
+
+    A live two-connection regression commits a CHECK on an untouched managed
+    table between captures and observes refusal, then commits unrelated
+    unmanaged DDL and observes acceptance. It also proves the reader sees
+    its own uncommitted table, preserves the caller transaction, and rolls
+    that table back while the independent writer's constraint remains.
+
+424. **Read absent PostgreSQL constraint flags under their older semantics.**
+    `conenforced` and `conperiod` arrived in PostgreSQL 18. Direct column
+    references made every catalog-backed CLI command fail on PostgreSQL 16,
+    including an otherwise valid bootstrap. Looking them up in the catalog
+    row's JSON representation keeps one query across these versions: an
+    absent enforcement flag means enforced, and an absent period flag means
+    non-temporal. PostgreSQL 18 still supplies its actual flags, so unsupported
+    NOT ENFORCED and temporal constraints remain refusals.
+
+    The ordinary CLI deployment loop now also runs on the pinned PostgreSQL
+    16 server: bootstrap, connected plan, apply, clean verify, and ledger
+    entries. A manually added CHECK must then appear as drift on both
+    versions. Removing the compatible lookup makes the older-server test
+    fail at bootstrap. This measures that path, not every feature on every
+    PostgreSQL release; the separate permission-version preflight remains
+    deferred in #321.
+
+425. **An introspection limitation keeps its object's namespace.** A
+    PostgreSQL aggregate called `app.t(bigint)` is not a defect of the table
+    `app.t` or of the routine `app.t(integer)`. Storing every limitation under
+    a `TableName` made connected plans and recorders refuse those valid
+    managed objects. The connected catalog result now carries a relation
+    target, a structured module identity, or an unnameable module diagnostic.
+    Relations share the table/view namespace; routines retain argument types
+    and triggers retain their parent. A declaration cannot name an unnameable
+    identity, so that diagnostic is not assigned to another same-named object.
+
+    Both PostgreSQL catalog exclusions and pure module assembly preserve the
+    target, and the CLI matches it against the corresponding managed scope.
+    SQL Server table limitations keep their relation targets and its existing
+    unreadable-module inventory keeps its separate handling. No saved schema
+    or plan format changes; the target belongs to the connected read result.
+
+    The live regression keeps a managed table and routine beside an unmanaged
+    aggregate overload: plan, snapshot, baseline and verify succeed. Making
+    the table UNLOGGED still refuses, as does replacing the exact managed
+    routine signature with an aggregate. Reverting to a name-only table
+    filter restores the false refusal. The broader unmanaged module inventory
+    work remains #303; this change scopes limitations rather than completing
+    that policy integration.
