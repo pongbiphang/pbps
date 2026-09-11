@@ -872,6 +872,13 @@ mod tests {
     /// A connected loopback pair, so [`apply_socket_options`] has a real
     /// socket to act on without needing a live PostgreSQL server — these
     /// assertions are about what the OS did, not about the protocol.
+    ///
+    /// `#[cfg(target_os = "linux")]` for the same reason as its one caller,
+    /// `keepalive_settings_land_on_the_real_socket_not_only_the_parsed_config`
+    /// below: gated out on every other platform, so an ungated helper would
+    /// compile with no caller there and fail `-D warnings`' `dead_code` lint
+    /// (issue #113 review).
+    #[cfg(target_os = "linux")]
     async fn connected_pair() -> (TcpStream, tokio::net::TcpListener) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
