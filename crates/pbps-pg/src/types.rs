@@ -661,6 +661,14 @@ fn pow10(n: i64) -> Option<i128> {
     u32::try_from(n).ok().and_then(|n| 10_i128.checked_pow(n))
 }
 
+/// `5^n` as a magnitude, or `None` when it overflows an `i128`. Used only for
+/// `n >= 0` — [`exact_in_float`] never asks for a negative one — and kept
+/// `checked` for the same reason as [`pow10`]: `numeric`'s scale reaches
+/// -1000, and `5^1000` is nowhere near representable.
+fn pow5(n: i64) -> Option<i128> {
+    u32::try_from(n).ok().and_then(|n| 5_i128.checked_pow(n))
+}
+
 /// How many decimal digits `max` is written with, which is the `p - s` a
 /// `numeric` needs in order to hold every value up to it.
 fn digits10(max: i128) -> i64 {
@@ -707,13 +715,54 @@ fn exact_in_float(from: Exact, max_exact_int: i128) -> bool {
     match from {
         Exact::Integer { max } => max <= max_exact_int,
         // A decimal fraction is not a binary fraction, so a positive scale is
-        // out. What is left is whole numbers, and they have to fit below the
-        // mantissa's first gap. `NaN` and infinity pass through unchanged
-        // (measured), so neither is a reason to refuse this one.
-        Exact::Numeric { int_digits, scale } => {
-            scale.is_some_and(|s| s <= 0)
-                && int_digits.is_some_and(|d| pow10(d).is_some_and(|p| p - 1 <= max_exact_int))
+        // out.
+        //
+        // A scale of zero or below is not "whole numbers below the mantissa's
+        // first gap" — that was the magnitude alone, and it is wrong: a
+        // `numeric(p, s)` with `s <= 0` holds `m * 10^|s|` for `|m| < 10^p`,
+        // and `10^|s| = 2^|s| * 5^|s|`. The `2^|s|` half is free — a binary
+        // float's exponent carries any power of two at no mantissa cost — so
+        // what has to fit in the mantissa is `m * 5^|s|`, not `m * 10^|s|`.
+        // Judging by magnitude alone refused `numeric(1,-7) -> real`: its
+        // largest value, `90000000`, is above `max_exact_int` (2^24), but
+        // every one of its ten possible values is exactly representable —
+        // measured on 18.6, `SELECT bool_and((k*10000000)::numeric(1,-7)
+        // ::real::double precision = (k*10000000)::double precision) FROM
+        // generate_series(-9,9) k` is `t` (#138).
+        //
+        // The worst-case `m` is always `10^p - 1`: it is the largest
+        // magnitude `p` digits reach, and `10^p` is even (10 is), so
+        // `10^p - 1` is odd — it carries no factor of two of its own to trade
+        // against `5^|s|`, so no smaller `m` ever demands more mantissa than
+        // it does.
+        //
+        // No separate check against the float's own exponent range is
+        // needed. `max_exact_int` is at most 2^53, and `pow10`/`pow5` below
+        // are checked against `i128` (~1.7e38) rather than against where the
+        // engine actually overflows (~3.4e38 for `real`, far larger for
+        // `double precision`) — so an `i128` overflow already refuses
+        // everything anywhere near where overflow could matter, well short of
+        // the engine's own threshold. And short of that overflow, the
+        // mantissa test is always the tighter one: measured by exhaustive
+        // search over `p` and `|s|`, the largest total magnitude that can
+        // still pass it at all is `numeric(3,-6)`'s `999000000` for `real`
+        // and of the same shape, many orders of magnitude smaller than either
+        // float's overflow point, for `double precision`.
+        //
+        // `NaN` and infinity pass through unchanged (measured), so neither is
+        // a reason to refuse this one.
+        Exact::Numeric {
+            int_digits: Some(digits),
+            scale: Some(s),
+        } if s <= 0 => {
+            let precision = digits + s;
+            let e = -s;
+            pow10(precision)
+                .zip(pow5(e))
+                .and_then(|(m_max, p5)| (m_max - 1).checked_mul(p5))
+                .is_some_and(|mantissa_demand| mantissa_demand <= max_exact_int)
         }
+        Exact::Numeric { .. } => false,
     }
 }
 
@@ -2979,6 +3028,15 @@ mod tests {
             // `9007199254740990`.
             ("integer", "real"),
             ("bigint", "double precision"),
+            // `numeric(9,-7)`'s largest magnitude, `999999999 * 10^7`, needs
+            // more mantissa than `real` has even after the free `2^7`
+            // (#138). `numeric(1,-9)` is the tight boundary one step past
+            // `numeric(1,-8)` below: `9 * 5^9` is `17578125`, one step over
+            // `real`'s `2^24`. And `numeric(1,-22)` is the same boundary one
+            // step past `double precision`'s own, below.
+            ("numeric(9,-7)", "real"),
+            ("numeric(1,-9)", "real"),
+            ("numeric(1,-22)", "double precision"),
         ] {
             assert_eq!(
                 risk(from, to),
@@ -2992,6 +3050,19 @@ mod tests {
             ("integer", "double precision"),
             ("smallint", "double precision"),
             ("real", "double precision"),
+            // A negative scale is not "round to a whole number and then
+            // judge the magnitude" — `numeric(1,-7)` holds `k * 10^7` for
+            // `k` in `-9..=9`, and every one of those ten values is exactly
+            // representable even though the largest, `90000000`, is above
+            // `real`'s `2^24` (#138, measured on 18.6 and in the live
+            // suite's `a_change_the_dialect_calls_safe_neither_fails_nor_
+            // alters_a_value`). `numeric(1,-8)` is the tight boundary: its
+            // mantissa demand, `9 * 5^8 = 3515625`, is the largest that still
+            // fits under `2^24`. `numeric(1,-21)` is the same boundary for
+            // `double precision`'s `2^53`.
+            ("numeric(1,-7)", "real"),
+            ("numeric(1,-8)", "real"),
+            ("numeric(1,-21)", "double precision"),
         ] {
             assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
         }

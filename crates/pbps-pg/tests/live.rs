@@ -852,6 +852,19 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         ("numeric(5,0)", "real", "99999"),
         ("bigint", "double precision", "9007199254740993"),
         ("integer", "double precision", "2147483647"),
+        // A negative scale is not "round to a whole number and judge the
+        // magnitude" (#138): `numeric(1,-7)`'s largest value, `90000000`, is
+        // above `real`'s `2^24`, and every one of its ten values is exactly
+        // representable regardless. `numeric(1,-8)` is the tight boundary —
+        // its mantissa demand, `9 * 5^8`, is the largest that still fits —
+        // and `numeric(1,-21)` is the same boundary for `double precision`.
+        ("numeric(1,-7)", "real", "90000000"),
+        ("numeric(1,-8)", "real", "900000000"),
+        (
+            "numeric(1,-21)",
+            "double precision",
+            "9000000000000000000000",
+        ),
         // A `time` into an `interval` at both ends of the day and at the last
         // microsecond, and into the precision that rounds it away.
         ("time", "interval", "'24:00:00'"),
@@ -894,8 +907,21 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
             .execute(&format!("ALTER TABLE {table} ALTER COLUMN c TYPE {to}"))
             .await
             .is_ok();
+        // `real`'s own shortest round-trip text only promises to re-parse to
+        // the same bits **at `real`'s own precision**: measured, a `real`
+        // that actually holds `8999999488` (a value `numeric(1,-9) -> real`
+        // rounds to) still prints `9e+09`, because that is shorter and still
+        // parses back to the same `real`. Widening through `double
+        // precision` first is an exact bit-widening, never a reparse, so
+        // what comes back is the value the column truly holds rather than a
+        // shorter decimal that merely shares its `real` rounding (#138).
+        let read_as = if to == "real" {
+            "c::double precision::text"
+        } else {
+            "c::text"
+        };
         let after = if altered {
-            Some(text(&mut conn, &format!("SELECT c::text FROM {table}")).await)
+            Some(text(&mut conn, &format!("SELECT {read_as} FROM {table}")).await)
         } else {
             None
         };
@@ -908,10 +934,28 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         if Postgres::new().type_change_risk(&normalize(from), &normalize(to))
             == TypeChangeRisk::Safe
         {
-            assert_eq!(
-                after.as_deref(),
-                Some(before.as_str()),
-                "`{from}` -> `{to}` is called Safe, and `{value}` did not survive it"
+            // A binary float target is compared as the number its text
+            // spells, not as the characters: the same exact value may be
+            // spelled `90000000` coming from `numeric` and `9e+07` coming
+            // back out of `real` or `double precision`, since both engine
+            // printers choose whichever is shorter. Every other target in
+            // this matrix keeps the literal comparison, where a spelling
+            // change **is** the finding (padding, a rendered date, a decimal
+            // point moving).
+            let survived = match (to, after.as_deref()) {
+                ("real" | "double precision", Some(after)) => {
+                    match (before.parse::<f64>(), after.parse::<f64>()) {
+                        (Ok(b), Ok(a)) => b == a,
+                        _ => false,
+                    }
+                }
+                (_, Some(after)) => after == before,
+                (_, None) => false,
+            };
+            assert!(
+                survived,
+                "`{from}` -> `{to}` is called Safe, and `{value}` did not survive it \
+                 (before {before:?}, after {after:?})"
             );
         }
     }
