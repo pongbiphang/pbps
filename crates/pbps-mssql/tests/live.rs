@@ -963,7 +963,10 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
     let mut db = TestDb::create("temporal").await;
     db.conn
         .execute(
-            "CREATE TABLE dbo.plain (id int NOT NULL);
+            "CREATE TABLE dbo.plain (
+             id int NOT NULL,
+             versioned_id int NULL
+         );
          CREATE TABLE dbo.versioned (
              id int NOT NULL PRIMARY KEY,
              valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
@@ -976,7 +979,9 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
              valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
              PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
          ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.disabled_history));
-         ALTER TABLE dbo.disabled SET (SYSTEM_VERSIONING = OFF);",
+         ALTER TABLE dbo.disabled SET (SYSTEM_VERSIONING = OFF);
+         ALTER TABLE dbo.plain ADD CONSTRAINT fk_plain_versioned
+             FOREIGN KEY (versioned_id) REFERENCES dbo.versioned(id);",
         )
         .await
         .expect("create temporal table and history");
@@ -1006,7 +1011,7 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .tables
             .contains_key(&TableName::new("dbo", "disabled_history"))
     );
-    assert_eq!(pulled.limitations.len(), 4);
+    assert_eq!(pulled.limitations.len(), 5);
     assert_eq!(pulled.schema.modules.len(), 1);
     assert!(
         pulled
@@ -1035,6 +1040,16 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         limitation.target.object_name() == TableName::new("dbo", "disabled")
             && limitation.detail.contains("PERIOD FOR SYSTEM_TIME")
     }));
+    assert!(pulled.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == TableName::new("dbo", "plain")
+            && limitation.detail.contains("fk_plain_versioned")
+            && limitation.detail.contains("dbo.versioned")
+    }));
+    assert!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")]
+            .foreign_keys
+            .is_empty()
+    );
 }
 
 /// A columnstore or XML index has the same catalog shape as a rowstore one and

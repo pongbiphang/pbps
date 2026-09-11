@@ -715,10 +715,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
     }
 
+    let mut unsupported_temporal_foreign_keys = BTreeSet::new();
     for f in &raw.foreign_key_columns {
-        let Some(table) = tables.get_mut(&f.object_id) else {
+        if !tables.contains_key(&f.object_id) {
             continue;
-        };
+        }
+        let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
+        if unsupported_temporal_tables.contains(&referenced) {
+            if unsupported_temporal_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
+                let table_name = name_of(f.object_id, &names);
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&f.object_id),
+                    format!(
+                        "{table_name}: foreign key `{}` references temporal table {referenced}, which is outside the declarations; the foreign key was left out too",
+                        f.constraint_name
+                    ),
+                );
+            }
+            continue;
+        }
+        let table = tables.get_mut(&f.object_id).unwrap();
         let fk = table
             .foreign_keys
             .entry(f.constraint_name.clone())
@@ -1708,6 +1726,37 @@ mod tests {
         assert_eq!(fk.references_columns, ["cid", "cemail"]);
         assert_eq!(fk.on_delete, ReferentialAction::Cascade);
         assert_eq!(fk.on_update, ReferentialAction::NoAction);
+    }
+
+    #[test]
+    fn a_foreign_key_to_a_temporal_table_is_reported_instead_of_declared() {
+        let mut raw = one_table_catalog();
+        let mut temporal = raw_table(11, "dbo", "versioned");
+        temporal.temporal_type = 2;
+        raw.tables.push(temporal);
+        raw.foreign_key_columns.push(RawForeignKeyColumn {
+            object_id: 10,
+            constraint_name: "fk_customer_versioned".into(),
+            ref_schema: "dbo".into(),
+            ref_table: "versioned".into(),
+            column: "id".into(),
+            ref_column: "id".into(),
+            on_delete: 0,
+            on_update: 0,
+        });
+
+        let pulled = assemble(&raw);
+
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "customer")]
+                .foreign_keys
+                .is_empty()
+        );
+        assert!(pulled.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == TableName::new("dbo", "customer")
+                && limitation.detail.contains("fk_customer_versioned")
+                && limitation.detail.contains("dbo.versioned")
+        }));
     }
 
     #[test]
