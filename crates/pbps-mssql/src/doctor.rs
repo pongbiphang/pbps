@@ -933,6 +933,17 @@ async fn object_permissions(
 /// exist for "cannot safely say" — not a false acceptance, which is what
 /// this whole function exists to rule out (AGENTS.md: when the answer is
 /// not clearly no, it is yes).
+///
+/// This does **not** cover every collation. `to_lowercase` folds case and
+/// nothing else: an accent-insensitive collation (`_AI`, e.g.
+/// `SQL_Latin1_General_CP1_CI_AI`) reads `app.café` and `app.cafe` as one
+/// securable, and this comparison still keeps them apart, so the false
+/// acceptance this function exists to refuse is still reachable through
+/// that door. Width-insensitive (`_WS`) and Kanatype-sensitive collations
+/// are the same shape. The pinned image's default is `_AS`
+/// (accent-sensitive), which is why the live test measuring this passes —
+/// it is not evidence that every collation is covered. Filed as #384
+/// rather than reproduced here.
 fn resolve_for_query<'a>(
     wanted: impl Iterator<Item = &'a ObjectName>,
     project_ids: &pbps_model::IdsFile,
