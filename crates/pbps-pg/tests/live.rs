@@ -19914,3 +19914,118 @@ async fn a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data() {
 
     db.drop().await;
 }
+
+/// The most parameters one bound PostgreSQL statement may carry, measured
+/// against the pinned image rather than assumed from the protocol's own
+/// documentation of itself.
+///
+/// The extended protocol's Bind message writes the parameter count as an
+/// `int16`, so 65,535 is the largest count representable at all — unlike SQL
+/// Server's `sp_executesql`, there is no wrapper spending parameters of its
+/// own on overhead, so this ceiling is not adjusted down the way
+/// `pbps_mssql::doctor::MAX_PARAMETERS` is. A synthetic `VALUES (...)` table
+/// answered every probe with "error serializing parameter 0" regardless of
+/// count — no column exists yet for the driver to infer a type against, so
+/// it never reached the count check at all — which is why this binds against
+/// a real `bigint` column instead, the same shape `pbps_pg::state`'s legacy
+/// fallback actually uses.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_query_may_bind_the_most_parameters_the_extended_protocol_represents() {
+    let mut conn = connect().await;
+    conn.execute("CREATE TEMPORARY TABLE pbps_probe_t (id bigint)")
+        .await
+        .expect("create probe table");
+    let probe = |n: usize| {
+        let slots: Vec<String> = (1..=n).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "SELECT id FROM pbps_probe_t WHERE id IN ({})",
+            slots.join(", ")
+        );
+        let params: Vec<pbps_db::Param<'static>> =
+            (0..n).map(|_| pbps_db::Param::from(1_i64)).collect();
+        (sql, params)
+    };
+    let (sql, params) = probe(65535);
+    conn.query_with(&sql, &params)
+        .await
+        .expect("65,535 bound parameters are accepted");
+    let (sql, params) = probe(65536);
+    conn.query_with(&sql, &params)
+        .await
+        .err()
+        .expect("65,536 are refused — the count no longer fits in the protocol's own field");
+}
+
+/// Round-2 review finding on #103's own PR, mirroring mssql's
+/// `the_legacy_fallback_batches_past_sql_servers_parameter_ceiling`: more
+/// legacy rows than one bound statement may carry, on a ledger `ensure_tables`
+/// has never touched, and `timeline` must still answer every one of them.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_legacy_fallback_batches_past_postgresqls_parameter_ceiling() {
+    let mut db = TestDb::create("manylegacy103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+
+    // One row's worth of `state_json`, reused for every row: this test is
+    // about the count of legacy ids the fallback has to ask for, not about
+    // what each row's recorded state says.
+    let schema = schema_103(2, 1);
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = StateSnapshot::new(
+        StateKind::Apply,
+        schema.clone(),
+        ids,
+        "bulk-legacy-operator",
+    );
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+
+    // More than the extended protocol's 65,535-parameter ceiling, so the
+    // setup itself is inserted in chunks well under that same ceiling (one
+    // bound parameter per row here) — this loop is not what the test is
+    // about, and must not trip the very limit the assertion below exists to
+    // cross.
+    const ROWS: usize = 65_600;
+    const INSERT_CHUNK: usize = 1000;
+    let mut inserted = 0;
+    while inserted < ROWS {
+        let chunk = INSERT_CHUNK.min(ROWS - inserted);
+        let mut sql = String::from(
+            "INSERT INTO public.__pbps_state \
+             (kind, git_sha, plan_checksum, state_json, operator, reason) VALUES ",
+        );
+        let mut params: Vec<pbps_db::Param<'_>> = Vec::with_capacity(chunk);
+        for i in 0..chunk {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let p = i + 1;
+            sql.push_str(&format!(
+                "('apply', NULL, NULL, ${p}, 'bulk-legacy-operator', NULL)"
+            ));
+            params.push(legacy_json.as_str().into());
+        }
+        sql.push(';');
+        db.conn
+            .execute_with(&sql, &params)
+            .await
+            .expect("bulk-insert a chunk of legacy rows");
+        inserted += chunk;
+    }
+
+    // No `ensure_tables` call: every one of these rows is legacy on a table
+    // that has never been migrated, exactly like the case above.
+    let rows = state::timeline(&mut db.conn, ROWS as u32)
+        .await
+        .expect("state list must succeed past the parameter ceiling, batched or not");
+    assert_eq!(rows.len(), ROWS);
+    assert!(
+        rows.iter().all(|r| r.state.is_ok()),
+        "every legacy row must parse, not just the ones inside one batch"
+    );
+
+    db.drop().await;
+}

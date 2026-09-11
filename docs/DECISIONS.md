@@ -9452,15 +9452,24 @@ SPEC is in sync with all of these.
     (the shape AGENTS.md asks for: prefer a failure unrepresentable over a
     branch that tests for it).
 
-    **The legacy fallback asks in pieces, not one statement.**
-    A third: `select_legacy_state_json` bound one parameter per legacy id
-    with no ceiling, and until a deployer runs a deployment after upgrading,
-    every row on a ledger is legacy — the normal case immediately after this
-    ships, not an exotic one. SQL Server refuses more than 2,098 user
-    parameters in one bound statement (`pbps_mssql::doctor::MAX_PARAMETERS`,
+    **The legacy fallback asks in pieces, not one statement, on both
+    dialects.** A third: `select_legacy_state_json` bound one parameter per
+    legacy id with no ceiling, and until a deployer runs a deployment after
+    upgrading, every row on a ledger is legacy — the normal case immediately
+    after this ships, not an exotic one. SQL Server refuses more than 2,098
+    user parameters in one bound statement (`pbps_mssql::doctor::MAX_PARAMETERS`,
     measured and already shared with the object-permission queries there);
-    `timeline`'s fallback now asks in chunks of that size. PostgreSQL has no
-    comparable ceiling for this shape and needed no change.
+    `timeline`'s fallback there now asks in chunks of that size. A round-2
+    review finding caught that the fix stopped one dialect short:
+    PostgreSQL's extended protocol writes a Bind message's parameter count as
+    an `int16`, so it has the same shape of ceiling, just a different number
+    — **measured** against the pinned image (`pbps_pg::state::MAX_PARAMETERS`,
+    the live test `a_query_may_bind_the_most_parameters_the_extended_protocol_represents`):
+    65,535 bound parameters succeed, 65,536 are refused with "error parsing
+    response from server". `pbps_pg::state::timeline`'s fallback now chunks
+    by that measured number too, the same shape as SQL Server's fix, one
+    dialect apart, with its own constant rather than the other engine's
+    2,098 — a different protocol, not a reused number.
 
     **A fourth `Unreadable` case, not a third `Malformed`.** A row a fallback
     query cannot read because a principal was denied `state_json` is neither a
@@ -9496,9 +9505,11 @@ SPEC is in sync with all of these.
     calls, never through `ensure_tables`; and a row a newer pbps wrote is
     `Unreadable::UnsupportedVersion` on the projected path exactly as an
     older pbps's JSON fallback already refuses it, beside the positive case
-    that a supported version is not refused. SQL Server also pins the
-    legacy fallback succeeding past its parameter ceiling. A unit test pins
-    a denied row rendering as denied, never as malformed and never with
-    tables/modules silently reading zero, and another pins the projected
-    path's version gate directly against `pbps_model::CURRENT_VERSION`/
-    `OLDEST_READABLE_VERSION`.
+    that a supported version is not refused. Both dialects also pin the
+    legacy fallback succeeding past their own measured parameter ceiling —
+    2,098 on SQL Server, 65,535 on PostgreSQL — each with a revert-and-watch-
+    fail cycle confirming the failure the fix removes names the protocol
+    limit, not something incidental. A unit test pins a denied row rendering
+    as denied, never as malformed and never with tables/modules silently
+    reading zero, and another pins the projected path's version gate
+    directly against `pbps_model::CURRENT_VERSION`/`OLDEST_READABLE_VERSION`.

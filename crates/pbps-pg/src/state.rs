@@ -247,6 +247,19 @@ fn select_timeline_unmigrated() -> String {
     )
 }
 
+/// The most parameters one bound statement may carry on this engine.
+///
+/// **Measured**, against the pinned image, not copied across from the other
+/// dialect's `pbps_mssql::doctor::MAX_PARAMETERS`: a different protocol, a
+/// different ceiling. PostgreSQL's extended protocol writes the Bind
+/// message's parameter count as an `int16`, so 65,535 bound parameters are
+/// accepted and 65,536 are refused (the live test
+/// `a_query_may_bind_the_most_parameters_the_extended_protocol_represents`)
+/// — unlike SQL Server's `sp_executesql` wrapper, nothing here spends
+/// parameters of its own first, so this number is not adjusted down the way
+/// the other dialect's is.
+const MAX_PARAMETERS: usize = 65535;
+
 /// `state_json` for exactly the rows [`timeline`] could not answer from the
 /// projected columns. Never sent when there are none, so the common case
 /// this issue exists to make cheap never runs it.
@@ -687,9 +700,18 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
         .collect();
     let mut legacy: std::collections::HashMap<i64, Result<TimelineState, Unreadable>> =
         std::collections::HashMap::new();
-    if !legacy_ids.is_empty() {
-        let sql = select_legacy_state_json(legacy_ids.len());
-        let params: Vec<Param<'_>> = legacy_ids.iter().map(|&id| id.into()).collect();
+    // In pieces of at most `MAX_PARAMETERS` ids, not one statement for every
+    // legacy id: this query binds one parameter per id, and until a deployer
+    // has run a deployment after upgrading, every row is legacy, so a
+    // long-lived ledger's ordinary `state list` is exactly the case that
+    // could reach the extended protocol's own parameter-count ceiling in a
+    // single request (a round-2 review finding on #103's own PR — the
+    // pre-#103 query needed only its `$1` limit parameter and had no such
+    // ceiling; the fix mirrors `pbps_mssql::state::timeline`'s identical
+    // chunking of the same shape, one dialect apart).
+    for chunk in legacy_ids.chunks(MAX_PARAMETERS) {
+        let sql = select_legacy_state_json(chunk.len());
+        let params: Vec<Param<'_>> = chunk.iter().map(|&id| id.into()).collect();
         match conn.query_with(&sql, &params).await {
             Ok(rows) => {
                 for row in &rows {
@@ -708,11 +730,12 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
             // never has, and DECISIONS 218's promise — a row this build
             // cannot read is carried, not thrown — extends to a row this
             // build was refused, not only one it could not parse (DECISIONS
-            // 433). Every legacy id in this batch shares one answer, because
-            // a permission denial is not sensitive to which row is read.
+            // 433). Every legacy id in this chunk shares one answer, because
+            // a permission denial is not sensitive to which row is read; a
+            // later chunk still asks for itself.
             Err(e) if is_select_denied(&e) => {
                 let denied = Err(Unreadable::Denied(e.to_string()));
-                for id in &legacy_ids {
+                for id in chunk {
                     legacy.insert(*id, denied.clone());
                 }
             }
