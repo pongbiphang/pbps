@@ -973,6 +973,14 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         )
         .await
         .expect("create temporal table and history");
+    for table in ["versioned", "plain"] {
+        db.conn
+            .execute(&format!(
+                "CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"
+            ))
+            .await
+            .expect("create trigger");
+    }
     let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect temporal catalog");
@@ -986,6 +994,23 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .contains_key(&TableName::new("dbo", "plain"))
     );
     assert_eq!(pulled.limitations.len(), 2);
+    assert_eq!(pulled.schema.modules.len(), 1);
+    assert!(
+        pulled
+            .schema
+            .modules
+            .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
+    );
+    assert_eq!(pulled.unmanaged_modules.len(), 1);
+    assert_eq!(
+        pulled.unmanaged_modules[0].target.object_name(),
+        TableName::new("dbo", "tr_versioned")
+    );
+    assert!(
+        pulled.unmanaged_modules[0]
+            .why
+            .contains("system versioning")
+    );
     for name in ["versioned", "versioned_history"] {
         assert!(
             pulled.limitations.iter().any(|l| {

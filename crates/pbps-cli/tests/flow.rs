@@ -1296,6 +1296,12 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
          ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
     );
     let d = Demo::new("temporal-pull");
+    for table in ["versioned", "plain"] {
+        on_server(
+            own.connection(),
+            &format!("CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"),
+        );
+    }
     let output = d.run(&["pull", "--db", own.connection()]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let warnings = stderr(&output);
@@ -1309,6 +1315,8 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
         assert!(!d.dir.join("schema").join(format!("{name}.yml")).exists());
     }
     assert!(d.dir.join("schema/dbo.plain.yml").is_file());
+    let validate = d.run(&["validate"]);
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
 // ---- pull (the paths that need no database) ----

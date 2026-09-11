@@ -600,12 +600,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
+    let mut temporal_tables = BTreeSet::new();
 
     for t in &raw.tables {
         // Both halves must stay unmanaged: declaring either as an ordinary
         // table loses the system-versioning relationship on bootstrap.
         if t.temporal_type != 0 {
             let name = TableName::new(t.schema.clone(), t.name.clone());
+            temporal_tables.insert(name.clone());
             push_limitation(
                 &mut warnings,
                 &mut limitations,
@@ -852,6 +854,18 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .as_ref()
             .map(|(s, t)| ObjectName::new(s.clone(), t.clone()))
             .or(on);
+
+        // A trigger declaration requires its parent in the managed schema.
+        // Keep the temporal table's dependent trigger in the same inventory
+        // instead of writing a declaration that validation cannot load.
+        if m.kind == ModuleKind::Trigger
+            && on
+                .as_ref()
+                .is_some_and(|parent| temporal_tables.contains(parent))
+        {
+            unmanageable("its parent table uses system versioning, which pbps cannot express");
+            continue;
+        }
 
         // The identity, which for a trigger is its table and its own name
         // (ADR-0009 §1). Nothing on this engine overloads, so no read-back
@@ -1924,6 +1938,49 @@ mod module_tests {
             Some("dbo.customer")
         );
         assert_eq!(m.definition, "AFTER INSERT AS SELECT 1;");
+    }
+
+    #[test]
+    fn a_trigger_on_a_temporal_table_is_inventoried_with_its_parent() {
+        let mut raw = raw_one_table();
+        let mut plain = raw.tables[0].clone();
+        plain.object_id = 2;
+        plain.name = "plain".into();
+        raw.tables.push(plain);
+        let mut column = raw.columns[0].clone();
+        column.object_id = 2;
+        raw.columns.push(column);
+        raw.tables[0].temporal_type = 2;
+        for table in ["t", "plain"] {
+            let mut trigger = module(
+                "dbo",
+                &format!("tr_{table}"),
+                ModuleKind::Trigger,
+                Some(&format!(
+                    "CREATE TRIGGER dbo.tr_{table} ON dbo.{table} AFTER INSERT AS SELECT 1;"
+                )),
+            );
+            trigger.parent = Some(("dbo".into(), table.into()));
+            raw.modules.push(trigger);
+        }
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.modules.len(), 1);
+        assert!(
+            pulled
+                .schema
+                .modules
+                .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
+        );
+        assert_eq!(pulled.unmanaged_modules.len(), 1);
+        assert_eq!(
+            pulled.unmanaged_modules[0].target.object_name(),
+            TableName::new("dbo", "tr_t")
+        );
+        assert!(
+            pulled.unmanaged_modules[0]
+                .why
+                .contains("system versioning")
+        );
     }
 
     /// A module whose definition cannot be read, or whose shape the emitter
