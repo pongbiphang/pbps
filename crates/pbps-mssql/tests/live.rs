@@ -3996,6 +3996,138 @@ async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
     db.drop().await;
 }
 
+/// The second door into the same collision, round 2's own review found
+/// (issue #133 round 3): a rename to `app.new_name` frees `app.Old_Name`,
+/// and the same plan declares a new `app.old_name` — three different Rust
+/// strings. Measured directly here rather than assumed: this container's
+/// default collation is `SQL_Latin1_General_CP1_CI_AS`, case-insensitive,
+/// so `OBJECT_ID`/`HAS_PERMS_BY_NAME` read `app.Old_Name` and `app.old_name`
+/// as the *same* securable — a claim check that trusted Rust's exact `Eq`
+/// would never see this collision, and the new table would silently inherit
+/// the departing identity's permissions answer.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests-pg.sh)"]
+async fn a_case_differing_reused_name_collides_under_the_servers_default_collation() {
+    let mut db = TestDb::create("doctorcasereuse").await;
+    let login = format!("pbps_cs_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+
+    // The one physical table this environment has, spelled with the case
+    // the recorded ids remember it under.
+    db.conn
+        .execute(
+            "CREATE TABLE app.Old_Name (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NOT NULL);",
+        )
+        .await
+        .expect("create the table under its current, mixed-case name");
+
+    // Measured, not assumed: the server really does read the two spellings
+    // as one object on this container.
+    let same_object: i32 = db
+        .conn
+        .query("SELECT CASE WHEN OBJECT_ID('app.Old_Name') = OBJECT_ID('app.old_name') THEN 1 ELSE 0 END;")
+        .await
+        .expect("compare the two spellings")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        same_object, 1,
+        "the premise this test measures: the server's default collation \
+         must read `app.Old_Name` and `app.old_name` as one object"
+    );
+
+    // Object-level INSERT alone, spelled the way the recorded ids remember
+    // it — not UPDATE, not DELETE, and nothing on the schema.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT INSERT ON app.Old_Name TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant INSERT on the object's current, mixed-case name");
+
+    let uid1: Uid = "t_ccc333".parse().expect("a well-formed table uid");
+    let uid2: Uid = "t_ddd444".parse().expect("a well-formed table uid");
+    let mut recorded_ids = IdsFile::default();
+    recorded_ids
+        .tables
+        .insert(uid1.clone(), "app.Old_Name".parse().unwrap());
+    let mut project_ids = IdsFile::default();
+    project_ids
+        .tables
+        .insert(uid1, "app.new_name".parse().unwrap());
+    project_ids
+        .tables
+        .insert(uid2, "app.old_name".parse().unwrap());
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(
+            pbps_model::StateKind::Apply,
+            &Schema::default(),
+            &recorded_ids,
+        ),
+    )
+    .await
+    .expect("record the environment's own state");
+
+    let data: pbps_mssql::doctor::DataTables = [
+        ("app.new_name".parse().unwrap(), seeded_table()),
+        ("app.old_name".parse().unwrap(), seeded_table()),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &data,
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+
+    let mut named: Vec<String> = pbps_mssql::doctor::missing(&held)
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        [
+            // `app.new_name`'s own demand, answered by the object it
+            // actually resolves to. Only INSERT was granted, so UPDATE and
+            // DELETE are its gaps here.
+            "DELETE on OBJECT::[app].[Old_Name]",
+            // `app.old_name`'s own demand: its resolution collides, under
+            // this server's collation, with `app.new_name`'s confirmed
+            // claim on `app.Old_Name`, so it could not be asked about at
+            // object scope at all and falls back to the schema instead of
+            // silently reading the other identity's INSERT as its own.
+            "DELETE on SCHEMA::[app]",
+            "INSERT on SCHEMA::[app]",
+            "UPDATE on OBJECT::[app].[Old_Name]",
+            "UPDATE on SCHEMA::[app]",
+        ],
+        "{:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    drop(lp);
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
 /// The base a least-privilege login needs before any of the questions this
 /// file asks about reference data: the managed permissions on `app`, the
 /// ledger's own on `dbo`, and the four database `CREATE`s. Everything the

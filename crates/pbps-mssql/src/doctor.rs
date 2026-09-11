@@ -904,12 +904,50 @@ async fn object_permissions(
 /// both hold a confirmed claim on the same name — the environment's own
 /// recorded ids name each uid once — so this rule never has to choose between
 /// two confirmed claims.
+///
+/// # Why the claim comparison is case-folded
+///
+/// A valid plan can rename `app.Old` to `app.new` and declare a new
+/// `app.old` in the same revision: three different Rust strings, `Old`
+/// among them, so an exact-`Eq` claim check never sees the second door this
+/// collision reaches through. Measured on the pinned image (issue #133
+/// round 3): its default collation is `SQL_Latin1_General_CP1_CI_AS`, and
+/// `CI` means SQL Server itself reads `app.Old` and `app.old` as one
+/// securable. Asking `HAS_PERMS_BY_NAME`/`OBJECT_ID` under either spelling
+/// then answers about the departing identity's object, and the arriving
+/// one silently inherits its permissions answer — the exact misattribution
+/// this function exists to refuse, reached past a claim check that never
+/// fires.
+///
+/// Reproducing SQL Server's actual collation rules in Rust is not
+/// attempted: collations are a hard shape with open issues of their own
+/// (#218, #234, #245), and a second, drifting source of truth for
+/// something the server already owns would be worse than this function's
+/// job is worth. Instead the comparison is deliberately *more* permissive
+/// than any single-byte-per-character SQL collation's case sensitivity
+/// alone: case-folded via `to_lowercase`, which also covers the
+/// accent-sensitive, case-insensitive default measured above. A pair of
+/// names this folds together that a case-*sensitive* collation would keep
+/// apart is a false refusal — cheap, and landing on the schema fallback
+/// for `data` or an unconditional gap for `granted`, both of which already
+/// exist for "cannot safely say" — not a false acceptance, which is what
+/// this whole function exists to rule out (AGENTS.md: when the answer is
+/// not clearly no, it is yes).
 fn resolve_for_query<'a>(
     wanted: impl Iterator<Item = &'a ObjectName>,
     project_ids: &pbps_model::IdsFile,
     recorded_ids: &pbps_model::IdsFile,
 ) -> (BTreeMap<ObjectName, ObjectName>, BTreeSet<ObjectName>) {
-    let claimed: BTreeSet<&ObjectName> = recorded_ids.tables.values().collect();
+    // Compared case-folded, not by Rust's exact `Eq` — see this function's own
+    // doc comment for why. Measured on the pinned image (issue #133 round 3):
+    // its default collation is `SQL_Latin1_General_CP1_CI_AS`, case
+    // *insensitive*, so `app.Old` and `app.old` are one securable to the
+    // server and two to a comparison that trusts Rust's ordering.
+    let claimed: BTreeSet<(String, String)> = recorded_ids
+        .tables
+        .values()
+        .map(|name| (name.schema.to_lowercase(), name.name.to_lowercase()))
+        .collect();
     let mut safe: BTreeMap<ObjectName, ObjectName> = BTreeMap::new();
     let mut unresolvable: BTreeSet<ObjectName> = BTreeSet::new();
     for declared in wanted {
@@ -918,7 +956,8 @@ fn resolve_for_query<'a>(
             .table_uid(declared)
             .and_then(|uid| recorded_ids.tables.get(uid))
             == Some(&query);
-        if confirmed || !claimed.contains(&query) {
+        let folded = (query.schema.to_lowercase(), query.name.to_lowercase());
+        if confirmed || !claimed.contains(&folded) {
             safe.insert(declared.clone(), query);
         } else {
             unresolvable.insert(declared.clone());
@@ -2080,6 +2119,42 @@ mod tests {
         assert_eq!(safe.get(&table("app.a")), Some(&table("app.a")));
         assert_eq!(safe.get(&table("app.b")), Some(&table("app.b")));
         assert!(unresolvable.is_empty(), "{unresolvable:?}");
+    }
+
+    /// The second door into the same collision, round 2's own review found
+    /// (issue #133 round 3): a rename to `app.new` frees `app.Old`, and the
+    /// same plan declares a new `app.old` — three different Rust strings,
+    /// but the pinned image's default collation is case-insensitive, so the
+    /// server reads `app.Old` and `app.old` as one securable. A claim check
+    /// that trusts Rust's exact `Eq` never sees this collision.
+    #[test]
+    fn resolve_for_query_folds_case_before_comparing_a_claim() {
+        let uid1: pbps_model::Uid = "t_ccc333".parse().expect("a well-formed table uid");
+        let uid2: pbps_model::Uid = "t_ddd444".parse().expect("a well-formed table uid");
+        let mut recorded_ids = pbps_model::IdsFile::default();
+        recorded_ids.tables.insert(uid1.clone(), table("app.Old"));
+        let mut project_ids = pbps_model::IdsFile::default();
+        project_ids.tables.insert(uid1, table("app.new"));
+        project_ids.tables.insert(uid2, table("app.old"));
+
+        let wanted = [table("app.new"), table("app.old")];
+        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
+
+        assert_eq!(
+            safe.get(&table("app.new")),
+            Some(&table("app.Old")),
+            "the confirmed resolution keeps the recorded spelling: {safe:?}"
+        );
+        assert!(
+            !safe.contains_key(&table("app.old")),
+            "the differently-cased fallback must not be asked about under a \
+             name the server reads as the same securable: {safe:?}"
+        );
+        assert_eq!(
+            unresolvable,
+            [table("app.old")].into_iter().collect(),
+            "{unresolvable:?}"
+        );
     }
 
     /// Every DML permission, on one object.
