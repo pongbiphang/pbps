@@ -9557,6 +9557,56 @@ async fn a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data() {
     db.drop().await;
 }
 
+/// Round-3 review finding on #103's own PR: a row a newer pbps wrote may
+/// populate a count in a shape this build cannot even parse — the version
+/// gate must still be what refuses it, not a decode failure on a column this
+/// build never gets to trust. Before `TimelineState::from_projected` existed,
+/// the JSON fallback's `read_json` checked the version before it touched the
+/// rest of the document at all; this pins that the projected path keeps the
+/// same ordering rather than decoding `tables_count` first and failing the
+/// whole call.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn an_unparseable_count_beside_an_unsupported_version_is_still_refused_by_version() {
+    let mut db = TestDb::create("futureversion103b").await;
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate");
+
+    // Written by hand, not through `record()`: `record()` only ever writes
+    // what `saturating_i32` produces, which is never negative — this row is
+    // shaped the way a *different*, newer pbps build might write one, not
+    // the way this build ever would.
+    db.conn
+        .execute_with(
+            "INSERT INTO dbo.__pbps_state \
+             (kind, git_sha, plan_checksum, state_json, operator, reason, \
+              state_version, tables_count, modules_count, staged_completed, staged_total) \
+             VALUES ('apply', NULL, NULL, @P1, 'live-test', NULL, @P2, @P3, 0, NULL, NULL)",
+            &[
+                "{}".into(),
+                (pbps_model::state::CURRENT_VERSION as i32 + 1).into(),
+                (-1_i32).into(),
+            ],
+        )
+        .await
+        .expect("write a row shaped like a future pbps's, by hand");
+
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("the whole call must still succeed — only the one row is refused");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        matches!(
+            rows[0].state,
+            Err(pbps_model::Unreadable::UnsupportedVersion(_))
+        ),
+        "refused by version, not failed by a count this build was never meant to trust"
+    );
+
+    db.drop().await;
+}
+
 /// Finding 4 from #353's round-1 review: `select_legacy_state_json` binds
 /// one parameter per legacy id, and SQL Server refuses more than
 /// [`pbps_mssql::doctor`]'s measured `MAX_PARAMETERS` (2,098) in one request.

@@ -1062,27 +1062,44 @@ fn projected_row(row: &Row) -> Result<ProjectedRow, LedgerError> {
     let state = match optional_i32(row, "state_version")? {
         None => None,
         Some(version) => {
-            let tables = as_count(required_i32(row, "tables_count")?, "tables_count")?;
-            let modules = as_count(required_i32(row, "modules_count")?, "modules_count")?;
-            let staged = match (
-                optional_i32(row, "staged_completed")?,
-                optional_i32(row, "staged_total")?,
-            ) {
-                (Some(completed), Some(total)) => Some(TimelineStaged {
-                    completed: as_count(completed, "staged_completed")?,
-                    total: as_count(total, "staged_total")?,
-                }),
-                // A migrated row that is not a staged checkpoint: both are
-                // NULL together, which is what "not mid-deployment" means
-                // (`pbps_model::StagedProgress`'s own doc comment).
-                _ => None,
-            };
-            Some(TimelineState::from_projected(
-                as_version(version, "state_version")?,
-                tables,
-                modules,
-                staged,
-            ))
+            let version = as_version(version, "state_version")?;
+            // The version is checked before any other projected column is
+            // even read, not only before `TimelineState` is built from them
+            // (a round-3 review finding on #103's own PR): `from_projected`
+            // already refuses an unsupported version, but `tables`/`modules`
+            // below were decoded *before* that call, so a newer pbps that
+            // wrote both an unsupported version and a count this build
+            // cannot parse would fail the whole `timeline()` call rather
+            // than refusing just that row — the one ordering the JSON
+            // fallback never got wrong (`read_json` checks the version
+            // before it touches the rest of the document at all). See
+            // `pbps_mssql::state::projected_row` for the identical fix and
+            // its full reasoning.
+            Some(match pbps_model::check_readable_version(version) {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    let tables = as_count(required_i32(row, "tables_count")?, "tables_count")?;
+                    let modules = as_count(required_i32(row, "modules_count")?, "modules_count")?;
+                    let staged = match (
+                        optional_i32(row, "staged_completed")?,
+                        optional_i32(row, "staged_total")?,
+                    ) {
+                        (Some(completed), Some(total)) => Some(TimelineStaged {
+                            completed: as_count(completed, "staged_completed")?,
+                            total: as_count(total, "staged_total")?,
+                        }),
+                        // A migrated row that is not a staged checkpoint: both
+                        // are NULL together, which is what "not
+                        // mid-deployment" means (`pbps_model::StagedProgress`'s
+                        // own doc comment).
+                        _ => None,
+                    };
+                    Ok(
+                        TimelineState::from_projected(version, tables, modules, staged)
+                            .expect("the version was already checked as readable above"),
+                    )
+                }
+            })
         }
     };
 

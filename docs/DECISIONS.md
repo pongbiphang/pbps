@@ -9452,6 +9452,28 @@ SPEC is in sync with all of these.
     (the shape AGENTS.md asks for: prefer a failure unrepresentable over a
     branch that tests for it).
 
+    **The version is checked before the other columns are decoded, not only
+    before `TimelineState` is built from them.** A round-3 finding on the
+    previous paragraph's own fix: `from_projected`'s check runs when it is
+    called, but `projected_row` on both dialects computed `tables`/`modules`
+    — decoding `tables_count`/`modules_count` out of the row — *before*
+    calling it, as ordinary function-call arguments. A row a newer pbps
+    wrote populating those two columns in a shape this build cannot parse
+    (bound by construction from a version this build wrote, per
+    `as_count`'s own doc comment — never true of *this* build's own rows,
+    but nothing here controls what a newer one writes) failed the whole
+    `timeline()` call on that decode, before `from_projected` was ever
+    reached to refuse the row by version instead. The JSON fallback never
+    had this gap: `read_json` checks the version before it touches the rest
+    of the document at all, and it is exactly that ordering the projected
+    path did not yet keep. Fixed by checking
+    `pbps_model::check_readable_version` first, immediately after
+    `state_version` is read and before `tables_count`/`modules_count` are
+    touched at all; `from_projected` remains the only constructor and is
+    still called to build the value once the check has already passed, so
+    the two checks cannot disagree — the second one is guaranteed to
+    succeed, which is what its `.expect` documents rather than skips.
+
     **The legacy fallback asks in pieces, not one statement, on both
     dialects.** A third: `select_legacy_state_json` bound one parameter per
     legacy id with no ceiling, and until a deployer runs a deployment after
@@ -9509,7 +9531,12 @@ SPEC is in sync with all of these.
     legacy fallback succeeding past their own measured parameter ceiling —
     2,098 on SQL Server, 65,535 on PostgreSQL — each with a revert-and-watch-
     fail cycle confirming the failure the fix removes names the protocol
-    limit, not something incidental. A unit test pins a denied row rendering
-    as denied, never as malformed and never with tables/modules silently
-    reading zero, and another pins the projected path's version gate
-    directly against `pbps_model::CURRENT_VERSION`/`OLDEST_READABLE_VERSION`.
+    limit, not something incidental. Both dialects also pin a row carrying
+    both an unsupported version and a count this build cannot parse being
+    refused by its version — the whole `timeline()` call still succeeding —
+    with its own revert-and-watch-fail cycle confirming the unfixed ordering
+    fails the whole call on the count instead. A unit test pins a denied row
+    rendering as denied, never as malformed and never with tables/modules
+    silently reading zero, and another pins the projected path's version
+    gate directly against `pbps_model::CURRENT_VERSION`/
+    `OLDEST_READABLE_VERSION`.
