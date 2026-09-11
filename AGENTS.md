@@ -132,7 +132,7 @@ checksum-pinned, and state lives in the database itself.
 
 - **Measure against a real engine before believing yourself.** Three times the
   obviously-correct answer was wrong and only a live server said so. When a
-  question is about what SQL Server does, run it.
+  question is about what SQL Server or PostgreSQL does, run it on that engine.
 - **Revert each fix and watch its new test fail** before keeping the fix. This
   has caught tests that passed for the wrong reason.
 - **Sweep every call site for the shape you just fixed**, before pushing. Most

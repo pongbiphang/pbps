@@ -1,9 +1,9 @@
 # PongBiphang Schema (`pbps`) — design specification
 
-> Status: living specification; Phases 0-3.5 are built for SQL Server
+> Status: living specification; Phases 0-5 are built, supporting SQL Server and PostgreSQL
 > Language: Rust
 > Position: declarative database schema version control and deployment
-> Primary dialect: SQL Server; secondary: PostgreSQL
+> Supported dialects: SQL Server and PostgreSQL
 
 ---
 
@@ -1427,8 +1427,8 @@ pbps/
     pbps-dialect/   The Dialect trait plus shared helpers
     pbps-mssql/     MSSQL: type normalization, SQL generation, introspection,
                     dependency queries
-    pbps-pg/        PostgreSQL: the dialect, as far as Phase 5 has built it;
-                    every part that is not built refuses by name
+    pbps-pg/        PostgreSQL: type normalization, SQL generation, introspection,
+                    dependency queries, probes and cost estimates
     pbps-db/        Connection abstraction, __pbps_state access, locking
     pbps-docs/      Documentation and ERD rendering (9.4); pure, no dialect
     pbps-cli/       clap, interactive prompts, diagnostic output
@@ -1472,7 +1472,7 @@ database is work with clearly drawn boundaries.
 | Purpose | Crate | Notes |
 |---|---|---|
 | SQL Server | `tiberius-ng` (the `tiberius` library API) | Pure Rust; **no driver to install** — one static binary, decisive for air-gapped environments. Adopted after the original package's pinned TLS stack accumulated findings no upgrade could reach; see open question 10 |
-| PostgreSQL | `tokio-postgres` | Phase 5 |
+| PostgreSQL | `tokio-postgres` plus `tokio-postgres-rustls` | Pure Rust driver with rustls TLS; no PostgreSQL client library to install (ADR-0014) |
 | Async | `tokio` plus `tokio-util` (tiberius compat) | |
 | CLI | `clap` (derive) | |
 | Diagnostics | `miette` | Errors with source spans; the heart of the Phase 1 product experience |
@@ -1491,9 +1491,11 @@ layer — ODBC, ADBC — is a separate question with its own answer; see
 ### 11.4 Distribution
 
 A single static binary. Windows runners use `x86_64-pc-windows-msvc`; Linux
-runners use `x86_64-unknown-linux-musl` for a fully static file. Since `tiberius`
-is pure Rust, both achieve "copy one file and run it", with no runtime to install
-on an air-gapped host.
+runners use `x86_64-unknown-linux-musl` for a fully static file. The same binary
+includes both SQL Server (`tiberius-ng`) and PostgreSQL (`tokio-postgres`)
+support with rustls TLS. Neither engine requires an installed ODBC driver or
+database client library on the target host; the distribution goal remains
+"copy one file and run it" on an air-gapped host.
 
 ### 11.5 Testing strategy
 
@@ -1557,6 +1559,10 @@ no process default to choose between them — which building, linting and
 
 ## 12. Phases
 
+Phases 0-5 are complete as scoped; Phase 6 remains the next phase. Supported
+features and remaining limitations are tracked in [STATUS.md](STATUS.md) and
+the individual ADRs.
+
 | Phase | Contents | Value delivered |
 |---|---|---|
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
@@ -1566,12 +1572,13 @@ no process default to choose between them — which building, linting and
 | **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions, and **the interactive prompt of 6.3** — the third intent channel, and the last place where a competitor's rename detection looks more finished than ours | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the first built-in analyzer catalogue ([ADR-0008](ADR-0008-policies.md), Decision 6) | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
-| **Phase 5** | The PostgreSQL dialect, designed against a real server before it is built ([ADR-0009](ADR-0009-postgres-modules.md) modules, [ADR-0010](ADR-0010-postgres-privileges.md) privileges, [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) the dialect seam, [ADR-0012](ADR-0012-postgres-type-catalogue.md) the type catalogue, [ADR-0013](ADR-0013-postgres-reference-data.md) reference data, [ADR-0014](ADR-0014-driver-seam-tested.md) the driver seam); then further dialects, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
+| **Phase 5** | The PostgreSQL dialect, built and connected to the CLI after design against a real server ([ADR-0009](ADR-0009-postgres-modules.md) modules, [ADR-0010](ADR-0010-postgres-privileges.md) privileges, [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) the dialect seam, [ADR-0012](ADR-0012-postgres-type-catalogue.md) the type catalogue, [ADR-0013](ADR-0013-postgres-reference-data.md) reference data, [ADR-0014](ADR-0014-driver-seam-tested.md) the driver seam). Further dialects remain future work, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 6** | The optional local UI ([ADR-0006](ADR-0006-optional-ui.md)): a single-user viewer over the typed JSON of 3.1 that can compose intent and commit it, holding no state of its own; [ADR-0015](ADR-0015-local-ui-implementation.md) says how it is built. Multi-tenant and hosted deployment are out of the open-source scope by decision, and get their own ADR | The people who review database change are not all terminal users; this reaches them without becoming a second system of record |
 
-When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
-at the same time**, even though it is not implemented. If Phase 5 forces a large
-change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
+The Phase 0 design required considering PostgreSQL alongside SQL Server
+before implementing the second engine. Phase 5 tested that boundary: the
+abstraction held with the model amendments recorded in ADR-0011 and the
+connected seam in ADR-0014.
 
 **Why depth precedes the second dialect.** The obvious ordering is the opposite:
 breadth of engines is the number every comparison table counts, and Flyway and
