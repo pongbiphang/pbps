@@ -9027,3 +9027,27 @@ SPEC is in sync with all of these.
     fail at bootstrap. This measures that path, not every feature on every
     PostgreSQL release; the separate permission-version preflight remains
     deferred in #321.
+
+425. **An introspection limitation keeps its object's namespace.** A
+    PostgreSQL aggregate called `app.t(bigint)` is not a defect of the table
+    `app.t` or of the routine `app.t(integer)`. Storing every limitation under
+    a `TableName` made connected plans and recorders refuse those valid
+    managed objects. The connected catalog result now carries a relation
+    target, a structured module identity, or an unnameable module diagnostic.
+    Relations share the table/view namespace; routines retain argument types
+    and triggers retain their parent. A declaration cannot name an unnameable
+    identity, so that diagnostic is not assigned to another same-named object.
+
+    Both PostgreSQL catalog exclusions and pure module assembly preserve the
+    target, and the CLI matches it against the corresponding managed scope.
+    SQL Server table limitations keep their relation targets and its existing
+    unreadable-module inventory keeps its separate handling. No saved schema
+    or plan format changes; the target belongs to the connected read result.
+
+    The live regression keeps a managed table and routine beside an unmanaged
+    aggregate overload: plan, snapshot, baseline and verify succeed. Making
+    the table UNLOGGED still refuses, as does replacing the exact managed
+    routine signature with an aggregate. Reverting to a name-only table
+    filter restores the false refusal. The broader unmanaged module inventory
+    work remains #303; this change scopes limitations rather than completing
+    that policy integration.

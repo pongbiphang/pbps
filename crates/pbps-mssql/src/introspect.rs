@@ -30,7 +30,7 @@ use crate::types;
 // The shapes a pull returns are `pbps-db`'s, filled here from `sys.*` and
 // re-exported under the paths this crate's callers and tests have always used
 // (DECISIONS 417).
-pub use pbps_db::catalog::{Limitation, Pulled, Unexpressible, UnmanagedModule};
+pub use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, Unexpressible, UnmanagedModule};
 
 /// One row of `sys.tables`.
 #[derive(Debug, Clone)]
@@ -276,7 +276,7 @@ fn push_limitation(
     warnings.push(detail.clone());
     if let Some(table) = table {
         limitations.push(Limitation {
-            table: table.clone(),
+            target: LimitationTarget::Relation(table.clone()),
             detail,
         });
     }
@@ -1541,7 +1541,8 @@ mod tests {
         assert!(
             p.limitations
                 .iter()
-                .all(|limitation| limitation.table == TableName::new("dbo", "customer"))
+                .all(|limitation| limitation.target.object_name()
+                    == TableName::new("dbo", "customer"))
         );
         assert!(p.warnings[0].contains("computed"), "{:?}", p.warnings);
         assert!(p.warnings[1].contains("my_udt"), "{:?}", p.warnings);
@@ -1565,7 +1566,10 @@ mod tests {
         };
         let p = assemble(&raw);
         assert!(p.schema.tables.is_empty());
-        assert_eq!(p.limitations[0].table, TableName::new("dbo", "shapes"));
+        assert_eq!(
+            p.limitations[0].target.object_name(),
+            TableName::new("dbo", "shapes")
+        );
         assert!(
             p.warnings.iter().any(|w| w.contains("whole table")),
             "{:?}",
@@ -1688,7 +1692,7 @@ mod tests {
         assert_eq!(
             p.limitations
                 .iter()
-                .map(|limitation| limitation.table.clone())
+                .map(|limitation| limitation.target.object_name())
                 .collect::<Vec<_>>(),
             [
                 TableName::new("dbo", "customer"),

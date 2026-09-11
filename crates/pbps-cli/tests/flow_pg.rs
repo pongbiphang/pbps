@@ -1139,3 +1139,55 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
         "DO $$ BEGIN IF to_regprocedure('app.f(smallint)') IS NOT NULL OR app.caller() <> 'new' THEN RAISE EXCEPTION 'refused rebuild changed the database'; END IF; END $$",
     );
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
+    let own = OwnDatabase::new(&server(), "limitation-scope");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("limitation-scope");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.t(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        "CREATE AGGREGATE app.t(bigint) (SFUNC = int8pl, STYPE = bigint, INITCOND = '0')",
+    );
+    succeeds(d.run(&["plan", "--db", connection]));
+    succeeds(d.run(&["snapshot", "--db", connection, "--force"]));
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "accept managed state",
+    ]));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // A real table limitation must still refuse the same managed scope.
+    on_server(connection, "ALTER TABLE app.t SET UNLOGGED");
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("UNLOGGED"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(connection, "ALTER TABLE app.t SET LOGGED");
+
+    // The exact managed signature becoming unsupported is also a limitation.
+    on_server(
+        connection,
+        "DROP FUNCTION app.t(integer); CREATE AGGREGATE app.t(integer) (SFUNC = int4pl, STYPE = integer, INITCOND = '0')",
+    );
+    let refused = d.run(&["baseline", "--db", connection, "--reason", "must refuse"]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("aggregate"),
+        "{}",
+        stderr(&refused)
+    );
+}

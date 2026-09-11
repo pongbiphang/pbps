@@ -881,7 +881,13 @@ pub(crate) fn managed_limitations(
     pulled
         .limitations
         .iter()
-        .filter(|limitation| managed_tables.contains(&limitation.table))
+        .filter(|limitation| match &limitation.target {
+            pbps_db::catalog::LimitationTarget::Relation(name) => {
+                managed_tables.contains(name) || modules.contains(&ModuleId::Named(name.clone()))
+            }
+            pbps_db::catalog::LimitationTarget::Module(id) => modules.contains(id),
+            pbps_db::catalog::LimitationTarget::UnnameableModule(_) => false,
+        })
         .map(|limitation| limitation.detail.clone())
         .chain(
             pulled
@@ -8383,11 +8389,15 @@ mod tests {
             unexpressible: Vec::new(),
             limitations: vec![
                 Limitation {
-                    table: "dbo.managed".parse().unwrap(),
+                    target: pbps_db::catalog::LimitationTarget::Relation(
+                        "dbo.managed".parse().unwrap(),
+                    ),
                     detail: "dbo.managed has a computed column".into(),
                 },
                 Limitation {
-                    table: "dbo.theirs".parse().unwrap(),
+                    target: pbps_db::catalog::LimitationTarget::Relation(
+                        "dbo.theirs".parse().unwrap(),
+                    ),
                     detail: "dbo.theirs has a computed column".into(),
                 },
             ],

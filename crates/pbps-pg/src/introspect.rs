@@ -70,9 +70,9 @@ use crate::types;
 // The shapes a pull returns are `pbps-db`'s, filled here from `pg_catalog` and
 // re-exported under the paths this crate's callers and tests have always used
 // (DECISIONS 417). `unmanaged_modules` is SQL Server's inventory and stays
-// empty from this engine: what this pull cannot hold is left out and said in
-// `warnings`, as the field's own documentation records.
-pub use pbps_db::catalog::{Limitation, Pulled, Unexpressible};
+// empty from this engine: what this pull cannot hold is left out and reported
+// in `warnings` and typed `limitations` (DECISIONS 425).
+pub use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, Unexpressible};
 
 /// One ordinary table, as `pg_class` has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1339,9 +1339,9 @@ fn add_module(
                 match arg.ty.parse::<RoutineArg>() {
                     Ok(parsed) => args.push(parsed),
                     Err(e) => {
-                        return note(
+                        return note_target(
                             pulled,
-                            &here,
+                            LimitationTarget::UnnameableModule(here.clone()),
                             format!(
                                 "`{here}` is a routine whose argument {} this model cannot hold as \
                                  an identity: {e}. It is left out of the pull, because a routine \
@@ -1377,9 +1377,9 @@ fn add_module(
             after_the_name(&raw.definition, "CREATE TRIGGER "),
         ),
         other => {
-            return note(
+            return note_target(
                 pulled,
-                &here,
+                LimitationTarget::UnnameableModule(here.clone()),
                 format!(
                     "`{here}` is a module of a kind this reader does not know (`{other}`). It is \
                      left out of the pull rather than read back as one of the kinds it is not."
@@ -1389,9 +1389,9 @@ fn add_module(
     };
 
     let Some(definition) = definition.filter(|d| !d.is_empty()) else {
-        return note(
+        return note_target(
             pulled,
-            &here,
+            LimitationTarget::module(id.clone()),
             format!(
                 "`{here}` is a module whose definition this reader could not separate from the \
                  statement the engine deparsed for it. It is left out of the pull rather than \
@@ -1405,9 +1405,9 @@ fn add_module(
     // text and read back by parsing it, and PostgreSQL will give a name that
     // does not survive that — a view called `f(int)`, a schema called `a.b`.
     if ModuleId::from_str(&id.to_string()).as_ref() != Ok(&id) {
-        return note(
+        return note_target(
             pulled,
-            &here,
+            LimitationTarget::module(id.clone()),
             format!(
                 "`{id}` is a module whose identity the declaration format cannot write back: it \
                  is stored as text and read by parsing it, and this one does not survive that. It \
@@ -1601,11 +1601,12 @@ fn note_false(pulled: &mut Pulled, table: &TableName, detail: String) -> bool {
 }
 
 fn note(pulled: &mut Pulled, table: &TableName, detail: String) {
+    note_target(pulled, LimitationTarget::Relation(table.clone()), detail);
+}
+
+fn note_target(pulled: &mut Pulled, target: LimitationTarget, detail: String) {
     pulled.warnings.push(detail.clone());
-    pulled.limitations.push(Limitation {
-        table: table.clone(),
-        detail,
-    });
+    pulled.limitations.push(Limitation { target, detail });
 }
 
 /// One column, and everything about it the model has nowhere to put.
@@ -4782,7 +4783,10 @@ mod tests {
         };
         let pulled = assemble(&raw);
         assert_eq!(pulled.limitations.len(), 1);
-        assert_eq!(pulled.limitations[0].table, TableName::new("app", "odd"));
+        assert_eq!(
+            pulled.limitations[0].target.object_name(),
+            TableName::new("app", "odd")
+        );
         assert_eq!(pulled.warnings.len(), pulled.limitations.len());
     }
 

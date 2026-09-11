@@ -1125,7 +1125,7 @@ fn ours_limitations<'a>(
     pulled
         .limitations
         .iter()
-        .filter(|l| l.table.schema == schema)
+        .filter(|l| l.target.object_name().schema == schema)
         .collect()
 }
 
@@ -1988,7 +1988,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     // not be confused; a table missing from both lists would be silence.
     let mut refused: Vec<_> = ours_limitations(&pulled, &s)
         .iter()
-        .map(|l| l.table.clone())
+        .map(|l| l.target.object_name())
         .filter(|t| !pulled.schema.tables.contains_key(t))
         .collect();
     refused.sort();
@@ -7592,9 +7592,17 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     assert!(problems.is_empty(), "{problems:?}");
 
     // Named, beside the relations they are on, which are named already.
-    let named: Vec<&str> = ours_limitations(&pulled, &s)
+    let named: Vec<String> = ours_limitations(&pulled, &s)
         .iter()
-        .map(|l| l.table.name.as_str())
+        .map(|l| match &l.target {
+            pbps_db::catalog::LimitationTarget::Module(pbps_model::ModuleId::Trigger {
+                on,
+                name,
+            }) => format!("{}.{name}", on.name),
+            target @ (pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::Module(_)
+            | pbps_db::catalog::LimitationTarget::UnnameableModule(_)) => target.object_name().name,
+        })
         .collect();
     for left_out in [
         "part",
@@ -7604,19 +7612,25 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         "pg_buffercache.user_tg",
     ] {
         assert!(
-            named.contains(&left_out),
+            named.contains(&left_out.to_owned()),
             "{left_out} is not named in {named:?}"
         );
     }
-    assert!(!named.contains(&"t.audit"), "{named:?}");
+    assert!(!named.contains(&"t.audit".to_owned()), "{named:?}");
     assert!(
-        !named.contains(&"pg_buffercache"),
+        !named.contains(&"pg_buffercache".to_owned()),
         "the extension's view is left out silently, and only the user's trigger on it is named: \
          {named:?}"
     );
     let detail = &ours_limitations(&pulled, &s)
         .iter()
-        .find(|l| l.table.name == "part.audit")
+        .find(|l| {
+            l.target
+                == pbps_db::catalog::LimitationTarget::Module(pbps_model::ModuleId::Trigger {
+                    on: pbps_model::ObjectName::new(&s, "part"),
+                    name: "audit".into(),
+                })
+        })
         .expect("named")
         .detail;
     assert!(

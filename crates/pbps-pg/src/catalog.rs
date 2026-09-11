@@ -34,9 +34,9 @@ use pbps_model::{Schema, TableName};
 pub use pbps_db::catalog::Spellings;
 
 use crate::introspect::{
-    GrantedKind, Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawDefaultAcl, RawGrant,
-    RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant, RawRole, RawSharedDependency,
-    RawTable, assemble,
+    GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
+    RawDefaultAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant,
+    RawRole, RawSharedDependency, RawTable, assemble,
 };
 
 /// The schemas that are never a project's.
@@ -290,7 +290,8 @@ fn unheld_modules_query() -> String {
     let held = on_a_relation_the_pull_holds();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS name,
-                'a materialized view, which holds rows a plan would have to refresh' AS detail
+                'a materialized view, which holds rows a plan would have to refresh' AS detail,
+                'm' AS kind, c.oid::int8 AS oid, '' AS on_table
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE c.relkind = 'm'
@@ -299,16 +300,16 @@ fn unheld_modules_query() -> String {
           UNION ALL
          SELECT n.nspname, p.proname,
                 CASE p.prokind WHEN 'a' THEN 'an aggregate function'
-                               ELSE 'a window function' END
+                               ELSE 'a window function' END, p.prokind::text, p.oid::int8, ''
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
           WHERE p.prokind IN ('a', 'w')
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {proc_not_extension}
           UNION ALL
-         SELECT n.nspname, c.relname || '.' || tg.tgname,
+         SELECT n.nspname, tg.tgname,
                 'a trigger on `' || n.nspname || '.' || c.relname
-                  || '` (not a table or a view this pull holds)'
+                  || '` (not a table or a view this pull holds)', 't', tg.oid::int8, c.relname
            FROM pg_catalog.pg_trigger tg
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -831,7 +832,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<(RawCatalog, Vec<Limitation>), D
             other => &format!("a relation of kind `{other}`"),
         };
         warnings.push(Limitation {
-            table: TableName::new(&schema, &name),
+            target: LimitationTarget::Relation(TableName::new(&schema, &name)),
             detail: format!(
                 "`{schema}.{name}` is {kind}, which this model does not hold. It is left out of \
                  the pull entirely — not read back as an ordinary table, which would make a plan \
@@ -1039,10 +1040,44 @@ fn decode_batch(batch: &CatalogBatch) -> Result<(RawCatalog, Vec<Limitation>), D
     {
         let schema = text(row, "schema_name")?;
         let name = text(row, "name")?;
+        let here = TableName::new(&schema, &name);
+        let target = match text(row, "kind")?.as_str() {
+            "m" => LimitationTarget::Relation(here),
+            "a" | "w" => {
+                let oid = number(row, "oid")?;
+                let args = raw
+                    .routine_args
+                    .iter()
+                    .filter(|arg| arg.routine_oid == oid)
+                    .map(|arg| arg.ty.parse::<pbps_model::RoutineArg>())
+                    .collect::<Result<Vec<_>, _>>();
+                match args {
+                    Ok(args) => LimitationTarget::Module(pbps_model::ModuleId::Routine(
+                        pbps_model::RoutineId::new(here, args),
+                    )),
+                    Err(_) => LimitationTarget::UnnameableModule(here),
+                }
+            }
+            "t" => LimitationTarget::Module(pbps_model::ModuleId::Trigger {
+                on: TableName::new(&schema, text(row, "on_table")?),
+                name,
+            }),
+            other => {
+                return Err(DbError::BadRow(format!(
+                    "unknown unsupported module kind {other}"
+                )));
+            }
+        };
+        let display = match &target {
+            LimitationTarget::Module(id) => id.to_string(),
+            LimitationTarget::Relation(name) | LimitationTarget::UnnameableModule(name) => {
+                name.to_string()
+            }
+        };
         warnings.push(Limitation {
-            table: TableName::new(&schema, &name),
+            target,
             detail: format!(
-                "`{schema}.{name}` is {}, which this model does not hold. It is left out of the \
+                "`{display}` is {}, which this model does not hold. It is left out of the \
                  pull entirely — not read back as an ordinary module, which would make a plan \
                  that recreates it as something else.",
                 text(row, "detail")?

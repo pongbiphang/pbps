@@ -36,13 +36,13 @@ pub struct Pulled {
     /// caller to put beside the other unexpressible differences
     /// (DECISIONS 95, 97).
     pub unexpressible: Vec<Unexpressible>,
-    /// Unsupported facts associated with a table. Callers use the parent name
+    /// Unsupported facts associated with an object. Callers use its typed target
     /// to distinguish a limitation inside the managed set (unexpressible
-    /// drift) from one on somebody else's table.
+    /// drift) from one on somebody else's object.
     ///
     /// The same argument as `unexpressible` above, on the other half of the
-    /// model: one is about a role's permissions, the other about a table's
-    /// features, and neither may be folded into the comparison or dropped
+    /// model: one is about a role's permissions, the other about unsupported
+    /// object features, and neither may be folded into the comparison or dropped
     /// from it.
     pub limitations: Vec<Limitation>,
     /// Modules the database has that pbps cannot manage: on SQL Server a CLR
@@ -84,15 +84,40 @@ pub struct Unexpressible {
     pub what: String,
 }
 
-/// One fact about a table that the model cannot hold.
-///
-/// It carries the table it belongs to so that a caller can tell a limitation
-/// inside the managed set — which is drift it must not call clean — from one on
-/// a table this project does not declare.
+/// One fact the model cannot hold, with the namespace needed to scope it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Limitation {
-    pub table: TableName,
+    pub target: LimitationTarget,
     pub detail: String,
+}
+
+/// Relations share a namespace; routines include their signature and triggers
+/// include their parent. A name-only table filter cannot distinguish them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LimitationTarget {
+    Relation(TableName),
+    Module(pbps_model::ModuleId),
+    /// No declaration can name this identity. Keep the diagnostic, without
+    /// attributing it to a different object that happens to share its name.
+    UnnameableModule(ObjectName),
+}
+
+impl LimitationTarget {
+    pub fn module(id: pbps_model::ModuleId) -> Self {
+        match id {
+            pbps_model::ModuleId::Named(name) => Self::Relation(name),
+            id @ (pbps_model::ModuleId::Routine(_) | pbps_model::ModuleId::Trigger { .. }) => {
+                Self::Module(id)
+            }
+        }
+    }
+
+    pub fn object_name(&self) -> ObjectName {
+        match self {
+            Self::Relation(name) | Self::UnnameableModule(name) => name.clone(),
+            Self::Module(id) => id.object_name(),
+        }
+    }
 }
 
 /// One module the database has and `pbps` does not manage.
