@@ -458,6 +458,28 @@ pub async fn rename_impact(
     }
 }
 
+/// Bootstrap can build database roles, but cluster roles must already exist
+/// and still exist when its successful snapshot is recorded.
+pub fn refuse_missing_cluster_roles(driver: Driver, missing: &[String]) -> anyhow::Result<()> {
+    match driver {
+        // Missing database roles are created by the SQL Server typed plan.
+        Driver::Mssql => Ok(()),
+        Driver::Postgres => {
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "{}",
+                    missing
+                        .iter()
+                        .map(|name| pbps_pg::roles::refuse_missing(name).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Cluster-owned identities move before pbps plans their database grants.
 /// SQL Server moves its database roles through the typed statements instead.
 pub async fn external_role_renames(

@@ -2978,6 +2978,10 @@ pub fn cmd_bootstrap(
             // Unsupported grants are outside role.grants, so an apparently
             // empty role is not proof that the database is empty (110).
             refuse_unexpressible(&existing.scoped, &target.label, "bootstrap again")?;
+            crate::engine::refuse_missing_cluster_roles(
+                conn.driver(),
+                &existing.scoped.missing_roles,
+            )?;
 
             // Only names the plan creates need to be free (DECISIONS 118).
             // PostgreSQL grants use existing cluster roles; their existence
@@ -3071,6 +3075,7 @@ pub fn cmd_bootstrap(
             // A database-side trigger can add a privilege during the build.
             // Never commit a snapshot that silently omits it (110, 147).
             refuse_unexpressible(&built, &target.label, "bootstrap again")?;
+            crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),

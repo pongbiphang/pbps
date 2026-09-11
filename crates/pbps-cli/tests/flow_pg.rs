@@ -334,6 +334,94 @@ fn routine_rebuilds_do_not_restore_revoked_public_execute() {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn bootstrap_requires_cluster_roles_before_building_and_before_recording() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_bootstrap_empty_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "bootstrap-missing-role");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("bootstrap-missing-role");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = |o: Output| {
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains(&format!("CREATE ROLE \"{}\"", role.1)),
+            "{}",
+            stderr(&o)
+        );
+    };
+    refused(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF to_regclass('app.t') IS NOT NULL OR EXISTS (SELECT 1 FROM public.__pbps_state) THEN RAISE EXCEPTION 'missing-role bootstrap built or recorded state'; END IF; END $$",
+    );
+
+    on_server(&server, &format!("CREATE ROLE {}", role.1));
+    on_server(
+        connection,
+        &format!(
+            "CREATE FUNCTION public.remove_bootstrap_role() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE object_identity = 'app.t') THEN DROP ROLE {}; END IF; END $$",
+            role.1
+        ),
+    );
+    on_server(
+        connection,
+        "CREATE EVENT TRIGGER remove_bootstrap_role ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.remove_bootstrap_role()",
+    );
+    refused(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        &format!(
+            "DO $$ BEGIN IF to_regclass('app.t') IS NOT NULL OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{}') THEN RAISE EXCEPTION 'missing-role read-back did not roll back the build'; END IF; END $$",
+            role.1
+        ),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let last = pbps_pg::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(last.snapshot.kind, pbps_model::StateKind::Failed);
+        assert!(last.snapshot.schema.roles.is_empty());
+        assert!(last.snapshot.ids.roles.is_empty());
+    });
+    on_server(connection, "DROP EVENT TRIGGER remove_bootstrap_role");
+    on_server(connection, "DROP FUNCTION public.remove_bootstrap_role()");
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(&server, &format!("DROP ROLE {}", role.1));
+    let missing = d.run(&["verify", "--db", connection]);
+    assert_eq!(
+        code(&missing),
+        2,
+        "{}{}",
+        stdout(&missing),
+        stderr(&missing)
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn grantless_cluster_role_additions_and_removals_update_the_recorded_scope() {
     struct Role(String, String);
     impl Drop for Role {
