@@ -370,6 +370,34 @@ fn apply_plan(d: &Demo, connection: &str, plan: &std::path::Path, staged: bool) 
     d.run(&args)
 }
 
+fn refuses_connected_check_json(d: &Demo, connection: &str, name: &str, detail: &str) {
+    let out = d.run(&["plan", "--db", connection, "--format", "json"]);
+    assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(report["result"], "unanswerable", "{report}");
+    assert!(
+        report["findings"].as_array().unwrap().iter().any(|f| {
+            let message = f["message"].as_str().unwrap_or_default();
+            message.contains(name) && message.contains(detail)
+        }),
+        "{report}"
+    );
+}
+
+fn passed_connected_check_json(d: &Demo, connection: &str, name: &str) -> serde_json::Value {
+    let out = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let check = report["data"]["connected_checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("missing {name}: {report}"));
+    assert_eq!(check["status"], "passed", "{report}");
+    assert_eq!(check["engine"], "PostgreSQL", "{report}");
+    check.clone()
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
@@ -400,6 +428,28 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
     assert!(stderr(&o).contains("security_invoker"), "{}", stderr(&o));
     assert!(!plan.exists());
     on_server(connection, "ALTER VIEW app.v RESET (security_invoker)");
+    // A comment is carried state the module precondition itself checks, not
+    // an introspection limitation that an earlier guard could refuse instead.
+    on_server(
+        connection,
+        "COMMENT ON VIEW app.v IS 'preserve this review note'",
+    );
+    refuses_connected_check_json(
+        &d,
+        connection,
+        "before_a_rebuild (PostgreSQL)",
+        "preserve this review note",
+    );
+    assert!(!plan.exists());
+    on_server(connection, "COMMENT ON VIEW app.v IS NULL");
+    let check = passed_connected_check_json(&d, connection, "before_a_rebuild");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 module rebuild"),
+        "{check}"
+    );
     succeeds(d.run(&planning));
 
     let staged = d.run(&["plan", "--db", connection, "--staged"]);
@@ -628,7 +678,17 @@ fn grantless_cluster_role_additions_and_removals_update_the_recorded_scope() {
         "{}",
         stderr(&missing)
     );
+    refuses_connected_check_json(&d, connection, "missing_roles (PostgreSQL)", &role.1);
+    assert!(!plan.exists());
     on_server(&server, &format!("CREATE ROLE {}", role.1));
+    let check = passed_connected_check_json(&d, connection, "missing_roles");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 incoming or renamed"),
+        "{check}"
+    );
     succeeds(d.run(&planning));
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
@@ -785,12 +845,21 @@ fn completed_cluster_role_renames_are_pinned_and_recorded_without_role_sql() {
         assert!(stderr(&o).contains("ALTER ROLE"), "{}", stderr(&o));
     };
     refused(d.run(&planning)); // NotRunYet
+    refuses_connected_check_json(&d, connection, "rename_evidence (PostgreSQL)", "ALTER ROLE");
     on_server(&server, &format!("CREATE ROLE {new}"));
     refused(d.run(&planning)); // BothPresent
     on_server(&server, &format!("DROP ROLE {new}"));
     on_server(&server, &format!("ALTER ROLE {old} RENAME TO {parked}"));
     refused(d.run(&planning)); // NeitherPresent
     on_server(&server, &format!("ALTER ROLE {parked} RENAME TO {new}"));
+    let check = passed_connected_check_json(&d, connection, "rename_evidence");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 external cluster-role rename"),
+        "{check}"
+    );
     succeeds(d.run(&planning)); // Done; no SQL is needed to move the grants.
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();

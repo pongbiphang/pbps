@@ -680,13 +680,26 @@ pub fn refuse_missing_cluster_roles(driver: Driver, missing: &[String]) -> anyho
 
 /// Cluster-owned identities move before pbps plans their database grants.
 /// SQL Server moves its database roles through the typed statements instead.
+pub struct ExternalRoleRenames {
+    pub renames: BTreeMap<String, String>,
+    pub check: ConnectedCheck,
+}
+
 pub async fn external_role_renames(
     conn: &mut Conn,
     recorded: &pbps_model::IdsFile,
     declared: &pbps_model::IdsFile,
-) -> anyhow::Result<BTreeMap<String, String>> {
+) -> anyhow::Result<ExternalRoleRenames> {
     match conn.driver() {
-        Driver::Mssql => Ok(BTreeMap::new()),
+        Driver::Mssql => Ok(ExternalRoleRenames {
+            renames: BTreeMap::new(),
+            check: ConnectedCheck {
+                name: "rename_evidence",
+                engine: "SQL Server",
+                status: "not_applicable",
+                message: "SQL Server renames database roles through the typed plan; external cluster-role rename evidence does not apply".into(),
+            },
+        }),
         Driver::Postgres => {
             let mut renames = BTreeMap::new();
             for (uid, from) in &recorded.roles {
@@ -695,11 +708,57 @@ pub async fn external_role_renames(
                 };
                 let evidence = pbps_pg::roles::rename_evidence(conn, from, to).await?;
                 if let Some(error) = pbps_pg::roles::refuse_rename(from, to, evidence) {
-                    return Err(error.into());
+                    anyhow::bail!("rename_evidence (PostgreSQL): {error}");
                 }
                 renames.insert(from.clone(), to.clone());
             }
-            Ok(renames)
+            let check = ConnectedCheck {
+                name: "rename_evidence",
+                engine: "PostgreSQL",
+                status: "passed",
+                message: format!("{} external cluster-role rename(s) confirmed complete", renames.len()),
+            };
+            Ok(ExternalRoleRenames { renames, check })
+        }
+    }
+}
+
+/// Reconcile only incoming and renamed cluster roles against the same read
+/// used for the baseline checksum. A second presence query could approve a
+/// role that arrived after that read, while the saved baseline still lacks it.
+pub fn reconcile_cluster_roles(
+    driver: Driver,
+    recorded: &pbps_model::IdsFile,
+    queried: &pbps_model::IdsFile,
+    renames: &BTreeMap<String, String>,
+    live: &Schema,
+    expected: &mut Schema,
+) -> anyhow::Result<ConnectedCheck> {
+    match driver {
+        Driver::Mssql => Ok(ConnectedCheck {
+            name: "missing_roles",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server creates and renames database roles through the typed plan; the external cluster-role presence check does not apply".into(),
+        }),
+        Driver::Postgres => {
+            let mut checked = 0;
+            for to in queried.roles.values().filter(|name| {
+                renames.values().any(|to| to == *name)
+                    || !recorded.roles.values().any(|old| old == *name)
+            }) {
+                let Some(role) = live.roles.get(to) else {
+                    anyhow::bail!("missing_roles (PostgreSQL): declared cluster role `{to}` is missing; create or rename it first, then plan again");
+                };
+                expected.roles.insert(to.clone(), role.clone());
+                checked += 1;
+            }
+            Ok(ConnectedCheck {
+                name: "missing_roles",
+                engine: "PostgreSQL",
+                status: "passed",
+                message: format!("{checked} incoming or renamed cluster role(s) present in the queried baseline"),
+            })
         }
     }
 }
@@ -754,25 +813,36 @@ pub async fn check_module_rebuilds(
     conn: &mut Conn,
     changes: &ChangeSet,
     after: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
-        Driver::Mssql => Ok(()),
+        Driver::Mssql => Ok(ConnectedCheck {
+            name: "before_a_rebuild",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server uses CREATE OR ALTER to retain module state; the PostgreSQL drop/recreate check does not apply".into(),
+        }),
         Driver::Postgres => {
-            for (id, (before_kind, after_kind)) in rebuilt_modules(changes) {
+            let rebuilt = rebuilt_modules(changes);
+            for (id, (before_kind, after_kind)) in &rebuilt {
                 let found = pbps_pg::modules::before_a_rebuild(
                     conn,
-                    &id,
-                    if after { after_kind } else { before_kind },
+                    id,
+                    if after { *after_kind } else { *before_kind },
                 )
                 .await?;
                 if let Some(reason) = found.refusal() {
-                    anyhow::bail!("{reason}");
+                    anyhow::bail!("before_a_rebuild (PostgreSQL): {reason}");
                 }
                 if !after && let pbps_pg::modules::Serialized::Not(reason) = found.serialized {
                     eprintln!("warning: {id}: {reason}");
                 }
             }
-            Ok(())
+            Ok(ConnectedCheck {
+                name: "before_a_rebuild",
+                engine: "PostgreSQL",
+                status: "passed",
+                message: format!("{} module rebuild(s) checked for catalog state a replacement cannot preserve", rebuilt.len()),
+            })
         }
     }
 }

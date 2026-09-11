@@ -697,6 +697,13 @@ environment at once: last apply, git sha, drift state, last verified. It is a
 report and not a gate — it exits `0` whatever it finds (see the contract
 above), so a watch built on it reads the JSON.
 
+Connected planning names `missing_roles` (incoming/renamed cluster-role
+presence in the queried baseline), `rename_evidence` (completed external role
+renames), and `before_a_rebuild` (module state a replacement cannot preserve).
+Their success results include the checked scope; their refusals use the same
+JSON findings envelope. SQL Server names these PostgreSQL-specific checks as
+`not_applicable`, since it uses database-role DDL and CREATE OR ALTER.
+
 Connected planning also reports `drop_blockers` in `data.connected_checks`.
 On PostgreSQL, table and column drops are checked against current catalog
 dependencies, accounting for dependents removed earlier by the plan. A blocker

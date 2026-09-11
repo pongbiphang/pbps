@@ -3332,7 +3332,7 @@ pub fn cmd_plan_db(
         refuse_mid_deployment(&entry, &target.label)?;
         let role_renames =
             crate::engine::external_role_renames(&mut conn, &entry.snapshot.ids, &resolved.ids)
-                .await?;
+                .await?.renames;
         let recorded_snapshot = entry.snapshot.clone();
         rename_snapshot_roles(&mut entry.snapshot, &role_renames);
         let recorded_ids = role_scope(&entry.snapshot.ids, &resolved.ids, dialect.as_ref());
@@ -3447,15 +3447,10 @@ pub fn cmd_plan_db(
         // principal must be planned onto the new one, not rejected as drift.
         // Newly managed roles also start from their actual grants. Both sets
         // remain in the pinned baseline and the differ's input (421).
-        for to in recorded_ids.roles.values().filter(|name| {
-            role_renames.values().any(|to| to == *name)
-                || !recorded_snapshot.ids.roles.values().any(|old| old == *name)
-        }) {
-            let Some(role) = as_recorded.roles.get(to) else {
-                bail!("declared cluster role `{to}` is missing; create or rename it first, then plan again");
-            };
-            expected.roles.insert(to.clone(), role.clone());
-        }
+        let missing_roles = crate::engine::reconcile_cluster_roles(
+            conn.driver(), &recorded_snapshot.ids, &recorded_ids, &role_renames,
+            &as_recorded, &mut expected,
+        )?;
         let recorded = pbps_model::state_checksum(&expected, &recorded_ids);
         if live != recorded {
             bail!(
@@ -3536,14 +3531,15 @@ pub fn cmd_plan_db(
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
         conn.begin(dialect.transaction_framing()).await?;
         let checks = async {
-            crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
-                .await?;
-            crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
-            crate::engine::check_drop_blockers(&mut conn, &cs).await
+            let rename_evidence = crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
+                .await?.check;
+            let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
+            let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
+            Ok::<_, anyhow::Error>((rename_evidence, rebuilds, drops))
         }
         .await;
         let rollback = conn.rollback(dialect.transaction_framing()).await;
-        let drop_blockers = checks?;
+        let (rename_evidence, rebuilds, drop_blockers) = checks?;
         rollback?;
 
         // The keys were matched to the rows under the type the key column has
@@ -3684,7 +3680,7 @@ pub fn cmd_plan_db(
             cs,
             baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
-            vec![permission_support, drop_blockers],
+            vec![permission_support, drop_blockers, missing_roles, rename_evidence, rebuilds],
             findings,
             cost,
         ))
@@ -4194,7 +4190,9 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     };
     refuse_mid_deployment(&entry, &target.label)?;
     let original_ids = entry.snapshot.ids.clone();
-    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
+        .await?
+        .renames;
     if plan.changes.is_empty() && original_ids.roles == plan.ids.roles {
         return Ok(None);
     }
@@ -4395,7 +4393,9 @@ async fn apply_staged_under_lock(
     };
 
     let original_ids = entry.snapshot.ids.clone();
-    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
+        .await?
+        .renames;
     rename_snapshot_roles(&mut entry.snapshot, &role_renames);
 
     // Both branches read once and hand back what they validated: the

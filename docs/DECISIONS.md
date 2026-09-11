@@ -9163,3 +9163,20 @@ SPEC is in sync with all of these.
     refusal and with valid earlier removal; CLI tests pin refusal before a
     saved artifact or DDL; failed applies retain their ordinary failed-attempt
     audit entry without recording a successful deployment (#254, #305).
+
+432. **Connected role and rebuild checks report their actual checked scope.**
+    The engine facade returns a named capability result with completed cluster
+    role rename evidence and module rebuild checks. Connected planning includes
+    these results in the same human/JSON check list as permission support and
+    table/column drop impact. PostgreSQL refusals name the check; SQL Server
+    names its different mechanism as inapplicable: database-role DDL and
+    CREATE OR ALTER do not need PostgreSQL's external-role or rebuild evidence.
+
+    Incoming/renamed cluster-role presence is reconciled in the facade from
+    the same queried schema used for the baseline checksum. It is not asked
+    again against a potentially different catalog, and the reported count is
+    only that checked scope. The prior behavior for an unchanged recorded role
+    remains the separate baseline-absence question in #312. The role rename
+    map and its successful report travel together; a failed check produces no
+    success report. CLI regressions pin named JSON refusals and successful
+    answers for all three existing checks, alongside their apply paths (#305).
