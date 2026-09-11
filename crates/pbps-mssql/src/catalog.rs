@@ -38,6 +38,18 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
    AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
  ORDER BY s.name, t.name;";
 
+fn tables_query(product_version: &str, edition: &str) -> String {
+    let major = product_version
+        .split('.')
+        .next()
+        .and_then(|v| v.parse::<u32>().ok());
+    if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 13) {
+        TABLES.replace("t.temporal_type", "CONVERT(tinyint, 0) AS temporal_type")
+    } else {
+        TABLES.to_owned()
+    }
+}
+
 const COLUMNS: &str = "\
 SELECT c.object_id, c.name, ty.name AS type_name,
        c.max_length, c.precision, c.scale, c.is_nullable, c.is_computed,
@@ -191,7 +203,20 @@ pub(crate) fn opt<'a, T: FromColumn<'a>>(row: &'a Row, col: &str) -> Result<Opti
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     let mut raw = RawCatalog::default();
 
-    for row in conn.query(TABLES).await? {
+    // Temporal metadata arrived in 2016; merely referencing the column fails
+    // on older servers. Azure's 12.x banner is not SQL Server 2014, and an
+    // unreadable version must not silently classify temporal tables as plain.
+    let versions = conn
+        .query(
+            "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
+                CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition;",
+        )
+        .await?;
+    let version = versions
+        .first()
+        .ok_or_else(|| DbError::BadRow("the server version query returned no row".into()))?;
+    let tables = tables_query(get(version, "version")?, get(version, "edition")?);
+    for row in conn.query(&tables).await? {
         raw.tables.push(RawTable {
             object_id: get(&row, "object_id")?,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
@@ -798,6 +823,23 @@ pub async fn misspelt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_servers_are_not_asked_for_a_temporal_catalog_column() {
+        for version in ["10.50.6000.34", "11.0.7001.0", "12.0.6024.0"] {
+            let query = tables_query(version, "Developer Edition");
+            assert!(!query.contains("t.temporal_type"), "{query}");
+            assert!(query.contains("CONVERT(tinyint, 0) AS temporal_type"));
+        }
+        for (version, edition) in [
+            ("13.0.1601.5", "Developer Edition"),
+            ("17.0.4075.5", "Developer Edition"),
+            ("12.0.2000.8", "SQL Azure"),
+            ("unknown", "Developer Edition"),
+        ] {
+            assert!(tables_query(version, edition).contains("t.temporal_type"));
+        }
+    }
 
     /// An engine without a view answers with the classes it has; one with
     /// every view is asked about every class.
