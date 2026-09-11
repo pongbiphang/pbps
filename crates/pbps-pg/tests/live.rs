@@ -7060,6 +7060,111 @@ async fn a_module_dropped_between_the_scan_and_the_deparse_says_the_catalog_move
     );
 }
 
+/// A constraint the catalog scan saw and the deparse could not — the same
+/// shape as the module test above, on `pg_get_constraintdef` instead of
+/// `pg_get_viewdef`/`pg_get_functiondef` (issue #357). This one shipped: it
+/// failed CI on an unrelated PR because the constraint branch read the
+/// deparsed-away `NULL` with the required-column accessor instead of routing
+/// it through [`deparsed_away`] like the module branch already did.
+///
+/// [`crate::catalog::introspect_within_transaction`], not
+/// [`crate::catalog::introspect`]. **Measured**, twice, with a controlled
+/// race (one statement, a `pg_sleep` before the deparse, a concurrent drop
+/// landing during the sleep): under `introspect`'s own `REPEATABLE READ`,
+/// `pg_get_constraintdef` still answered with the *pre-drop* definition — a
+/// repeatable-read transaction's syscache lookups stay tied to its own
+/// snapshot, so a plain pull cannot observe this race at all, no matter how
+/// long the deparse or how much concurrent churn. Under the caller's
+/// ordinary `READ COMMITTED` — [`crate::catalog::introspect_within_transaction`]'s
+/// own terms, and the scope of the CI failure this issue records
+/// (`a_read_back_inside_the_callers_transaction_sees_its_uncommitted_build`)
+/// — the same probe answered `NULL`. That is the case this test drives.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_constraint_dropped_between_the_scan_and_the_deparse_says_the_catalog_moved() {
+    let mut conn = connect().await;
+    // The deparser answers `NULL` for an oid that is not there rather than
+    // raising, exactly like the two `pg_get_*def` calls the module test
+    // checks — this is the third one #357's evidence names.
+    assert!(
+        truth(
+            &mut conn,
+            "SELECT pg_catalog.pg_get_constraintdef(999999::oid) IS NULL"
+        )
+        .await,
+        "pg_get_constraintdef must answer NULL for an oid that is gone"
+    );
+
+    // One table, many `CHECK` constraints, dropped one at a time. One table
+    // rather than many: what the race needs is many `pg_constraint` rows for
+    // one statement to scan and deparse, and `ALTER TABLE ... DROP
+    // CONSTRAINT` does not need a second table to land on.
+    const CONSTRAINTS: usize = 300;
+    let s = emit_schema("vanishing_constraints");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TABLE {s}.t (a int)"))
+        .await
+        .expect("a table");
+    for n in 0..CONSTRAINTS {
+        conn.execute(&format!(
+            "ALTER TABLE {s}.t ADD CONSTRAINT c{n} CHECK (a <> -{})",
+            n + 1_000_000
+        ))
+        .await
+        .expect("a constraint");
+    }
+
+    // The caller's own transaction: ordinary `READ COMMITTED`, exactly as
+    // [`crate::catalog::introspect_within_transaction`]'s own documentation
+    // requires and as the production failure this issue records used it.
+    conn.execute("BEGIN")
+        .await
+        .expect("the caller's own transaction");
+
+    let churn_schema = s.clone();
+    let churn = tokio::spawn(async move {
+        let mut churner = connect().await;
+        for n in 0..CONSTRAINTS {
+            churner
+                .execute(&format!(
+                    "ALTER TABLE {churn_schema}.t DROP CONSTRAINT c{n}"
+                ))
+                .await
+                .expect("drop one constraint");
+        }
+    });
+
+    let mut caught = 0usize;
+    let mut pulls = 0usize;
+    while !churn.is_finished() {
+        pulls += 1;
+        if let Err(e) = pbps_pg::catalog::introspect_within_transaction(&mut conn).await {
+            let message = e.to_string();
+            assert!(
+                !message.contains("gone out of step"),
+                "a vanished constraint is not a reader out of step with its query: {message}"
+            );
+            assert!(
+                message.contains("the catalog changed while it was being read"),
+                "the pull failed for a reason this test does not cause: {message}"
+            );
+            caught += 1;
+        }
+    }
+    churn.await.expect("the churner finished");
+    conn.execute("ROLLBACK").await.expect("rollback");
+    drop_schema(&mut conn, &s).await;
+
+    // Asserted to have fired, for the same reason the module test asserts it:
+    // a test that can pass without reaching the case is one that will go on
+    // passing when the case breaks.
+    assert!(
+        caught > 0,
+        "{pulls} pulls ran and none of them overlapped a drop; the fixture has stopped \
+         reaching the case it exists for"
+    );
+}
+
 /// The routine half of "the identity and the body both carry it, and the
 /// engine accepts the disagreement without a word".
 ///
