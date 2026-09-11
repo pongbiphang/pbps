@@ -4271,6 +4271,9 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             crate::engine::Read::InsideOwnTransaction,
         )
         .await?;
+        refuse_recreated_tables(&plan.changes, &after.unmanaged).map_err(|e| {
+            anyhow::anyhow!("{e:#}\n\nNothing has been applied — the transaction was rolled back.")
+        })?;
         // Everything this plan does not touch has to be what the baseline
         // held, down to the rows of a table it does touch that no change of
         // it names (DECISIONS 150, 153). The read above is what gets
@@ -4693,6 +4696,15 @@ async fn apply_staged_under_lock(
         crate::engine::Read::Snapshot,
     )
     .await?;
+    refuse_recreated_tables(&plan.changes, &after.unmanaged).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}\n\n\
+             All {total} statement(s) completed, but the staged deployment cannot close. \
+             Nothing was rolled back; the ledger retains the last checkpoint. \
+             Remove the recreated table and run `pbps apply --staged --resume`, \
+             or accept the database with `pbps baseline --reason ...` and plan from there."
+        )
+    })?;
     // And the last window of all: between the final checkpoint and this read.
     // Refused *before* the ordinary entry is written, because that entry is
     // what says the deployment finished — leaving the environment on its last
@@ -4748,6 +4760,28 @@ enum StagedRead {
     Checkpoint { completed: usize, total: usize },
     /// The read after the last checkpoint, which becomes the closing entry.
     Closing { total: usize },
+}
+
+/// Ids follow a renamed table and omit a dropped one, so a recreated name
+/// falls outside the managed schema. Its absence remains a plan promise
+/// (SPEC §7.6). Use the same read's inventory without adopting unrelated
+/// unmanaged tables into the guard (SPEC §8.2); the net promise also permits
+/// a plan that deliberately reuses a name.
+fn refuse_recreated_tables(
+    changes: &pbps_model::ChangeSet,
+    unmanaged: &[TableName],
+) -> anyhow::Result<()> {
+    let expected: BTreeMap<_, _> = changes
+        .changes
+        .iter()
+        .flat_map(|change| change.change.tables_after())
+        .collect();
+    for (name, presence) in expected {
+        if presence == pbps_model::Presence::Absent && unmanaged.contains(name) {
+            anyhow::bail!("{name} is still there, and this plan removes it");
+        }
+    }
+    Ok(())
 }
 
 /// A checkpoint spans one emitted statement, not the whole logical rename.

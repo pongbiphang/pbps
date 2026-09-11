@@ -2858,3 +2858,143 @@ fn a_staged_schema_transfer_does_not_hide_an_unplanned_column_at_the_intermediat
         0
     );
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_rename_refuses_a_recreated_source_even_when_resuming_only_the_closing_read() {
+    let own = OwnDatabase::new(&server(), "invariant_recreated_source");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-recreated-source", ONE_COLUMN);
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.recreate_source() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.t') IS NOT NULL AND to_regclass('app.t') IS NULL THEN
+            CREATE TABLE app.t (impostor text);
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER recreate_source ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.recreate_source();
+    "#,
+    );
+    for resume in [false, true] {
+        let mut flags = vec!["--allow", "rename", "--staged"];
+        if resume {
+            flags.push("--resume");
+        }
+        let refused = approved_apply(&d, connection, &plan, &flags);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+        let checkpoint = latest_snapshot(connection);
+        assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 2);
+        assert!(
+            checkpoint
+                .schema
+                .tables
+                .contains_key(&"moved.u".parse().unwrap())
+        );
+        assert!(
+            !checkpoint
+                .schema
+                .tables
+                .contains_key(&"app.t".parse().unwrap())
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            0
+        );
+    }
+    // An unrelated unmanaged table does not become drift when the source is repaired.
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER recreate_source; DROP TABLE app.t; CREATE TABLE witness.unrelated (id bigint)",
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--staged", "--resume"],
+    ));
+    assert_eq!(
+        latest_snapshot(connection).kind,
+        pbps_model::StateKind::Apply
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_transactional_rename_rolls_back_when_a_trigger_recreates_its_source() {
+    let own = OwnDatabase::new(&server(), "invariant_recreated_transaction");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "invariant-recreated-transaction", ONE_COLUMN);
+    on_server(
+        connection,
+        "CREATE SCHEMA moved; CREATE SCHEMA witness; INSERT INTO app.t VALUES (42)",
+    );
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, false);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.recreate_source() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.t') IS NOT NULL AND to_regclass('app.t') IS NULL THEN
+            CREATE TABLE app.t (impostor text);
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER recreate_source ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.recreate_source();
+    "#,
+    );
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "rename"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM app.t WHERE id = 42"),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid IN (to_regclass('moved.t'), to_regclass('moved.u'))"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+        ),
+        0
+    );
+    assert_eq!(
+        latest_snapshot(connection).kind,
+        pbps_model::StateKind::Failed
+    );
+    on_server(connection, "DROP EVENT TRIGGER recreate_source");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
