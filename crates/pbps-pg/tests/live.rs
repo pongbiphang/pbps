@@ -136,24 +136,31 @@ async fn a_refused_socket_names_the_address_it_could_not_reach() {
     }
 }
 
-/// A firewall that drops rather than refuses is the case an unbounded connect
-/// waits out the OS retry for. It has to end in a bounded time and say so.
+/// A socket that accepts nothing and whose accept queue is full, so the
+/// kernel drops every further SYN.
 ///
 /// The black hole is built here rather than found on the network. A reserved
 /// address is not one: `203.0.113.1` dropped the first SYN of a run and then
 /// answered `EHOSTUNREACH` for every later one, because the kernel caches the
-/// ICMP unreachable — the test passed once and failed on re-run, which is the
-/// worst of both answers. A listening socket whose accept queue is full drops
-/// the SYN every time instead, and needs no route and no privilege.
+/// ICMP unreachable — a test built on it passed once and failed on re-run,
+/// which is the worst of both answers. A listening socket whose accept queue
+/// is full drops the SYN every time instead, and needs no route and no
+/// privilege.
 ///
 /// Linux-only for that reason: this is Linux's overflow behaviour with
 /// `tcp_abort_on_overflow` at its default of 0. Windows sends an RST, which is
-/// the *refused* category, so the test is absent there rather than asserting
-/// something the platform does not do.
+/// the *refused* category, so every test built on this is absent there rather
+/// than asserting something the platform does not do.
+///
+/// The listener and the queued connections are handed back with the address:
+/// dropping either would close the port, and a closed port **refuses**
+/// instead of dropping.
 #[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
+async fn black_hole() -> (
+    std::net::SocketAddr,
+    tokio::net::TcpListener,
+    Vec<tokio::net::TcpStream>,
+) {
     // Backlog 1, and nothing ever accepts: once the queue is full the kernel
     // stops answering SYNs altogether.
     let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
@@ -183,6 +190,16 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
         !queued.is_empty(),
         "the queue never accepted anything, so it was never full"
     );
+    (addr, listener, queued)
+}
+
+/// A firewall that drops rather than refuses is the case an unbounded connect
+/// waits out the OS retry for. It has to end in a bounded time and say so.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
+    let (addr, _listener, _queued) = black_hole().await;
 
     let started = std::time::Instant::now();
     let error = refusal(&format!(
@@ -192,7 +209,16 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
     ))
     .await;
     match &error {
-        DbError::ConnectTimeout { addr: reported } => assert_eq!(*reported, addr.to_string()),
+        // `after` is new (issue #113): this string sets no `connect_timeout`,
+        // so the budget that ran out has to be the unconditional ceiling, not
+        // merely *some* duration.
+        DbError::ConnectTimeout {
+            addr: reported,
+            after,
+        } => {
+            assert_eq!(*reported, addr.to_string());
+            assert_eq!(*after, pbps_db::CONNECT_TIMEOUT);
+        }
         DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::Driver { .. }
@@ -203,6 +229,46 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
     assert!(
         waited >= pbps_db::CONNECT_TIMEOUT && waited < pbps_db::CONNECT_TIMEOUT * 2,
         "the timeout has to bound the wait, not merely follow it: {waited:?}"
+    );
+}
+
+/// `connect_timeout` smaller than the 30s ceiling is honoured, not silently
+/// replaced by it — the same dropped-SYN black hole as the test above, but
+/// with `connect_timeout=1` in the string. A `ConnectTimeout` that names a 1s
+/// budget and arrives in around a second rather than around thirty proves the
+/// connection string's own value was the one actually spent (issue #113).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling() {
+    let (addr, _listener, _queued) = black_hole().await;
+
+    let started = std::time::Instant::now();
+    let error = refusal(&format!(
+        "host={} port={} user=postgres connect_timeout=1",
+        addr.ip(),
+        addr.port()
+    ))
+    .await;
+    match &error {
+        DbError::ConnectTimeout {
+            addr: reported,
+            after,
+        } => {
+            assert_eq!(*reported, addr.to_string());
+            assert_eq!(*after, std::time::Duration::from_secs(1));
+        }
+        DbError::BadConnectionString(_)
+        | DbError::Connect { .. }
+        | DbError::Driver { .. }
+        | DbError::WrongSession { .. }
+        | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited < pbps_db::CONNECT_TIMEOUT,
+        "a 1s connect_timeout must give up long before the 30s ceiling the \
+         string never asked for: {waited:?}"
     );
 }
 

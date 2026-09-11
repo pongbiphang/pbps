@@ -55,9 +55,17 @@ pub enum DbError {
     #[error(
         "`{addr}` did not answer within {}s.\n\
          The host is unreachable or a firewall is dropping the connection rather than refusing it.",
-        CONNECT_TIMEOUT.as_secs()
+        after.as_secs()
     )]
-    ConnectTimeout { addr: String },
+    ConnectTimeout {
+        addr: String,
+        /// The budget that ran out. Usually [`CONNECT_TIMEOUT`], but a
+        /// PostgreSQL connection string may ask for a smaller one (issue
+        /// #113) — carried per instance rather than read from the constant,
+        /// or the message would claim a budget larger than the one that was
+        /// actually spent.
+        after: std::time::Duration,
+    },
 
     /// The driver reported a failure — the server refused the statement, or
     /// the protocol broke.
@@ -134,8 +142,8 @@ impl DbError {
 /// run.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Opens a TCP socket to `addr`, bounded by [`CONNECT_TIMEOUT`], giving every
-/// address the name resolves to a chance inside that budget.
+/// Opens a TCP socket to `addr`, bounded by `budget`, giving every address the
+/// name resolves to a chance inside it.
 ///
 /// One place, used by both drivers, because "there is a network" is this
 /// crate's and neither driver's — and because the bug this shape had was the
@@ -150,18 +158,30 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// project puts first.
 ///
 /// The budget is divided as it is spent — each attempt gets what is left,
-/// divided by how many addresses are left — so the total is still
-/// [`CONNECT_TIMEOUT`] however many addresses there are, an address that
-/// refuses at once hands its share to the rest, and the last one gets whatever
-/// remains. Fixed shares would have made a slow-but-answering server fail
-/// behind a dead one.
-pub(crate) async fn open_socket(addr: &str) -> Result<tokio::net::TcpStream, DbError> {
+/// divided by how many addresses are left — so the total is still `budget`
+/// however many addresses there are, an address that refuses at once hands its
+/// share to the rest, and the last one gets whatever remains. Fixed shares
+/// would have made a slow-but-answering server fail behind a dead one.
+///
+/// `budget` is [`CONNECT_TIMEOUT`] for every caller except the PostgreSQL
+/// driver, which may ask for less: see `postgres::connect_budget` for why a
+/// larger request is refused rather than silently capped (issue #113).
+///
+/// `shuffle` reorders the resolved addresses before any of them is tried —
+/// PostgreSQL's `load_balance_hosts=random`, the one connection-string setting
+/// that changes address *order* rather than a socket option. SQL Server has no
+/// such setting, so its caller always passes `false`.
+pub(crate) async fn open_socket(
+    addr: &str,
+    budget: std::time::Duration,
+    shuffle: bool,
+) -> Result<tokio::net::TcpStream, DbError> {
     let started = tokio::time::Instant::now();
 
     // Resolution is inside the budget too: a DNS server that does not answer is
     // one of the ways an endpoint fails to be reachable.
     let addresses: Vec<std::net::SocketAddr> =
-        match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(addr)).await {
+        match tokio::time::timeout(budget, tokio::net::lookup_host(addr)).await {
             Ok(Ok(found)) => found.collect(),
             Ok(Err(source)) => {
                 return Err(DbError::Connect {
@@ -172,6 +192,7 @@ pub(crate) async fn open_socket(addr: &str) -> Result<tokio::net::TcpStream, DbE
             Err(_elapsed) => {
                 return Err(DbError::ConnectTimeout {
                     addr: addr.to_owned(),
+                    after: budget,
                 });
             }
         };
@@ -186,10 +207,59 @@ pub(crate) async fn open_socket(addr: &str) -> Result<tokio::net::TcpStream, DbE
             ),
         });
     }
-    let left = CONNECT_TIMEOUT
-        .checked_sub(started.elapsed())
-        .unwrap_or_default();
-    connect_any(addr, addresses, left).await
+    let addresses = order_addresses(addresses, shuffle, &mut rand::rng());
+    let left = budget.checked_sub(started.elapsed()).unwrap_or_default();
+    // `after: budget` here, not `left` — DECISIONS 232's own budget-division
+    // rule turned against a first draft of this function: `connect_any` only
+    // knows the share of the budget resolution left it (`left`), which is
+    // always a little less than `budget` — even a numeric address resolves in
+    // some nonzero time — and `Duration::as_secs()` truncates rather than
+    // rounds, so reporting `left` could read a whole second short of what was
+    // actually asked for. Caught by the live suite on this branch's first
+    // run (`29.999979671s` reported where the string asked for `30s`), fixed
+    // by reporting what the caller asked for — `budget` — rather than what
+    // one sub-step of it was left holding.
+    connect_any(addr, addresses, left)
+        .await
+        .map_err(|error| match error {
+            DbError::ConnectTimeout { addr, .. } => DbError::ConnectTimeout {
+                addr,
+                after: budget,
+            },
+            // Enumerated rather than wildcarded, same as `DbError::server_error_code`:
+            // `connect_any` in fact returns only `Connect` or `ConnectTimeout`, but
+            // the compiler does not know that from the return type, and a variant
+            // added later must be looked at here rather than silently pass through.
+            error @ (DbError::BadConnectionString(_)
+            | DbError::Connect { .. }
+            | DbError::Driver { .. }
+            | DbError::WrongSession { .. }
+            | DbError::BadRow(_)) => error,
+        })
+}
+
+/// Reorders the resolved addresses when the connection string asked for it,
+/// before [`connect_any`] tries any of them.
+///
+/// `tokio-postgres`'s own `connect_host` does the same thing to the same
+/// list — `addrs.shuffle(&mut rand::rng())` over the `Vec<SocketAddr>`
+/// `lookup_host` returned — right before trying each in turn. `Disable` (the
+/// default, and the only option SQL Server's ADO.NET strings have no
+/// equivalent of) leaves resolution order alone.
+///
+/// `rng` is a parameter rather than `rand::rng()` called inside, so a test can
+/// hand it a seeded one and assert the exact permutation instead of only the
+/// multiset.
+fn order_addresses(
+    mut addresses: Vec<std::net::SocketAddr>,
+    shuffle: bool,
+    rng: &mut impl rand::Rng,
+) -> Vec<std::net::SocketAddr> {
+    if shuffle {
+        use rand::seq::SliceRandom;
+        addresses.shuffle(rng);
+    }
+    addresses
 }
 
 /// Tries each address in turn inside one budget, and says which way it failed.
@@ -235,6 +305,7 @@ async fn connect_any(
         }),
         None => Err(DbError::ConnectTimeout {
             addr: addr.to_owned(),
+            after: budget,
         }),
     }
 }
@@ -604,12 +675,10 @@ mod tests {
 
 #[cfg(test)]
 mod socket_tests {
-    // Gated with the tests that use it. Two of the three are Linux-only, and
-    // `-D warnings` turns an import nothing uses into an error — on the other
-    // platform only, which is a failure this machine cannot see.
-    #[cfg(target_os = "linux")]
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    use rand::SeedableRng;
 
     use super::*;
 
@@ -718,5 +787,45 @@ mod socket_tests {
             .await
             .expect_err("there is nothing to connect to");
         assert!(matches!(error, DbError::ConnectTimeout { .. }), "{error:?}");
+    }
+
+    fn addresses(count: u8) -> Vec<SocketAddr> {
+        (0..count)
+            .map(|i| SocketAddr::from(([127, 0, 0, i], 5432)))
+            .collect()
+    }
+
+    /// `load_balance_hosts`'s default, `Disable`, leaves resolution order
+    /// alone — the shape every caller had before this issue, and the one SQL
+    /// Server's `open_socket` caller still always asks for.
+    #[test]
+    fn disable_preserves_resolution_order() {
+        let resolved = addresses(10);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        assert_eq!(order_addresses(resolved.clone(), false, &mut rng), resolved);
+    }
+
+    /// `Random` reorders the same addresses it was given — not a different
+    /// set, and (measured against a seeded RNG rather than trusted by
+    /// inspection) not always the same order it started in.
+    #[test]
+    fn random_reorders_the_same_addresses_it_was_given() {
+        let resolved = addresses(10);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let shuffled = order_addresses(resolved.clone(), true, &mut rng);
+
+        let mut sorted_shuffled = shuffled.clone();
+        sorted_shuffled.sort();
+        let mut sorted_resolved = resolved.clone();
+        sorted_resolved.sort();
+        assert_eq!(
+            sorted_shuffled, sorted_resolved,
+            "a shuffle must not lose or invent an address: {shuffled:?}"
+        );
+        assert_ne!(
+            shuffled, resolved,
+            "a seeded shuffle of ten addresses that left the order unchanged \
+             is not exercising the shuffle at all"
+        );
     }
 }

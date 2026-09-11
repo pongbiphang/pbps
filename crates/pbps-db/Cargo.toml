@@ -26,6 +26,11 @@ tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
+# Socket-tuning parity with `tokio-postgres`'s own `connect_socket` (issue
+# #113): `SockRef` from `socket2` sets keepalive and `tcp_user_timeout`, and
+# `rand` shuffles the resolved address list for `load_balance_hosts=random`.
+socket2.workspace = true
+rand.workspace = true
 
 # The socket opener's tests need a runtime: they build a black hole out of a
 # listening socket and time the attempts against it.

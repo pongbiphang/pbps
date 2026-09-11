@@ -9236,3 +9236,134 @@ SPEC is in sync with all of these.
     in `pbps-pg`, which pins the guard's own answer over the boundary this
     crate actually wires in (`crate::LEXICON.identifier_continues`) — not
     `build()`'s output, which the paragraph above explains cannot move.
+
+434. **The PostgreSQL seam honours the socket-tuning parameters 231 left open,
+    rather than refusing them.** `keepalives`, `keepalives_idle`,
+    `keepalives_interval`, `keepalives_retries`, `tcp_user_timeout`,
+    `connect_timeout` and `load_balance_hosts` were each neither applied nor
+    refused — the shape PITFALLS calls "a
+    comment that describes a check the code does not make", one level down: no
+    comment even claimed a check here. Refusing them, the other honest option
+    231 named, was rejected because every one of them is a string that
+    connects and works today; refusing a valid input is the failure this
+    project's review rules put first (issue #113).
+
+    `DbError::ConnectTimeout`'s message was `"...did not answer within {}s...",
+    CONNECT_TIMEOUT.as_secs()` — the constant, interpolated at every call site,
+    not a field. The moment a connection string can set its own budget that
+    becomes a false statement: an operator who asked for `connect_timeout=10`
+    and waited 10 seconds would be told the seam waited 30. So the variant
+    gained an `after: Duration` field carried per instance — required to keep
+    the message honest once `connect_timeout` is a real input, not a
+    convenience added for its test. That field is new to this branch, and so
+    was a bug in it: a first draft reported `connect_any`'s own reduced
+    sub-budget (`budget` minus whatever `open_socket`'s DNS resolution had
+    already spent) rather than the original request, which — because
+    `Duration::as_secs()` truncates rather than rounds — read a whole second
+    short of the true budget even for a numeric address resolving in
+    microseconds. The live suite caught it on this branch's first run
+    (`29.999979671s` reported where the string asked for `30s`); the fix
+    reports `budget`, the total the caller actually asked for, rather than the
+    remainder one sub-step of it was left holding.
+
+    `socket2` and `rand` are new direct dependencies of `pbps-db`, and cost
+    nothing `cargo deny` had not already priced: both are already resolved in
+    the tree at the versions named here — `socket2` through `tokio`'s own
+    `net` feature, `rand` through `tokio-postgres`'s `postgres-protocol` — so
+    this adds an edge to an audited node rather than a new one. `cargo deny
+    check` stayed clean before and after, with no new duplicate-version
+    warning. `socket2::SockRef::from(&tcp)` sets keepalive, and
+    `tcp_user_timeout` where the platform honours it, on the socket
+    `pbps_db::open_socket` already opened, after `open_socket` returns and
+    before `connect_raw` takes it — the same place `set_nodelay` already
+    runs, for the same reason: these are socket properties, not session ones.
+    `rand::seq::SliceRandom` shuffles the resolved address list before
+    `connect_any` tries any of it.
+
+    `keepalives` and `keepalives_idle` are applied unconditionally once
+    keepalive is on, because `Config`'s accessors cannot tell "the string set
+    this" from "nobody said" for either of them — applying whatever the
+    accessor returns is correct in both cases, the same value `Config::connect`
+    would have used. `keepalives_interval` and `keepalives_retries` are
+    applied only when `Some`, under the identical `#[cfg]` platform exclusions
+    `tokio-postgres`'s own `keepalive.rs` uses — copied rather than invented,
+    because a platform set either wider or narrower than the driver's stops
+    being parity with it. `tcp_user_timeout` is the one exception to "honour":
+    `TCP_USER_TIMEOUT` does not exist outside Linux, so a request for it
+    elsewhere is refused by name (mirroring `tokio-postgres`'s own
+    `#[cfg(target_os = "linux")]` for the same option) rather than silently
+    dropped — the one parameter of the seven where "honour here, refuse there"
+    is coherent, because the missing thing is the OS feature, not pbps's
+    support for it. That refusal runs in `Conn::connect_as` on the parsed
+    `Config`, beside `endpoint`'s own `hostaddr`/multi-host/Unix-socket
+    refusals and before `open_socket` is ever called — not inside
+    `apply_socket_options`, where a first draft of this fix put it. A review
+    of this PR caught the difference: on a platform that cannot honour
+    `tcp_user_timeout`, a connection string naming it and pointed at an
+    unreachable endpoint would have dialled first and reported the network
+    failure — `Connect` or a `ConnectTimeout` that spent the whole budget —
+    instead of the named configuration refusal this paragraph promises. A
+    string this build will not accept is refused without a network round
+    trip, the same rule `endpoint`'s own refusals already follow, not only
+    when the parameter happens to be one `open_socket` never touches.
+
+    `connect_timeout` is a **ceiling**, not a default: `CONNECT_TIMEOUT`'s own
+    doc comment calls it "short enough that a pipeline blocked by a firewall
+    reports it while someone is still watching" — an operational bound pbps
+    enforces for itself, stated unconditionally, not "the default when the
+    string doesn't say". A request at or below 30s is honoured exactly, fed
+    into `open_socket`/`connect_any` as the shared total budget — 232's own
+    rule, "the budget is divided as it is spent... so the total is still
+    `CONNECT_TIMEOUT` however many [addresses] there are", applied unchanged
+    to a value that now comes from the string instead of the constant. Not
+    `tokio-postgres`'s own per-address-attempt application (its own doc
+    comment: "this timeout will apply to each address of each host
+    separately"), which would let a dual-stack name's `connect_timeout=10`
+    run up to 20s and quietly contradict the number in the string — 232
+    already ruled that shape out for the constant, and nothing about the
+    value coming from a string instead changes the reason. A request above
+    30s is refused by name, naming the ceiling,
+    rather than silently capped — silent capping is the same "neither applied
+    nor refused" shape this decision exists to remove, just relocated instead
+    of fixed. `connect_timeout=0` and a negative value are `tokio_postgres`'s
+    own way of saying "unset" (its string parser only calls the setter for a
+    value greater than zero), so both fall back to the ceiling exactly like
+    saying nothing.
+
+    `load_balance_hosts=random` reorders the same resolved-address list
+    `tokio-postgres`'s own `connect_host` shuffles, before either tries an
+    address — not a socket option, and not refused: unlike `hostaddr` and
+    multiple hosts (229), a string naming it connects and works today, it
+    just distributes nothing without this fix.
+
+    The SQL Server side has no matching gap: `tiberius-ng`'s `Client::connect`
+    takes an already-open stream and never opens a socket itself, and its
+    ADO.NET parser has no keepalive, timeout or load-balancing key to read —
+    checked in the driver source, not assumed. `pbps_db::open_socket`'s
+    `mssql` caller passes `CONNECT_TIMEOUT` and `shuffle: false` unconditionally
+    for that reason.
+
+    Pinned by unit tests in `crates/pbps-db/src/postgres.rs` for the budget
+    ceiling, the zero/negative fallback, `load_balance_hosts`, keepalive
+    on/off, and the `tcp_user_timeout` refusal as a pure function of platform
+    (so the refusal is exercised on every CI runner, not only the ones the
+    real `#[cfg]` excludes); a fifth,
+    `keepalive_settings_land_on_the_real_socket_not_only_the_parsed_config`,
+    asserts the OS's own `SO_KEEPALIVE` and `TCP_KEEPIDLE` state through
+    `SockRef`, not the parsed `Config`. `order_addresses` is pinned directly
+    in `crates/pbps-db/src/lib.rs` for both `Disable` and a seeded `Random`.
+    The ordering fix has its own two:
+    `a_tcp_user_timeout_the_platform_cannot_honour_is_refused_before_any_socket_opens`
+    calls `Conn::connect_as` with `is_linux: false` against a host that is
+    never resolved (RFC 2606 `.invalid`) and a generous `tcp_user_timeout`,
+    and asserts both the refusal's message and that it returns in well under
+    a second — a platform this test can pin without needing to run on
+    Windows for real, the same reason `tcp_user_timeout_disposition` itself
+    takes `is_linux` as a parameter rather than a bare `#[cfg]`; its negative
+    case beside it, naming no `tcp_user_timeout`, still reaches `open_socket`
+    and fails as an ordinary `Connect` against a bound-then-dropped local
+    port, so the ordering fix has not swallowed a genuine network failure
+    into a configuration refusal.
+    The live suite adds a smaller-`connect_timeout` test
+    (`a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling`) beside the
+    existing 30-second black-hole test in `crates/pbps-pg/tests/live.rs`.
