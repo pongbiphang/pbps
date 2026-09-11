@@ -453,12 +453,18 @@ fn columns_query() -> String {
 /// Every constraint of every kind, including the ones this reader does not
 /// know: the assembler decides what to do with each, and a kind it has never
 /// seen is reported rather than dropped in a `WHERE` nobody re-reads.
+///
+/// `schema_name` and `table_name` ride along for [`deparsed_away`]'s sake, not
+/// the assembler's: `RawConstraint` already carries `table_oid`, but the error
+/// path that fires when `pg_get_constraintdef` comes back `NULL` needs a name
+/// an operator can read, and the two joins that produce it are already here.
 fn constraints_query() -> String {
     // These flags arrived in PostgreSQL 18. JSON field lookup can represent
     // their absence on older catalogs without making the SQL fail to parse;
     // pre-18 constraints are enforced and have no temporal period (424).
     format!(
         "SELECT con.conrelid::int8 AS table_oid, con.conname AS name, con.contype::text AS kind,
+            n.nspname AS schema_name, c.relname AS table_name,
             pg_catalog.array_to_string(con.conkey, ',') AS conkey,
             pg_catalog.array_to_string(con.confkey, ',') AS confkey,
             con.confrelid::int8 AS ref_table,
@@ -899,10 +905,23 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         .ok_or_else(|| missing("constraints"))?
     {
         let ref_table = number(row, "ref_table")?;
+        let kind = first_char(&text(row, "kind")?).unwrap_or('?');
+        let schema = text(row, "schema_name")?;
+        let table = text(row, "table_name")?;
+        let name = text(row, "name")?;
+        // Not `text`: a `NULL` here is not a column this reader has lost track
+        // of, and saying so sends the reader to the one place that is right —
+        // the same reasoning as the module branch above, for the same reason
+        // (`pg_get_constraintdef` resolves through the syscache, not the
+        // snapshot). The constraint's own name has no schema of its own, so
+        // the vanished object is named `schema.table.constraint`.
+        let Some(definition) = optional_text(row, "definition")? else {
+            return Err(deparsed_away(kind, &schema, &format!("{table}.{name}")));
+        };
         raw.constraints.push(RawConstraint {
             table_oid: number(row, "table_oid")?,
-            name: text(row, "name")?,
-            kind: first_char(&text(row, "kind")?).unwrap_or('?'),
+            name,
+            kind,
             columns: numbers(&optional_text(row, "conkey")?.unwrap_or_default()),
             ref_columns: numbers(&optional_text(row, "confkey")?.unwrap_or_default()),
             // 0 is `pg_constraint`'s "no referenced table", not an oid.
@@ -912,7 +931,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             validated: flag(row, "validated")?,
             deferrable: flag(row, "deferrable")?,
             deferred: flag(row, "deferred")?,
-            definition: text(row, "definition")?,
+            definition,
             expression: optional_text(row, "expression")?,
             match_type: first_char(&text(row, "match_type")?).unwrap_or(' '),
             delete_set_columns: numbers(
@@ -2072,6 +2091,105 @@ mod tests {
         assert!(!flag(&row, "flag").unwrap());
         assert!(flag(&row, "none").is_err());
         assert!(decode_batch(&CatalogBatch::new()).is_err());
+    }
+
+    /// Every batch key [`decode_batch`] requires, each holding no rows —
+    /// a starting point for a test that cares about exactly one part.
+    fn empty_catalog_batch() -> CatalogBatch {
+        let mut batch = CatalogBatch::new();
+        for part in [
+            "partitioned",
+            "tables",
+            "columns",
+            "constraints",
+            "indexes",
+            "modules",
+            "module_args",
+            "roles",
+            "grants",
+            "routine_args",
+            "other_acls",
+            "held_elsewhere",
+            "default_acls",
+            "unheld_modules",
+        ] {
+            batch.insert(part.to_owned(), Vec::new());
+        }
+        batch
+    }
+
+    /// A whole, otherwise-valid constraint row — every column
+    /// [`RawConstraint`] needs — so that a test varying `definition` alone
+    /// exercises exactly that column, not some other one this fixture left
+    /// out. (An earlier, sparser version of this fixture caught a
+    /// deliberate revert on `conkey` instead, which was true but not the
+    /// point.)
+    ///
+    /// `definition`'s three states are three different facts: `None` is the
+    /// column truly absent from the row (a real reader/query mismatch);
+    /// `Some(None)` is the column present and JSON `null` (the deparser
+    /// answering `NULL` for an oid that is gone); `Some(Some(s))` is an
+    /// ordinary value, for a test that does not care about either.
+    fn bare_constraint_row(definition: Option<Option<&str>>) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "table_oid": 1, "name": "c1", "kind": "c",
+            "schema_name": "s", "table_name": "t",
+            "conkey": "1", "confkey": null, "ref_table": 0,
+            "on_delete": " ", "on_update": " ",
+            "validated": true, "deferrable": false, "deferred": false,
+            "expression": null, "match_type": " ",
+            "delete_set_columns": null, "index_oid": 0,
+            "enforced": true, "period": false, "no_inherit": false,
+            "triggers_not_ordinary": false,
+        });
+        if let Some(def) = definition {
+            row["definition"] = match def {
+                Some(s) => serde_json::json!(s),
+                None => serde_json::Value::Null,
+            };
+        }
+        row
+    }
+
+    /// The constraint branch this issue is about: a `NULL` `pg_get_constraintdef`
+    /// is the constraint having vanished between the scan and the deparse, not
+    /// a row this reader has lost track of. Mirrors the module branch's own
+    /// rule and pins the message an operator sees: which table, which
+    /// constraint, and never "gone out of step" (issue #357).
+    #[test]
+    fn a_constraint_whose_definition_deparsed_away_says_the_catalog_moved() {
+        let mut batch = empty_catalog_batch();
+        batch.insert(
+            "constraints".to_owned(),
+            vec![bare_constraint_row(Some(None))],
+        );
+        let err = decode_batch(&batch).unwrap_err().to_string();
+        assert!(
+            err.contains("the catalog changed while it was being read"),
+            "{err}"
+        );
+        assert!(
+            err.contains("s.t.c1"),
+            "the message must name which constraint on which table vanished: {err}"
+        );
+        assert!(!err.contains("gone out of step"), "{err}");
+    }
+
+    /// The negative case that matters: a column the query genuinely never
+    /// returned — as opposed to one the deparser answered `NULL` — is still a
+    /// real reader/query mismatch, and must still say so. Classifying every
+    /// `NULL` as a vanished object would trade one wrong diagnosis for
+    /// another.
+    #[test]
+    fn a_constraint_row_missing_its_definition_column_entirely_still_reports_missing() {
+        let mut batch = empty_catalog_batch();
+        batch.insert("constraints".to_owned(), vec![bare_constraint_row(None)]);
+        let err = decode_batch(&batch).unwrap_err().to_string();
+        assert!(err.contains("gone out of step"), "{err}");
+        assert!(
+            !err.contains("the catalog changed while it was being read"),
+            "{err}"
+        );
     }
 
     /// The two catalog spellings this file has to read, and the shapes that
