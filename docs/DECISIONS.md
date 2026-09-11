@@ -9272,12 +9272,13 @@ SPEC is in sync with all of these.
     `net` feature, `rand` through `tokio-postgres`'s `postgres-protocol` — so
     this adds an edge to an audited node rather than a new one. `cargo deny
     check` stayed clean before and after, with no new duplicate-version
-    warning. `socket2::SockRef::from(&tcp)` sets keepalive and
-    `tcp_user_timeout` on the socket `pbps_db::open_socket` already opened,
-    after `open_socket` returns and before `connect_raw` takes it — the same
-    place `set_nodelay` already runs, for the same reason: these are socket
-    properties, not session ones. `rand::seq::SliceRandom` shuffles the
-    resolved address list before `connect_any` tries any of it.
+    warning. `socket2::SockRef::from(&tcp)` sets keepalive, and
+    `tcp_user_timeout` where the platform honours it, on the socket
+    `pbps_db::open_socket` already opened, after `open_socket` returns and
+    before `connect_raw` takes it — the same place `set_nodelay` already
+    runs, for the same reason: these are socket properties, not session ones.
+    `rand::seq::SliceRandom` shuffles the resolved address list before
+    `connect_any` tries any of it.
 
     `keepalives` and `keepalives_idle` are applied unconditionally once
     keepalive is on, because `Config`'s accessors cannot tell "the string set
@@ -9293,7 +9294,18 @@ SPEC is in sync with all of these.
     `#[cfg(target_os = "linux")]` for the same option) rather than silently
     dropped — the one parameter of the seven where "honour here, refuse there"
     is coherent, because the missing thing is the OS feature, not pbps's
-    support for it.
+    support for it. That refusal runs in `Conn::connect_as` on the parsed
+    `Config`, beside `endpoint`'s own `hostaddr`/multi-host/Unix-socket
+    refusals and before `open_socket` is ever called — not inside
+    `apply_socket_options`, where a first draft of this fix put it. A review
+    of this PR caught the difference: on a platform that cannot honour
+    `tcp_user_timeout`, a connection string naming it and pointed at an
+    unreachable endpoint would have dialled first and reported the network
+    failure — `Connect` or a `ConnectTimeout` that spent the whole budget —
+    instead of the named configuration refusal this paragraph promises. A
+    string this build will not accept is refused without a network round
+    trip, the same rule `endpoint`'s own refusals already follow, not only
+    when the parameter happens to be one `open_socket` never touches.
 
     `connect_timeout` is a **ceiling**, not a default: `CONNECT_TIMEOUT`'s own
     doc comment calls it "short enough that a pipeline blocked by a firewall
@@ -9340,6 +9352,18 @@ SPEC is in sync with all of these.
     asserts the OS's own `SO_KEEPALIVE` and `TCP_KEEPIDLE` state through
     `SockRef`, not the parsed `Config`. `order_addresses` is pinned directly
     in `crates/pbps-db/src/lib.rs` for both `Disable` and a seeded `Random`.
+    The ordering fix has its own two:
+    `a_tcp_user_timeout_the_platform_cannot_honour_is_refused_before_any_socket_opens`
+    calls `Conn::connect_as` with `is_linux: false` against a host that is
+    never resolved (RFC 2606 `.invalid`) and a generous `tcp_user_timeout`,
+    and asserts both the refusal's message and that it returns in well under
+    a second — a platform this test can pin without needing to run on
+    Windows for real, the same reason `tcp_user_timeout_disposition` itself
+    takes `is_linux` as a parameter rather than a bare `#[cfg]`; its negative
+    case beside it, naming no `tcp_user_timeout`, still reaches `open_socket`
+    and fails as an ordinary `Connect` against a bound-then-dropped local
+    port, so the ordering fix has not swallowed a genuine network failure
+    into a configuration refusal.
     The live suite adds a smaller-`connect_timeout` test
     (`a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling`) beside the
     existing 30-second black-hole test in `crates/pbps-pg/tests/live.rs`.

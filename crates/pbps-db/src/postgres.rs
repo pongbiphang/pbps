@@ -60,6 +60,22 @@ impl Conn {
     /// dropped the connection for thirty seconds would have been reported as a
     /// typo, and review caught it.
     pub(crate) async fn connect(connection_string: &str) -> Result<Self, DbError> {
+        Self::connect_as(connection_string, cfg!(target_os = "linux")).await
+    }
+
+    /// [`connect`]'s body, taking the platform as a parameter rather than
+    /// reading `cfg!(target_os = "linux")` itself.
+    ///
+    /// The one thing this connection string's disposition depends on that
+    /// `endpoint`'s own refusals do not is which platform is running it —
+    /// and a test that can only observe that by actually running on the
+    /// other platform cannot pin the *ordering* this function promises:
+    /// that `tcp_user_timeout` is refused before `open_socket` runs, not
+    /// discovered after (review of issue #113 on PR #346). Passing
+    /// `is_linux` through lets a test simulate either platform here, the
+    /// same reason [`tcp_user_timeout_disposition`] takes it as a
+    /// parameter rather than being `#[cfg]`-gated itself.
+    async fn connect_as(connection_string: &str, is_linux: bool) -> Result<Self, DbError> {
         let config: Config = connection_string
             .parse()
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
@@ -67,6 +83,18 @@ impl Conn {
         let addr = format!("{host}:{port}");
         let budget = connect_budget(&config)?;
         let shuffle = wants_random_order(&config);
+        // `tcp_user_timeout` is the one of the seven socket-tuning parameters
+        // whose disposition depends on the platform this binary runs on, not
+        // on anything `open_socket` could discover — so its refusal belongs
+        // beside `endpoint`'s own `hostaddr`/multi-host/Unix-socket refusals,
+        // before any socket opens, not inside `apply_socket_options` after
+        // one already has. A connection string this build will not accept
+        // must be refused without a network round trip, and certainly
+        // without waiting out `budget` first to learn the endpoint is also
+        // unreachable — a review finding on PR #346 caught this landing
+        // after `open_socket` in an earlier draft (DECISIONS 434).
+        let tcp_user_timeout =
+            tcp_user_timeout_disposition(is_linux, config.get_tcp_user_timeout().copied())?;
 
         // Opening the socket here rather than letting the driver do it is what
         // keeps `Connect` and `ConnectTimeout` apart: the driver opens the
@@ -91,7 +119,7 @@ impl Conn {
         // straight to the PostgreSQL handshake and never asks it anything
         // socket-level; `Config::connect`'s own `connect_socket` is the one
         // place that does, and this seam does not call it (issue #113).
-        apply_socket_options(&tcp, &config, &format!("{host}:{port}"))?;
+        apply_socket_options(&tcp, &config, tcp_user_timeout, &format!("{host}:{port}"))?;
 
         // `connect_raw`, not `connect`: the driver's own `connect` opens the
         // socket, and then the three failures above collapse into its error
@@ -460,7 +488,20 @@ fn tcp_user_timeout_disposition(
 /// and `connect_raw` — the same shape `set_nodelay` already uses a few lines
 /// up, for the same reason: these are properties of the socket, not of the
 /// PostgreSQL session that has not started yet.
-fn apply_socket_options(tcp: &TcpStream, config: &Config, addr: &str) -> Result<(), DbError> {
+///
+/// `tcp_user_timeout` arrives already resolved by `connect`'s own call to
+/// [`tcp_user_timeout_disposition`], made before `open_socket` so an
+/// unsupported request is refused before any I/O rather than discovered
+/// here, after a socket this function is now holding open (review of issue
+/// #113 on PR #346). `Some` on a platform that cannot honour it would mean
+/// `connect` let a refusal through, not something this function should try
+/// to paper over.
+fn apply_socket_options(
+    tcp: &TcpStream,
+    config: &Config,
+    tcp_user_timeout: Option<std::time::Duration>,
+    addr: &str,
+) -> Result<(), DbError> {
     let sock = SockRef::from(tcp);
 
     if let Some(keepalive) = keepalive_settings(config) {
@@ -471,18 +512,20 @@ fn apply_socket_options(tcp: &TcpStream, config: &Config, addr: &str) -> Result<
             })?;
     }
 
-    #[cfg(target_os = "linux")]
-    if let Some(timeout) =
-        tcp_user_timeout_disposition(true, config.get_tcp_user_timeout().copied())?
-    {
+    if let Some(timeout) = tcp_user_timeout {
+        #[cfg(target_os = "linux")]
         sock.set_tcp_user_timeout(Some(timeout))
             .map_err(|source| DbError::Connect {
                 addr: addr.to_owned(),
                 source,
             })?;
+        #[cfg(not(target_os = "linux"))]
+        unreachable!(
+            "`connect` refuses `tcp_user_timeout` before opening a socket on \
+             every platform that cannot honour it, so `Some` cannot reach \
+             this function except on Linux: {timeout:?}"
+        );
     }
-    #[cfg(not(target_os = "linux"))]
-    tcp_user_timeout_disposition(false, config.get_tcp_user_timeout().copied())?;
 
     Ok(())
 }
@@ -869,6 +912,88 @@ mod tests {
         assert!(error.to_string().contains("tcp_user_timeout"), "{error}");
     }
 
+    /// The ordering fix itself: a platform that cannot honour
+    /// `tcp_user_timeout` refuses it before `open_socket` runs, not after —
+    /// a review finding on PR #346 caught an earlier draft doing the second
+    /// one, which meant an unsupported option on an unreachable endpoint was
+    /// reported as a network failure instead of the promised named
+    /// configuration refusal.
+    ///
+    /// `is_linux: false` regardless of the platform actually running this
+    /// test — the point is the *ordering*, which `connect_as` lets a test
+    /// pin without needing to run on the other platform for real. The host
+    /// is `.invalid` (RFC 2606): never resolved, because nothing here
+    /// reaches far enough to resolve it if the refusal runs where it
+    /// should.
+    #[tokio::test]
+    async fn a_tcp_user_timeout_the_platform_cannot_honour_is_refused_before_any_socket_opens() {
+        let started = std::time::Instant::now();
+        // A `match` rather than `expect_err`, because `Conn` has no `Debug` —
+        // a connection is not a value to print (the same reason
+        // `crates/pbps-pg/tests/live.rs`'s `refusal` helper does the same).
+        let error = match Conn::connect_as(
+            "host=nowhere.invalid port=5432 user=u tcp_user_timeout=5",
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("this connection string must be refused, not connected"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, DbError::BadConnectionString(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("tcp_user_timeout"), "{error}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "a refusal that runs before any socket opens cannot be waiting on \
+             anything network-shaped: took {elapsed:?}"
+        );
+    }
+
+    /// The negative case beside the one above: with no `tcp_user_timeout` in
+    /// the string, the same unreachable endpoint still reaches `open_socket`
+    /// and fails as an ordinary network error — proving the ordering fix
+    /// refuses only what it is supposed to, rather than swallowing a genuine
+    /// `Connect`/`ConnectTimeout` into a configuration refusal it was never
+    /// meant to produce.
+    ///
+    /// The endpoint is a real, bound-then-dropped local listener rather than
+    /// a black hole: nothing is listening on it by the time this dials, so
+    /// the OS refuses the connection immediately instead of dropping it,
+    /// which proves the point just as well without a thirty-second wait.
+    #[tokio::test]
+    async fn the_same_unreachable_endpoint_without_tcp_user_timeout_still_fails_as_a_network_error()
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let addr = listener.local_addr().expect("the bound address");
+        drop(listener);
+
+        let error = match Conn::connect_as(
+            &format!("host={} port={} user=u", addr.ip(), addr.port()),
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("nothing is listening on this port anymore"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                DbError::Connect { .. } | DbError::ConnectTimeout { .. }
+            ),
+            "an ordinary network failure must still be one, not a configuration \
+             refusal the ordering fix was never meant to produce: {error:?}"
+        );
+    }
+
     /// A connected loopback pair, so [`apply_socket_options`] has a real
     /// socket to act on without needing a live PostgreSQL server — these
     /// assertions are about what the OS did, not about the protocol.
@@ -908,7 +1033,7 @@ mod tests {
     async fn keepalive_settings_land_on_the_real_socket_not_only_the_parsed_config() {
         let (client, _listener) = connected_pair().await;
         let on = config_of("host=db.example keepalives=1 keepalives_idle=45 user=u");
-        apply_socket_options(&client, &on, "test").expect("keepalive settings apply");
+        apply_socket_options(&client, &on, None, "test").expect("keepalive settings apply");
         let sock = SockRef::from(&client);
         assert!(
             sock.keepalive().expect("read keepalive back"),
@@ -922,7 +1047,8 @@ mod tests {
 
         let (client_off, _listener_off) = connected_pair().await;
         let off = config_of("host=db.example keepalives=0 user=u");
-        apply_socket_options(&client_off, &off, "test").expect("keepalives=0 applies cleanly");
+        apply_socket_options(&client_off, &off, None, "test")
+            .expect("keepalives=0 applies cleanly");
         let sock_off = SockRef::from(&client_off);
         assert!(
             !sock_off.keepalive().expect("read keepalive back"),
