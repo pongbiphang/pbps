@@ -11619,9 +11619,34 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
     assert_eq!(check["engine"], "SQL Server");
     assert_eq!(check["status"], "not_applicable");
     assert!(check["message"].as_str().unwrap().contains("PostgreSQL"));
+    let cost = &report["data"]["cost"];
+    assert_eq!(cost["status"], "unavailable");
+    assert_eq!(cost["engine"], "sqlserver");
+    assert!(
+        cost["reason"]
+            .as_str()
+            .unwrap()
+            .contains("operational_cost")
+    );
+    assert!(
+        cost["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not been measured")
+    );
+    envelope_matches_schema(
+        &jsonschema::validator_for(&envelope_schema()).unwrap(),
+        "plan",
+        &o,
+    );
+    let human = stdout(&assert_ok(d.run(&["plan", "--db", own.connection()])));
+    assert!(human.contains("operational_cost is not implemented for SQL Server"));
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert_eq!(saved.changes.changes.len(), 1);
+    let saved_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
+    assert!(saved_json.get("cost").is_none());
     assert!(
         !std::fs::read_to_string(&artifact)
             .unwrap()

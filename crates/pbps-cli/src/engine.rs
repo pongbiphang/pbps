@@ -38,6 +38,98 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+/// Catalog estimates are advisory. Failure to measure is an unavailable
+/// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
+pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::CostReport {
+    use crate::cost::{ChangeCost, CostReport, Reads, Rewrite, Rows};
+    match conn.driver() {
+        Driver::Mssql => CostReport::Unavailable {
+            engine: "sqlserver",
+            reason: "operational_cost is not implemented for SQL Server; its costs have not been measured (ADR-0012, issue #255)".to_owned(),
+        },
+        Driver::Postgres => {
+            use pbps_pg::estimate as pg;
+            let mut estimates = pg::planned_estimates(cs).into_iter().peekable();
+            let mut changes = Vec::with_capacity(cs.changes.len());
+            for (change_index, p) in cs.changes.iter().enumerate() {
+                let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index) else {
+                    changes.push(ChangeCost::Unavailable {
+                        change_index,
+                        reason: "operational_cost has no measurement for this PostgreSQL change".to_owned(),
+                    });
+                    continue;
+                };
+                let column = match &p.change {
+                    pbps_model::Change::AlterColumnType { column, .. }
+                    | pbps_model::Change::AlterColumnNullability { column, .. } => Some(column.name.as_str()),
+                    pbps_model::Change::CreateTable { .. }
+                    | pbps_model::Change::DropTable { .. }
+                    | pbps_model::Change::RenameTable { .. }
+                    | pbps_model::Change::AddColumn { .. }
+                    | pbps_model::Change::DropColumn { .. }
+                    | pbps_model::Change::RenameColumn { .. }
+                    | pbps_model::Change::AlterColumnDefault { .. }
+                    | pbps_model::Change::SetColumnDeprecated { .. }
+                    | pbps_model::Change::SetPrimaryKey { .. }
+                    | pbps_model::Change::AddUnique { .. }
+                    | pbps_model::Change::DropUnique { .. }
+                    | pbps_model::Change::AddForeignKey { .. }
+                    | pbps_model::Change::DropForeignKey { .. }
+                    | pbps_model::Change::AddCheck { .. }
+                    | pbps_model::Change::DropCheck { .. }
+                    | pbps_model::Change::AddIndex { .. }
+                    | pbps_model::Change::DropIndex { .. }
+                    | pbps_model::Change::InsertRow { .. }
+                    | pbps_model::Change::UpdateRow { .. }
+                    | pbps_model::Change::DeleteRow { .. }
+                    | pbps_model::Change::SetDataMode { .. }
+                    | pbps_model::Change::CreateModule { .. }
+                    | pbps_model::Change::AlterModule { .. }
+                    | pbps_model::Change::DropModule { .. }
+                    | pbps_model::Change::CreateRole { .. }
+                    | pbps_model::Change::DropRole { .. }
+                    | pbps_model::Change::RenameRole { .. }
+                    | pbps_model::Change::Grant { .. }
+                    | pbps_model::Change::Revoke { .. } => None,
+                };
+                if let Err(error) = pg::against(conn, &mut e, column).await {
+                    changes.push(ChangeCost::Unavailable {
+                        change_index,
+                        reason: format!("operational_cost could not read PostgreSQL catalog context: {error}"),
+                    });
+                    continue;
+                }
+                changes.push(ChangeCost::Available {
+                    change_index,
+                    about: e.about,
+                    table: e.table.to_string(),
+                    rewrite: match e.rewrite {
+                        pg::Rewrite::Yes => Rewrite::Yes,
+                        pg::Rewrite::No => Rewrite::No,
+                        pg::Rewrite::Unknown(reason) => Rewrite::Unknown { reason },
+                    },
+                    reads: match e.reads {
+                        pg::Reads::EveryRow => Reads::EveryRow,
+                        pg::Reads::Nothing => Reads::Nothing,
+                        pg::Reads::Unknown(reason) => Reads::Unknown { reason },
+                    },
+                    lock: e.lock.to_string(),
+                    blocks: e.lock.blocks().to_owned(),
+                    also_locks: e.also_locks.iter().map(ToString::to_string).collect(),
+                    rows: match e.rows {
+                        Some(pg::Rows::Estimated(count)) => Rows::Estimated { count },
+                        Some(pg::Rows::NeverAnalyzed) => Rows::NeverAnalyzed,
+                        None => Rows::Unknown {
+                            reason: e.rows_unknown.unwrap_or_else(|| "no catalog row estimate is available".to_owned()),
+                        },
+                    },
+                });
+            }
+            CostReport::Available { engine: "postgres", changes }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The ledger and the lock (SPEC §8.1)
 // ---------------------------------------------------------------------------
@@ -773,6 +865,44 @@ mod tests {
                 Err(other) => panic!("refused for the wrong reason: {other}"),
                 Ok(report) => panic!("answered: {report:?}"),
             }
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+    fn a_failed_cost_query_is_unavailable_not_a_static_guess() {
+        block_on(async {
+            let mut conn = pg().await;
+            conn.execute("BEGIN").await.unwrap();
+            assert!(conn.execute("SELECT 1 / 0").await.is_err());
+            let cs = ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(
+                    pbps_model::Change::AlterColumnType {
+                        uid: "c_aaaaaa".parse().unwrap(),
+                        column: "public.t.v".parse().unwrap(),
+                        from: "integer".parse().unwrap(),
+                        to: "bigint".parse().unwrap(),
+                        from_nullable: true,
+                        to_nullable: true,
+                    },
+                )],
+            };
+            let report = operational_cost(&mut conn, &cs).await;
+            conn.execute("ROLLBACK").await.unwrap();
+            let value = serde_json::to_value(&report).unwrap();
+            assert_eq!(value["status"], "available");
+            let change = &value["changes"][0];
+            assert_eq!(change["status"], "unavailable");
+            assert!(
+                change["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not read PostgreSQL catalog")
+            );
+            assert!(change.get("rewrite").is_none());
+            let human = crate::cost::render(&report);
+            assert!(human.contains("unavailable"));
+            assert!(!human.contains("Rewrite: yes"));
         });
     }
 }

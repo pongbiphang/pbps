@@ -3318,7 +3318,7 @@ pub fn cmd_plan_db(
         );
     }
 
-    let (cs, baseline_checksum, baseline_description, connected_checks, findings) = db::runtime()?.block_on(async {
+    let (cs, baseline_checksum, baseline_description, connected_checks, findings, cost) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         let mut findings = Vec::new();
 
@@ -3678,12 +3678,14 @@ pub fn cmd_plan_db(
             &entry.snapshot.schema,
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
+        let cost = crate::engine::operational_cost(&mut conn, &cs).await;
         Ok((
             cs,
             baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
             vec![permission_support],
             findings,
+            cost,
         ))
     })?;
 
@@ -3720,12 +3722,16 @@ pub fn cmd_plan_db(
         roles: crate::report::touched_roles(&cs),
         risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
         connected_checks,
+        cost: Some(cost),
     };
     if !json {
         println!("Baseline: {baseline_description}");
         print!("{}", crate::report::plan(&cs));
         for check in &data.connected_checks {
             println!("{}: {}", check.name, check.message);
+        }
+        if let Some(cost) = &data.cost {
+            print!("{}", crate::cost::render(cost));
         }
     }
 

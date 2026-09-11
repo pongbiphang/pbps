@@ -157,6 +157,16 @@
           "items": {
             "$ref": "#/$defs/ConnectedCheck"
           }
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CostReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -190,6 +200,270 @@
         "engine",
         "status",
         "message"
+      ]
+    },
+    "CostReport": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "engine": {
+              "type": "string"
+            },
+            "changes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ChangeCost"
+              }
+            },
+            "status": {
+              "type": "string",
+              "const": "available"
+            }
+          },
+          "required": [
+            "status",
+            "engine",
+            "changes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "engine": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "engine",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "ChangeCost": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "change_index": {
+              "description": "Zero-based index in the saved plan's change set.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "about": {
+              "type": "string"
+            },
+            "table": {
+              "type": "string"
+            },
+            "rewrite": {
+              "$ref": "#/$defs/Rewrite"
+            },
+            "reads": {
+              "$ref": "#/$defs/Reads"
+            },
+            "lock": {
+              "type": "string"
+            },
+            "blocks": {
+              "type": "string"
+            },
+            "also_locks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "rows": {
+              "$ref": "#/$defs/Rows"
+            },
+            "status": {
+              "type": "string",
+              "const": "available"
+            }
+          },
+          "required": [
+            "status",
+            "change_index",
+            "about",
+            "table",
+            "rewrite",
+            "reads",
+            "lock",
+            "blocks",
+            "also_locks",
+            "rows"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "change_index": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "change_index",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "Rewrite": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string",
+              "const": "yes"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string",
+              "const": "no"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "value",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "Reads": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string",
+              "const": "every_row"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string",
+              "const": "nothing"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "value",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "Rows": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "status": {
+              "type": "string",
+              "const": "estimated"
+            }
+          },
+          "required": [
+            "status",
+            "count"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "never_analyzed"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
       ]
     },
     "envelope.plan": {

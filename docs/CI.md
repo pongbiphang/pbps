@@ -64,7 +64,8 @@ the binary** (SPEC 14.3): the JSON is the stable surface, and a converter can be
 rewritten for a platform the binary has never heard of.
 
 A connected plan also accepts `--format json`. Its envelope reports the change
-counts and connected capability checks; `--out plan.json` writes the separate,
+counts, connected capability checks, and operational cost estimates;
+`--out plan.json` writes the separate,
 checksum-pinned artifact that `apply` accepts. Use `pbps explain --plan plan.json
 --format json` to inspect that artifact's full change list. A connection or
 planning failure produces an `unanswerable` envelope and exits `1`.

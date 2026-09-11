@@ -9116,3 +9116,21 @@ SPEC is in sync with all of these.
     report is not stored in the plan or included in its risk or checksum.
     The two-version CLI regression pins rejection before writes and successful
     ordinary/revoke-only execution on 16 and MAINTAIN execution on 18 (#305, #321).
+
+430. **Connected cost is advisory output beside the plan, never part of its risk.**
+    `plan --db` asks the engine facade for operational cost while its connection
+    is open, then renders the same answer in a separate human section or JSON
+    `data.cost`. PostgreSQL supplies the measured rewrite, scan and lock facts
+    and its approximate catalog row count (ADR-0012 §3). Each estimate retains
+    its original change index and uses that change's strategy, so an unmeasured
+    change cannot shift the column queried by the connected estimator and an
+    ordinary index cannot inherit another index's concurrent-build lock.
+
+    Every planned change has either an estimate or a named unavailable answer.
+    SQL Server reports the unmeasured capability by name (#255). A failed
+    catalog query makes the affected estimate unavailable; it neither guesses
+    from the static half nor refuses a valid plan. Unknown rewrite/scan reasons,
+    never-analyzed tables, other locked tables and absent row-count reasons
+    survive into both formats. The existing global-strategy estimator API keeps
+    its contract; the command uses the per-change API. Cost never enters
+    SavedPlan, its checksum, risk classification, or an apply approval (#305).
