@@ -572,7 +572,7 @@ pub(crate) fn catalogued_as(
 ) -> pbps_db::catalog::CatalogNames {
     let mut out = pbps_db::catalog::CatalogNames::new();
     for (name, table) in &schema.tables {
-        let live_table = live_name(name, final_ids, live_ids);
+        let live_table = final_ids.resolved_in(name, live_ids);
         // Only the key column is named to the catalog; every other column
         // reaches it as a converted literal, under no name at all.
         let live_key = table
@@ -762,7 +762,7 @@ fn key_type_changes_over_aliases(
         // below are keyed by the name the database has now. A table renamed
         // in the same revision was looked up under its new name in neither,
         // and the guard passed a key-type change it exists to refuse.
-        let live = live_name(&column.table, final_ids, live_ids);
+        let live = final_ids.resolved_in(&column.table, live_ids);
         let Some(table) = declared_live.tables.get(&live) else {
             continue;
         };
@@ -859,30 +859,22 @@ fn tables_under(schema: &Schema, final_ids: &IdsFile, live_ids: &IdsFile) -> Sch
     out.tables = schema
         .tables
         .iter()
-        .map(|(final_name, table)| (live_name(final_name, final_ids, live_ids), table.clone()))
+        .map(|(final_name, table)| (final_ids.resolved_in(final_name, live_ids), table.clone()))
         .collect();
     out
 }
 
-/// The name the database has for the table this plan calls `final_name` —
-/// the same one for everything this plan does not rename.
-///
-/// Everything keyed by the live names (the declarations re-keyed by
-/// [`tables_under`], the rows read back, the scopes) has to be looked up
-/// through this, and a change's own table name is always the *final* one.
-fn live_name(final_name: &TableName, final_ids: &IdsFile, live_ids: &IdsFile) -> TableName {
-    final_ids
-        .table_uid(final_name)
-        .and_then(|uid| live_ids.tables.get(uid))
-        .cloned()
-        .unwrap_or_else(|| final_name.clone())
-}
-
 /// [`scopes_at`] on its parts: `data` keyed by the names `final_ids` gives
 /// each table, re-keyed by the names `live_ids` gives the same uids.
+///
+/// The lookup itself is [`IdsFile::resolved_in`] — shared with `doctor`'s
+/// readiness questions (DECISIONS 439), which resolve a declared object to
+/// the name an environment currently has it under for the same reason this
+/// does: a name only the declarations have moved to is not yet a name the
+/// database answers to.
 fn scopes_under(data: &DataScopes, final_ids: &IdsFile, live_ids: &IdsFile) -> DataScopes {
     data.iter()
-        .map(|(final_name, scope)| (live_name(final_name, final_ids, live_ids), scope.clone()))
+        .map(|(final_name, scope)| (final_ids.resolved_in(final_name, live_ids), scope.clone()))
         .collect()
 }
 

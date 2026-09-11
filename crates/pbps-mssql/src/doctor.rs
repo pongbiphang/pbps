@@ -434,10 +434,38 @@ pub struct Held {
     /// reporting them as gaps.
     pub roles_declared: bool,
 
-    /// Per object a declared role is granted on, the permissions effective on
-    /// it — asked about every named object, absent or invisible included, for
-    /// the same reason `referenced_objects` is.
+    /// Per object, the permissions effective on it — asked about every named
+    /// object, absent or invisible included, for the same reason
+    /// `referenced_objects` is.
+    ///
+    /// Keyed by the name the object was actually asked about: the current
+    /// physical name for a declared target this resolution judged safe, or
+    /// the name as recorded or discovered for a target sourced from this
+    /// environment's own recorded grants or the catalog, which already name
+    /// the object as it stands and need no resolution.
+    ///
+    /// A declared target this resolution could not safely ask about at all —
+    /// because the name its own resolution would use is already confirmed,
+    /// by this environment's own recorded ids, to belong to a *different*
+    /// identity — is not in this map. It is in
+    /// [`Held::granted_unresolvable`] instead, which `missing` reports as an
+    /// unconditional gap: GRANTED has no schema-scope fallback to fall back
+    /// to (issue #133 round 2).
     pub granted_objects: BTreeMap<ObjectName, BTreeSet<String>>,
+
+    /// A declared grant target whose current physical name this environment
+    /// could not safely determine: the name its own resolution would use is
+    /// already confirmed, by this environment's own recorded ids, to be a
+    /// *different* identity's object. Asking under that name would read the
+    /// other identity's permissions, not this target's — so it is not asked
+    /// at all, and `missing` reports every GRANTED requirement against it as
+    /// an unconditional gap instead.
+    ///
+    /// This is the same collision `Held::data_tables`'s declared-name keying
+    /// exists to survive; GRANTED has no schema-scope fallback to fall back
+    /// to, unlike the data requirements, so an unresolvable target cannot be
+    /// silently skipped (issue #133 round 2).
+    pub granted_unresolvable: BTreeSet<ObjectName>,
 
     /// Per schema a declared role is granted on (`schema::x`), the
     /// schema-scoped permissions effective on it. A schema the database does
@@ -448,14 +476,31 @@ pub struct Held {
     /// it (ADR-0004).
     ///
     /// A *predicate*, not a set of holdings: the permissions come from
-    /// [`Held::data_objects`], or from [`Held::schemas`] where the table does
-    /// not exist yet. A table that declares no row at all is absent, and so is
-    /// one whose declaration can produce no statement — `mode: ensure` with no
+    /// [`Held::data_objects`], keyed by [`Held::data_securable`]'s current
+    /// name for the table, or from [`Held::schemas`] where the table does not
+    /// exist yet or its current name could not be safely determined. A table
+    /// that declares no row at all is absent, and so is one whose
+    /// declaration can produce no statement — `mode: ensure` with no
     /// declared row manages nothing, so it is asked for nothing.
+    ///
+    /// Keyed by the **declared** name, not a resolved one: each of a plan's
+    /// declared tables is unique by construction, and keying this map by a
+    /// resolved physical name instead once let two declarations that resolve
+    /// to the same name — a rename freeing a name a new declaration reuses in
+    /// the same plan — collapse into one map entry, silently dropping one of
+    /// the two demands (issue #133 round 2).
     pub data_tables: DataTables,
 
-    /// Per declared data table that the catalog shows, the permissions
-    /// effective on that **object**.
+    /// Per declared table, the current physical name this resolution judged
+    /// safe to ask about — absent for a table whose resolved name is already
+    /// confirmed, by this environment's own recorded ids, to belong to a
+    /// *different* declared table. `data_gaps` reads a table missing here as
+    /// unresolved and falls back to the schema answer rather than ask under a
+    /// name that would read someone else's object (issue #133 round 2).
+    pub data_securable: BTreeMap<ObjectName, ObjectName>,
+
+    /// Per current physical name named in [`Held::data_securable`] that the
+    /// catalog shows, the permissions effective on that **object**.
     ///
     /// Empty for a table the deployment has still to create, in which case
     /// [`missing`] falls back to the schema answer — the ledger's shape, for
@@ -830,6 +875,108 @@ async fn object_permissions(
     Ok(out)
 }
 
+/// Resolves each of `wanted`'s declared names to the physical name this
+/// environment currently has it under, refusing a resolution that would
+/// misattribute a *different* identity's object.
+///
+/// # Why a resolved name can be unsafe to ask under
+///
+/// `IdsFile::resolved_in` answers per declared name in isolation: given one
+/// name, what does its uid currently go by here. Asked across a whole batch
+/// at once, two different declared names can answer with the *same* physical
+/// name — a rename frees the name the departing identity carried, and the
+/// same plan can declare a new identity under that freed name before the
+/// rename has actually run against this environment. Asking under the shared
+/// name and keying the answer by it would collapse the two declarations'
+/// distinct demands into one map entry (issue #133 round 2); keying instead
+/// by the declared name and asking under the resolved one just moves the
+/// danger from "one demand disappears" to "one demand reads the other
+/// identity's permissions", which is worse because nothing about the answer
+/// looks wrong.
+///
+/// A resolution is trusted only when it is **confirmed**: the environment's
+/// own recorded ids name that uid under that name right now. An unresolved
+/// fallback — no uid, or a uid this environment has not recorded — asserts
+/// nothing the environment itself has said; it is just the declared name,
+/// unchanged. When a fallback's candidate name is one the recorded ids
+/// confirm belongs to some other uid, the fallback loses: that physical
+/// object is already, confirmedly, someone else's. Two declared names cannot
+/// both hold a confirmed claim on the same name — the environment's own
+/// recorded ids name each uid once — so this rule never has to choose between
+/// two confirmed claims.
+///
+/// # Why the claim comparison is case-folded
+///
+/// A valid plan can rename `app.Old` to `app.new` and declare a new
+/// `app.old` in the same revision: three different Rust strings, `Old`
+/// among them, so an exact-`Eq` claim check never sees the second door this
+/// collision reaches through. Measured on the pinned image (issue #133
+/// round 3): its default collation is `SQL_Latin1_General_CP1_CI_AS`, and
+/// `CI` means SQL Server itself reads `app.Old` and `app.old` as one
+/// securable. Asking `HAS_PERMS_BY_NAME`/`OBJECT_ID` under either spelling
+/// then answers about the departing identity's object, and the arriving
+/// one silently inherits its permissions answer — the exact misattribution
+/// this function exists to refuse, reached past a claim check that never
+/// fires.
+///
+/// Reproducing SQL Server's actual collation rules in Rust is not
+/// attempted: collations are a hard shape with open issues of their own
+/// (#218, #234, #245), and a second, drifting source of truth for
+/// something the server already owns would be worse than this function's
+/// job is worth. Instead the comparison is deliberately *more* permissive
+/// than any single-byte-per-character SQL collation's case sensitivity
+/// alone: case-folded via `to_lowercase`, which also covers the
+/// accent-sensitive, case-insensitive default measured above. A pair of
+/// names this folds together that a case-*sensitive* collation would keep
+/// apart is a false refusal — cheap, and landing on the schema fallback
+/// for `data` or an unconditional gap for `granted`, both of which already
+/// exist for "cannot safely say" — not a false acceptance, which is what
+/// this whole function exists to rule out (AGENTS.md: when the answer is
+/// not clearly no, it is yes).
+///
+/// This does **not** cover every collation. `to_lowercase` folds case and
+/// nothing else: an accent-insensitive collation (`_AI`, e.g.
+/// `SQL_Latin1_General_CP1_CI_AI`) reads `app.café` and `app.cafe` as one
+/// securable, and this comparison still keeps them apart, so the false
+/// acceptance this function exists to refuse is still reachable through
+/// that door. Width-insensitive (`_WS`) and Kanatype-sensitive collations
+/// are the same shape. The pinned image's default is `_AS`
+/// (accent-sensitive), which is why the live test measuring this passes —
+/// it is not evidence that every collation is covered. Filed as #384
+/// rather than reproduced here.
+fn resolve_for_query<'a>(
+    wanted: impl Iterator<Item = &'a ObjectName>,
+    project_ids: &pbps_model::IdsFile,
+    recorded_ids: &pbps_model::IdsFile,
+) -> (BTreeMap<ObjectName, ObjectName>, BTreeSet<ObjectName>) {
+    // Compared case-folded, not by Rust's exact `Eq` — see this function's own
+    // doc comment for why. Measured on the pinned image (issue #133 round 3):
+    // its default collation is `SQL_Latin1_General_CP1_CI_AS`, case
+    // *insensitive*, so `app.Old` and `app.old` are one securable to the
+    // server and two to a comparison that trusts Rust's ordering.
+    let claimed: BTreeSet<(String, String)> = recorded_ids
+        .tables
+        .values()
+        .map(|name| (name.schema.to_lowercase(), name.name.to_lowercase()))
+        .collect();
+    let mut safe: BTreeMap<ObjectName, ObjectName> = BTreeMap::new();
+    let mut unresolvable: BTreeSet<ObjectName> = BTreeSet::new();
+    for declared in wanted {
+        let query = project_ids.resolved_in(declared, recorded_ids);
+        let confirmed = project_ids
+            .table_uid(declared)
+            .and_then(|uid| recorded_ids.tables.get(uid))
+            == Some(&query);
+        let folded = (query.schema.to_lowercase(), query.name.to_lowercase());
+        if confirmed || !claimed.contains(&folded) {
+            safe.insert(declared.clone(), query);
+        } else {
+            unresolvable.insert(declared.clone());
+        }
+    }
+    (safe, unresolvable)
+}
+
 /// The permissions the connected account effectively holds.
 ///
 /// `schemas` are the schemas the project manages; `dbo` is added because the
@@ -851,12 +998,53 @@ async fn object_permissions(
 /// schemas are not there yet. Joining against `sys.schemas` leaves those
 /// unasked rather than reported as gaps — the alternative would fire on the
 /// most common first run there is.
+///
+/// # Why the declared data and grant targets are resolved before they are asked
+///
+/// `data` and `granted.objects` name their objects the way the declarations
+/// do. Until a pending rename reaches *this* environment, the object there
+/// still answers to its old name, and `sp_rename` keeps a `GRANT` or a `DENY`
+/// with the object rather than with the name (measured on the pinned image,
+/// issue #133). Asking `HAS_PERMS_BY_NAME` under the declared name finds
+/// nothing there, so the object question silently falls back to the schema —
+/// a careful DBA's object-level `GRANT` reads as a gap, and an object-level
+/// `DENY` that really blocks the deployment does not.
+///
+/// `project_ids` is the project's own identity mapping (declared name ->
+/// uid); `recorded_ids`, read below alongside `recorded` for the same reason
+/// the role question already reads it, is this **environment's** own
+/// mapping (uid -> the name it currently has). Resolving through both, per
+/// object, turns "the name the declarations call it" into "the name this
+/// database calls it right now" — which is what a `GRANT` issued today has
+/// to name (DECISIONS 439).
+///
+/// `referenced` is deliberately left unresolved: those tables lie outside the
+/// managed schemas, and pbps never renames an object it does not manage.
+///
+/// # Why the resolution can refuse to answer
+///
+/// Resolving each declared name in isolation is not enough once more than one
+/// is asked about together: a rename frees the name the departing identity
+/// carried, and the same plan can declare a *new* table under that freed name
+/// before the rename has actually run against this environment. Two declared
+/// names then resolve to the same physical name, and naively asking under it
+/// and keying the answer by it collapsed the two declarations' distinct
+/// demands into one map entry (issue #133 round 2). `resolve_for_query`
+/// trusts a resolution only when the environment's own recorded ids confirm
+/// it; an unresolved fallback that a confirmed resolution has already claimed
+/// is refused rather than asked about, because asking would read the other
+/// identity's permissions instead. `Held::data_tables` is keyed by the
+/// declared name for the same reason and survives the refusal by falling back
+/// to the schema answer; `Held::granted_objects` has no such fallback, so a
+/// refused grant target is reported through `Held::granted_unresolvable` as
+/// an unconditional gap instead.
 pub async fn permissions(
     conn: &mut Conn,
     schemas: &[String],
     referenced: &[ObjectName],
     granted: &GrantTargets,
     data: &DataTables,
+    project_ids: &pbps_model::IdsFile,
 ) -> Result<Held, DbError> {
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
@@ -870,10 +1058,20 @@ pub async fn permissions(
     // Recorded tables remain managed until their drop is applied, even when
     // the declarations no longer name their schema (decision 69). Tombstones
     // are permanent history and must not keep these requirements switched on.
-    let recorded = match crate::state::latest(conn).await {
-        Ok(Some(entry)) => entry.snapshot.schema,
-        // An unreadable ledger is reported by the ledger permission rows.
-        _ => pbps_model::Schema::default(),
+    //
+    // `recorded_ids` comes from the same read: an unreadable ledger must not
+    // be papered over by inventing a resolution from the declarations, so a
+    // failed or empty read leaves it as `IdsFile::default()` — which has no
+    // uid for anything, so every resolution below falls through to the name
+    // it was asked with, exactly like an environment that never had the
+    // object. The permission gap this read's own failure causes is reported
+    // by the ledger permission rows, not by this fallback.
+    let (recorded, recorded_ids) = match crate::state::latest(conn).await {
+        Ok(Some(entry)) => (entry.snapshot.schema, entry.snapshot.ids),
+        _ => (
+            pbps_model::Schema::default(),
+            pbps_model::IdsFile::default(),
+        ),
     };
     let mut managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
     managed.extend(recorded.tables.keys().map(|table| table.schema.as_str()));
@@ -991,13 +1189,32 @@ pub async fn permissions(
         })
         .map(|r| r.name)
         .collect();
-    let data_names: Vec<ObjectName> = data.keys().cloned().collect();
+    // Resolved to the name this environment currently has, per table — see
+    // the module-level note above and `resolve_for_query`'s. A table a
+    // rename has not reached here yet is asked about under the name it still
+    // carries; one this deployment has still to create has no uid recorded
+    // anywhere and keeps its declared name, which is the
+    // object-does-not-exist-yet path this whole question already falls back
+    // from. A table `resolve_for_query` could not safely resolve is simply
+    // absent from `data_securable` — no object is asked about, and
+    // `data_gaps` falls back to the schema answer, exactly like a table this
+    // deployment has still to create.
+    let (data_securable, _) = resolve_for_query(data.keys(), project_ids, &recorded_ids);
+    let data_names: Vec<ObjectName> = data_securable.values().cloned().collect();
     // The declared row columns, not the catalog's: see `Columns::Declared`.
     // `UPDATE` is the only one of the three the engine takes at column scope,
-    // so it is the only one this list can change the answer for.
-    let data_columns: BTreeMap<ObjectName, Vec<String>> = data
+    // so it is the only one this list can change the answer for. Keyed by the
+    // same resolved name as `data_names`: `Columns::Declared` matches a
+    // column to its object by that list's position. `resolve_for_query`
+    // guarantees the values in `data_securable` are pairwise distinct, so
+    // each declared table's columns land under their own key here rather
+    // than overwriting another's.
+    let data_columns: BTreeMap<ObjectName, Vec<String>> = data_securable
         .iter()
-        .map(|(table, demand)| (table.clone(), demand.row_columns().to_vec()))
+        .filter_map(|(declared, query)| {
+            data.get(declared)
+                .map(|demand| (query.clone(), demand.row_columns().to_vec()))
+        })
         .collect();
     let data_objects = object_permissions(
         conn,
@@ -1035,6 +1252,10 @@ pub async fn permissions(
     // schema that does not exist yet is unasked rather than reported.
     let mut granted_objects: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
     let mut granted_schemas: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // A declared target `resolve_for_query` could not safely ask about — see
+    // its own doc comment. Reported by `missing` as an unconditional gap:
+    // GRANTED has no schema-scope fallback the way the data requirements do.
+    let mut granted_unresolvable: BTreeSet<ObjectName> = BTreeSet::new();
     // A schema a role is granted on that the database does not have: the
     // `GRANT ... ON SCHEMA::x` fails at apply, and pbps never creates a
     // schema, so it is reported like a managed schema that is missing rather
@@ -1069,7 +1290,20 @@ pub async fn permissions(
         // some permission on (metadata visibility), which is precisely not
         // the ones a readiness check is for. A ledger this account cannot
         // read is a gap of its own, reported by the ledger rows.
-        let mut objects: BTreeSet<ObjectName> = targets.objects.iter().cloned().collect();
+        // Resolved like the data tables above, and for the same reason: a
+        // declared grant target is a table this project manages, and a
+        // pending rename this environment has not caught up to yet leaves it
+        // answering to its old name. `recorded.roles`' own targets, added
+        // below, need no such resolution — they are read back from this
+        // environment's own last-recorded state, so they already name
+        // whatever it currently calls the object. A target
+        // `resolve_for_query` judges unsafe to resolve is not asked about at
+        // all — see `granted_unresolvable`'s doc comment — rather than risk
+        // reading a different identity's object under its name.
+        let (safe_targets, unresolvable_targets) =
+            resolve_for_query(targets.objects.iter(), project_ids, &recorded_ids);
+        granted_unresolvable.extend(unresolvable_targets);
+        let mut objects: BTreeSet<ObjectName> = safe_targets.into_values().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
         for role in recorded.roles.values() {
             for target in role.grants.keys() {
@@ -1195,8 +1429,12 @@ pub async fn permissions(
         referenced_objects,
         roles_declared,
         granted_objects,
+        granted_unresolvable,
         granted_schemas,
+        // Keyed by the declared name, unlike `data_objects` — see
+        // `Held::data_tables`'s doc comment for why.
         data_tables: data.clone(),
+        data_securable,
         data_objects,
     })
 }
@@ -1223,13 +1461,20 @@ fn data_gaps(held: &Held, r: &Requirement, wanted: fn(&DataDemand) -> bool, out:
         if !wanted(demand) {
             continue;
         }
-        let (granted, securable) = match held.data_objects.get(table) {
-            Some(granted) => (granted, Securable::Object(table.clone())),
-            // No object, so the schema — and only if *it* was asked about. A
-            // schema the database does not have produced no row from
-            // `sys.schemas`, which is not the same as holding nothing there;
-            // `absent_schemas` reports it, and inventing a gap on a securable
-            // no `GRANT` can name yet would fire on every first deployment.
+        // The current physical name, if `permissions` judged one safe to ask
+        // about (`Held::data_securable`'s doc comment) and the catalog shows
+        // an object under it. Either way, no object, so the schema — and
+        // only if *it* was asked about. A schema the database does not have
+        // produced no row from `sys.schemas`, which is not the same as
+        // holding nothing there; `absent_schemas` reports it, and inventing a
+        // gap on a securable no `GRANT` can name yet would fire on every
+        // first deployment.
+        let (granted, securable) = match held
+            .data_securable
+            .get(table)
+            .and_then(|query| held.data_objects.get(query).map(|g| (g, query)))
+        {
+            Some((granted, query)) => (granted, Securable::Object(query.clone())),
             None => match held.schemas.get(&table.schema) {
                 Some(granted) => (granted, Securable::Schema(table.schema.clone())),
                 None => continue,
@@ -1361,6 +1606,17 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                             securable: Securable::Object(object.clone()),
                         });
                     }
+                }
+                // Never asked about at all — see `Held::granted_unresolvable`'s
+                // doc comment. GRANTED has no schema-scope fallback, so an
+                // unconditional gap is the only honest answer: this
+                // resolution cannot say the account holds it.
+                for object in &held.granted_unresolvable {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Object(object.clone()),
+                    });
                 }
                 for (schema, granted) in &held.granted_schemas {
                     if !granted.contains(r.name) {
@@ -1510,10 +1766,12 @@ mod tests {
             referenced_objects: BTreeMap::new(),
             roles_declared: false,
             granted_objects: BTreeMap::new(),
+            granted_unresolvable: BTreeSet::new(),
             granted_schemas: BTreeMap::new(),
             // No `data:` block is the overwhelmingly common case, so this
             // helper declares none; the tests that need one add it.
             data_tables: DataTables::new(),
+            data_securable: BTreeMap::new(),
             data_objects: BTreeMap::new(),
         }
     }
@@ -1817,6 +2075,99 @@ mod tests {
         name.parse().expect("a `schema.table` constant")
     }
 
+    /// The collision `resolve_for_query` exists for: a rename frees the name
+    /// the departing identity carried, and the same plan declares a *new*
+    /// table under that freed name before the rename has run against this
+    /// environment. Both declared names resolve to `app.old` — naively
+    /// asking under it and keying by it once collapsed one of the two
+    /// declarations' distinct demands into the other's map entry (issue #133
+    /// round 2, `Preserve distinct demands when a rename source is reused`).
+    #[test]
+    fn resolve_for_query_keeps_the_confirmed_claim_and_refuses_the_colliding_fallback() {
+        let uid1: pbps_model::Uid = "t_aaa111".parse().expect("a well-formed table uid");
+        let uid2: pbps_model::Uid = "t_bbb222".parse().expect("a well-formed table uid");
+        // The environment's own recorded ids: uid1 is `app.old` here, still.
+        // uid2 has no entry at all — the table this uid names has not been
+        // created against this environment yet.
+        let mut recorded_ids = pbps_model::IdsFile::default();
+        recorded_ids.tables.insert(uid1.clone(), table("app.old"));
+        // The project's own ids: uid1 has moved to `app.new`, and uid2 is
+        // freshly declared under the name uid1 just vacated.
+        let mut project_ids = pbps_model::IdsFile::default();
+        project_ids.tables.insert(uid1, table("app.new"));
+        project_ids.tables.insert(uid2, table("app.old"));
+
+        let wanted = [table("app.new"), table("app.old")];
+        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
+
+        assert_eq!(
+            safe.get(&table("app.new")),
+            Some(&table("app.old")),
+            "the confirmed resolution — this environment's own recorded ids \
+             say so — is trusted: {safe:?}"
+        );
+        assert!(
+            !safe.contains_key(&table("app.old")),
+            "the colliding fallback must not be asked about under a name \
+             the recorded ids already give to a different identity: {safe:?}"
+        );
+        assert_eq!(
+            unresolvable,
+            [table("app.old")].into_iter().collect(),
+            "the declaration that could not be safely resolved is reported, \
+             not silently dropped"
+        );
+    }
+
+    /// The ordinary case, with nothing renamed and nothing reused: every
+    /// declared name resolves to itself and none collide.
+    #[test]
+    fn resolve_for_query_resolves_every_name_when_nothing_collides() {
+        let project_ids = pbps_model::IdsFile::default();
+        let recorded_ids = pbps_model::IdsFile::default();
+        let wanted = [table("app.a"), table("app.b")];
+        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
+        assert_eq!(safe.get(&table("app.a")), Some(&table("app.a")));
+        assert_eq!(safe.get(&table("app.b")), Some(&table("app.b")));
+        assert!(unresolvable.is_empty(), "{unresolvable:?}");
+    }
+
+    /// The second door into the same collision, round 2's own review found
+    /// (issue #133 round 3): a rename to `app.new` frees `app.Old`, and the
+    /// same plan declares a new `app.old` — three different Rust strings,
+    /// but the pinned image's default collation is case-insensitive, so the
+    /// server reads `app.Old` and `app.old` as one securable. A claim check
+    /// that trusts Rust's exact `Eq` never sees this collision.
+    #[test]
+    fn resolve_for_query_folds_case_before_comparing_a_claim() {
+        let uid1: pbps_model::Uid = "t_ccc333".parse().expect("a well-formed table uid");
+        let uid2: pbps_model::Uid = "t_ddd444".parse().expect("a well-formed table uid");
+        let mut recorded_ids = pbps_model::IdsFile::default();
+        recorded_ids.tables.insert(uid1.clone(), table("app.Old"));
+        let mut project_ids = pbps_model::IdsFile::default();
+        project_ids.tables.insert(uid1, table("app.new"));
+        project_ids.tables.insert(uid2, table("app.old"));
+
+        let wanted = [table("app.new"), table("app.old")];
+        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
+
+        assert_eq!(
+            safe.get(&table("app.new")),
+            Some(&table("app.Old")),
+            "the confirmed resolution keeps the recorded spelling: {safe:?}"
+        );
+        assert!(
+            !safe.contains_key(&table("app.old")),
+            "the differently-cased fallback must not be asked about under a \
+             name the server reads as the same securable: {safe:?}"
+        );
+        assert_eq!(
+            unresolvable,
+            [table("app.old")].into_iter().collect(),
+            "{unresolvable:?}"
+        );
+    }
+
     /// Every DML permission, on one object.
     fn dml() -> BTreeSet<String> {
         ["INSERT", "UPDATE", "DELETE"]
@@ -1861,6 +2212,7 @@ mod tests {
         );
 
         held.data_tables.insert(table("app.t"), exact_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let gaps = missing(&held);
         let mut named: Vec<String> = gaps
@@ -1899,6 +2251,7 @@ mod tests {
     fn a_grant_on_the_table_alone_satisfies_the_check() {
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(table("app.t"), exact_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), dml());
         assert!(
             held.schemas["app"].is_disjoint(&dml()),
@@ -1920,6 +2273,7 @@ mod tests {
             "the premise: the whole schema is granted"
         );
         held.data_tables.insert(table("app.t"), ensure_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects
             .insert(table("app.t"), ["UPDATE".to_owned()].into_iter().collect());
         let gaps = missing(&held);
@@ -1937,6 +2291,10 @@ mod tests {
     fn a_data_table_that_does_not_exist_yet_is_asked_of_its_schema() {
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(table("app.t"), exact_table());
+        // Resolved, like `permissions` would resolve it, but the catalog
+        // shows no object under that name — the same shape a table this
+        // deployment has still to create leaves behind.
+        held.data_securable.insert(table("app.t"), table("app.t"));
         let mut named: Vec<String> = missing(&held)
             .iter()
             .map(|g| format!("{} on {}", g.permission, g.securable()))
@@ -1958,6 +2316,8 @@ mod tests {
         for n in ["u", "v", "w", "x"] {
             held.data_tables
                 .insert(table(&format!("app.{n}")), exact_table());
+            held.data_securable
+                .insert(table(&format!("app.{n}")), table(&format!("app.{n}")));
         }
         assert_eq!(missing(&held).len(), 3, "{:?}", missing(&held));
 
@@ -1976,6 +2336,7 @@ mod tests {
     fn an_ensure_table_is_not_asked_for_delete() {
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(table("app.t"), ensure_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
@@ -1993,6 +2354,7 @@ mod tests {
             table("app.t"),
             demand(pbps_model::DataMode::Exact, &[], &["label"]),
         );
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
@@ -2013,6 +2375,7 @@ mod tests {
             table("app.t"),
             demand(pbps_model::DataMode::Exact, &["a"], &[]),
         );
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
@@ -2035,6 +2398,7 @@ mod tests {
             table("app.t"),
             DataDemand::of(&t).expect("it still inserts"),
         );
+        held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
@@ -2049,11 +2413,15 @@ mod tests {
     fn the_dml_demanded_is_per_table_and_not_estate_wide() {
         let mut held = everything_but_the_dml(&["app", "ref"]);
         held.data_tables.insert(table("app.seeded"), exact_table());
+        held.data_securable
+            .insert(table("app.seeded"), table("app.seeded"));
         held.data_objects
             .insert(table("app.seeded"), BTreeSet::new());
         held.data_objects
             .insert(table("app.plain"), BTreeSet::new());
         held.data_tables.insert(table("ref.lookup"), ensure_table());
+        held.data_securable
+            .insert(table("ref.lookup"), table("ref.lookup"));
         held.data_objects
             .insert(table("ref.lookup"), BTreeSet::new());
         let mut named: Vec<String> = missing(&held)
@@ -2075,6 +2443,89 @@ mod tests {
         );
     }
 
+    /// Two declared tables that resolve to the same physical name — the
+    /// collision `resolve_for_query` exists for — must keep two distinct
+    /// demands in `Held::data_tables`, keyed by the declared name. Keying by
+    /// the resolved name instead, as an earlier version of this fix did,
+    /// silently dropped one of the two on `.collect()` into the map (issue
+    /// #133 round 2).
+    #[test]
+    fn a_table_whose_resolution_collides_with_anothers_keeps_its_own_demand() {
+        let mut held = everything_but_the_dml(&["app"]);
+        // `app.new` resolved safely to the object this environment still has
+        // under `app.old`, and that object is fully granted.
+        held.data_tables.insert(table("app.new"), exact_table());
+        held.data_securable
+            .insert(table("app.new"), table("app.old"));
+        held.data_objects.insert(table("app.old"), dml());
+        // `app.old` is declared too — the new table a plan can declare under
+        // the name the rename above just freed. Its own resolution collided
+        // with `app.new`'s confirmed claim on `app.old`, so `permissions`
+        // left it out of `data_securable` entirely: no object to ask about,
+        // so it falls back to the schema, which this helper strips of DML.
+        held.data_tables.insert(table("app.old"), ensure_table());
+
+        let mut named: Vec<String> = missing(&held)
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            // `app.new`'s own demand (INSERT, UPDATE, DELETE) is fully
+            // satisfied by the object grant its resolved name reads —
+            // proof the entry under the *declared* key `app.new` was not
+            // collapsed into `app.old`'s. `app.old`'s own demand (INSERT,
+            // UPDATE — `ensure_table` never demands DELETE) could not be
+            // asked about at object scope at all, so it falls back to the
+            // only securable left safe to ask it at.
+            ["INSERT on SCHEMA::[app]", "UPDATE on SCHEMA::[app]"],
+            "{named:?}"
+        );
+    }
+
+    /// The same collision, reachable through `grant_targets()` instead of
+    /// `data_tables()`: a declared grant target whose resolution collides
+    /// with another identity's confirmed claim has no schema-scope fallback,
+    /// so it must be reported as an unconditional gap rather than silently
+    /// dropped or, worse, answered by the wrong object's permissions (issue
+    /// #133 round 2).
+    #[test]
+    fn a_granted_target_that_cannot_be_safely_resolved_is_an_unconditional_gap() {
+        let mut held = everything(&["app"]);
+        held.roles_declared = true;
+        held.database.insert("CREATE ROLE".into());
+        held.database.insert("ALTER ANY ROLE".into());
+        // The confirmed claim: some other declared target already resolved
+        // safely to `app.old` and is fully granted there. `CONTROL` is the
+        // only permission `Needed::Granted` asks for.
+        held.granted_objects.insert(
+            table("app.old"),
+            ["CONTROL".to_owned()].into_iter().collect(),
+        );
+        // The target this test is about could not be resolved without
+        // colliding with that claim, so `permissions` put it here instead of
+        // asking under `app.old` and risking the other identity's answer.
+        held.granted_unresolvable.insert(table("app.new"));
+
+        let gaps = missing(&held);
+        let named: Vec<String> = gaps
+            .iter()
+            .filter(|g| g.securable() == "OBJECT::[app].[new]")
+            .map(|g| g.permission.to_owned())
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "an unresolvable grant target must be reported missing, never \
+             silently read as ready: {gaps:?}"
+        );
+        assert!(
+            !gaps.iter().any(|g| g.securable() == "OBJECT::[app].[old]"),
+            "the confirmed claim's own object is fully granted and must not \
+             appear as a gap: {gaps:?}"
+        );
+    }
+
     /// A declared schema the database does not have produced no row from
     /// `sys.schemas`, so nothing was asked about it and nothing can be said —
     /// it is reported by `absent_schemas` instead. Inventing a gap there would
@@ -2085,6 +2536,7 @@ mod tests {
         held.schemas.remove("app");
         held.absent_schemas.insert("app".to_owned());
         held.data_tables.insert(table("app.t"), exact_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
         assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
@@ -2567,8 +3019,10 @@ mod tests {
             referenced_objects: BTreeMap::new(),
             roles_declared: false,
             granted_objects: BTreeMap::new(),
+            granted_unresolvable: BTreeSet::new(),
             granted_schemas: BTreeMap::new(),
             data_tables: DataTables::new(),
+            data_securable: BTreeMap::new(),
             data_objects: BTreeMap::new(),
         };
         // Not the ones that depend on what the project declares: no foreign

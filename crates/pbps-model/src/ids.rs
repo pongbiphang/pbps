@@ -143,6 +143,34 @@ impl IdsFile {
         self.roles.insert(uid, to.to_owned());
     }
 
+    /// The name `recorded` has for the same object `self` calls `wanted` —
+    /// the name a live environment or a plan's own catalog read currently
+    /// holds it under, found by way of the uid rather than the name.
+    ///
+    /// Falls back to `wanted` itself in the two cases where there is nothing
+    /// to resolve through, and both are today's ordinary behaviour rather
+    /// than an error: `self` has no uid for `wanted` (nothing has minted one
+    /// yet — an object added since the last `plan`, so nothing has been
+    /// applied for it anywhere), or `recorded` does not have that uid (this
+    /// particular environment has never had the object, so there is nothing
+    /// recorded to resolve against). A caller reading an unreadable
+    /// `recorded` — a ledger that could not be read at all — must not build
+    /// one from `self` to paper over that: passing `IdsFile::default()` falls
+    /// through the same "no uid known here" path deliberately, rather than
+    /// this function inventing a distinction between "never recorded" and
+    /// "could not be read" that it has no way to tell apart.
+    ///
+    /// Shared by `apply`'s staged-resume bookkeeping (`deploy::live_name`,
+    /// historically) and `doctor`'s readiness questions (DECISIONS 439): both
+    /// need "what does the object I mean by this name answer to right now",
+    /// and both get it from the same two maps.
+    pub fn resolved_in(&self, wanted: &TableName, recorded: &IdsFile) -> TableName {
+        self.table_uid(wanted)
+            .and_then(|uid| recorded.tables.get(uid))
+            .cloned()
+            .unwrap_or_else(|| wanted.clone())
+    }
+
     /// Checks internal consistency.
     ///
     /// The tool writes this file itself, so under normal conditions it cannot
@@ -302,6 +330,56 @@ mod tests {
         // A name nobody has is a no-op, not a new role.
         f.rename_role("ghost", "phantom");
         assert_eq!(f, before);
+    }
+
+    /// The finding this method exists for (issue #133): a rename that is
+    /// declared but not yet applied to a given environment must resolve to
+    /// the name *that environment* still has, not the name the declarations
+    /// (or another environment's) ids file already moved to.
+    #[test]
+    fn resolution_prefers_the_recorded_name_over_the_wanted_one() {
+        let mut wanted = IdsFile::default();
+        wanted
+            .tables
+            .insert(uid("t_a9k2mq"), "app.new_name".parse().unwrap());
+        let mut recorded = IdsFile::default();
+        // Same uid, this environment's own name for it: the rename has not
+        // reached here yet.
+        recorded
+            .tables
+            .insert(uid("t_a9k2mq"), "app.old_name".parse().unwrap());
+
+        assert_eq!(
+            wanted.resolved_in(&"app.new_name".parse().unwrap(), &recorded),
+            "app.old_name".parse().unwrap()
+        );
+    }
+
+    /// Two cases fall through to the name asked with, and both are ordinary
+    /// rather than an error: no uid for it in `wanted` at all (nothing has
+    /// been applied for this object anywhere yet), and a uid `wanted` knows
+    /// that `recorded` does not (this environment has never had it).
+    #[test]
+    fn resolution_falls_back_to_the_wanted_name_when_it_cannot_resolve() {
+        let mut wanted = IdsFile::default();
+        wanted
+            .tables
+            .insert(uid("t_a9k2mq"), "app.t".parse().unwrap());
+        let empty = IdsFile::default();
+
+        // No uid for the asked name at all: an object added since the last
+        // `plan`.
+        assert_eq!(
+            wanted.resolved_in(&"app.never_minted".parse().unwrap(), &empty),
+            "app.never_minted".parse().unwrap()
+        );
+        // A uid `wanted` has, but `recorded` — an environment that has never
+        // had this table, or whose ledger could not be read at all — does
+        // not.
+        assert_eq!(
+            wanted.resolved_in(&"app.t".parse().unwrap(), &empty),
+            "app.t".parse().unwrap()
+        );
     }
 
     #[test]
