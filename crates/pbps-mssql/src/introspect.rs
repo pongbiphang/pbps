@@ -159,6 +159,7 @@ pub struct RawIndexColumn {
 /// `sys.sql_modules` report it (ADR-0002).
 #[derive(Debug, Clone)]
 pub struct RawModule {
+    pub object_id: i32,
     pub schema: String,
     pub name: String,
     pub kind: ModuleKind,
@@ -169,6 +170,9 @@ pub struct RawModule {
     pub definition: Option<String>,
     /// A trigger's table, as `(schema, table)`.
     pub parent: Option<(String, String)>,
+    /// Views and inline table-valued functions bind referenced objects when
+    /// they are created; other T-SQL modules permit deferred name resolution.
+    pub requires_bound_references: bool,
     /// Whether the module was created with `QUOTED_IDENTIFIER` and `ANSI_NULLS`
     /// both ON, which is what a `CREATE OR ALTER` sent by pbps will run under.
     ///
@@ -179,6 +183,13 @@ pub struct RawModule {
     /// them (they are options, not definition), so such a module is inventoried
     /// rather than claimed to round-trip (ADR-0002).
     pub default_set_options: bool,
+}
+
+/// One resolved same-database dependency from `sys.sql_expression_dependencies`.
+#[derive(Debug, Clone)]
+pub struct RawModuleDependency {
+    pub module_object_id: i32,
+    pub referenced_object_id: i32,
 }
 
 /// One user-defined database role, as `sys.database_principals` reports it
@@ -267,6 +278,7 @@ pub struct RawCatalog {
     pub checks: Vec<RawCheck>,
     pub index_columns: Vec<RawIndexColumn>,
     pub modules: Vec<RawModule>,
+    pub module_dependencies: Vec<RawModuleDependency>,
     pub roles: Vec<RawRole>,
     pub permissions: Vec<RawPermission>,
 }
@@ -603,6 +615,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
     let mut unsupported_temporal_tables = BTreeSet::new();
+    let mut unavailable_object_ids = BTreeSet::new();
 
     for t in &raw.tables {
         // Both halves of active versioning, and a current table whose period
@@ -611,6 +624,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if t.temporal_type != 0 || t.has_period {
             let name = TableName::new(t.schema.clone(), t.name.clone());
             unsupported_temporal_tables.insert(name.clone());
+            unavailable_object_ids.insert(t.object_id);
             push_limitation(
                 &mut warnings,
                 &mut limitations,
@@ -838,6 +852,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // the same reason a computed column is not: a module missing from the
     // declarations is a module the next plan would propose destroying.
     let mut unmanaged_modules: Vec<UnmanagedModule> = Vec::new();
+    // A view (or inline TVF) that directly or transitively binds an omitted
+    // object cannot be recreated in an empty database. Grow the unavailable
+    // set to a fixed point so a view over an omitted view goes with it too.
+    loop {
+        let mut changed = false;
+        for module in &raw.modules {
+            if module.requires_bound_references
+                && raw.module_dependencies.iter().any(|dependency| {
+                    dependency.module_object_id == module.object_id
+                        && unavailable_object_ids.contains(&dependency.referenced_object_id)
+                })
+            {
+                changed |= unavailable_object_ids.insert(module.object_id);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     for m in &raw.modules {
         let name = ObjectName::new(m.schema.clone(), m.name.clone());
         let mut unmanageable = |why: &str| {
@@ -847,6 +880,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 why: why.to_owned(),
             });
         };
+
+        if unavailable_object_ids.contains(&m.object_id) {
+            unmanageable(
+                "it has a create-time-bound dependency on a temporal table or another omitted module",
+            );
+            continue;
+        }
 
         let Some(stored) = &m.definition else {
             unmanageable(
@@ -1949,11 +1989,13 @@ mod module_tests {
 
     fn module(schema: &str, name: &str, kind: ModuleKind, definition: Option<&str>) -> RawModule {
         RawModule {
+            object_id: 100,
             schema: schema.into(),
             name: name.into(),
             kind,
             definition: definition.map(str::to_owned),
             parent: None,
+            requires_bound_references: kind == ModuleKind::View,
             default_set_options: true,
         }
     }
@@ -2056,6 +2098,65 @@ mod module_tests {
                 .why
                 .contains("system versioning")
         );
+    }
+
+    #[test]
+    fn create_time_bound_modules_follow_temporal_dependencies_transitively() {
+        let mut raw = raw_one_table();
+        raw.tables[0].temporal_type = 2;
+
+        let mut direct = module(
+            "dbo",
+            "v_direct",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_direct AS SELECT id FROM dbo.t"),
+        );
+        direct.object_id = 10;
+        let mut transitive = module(
+            "dbo",
+            "v_transitive",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_transitive AS SELECT id FROM dbo.v_direct"),
+        );
+        transitive.object_id = 11;
+        let mut deferred = module(
+            "dbo",
+            "p_deferred",
+            ModuleKind::Procedure,
+            Some("CREATE PROCEDURE dbo.p_deferred AS SELECT id FROM dbo.t"),
+        );
+        deferred.object_id = 12;
+        raw.modules = vec![direct, transitive, deferred];
+        raw.module_dependencies = vec![
+            RawModuleDependency {
+                module_object_id: 10,
+                referenced_object_id: 1,
+            },
+            RawModuleDependency {
+                module_object_id: 11,
+                referenced_object_id: 10,
+            },
+            RawModuleDependency {
+                module_object_id: 12,
+                referenced_object_id: 1,
+            },
+        ];
+
+        let pulled = assemble(&raw);
+
+        assert_eq!(pulled.schema.modules.len(), 1);
+        assert!(
+            pulled
+                .schema
+                .modules
+                .contains_key(&"dbo.p_deferred".parse().unwrap())
+        );
+        for name in ["v_direct", "v_transitive"] {
+            assert!(pulled.unmanaged_modules.iter().any(|module| {
+                module.target.object_name() == TableName::new("dbo", name)
+                    && module.why.contains("create-time-bound dependency")
+            }));
+        }
     }
 
     /// A module whose definition cannot be read, or whose shape the emitter

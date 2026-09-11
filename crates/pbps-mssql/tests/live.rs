@@ -985,6 +985,17 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         )
         .await
         .expect("create temporal table and history");
+    for (view, source) in [
+        ("v_versioned", "versioned"),
+        ("v_versioned_chain", "v_versioned"),
+    ] {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW dbo.{view} AS SELECT id FROM dbo.{source};"
+            ))
+            .await
+            .expect("create temporal-dependent view");
+    }
     for table in ["versioned", "disabled", "plain"] {
         db.conn
             .execute(&format!(
@@ -1019,11 +1030,17 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .modules
             .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
     );
-    assert_eq!(pulled.unmanaged_modules.len(), 2);
+    assert_eq!(pulled.unmanaged_modules.len(), 4);
     for trigger in ["tr_disabled", "tr_versioned"] {
         assert!(pulled.unmanaged_modules.iter().any(|module| {
             module.target.object_name() == TableName::new("dbo", trigger)
                 && module.why.contains("system versioning")
+        }));
+    }
+    for view in ["v_versioned", "v_versioned_chain"] {
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", view)
+                && module.why.contains("create-time-bound dependency")
         }));
     }
     for name in ["disabled", "versioned", "versioned_history"] {

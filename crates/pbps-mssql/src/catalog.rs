@@ -11,7 +11,7 @@ use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
     IndexKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawTable, Securable, assemble,
+    RawKeyColumn, RawModule, RawModuleDependency, RawTable, Securable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the name list drops this tool's
@@ -147,7 +147,7 @@ SELECT i.object_id, i.name, i.is_unique, i.type AS index_type,
 /// `parent_object_id` gives a trigger its table. `is_ms_shipped = 0` drops the
 /// system objects.
 const MODULES: &str = "\
-SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
+SELECT o.object_id, s.name AS schema_name, o.name AS object_name, o.type AS type_code,
        m.definition AS definition,
        ps.name AS parent_schema, pt.name AS parent_table,
        -- Persisted with the module and re-applied on every execution, so they
@@ -166,6 +166,19 @@ SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
  WHERE o.is_ms_shipped = 0
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
  ORDER BY s.name, o.name;";
+
+// Only dependencies the engine resolved to an object in this database can
+// name a temporal table read above. Unresolved and cross-database references
+// have no `referenced_id` and cannot be matched safely by text.
+const MODULE_DEPENDENCIES: &str = "\
+SELECT DISTINCT d.referencing_id, d.referenced_id
+  FROM sys.sql_expression_dependencies d
+ WHERE d.referenced_id IS NOT NULL
+ ORDER BY d.referencing_id, d.referenced_id;";
+
+fn requires_bound_references(type_code: &str) -> bool {
+    matches!(type_code.trim(), "V" | "IF")
+}
 
 /// User-defined database roles (ADR-0005). `is_fixed_role = 0` drops
 /// `db_owner` and friends; `public` is type `R` and not fixed, so it is
@@ -314,12 +327,21 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         let quoted: bool = get(&row, "quoted_identifier")?;
         let ansi_nulls: bool = get(&row, "ansi_nulls")?;
         raw.modules.push(RawModule {
+            object_id: get(&row, "object_id")?,
             default_set_options: quoted && ansi_nulls,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "object_name")?.to_owned(),
             kind,
             definition: opt::<&str>(&row, "definition")?.map(str::to_owned),
             parent,
+            requires_bound_references: requires_bound_references(code),
+        });
+    }
+
+    for row in conn.query(MODULE_DEPENDENCIES).await? {
+        raw.module_dependencies.push(RawModuleDependency {
+            module_object_id: get(&row, "referencing_id")?,
+            referenced_object_id: get(&row, "referenced_id")?,
         });
     }
 
@@ -857,6 +879,16 @@ mod tests {
             let query = tables_query(version, edition);
             assert!(query.contains("t.temporal_type"));
             assert!(query.contains("sys.periods"));
+        }
+    }
+
+    #[test]
+    fn only_views_and_inline_table_functions_require_bound_references() {
+        for code in ["V", "IF"] {
+            assert!(requires_bound_references(code), "{code}");
+        }
+        for code in ["P", "PC", "FN", "TF", "FS", "FT", "TR"] {
+            assert!(!requires_bound_references(code), "{code}");
         }
     }
 

@@ -108,6 +108,7 @@ fn full_catalog() -> RawCatalog {
         ],
         modules: vec![
             RawModule {
+                object_id: 20,
                 schema: "dbo".into(),
                 name: "v_active".into(),
                 kind: ModuleKind::View,
@@ -116,9 +117,11 @@ fn full_catalog() -> RawCatalog {
                         .into(),
                 ),
                 parent: None,
+                requires_bound_references: true,
                 default_set_options: true,
             },
             RawModule {
+                object_id: 21,
                 schema: "dbo".into(),
                 name: "tr_customer".into(),
                 kind: ModuleKind::Trigger,
@@ -127,6 +130,7 @@ fn full_catalog() -> RawCatalog {
                         .into(),
                 ),
                 parent: Some(("dbo".into(), "customer".into())),
+                requires_bound_references: false,
                 default_set_options: true,
             },
         ],
