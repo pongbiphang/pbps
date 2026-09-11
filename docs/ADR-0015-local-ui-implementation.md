@@ -1435,10 +1435,14 @@ What this ADR reasons about and has not measured, in the order the steps of
   and never asks whether `a` is itself symbolic, not merely the refusal
   with `--no-recurse` left in place, which would record `a` itself and
   catch the retarget below through its own lock instead of reproducing
-  the defect. It then builds the same chain, pauses the compose where
-  step 5's checks would sit, retargets `a` to a branch whose tip lacks
-  the change, resumes, and asserts that it installs an index built for
-  `b`'s tip onto a checkout `symbolic-ref` has moved to the other
+  the defect. It then builds the same chain, pauses the compose after
+  step 5's checks have passed and before step 6 installs the prepared
+  index — retargeting any earlier changes what the restored, recursive
+  `symbolic-ref HEAD` answers, and step 5's own compare-and-swap check,
+  unrelated to step 1's fix, catches that and undoes step 2 instead —
+  retargets `a` to a branch whose tip lacks the change, resumes, and
+  asserts that it installs an index built for `b`'s tip onto a checkout
+  `symbolic-ref` has moved to the other
   branch, with `git status` then reporting the composed paths staged —
   the difference nobody made that the refusal
   exists to prevent.
