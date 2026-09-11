@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 # Phase 0 spike: evaluating the span and diagnostic capabilities of candidate
-# YAML crates. The whole spikes/yaml-span directory goes once the choice is made.
+# YAML crates. Retained outside the production workspace as the original
+# decision evidence (DECISIONS 437; ../README.md).
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

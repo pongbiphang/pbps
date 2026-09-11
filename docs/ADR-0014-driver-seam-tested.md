@@ -267,7 +267,11 @@ never answered:   Some("ConnectTimeout")
 
 ## Placement
 
-The spike is evidence and goes once this is settled, like `spikes/yaml-span`.
+The spike is retained outside the production workspace, together with
+`spikes/yaml-span` and `spikes/pg-measurements` (DECISIONS 437). The scripts
+preserve how the original answers were obtained; the production live suite
+verifies the current implementation. Retention replaces the earlier promise
+to delete the experiments once their decisions were settled.
 The two amendments (§1, §2) are small, are not PostgreSQL-specific, and are
 better taken while there is still exactly one dialect to update — but they touch
 `pbps-db` and `pbps-mssql`, so they wait for PR #10 rather than compete with it.

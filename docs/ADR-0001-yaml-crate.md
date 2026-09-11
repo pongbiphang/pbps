@@ -3,7 +3,8 @@
 - Status: decided
 - Date: 2026-08-30
 - Related: docs/SPEC.md §11.3, §13.1
-- Evaluation code: `spikes/yaml-span/` (removable now the choice is settled)
+- Evaluation code: `spikes/yaml-span/` (retained outside the production
+  workspace as historical evidence; DECISIONS 437)
 
 ## Background
 
