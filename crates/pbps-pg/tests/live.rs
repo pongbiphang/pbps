@@ -19488,3 +19488,205 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
     rollback(&mut conn).await;
     drop_schema(&mut conn, &s).await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #103: the timeline reads projected columns, not `state_json`.
+// ---------------------------------------------------------------------------
+
+/// The `public.__pbps_state` DDL from before issue #103's migration — no
+/// `state_version`/`tables_count`/`modules_count`/`staged_completed`/
+/// `staged_total`. Kept as a literal rather than derived from `CREATE_STATE`,
+/// because the whole point of this test is to meet the table the way a
+/// database upgraded across this change actually does.
+const PRE_103_CREATE_STATE: &str = "\
+CREATE TABLE public.__pbps_state (
+    id            bigint GENERATED ALWAYS AS IDENTITY
+                  CONSTRAINT pk___pbps_state PRIMARY KEY,
+    applied_at    timestamp(3)   NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'),
+    kind          varchar(16)    NOT NULL,
+    git_sha       varchar(40)    NULL,
+    plan_checksum varchar(64)    NULL,
+    state_json    text           NOT NULL,
+    operator      varchar(128)   NOT NULL,
+    reason        varchar(1000)  NULL
+)";
+
+fn schema_103(tables: usize, modules: usize) -> Schema {
+    let mut schema = Schema::default();
+    for i in 0..tables {
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("bigint".parse().unwrap()).not_null(),
+        );
+        t.primary_key = Some(PrimaryKey {
+            name: Some(format!("pk_t{i}")),
+            columns: vec!["id".into()],
+        });
+        schema
+            .tables
+            .insert(TableName::new("public", format!("t{i}")), t);
+    }
+    for i in 0..modules {
+        schema.modules.insert(
+            pbps_model::ModuleId::Named(ObjectName::new("public", format!("v{i}"))),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: "SELECT 1 AS x".to_owned(),
+            },
+        );
+    }
+    schema
+}
+
+/// A `__pbps_state` created before issue #103 is migrated in place by
+/// `ensure_tables`, a row it already held keeps listing its counts through
+/// the JSON fallback, and a row recorded afterwards reads them from the new
+/// columns instead.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_pre_issue_103_ledger_is_migrated_in_place_and_legacy_rows_still_list_their_counts() {
+    let mut db = TestDb::create("migrate103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+
+    let schema = schema_103(2, 1);
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "pre-103-operator");
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+    db.conn
+        .execute_with(
+            "INSERT INTO public.__pbps_state (kind, git_sha, plan_checksum, state_json, \
+             operator, reason) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                "apply".into(),
+                None::<&str>.into(),
+                None::<&str>.into(),
+                legacy_json.as_str().into(),
+                "pre-103-operator".into(),
+                None::<&str>.into(),
+            ],
+        )
+        .await
+        .expect("write the legacy row by hand");
+
+    state::ensure_tables(&mut db.conn).await.expect("migrate");
+    state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate again");
+
+    let columns = db
+        .conn
+        .query(
+            "SELECT count(*)::int8 AS present
+               FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = '__pbps_state'
+                AND column_name IN ('state_version', 'tables_count', 'modules_count', \
+                                     'staged_completed', 'staged_total')",
+        )
+        .await
+        .expect("ask the catalog");
+    assert_eq!(
+        columns[0].try_get::<i64>("present").unwrap(),
+        Some(5),
+        "all five columns must exist after migration"
+    );
+
+    let rows = state::timeline(&mut db.conn, 10).await.expect("timeline");
+    assert_eq!(rows.len(), 1);
+    let read_back = rows[0].state.as_ref().expect("the legacy row parses");
+    assert_eq!(read_back.tables, schema.tables.len());
+    assert_eq!(read_back.modules, schema.modules.len());
+    assert_eq!(read_back.version, legacy.version);
+
+    let fresh_id = state::record(&mut db.conn, &legacy).await.expect("record");
+    let row = db
+        .conn
+        .query_with(
+            "SELECT tables_count, modules_count FROM public.__pbps_state WHERE id = $1",
+            &[fresh_id.into()],
+        )
+        .await
+        .expect("read back");
+    assert_eq!(
+        row[0].try_get::<i32>("tables_count").unwrap(),
+        Some(schema.tables.len() as i32),
+        "tables_count must be populated by record, not left NULL"
+    );
+
+    let rows = state::timeline(&mut db.conn, 10).await.expect("timeline");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].state.is_ok());
+    assert!(rows[1].state.is_ok());
+
+    db.drop().await;
+}
+
+/// The sharp test issue #103 names: a fully-migrated ledger whose
+/// `state_json` this role may not see still answers `state list`, because
+/// `select_timeline` never asks for that column.
+///
+/// PostgreSQL has no `DENY`; a role that is granted `SELECT` on every column
+/// except `state_json` — never a table-wide `GRANT` — is refused exactly
+/// that one column (measured: a table-wide `GRANT SELECT` cannot be narrowed
+/// back down by revoking one column, since the table grant already covers
+/// it).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json() {
+    let mut db = TestDb::create("denied103").await;
+    let schema = schema_103(2, 1);
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let snap = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "live-test");
+    state::record(&mut db.conn, &snap).await.expect("record");
+
+    let role = format!("pbps_denied103_{}", std::process::id());
+    let password = "pbpsDenied103!1";
+    let _ = db
+        .conn
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
+    db.conn
+        .execute(&format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        .await
+        .expect("create role");
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT (id, applied_at, kind, git_sha, plan_checksum, operator, reason, \
+             state_version, tables_count, modules_count, staged_completed, staged_total) \
+             ON public.__pbps_state TO {role}"
+        ))
+        .await
+        .expect("grant every column except state_json");
+
+    let mut lp = Conn::connect(
+        pbps_db::Driver::Postgres,
+        &conn_str_as(&role, password, &db.name),
+    )
+    .await
+    .expect("connect as the role");
+
+    // The premise: this principal really cannot read `state_json`.
+    let denied = lp.query("SELECT state_json FROM public.__pbps_state").await;
+    assert!(
+        denied.is_err(),
+        "the premise is wrong if state_json is readable"
+    );
+
+    // And yet the timeline succeeds, with the right counts.
+    let rows = state::timeline(&mut lp, 10)
+        .await
+        .expect("state list must succeed without reading state_json");
+    assert_eq!(rows.len(), 1);
+    let read_back = rows[0].state.as_ref().expect("read from the columns");
+    assert_eq!(read_back.tables, schema.tables.len());
+    assert_eq!(read_back.modules, schema.modules.len());
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect().await;
+    let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+}

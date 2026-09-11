@@ -9087,3 +9087,220 @@ async fn numeric_capacity_safe_alters_preserve_both_endpoints() {
     }
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #103: the timeline reads projected columns, not `state_json`.
+// ---------------------------------------------------------------------------
+
+/// The `dbo.__pbps_state` DDL from before issue #103's migration — no
+/// `state_version`/`tables_count`/`modules_count`/`staged_completed`/
+/// `staged_total`. Kept as a literal rather than derived from `CREATE_STATE`,
+/// because the whole point of this test is to meet the table the way a
+/// database upgraded across this change actually does.
+const PRE_103_CREATE_STATE: &str = "\
+CREATE TABLE dbo.__pbps_state (
+    id            BIGINT IDENTITY(1,1) NOT NULL
+                  CONSTRAINT pk___pbps_state PRIMARY KEY,
+    applied_at    DATETIME2(3)   NOT NULL
+                  CONSTRAINT df___pbps_state_applied_at DEFAULT SYSUTCDATETIME(),
+    kind          VARCHAR(16)    NOT NULL,
+    git_sha       VARCHAR(40)    NULL,
+    plan_checksum CHAR(64)       NULL,
+    state_json    NVARCHAR(MAX)  NOT NULL,
+    operator      NVARCHAR(128)  NOT NULL,
+    reason        NVARCHAR(1000) NULL
+);";
+
+/// A `__pbps_state` created before issue #103 is migrated in place by
+/// `ensure_tables`, a row it already held keeps listing its counts through
+/// the JSON fallback, and a row recorded afterwards reads them from the new
+/// columns instead — the three shapes `ensure_tables` now has to tolerate
+/// (a database upgraded across this change is exactly a live example of the
+/// first).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_pre_issue_103_ledger_is_migrated_in_place_and_legacy_rows_still_list_their_counts() {
+    let mut db = TestDb::create("migrate103").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+
+    // A row written the way a pre-#103 build wrote it: the six original
+    // columns only, nothing in the five this PR adds.
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+    db.conn
+        .execute_with(
+            "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, \
+             reason) VALUES (@P1, @P2, @P3, @P4, @P5, @P6);",
+            &[
+                "apply".into(),
+                None::<&str>.into(),
+                None::<&str>.into(),
+                legacy_json.as_str().into(),
+                "pre-103-operator".into(),
+                None::<&str>.into(),
+            ],
+        )
+        .await
+        .expect("write the legacy row by hand");
+
+    // The migration: idempotent, and safe to call twice.
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate");
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate again");
+
+    let columns = db
+        .conn
+        .query(
+            "SELECT COL_LENGTH('dbo.__pbps_state', 'state_version') AS c1,
+                    COL_LENGTH('dbo.__pbps_state', 'tables_count') AS c2,
+                    COL_LENGTH('dbo.__pbps_state', 'modules_count') AS c3,
+                    COL_LENGTH('dbo.__pbps_state', 'staged_completed') AS c4,
+                    COL_LENGTH('dbo.__pbps_state', 'staged_total') AS c5;",
+        )
+        .await
+        .expect("ask the catalog");
+    for i in 0..5 {
+        assert!(
+            columns[0].try_get_at::<i32>(i).unwrap().is_some(),
+            "column {i} was not added by the migration"
+        );
+    }
+
+    // The legacy row: read through the fallback, its counts still correct.
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("timeline");
+    assert_eq!(rows.len(), 1);
+    let state = rows[0].state.as_ref().expect("the legacy row parses");
+    assert_eq!(state.tables, schema.tables.len());
+    assert_eq!(state.modules, schema.modules.len());
+    assert_eq!(state.version, legacy.version);
+
+    // A row recorded after the migration: its counts come from the columns,
+    // not a re-parse — checked directly against the ledger's own columns
+    // rather than inferred from a timing difference.
+    let fresh_id = pbps_mssql::state::record(&mut db.conn, &legacy)
+        .await
+        .expect("record");
+    let row = db
+        .conn
+        .query_with(
+            "SELECT state_version, tables_count, modules_count FROM dbo.__pbps_state \
+             WHERE id = @P1;",
+            &[fresh_id.into()],
+        )
+        .await
+        .expect("read back");
+    assert_eq!(
+        row[0].try_get_at::<i32>(1).unwrap(),
+        Some(schema.tables.len() as i32),
+        "tables_count must be populated by record, not left NULL"
+    );
+    assert_eq!(
+        row[0].try_get_at::<i32>(2).unwrap(),
+        Some(schema.modules.len() as i32)
+    );
+
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("timeline");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].state.is_ok());
+    assert!(rows[1].state.is_ok());
+
+    db.drop().await;
+}
+
+/// The sharp test issue #103 names: a fully-migrated ledger whose
+/// `state_json` this login may not see still answers `state list`, because
+/// [`pbps_mssql::state::SELECT_TIMELINE`] never asks for that column.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json() {
+    let mut db = TestDb::create("denied103").await;
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let snap = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record(&mut db.conn, &snap)
+        .await
+        .expect("record");
+
+    let login = format!("pbps_denied103_{}", std::process::id());
+    let password = "pbpsDenied103!1";
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT SELECT ON dbo.__pbps_state TO [{login}]; \
+             DENY SELECT ON dbo.__pbps_state(state_json) TO [{login}];"
+        ))
+        .await
+        .expect("grant table SELECT and deny the one column");
+
+    let base = conn_str();
+    let base_no_credentials = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{base_no_credentials};User Id={login};Password={password};Database={}",
+        db.name
+    );
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+
+    // The premise: this principal really cannot read `state_json`.
+    let denied = lp.query("SELECT state_json FROM dbo.__pbps_state;").await;
+    assert!(
+        denied.is_err(),
+        "the premise is wrong if state_json is readable"
+    );
+
+    // And yet the timeline succeeds, with the right counts.
+    let rows = pbps_mssql::state::timeline(&mut lp, 10)
+        .await
+        .expect("state list must succeed without reading state_json");
+    assert_eq!(rows.len(), 1);
+    let state = rows[0].state.as_ref().expect("read from the columns");
+    assert_eq!(state.tables, schema.tables.len());
+    assert_eq!(state.modules, schema.modules.len());
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}

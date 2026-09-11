@@ -14,9 +14,11 @@
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
-use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, ids_to_prune};
-use pbps_db::{Conn, DbError};
-use pbps_model::StateSnapshot;
+use pbps_db::ledger::{
+    LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineStaged, TimelineState, ids_to_prune,
+};
+use pbps_db::{Conn, DbError, Param};
+use pbps_model::{StateSnapshot, Unreadable};
 
 use crate::catalog::{get, opt};
 
@@ -41,21 +43,59 @@ pub const LOCK_TABLE: &str = "dbo.__pbps_lock";
 /// `IF OBJECT_ID` rather than `CREATE OR ALTER`: creating the ledger must be
 /// safe to run on every command that writes one, and re-running must not
 /// disturb the rows already there.
+///
+/// The last five columns are `state list`'s own projection (issue #103,
+/// DECISIONS 432) — the same move SPEC §8.1 already made for
+/// `kind`/`git_sha`/`plan_checksum`/`operator`/`reason`, so a reader of the
+/// timeline can get counts without parsing `state_json`. Nullable, because a
+/// row recorded before they existed has none; [`timeline`] falls back to
+/// `state_json` for exactly that row rather than refusing the whole call.
 const CREATE_STATE: &str = "\
 IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.__pbps_state (
-        id            BIGINT IDENTITY(1,1) NOT NULL
-                      CONSTRAINT pk___pbps_state PRIMARY KEY,
-        applied_at    DATETIME2(3)   NOT NULL
-                      CONSTRAINT df___pbps_state_applied_at DEFAULT SYSUTCDATETIME(),
-        kind          VARCHAR(16)    NOT NULL,
-        git_sha       VARCHAR(40)    NULL,
-        plan_checksum CHAR(64)       NULL,
-        state_json    NVARCHAR(MAX)  NOT NULL,
-        operator      NVARCHAR(128)  NOT NULL,
-        reason        NVARCHAR(1000) NULL
+        id               BIGINT IDENTITY(1,1) NOT NULL
+                         CONSTRAINT pk___pbps_state PRIMARY KEY,
+        applied_at       DATETIME2(3)   NOT NULL
+                         CONSTRAINT df___pbps_state_applied_at DEFAULT SYSUTCDATETIME(),
+        kind             VARCHAR(16)    NOT NULL,
+        git_sha          VARCHAR(40)    NULL,
+        plan_checksum    CHAR(64)       NULL,
+        state_json       NVARCHAR(MAX)  NOT NULL,
+        operator         NVARCHAR(128)  NOT NULL,
+        reason           NVARCHAR(1000) NULL,
+        state_version    INT NULL,
+        tables_count     INT NULL,
+        modules_count    INT NULL,
+        staged_completed INT NULL,
+        staged_total     INT NULL
     );
+END;";
+
+/// Adds the five timeline columns to a `__pbps_state` created before issue
+/// #103, if they are not there yet.
+///
+/// Guarded by `IF COL_LENGTH(...) IS NULL` rather than a probe asked of Rust
+/// first: **measured** against the pinned server, a login holding `SELECT`,
+/// `INSERT` and `DELETE` on the table and no `ALTER` runs this exact batch
+/// against a table that already has the columns and it does nothing —
+/// SQL Server evaluates the `IF` before it would need `ALTER` to act on the
+/// `THEN`, unlike the other engine's `ALTER TABLE ... ADD COLUMN IF NOT
+/// EXISTS`, which is refused by ownership before the `IF NOT EXISTS` is
+/// looked at at all (see `pbps_pg::state::migrate_timeline_columns`, which
+/// therefore cannot use this shape). So a deployment account that never needs
+/// `ALTER` after the one-time migration never has to hold it — the same
+/// reasoning [`CREATE_STATE`] already relies on for `IF OBJECT_ID(...) IS
+/// NULL`.
+const ADD_TIMELINE_COLUMNS: &str = "\
+IF COL_LENGTH('dbo.__pbps_state', 'state_version') IS NULL
+BEGIN
+    ALTER TABLE dbo.__pbps_state ADD
+        state_version    INT NULL,
+        tables_count     INT NULL,
+        modules_count    INT NULL,
+        staged_completed INT NULL,
+        staged_total     INT NULL;
 END;";
 
 /// The width of `__pbps_state.reason`, in the unit `NVARCHAR(n)` is measured
@@ -108,20 +148,61 @@ SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_
   FROM dbo.__pbps_state
  ORDER BY id DESC;";
 
-/// The timeline reads the projected columns, so a row whose `state_json` this
-/// build cannot parse is still a row.
+/// The timeline reads the projected columns — including the five issue #103
+/// added — and never `state_json`: the whole point is that a row whose
+/// recorded state this build cannot read, or may not read, is still a row,
+/// and getting that without ever asking for `state_json` is what lets
+/// `state list` succeed against a ledger whose `state_json` this login cannot
+/// see (the sharp test issue #103 names). A row from before the migration has
+/// `state_version IS NULL`; [`timeline`] asks [`select_legacy_state_json`]
+/// for exactly those rows, in a second statement, so the common case —
+/// every row already migrated — never sends `state_json` at all.
 const SELECT_TIMELINE: &str = "\
 SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at,
-       kind, git_sha, plan_checksum, operator, reason, state_json
+       kind, git_sha, plan_checksum, operator, reason,
+       state_version, tables_count, modules_count, staged_completed, staged_total
   FROM dbo.__pbps_state
  ORDER BY id DESC;";
 
+/// `state_json` for exactly the rows [`timeline`] could not answer from the
+/// projected columns. Never sent when there are none, so the common case
+/// this issue exists to make cheap never runs it.
+fn select_legacy_state_json(count: usize) -> String {
+    let slots: Vec<String> = (1..=count).map(|i| format!("@P{i}")).collect();
+    format!(
+        "SELECT id, state_json FROM dbo.__pbps_state WHERE id IN ({});",
+        slots.join(", ")
+    )
+}
+
 /// `OUTPUT INSERTED.id` rather than `SCOPE_IDENTITY()`: it is one round trip,
 /// and it cannot be confused by a trigger someone added to the ledger.
-const INSERT_STATE: &str = "\
-INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason)
+///
+/// The last five values are the same projection [`CREATE_STATE`] documents,
+/// computed from the snapshot being recorded rather than passed separately —
+/// a caller able to set them independently could make them disagree with
+/// `state_json`, which is exactly what the five columns beside it already
+/// exist to never do.
+///
+/// Two spellings, not one with an optional pair of parameters: `Param` has no
+/// nullable-integer variant, and `staged_completed`/`staged_total` are NULL on
+/// precisely the rows that are not a staged checkpoint. [`record`] chooses
+/// between them by the snapshot's own `staged` field — never by anything a
+/// caller supplies as text — so there is nothing for
+/// `no_statement_interpolates_a_value` to catch in either.
+const INSERT_STATE_STAGED: &str = "\
+INSERT INTO dbo.__pbps_state
+    (kind, git_sha, plan_checksum, state_json, operator, reason,
+     state_version, tables_count, modules_count, staged_completed, staged_total)
 OUTPUT INSERTED.id
-VALUES (@P1, @P2, @P3, @P4, @P5, @P6);";
+VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, @P10, @P11);";
+
+const INSERT_STATE_NOT_STAGED: &str = "\
+INSERT INTO dbo.__pbps_state
+    (kind, git_sha, plan_checksum, state_json, operator, reason,
+     state_version, tables_count, modules_count, staged_completed, staged_total)
+OUTPUT INSERTED.id
+VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, NULL, NULL);";
 
 const SELECT_IDS: &str = "SELECT id FROM dbo.__pbps_state ORDER BY id DESC;";
 
@@ -135,16 +216,53 @@ const INSERT_LOCK: &str = "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1
 
 const DELETE_LOCK: &str = "DELETE FROM dbo.__pbps_lock WHERE id = 1;";
 
-/// Creates the ledger and lock tables if they are not there yet.
+/// Creates the ledger and lock tables if they are not there yet, and migrates
+/// a `__pbps_state` from before issue #103 to carry the timeline columns.
 pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     conn.execute(CREATE_STATE).await?;
-    conn.execute(CREATE_LOCK).await
+    conn.execute(CREATE_LOCK).await?;
+    migrate_timeline_columns(conn).await
+}
+
+/// Runs [`ADD_TIMELINE_COLUMNS`], and turns a failure into one that names the
+/// ledger, the columns and the right this needs.
+///
+/// The driver's own message for a denied `ALTER` — measured, Msg 1088,
+/// "Cannot find the object ... because it does not exist or you do not have
+/// permissions" — names neither. `doctor` does not yet ask for `ALTER` on an
+/// existing ledger (it asks only while the table is being created,
+/// [`crate::doctor::Needed::LedgerCreation`]), so an operator meeting this for
+/// the first time has no readiness check that would have warned them; that
+/// gap is reported beside this change, not closed by it.
+async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
+    conn.execute(ADD_TIMELINE_COLUMNS).await.map_err(|e| {
+        let code = e.server_error_code();
+        DbError::Driver {
+            message: format!(
+                "dbo.__pbps_state is missing the timeline columns (state_version, \
+                 tables_count, modules_count, staged_completed, staged_total) issue #103 \
+                 added, and this login could not add them: {e}\n\
+                 This is a one-time migration that needs ALTER on dbo.__pbps_state; it is \
+                 not part of the ordinary deployment grant, so a login holding only what \
+                 `doctor` asks for today will meet this until that is fixed."
+            ),
+            code,
+        }
+    })
 }
 
 /// The cheapest statement that resolves the ledger and checks the permission to
 /// read it without returning a row. See [`is_initialized`] for why it is a
 /// statement at all.
-const PROBE_STATE: &str = "SELECT TOP (0) 1 AS present FROM dbo.__pbps_state;";
+///
+/// `id`, not a bare `1`: **measured** against the pinned server, once any
+/// column of a table carries a column-level `DENY`, `SELECT TOP (0) 1 AS
+/// present FROM t` — naming no column at all — is refused with the same Msg
+/// 230 a query naming the denied column would get, even though it reads
+/// nothing. Naming a real, always-granted column (issue #103's sharp test
+/// denies only `state_json`) is what keeps this probe answering the question
+/// it exists to answer rather than "is every column of this table readable".
+const PROBE_STATE: &str = "SELECT TOP (0) id AS present FROM dbo.__pbps_state;";
 
 /// Whether this database has a ledger at all.
 ///
@@ -207,6 +325,14 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
 /// reason rather than failing the call: an environment upgraded across a
 /// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
 /// one of them must not erase the history above it (DECISIONS 218).
+///
+/// [`SELECT_TIMELINE`] never asks for `state_json` (DECISIONS 432): a second
+/// query, [`select_legacy_state_json`], asks for it only for the rows that
+/// predate the migration — `state_version IS NULL` — and only for those ids.
+/// In the common case, once a ledger's rows are all migrated, that second
+/// query is never sent, which is the whole point of issue #103 and the
+/// property its sharp test pins: a fully-migrated ledger whose `state_json`
+/// this login may not see still answers `state list`.
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
     if !is_initialized(conn).await? {
         return Err(LedgerError::NotInitialized);
@@ -214,7 +340,74 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
     let rows = conn
         .query_with(SELECT_TIMELINE, &[top(limit).into()])
         .await?;
-    rows.iter().map(timeline_from_row).collect()
+    let projected: Vec<ProjectedRow> = rows.iter().map(projected_row).collect::<Result<_, _>>()?;
+
+    let legacy_ids: Vec<i64> = projected
+        .iter()
+        .filter(|r| r.state.is_none())
+        .map(|r| r.id)
+        .collect();
+    let mut legacy: std::collections::HashMap<i64, Result<TimelineState, Unreadable>> =
+        std::collections::HashMap::new();
+    if !legacy_ids.is_empty() {
+        let sql = select_legacy_state_json(legacy_ids.len());
+        let params: Vec<Param<'_>> = legacy_ids.iter().map(|&id| id.into()).collect();
+        match conn.query_with(&sql, &params).await {
+            Ok(rows) => {
+                for row in &rows {
+                    let id: i64 = get(row, "id")?;
+                    let state_json: &str = get(row, "state_json")?;
+                    // `read_json`, the same reader the pre-migration
+                    // `timeline_from_row` used: version before shape, and the
+                    // failure carried rather than returned (DECISIONS 222).
+                    let state = StateSnapshot::read_json(state_json)
+                        .map(|s| TimelineState::from_snapshot(&s));
+                    legacy.insert(id, state);
+                }
+            }
+            // Denied specifically, never a hard failure of the whole call:
+            // this is the fallback query, run only for rows a fresh ledger
+            // never has, and DECISIONS 218's promise — a row this build
+            // cannot read is carried, not thrown — extends to a row this
+            // build was refused, not only one it could not parse (DECISIONS
+            // 432). Every legacy id in this batch shares one answer, because
+            // a column-level DENY is not sensitive to which row is read.
+            Err(e) if is_select_denied(&e) => {
+                let denied = Err(Unreadable::Denied(e.to_string()));
+                for id in &legacy_ids {
+                    legacy.insert(*id, denied.clone());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(projected
+        .into_iter()
+        .map(|r| TimelineEntry {
+            id: r.id,
+            applied_at: r.applied_at,
+            kind: r.kind,
+            git_sha: r.git_sha,
+            plan_checksum: r.plan_checksum,
+            operator: r.operator,
+            reason: r.reason,
+            state: match r.state {
+                Some(state) => Ok(state),
+                // The fallback query answered for every id it was asked
+                // about; a legacy id missing from its answer means the row
+                // left the ledger between the two queries (a concurrent
+                // `state prune`), not that it was ever malformed or denied.
+                None => legacy.remove(&r.id).unwrap_or_else(|| {
+                    Err(Unreadable::Malformed(
+                        "this row's state_json could not be re-read; it may have been \
+                         pruned while the timeline was being read"
+                            .to_owned(),
+                    ))
+                }),
+            },
+        })
+        .collect())
 }
 
 /// `TOP (n)` takes a signed integer, and the count is unsigned.
@@ -226,11 +419,20 @@ fn top(limit: u32) -> i32 {
     i32::try_from(limit).unwrap_or(i32::MAX)
 }
 
+/// A count or version as the `INT` columns hold it: saturating, like [`top`]
+/// — a table, module or staged-statement count that does not fit `i32` is not
+/// a real schema, and a wrapped negative would misreport the count rather
+/// than merely cap it.
+fn saturating_i32(n: u64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
 /// Appends one state to the ledger and returns its id.
 ///
 /// The columns beside `state_json` are projected from the snapshot rather than
 /// passed separately: they exist so `status` can filter without parsing JSON,
-/// and a caller able to set them independently could make them lie.
+/// and a caller able to set them independently could make them lie. The five
+/// issue #103 added follow the same rule (DECISIONS 432).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     ensure_tables(conn).await?;
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
@@ -239,19 +441,37 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
     })?;
 
     let kind = snapshot.kind.as_str();
-    let rows = conn
-        .query_with(
-            INSERT_STATE,
-            &[
-                kind.into(),
-                snapshot.git_sha.as_deref().into(),
-                snapshot.plan_checksum.as_deref().into(),
-                state_json.as_str().into(),
-                snapshot.operator.as_str().into(),
-                snapshot.reason.as_deref().into(),
-            ],
-        )
-        .await?;
+    let state_version = saturating_i32(u64::from(snapshot.version));
+    let tables_count = saturating_i32(snapshot.schema.tables.len() as u64);
+    let modules_count = saturating_i32(snapshot.schema.modules.len() as u64);
+
+    let mut params: Vec<Param<'_>> = vec![
+        kind.into(),
+        snapshot.git_sha.as_deref().into(),
+        snapshot.plan_checksum.as_deref().into(),
+        state_json.as_str().into(),
+        snapshot.operator.as_str().into(),
+        snapshot.reason.as_deref().into(),
+        state_version.into(),
+        tables_count.into(),
+        modules_count.into(),
+    ];
+    // `staged_completed`/`staged_total` cannot be bound as NULL through
+    // `Param` — it has no nullable-integer variant, and adding one would mean
+    // updating the binder `pbps_db::Param` matches in *both* drivers for two
+    // columns that are NULL on precisely the rows that are not staged. Two
+    // static statements, chosen by whether this snapshot has staged progress
+    // at all, cost nothing `no_statement_interpolates_a_value` would catch —
+    // neither text is built from a value — and need no new binder variant.
+    let sql = match &snapshot.staged {
+        Some(progress) => {
+            params.push(saturating_i32(progress.completed as u64).into());
+            params.push(saturating_i32(progress.total as u64).into());
+            INSERT_STATE_STAGED
+        }
+        None => INSERT_STATE_NOT_STAGED,
+    };
+    let rows = conn.query_with(sql, &params).await?;
     match rows.first() {
         Some(row) => Ok(get(row, "id")?),
         None => Err(LedgerError::Db(DbError::BadRow(
@@ -324,6 +544,18 @@ fn is_missing_table(e: &DbError) -> bool {
     e.server_error_code().as_deref() == Some(INVALID_OBJECT_NAME)
 }
 
+/// SQL Server's "SELECT permission was denied on the column", **measured**
+/// against the pinned server: Msg 230. Table-level denial is 229, the code
+/// beside [`INVALID_OBJECT_NAME`] above — and by the time [`timeline`] would
+/// meet this one, [`is_initialized`]'s table-level probe has already
+/// succeeded, so 230 is specifically a principal refused `state_json` and
+/// nothing else on the ledger, the shape issue #103's sharp test builds.
+const SELECT_DENIED_ON_COLUMN: &str = "230";
+
+fn is_select_denied(e: &DbError) -> bool {
+    e.server_error_code().as_deref() == Some(SELECT_DENIED_ON_COLUMN)
+}
+
 /// Releases the lock. `false` means it was not held.
 pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
     // The *lock* table, not the state table. Guarding on `is_initialized` meant
@@ -379,19 +611,71 @@ fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
     })
 }
 
-fn timeline_from_row(row: &pbps_db::Row) -> Result<TimelineEntry, LedgerError> {
+/// A ledger row's projected columns, without `state_json` (DECISIONS 432):
+/// [`SELECT_TIMELINE`] never asks for it. `state` is `None` exactly when this
+/// row predates issue #103's migration — `state_version IS NULL` — and
+/// [`timeline`] must still ask [`select_legacy_state_json`] for it.
+struct ProjectedRow {
+    id: i64,
+    applied_at: String,
+    kind: String,
+    git_sha: Option<String>,
+    plan_checksum: Option<String>,
+    operator: String,
+    reason: Option<String>,
+    state: Option<TimelineState>,
+}
+
+/// A count or a version read back from an `INT` column. Negative is
+/// impossible by construction — [`record`] only ever writes what
+/// [`saturating_i32`] produces — so it is reported rather than clamped: a
+/// negative here means the row and this reader have gone out of step, not
+/// that the count was merely large.
+fn as_count(n: i32, column: &str) -> Result<usize, DbError> {
+    usize::try_from(n).map_err(|_| DbError::BadRow(format!("`{column}` is {n}, not a count")))
+}
+
+fn as_version(n: i32, column: &str) -> Result<u32, DbError> {
+    u32::try_from(n).map_err(|_| DbError::BadRow(format!("`{column}` is {n}, not a version")))
+}
+
+fn projected_row(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
     let id: i64 = get(row, "id")?;
-    let state_json: &str = get(row, "state_json")?;
 
-    // `read_json`, the same reader `entry_from_row` uses through `from_json`:
-    // the version before the shape, so an older row is refused by its version
-    // rather than by whichever field of its older shape serde reached first.
-    // The failure is carried on the row rather than returned — this is the one
-    // reader whose answer is the list itself — and the two kinds stay apart,
-    // because their remedies do (DECISIONS 222).
-    let state = StateSnapshot::read_json(state_json);
+    // `state_version` is the migration's own marker: written by every
+    // `record` from here on, and NULL on every row from before it. It is the
+    // one column this test asks about rather than `tables_count` or the
+    // staged pair, because those three project independently of whether a
+    // row is staged and would each need their own "is this really absent"
+    // rule; `state_version` has only one meaning either way.
+    let state = match opt::<i32>(row, "state_version")? {
+        None => None,
+        Some(version) => {
+            let tables = as_count(get(row, "tables_count")?, "tables_count")?;
+            let modules = as_count(get(row, "modules_count")?, "modules_count")?;
+            let staged = match (
+                opt::<i32>(row, "staged_completed")?,
+                opt::<i32>(row, "staged_total")?,
+            ) {
+                (Some(completed), Some(total)) => Some(TimelineStaged {
+                    completed: as_count(completed, "staged_completed")?,
+                    total: as_count(total, "staged_total")?,
+                }),
+                // A migrated row that is not a staged checkpoint: both are
+                // NULL together, which is what "not mid-deployment" means
+                // (`pbps_model::StagedProgress`'s own doc comment).
+                _ => None,
+            };
+            Some(TimelineState {
+                version: as_version(version, "state_version")?,
+                tables,
+                modules,
+                staged,
+            })
+        }
+    };
 
-    Ok(TimelineEntry {
+    Ok(ProjectedRow {
         id,
         applied_at: opt::<&str>(row, "applied_at")?
             .ok_or_else(|| DbError::BadRow("`applied_at` is unexpectedly NULL".into()))?
@@ -428,7 +712,7 @@ mod tests {
     fn the_reason_width_is_the_one_the_ddl_declares() {
         assert!(
             CREATE_STATE.contains(&format!(
-                "reason        NVARCHAR({REASON_UTF16_UNITS}) NULL"
+                "reason           NVARCHAR({REASON_UTF16_UNITS}) NULL"
             )),
             "{CREATE_STATE}"
         );
@@ -472,14 +756,18 @@ mod tests {
         assert_eq!(LOCK_TABLE, format!("{LEDGER_SCHEMA}.{LOCK_TABLE_NAME}"));
         for sql in [
             CREATE_STATE,
+            ADD_TIMELINE_COLUMNS,
             SELECT_LATEST,
             SELECT_HISTORY,
-            INSERT_STATE,
+            SELECT_TIMELINE,
+            INSERT_STATE_STAGED,
+            INSERT_STATE_NOT_STAGED,
             SELECT_IDS,
             DELETE_UP_TO,
         ] {
             assert!(sql.contains("__pbps_state"), "{sql}");
         }
+        assert!(select_legacy_state_json(2).contains("__pbps_state"));
         for sql in [CREATE_LOCK, SELECT_LOCK, INSERT_LOCK, DELETE_LOCK] {
             assert!(sql.contains("__pbps_lock"), "{sql}");
         }
@@ -491,16 +779,63 @@ mod tests {
     fn no_statement_interpolates_a_value() {
         for sql in [
             SELECT_HISTORY,
-            INSERT_STATE,
+            SELECT_TIMELINE,
+            INSERT_STATE_STAGED,
+            INSERT_STATE_NOT_STAGED,
             DELETE_UP_TO,
             INSERT_LOCK,
             DELETE_LOCK,
+            &select_legacy_state_json(3),
         ] {
             assert!(
                 !sql.contains("'{") && !sql.contains("{}"),
                 "a format placeholder in ledger SQL means a value is being pasted: {sql}"
             );
         }
-        assert!(INSERT_STATE.contains("@P6"), "all six values are bound");
+        assert!(
+            INSERT_STATE_STAGED.contains("@P11"),
+            "all eleven values are bound"
+        );
+        assert!(
+            INSERT_STATE_NOT_STAGED.contains("@P9")
+                && INSERT_STATE_NOT_STAGED.contains("NULL, NULL"),
+            "the nine bound values plus the two literal NULLs"
+        );
+    }
+
+    /// One placeholder per id asked about, in order — the shape
+    /// [`timeline`]'s fallback relies on to keep a returned row matched to
+    /// the id that asked for it.
+    #[test]
+    fn the_legacy_query_binds_one_placeholder_per_id() {
+        assert_eq!(
+            select_legacy_state_json(3),
+            "SELECT id, state_json FROM dbo.__pbps_state WHERE id IN (@P1, @P2, @P3);"
+        );
+        assert_eq!(
+            select_legacy_state_json(1),
+            "SELECT id, state_json FROM dbo.__pbps_state WHERE id IN (@P1);"
+        );
+    }
+
+    /// A count too large for `i32` saturates rather than wrapping — the same
+    /// rule [`top`] follows, applied to what `record` writes.
+    #[test]
+    fn a_count_too_large_for_the_column_saturates() {
+        assert_eq!(saturating_i32(0), 0);
+        assert_eq!(saturating_i32(i32::MAX as u64), i32::MAX);
+        assert_eq!(saturating_i32(i32::MAX as u64 + 1), i32::MAX);
+        assert_eq!(saturating_i32(u64::MAX), i32::MAX);
+    }
+
+    /// A negative value in a column this build only ever writes non-negative
+    /// numbers to is reported rather than clamped to zero — clamping would
+    /// read as "no tables" about a row that is actually corrupted.
+    #[test]
+    fn a_negative_count_or_version_is_reported_not_clamped() {
+        assert!(as_count(-1, "tables_count").is_err());
+        assert_eq!(as_count(5, "tables_count").unwrap(), 5);
+        assert!(as_version(-1, "state_version").is_err());
+        assert_eq!(as_version(7, "state_version").unwrap(), 7);
     }
 }

@@ -86,12 +86,70 @@ pub struct TimelineEntry {
     pub operator: String,
     pub reason: Option<String>,
 
-    /// The recorded state, or why this build could not read it.
+    /// The four numbers a timeline row draws, or why this build could not read
+    /// them.
     ///
-    /// A `Result` rather than a snapshot beside an optional reason: exactly one
+    /// A `Result` rather than the data beside an optional reason: exactly one
     /// of the two is true of every row, and a struct able to hold both — or
     /// neither — needs a comment where a type does the same work.
-    pub state: Result<StateSnapshot, pbps_model::Unreadable>,
+    ///
+    /// [`TimelineState`], not [`StateSnapshot`] (DECISIONS 432): the common
+    /// path reads `state_version`, `tables_count`, `modules_count`,
+    /// `staged_completed` and `staged_total` straight off the row and never
+    /// touches `state_json`, so it never has the schema or the identity
+    /// mapping in hand. A field typed `StateSnapshot` that was routinely
+    /// empty everywhere but four numbers would be a type lying about what it
+    /// holds; `TimelineState` can hold exactly what a timeline row needs and
+    /// nothing a reader might reach for and not find.
+    pub state: Result<TimelineState, pbps_model::Unreadable>,
+}
+
+/// The four numbers [`crate::TimelineEntry`] draws from a recorded state.
+///
+/// Read straight from the ledger's projected columns for a row recorded after
+/// they existed; read out of a full [`StateSnapshot`] parse for one recorded
+/// before (DECISIONS 432) — either way the timeline needs only these, never
+/// the schema or the identity mapping the full snapshot also carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineState {
+    /// The recorded state's own format version ([`StateSnapshot::version`]).
+    pub version: u32,
+
+    /// How many tables the recorded schema has.
+    pub tables: usize,
+
+    /// How many modules the recorded schema has.
+    pub modules: usize,
+
+    /// Present only for a [`pbps_model::StateKind::Staged`] checkpoint — the
+    /// same absence rule [`pbps_model::StagedProgress`] documents.
+    pub staged: Option<TimelineStaged>,
+}
+
+impl TimelineState {
+    /// Reads the four numbers off a fully-parsed snapshot — the fallback path
+    /// for a row recorded before the projected columns existed, or written by
+    /// hand (DECISIONS 432).
+    pub fn from_snapshot(snapshot: &StateSnapshot) -> Self {
+        TimelineState {
+            version: snapshot.version,
+            tables: snapshot.schema.tables.len(),
+            modules: snapshot.schema.modules.len(),
+            staged: snapshot.staged.as_ref().map(|s| TimelineStaged {
+                completed: s.completed,
+                total: s.total,
+            }),
+        }
+    }
+}
+
+/// How far a staged checkpoint had got, without
+/// [`pbps_model::StagedProgress::last_statement`] — nothing in `state list`
+/// renders it, and a projected column exists for what a reader actually asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineStaged {
+    pub completed: usize,
+    pub total: usize,
 }
 
 /// Who holds `__pbps_lock`, and since when.
