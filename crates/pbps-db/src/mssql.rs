@@ -53,7 +53,13 @@ impl Conn {
         // resolve-and-try-each-address loop, so one black-holed address of a
         // dual-stack name spent the entire budget and the healthy one was never
         // tried. The same shape was on both sides of the seam.
-        let tcp = crate::open_socket(&addr).await?;
+        //
+        // `CONNECT_TIMEOUT` unconditionally: an ADO.NET connection string has
+        // no `connect_timeout` of its own to honour or refuse (issue #113;
+        // `tiberius-ng`'s `Config::from_ado_string` parses no such key), and
+        // `false` for the same reason — no `load_balance_hosts` equivalent
+        // either, so resolution order is never reshuffled here.
+        let tcp = crate::open_socket(&addr, crate::CONNECT_TIMEOUT, false).await?;
         tcp.set_nodelay(true).map_err(|source| DbError::Connect {
             addr: config.get_addr().to_owned(),
             source,

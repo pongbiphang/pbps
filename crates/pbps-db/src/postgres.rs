@@ -17,6 +17,7 @@
 //! detached: a detached task would outlive the `Conn` that owns it and keep a
 //! server-side session open after the command that opened it has exited.
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio_postgres::Config;
 use tokio_postgres::tls::MakeTlsConnect;
@@ -64,6 +65,8 @@ impl Conn {
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
         let (host, port) = endpoint(&config)?;
         let addr = format!("{host}:{port}");
+        let budget = connect_budget(&config)?;
+        let shuffle = wants_random_order(&config);
 
         // Opening the socket here rather than letting the driver do it is what
         // keeps `Connect` and `ConnectTimeout` apart: the driver opens the
@@ -71,10 +74,24 @@ impl Conn {
         // error type, and the seam wants that error by value (ADR-0014 §3).
         // How it is opened is [`crate::open_socket`]'s, shared with the other
         // driver: every address the name resolves to gets a chance inside the
-        // one budget.
-        let tcp = crate::open_socket(&addr).await?;
+        // one budget — `budget` rather than `pbps_db::CONNECT_TIMEOUT` bare,
+        // because `connect_timeout` may have asked for less than that ceiling
+        // (see `connect_budget`), and `shuffle` because `load_balance_hosts
+        // =random` reorders this same resolved list rather than touching a
+        // socket option (issue #113).
+        let tcp = crate::open_socket(&addr, budget, shuffle).await?;
         tcp.set_nodelay(true)
             .map_err(|source| DbError::Connect { addr, source })?;
+        // `addr` was just moved above (see the note on `require_session`
+        // below), so this and every later error in `connect` names the
+        // endpoint through a freshly built string instead.
+        //
+        // Keepalive and `tcp_user_timeout` land here — after `open_socket`,
+        // before `connect_raw` — because `connect_raw` hands the socket
+        // straight to the PostgreSQL handshake and never asks it anything
+        // socket-level; `Config::connect`'s own `connect_socket` is the one
+        // place that does, and this seam does not call it (issue #113).
+        apply_socket_options(&tcp, &config, &format!("{host}:{port}"))?;
 
         // `connect_raw`, not `connect`: the driver's own `connect` opens the
         // socket, and then the three failures above collapse into its error
@@ -309,6 +326,165 @@ fn endpoint(config: &Config) -> Result<(String, u16), DbError> {
     }
     let port = ports.first().copied().unwrap_or(5432);
     Ok((name, port))
+}
+
+/// The socket budget this connection string asks for, bounded by
+/// [`crate::CONNECT_TIMEOUT`].
+///
+/// `CONNECT_TIMEOUT`'s own doc comment calls it "short enough that a pipeline
+/// blocked by a firewall reports it while someone is still watching" — a
+/// ceiling pbps enforces for its own reason, not a default the connection
+/// string is free to raise. A smaller request is honoured, because it serves
+/// that same reason even better: a pipeline behind a dropped connection learns
+/// sooner. A larger one is refused by name, with the ceiling named in the
+/// message, rather than silently capped — silent capping is exactly the shape
+/// issue #113 exists to remove, applied to the one parameter that already had
+/// a value here before the string was read.
+fn connect_budget(config: &Config) -> Result<std::time::Duration, DbError> {
+    match config.get_connect_timeout() {
+        Some(requested) if *requested > crate::CONNECT_TIMEOUT => {
+            Err(DbError::BadConnectionString(format!(
+                "`connect_timeout={}` is longer than the {}s pbps waits for a \
+                 TCP connection before giving up. That bound exists so a \
+                 pipeline behind a dropped connection reports it while someone \
+                 is still watching, and honouring a longer request would give \
+                 that up silently. Ask for {}s or less.",
+                requested.as_secs(),
+                crate::CONNECT_TIMEOUT.as_secs(),
+                crate::CONNECT_TIMEOUT.as_secs(),
+            )))
+        }
+        // Whole seconds only, and `connect_timeout=0` or a negative value
+        // never reaches this arm: `tokio_postgres::Config`'s own string parser
+        // only calls its `connect_timeout` setter for a value greater than
+        // zero, so `get_connect_timeout()` already reads `None` for either —
+        // the same "unset" this function's `None` arm returns
+        // `CONNECT_TIMEOUT` for. Nothing here needs to re-enforce that floor.
+        Some(requested) => Ok(*requested),
+        None => Ok(crate::CONNECT_TIMEOUT),
+    }
+}
+
+/// Whether `load_balance_hosts` asks for the resolved addresses to be tried
+/// in a random order rather than resolution order.
+///
+/// The one connection-string setting this seam turns into an address-ordering
+/// choice rather than a socket option — see [`crate::open_socket`]'s
+/// `shuffle` parameter, which this feeds.
+fn wants_random_order(config: &Config) -> bool {
+    config.get_load_balance_hosts() == tokio_postgres::config::LoadBalanceHosts::Random
+}
+
+/// The keepalive settings this connection string asks for, or `None` when
+/// `keepalives=0` turns keepalive off and there is nothing to set.
+///
+/// Read from `Config`'s own accessors rather than through `tokio-postgres`'s
+/// private `KeepaliveConfig`, but built the same way its `connect_socket`
+/// builds one: `keepalives_idle` always has a value (2h by default), so it is
+/// applied unconditionally once keepalive is on — there is no "the string
+/// left it unset" to preserve, because the accessor cannot tell that case
+/// apart from the default either. `keepalives_interval` and
+/// `keepalives_retries` default to `None` and are applied only when the
+/// string set them. The `#[cfg]` exclusions are copied from
+/// `tokio-postgres`'s own `keepalive.rs` rather than invented — a platform set
+/// either wider or narrower than the driver's would stop being parity with it.
+fn keepalive_settings(config: &Config) -> Option<TcpKeepalive> {
+    if !config.get_keepalives() {
+        return None;
+    }
+    let mut keepalive = TcpKeepalive::new().with_time(config.get_keepalives_idle());
+
+    #[cfg(not(any(
+        target_os = "aix",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "openbsd"
+    )))]
+    if let Some(interval) = config.get_keepalives_interval() {
+        keepalive = keepalive.with_interval(interval);
+    }
+
+    #[cfg(not(any(
+        target_os = "aix",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "windows",
+        target_os = "openbsd"
+    )))]
+    if let Some(retries) = config.get_keepalives_retries() {
+        keepalive = keepalive.with_retries(retries);
+    }
+
+    Some(keepalive)
+}
+
+/// Whether `tcp_user_timeout` is honoured, refused by name, or asked for
+/// nothing at all.
+///
+/// A pure function of `is_linux` rather than a bare `#[cfg]`, so the refusal
+/// branch is exercised by a unit test on every platform CI runs it on and not
+/// only the ones the real `#[cfg(target_os = "linux")]` at each call site
+/// would otherwise compile it out of.
+///
+/// `TCP_USER_TIMEOUT` genuinely does not exist outside Linux — the same
+/// narrower gate `tokio-postgres`'s own `connect_socket.rs` uses for it,
+/// narrower than `socket2`'s own (which also allows Android, Fuchsia and
+/// Cygwin). Refusing a request for it elsewhere by name, instead of silently
+/// dropping it, is what issue #113 is about: this is the one of the seven
+/// parameters where "honour here, refuse there" is coherent, because the
+/// thing missing on the other platforms is the OS feature itself, not pbps's
+/// support for it.
+fn tcp_user_timeout_disposition(
+    is_linux: bool,
+    requested: Option<std::time::Duration>,
+) -> Result<Option<std::time::Duration>, DbError> {
+    match (is_linux, requested) {
+        (true, requested) => Ok(requested),
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(DbError::BadConnectionString(
+            "`tcp_user_timeout` sets `TCP_USER_TIMEOUT`, a Linux-only socket \
+             option, and this build is not on Linux, so it cannot be \
+             honoured. Remove it from the connection string."
+                .to_owned(),
+        )),
+    }
+}
+
+/// Applies the socket-level settings `Config::connect` would have applied
+/// through its own `connect_socket` — keepalive and `tcp_user_timeout` — and
+/// which this seam's `connect_raw` call never reaches, because it is handed
+/// an already-open socket instead of opening one itself (see the module
+/// header and ADR-0014 §3).
+///
+/// Takes `&TcpStream` rather than ownership and runs between `open_socket`
+/// and `connect_raw` — the same shape `set_nodelay` already uses a few lines
+/// up, for the same reason: these are properties of the socket, not of the
+/// PostgreSQL session that has not started yet.
+fn apply_socket_options(tcp: &TcpStream, config: &Config, addr: &str) -> Result<(), DbError> {
+    let sock = SockRef::from(tcp);
+
+    if let Some(keepalive) = keepalive_settings(config) {
+        sock.set_tcp_keepalive(&keepalive)
+            .map_err(|source| DbError::Connect {
+                addr: addr.to_owned(),
+                source,
+            })?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(timeout) =
+        tcp_user_timeout_disposition(true, config.get_tcp_user_timeout().copied())?
+    {
+        sock.set_tcp_user_timeout(Some(timeout))
+            .map_err(|source| DbError::Connect {
+                addr: addr.to_owned(),
+                source,
+            })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    tcp_user_timeout_disposition(false, config.get_tcp_user_timeout().copied())?;
+
+    Ok(())
 }
 
 /// Whether this connection needs a TLS stack at all.
@@ -575,5 +751,176 @@ mod tests {
                 "{connection}: {error}"
             );
         }
+    }
+
+    /// `connect_timeout` below the ceiling is honoured exactly; saying
+    /// nothing still gets `CONNECT_TIMEOUT`. Neither of these two is the shape
+    /// this issue is about — the refusal below it.
+    #[test]
+    fn a_connect_timeout_within_the_ceiling_is_honoured_and_absent_is_the_ceiling() {
+        assert_eq!(
+            connect_budget(&config_of("host=db.example connect_timeout=5 user=u"))
+                .expect("within the ceiling"),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            connect_budget(&config_of("host=db.example connect_timeout=30 user=u"))
+                .expect("exactly the ceiling"),
+            crate::CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            connect_budget(&config_of("host=db.example user=u")).expect("nothing asked"),
+            crate::CONNECT_TIMEOUT
+        );
+    }
+
+    /// A `connect_timeout` past the ceiling is refused by name, naming the
+    /// ceiling — not silently capped. Silent capping is the shape a parameter
+    /// neither applied nor refused belongs to (issue #113, PITFALLS), applied
+    /// to the one parameter pbps already had an opinion about before the
+    /// string was read.
+    #[test]
+    fn a_connect_timeout_past_the_ceiling_is_refused_and_names_it() {
+        let error = connect_budget(&config_of("host=db.example connect_timeout=60 user=u"))
+            .expect_err("60s exceeds the 30s ceiling");
+        assert!(
+            matches!(error, DbError::BadConnectionString(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("30"), "{error}");
+        assert!(error.to_string().contains("connect_timeout"), "{error}");
+    }
+
+    /// `connect_timeout=0` and a negative value are `tokio_postgres::Config`'s
+    /// own way of saying "unset" — its string parser never calls the setter
+    /// for either — so both fall back to `CONNECT_TIMEOUT` exactly like saying
+    /// nothing, rather than this seam inventing a zero-second budget or a
+    /// floor of its own.
+    #[test]
+    fn connect_timeout_zero_or_negative_is_the_parsers_own_unset_and_falls_back() {
+        assert_eq!(
+            connect_budget(&config_of("host=db.example connect_timeout=0 user=u"))
+                .expect("zero is unset"),
+            crate::CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            connect_budget(&config_of("host=db.example connect_timeout=-5 user=u"))
+                .expect("negative is unset"),
+            crate::CONNECT_TIMEOUT
+        );
+    }
+
+    /// `Random` is the only value that reorders; the default and an explicit
+    /// `Disable` both leave resolution order alone.
+    #[test]
+    fn only_load_balance_hosts_random_asks_for_reordering() {
+        assert!(wants_random_order(&config_of(
+            "host=db.example load_balance_hosts=random user=u"
+        )));
+        assert!(!wants_random_order(&config_of(
+            "host=db.example load_balance_hosts=disable user=u"
+        )));
+        assert!(!wants_random_order(&config_of("host=db.example user=u")));
+    }
+
+    /// `keepalives=0` turns keepalive off and there is nothing to set; the
+    /// default (saying nothing) keeps it on, which is the gap this issue is
+    /// about — the driver's default and pbps's used to disagree.
+    #[test]
+    fn keepalives_off_asks_for_nothing_and_the_default_asks_for_something() {
+        assert!(
+            keepalive_settings(&config_of("host=db.example keepalives=0 user=u")).is_none(),
+            "keepalives=0 must set nothing rather than the OS default"
+        );
+        assert!(
+            keepalive_settings(&config_of("host=db.example user=u")).is_some(),
+            "the driver's own default is keepalives on"
+        );
+    }
+
+    /// The refusal branch, proved directly rather than trusted from a
+    /// `#[cfg]` this machine's CI may never compile the other side of:
+    /// honoured on Linux, refused by name (mentioning why) everywhere else,
+    /// and nothing asked for is never refused anywhere.
+    #[test]
+    fn tcp_user_timeout_is_honoured_on_linux_and_refused_by_name_elsewhere() {
+        let requested = Some(std::time::Duration::from_secs(5));
+
+        assert_eq!(
+            tcp_user_timeout_disposition(true, requested).expect("linux honours it"),
+            requested
+        );
+        assert_eq!(
+            tcp_user_timeout_disposition(true, None).expect("linux, nothing asked"),
+            None
+        );
+        assert_eq!(
+            tcp_user_timeout_disposition(false, None).expect("nothing asked, nothing refused"),
+            None
+        );
+
+        let error = tcp_user_timeout_disposition(false, requested)
+            .expect_err("a non-Linux target cannot honour TCP_USER_TIMEOUT");
+        assert!(
+            matches!(error, DbError::BadConnectionString(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("Linux"), "{error}");
+        assert!(error.to_string().contains("tcp_user_timeout"), "{error}");
+    }
+
+    /// A connected loopback pair, so [`apply_socket_options`] has a real
+    /// socket to act on without needing a live PostgreSQL server — these
+    /// assertions are about what the OS did, not about the protocol.
+    async fn connected_pair() -> (TcpStream, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let addr = listener.local_addr().expect("the bound address");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        (client, listener)
+    }
+
+    /// The socket's own keepalive state after `apply_socket_options` — read
+    /// back through `SockRef`, not through the `Config` that was just parsed.
+    /// A test that only checked the parsed config would prove that parsing
+    /// works and nothing about whether anything reached the OS, which is
+    /// exactly the gap issue #113 is about.
+    ///
+    /// Positive: `keepalives=1` with an explicit idle turns `SO_KEEPALIVE` on
+    /// and sets the idle time asked for. Negative: `keepalives=0` must leave
+    /// the socket at the OS default (off on Linux) rather than at the
+    /// driver's own default (on) — the exact conflation this issue exists to
+    /// remove.
+    ///
+    /// `#[cfg(target_os = "linux")]` because `tcp_keepalive_time`'s getter is
+    /// not available on every platform (`socket2`'s own gate excludes
+    /// Windows), not because the setting itself is Linux-only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn keepalive_settings_land_on_the_real_socket_not_only_the_parsed_config() {
+        let (client, _listener) = connected_pair().await;
+        let on = config_of("host=db.example keepalives=1 keepalives_idle=45 user=u");
+        apply_socket_options(&client, &on, "test").expect("keepalive settings apply");
+        let sock = SockRef::from(&client);
+        assert!(
+            sock.keepalive().expect("read keepalive back"),
+            "keepalives=1 must turn SO_KEEPALIVE on"
+        );
+        assert_eq!(
+            sock.tcp_keepalive_time().expect("read the idle time back"),
+            std::time::Duration::from_secs(45),
+            "keepalives_idle must reach the real socket, not only the parsed config"
+        );
+
+        let (client_off, _listener_off) = connected_pair().await;
+        let off = config_of("host=db.example keepalives=0 user=u");
+        apply_socket_options(&client_off, &off, "test").expect("keepalives=0 applies cleanly");
+        let sock_off = SockRef::from(&client_off);
+        assert!(
+            !sock_off.keepalive().expect("read keepalive back"),
+            "keepalives=0 must leave the OS default off, not the driver's own \
+             default of on"
+        );
     }
 }

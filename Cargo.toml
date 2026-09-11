@@ -72,6 +72,17 @@ tokio-postgres = { version = "0.7", default-features = false }
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
+# `tokio-postgres`'s own `connect_socket` applies `keepalives`,
+# `keepalives_idle/_interval/_retries` and `tcp_user_timeout` through
+# `socket2::SockRef` and shuffles `load_balance_hosts=random` through `rand` —
+# `pbps-db` opens the socket itself instead (ADR-0014 §3), so it needs the same
+# two crates directly to reach parity (issue #113). Neither is new to the
+# tree: `socket2` is already resolved through `tokio`'s own `net` feature and
+# `rand` through `tokio-postgres`'s `postgres-protocol`, both at the version
+# named here, so this adds a direct edge to an already-audited node rather
+# than a new one (DECISIONS 429).
+socket2    = { version = "0.6", features = ["all"] }
+rand       = "0.10"
 
 serde_json = { version = "1", features = ["preserve_order"] }
 

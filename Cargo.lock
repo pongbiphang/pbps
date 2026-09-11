@@ -1242,9 +1242,11 @@ version = "0.0.0"
 dependencies = [
  "pbps-dialect",
  "pbps-model",
+ "rand",
  "rustls",
  "rustls-native-certs",
  "serde_json",
+ "socket2",
  "thiserror",
  "tiberius-ng",
  "tokio",
