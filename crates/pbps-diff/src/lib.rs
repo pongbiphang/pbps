@@ -1027,6 +1027,138 @@ mod tests {
 
     // ---- rename intents that claim one name ----
 
+    #[test]
+    fn column_conflicts_under_contested_table_identity_remain_visible_and_conditional() {
+        let (_, ids) = baseline(&[("dbo.old", &["x"])]);
+        let declared = schema(&[("dbo.a", &["p", "q"]), ("dbo.b", &["y"])]);
+        let intents = vec![
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.a"),
+            },
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.b"),
+            },
+            Intent::RenameColumn {
+                table: t("dbo.a"),
+                from: "x".into(),
+                to: "p".into(),
+            },
+            Intent::RenameColumn {
+                table: t("dbo.a"),
+                from: "x".into(),
+                to: "q".into(),
+            },
+        ];
+        let blockers = resolve(&declared, &ids, &intents, &ctx()).unwrap_err();
+        assert_eq!(blockers.len(), 2, "{blockers:?}");
+        assert!(
+            matches!(&blockers[0], Blocker::ConflictingRenameIntents { name, .. } if name == "dbo.old")
+        );
+        assert!(
+            matches!(&blockers[1], Blocker::ProvisionalTableIdentity { from, to, blocker }
+            if *from == t("dbo.old") && *to == t("dbo.a")
+            && matches!(blocker.as_ref(), Blocker::ConflictingRenameIntents { name, .. } if name == "dbo.a.x"))
+        );
+
+        // Editing the table contest away must re-resolve from the input ids,
+        // not retain a warning or a decision from the provisional round.
+        let settled: Vec<_> = intents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, i)| i.clone())
+            .collect();
+        let blockers = resolve(&declared, &ids, &settled, &ctx()).unwrap_err();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            matches!(&blockers[0], Blocker::ConflictingRenameIntents { name, .. } if name == "dbo.a.x")
+        );
+    }
+
+    #[test]
+    fn provisional_identity_context_covers_other_column_diagnoses_but_not_unrelated_tables() {
+        let (_, ids) = baseline(&[("dbo.old", &["x", "occupied"]), ("dbo.stable", &["gone"])]);
+        let declared = schema(&[
+            ("dbo.a", &["occupied"]),
+            ("dbo.b", &["y"]),
+            ("dbo.stable", &[]),
+        ]);
+        let intents = vec![
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.a"),
+            },
+            Intent::RenameTable {
+                from: t("dbo.old"),
+                to: t("dbo.b"),
+            },
+            Intent::RenameColumn {
+                table: t("dbo.a"),
+                from: "x".into(),
+                to: "occupied".into(),
+            },
+            Intent::RenameColumn {
+                table: t("dbo.b"),
+                from: "x".into(),
+                to: "y".into(),
+            },
+        ];
+        let blockers = resolve(&declared, &ids, &intents, &ctx()).unwrap_err();
+        for kind in ["target", "drop", "unused"] {
+            assert!(blockers.iter().any(|b| matches!(b, Blocker::ProvisionalTableIdentity { blocker, .. }
+                if match (kind, blocker.as_ref()) {
+                    ("target", Blocker::RenameTargetExists { .. }) => true,
+                    ("drop", Blocker::DropColumnNeedsReason { column }) => column.table == t("dbo.a"),
+                    ("unused", Blocker::UnusedIntent { .. }) => true,
+                    _ => false,
+                })), "missing {kind}: {blockers:?}");
+        }
+        assert!(blockers.iter().any(|b| matches!(b, Blocker::DropColumnNeedsReason { column } if column.table == t("dbo.stable"))));
+    }
+
+    #[test]
+    fn contested_table_target_qualifies_column_ambiguity_but_not_a_same_spelled_role_target() {
+        let initial = with_roles(
+            &[("dbo.old1", &["x"]), ("dbo.old2", &["z"])],
+            &["old_role", "dbo.a.occupied"],
+        );
+        let ids = resolve(&initial, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared = with_roles(&[("dbo.a", &["new"])], &["dbo.a.occupied"]);
+        let blockers = resolve(
+            &declared,
+            &ids,
+            &[
+                Intent::RenameTable {
+                    from: t("dbo.old1"),
+                    to: t("dbo.a"),
+                },
+                Intent::RenameTable {
+                    from: t("dbo.old2"),
+                    to: t("dbo.a"),
+                },
+                Intent::RenameRole {
+                    from: "old_role".into(),
+                    to: "dbo.a.occupied".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+        assert!(
+            blockers.iter().any(
+                |b| matches!(b, Blocker::ProvisionalTableIdentity { from, to, blocker }
+            if *from == t("dbo.old1") && *to == t("dbo.a")
+            && matches!(blocker.as_ref(), Blocker::AmbiguousColumns { .. }))
+            ),
+            "{blockers:?}"
+        );
+        assert!(blockers.iter().any(|b| matches!(b, Blocker::RenameTargetExists { target } if target == "dbo.a.occupied")), "{blockers:?}");
+    }
+
     /// The one that was silent. Two intents naming one source: the first to be
     /// reached consumed it, the second fell through, and because its target had
     /// meanwhile been minted into the ids file the absorbed check read it as

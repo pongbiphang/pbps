@@ -1057,6 +1057,75 @@ fn annotation_and_command_conflicts_name_operations_without_claiming_two_annotat
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
 
+#[test]
+fn derived_column_conflicts_are_conditional_in_plan_text_and_json_without_recording_a_winner() {
+    let d = Demo::new("provisional-blockers");
+    d.table("table: dbo.old\ncolumns:\n  x: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let ids = std::fs::read(d.ids_path()).unwrap();
+    d.table("table: dbo.a\nrenamed_from: dbo.old\ncolumns:\n  p: {type: int, renamed_from: x}\n  q: {type: int, renamed_from: x}\n");
+    let b = d.dir.join("schema/dbo.z.yml");
+    std::fs::write(
+        &b,
+        "table: dbo.b\nrenamed_from: dbo.old\ncolumns:\n  y: {type: int}\n",
+    )
+    .unwrap();
+    let out = d.run(&["plan", "--no-input"]);
+    assert_eq!(code(&out), FINDING, "{}{}", stdout(&out), stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("2 change(s)"), "{text}");
+    assert!(
+        text.contains("if dbo.old -> dbo.a is what you meant"),
+        "{text}"
+    );
+    assert!(
+        text.contains("dbo.a.p") && text.contains("dbo.a.q"),
+        "{text}"
+    );
+    let out = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&out), FINDING);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2, "{json}");
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["id"] == "identity.conflicting-rename-intents")
+    );
+    assert!(
+        !findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("provisional")
+    );
+    assert!(
+        findings[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("provisional table identity")
+    );
+    assert_eq!(std::fs::read(d.ids_path()).unwrap(), ids);
+
+    // The same column contradiction is unconditional once the table identity
+    // is no longer contested. Fixing both contradictions finally records it.
+    std::fs::write(&b, "table: dbo.b\ncolumns:\n  y: {type: int}\n").unwrap();
+    let out = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&out), FINDING);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+    assert!(
+        !json["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("provisional")
+    );
+    assert_eq!(std::fs::read(d.ids_path()).unwrap(), ids);
+    d.table("table: dbo.a\nrenamed_from: dbo.old\ncolumns:\n  p: {type: int, renamed_from: x}\n  q: {type: int}\n");
+    let out = d.run(&["plan", "--no-input"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+}
+
 /// The split of side effects in SPEC §6.2: plan absorbs the annotation into the
 /// ids file but never touches the YAML; stripping the now-redundant line is
 /// fmt's job, and fmt must not strip one whose fact is not absorbed yet.

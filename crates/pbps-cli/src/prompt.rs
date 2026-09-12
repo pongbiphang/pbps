@@ -63,6 +63,9 @@ pub enum ChoiceKind {
 pub fn choices(b: &Blocker) -> Vec<Choice> {
     let mut out = Vec::new();
     match b {
+        // A choice under a contested identity could record a decision about
+        // the wrong table. Re-resolution asks it once the identity is settled.
+        Blocker::ProvisionalTableIdentity { .. } => {}
         Blocker::AmbiguousColumns {
             table,
             disappeared,
@@ -305,6 +308,10 @@ fn reason<R: std::io::BufRead>(lines: &mut std::io::Lines<R>, what: &str) -> Opt
 
 fn question(b: &Blocker) -> String {
     match b {
+        Blocker::ProvisionalTableIdentity { from, to, blocker } => format!(
+            "if {from} -> {to} is what you meant (provisional table identity): {}",
+            question(blocker)
+        ),
         Blocker::AmbiguousColumns {
             table,
             disappeared,
@@ -373,6 +380,24 @@ mod tests {
 
     fn table() -> TableName {
         "dbo.customer".parse().unwrap()
+    }
+
+    #[test]
+    fn provisional_questions_wait_for_identity_to_be_resolved_again() {
+        let ordinary = Blocker::AmbiguousColumns {
+            table: table(),
+            disappeared: vec!["old".into()],
+            appeared: vec!["new".into()],
+        };
+        assert!(!choices(&ordinary).is_empty());
+        let derived = Blocker::ProvisionalTableIdentity {
+            from: "dbo.previous".parse().unwrap(),
+            to: table(),
+            blocker: Box::new(ordinary.clone()),
+        };
+        assert!(choices(&derived).is_empty());
+        assert_eq!(ask_from(&[derived], answers("1\n")), None);
+        assert!(ask_from(&[ordinary], answers("1\n")).is_some());
     }
 
     #[test]

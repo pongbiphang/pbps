@@ -598,6 +598,12 @@ Four properties hold it to that:
   defaulted. An empty one ends the prompt rather than writing a tombstone that
   explains nothing.
 
+Identity is re-resolved after each round of answers. A column blocker derived
+under a contested table rename remains visible, but its report states the
+provisional rename it assumes. It offers no interactive choice until that
+identity is settled; an undisputed table's blockers need no such qualification.
+The conditional context does not change the underlying finding's stable ID.
+
 ### 6.4 Behaviour without a TTY
 
 With no TTY it **never prompts**; it fails and prints a copy-pastable command:
