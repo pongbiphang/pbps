@@ -1335,34 +1335,72 @@ impl AsStored {
     }
 
     /// `expr`, converted to the type this plan gives `column` — as it is
-    /// where the plan leaves the type alone, and `None` where the `CAST` this
-    /// would build can raise.
+    /// where the plan leaves the type alone.
     ///
-    /// **Not `TypeChangeRisk::Safe` alone** — DECISIONS 448, found by two live
-    /// tests this crate already had: `TypeChangeRisk::Narrowing` is set
-    /// whenever a change can lose precision by rounding, which is not the
-    /// same question as whether an explicit `CAST` can *raise*, and DECISIONS
-    /// 392's exception — no probe is built, because the row that would raise
-    /// cannot survive the `AlterColumnType` change's own conversion probe (387)
-    /// either — only holds for the second. A narrowing that only rounds keeps
-    /// its `CAST`, because rounding is exactly what the engine's own `ALTER`
-    /// does to the same value, and the key comparison has to see it (DECISIONS
-    /// 340) — `types::narrowing_cast_cannot_overflow` names the one such shape
-    /// these two tests demand. Anything else that is not `Safe` gets no `CAST`
-    /// and this key gets no probe of its own, matching the rule `rows_after`'s
-    /// `projected` applies at the sibling site (392).
-    fn converted(&self, column: &ColumnRef, expr: String) -> Option<String> {
-        match (self.retyped_from.get(column), self.retyped.get(column)) {
-            (Some(from), Some(to)) => {
-                let from = crate::types::normalize(from).ok()?;
-                let to = crate::types::normalize(to).ok()?;
-                let cannot_raise = crate::types::change_risk(&from, &to)
-                    == pbps_dialect::TypeChangeRisk::Safe
-                    || crate::types::narrowing_cast_cannot_overflow(&from, &to);
-                cannot_raise.then(|| format!("CAST({expr} AS {to})"))
+    /// **Always the plain `CAST`, never a guarded one** — `origin/master`'s
+    /// own behaviour, unconditionally. A caller comparing this against
+    /// another stored value, where the retype might raise, pairs it with
+    /// `raise_guard` and excludes the row from its own count with an
+    /// `AND NOT (...)` rather than asking this function to launder that
+    /// exclusion into a manufactured `NULL`: a NULL already carries a
+    /// specific meaning everywhere a probe here compares two stored columns
+    /// — "this tuple references nothing" (DECISIONS 337, 348) — and "this
+    /// value could not be tested" is a different fact than "this key column
+    /// is absent". Collapsing the two into one signal was tried and measured
+    /// unsafe on the parent side (see `raise_guard`): a parent row excluded
+    /// this way stops matching as a survivor for *every* child, which
+    /// over-counts the very probe DECISIONS 449 exists to keep honest.
+    fn converted(&self, column: &ColumnRef, expr: String) -> String {
+        match self.retyped.get(column) {
+            Some(to) => {
+                let to = crate::types::normalize(to).unwrap_or_else(|_| to.clone());
+                format!("CAST({expr} AS {to})")
             }
-            _ => Some(expr),
+            None => expr,
         }
+    }
+
+    /// The predicate over `expr` — a raw, unconverted stored expression, the
+    /// same one `converted` would be given — that names the rows whose
+    /// `CAST` on this column `converted` would raise on. `None` where the
+    /// column is not one this plan retypes, where the retype cannot raise
+    /// (`TypeChangeRisk::Safe`), or where `types::cannot_become` has no
+    /// predicate for the pair at all.
+    ///
+    /// **Per row, not per type pair (DECISIONS 449).** Two live tests this
+    /// crate already had prove `TypeChangeRisk::Safe` is the wrong gate for
+    /// deciding whether a key spanning a retyped column gets a probe:
+    /// `Narrowing` is set whenever a change can lose precision by rounding,
+    /// which is a different question from whether the `CAST` this builds can
+    /// *raise*, and a coarse "no probe at all" for every `Narrowing` pair —
+    /// this project's own first attempt at #253 — loses the check for every
+    /// table whose rows happen to fit, not only the rare one that does not:
+    /// review measured, for `numeric(20,0) -> integer`, that the
+    /// `AlterColumnType` conversion probe counts **zero** for a child value
+    /// of `2`, so it is not the backstop a coarse skip assumed for that row
+    /// either.
+    ///
+    /// So a caller builds the plain `CAST` unconditionally and excludes,
+    /// with this predicate, only the rows `types::cannot_become` names —
+    /// per stored value — as ones the `CAST` would raise on. The excluded
+    /// row is not silently dropped from the plan's safety net: it is
+    /// counted and named by the `AlterColumnType` change's own conversion
+    /// probe (387), which is the premise DECISIONS 392's "no probe needed
+    /// here" actually relies on, true per row rather than per type pair.
+    ///
+    /// `cannot_become` returning `None` here means *unexpressed* for at
+    /// least one family (`Exact::Integer -> Exact::Integer`; issue #429
+    /// tracks it), not *safe* — so `None` excludes nothing, and a caller's
+    /// unconditional `CAST` stays exactly as `origin/master` always built
+    /// it: it may raise, and the probe runner reports that by name (issue
+    /// #253's own finding), which this project prefers over a probe
+    /// silently narrowed to skip a row with no evidence behind the skip.
+    fn raise_guard(&self, column: &ColumnRef, expr: &str) -> Option<String> {
+        let from = self.retyped_from.get(column)?;
+        let to = self.retyped.get(column)?;
+        let to = crate::types::normalize(to).unwrap_or_else(|_| to.clone());
+        let from = crate::types::normalize(from).ok()?;
+        crate::types::cannot_become(&from, &to, expr)
     }
 
     fn removed_from(&self, stored_child: &TableName) -> Removal {
@@ -1809,22 +1847,16 @@ fn planned_key_probes(
         // that stands for it in a body the engine assembles (DECISIONS 353).
         let mut clauses: Vec<String> = Vec::new();
         let mut collated: BTreeMap<String, usize> = BTreeMap::new();
-        // Set where a column of this key is one whose `CAST` to the plan's new
-        // type can raise — not merely narrow, since a narrowing that only
-        // rounds keeps its `CAST` (DECISIONS 448). Where it is set, `converted`
-        // has no `CAST` it can safely build, and this key gets no probe of its
-        // own at all (DECISIONS 392) — the `AlterColumnType` change's own
-        // conversion probe already counts the row and names the column.
-        //
-        // That skip carries no description anywhere a reader can find — there
-        // is no probe here to hold one, and the two probes this key would
-        // otherwise share (`delete_probe`, `hidden_children_probe`) answer a
-        // different question and are not this key's to annotate. This is
-        // exactly the shape #270 names ("a probe that is never built is
-        // invisible to the runner"): its own fix is a change to the dialect
-        // seam, touching both drivers, and is deliberately not duplicated
-        // here.
-        let mut narrows_unsafely = false;
+        // Rows `raise_guard` names as ones this key's own columns cannot
+        // safely compare through their `CAST` — excluded, not blanked to
+        // `NULL`, because a `NULL` already means something else here
+        // (DECISIONS 449, `converted`'s own doc comment). One list per
+        // alias: the child's own stored row (`ch`), the specific parent row
+        // this key's probe asks about by primary key (`p`), and every
+        // surviving parent row a comparison might match against (`q`).
+        let mut child_guards: Vec<String> = Vec::new();
+        let mut parent_guards_p: Vec<String> = Vec::new();
+        let mut parent_guards_q: Vec<String> = Vec::new();
         for (c, r) in a.columns.iter().zip(&a.referenced) {
             let Some(stored_r) = names.column(&a.parent.column(r)) else {
                 continue;
@@ -1853,15 +1885,20 @@ fn planned_key_probes(
                     // closure owns what it needs.
                     let column = a.parent.column(r);
                     let quoted = quote(&stored_r.name)?;
-                    // A narrowing here would need a `CAST` that can raise; see
-                    // `converted` and DECISIONS 392.
-                    let (Some(p), Some(q)) = (
-                        names.converted(&column, format!("p.{quoted}")),
-                        names.converted(&column, format!("q.{quoted}")),
-                    ) else {
-                        narrows_unsafely = true;
-                        break;
-                    };
+                    let (p_raw, q_raw) = (format!("p.{quoted}"), format!("q.{quoted}"));
+                    // A narrowing here builds a plain `CAST`; a row it could
+                    // raise on is excluded below rather than compared, on
+                    // whichever alias the row belongs to (DECISIONS 449).
+                    let (p, q) = (
+                        names.converted(&column, p_raw.clone()),
+                        names.converted(&column, q_raw.clone()),
+                    );
+                    if let Some(g) = names.raise_guard(&column, &p_raw) {
+                        parent_guards_p.push(g);
+                    }
+                    if let Some(g) = names.raise_guard(&column, &q_raw) {
+                        parent_guards_q.push(g);
+                    }
                     // A column this plan retypes carries its collation into
                     // the new type only where that type has one.
                     let still_collatable = match names.retyped.get(&column) {
@@ -1900,23 +1937,16 @@ fn planned_key_probes(
                 }
                 None => {
                     // Same rule, on the child side of the key.
-                    let Some(side) = names
-                        .converted(&a.child.column(c), format!("ch.{}", quote(&stored_c.name)?))
-                    else {
-                        narrows_unsafely = true;
-                        break;
-                    };
+                    let raw = format!("ch.{}", quote(&stored_c.name)?);
+                    let side = names.converted(&a.child.column(c), raw.clone());
                     stored_sides.push(side.clone());
+                    if let Some(g) = names.raise_guard(&a.child.column(c), &raw) {
+                        child_guards.push(g);
+                    }
                     Some(side)
                 }
             };
             columns.push((c.clone(), r.clone(), parent_side, held));
-        }
-        // No probe for this key at all where a column of it cannot be
-        // safely converted — see the field comment on `narrows_unsafely`,
-        // and #270 for why the skip itself goes unrecorded.
-        if narrows_unsafely {
-            continue;
         }
         // A NULL on either side of any column: the tuple references nothing,
         // whatever the other columns hold. Through `unwrapped`, because a
@@ -2063,12 +2093,30 @@ fn planned_key_probes(
             }
             (gone, inserted)
         };
+        // A parent row this key's own columns cannot cast is excluded from
+        // matching as this row (`p`) or as any surviving row (`q`) — not
+        // blanked to `NULL`: a parent row that silently stopped matching
+        // every child would over-count every child that pointed at it
+        // (DECISIONS 449), and it is caught instead by that column's own
+        // `AlterColumnType` conversion probe, over the whole parent table,
+        // whether or not this specific row is the one a delete targets — the
+        // `ALTER` this key's probe is asked about runs before the delete,
+        // so every stored row still has to survive it (rank 9 precedes the
+        // delete's own rank).
+        let excluded_p: String = parent_guards_p
+            .iter()
+            .map(|g| format!(" AND NOT ({g})"))
+            .collect();
+        let excluded_q: String = parent_guards_q
+            .iter()
+            .map(|g| format!(" AND NOT ({g})"))
+            .collect();
         let references = |sides: &dyn Fn(&str) -> Option<String>| {
             let survivor = {
                 let (gone, inserted) = &survivors;
                 {
                     let mut terms = vec![format!(
-                        "EXISTS (SELECT 1 FROM {parent} AS q WHERE true{gone}{})",
+                        "EXISTS (SELECT 1 FROM {parent} AS q WHERE true{gone}{excluded_q}{})",
                         tuple("q", sides)
                     )];
                     for row in inserted {
@@ -2103,9 +2151,21 @@ fn planned_key_probes(
                     format!(" AND NOT ({})", terms.join(" OR "))
                 }
             };
-            format!("(EXISTS ({parent_row}{}){survivor})", tuple("p", sides))
+            format!(
+                "(EXISTS ({parent_row}{excluded_p}{}){survivor})",
+                tuple("p", sides)
+            )
         };
-        let as_backfilled = references(&|_| None);
+        // The row this key's own columns cannot cast, on the child's own
+        // side, is excluded from the *stored* match only — the count this
+        // plan's own writes (`references` used with a `sides` override) is
+        // a different question, about a value the plan spells, not one a
+        // row already holds, so it is untouched here.
+        let excluded_ch: String = child_guards
+            .iter()
+            .map(|g| format!(" AND NOT ({g})"))
+            .collect();
+        let as_backfilled = format!("({}){excluded_ch}", references(&|_| None));
         // The count over the stored rows, `ONLY` unless partitioned, assembled
         // by the engine because `relkind` is the engine's to say — and, where
         // a body carries a collation mark, because the collation is too.
@@ -2287,11 +2347,33 @@ fn planned_key_probes(
                 ));
             }
         }
+        // Named only where a guard actually excludes something — DECISIONS
+        // 449: this count now excludes rows whose own retyped column cannot
+        // be cast, and a reader comparing two runs of this same probe needs
+        // to know the number can move for a reason this description states
+        // rather than one it silently omits (issue #253's own "say so in
+        // the description" requirement, unsatisfiable while a whole-key
+        // skip existed and satisfiable now that it does not).
+        let guard_note = if child_guards.is_empty()
+            && parent_guards_p.is_empty()
+            && parent_guards_q.is_empty()
+        {
+            String::new()
+        } else {
+            // Deliberately not the phrase the conversion probe's own
+            // description uses ("cannot become") — a caller matching
+            // probes by a description substring, as this crate's own
+            // tests do, must still find exactly one probe per fact.
+            "; excludes a row this narrowing's own conversion would \
+                 refuse — the `AlterColumnType` change's conversion probe \
+                 counts and names that row instead"
+                .to_owned()
+        };
         out.push(Probe::new(
             format!(
                 "rows of {} that reference {table} row `{key}` through the foreign key this plan \
                  adds on a column it also adds, whose default is what every stored row will hold \
-                 there; the key cannot be added once the row is gone",
+                 there; the key cannot be added once the row is gone{guard_note}",
                 a.child
             ),
             format!(
@@ -3446,22 +3528,26 @@ mod tests {
         );
     }
 
-    /// DECISIONS 392's rule, applied at `AsStored::converted`'s own site: a
-    /// key this plan adds over a column it *narrows* gets no probe of its
-    /// own. The `CAST` `converted` would otherwise build can raise on the
-    /// first stored row that cannot make the trip, and a probe built from one
-    /// is a probe that raises — reported as unchecked, while `apply` proceeds
-    /// regardless, silently losing the very count that gates the delete
-    /// (issue #253). That row cannot survive the `AlterColumnType` change's
-    /// own conversion probe either, and that probe is what counts it and
-    /// names the column instead.
+    /// DECISIONS 449's rule, applied at `AsStored::converted`/`raise_guard`'s
+    /// own site: a key this plan adds over a column it *narrows* still gets
+    /// its own probe — a whole-key skip loses the check for every table
+    /// whose rows happen to fit, not only the rare one that does not (issue
+    /// #253's finding, on review). What changes is what the probe counts:
+    /// `converted` still builds a plain `CAST`, and the probe's own `WHERE`
+    /// excludes, with an `AND NOT (...)`, any row `types::cannot_become`
+    /// names as one that `CAST` would raise on — never blanked to `NULL`,
+    /// which already means something else in this same query (`converted`'s
+    /// own doc comment). That excluded row is not silently dropped: it is
+    /// counted and named by the `AlterColumnType` change's own conversion
+    /// probe, which runs beside this one and is what DECISIONS 392's "no
+    /// probe needed here" premise actually relies on, true per row rather
+    /// than per column.
     ///
     /// The positive half matters as much: a key over a column this plan
-    /// *widens* still gets its own probe, carrying the CAST — so the skip
-    /// above is the narrowing rule, and not a rule that silences every added
-    /// key spanning a retyped column.
+    /// *widens* still gets its own probe, carrying a plain `CAST` and no
+    /// exclusion — nothing here can raise, so there is nothing to exclude.
     #[test]
-    fn a_key_this_plan_adds_on_a_column_it_narrows_gets_no_probe_of_its_own() {
+    fn a_key_this_plan_adds_on_a_column_it_narrows_gets_its_own_probe_with_a_guarded_cast() {
         let child: TableName = "app.child".parse().expect("a table name");
         let parent: TableName = "app.status".parse().expect("a table name");
         let key = pbps_model::ForeignKey {
@@ -3498,22 +3584,41 @@ mod tests {
         // a value over three characters raises rather than truncating.
         let narrowed = probes(&plan(retype("text", "varchar(3)")));
         assert!(
-            narrowed.iter().any(|p| p.sql.contains("length(rtrim")),
+            narrowed
+                .iter()
+                .any(|p| p.description.contains("cannot become") && p.sql.contains("length(rtrim")),
             "the ALTER's own conversion probe still runs and still counts \
-             the offending rows: {narrowed:#?}"
+             the offending rows by name: {narrowed:#?}"
         );
         assert!(
             narrowed
                 .iter()
-                .all(|p| !p.description.contains(has_its_own_probe)),
-            "a narrowing CAST here can raise and take the whole probe with \
-             it, so none is built: {narrowed:#?}"
+                .any(|p| p.description.contains(has_its_own_probe)),
+            "a narrowing key still gets its own probe — a whole-key skip \
+             would lose the check for every row that fits: {narrowed:#?}"
         );
         assert!(
             narrowed
                 .iter()
-                .all(|p| !p.sql.contains("CAST(ch.\"status\" AS")),
-            "{narrowed:#?}"
+                .any(|p| p.description.contains(has_its_own_probe)
+                    && p.sql
+                        .contains("CAST(ch.\"status\" AS character varying(3))")
+                    && p.sql.contains("AND NOT (length(rtrim(")),
+            "the row a raising `CAST` would hit is excluded from this \
+             probe's own count — not attempted, not blanked to `NULL` — so \
+             this probe never raises on it: {narrowed:#?}"
+        );
+        // The description says so: a reader comparing two runs of this
+        // count needs to know it can move for a reason other than the data
+        // changing (issue #253's own "say so in the description" line).
+        assert!(
+            narrowed
+                .iter()
+                .any(|p| p.description.contains(has_its_own_probe)
+                    && p.description
+                        .contains("excludes a row this narrowing's own conversion would refuse")),
+            "a guarded probe names the exclusion in its own description: \
+             {narrowed:#?}"
         );
 
         // `varchar(3)` into `text` is the reverse and safe — nothing a
@@ -3525,6 +3630,18 @@ mod tests {
                 .any(|p| p.description.contains(has_its_own_probe)
                     && p.sql.contains("CAST(ch.\"status\" AS text)")),
             "a widening still gets its own probe, carrying the CAST: \
+             {widened:#?}"
+        );
+        // And says nothing about an exclusion it does not make — nothing
+        // here can raise, so nothing is excluded.
+        assert!(
+            widened
+                .iter()
+                .any(|p| p.description.contains(has_its_own_probe))
+                && widened
+                    .iter()
+                    .all(|p| !p.description.contains("excludes a row")),
+            "an unguarded probe's description carries no exclusion note: \
              {widened:#?}"
         );
     }

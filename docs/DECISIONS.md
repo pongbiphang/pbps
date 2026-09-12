@@ -10132,51 +10132,151 @@ SPEC is in sync with all of these.
      The scan's character-width stepping (408) needed no change either way:
      ASCII-only folding never changes a string's byte length or its char
      boundaries, so the same stepping rule runs unchanged on the folded body.
-449. **A key this plan adds over a column it narrows is admitted by whether its
-    `CAST` can raise, not by `TypeChangeRisk`.** DECISIONS 392's rule for this
-    shape — no probe is built for a narrowing key, because the row that would
-    make the `CAST` raise cannot survive the `AlterColumnType` change's own
-    conversion probe either, and that probe is what counts it — assumes that
-    probe is the one that would have caught it. **Measured, it is not,** for
-    every narrowing that only rounds: `CAST(999.99::numeric(5,2) AS
-    numeric(5,1))` is `1000.0`, no error, and over the fixture
-    `a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_values`
-    pins — `child.amount` and `parent.amount` both narrowed from `numeric(5,2)`
-    to `numeric(5,1)` — the conversion probe on each column counts **zero**.
-    Nothing there catches the hazard that test exists for: two stored values,
-    `1.04` and `1.00`, that round to the same `1.0` and collide once the key is
-    validated. Deleting the key probe for this pair would have deleted the only
-    thing that sees it, and DECISIONS 340 — a key spanning a retyped column
-    compares the converted values — is still the right rule; 392's exception to
-    it does not reach here.
+449. **A key this plan adds over a column it narrows excludes the rows its
+    `CAST` would raise on, one row at a time — it does not skip the whole
+    key.** DECISIONS 392's rule for this shape — no probe is built for a
+    narrowing key, because the row that would make the `CAST` raise cannot
+    survive the `AlterColumnType` change's own conversion probe either, and
+    that probe is what counts it — is true **per row**, not per column, and
+    a gate built at the column's type pair rather than at the row is wrong
+    in two different ways, found across two rounds of review on the same PR.
 
-    `TypeChangeRisk::Narrowing` conflates two different properties: it is set
-    whenever a change can lose precision by rounding, which is true of every
-    scale reduction, and 392's rule needs to ask only whether a `CAST` can
-    *raise*, which is not the same question. So `AsStored::converted` admits
-    `TypeChangeRisk::Safe` as before, plus one further case the failing tests
-    force: `numeric(p,s) -> numeric(p2,s2)` where the target's scale shrinks
-    (`s2 < s`, the only case that rounds) requires the integer-digit capacity
-    to **strictly** grow — `p2 - s2 > p - s` — and where the scale does not
-    shrink, `p2 - s2 >= p - s` is enough. The strict form is not a stylistic
-    choice: rounding can carry a value into an extra integer digit, and at
-    the equal-`int_digits` boundary the target has no room for it.
-    **Measured**, three edges of the same value: `CAST(999.99::numeric(5,2)
-    AS numeric(5,1))` (`int_digits` `3 -> 4`, strictly greater) is `1000.0`,
-    no error. `CAST(999.99::numeric(5,2) AS numeric(4,1))` (`3 -> 3`, equal —
-    what a non-strict `>=` rule would wrongly admit) is `22003 numeric field
-    overflow`, detail "A field with precision 4, scale 1 must round to an
-    absolute value less than 10^3" — while the same cast applied to `12.34`
-    instead succeeds as `12.3`. That is the worst shape a wrong predicate can
-    take: it passes any fixture whose rows happen to be small, and only
-    raises for the rows large enough to round into the extra digit. The
-    wide-margin boundary `CAST(999.99::numeric(5,2) AS numeric(3,1))`
-    (`3 -> 2`) also raises `22003`, but that pair is admitted by neither the
-    correct rule nor the wrong one, so it alone would not have caught this.
-    No other family is admitted here; nothing in this shape's evidence
-    reaches beyond `numeric`, and `types::cannot_become` is the wrong
-    predicate to reuse for it — its bounded-numeric-target arm returns a real
-    overflow check for *every* narrowing into a bounded `numeric`, whether or
-    not overflow is reachable for that particular precision and scale, which
-    is the same over-broad answer `TypeChangeRisk::Narrowing` gives (issue
-    #253).
+    **First wrong direction: too narrow.** Gating on `TypeChangeRisk::Safe`
+    alone breaks two pre-existing live tests protecting DECISIONS 340 (a key
+    spanning a retyped column compares the converted values) over a
+    rounding-only narrowing whose `CAST` can never overflow. **Measured**:
+    `CAST(999.99::numeric(5,2) AS numeric(5,1))` is `1000.0`, no error, and
+    over the fixture
+    `a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_values`
+    pins — both `child.amount` and `parent.amount` narrowed from
+    `numeric(5,2)` to `numeric(5,1)` — the `AlterColumnType` conversion
+    probe on each column counts **zero**. Nothing there catches the hazard
+    that test exists for: two stored values, `1.04` and `1.00`, round to the
+    same `1.0` and collide once the key is validated. A gate that skips this
+    pair's key probe entirely would have deleted the only thing that sees
+    it.
+
+    **Second wrong direction, and the one this entry's design answers:
+    too broad.** A first attempt narrowed the gate to a bounded, measured
+    `numeric`-only predicate (`types::narrowing_cast_cannot_overflow`,
+    since deleted) admitting a pair only where its `CAST` could *never*
+    raise for any value, and skipping the pair's whole key otherwise —
+    matching origin/master's own pre-#253 behaviour of always building the
+    key probe, just made conditional on the type pair. Review caught the
+    same conflation one level down: for `numeric(20,0) -> integer`, a child
+    value of `2` and the referenced parent row `2` deleted by the same plan,
+    the `AlterColumnType` conversion probe counts **zero** — `2` fits an
+    `integer` fine — and the coarse skip built from the type pair took the
+    key probe with it anyway, because *some* value of that pair (`5000000000`,
+    say) can overflow. Before #253 touched anything, a table whose rows all
+    fit had a working orphan check, because the unconditional `CAST`
+    happened not to raise for any of them. A coarse, type-level skip took
+    that check away from every such table, not only the one row that
+    overflows — the same shape as the first wrong direction, one level down:
+    a comparison made against the case that fails, when the case that
+    succeeds is the one being taken away.
+
+    **The fix asks the question `cannot_become` already answers, per row —
+    and excludes, rather than blanks.** `AsStored::converted` still admits
+    `TypeChangeRisk::Safe` outright and still builds the plain `CAST` for
+    everything else — origin/master's own behaviour, unconditionally. A
+    first version of this fix instead wrapped that `CAST` in `CASE WHEN
+    <cannot_become predicate> THEN NULL ELSE CAST(...) END`, reasoning that
+    a `NULL` there already means "matches nothing" everywhere this feeds a
+    key comparison (DECISIONS 337, 348). **A second round of review found
+    that reasoning incomplete: this query already gives `NULL` that one
+    meaning, and a manufactured `NULL` is a second, different fact — "this
+    value could not be tested" — riding the same wire.** On the parent
+    side specifically, a manufactured `NULL` does not merely read as
+    absent: it makes that *specific* parent row stop matching as a survivor
+    for *every* child that might otherwise have matched it there, which
+    over-counts the very probe DECISIONS 449 exists to keep honest — and
+    over-reporting a pre-delete count is refusing a plan that may be valid,
+    which this project's finding rules treat as the most serious of the
+    three mandatory-fix cases. (It turns out to be moot here specifically —
+    see below — but "moot because something else fails first" was rightly
+    judged a reason to write the correct thing, not a reason to leave the
+    wrong one in place.)
+
+    So the design excludes instead: `AsStored::raise_guard(column, expr)`
+    answers, separately from `converted`, the predicate over `expr` that
+    names the rows a column's `CAST` would raise on, and each of
+    `planned_key_probes`'s three row contexts — the child's own stored row
+    (`ch`), the specific parent row a key's probe asks about by primary key
+    (`p`), and every surviving parent row a comparison might match against
+    (`q`) — gets its own `AND NOT (<raise_guard predicate over that row's
+    own alias>)` term, added to that context's own `WHERE` clause rather
+    than folded into any one comparison. A `NULL` keeps its single meaning
+    throughout; the excluded row is not silently dropped from the plan's
+    safety net, it is counted and named by the `AlterColumnType` conversion
+    probe running beside this one, which is the premise DECISIONS 392
+    actually needs, true per row instead of per column. No whole-key skip
+    exists in this design at all — every key this plan adds over a narrowed
+    column gets its own probe, unconditionally.
+
+    **Why the parent-side exclusion's over-count risk is moot, in the one
+    case that can trigger it.** `raise_guard` only ever fires for a column
+    this same plan retypes (it reads `retyped_from`/`retyped` directly), so
+    a parent row it excludes on the referenced column is a row belonging to
+    a table whose `AlterColumnType` change carries its own conversion probe
+    (387) — a second, independent probe, scanning that whole table
+    unconditionally. That `ALTER` runs at rank 9, strictly before any
+    `DELETE` (DECISIONS 340), so every row still present at that point —
+    including one a later statement in the same plan is about to delete —
+    has to survive it or the deploy is already refused, regardless of what
+    this key's own orphan probe does or does not count. The excluded
+    parent row is therefore always independently caught, on the same plan,
+    by a probe that does not depend on `planned_key_probes` at all.
+
+    **Where `cannot_become` returns `None` for a pair that is `Narrowing`
+    (not `Safe`), this builds the plain, unguarded `CAST` — exactly
+    `origin/master`'s own behaviour, left alone rather than papered over.**
+    `None` there is *unexpressed*, not *safe*: **measured**,
+    `CAST(3000000000::bigint AS integer)` raises `22003 integer out of
+    range` on `w80b-pg`, yet `cannot_become` has no match arm for
+    `Exact::Integer -> Exact::Integer` at all (only `Exact::Numeric` and
+    `Approx` sources are covered), so it falls through to its catch-all
+    `None`. Building the unguarded `CAST` here can raise, and the probe
+    runner reports that by name — issue #253's own finding, applied to a
+    pair this PR cannot close. This project's declared failure mode is
+    doing the wrong thing *silently*; a probe that is present and loud is
+    preferred over one silently narrowed to skip a pair with no evidence
+    behind the skip, and a whole-key skip for this pair would have thrown
+    away the working check for every table whose `bigint` values all fit
+    `integer` — the same regression this entry exists to name. The
+    `cannot_become` gap itself is filed separately (issue #429): it
+    predates this PR, it also affects the `AlterColumnType` change's own
+    conversion probe on this same pair, and closing it needs its own
+    measurement matrix across every `Exact::Integer` narrowing, not only
+    the one this issue happened to need.
+
+    `types::narrowing_cast_cannot_overflow`, the strict/scale-aware,
+    `numeric`-only type-level predicate an earlier round of this same PR
+    built and measured, is retired: nothing in this design consults a
+    type-level "can this pair ever raise" answer any more, only the
+    row-level one `cannot_become` already gave. Its doc comment recorded
+    two real, hard-won measurements worth keeping here instead: `CAST(
+    999.99::numeric(5,2) AS numeric(4,1))` — equal `int_digits`, `3 -> 3` —
+    raises `22003 numeric field overflow`, detail "A field with precision
+    4, scale 1 must round to an absolute value less than 10^3", while the
+    same cast on `12.34` succeeds as `12.3`; a type-level predicate that
+    once admitted that pair by a non-strict comparison would have passed
+    any fixture whose rows happened to be small. `cannot_become`'s own
+    bounded-numeric-target arm asks the equivalent, per-row question
+    directly — round the value to the target's scale and compare against
+    the bound — so this shape is now answered without a second predicate to
+    keep in sync with the first (issue #253).
+
+    **The guarded probe says so.** Issue #253 asked that a probe skipped for
+    this reason name the fact in its own description; that request went
+    unmet through the whole-key-skip design, because a probe never built has
+    no description to carry it (the reasoning behind #270, which this
+    shape was compared against and then retracted from once the skip it
+    named stopped existing). Under this design the probe is always built,
+    and its count now means something narrower than it used to — "orphans
+    among the rows whose conversion cannot fail" rather than "orphans" — so
+    `planned_key_probes` appends a clause to the probe's own description
+    wherever a guard actually excludes something, naming the
+    `AlterColumnType` conversion probe as the one that counts what this one
+    does not. A probe with nothing to exclude carries no such clause: the
+    count still means exactly what it always did.

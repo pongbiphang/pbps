@@ -12135,24 +12135,32 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     conn.drop().await;
 }
 
-/// A foreign key this plan adds over a column it also *narrows* gets no probe
-/// of its own — DECISIONS 392's rule, applied at `AsStored::converted`'s own
-/// site (issue #253).
+/// A foreign key this plan adds over a column it also *narrows* still gets
+/// its own probe (issue #253, DECISIONS 449) — a mixed table, where one
+/// stored value cannot make the trip and the rest can.
 ///
 /// `numeric(20,0)` into `integer`, so that the `AlterColumnType` change's own
-/// conversion probe (387) exists to take over — this is one of the pairs
-/// `types::cannot_become` names, unlike a plain `bigint` into `integer`, which
-/// this catalogue leaves to the "narrows without a row to point at" default
-/// (a gap of its own, and not this issue's). **Measured**, an explicit `CAST`
-/// does not save an out-of-range value here either — `CAST(5000000000::
-/// numeric(20,0) AS integer)` raises `22003`, the same `SQLSTATE` the `ALTER`
-/// itself refuses with. So a probe built by projecting the stored value
-/// through `converted`'s `CAST` raises on the very row the delete would have
-/// orphaned, and a probe that raises is reported as *unchecked*, not as a
-/// violation — `apply` proceeds regardless, and the count that was supposed
-/// to stop the delete goes quiet instead. The fixed shape carries no such
-/// `CAST`: no probe is built through the key at all, and the conversion
-/// probe is what counts the row and names the column.
+/// conversion probe (387) exists to name the offending row — this is one of
+/// the pairs `types::cannot_become` names, unlike a plain `bigint` into
+/// `integer`, which this catalogue leaves to the "narrows without a row to
+/// point at" default (a gap of its own, tracked separately, and not this
+/// issue's). **Measured**, an explicit `CAST` does not save an out-of-range
+/// value here either — `CAST(5000000000::numeric(20,0) AS integer)` raises
+/// `22003`, the same `SQLSTATE` the `ALTER` itself refuses with. A probe built
+/// by projecting the stored value straight through `converted`'s `CAST` would
+/// raise on the very row the delete would have orphaned, and a probe that
+/// raises is reported as *unchecked*, not as a violation — `apply` proceeds
+/// regardless. So this key's probe carries a plain `CAST`, exactly as
+/// `origin/master` always built one, plus an exclusion: the one row
+/// `cannot_become` names as unable to make the trip is filtered out of the
+/// probe's own count with `AND NOT (...)`, never compared and never blanked
+/// to `NULL` — this same query already gives `NULL` a specific meaning
+/// elsewhere (DECISIONS 449, `converted`'s own doc comment), so the
+/// exclusion has to stay a separate fact. The probe runs, does not raise,
+/// and counts zero through the key, while the conversion probe counts and
+/// names that same row directly. A whole-key skip here would have thrown
+/// away the check for every *other* row of the table, which is exactly what
+/// the sibling test below pins.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_through_a_raising_cast()
@@ -12226,11 +12234,11 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
             on_update: ReferentialAction::NoAction,
         },
     );
-    with_data(
-        &mut child,
-        DataMode::Exact,
-        &[("c1", row(&[("parent", Value::Int(5000000000))]))],
-    );
+    // `c1` is not declared reference data — it stays an ordinary stored row
+    // this plan does not itself write, exactly as the protected sibling test
+    // above leaves its child table. Declaring it would ask the plan to
+    // rewrite the literal `5000000000` as an `integer`, which cannot hold it
+    // either — a different, real hazard, and not the one this test is about.
     let mut declared = Schema::default();
     declared.tables.insert(parent_name, parent);
     declared.tables.insert(child_name, child);
@@ -12259,28 +12267,189 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
 
     let pg = Postgres::new();
     let probes = pg.preflight(&cs);
-    // No probe casts the narrowed column through the key this plan adds —
-    // the shape this test pins — and every probe still answers a count
-    // rather than raising, which `deploy::preflight` cannot tell apart from
-    // "nothing to check" (DECISIONS 392).
+    // The key this plan adds still has its own probe, carrying a plain
+    // `CAST`: the row `cannot_become` names is excluded from this probe's
+    // own count with an `AND NOT (...)`, not attempted and not blanked to
+    // `NULL` (DECISIONS 449).
+    let has_its_own_probe = "the key cannot be added once the row is gone";
+    assert!(
+        probes
+            .iter()
+            .any(|p| p.description.contains(has_its_own_probe)
+                && p.sql.contains("CAST(ch.\"parent\" AS integer)")
+                && p.sql.contains("AND NOT (round(")),
+        "a narrowing key still gets its own probe, carrying a plain CAST \
+         and an exclusion for the row it would raise on: {probes:#?}"
+    );
+    // Every probe still answers a count rather than raising, which
+    // `deploy::preflight` cannot tell apart from "nothing to check"
+    // (DECISIONS 392) — the whole point of the guard.
     let mut named = Vec::new();
     for p in &probes {
-        assert!(
-            !p.sql.contains("CAST(ch.\"parent\" AS"),
-            "a narrowing CAST here can raise and take the whole probe with \
-             it: {}",
-            p.sql
-        );
         named.push((p.description.clone(), counted(&mut conn, &p.sql).await));
     }
+    // The key's own probe counts zero: the one stored child row is excluded
+    // by the guard rather than compared, so it neither raises nor is
+    // (wrongly) reported as an orphan through this probe.
+    assert_eq!(
+        one(&named, has_its_own_probe),
+        0,
+        "the guarded row is excluded from this probe's count, not counted \
+         as an orphan by it: {named:#?}"
+    );
     // The count that actually stops this delete is the `ALTER`'s own
-    // conversion probe, not a count through the key: it names the column and
-    // counts exactly the one row that cannot make the trip.
+    // conversion probe: it names the column and counts exactly the one row
+    // that cannot make the trip.
     assert_eq!(
         one(&named, "cannot become"),
         1,
         "the row the delete would have orphaned is exactly the one the \
          narrower type cannot hold: {named:#?}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.drop().await;
+}
+
+/// The regression a narrowing key's probe must not lose: a table whose rows
+/// all *fit* the narrower type still needs its orphan check to work, exactly
+/// as it did before this plan retyped anything.
+///
+/// Before DECISIONS 449's row-level guard, a coarse "no probe at all for a
+/// `Narrowing` pair" skip — this project's own first attempt at #253 — took
+/// this table's working check away too: the `AlterColumnType` conversion
+/// probe (387) counts **zero** for a table where every value fits, so it is
+/// not the backstop that skip assumed, and the sibling test above proves it
+/// is not the backstop for the *raising* row either — the guard is what
+/// removes the raising `CAST`'s hazard without giving up the check. Same
+/// `numeric(20,0) -> integer` narrowing as the mixed-table test above, but
+/// every stored value here is small enough that neither the `ALTER` nor an
+/// explicit `CAST` ever raises on it — so nothing here is guarded to `NULL`,
+/// and the key's own probe has to catch the orphan on its own.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_whose_value_fits() {
+    let mut conn = TestDb::create("pull_data_narrowedkeyfits").await;
+    let s = data_schema("narrowedkeyfits");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code bigint PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, parent numeric(20,0));
+         INSERT INTO {s}.parent VALUES (2, 'Keep'), (3, 'Old');
+         INSERT INTO {s}.child VALUES ('c1', 3);"
+    ))
+    .await
+    .expect("the fixture");
+    // Measured, and rolled back: nothing here is out of range for
+    // `integer`, so neither the `ALTER` nor an explicit `CAST` raises on
+    // this table's data. The plan below still needs to find the column
+    // stored as `numeric(20,0)`, so this is by hand and not kept.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!(
+        "ALTER TABLE {s}.child ALTER COLUMN parent TYPE integer"
+    ))
+    .await
+    .expect("every stored value fits the narrower type");
+    conn.execute("ROLLBACK").await.expect("rollback");
+
+    let parent_name = TableName::new(&s, "parent");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("bigint")).not_null());
+    parent
+        .columns
+        .insert("label".into(), Column::new(ty("text")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    // The plan deletes parent row `3`, keeping only `2`.
+    with_data(
+        &mut parent,
+        DataMode::Exact,
+        &[("2", row(&[("label", Value::Text("Keep".into()))]))],
+    );
+    let child_name = TableName::new(&s, "child");
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("parent".into(), Column::new(ty("integer")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    child.foreign_keys.insert(
+        "child_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    // `c1` is not declared reference data, exactly as in the mixed-table
+    // test above and the protected sibling test that predates both: it stays
+    // an ordinary stored row this plan does not itself write, and still
+    // holds `3` — the parent row this same plan deletes — when the probe
+    // runs.
+    let mut declared = Schema::default();
+    declared.tables.insert(parent_name, parent);
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. })),
+        "the column is narrowed: {cs:#?}"
+    );
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        "and the key is added in the same plan: {cs:#?}"
+    );
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::DeleteRow { .. })),
+        "over a parent row this same plan deletes: {cs:#?}"
+    );
+
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs);
+    let has_its_own_probe = "the key cannot be added once the row is gone";
+    let mut named = Vec::new();
+    for p in &probes {
+        named.push((p.description.clone(), counted(&mut conn, &p.sql).await));
+    }
+    // The conversion probe, if it exists at all here, counts zero — nothing
+    // in this table is out of range, so it is not what catches this orphan.
+    assert!(
+        named
+            .iter()
+            .filter(|(d, _)| d.contains("cannot become"))
+            .all(|(_, n)| *n == 0),
+        "no stored value here fails the conversion: {named:#?}"
+    );
+    // The key's own probe is what has to catch it, and does: `c1` still
+    // holds `3` once the delete has run, and `3` no longer names a parent
+    // row.
+    assert_eq!(
+        one(&named, has_its_own_probe),
+        1,
+        "a row this plan would leave dangling once the delete runs, over a \
+         narrowing pair whose values all fit — the probe a coarse whole-key \
+         skip would have thrown away: {named:#?}"
     );
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
