@@ -1670,6 +1670,41 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_whitespace_is_an_expression_identifier_not_an_empty_expression() {
+        for expression in ["\u{a0}", "\u{2003}", "\t\u{a0}\n"] {
+            let mut table = structural_table();
+            table.columns.insert(
+                expression.trim_ascii().into(),
+                pbps_model::Column::new(ty("boolean")),
+            );
+            table.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "a".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: Some(expression.into()),
+                },
+            );
+            let errors = structural_errors(&table);
+            assert!(errors.is_empty(), "{expression:?}: {errors:?}");
+            // ASCII whitespace still contains no expression on either path.
+            table.checks.get_mut("ck").unwrap().expression = " \t\r\n\x0c".into();
+            table.indexes.get_mut("ix").unwrap().filter = Some(" \t\r\n\x0c".into());
+            assert_eq!(structural_errors(&table).len(), 2);
+        }
+    }
+
+    #[test]
     fn every_independent_key_structure_mistake_is_reported_in_one_pass() {
         let mut table = structural_table();
         table.primary_key = Some(pbps_model::PrimaryKey {

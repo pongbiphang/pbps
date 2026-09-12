@@ -10596,6 +10596,11 @@ SPEC is in sync with all of these.
      type families can be keys. Unknown types keep the catalogue's own finding
      rather than acquiring a second speculative key-type error.
 
+     Empty expressions mean ASCII whitespace only: measured, a non-breaking
+     space can name a boolean column and is a legal unquoted check/filter
+     expression. Rust's Unicode `trim` would refuse that valid declaration, so
+     both expression checks use `trim_ascii` and pin Unicode identifier cases.
+
      The unit tests pin each structural rule and aggregate independent errors.
      The live declaration matrix sends the emitter's statements to the engine,
      asserting the exact SQLSTATE for refusals and successful creation for

@@ -65,7 +65,9 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         }
     }
     for (name, check) in &table.checks {
-        if check.expression.trim().is_empty() {
+        // Non-ASCII whitespace can be an unquoted identifier in PostgreSQL;
+        // Rust's Unicode trim would reject a legal boolean-column expression.
+        if check.expression.trim_ascii().is_empty() {
             found.push(invalid(format!(
                 "check constraint `{name}` has an empty expression"
             )));
@@ -83,7 +85,11 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
                 )));
             }
         }
-        if index.filter.as_ref().is_some_and(|f| f.trim().is_empty()) {
+        if index
+            .filter
+            .as_ref()
+            .is_some_and(|f| f.trim_ascii().is_empty())
+        {
             found.push(invalid(format!("{what} has an empty filter expression")));
         }
     }

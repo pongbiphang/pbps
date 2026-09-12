@@ -3764,6 +3764,31 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         });
         cases.push((format!("key type {declared}"), table, None));
     }
+    for expression in ["\u{a0}", "\u{2003}", "\t\u{a0}\n"] {
+        let mut table = base();
+        table
+            .columns
+            .insert(expression.trim_ascii().into(), Column::new(ty("boolean")));
+        table.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: expression.into(),
+            },
+        );
+        table.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "a".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: Some(expression.into()),
+            },
+        );
+        cases.push((format!("non-ASCII expression {expression:?}"), table, None));
+    }
     let pg = Postgres::new();
     let name = TableName::new(&s, "t");
     for (label, table, expected) in cases {
