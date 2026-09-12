@@ -366,10 +366,16 @@ impl ObservedTable {
     }
 
     /// Every row, keyed as `spelling` spells it where it does and as the
-    /// engine does elsewhere.
-    pub fn rows_as(&self, spelling: &BTreeSet<RowKey>) -> BTreeMap<RowKey, &ObservedRow> {
+    /// engine does elsewhere. `prefer` names the reference side's keys: a
+    /// union scope may contain another side's alias for the same row, but
+    /// that alias must not hide the reference row's explicit default cells.
+    pub fn rows_as(
+        &self,
+        spelling: &BTreeSet<RowKey>,
+        prefer: &BTreeSet<RowKey>,
+    ) -> BTreeMap<RowKey, &ObservedRow> {
         let mut requested: BTreeMap<&RowKey, &RowKey> = BTreeMap::new();
-        for key in spelling {
+        for key in prefer.iter().chain(spelling) {
             if let Some(canonical) = self.aliases.get(key) {
                 requested.entry(canonical).or_insert(key);
             }
@@ -487,13 +493,16 @@ impl DataScope {
     /// `reference` is this side's own block, whose spelling of each cell
     /// decides how a cell at its default is read (see [`ObservedRow`]).
     pub fn project(&self, observed: &ObservedTable, reference: Option<&TableData>) -> TableData {
+        let preferred = reference
+            .map(|data| data.rows.keys().cloned().collect())
+            .unwrap_or_default();
         let seen = |k: RowKey, r: &ObservedRow| {
             let row = r.as_seen_by(reference.and_then(|d| d.rows.get(&k)));
             (k, row)
         };
         let rows = match self.mode {
             DataMode::Exact => observed
-                .rows_as(&self.keys)
+                .rows_as(&self.keys, &preferred)
                 .into_iter()
                 .map(|(k, r)| seen(k, r))
                 .collect(),
@@ -577,12 +586,9 @@ impl crate::schema::Schema {
     /// side's, i.e. asking `reference`'s own side about a table it never
     /// mentions is asking about a keyset that does not exist.
     ///
-    /// This narrows only the *conflict test*; `scope.project` below still
-    /// hands the unnarrowed `scope` to [`ObservedTable::rows_as`], which picks
-    /// a canonical spelling among several aliasing to one row by sorting them
-    /// (issue #107) rather than by which side asked. #107 stays open and
-    /// stays exactly as broken after this change — fixing it is a different
-    /// PR, against `rows_as` itself, not this narrowing.
+    /// Projection keeps the union wide enough to pin every covered row,
+    /// while preferring `reference`'s keys when both sides name the same row.
+    /// This also preserves the reference row's explicit default cells.
     pub fn with_observed_rows(
         mut self,
         rows: &ObservedRows,
@@ -657,7 +663,10 @@ pub fn plan_base(
             (Some(mode), Some(observed)) => Some(TableData {
                 mode,
                 rows: observed
-                    .rows_as(spelling.unwrap_or(&BTreeSet::new()))
+                    .rows_as(
+                        spelling.unwrap_or(&BTreeSet::new()),
+                        spelling.unwrap_or(&BTreeSet::new()),
+                    )
                     .into_iter()
                     .map(|(k, r)| {
                         let row = r.as_seen_by(own.and_then(|d| d.rows.get(&k)));
@@ -1306,6 +1315,54 @@ mod tests {
             .expect("recorded's own spelling `1` alone is not a conflict");
         live.with_observed_rows(&observed_rows, &scopes, &declared)
             .expect("declared's own spelling `01` alone is not a conflict");
+    }
+
+    #[test]
+    fn a_union_projection_preserves_the_reference_key_and_explicit_default_cells() {
+        let mut seen = observed(&["new", "2", "unmanaged"]);
+        seen.aliases = [("NEW", "new"), ("new", "new"), ("02", "2")]
+            .into_iter()
+            .map(|(alias, canonical)| (RowKey::from(alias), RowKey::from(canonical)))
+            .collect();
+        let explicit: Row = [("label".to_owned(), Value::Text("New".into()))]
+            .into_iter()
+            .collect();
+        seen.rows.get_mut(&RowKey::from("new")).unwrap().cells = explicit.clone();
+        seen.rows.get_mut(&RowKey::from("new")).unwrap().at_default =
+            ["label".to_owned()].into_iter().collect();
+        let recorded = TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from("new"), explicit.clone())]
+                .into_iter()
+                .collect(),
+        };
+        let declared = TableData {
+            mode: DataMode::Exact,
+            rows: rows(&["NEW", "02"]),
+        };
+        let union = DataScope::of(&recorded).union(DataScope::of(&declared));
+        let projected = union.project(&seen, Some(&recorded));
+        assert_eq!(
+            projected.rows,
+            [
+                (RowKey::from("new"), explicit),
+                (RowKey::from("02"), Row::default()),
+                (RowKey::from("unmanaged"), Row::default()),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!projected.rows.contains_key(&RowKey::from("NEW")));
+        assert!(projected.rows.contains_key(&RowKey::from("02")));
+        assert!(projected.rows.contains_key(&RowKey::from("unmanaged")));
+
+        // The same read under the other side keeps its key and its omission.
+        let projected = union.project(&seen, Some(&declared));
+        assert_eq!(projected.rows[&RowKey::from("NEW")], Row::default());
+        assert!(!projected.rows.contains_key(&RowKey::from("new")));
+        // No reference retains the scope's spelling and omits default cells.
+        let projected = union.project(&seen, None);
+        assert_eq!(projected.rows[&RowKey::from("NEW")], Row::default());
     }
 
     /// The catalog cannot tell `label: Unlabelled` from an omitted `label`
