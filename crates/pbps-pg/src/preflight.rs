@@ -1388,9 +1388,8 @@ impl AsStored {
     /// probe (387), which is the premise DECISIONS 392's "no probe needed
     /// here" actually relies on, true per row rather than per type pair.
     ///
-    /// `cannot_become` returning `None` here means *unexpressed* for at
-    /// least one family (`Exact::Integer -> Exact::Integer`; issue #429
-    /// tracks it), not *safe* — so `None` excludes nothing, and a caller's
+    /// `cannot_become` returning `None` here is not a general proof that
+    /// a cast is safe — so `None` excludes nothing, and a caller's
     /// unconditional `CAST` stays exactly as `origin/master` always built
     /// it: it may raise, and the probe runner reports that by name (issue
     /// #253's own finding), which this project prefers over a probe
@@ -3579,6 +3578,34 @@ mod tests {
         // The unique tail of the description `planned_key_probes` gives the
         // count over this key — present only where that count is built.
         let has_its_own_probe = "the key cannot be added once the row is gone";
+
+        for (from, to, max) in [
+            ("bigint", "integer", 2147483647_i64),
+            ("bigint", "smallint", 32767),
+            ("integer", "smallint", 32767),
+        ] {
+            let narrowed = probes(&plan(retype(from, to)));
+            let min = -max - 1;
+            assert!(
+                narrowed
+                    .iter()
+                    .any(|p| p.description.contains("cannot become")
+                        && p.sql
+                            .contains(&format!("\"status\" > {max} OR \"status\" < {min}"))),
+                "{from} -> {to}: {narrowed:#?}"
+            );
+            assert!(
+                narrowed
+                    .iter()
+                    .any(|p| p.description.contains(has_its_own_probe)
+                        && p.sql.contains(&format!("CAST(ch.\"status\" AS {to})"))
+                        && p.sql.contains(&format!(
+                            "AND NOT (ch.\"status\" > {max} OR ch.\"status\" < {min})"
+                        ))
+                        && p.description.contains("excludes a row")),
+                "{from} -> {to}: {narrowed:#?}"
+            );
+        }
 
         // `text` into `varchar(3)` is a narrowing (measured, DECISIONS 387):
         // a value over three characters raises rather than truncating.
