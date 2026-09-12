@@ -273,19 +273,31 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
 /// permissions" — names neither. `doctor` asks for this right before migration,
 /// but callers that deploy without running it still need an actionable error.
 async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
-    conn.execute(ADD_TIMELINE_COLUMNS).await.map_err(|e| {
-        let code = e.server_error_code();
-        DbError::Driver {
-            message: format!(
-                "dbo.__pbps_state is missing the timeline columns (state_version, \
+    conn.execute(ADD_TIMELINE_COLUMNS)
+        .await
+        .map_err(migration_error)
+}
+
+fn migration_error(e: DbError) -> DbError {
+    let code = e.server_error_code();
+    // Msg 1088 is the measured refusal for this ALTER (DECISIONS 435).
+    // A transport failure says nothing about the login's rights.
+    let guidance = if code.as_deref() == Some("1088") {
+        "This is a one-time migration that needs ALTER on dbo.__pbps_state. \
+             Run `pbps doctor` and obtain the ALTER right it reports before retrying."
+    } else {
+        "The timeline-column migration failed. Investigate the original database \
+             or connection error above before retrying."
+    };
+    DbError::Driver {
+        message: format!(
+            "dbo.__pbps_state is missing the timeline columns (state_version, \
                  tables_count, modules_count, staged_completed, staged_total) issue #103 \
                  added, and this login could not add them: {e}\n\
-                 This is a one-time migration that needs ALTER on dbo.__pbps_state. \
-                 Run `pbps doctor` and obtain the ALTER right it reports before retrying."
-            ),
-            code,
-        }
-    })
+                 {guidance}"
+        ),
+        code,
+    }
 }
 
 /// The cheapest statement that resolves the ledger and checks the permission to
@@ -831,6 +843,25 @@ fn ledger_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_permission_migration_failures_recommend_obtaining_rights() {
+        for code in [Some("1088"), Some("1205"), None] {
+            let original = "original driver failure";
+            let error = migration_error(DbError::Driver {
+                message: original.into(),
+                code: code.map(str::to_owned),
+            });
+            assert_eq!(error.server_error_code().as_deref(), code);
+            let message = error.to_string();
+            assert!(message.contains(original));
+            assert_eq!(message.contains("right it reports"), code == Some("1088"));
+            assert_eq!(
+                message.contains("Investigate the original"),
+                code != Some("1088")
+            );
+        }
+    }
 
     /// A count too large for `TOP` must become "as many as it can", never a
     /// small number and never a negative one: wrapping would silently shorten
