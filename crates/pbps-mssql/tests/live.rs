@@ -7822,6 +7822,91 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_pinned_union_keeps_recorded_key_spelling_and_default_cells() {
+    use pbps_model::{DataMode, DataScope, DataScopes, Row, RowKey, TableData, Value};
+
+    let mut db = TestDb::create("preferred_key_spelling").await;
+    db.conn.execute(
+        "CREATE TABLE dbo.k (code varchar(20) COLLATE Latin1_General_100_CI_AS NOT NULL PRIMARY KEY, \
+         label nvarchar(50) NOT NULL DEFAULT N'New'); INSERT dbo.k(code) VALUES ('new');",
+    ).await.unwrap();
+    let name = TableName::new("dbo", "k");
+    let live = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let explicit: Row = [("label".to_owned(), Value::Text("New".into()))]
+        .into_iter()
+        .collect();
+    let mut recorded = live.clone();
+    recorded.tables.get_mut(&name).unwrap().data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [(RowKey::from("new"), explicit.clone())]
+            .into_iter()
+            .collect(),
+    });
+    let mut declared = live.clone();
+    declared.tables.get_mut(&name).unwrap().data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [(RowKey::from("NEW"), Row::default())]
+            .into_iter()
+            .collect(),
+    });
+    let union = DataScope::of(recorded.tables[&name].data.as_ref().unwrap())
+        .union(DataScope::of(declared.tables[&name].data.as_ref().unwrap()));
+    let scopes: DataScopes = [(name.clone(), union.clone())].into_iter().collect();
+    let read = [(name.clone(), union.rows_to_read())].into_iter().collect();
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .unwrap();
+    assert_eq!(
+        observed[&name].aliases[&RowKey::from("NEW")],
+        RowKey::from("new")
+    );
+    assert!(
+        observed[&name].rows[&RowKey::from("new")]
+            .at_default
+            .contains("label")
+    );
+    let pinned = live
+        .clone()
+        .with_observed_rows(&observed, &scopes, &recorded)
+        .unwrap();
+    assert_eq!(pinned.tables[&name].data, recorded.tables[&name].data);
+    let ids = mint_ids(&recorded, &IdsFile::default(), &[]);
+    let checksum = pbps_model::plan::state_checksum(&pinned, &ids);
+    assert_eq!(checksum, pbps_model::plan::state_checksum(&recorded, &ids));
+
+    let base =
+        pbps_model::data::plan_base(&live, &observed, &recorded.data_scopes(), &declared).unwrap();
+    assert_eq!(base.tables[&name].data, declared.tables[&name].data);
+    // A fresh read of the same union must reproduce the approved baseline.
+    let reread = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .unwrap();
+    let unchanged = live
+        .clone()
+        .with_observed_rows(&reread, &scopes, &recorded)
+        .unwrap();
+    assert_eq!(checksum, pbps_model::plan::state_checksum(&unchanged, &ids));
+    // The reference determines spelling, never the observed value: real drift
+    // must still move the checksum when the row now differs from its default.
+    db.conn
+        .execute("UPDATE dbo.k SET label = N'Changed' WHERE code = 'new'")
+        .await
+        .unwrap();
+    let reread = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .unwrap();
+    let changed = live
+        .with_observed_rows(&reread, &scopes, &recorded)
+        .unwrap();
+    assert_ne!(checksum, pbps_model::plan::state_checksum(&changed, &ids));
+    db.drop().await;
+}
+
 /// Roles against the engine (ADR-0005): the plan's `CREATE ROLE` and `GRANT`
 /// are accepted, the catalog reads the role and its grants back exactly, a
 /// hand-made `GRANT` and a `DENY` are seen for what they are, and a rename
