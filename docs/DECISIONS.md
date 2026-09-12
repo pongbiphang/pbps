@@ -10424,10 +10424,23 @@ SPEC is in sync with all of these.
        cannot change an answer is one nobody re-reads.
      - The action's statement runs even when it matches no row, so a
        statement-level trigger on the referencing table fires with zero
-       referencing rows. This is why the delete side is guarded at all: the
-       row-delete preflight and the statement guard that matches it (333)
-       already refuse a plan whose declared row still has children, and a
-       statement trigger is what a delete can still reach past them.
+       referencing rows. That is the *least* a delete reaches, not the most,
+       and the delete side keeps its row-level triggers and its recursion for
+       the concurrent case. The row-delete preflight and the statement guard
+       that matches it (333) refuse a plan whose declared row still has
+       children — with one deployer and nobody else writing, the action's
+       statement therefore matches nothing and only the statement trigger
+       fires, measured. **Measured on 18.6**, a second session that inserts a
+       child and a grandchild and commits while that guarded `DELETE` waits on
+       the parent's row lock defeats both: the `NOT EXISTS` guard still admits
+       the delete, the cascade removes the rows the other session committed,
+       and the child's row trigger, the grandchild's row trigger and both
+       statement triggers all fire. (The other order is safe on its own —
+       an insert that starts *after* the delete has the parent row blocks and
+       then fails the foreign key.) Narrowing the delete side to statement
+       triggers, or refusing to walk past the first action because its
+       statement "must" be empty, would hand an attacker exactly the trigger
+       the guard had stopped looking at.
      - Referential actions carry `ONLY`. They reach partitions of the
        referencing side and name the root of its partition tree — a statement
        trigger on a partition does not fire, one on the root does — but they
@@ -10545,7 +10558,8 @@ SPEC is in sync with all of these.
      cascade-reached table blocked until the write commits; the cannot-lock
      refusal naming its table; and the removals — of a foreign key, of the table
      carrying one, and of each of the two triggers that widen a write — and the
-     two not-firing actions,
+     two not-firing actions, the row-level and grandchild triggers a delete
+     action reaches,
      each paired with the state in which the same closure does follow it, and
      each again with the referencing side partitioned, where the action trigger
      belongs to the declared constraint and not to the copy the walk matched; the

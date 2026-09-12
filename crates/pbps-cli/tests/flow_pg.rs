@@ -4586,6 +4586,33 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
             false,
         ),
         (
+            // The delete side reaches row-level triggers too. The row-delete
+            // preflight and the guard inside the emitted statement refuse a
+            // plan whose declared row still has children, so the action's
+            // statement usually matches nothing -- but measured on 18.6, a
+            // concurrent child inserted while that guarded DELETE waits on the
+            // parent row lock is cascaded anyway, and its row trigger, its
+            // grandchild's row trigger and both statement triggers all fire
+            // (DECISIONS 451).
+            "a_row_trigger_on_a_delete_actions_child",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON DELETE CASCADE); \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            RowOperation::Delete,
+            true,
+        ),
+        (
+            "a_grandchild_a_delete_action_cascades_into",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON DELETE CASCADE); \
+                    CREATE TABLE {{s}}.g(id int PRIMARY KEY, cid int REFERENCES {{s}}.c(id) ON DELETE CASCADE); \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.g FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            RowOperation::Delete,
+            true,
+        ),
+        (
             "an_event_the_action_does_not_raise",
             format!(
                 "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE); \
