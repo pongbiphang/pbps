@@ -3521,6 +3521,287 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
     );
 }
 
+/// The declaration validator must agree with emitted DDL, including the legal
+/// PostgreSQL repetitions that SQL Server's key-column helper would refuse.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repetitions() {
+    let s = emit_schema("structure");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (a integer PRIMARY KEY, b integer, UNIQUE(a,b))"
+    ))
+    .await
+    .unwrap();
+    let base = || {
+        let mut table = Table::default();
+        for name in ["a", "b"] {
+            table
+                .columns
+                .insert(name.into(), Column::new(ty("integer")).not_null());
+        }
+        table
+            .columns
+            .insert("j".into(), Column::new(ty("json")).not_null());
+        table
+    };
+    let mut cases: Vec<(String, Table, Option<&str>)> = Vec::new();
+    for kind in ["primary", "unique", "index", "foreign"] {
+        for (columns, code) in [
+            (vec![], Some("42601")),
+            (vec!["missing"], Some("42703")),
+            (
+                vec!["a", "a"],
+                if matches!(kind, "primary" | "unique") {
+                    Some("42701")
+                } else {
+                    None
+                },
+            ),
+            (
+                vec!["j"],
+                Some(if kind == "foreign" { "42804" } else { "42704" }),
+            ),
+            (vec!["a"], None),
+        ] {
+            let label = format!("{kind} {columns:?}");
+            let mut table = base();
+            let columns: Vec<String> = columns.into_iter().map(String::from).collect();
+            match kind {
+                "primary" => {
+                    table.primary_key = Some(PrimaryKey {
+                        name: Some("pk".into()),
+                        columns,
+                    })
+                }
+                "unique" => {
+                    table
+                        .unique
+                        .insert("uq".into(), UniqueConstraint { columns });
+                }
+                "index" => {
+                    table.indexes.insert(
+                        "ix".into(),
+                        Index {
+                            columns: columns
+                                .into_iter()
+                                .map(|name| IndexColumn {
+                                    name,
+                                    descending: false,
+                                })
+                                .collect(),
+                            include: vec![],
+                            unique: false,
+                            filter: None,
+                        },
+                    );
+                }
+                _ => {
+                    let references_columns = if columns.len() == 2 {
+                        vec!["a".into(), "b".into()]
+                    } else {
+                        vec!["a".into()]
+                    };
+                    table.foreign_keys.insert(
+                        "fk".into(),
+                        ForeignKey {
+                            columns,
+                            references_table: TableName::new(&s, "parent"),
+                            references_columns,
+                            on_delete: Default::default(),
+                            on_update: Default::default(),
+                        },
+                    );
+                }
+            }
+            cases.push((label, table, code));
+        }
+    }
+    for (remote, code) in [(vec![], "42601"), (vec!["a", "b"], "42830")] {
+        let mut table = base();
+        table.foreign_keys.insert(
+            "fk".into(),
+            ForeignKey {
+                columns: vec!["a".into()],
+                references_table: TableName::new(&s, "parent"),
+                references_columns: remote.into_iter().map(String::from).collect(),
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        cases.push((format!("foreign referenced list {code}"), table, Some(code)));
+    }
+    for (include, code) in [
+        (vec!["missing"], Some("42703")),
+        (vec!["a", "b", "b", "j"], None),
+    ] {
+        let mut table = base();
+        table.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "a".into(),
+                    descending: false,
+                }],
+                include: include.into_iter().map(String::from).collect(),
+                unique: false,
+                filter: None,
+            },
+        );
+        cases.push((format!("include {code:?}"), table, code));
+    }
+    for filter in [false, true] {
+        let mut table = base();
+        if filter {
+            table.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        name: "a".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: Some(" \n ".into()),
+                },
+            );
+        } else {
+            table.checks.insert(
+                "ck".into(),
+                CheckConstraint {
+                    expression: " \n ".into(),
+                },
+            );
+        }
+        cases.push((
+            format!("empty expression filter={filter}"),
+            table,
+            Some("42601"),
+        ));
+    }
+    for count in [32, 33] {
+        for kind in ["primary", "unique", "index", "include"] {
+            let mut table = base();
+            let columns: Vec<_> = (0..count).map(|n| format!("c{n}")).collect();
+            for column in &columns {
+                table
+                    .columns
+                    .insert(column.clone(), Column::new(ty("integer")).not_null());
+            }
+            match kind {
+                "primary" => {
+                    table.primary_key = Some(PrimaryKey {
+                        name: Some("pk".into()),
+                        columns,
+                    })
+                }
+                "unique" => {
+                    table
+                        .unique
+                        .insert("uq".into(), UniqueConstraint { columns });
+                }
+                _ => {
+                    let (keys, include) = if kind == "include" {
+                        (columns[..1].to_vec(), columns[1..].to_vec())
+                    } else {
+                        (columns, vec![])
+                    };
+                    table.indexes.insert(
+                        "ix".into(),
+                        Index {
+                            columns: keys
+                                .into_iter()
+                                .map(|name| IndexColumn {
+                                    name,
+                                    descending: false,
+                                })
+                                .collect(),
+                            include,
+                            unique: false,
+                            filter: None,
+                        },
+                    );
+                }
+            }
+            cases.push((
+                format!("{kind} width {count}"),
+                table,
+                if count == 33 { Some("54011") } else { None },
+            ));
+        }
+    }
+    // Every admitted type family other than json can be a btree key. Include
+    // aliases: varchar uses text's operator class, not one of its own.
+    for declared in [
+        "smallint",
+        "int",
+        "bigint",
+        "numeric",
+        "real",
+        "float8",
+        "bool",
+        "char(2)",
+        "varchar(20)",
+        "text",
+        "bytea",
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "uuid",
+        "jsonb",
+    ] {
+        let mut table = base();
+        table
+            .columns
+            .insert("a".into(), Column::new(ty(declared)).not_null());
+        table.primary_key = Some(PrimaryKey {
+            name: Some("pk".into()),
+            columns: vec!["a".into()],
+        });
+        cases.push((format!("key type {declared}"), table, None));
+    }
+    let pg = Postgres::new();
+    let name = TableName::new(&s, "t");
+    for (label, table, expected) in cases {
+        let problems = pg.validate_table(&name, &table);
+        assert_eq!(
+            problems.is_empty(),
+            expected.is_none(),
+            "{label}: {problems:?}"
+        );
+        let statements = pg
+            .emit(
+                &pbps_model::Change::CreateTable {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                    name: name.clone(),
+                    table: Box::new(table),
+                },
+                Strategy::default(),
+            )
+            .expect("emitter spells structural errors for the engine");
+        let mut refusal = None;
+        for statement in statements {
+            if let Err(error) = conn.execute(&statement.sql).await {
+                refusal = Some(error);
+                break;
+            }
+        }
+        assert_eq!(
+            refusal.as_ref().map(sqlstate),
+            expected,
+            "{label}: {refusal:?}"
+        );
+        conn.execute(&format!("DROP TABLE IF EXISTS {s}.t"))
+            .await
+            .unwrap();
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
 /// A rename that crosses a schema takes two statements, and each says what it
 /// does to the name so that a staged checkpoint can find the table in between.
 #[tokio::test]
