@@ -10344,3 +10344,83 @@ SPEC is in sync with all of these.
      inheritors that can already act as the deployer remain trusted. This
      narrows the execution policy without granting any additional privileges
      or extending the guard to transitive routine calls and indirect writes.
+
+451. **The named table is not the write set: a row operation is guarded over the
+     foreign keys whose actions write for it.** 445 authenticated the triggers
+     of the table the plan names and its inheritance descendants. That is not
+     where the write ends. **Measured on PostgreSQL 18.6**, with the same
+     separate non-superuser roles as 445 and reproduced end to end through the
+     CLI (#412): a deployer's `UPDATE` of a referenced UNIQUE value makes the
+     engine write the referencing table for it, and an invoker trigger the
+     attacker attached there with nothing but `TRIGGER` on it copies a secret
+     the attacker cannot read — `current_user` inside that trigger is the
+     deployer. PostgreSQL runs a referential action as the *referencing* table's
+     owner, so the escalation is exactly the ordinary case where the deployment
+     role owns the table the action writes. `unmanaged: ignore` and `warn` do
+     not authorize it, for the reason 445 already gave: scope is comparison,
+     not execution.
+
+     The guard therefore walks the write-producing closure of each row
+     operation: `CASCADE`, `SET NULL` and `SET DEFAULT` produce a write,
+     `NO ACTION` and `RESTRICT` only refuse, and every statement the walk finds
+     is itself walked, so a cascade two foreign keys away is authenticated by
+     the same rule as the first. What the engine actually writes, measured:
+
+     - An `ON UPDATE` action sets **every** column of the foreign key, even when
+       only one referenced column changed; an `ON DELETE SET NULL`/`SET DEFAULT`
+       with a column list sets that list (`confdelsetcols`, PostgreSQL 15 and
+       later). `UPDATE OF` on the referencing side follows those columns, by
+       name: a partition may number its columns differently from its root.
+     - A referenced column that is generated changes when a `SET` column it
+       derives from does, so the closure's key test reuses the same touched-
+       column rule 445 defined for `UPDATE OF` rather than matching the SET list
+       alone.
+     - The action's statement runs even when it matches no row, so a
+       statement-level trigger on the referencing table fires with zero
+       referencing rows. This is why the delete side is guarded at all: the
+       row-delete preflight and the statement guard that matches it (333)
+       already refuse a plan whose declared row still has children, and a
+       statement trigger is what a delete can still reach past them.
+     - Referential actions carry `ONLY`. They reach partitions of the
+       referencing side and name the root of its partition tree — a statement
+       trigger on a partition does not fire, one on the root does — but they
+       never reach a plain inheritance descendant, which the emitted row
+       statement, carrying no `ONLY`, does. The two expansions are therefore
+       kept apart rather than shared: one rule for both would either miss a
+       partition or refuse for an inheritance child the engine leaves alone.
+
+     Each reached table is locked `ROW EXCLUSIVE` before its triggers are read
+     and held for the write, as 445 requires of the named one; the same lock on
+     the referenced side is what keeps a new foreign key from being added to it
+     mid-walk, since `ALTER TABLE ... ADD FOREIGN KEY` takes
+     `SHARE ROW EXCLUSIVE` on both sides. Reached tables are followed by oid,
+     never by name: a name is needed only to write `LOCK TABLE`, and a rename
+     between reading that name and locking it would otherwise hand the guard a
+     lock on some other relation, so the lock is proved to have landed on the
+     intended oid before its triggers count for anything.
+
+     The cost is one refusal that is not about a trigger: `ROW EXCLUSIVE` needs
+     `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on the table, and measured,
+     `SELECT` alone is `permission denied`. Because the action runs as the
+     referencing table's owner, a deployment role can have a valid plan whose
+     cascade reaches a table it may not write. Refusing is the safe direction —
+     there is no weaker lock that conflicts with `CREATE TRIGGER` — and the
+     refusal names the table and the privilege rather than surfacing the
+     engine's bare `permission denied`. Narrowing the closure to tables whose
+     owner can act as the deployer would avoid it and was not taken: the
+     effective-role rule is the thing an attacker would have to fool, and a
+     guard that is right about who may write beats one that is clever about
+     when it need not look.
+
+     Live regressions: the escalation through `ON UPDATE CASCADE`, `SET NULL`
+     and `SET DEFAULT` and through `ON DELETE CASCADE` and `SET NULL`, at row
+     and statement level, two foreign keys deep, under both apply modes and
+     both `unmanaged` settings, each with a control proving the action really
+     reaches the table and that the same plan applies once the trigger is gone;
+     a table of closure membership cases pairing every non-writing action,
+     unreached event, untouched column and unreachable descendant with the
+     writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
+     cascade-reached table blocked until the write commits; and the
+     cannot-lock refusal naming its table. They pass on 16.15 as well as 18.6:
+     the one catalogue column the closure needs that is not ancient,
+     `confdelsetcols`, arrived in 15.

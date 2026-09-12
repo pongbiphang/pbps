@@ -3,12 +3,26 @@
 //! The table lock is part of the execution guard, not a post-write drift check:
 //! TRIGGER privilege permits CREATE OR REPLACE even for an existing trigger.
 //! It cannot change a trigger while the writer holds ROW EXCLUSIVE (DECISIONS 445).
+//!
+//! The named table is not the only table the write reaches: a referential
+//! action writes the referencing side of a foreign key, and a trigger there
+//! runs under the deployer just the same. The guard therefore authenticates the
+//! whole write-producing foreign-key closure of each row operation (DECISIONS 451).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use pbps_db::{Conn, DbError};
 use pbps_dialect::{RowOperation, RowWrite};
 use pbps_model::{ModuleId, ModuleKind, Schema, TableName};
+
+/// `insufficient_privilege`, which `LOCK TABLE` raises for a table the
+/// deployment role may read but not write.
+const DENIED: &str = "42501";
+
+/// `pg_trigger.tgtype` event bits.
+const INSERT: i16 = 4;
+const DELETE: i16 = 8;
+const UPDATE: i16 = 16;
 
 /// Valid only inside the transaction that authenticated and locked the tables.
 /// Oids survive a table rename; names alone would also bless a replacement.
@@ -31,7 +45,7 @@ pub async fn prepare(
     writes.dedup();
     let mut guard = Guard::default();
     for write in writes {
-        for trigger in read_locked(conn, &write).await? {
+        for trigger in reachable(conn, &write).await? {
             let id = ModuleId::Trigger {
                 on: trigger.table.clone(),
                 name: trigger.name.clone(),
@@ -45,7 +59,7 @@ pub async fn prepare(
                         == Some(m.definition.as_str())
             });
             if !matches_record || !trigger.trusted_owner {
-                return Err(refused(&trigger.table, &trigger.name));
+                return Err(refused(&trigger, &write.table));
             }
             guard.approved.insert(trigger.oid, trigger.function_oid);
         }
@@ -56,10 +70,10 @@ pub async fn prepare(
 /// Recheck immediately before each row statement, including on a newly created
 /// or renamed table. The lock stays held through that statement's transaction.
 pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(), DbError> {
-    for trigger in read_locked(conn, write).await? {
+    for trigger in reachable(conn, write).await? {
         if guard.approved.get(&trigger.oid) != Some(&trigger.function_oid) || !trigger.trusted_owner
         {
-            return Err(refused(&trigger.table, &trigger.name));
+            return Err(refused(&trigger, &write.table));
         }
     }
     Ok(())
@@ -67,9 +81,9 @@ pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(
 
 fn event(operation: &RowOperation) -> i16 {
     match operation {
-        RowOperation::Insert => 4,
-        RowOperation::Update { .. } => 16,
-        RowOperation::Delete => 8,
+        RowOperation::Insert => INSERT,
+        RowOperation::Update { .. } => UPDATE,
+        RowOperation::Delete => DELETE,
     }
 }
 
@@ -80,25 +94,34 @@ struct Trigger {
     name: String,
     definition: String,
     trusted_owner: bool,
+    /// False for the table the plan writes by name; true for a table the
+    /// engine writes on its own behalf through a referential action.
+    through_an_action: bool,
 }
 
-async fn read_locked(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError> {
+/// One statement the engine will run for this write: the relation it names, the
+/// trigger event, and, for an UPDATE, the columns it sets.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Statement {
+    relation: i64,
+    event: i16,
+    columns: BTreeSet<String>,
+    /// A referential action carries ONLY, and an INSERT has no descendants to
+    /// reach but its partitions. Measured on PostgreSQL 18.6: a cascade updates
+    /// and deletes partitions of the referencing table but never a plain
+    /// inheritance descendant, while the emitted row statement reaches both.
+    partitions_only: bool,
+}
+
+/// Every trigger the write can fire, with the tables holding them locked.
+///
+/// The named table is locked under the caller's `search_path` because that is
+/// the name the plan will write; everything the closure reaches afterwards is
+/// followed by oid, so a rename cannot move the guard onto another relation.
+async fn reachable(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError> {
     let table = &write.table;
-    let events = event(&write.operation);
-    // UPDATE OF follows the SET list, including generated columns that depend
-    // on it. A BEFORE ROW UPDATE trigger makes PostgreSQL include all generated
-    // columns, even if that trigger is disabled; measured on PostgreSQL 18.
-    let columns = match &write.operation {
-        RowOperation::Update { columns } => columns
-            .iter()
-            .map(|name| literal(name))
-            .collect::<Vec<_>>()
-            .join(", "),
-        RowOperation::Insert | RowOperation::Delete => String::new(),
-    };
-    // No ONLY: PostgreSQL DML can reach inheritance descendants. Lock and
-    // inspect only descendants that this operation can reach. Statement-level
-    // triggers fire on the named target, not each inheritance descendant.
+    // No ONLY: PostgreSQL DML can reach inheritance descendants, and locking
+    // the descendants is what keeps their triggers from being replaced too.
     conn.execute(&format!(
         "LOCK TABLE {}.{} IN ROW EXCLUSIVE MODE",
         ident(&table.schema),
@@ -113,21 +136,184 @@ async fn read_locked(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, 
         .to_owned();
     conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
         .await?;
-    // INHERIT can confer function ownership rights without a SET ROLE path.
-    // Check every effective owner, including the direct owner, because replacing
-    // a function preserves its OID and does not conflict with the table lock.
-    let result: Result<Vec<Trigger>, DbError> = async {
-        let rows = conn.query(&format!(
-            "WITH RECURSIVE relations(oid) AS (
-                 SELECT c.oid FROM pg_catalog.pg_class c
-                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = {schema} AND c.relname = {name}
-                 UNION
-                 SELECT i.inhrelid FROM pg_catalog.pg_inherits i
-                 JOIN relations r ON r.oid = i.inhparent
-                 JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent
-                 WHERE {events} <> 4 OR parent.relkind = 'p'
-             )
+    let result = walk(conn, write).await;
+    // On a query error the caller must roll back the transaction. On success,
+    // restore its path before returning; no setting leaks into emitted SQL.
+    if result.is_ok() {
+        conn.query(&format!(
+            "SELECT pg_catalog.set_config('search_path', {}, true)",
+            literal(&path)
+        ))
+        .await?;
+    }
+    result
+}
+
+async fn walk(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError> {
+    let table = &write.table;
+    let rows = conn
+        .query(&format!(
+            "SELECT c.oid::int8 AS oid FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = {} AND c.relname = {}",
+            literal(&table.schema),
+            literal(&table.name)
+        ))
+        .await?;
+    let Some(row) = rows.first() else {
+        // The lock above already succeeded, so the name resolved a moment ago;
+        // a write to a table that is gone fails on its own statement.
+        return Ok(Vec::new());
+    };
+    let named = row.try_get::<i64>("oid")?.ok_or_else(missing)?;
+    let mut queue = VecDeque::from([Statement {
+        relation: named,
+        event: event(&write.operation),
+        columns: match &write.operation {
+            RowOperation::Update { columns } => columns.iter().cloned().collect(),
+            RowOperation::Insert | RowOperation::Delete => BTreeSet::new(),
+        },
+        partitions_only: false,
+    }]);
+    let mut done = BTreeSet::new();
+    let mut locked = BTreeSet::from([named]);
+    let mut triggers = Vec::new();
+    while let Some(statement) = queue.pop_front() {
+        if !done.insert(statement.clone()) {
+            continue;
+        }
+        if locked.insert(statement.relation) {
+            lock_by_oid(conn, statement.relation).await?;
+        }
+        triggers.extend(
+            read_triggers(conn, &statement)
+                .await?
+                .into_iter()
+                .map(|mut trigger| {
+                    trigger.through_an_action = statement.relation != named;
+                    trigger
+                }),
+        );
+        // An INSERT fires no referential action: the row it adds is the one a
+        // foreign key checks, never one another row already refers to.
+        if statement.event != INSERT {
+            queue.extend(read_actions(conn, &statement).await?);
+        }
+    }
+    Ok(triggers)
+}
+
+/// Lock a relation the closure found, and prove the lock landed on it.
+///
+/// The name is read before the lock, so another session can still rename the
+/// relation away and give the name to one of its own in between. Re-resolving
+/// the name afterwards settles which relation the lock actually holds; once it
+/// is the intended one, ROW EXCLUSIVE keeps it that way (DECISIONS 445).
+async fn lock_by_oid(conn: &mut Conn, relation: i64) -> Result<(), DbError> {
+    let rows = conn
+        .query(&format!(
+            "SELECT n.nspname AS schema_name, c.relname AS table_name
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.oid = {relation}::pg_catalog.oid"
+        ))
+        .await?;
+    let row = rows.first().ok_or_else(|| moved(relation))?;
+    let schema = row.try_get::<&str>("schema_name")?.ok_or_else(missing)?;
+    let name = row.try_get::<&str>("table_name")?.ok_or_else(missing)?;
+    let (schema, name) = (schema.to_owned(), name.to_owned());
+    let table = TableName::new(&schema, &name);
+    // ROW EXCLUSIVE needs INSERT, UPDATE, DELETE or TRUNCATE on the table;
+    // measured on 18.6, SELECT alone is `permission denied`. The engine runs
+    // the action as the referencing table's owner and so needs none of them,
+    // which makes this the one plan the closure can refuse for a reason that
+    // is not a trigger at all: say which table and why (DECISIONS 451).
+    conn.execute(&format!(
+        "LOCK TABLE {}.{} IN ROW EXCLUSIVE MODE",
+        ident(&schema),
+        ident(&name)
+    ))
+    .await
+    .map_err(|e| {
+        if matches!(&e, DbError::Driver { code, .. } if code.as_deref() == Some(DENIED)) {
+            return DbError::Driver {
+                code: Some(DENIED.to_owned()),
+                message: format!(
+                    "the data-trigger guard cannot lock `{table}`, which this row operation writes through a foreign-key referential action ({e}). The deployment role needs INSERT, UPDATE, DELETE or TRUNCATE on it to hold its triggers still through the write."
+                ),
+            };
+        }
+        e
+    })?;
+    let rows = conn
+        .query(&format!(
+            "SELECT c.oid::int8 AS oid FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = {} AND c.relname = {}",
+            literal(&schema),
+            literal(&name)
+        ))
+        .await?;
+    let locked = match rows.first() {
+        Some(row) => row.try_get::<i64>("oid")?,
+        None => None,
+    };
+    if locked != Some(relation) {
+        return Err(moved(relation));
+    }
+    Ok(())
+}
+
+/// The relations one statement reaches, and the columns an UPDATE touches on
+/// each of them. Both queries below start from these.
+fn reached(statement: &Statement) -> String {
+    let columns = statement
+        .columns
+        .iter()
+        .map(|name| literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let descends = statement.event != INSERT && !statement.partitions_only;
+    // UPDATE OF follows the SET list, including generated columns that depend
+    // on it. A BEFORE ROW UPDATE trigger makes PostgreSQL include all generated
+    // columns, even if that trigger is disabled; measured on PostgreSQL 18.
+    format!(
+        "WITH RECURSIVE relations(oid) AS (
+             SELECT {relation}::pg_catalog.oid
+             UNION
+             SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+             JOIN relations r ON r.oid = i.inhparent
+             JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent
+             WHERE parent.relkind = 'p' OR {descends}
+         ),
+         touched(attrelid, attnum) AS (
+             SELECT a.attrelid, a.attnum
+             FROM relations r
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = r.oid
+             WHERE a.attname::text = ANY(ARRAY[{columns}]::text[])
+                OR (a.attgenerated <> '' AND (EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_trigger before_update
+                       WHERE before_update.tgrelid = a.attrelid
+                         AND (before_update.tgtype & 19) = 19
+                   ) OR EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_attrdef ad
+                       JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = ad.oid
+                       JOIN pg_catalog.pg_attribute source ON source.attrelid = d.refobjid AND source.attnum = d.refobjsubid
+                       WHERE ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+                         AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = a.attrelid
+                         AND source.attname::text = ANY(ARRAY[{columns}]::text[])
+                   )))
+         )",
+        relation = statement.relation,
+    )
+}
+
+async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Trigger>, DbError> {
+    // Statement-level triggers fire on the relation the statement names, not on
+    // each descendant it reaches; row-level ones fire wherever the row lands.
+    let rows = conn
+        .query(&format!(
+            "{ctes}
              SELECT t.oid::int8 AS oid, t.tgfoid::int8 AS function_oid,
                     n.nspname AS schema_name, c.relname AS table_name,
                     t.tgname AS name, pg_catalog.pg_get_triggerdef(t.oid) AS definition,
@@ -142,48 +328,120 @@ async fn read_locked(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, 
              JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE NOT t.tgisinternal AND (t.tgtype & {events}) <> 0
-               AND ({events} <> 16 OR t.tgattr = ''::pg_catalog.int2vector OR EXISTS (
-                   SELECT 1 FROM pg_catalog.pg_attribute a
-                   WHERE a.attrelid = t.tgrelid AND a.attnum = ANY(t.tgattr)
-                     AND (a.attname::text = ANY(ARRAY[{columns}]::text[]) OR
-                          (a.attgenerated <> '' AND (EXISTS (
-                              SELECT 1 FROM pg_catalog.pg_trigger before_update
-                              WHERE before_update.tgrelid = t.tgrelid AND (before_update.tgtype & 19) = 19
-                          ) OR EXISTS (
-                              SELECT 1 FROM pg_catalog.pg_attrdef ad
-                              JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.objid = ad.oid
-                              JOIN pg_catalog.pg_attribute source ON source.attrelid = d.refobjid AND source.attnum = d.refobjsubid
-                              WHERE ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-                                AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = a.attrelid
-                                AND source.attname::text = ANY(ARRAY[{columns}]::text[])
-                          ))))
+               AND ({events} <> {update} OR t.tgattr = ''::pg_catalog.int2vector OR EXISTS (
+                   SELECT 1 FROM touched
+                   WHERE touched.attrelid = t.tgrelid AND touched.attnum = ANY(t.tgattr)
                ))
-               AND ((n.nspname = {schema} AND c.relname = {name}) OR (t.tgtype & 1) <> 0)
+               AND (t.tgrelid = {relation}::pg_catalog.oid OR (t.tgtype & 1) <> 0)
                AND (t.tgenabled = 'A' OR t.tgenabled =
                     CASE WHEN pg_catalog.current_setting('session_replication_role') = 'replica'
                          THEN 'R' ELSE 'O' END)
              ORDER BY t.oid",
-            schema = literal(&table.schema), name = literal(&table.name)
-        )).await?;
-        rows.iter().map(|r| Ok(Trigger {
-            oid: r.try_get("oid")?.ok_or_else(missing)?,
-            table: TableName::new(r.try_get::<&str>("schema_name")?.ok_or_else(missing)?, r.try_get::<&str>("table_name")?.ok_or_else(missing)?),
-            function_oid: r.try_get("function_oid")?.ok_or_else(missing)?,
-            name: r.try_get::<&str>("name")?.ok_or_else(missing)?.to_owned(),
-            definition: r.try_get::<&str>("definition")?.ok_or_else(missing)?.to_owned(),
-            trusted_owner: r.try_get("trusted_owner")?.ok_or_else(missing)?,
-        })).collect()
-    }.await;
-    // On a query error the caller must roll back the transaction. On success,
-    // restore its path before returning; no setting leaks into emitted SQL.
-    if result.is_ok() {
-        conn.query(&format!(
-            "SELECT pg_catalog.set_config('search_path', {}, true)",
-            literal(&path)
+            ctes = reached(statement),
+            events = statement.event,
+            update = UPDATE,
+            relation = statement.relation,
         ))
         .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(Trigger {
+                oid: r.try_get("oid")?.ok_or_else(missing)?,
+                table: TableName::new(
+                    r.try_get::<&str>("schema_name")?.ok_or_else(missing)?,
+                    r.try_get::<&str>("table_name")?.ok_or_else(missing)?,
+                ),
+                function_oid: r.try_get("function_oid")?.ok_or_else(missing)?,
+                name: r.try_get::<&str>("name")?.ok_or_else(missing)?.to_owned(),
+                definition: r
+                    .try_get::<&str>("definition")?
+                    .ok_or_else(missing)?
+                    .to_owned(),
+                trusted_owner: r.try_get("trusted_owner")?.ok_or_else(missing)?,
+                through_an_action: false,
+            })
+        })
+        .collect()
+}
+
+/// The statements PostgreSQL runs itself for this one's referential actions.
+///
+/// CASCADE, SET NULL and SET DEFAULT each write the referencing side; NO ACTION
+/// and RESTRICT only refuse. Measured on PostgreSQL 18.6: an ON UPDATE action
+/// writes every column of the foreign key even when one referenced column
+/// changed, an ON DELETE SET NULL/DEFAULT with a column list writes that list
+/// (`confdelsetcols`, PostgreSQL 15 and later), and the statement names the
+/// root of the referencing side's partition tree, never a partition of it.
+async fn read_actions(conn: &mut Conn, statement: &Statement) -> Result<Vec<Statement>, DbError> {
+    let rows = conn
+        .query(&format!(
+            "{ctes},
+             edges(constraint_oid, referencing, cascades, written) AS (
+                 SELECT con.oid, con.conrelid,
+                        {events} = {delete} AND con.confdeltype = 'c',
+                        CASE WHEN {events} = {delete} AND con.confdelsetcols IS NOT NULL
+                                  AND con.confdelsetcols <> '{{}}'::pg_catalog.int2[]
+                             THEN con.confdelsetcols ELSE con.conkey END
+                 FROM pg_catalog.pg_constraint con
+                 JOIN relations r ON r.oid = con.confrelid
+                 WHERE con.contype = 'f'
+                   AND (CASE WHEN {events} = {delete} THEN con.confdeltype ELSE con.confupdtype END)
+                       IN ('c', 'n', 'd')
+                   AND ({events} <> {update} OR EXISTS (
+                       SELECT 1 FROM touched
+                       WHERE touched.attrelid = con.confrelid AND touched.attnum = ANY(con.confkey)
+                   ))
+             ),
+             up(constraint_oid, oid) AS (
+                 SELECT e.constraint_oid, e.referencing FROM edges e
+                 UNION
+                 SELECT u.constraint_oid, i.inhparent
+                 FROM up u
+                 JOIN pg_catalog.pg_inherits i ON i.inhrelid = u.oid
+                 JOIN pg_catalog.pg_class p ON p.oid = i.inhparent AND p.relkind = 'p'
+             )
+             SELECT DISTINCT e.constraint_oid::int8 AS constraint_oid, u.oid::int8 AS relation,
+                    (CASE WHEN e.cascades THEN {delete} ELSE {update} END)::int2 AS event,
+                    a.attname AS column_name
+             FROM up u
+             JOIN edges e ON e.constraint_oid = u.constraint_oid
+             LEFT JOIN pg_catalog.pg_attribute a
+                    ON NOT e.cascades AND a.attrelid = e.referencing AND a.attnum = ANY(e.written)
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_inherits i
+                 JOIN pg_catalog.pg_class p ON p.oid = i.inhparent AND p.relkind = 'p'
+                 WHERE i.inhrelid = u.oid
+             )
+             ORDER BY constraint_oid, relation, event",
+            ctes = reached(statement),
+            events = statement.event,
+            delete = DELETE,
+            update = UPDATE,
+        ))
+        .await?;
+    // One statement per constraint: merging two constraints' column sets would
+    // authenticate each against columns only the other one writes.
+    let mut derived: BTreeMap<(i64, i64, i16), BTreeSet<String>> = BTreeMap::new();
+    for row in &rows {
+        let key = (
+            row.try_get::<i64>("constraint_oid")?.ok_or_else(missing)?,
+            row.try_get::<i64>("relation")?.ok_or_else(missing)?,
+            row.try_get::<i16>("event")?.ok_or_else(missing)?,
+        );
+        let columns = derived.entry(key).or_default();
+        if let Some(column) = row.try_get::<&str>("column_name")? {
+            columns.insert(column.to_owned());
+        }
     }
-    result
+    Ok(derived
+        .into_iter()
+        .map(|((_, relation, event), columns)| Statement {
+            relation,
+            event,
+            columns,
+            partitions_only: true,
+        })
+        .collect())
 }
 
 fn ident(value: &str) -> String {
@@ -194,11 +452,29 @@ fn literal(value: &str) -> String {
     format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
-fn refused(table: &TableName, trigger: &str) -> DbError {
+fn refused(trigger: &Trigger, written: &TableName) -> DbError {
+    let table = &trigger.table;
+    let name = &trigger.name;
+    let reached = if trigger.through_an_action {
+        format!(
+            " `{table}` is written by a foreign-key referential action of the row operation on `{written}`, so its triggers run under the deployment role too."
+        )
+    } else {
+        String::new()
+    };
     DbError::Driver {
         code: None,
         message: format!(
-            "unsafe data trigger `{trigger}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role. Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
+            "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role.{reached} Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
+        ),
+    }
+}
+
+fn moved(relation: i64) -> DbError {
+    DbError::Driver {
+        code: None,
+        message: format!(
+            "a table reached through a foreign-key action (oid {relation}) was renamed or dropped while the data-trigger guard was locking it; nothing was written. Re-run the command."
         ),
     }
 }

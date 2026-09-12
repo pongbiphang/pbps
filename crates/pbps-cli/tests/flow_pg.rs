@@ -4189,3 +4189,672 @@ fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
         succeeds(d.run(&["verify", "--db", &deployment]));
     }
 }
+
+/// A row operation writes more tables than the one it names: PostgreSQL runs a
+/// referential action on the referencing side, and a trigger there runs under
+/// the deployment role just as one on the named table does (DECISIONS 451).
+///
+/// The delete cases carry a statement-level trigger and no referencing row on
+/// purpose. A row that still points at the declared row makes the existing
+/// delete preflight refuse the plan long before the guard, but the action's own
+/// statement runs whether or not it matches anything — measured on 18.6 — so a
+/// statement trigger on the referencing table is the delete's live reach.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn referential_actions_cannot_reach_an_unapproved_trigger() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for role in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {role}"));
+            }
+        }
+    }
+    let admin = server();
+    let deployer = format!("pbps_fk_deployer_{}", std::process::id());
+    let attacker = format!("pbps_fk_attacker_{}", std::process::id());
+    let _roles = Roles(admin.clone(), vec![deployer.clone(), attacker.clone()]);
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'trigger-test'; \
+         CREATE ROLE {attacker} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'trigger-test'"
+        ),
+    );
+    // `chain` puts the trigger two foreign keys away: the first action's own
+    // write is what produces the second, which only a recursive closure finds.
+    for (operation, action, level, staged, chain) in [
+        ("UPDATE", "CASCADE", "ROW", false, false),
+        ("UPDATE", "SET NULL", "ROW", false, false),
+        ("UPDATE", "SET DEFAULT", "ROW", false, false),
+        ("UPDATE", "CASCADE", "ROW", false, true),
+        ("DELETE", "CASCADE", "STATEMENT", false, false),
+        ("DELETE", "SET NULL", "STATEMENT", false, false),
+        ("UPDATE", "CASCADE", "STATEMENT", true, false),
+        ("DELETE", "CASCADE", "STATEMENT", true, true),
+    ] {
+        let slug = format!(
+            "fk_{}_{}_{level}_{staged}_{chain}",
+            operation.to_lowercase(),
+            action.to_lowercase().replace(' ', "_")
+        )
+        .to_lowercase();
+        let own = OwnDatabase::new(&admin, &slug);
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app AUTHORIZATION {deployer}; CREATE SCHEMA attacker AUTHORIZATION {attacker}; \
+             GRANT USAGE ON SCHEMA app TO {attacker}; GRANT USAGE ON SCHEMA attacker TO {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE public.secret(value text); INSERT INTO public.secret VALUES ('test-only-secret'); \
+             GRANT SELECT ON public.secret TO {deployer}; \
+             CREATE TABLE attacker.leaked(value text); ALTER TABLE attacker.leaked OWNER TO {attacker}; \
+             GRANT INSERT ON attacker.leaked TO {deployer}"
+            ),
+        );
+        let login = |role: &str| {
+            format!(
+                "{} user={role} password=trigger-test",
+                connection
+                    .split_whitespace()
+                    .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let deployment = login(&deployer);
+        let attack = login(&attacker);
+        assert!(try_on_server(&attack, "SELECT * FROM public.secret").is_err());
+        let d = Demo::new(&slug);
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!(
+                "dialect: postgres\nunmanaged: {}\n",
+                if staged { "warn" } else { "ignore" }
+            ),
+        )
+        .unwrap();
+        // The referenced key is a UNIQUE column and not the primary key: a
+        // declared row is identified by its key, so only another column of it
+        // can change under an UPDATE at all.
+        let declared = "table: app.t\ncolumns:\n  code: {type: text, nullable: false}\n  ukey: {type: text, nullable: false}\n  label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\nunique:\n  uq_t_ukey: [ukey]\ndata:\n  mode: exact\n  rows:\n    fallback: {ukey: fallback, label: Fallback}\n";
+        d.table(&format!(
+            "{declared}    first: {{ukey: k1, label: First}}\n"
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", &deployment]));
+        // Unmanaged and owned by the deployer, which is what makes an invoker
+        // trigger on it run with the deployer's privileges.
+        let (on_update, on_delete) = if operation == "UPDATE" {
+            (action, "NO ACTION")
+        } else {
+            ("NO ACTION", action)
+        };
+        // A delete case leaves the declared row unreferenced: see the note on
+        // this test. Every other row here belongs to the control below.
+        let held = if operation == "UPDATE" {
+            "k1"
+        } else {
+            "fallback"
+        };
+        on_server(
+            &deployment,
+            &format!(
+                "CREATE TABLE app.child(id integer PRIMARY KEY, ukey text DEFAULT 'fallback' UNIQUE, note text, \
+             CONSTRAINT fk_child FOREIGN KEY (ukey) REFERENCES app.t(ukey) ON UPDATE {on_update} ON DELETE {on_delete}); \
+             CREATE TABLE app.grandchild(id integer PRIMARY KEY, ukey text, \
+             CONSTRAINT fk_grandchild FOREIGN KEY (ukey) REFERENCES app.child(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
+             INSERT INTO app.child VALUES (1, '{held}', 'note'); \
+             INSERT INTO app.grandchild VALUES (1, '{held}')"
+            ),
+        );
+        let reached = if chain { "app.grandchild" } else { "app.child" };
+        let fires = if operation == "DELETE" && action == "CASCADE" {
+            "DELETE"
+        } else {
+            "UPDATE"
+        };
+        // The control: the same action, on rows of its own, with a trigger the
+        // deployer owns. It proves the engine really writes `reached` here, so
+        // a later "no leak" cannot pass because nothing fired at all.
+        on_server(
+            &deployment,
+            &format!(
+                "CREATE TABLE public.fired(value integer); \
+             CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NULL; END$$; \
+             CREATE TRIGGER control AFTER {fires} ON {reached} FOR EACH {level} EXECUTE FUNCTION public.mark(); \
+             INSERT INTO app.t VALUES ('control', 'c1', 'Control'); \
+             INSERT INTO app.child VALUES (99, 'c1', 'control'); \
+             INSERT INTO app.grandchild VALUES (99, 'c1')"
+            ),
+        );
+        on_server(
+            &deployment,
+            &if operation == "UPDATE" {
+                "UPDATE app.t SET ukey = 'c2' WHERE code = 'control'".to_owned()
+            } else {
+                "DELETE FROM app.t WHERE code = 'control'".to_owned()
+            },
+        );
+        assert!(
+            scalar(connection, "SELECT count(*) FROM public.fired") > 0,
+            "{slug}: the referential action never reached {reached}"
+        );
+        on_server(
+            &deployment,
+            &format!(
+                "DROP TRIGGER control ON {reached}; TRUNCATE public.fired; \
+             DELETE FROM app.grandchild WHERE id = 99; DELETE FROM app.child WHERE id = 99; \
+             DELETE FROM app.t WHERE code = 'control'"
+            ),
+        );
+        let after = if operation == "UPDATE" {
+            format!("{declared}    first: {{ukey: k2, label: First}}\n")
+        } else {
+            declared.to_owned()
+        };
+        d.table(&after);
+        let plan = connected_artifact(&d, &deployment, staged);
+        // Installed after approval by a role that cannot read the secret and
+        // owns neither the table it writes through nor the one it lands on.
+        on_server(
+            connection,
+            &format!("GRANT TRIGGER ON {reached} TO {attacker}"),
+        );
+        on_server(
+            &attack,
+            &format!(
+                "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
+             $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
+             IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$; \
+             CREATE TRIGGER steal BEFORE {fires} ON {reached} FOR EACH {level} EXECUTE FUNCTION attacker.steal()"
+            ),
+        );
+        let blocked = d.run(&["plan", "--db", &deployment]);
+        assert_eq!(
+            code(&blocked),
+            1,
+            "{}{}",
+            stdout(&blocked),
+            stderr(&blocked)
+        );
+        assert!(
+            stderr(&blocked).contains("unsafe data trigger") && stderr(&blocked).contains(reached),
+            "{slug}: {}",
+            stderr(&blocked)
+        );
+        let mut extra = Vec::new();
+        if staged {
+            extra.push("--staged");
+        }
+        extra.extend([
+            "--allow",
+            if operation == "UPDATE" {
+                "data-update"
+            } else {
+                "data-delete"
+            },
+        ]);
+        let refused = approved_apply(&d, &deployment, &plan, &extra);
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM attacker.leaked"),
+            0,
+            "{slug} leaked despite the approval boundary: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("unsafe data trigger") && stderr(&refused).contains(reached),
+            "{slug}: {}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            0,
+            "{slug}"
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM app.t WHERE code = 'first' AND ukey = 'k1'"
+            ),
+            1,
+            "{slug}: the refused write must leave the named table alone"
+        );
+        // The same plan with the trigger gone: the row operation and every
+        // action it produces are ordinary work the deployer is allowed to do.
+        on_server(&deployment, &format!("DROP TRIGGER steal ON {reached}"));
+        succeeds(approved_apply(&d, &deployment, &plan, &extra));
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM attacker.leaked"),
+            0,
+            "{slug}"
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM app.t WHERE code = 'first'"
+            ),
+            i64::from(operation == "UPDATE"),
+            "{slug}: the row operation itself went through"
+        );
+        if operation == "UPDATE" {
+            let landed = match action {
+                "CASCADE" => "SELECT count(*) FROM app.child WHERE ukey = 'k2'",
+                "SET NULL" => "SELECT count(*) FROM app.child WHERE ukey IS NULL",
+                _ => "SELECT count(*) FROM app.child WHERE ukey = 'fallback'",
+            };
+            assert_eq!(scalar(connection, landed), 1, "{slug}: the action ran");
+        }
+        succeeds(d.run(&["verify", "--db", &deployment]));
+    }
+}
+
+/// The closure is the set of tables a row operation makes PostgreSQL write, and
+/// no more: an action that writes nothing, an event the action does not raise
+/// and a column it does not set all leave their triggers alone. A guard that
+/// refused those would refuse valid plans, which is the other way to be wrong.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "fk_closure");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
+    );
+    let update = |columns: &[&str]| RowOperation::Update {
+        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    // Every case declares `{s}.p`, writes it, and puts one trigger somewhere a
+    // referential action may or may not reach. `p` always keeps the same shape
+    // so the write is the only thing that changes.
+    let head = "CREATE TABLE {s}.p(code text PRIMARY KEY, ukey text UNIQUE, other text UNIQUE, label text, \
+                UNIQUE (ukey, other)); ";
+    let cases: Vec<(&str, String, RowOperation, bool)> = vec![
+        (
+            "no_action",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE NO ACTION); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "restrict",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE RESTRICT); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "cascade",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "set_default",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE SET DEFAULT); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "delete_action_under_an_update",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE NO ACTION ON DELETE CASCADE); \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "update_action_under_a_delete",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE ON DELETE NO ACTION); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            RowOperation::Delete,
+            false,
+        ),
+        (
+            "insert_raises_no_action",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            RowOperation::Insert,
+            false,
+        ),
+        (
+            "untouched_referenced_column",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["label"]),
+            false,
+        ),
+        (
+            "another_key_of_the_same_table",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, other text REFERENCES {{s}}.p(other) ON UPDATE CASCADE); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "an_event_the_action_does_not_raise",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE); \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "a_child_column_the_action_does_not_set",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE, note text); \
+                    CREATE TRIGGER hook AFTER UPDATE OF note ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "the_child_column_the_action_sets",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE, note text); \
+                    CREATE TRIGGER hook AFTER UPDATE OF ukey ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "outside_an_on_delete_set_null_column_list",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text, other text, note text, \
+                    FOREIGN KEY (ukey, other) REFERENCES {{s}}.p(ukey, other) ON DELETE SET NULL (other)); \
+                    CREATE TRIGGER hook AFTER UPDATE OF ukey ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            RowOperation::Delete,
+            false,
+        ),
+        (
+            "inside_an_on_delete_set_null_column_list",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text, other text, note text, \
+                    FOREIGN KEY (ukey, other) REFERENCES {{s}}.p(ukey, other) ON DELETE SET NULL (other)); \
+                    CREATE TRIGGER hook AFTER UPDATE OF other ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            RowOperation::Delete,
+            true,
+        ),
+        (
+            "an_inheritance_descendant_of_the_child",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE); \
+                    CREATE TABLE {{s}}.sub () INHERITS ({{s}}.c); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.sub FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "a_partition_of_the_child",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY RANGE (id); \
+                    CREATE TABLE {{s}}.part PARTITION OF {{s}}.c FOR VALUES FROM (0) TO (10); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.part FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "a_statement_trigger_on_a_partition_of_the_child",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY RANGE (id); \
+                    CREATE TABLE {{s}}.part PARTITION OF {{s}}.c FOR VALUES FROM (0) TO (10); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.part FOR EACH STATEMENT EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "a_statement_trigger_on_the_child_itself",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY RANGE (id); \
+                    CREATE TABLE {{s}}.part PARTITION OF {{s}}.c FOR VALUES FROM (0) TO (10); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH STATEMENT EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "two_foreign_keys_away",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text UNIQUE REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE); \
+                    CREATE TABLE {{s}}.g(id int PRIMARY KEY, ukey text REFERENCES {{s}}.c(ukey) ON UPDATE CASCADE); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.g FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "a_cycle_the_walk_has_to_leave",
+            format!(
+                "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text UNIQUE REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE, \
+                    loop_ukey text REFERENCES {{s}}.c(ukey) ON UPDATE CASCADE); \
+                    CREATE TABLE {{s}}.elsewhere(id int PRIMARY KEY); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.elsewhere FOR EACH ROW EXECUTE FUNCTION public.hook()"
+            ),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "a_generated_referenced_column_of_a_set_column",
+            "CREATE TABLE {s}.p(code text PRIMARY KEY, label text, ukey text GENERATED ALWAYS AS (upper(label)) STORED UNIQUE); \
+                    CREATE TABLE {s}.c(id int PRIMARY KEY, ukey text REFERENCES {s}.p(ukey) ON UPDATE CASCADE); \
+                    CREATE TRIGGER hook AFTER UPDATE ON {s}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
+                .to_owned(),
+            update(&["label"]),
+            true,
+        ),
+    ];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let dialect = pbps_pg::Postgres::new();
+        for (label, ddl, operation, refused) in cases {
+            conn.execute(&format!("CREATE SCHEMA {label}"))
+                .await
+                .unwrap();
+            conn.execute(&ddl.replace("{s}", label))
+                .await
+                .unwrap_or_else(|e| panic!("{label} setup: {e}"));
+            let write = RowWrite {
+                table: pbps_model::TableName::new(label, "p"),
+                operation,
+            };
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let checked = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                &[write],
+                &Default::default(),
+                &Default::default(),
+            )
+            .await;
+            assert_eq!(
+                checked.is_err(),
+                refused,
+                "{label}: {:?}",
+                checked.err().map(|e| e.to_string())
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+        }
+    });
+}
+
+/// The lock the guard takes on a table it reaches through an action is the same
+/// guarantee it takes on the named one: authentication that a concurrent
+/// CREATE OR REPLACE TRIGGER could undo before the write is no guarantee.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_cascade_reached_table_is_held_until_the_write_finishes() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "fk_lock");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+        CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE); \
+        CREATE TABLE app.c(id integer PRIMARY KEY, ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE); \
+        CREATE FUNCTION app.trusted() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE TRIGGER guarded BEFORE UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION app.trusted(); \
+        INSERT INTO app.p VALUES ('first', 'k1'); INSERT INTO app.c VALUES (1, 'k1')",
+    );
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut writer = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection).await.unwrap();
+        let mut other = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection).await.unwrap();
+        let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
+        let dialect = pbps_pg::Postgres::new();
+        let write = RowWrite {
+            table: pbps_model::TableName::new("app", "p"),
+            operation: RowOperation::Update { columns: ["ukey".to_owned()].into() },
+        };
+        writer.begin(dialect.transaction_framing()).await.unwrap();
+        let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
+        other.execute("SET lock_timeout = '100ms'").await.unwrap();
+        // The named table is not the one under contention here: `app.c` is
+        // only ever written by the cascade the guard followed.
+        let replace = "CREATE OR REPLACE TRIGGER guarded BEFORE UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION app.replacement()";
+        let blocked = other.execute(replace).await.unwrap_err();
+        assert!(matches!(blocked, pbps_db::DbError::Driver { ref code, .. } if code.as_deref() == Some("55P03")), "{blocked}");
+        pbps_pg::data_triggers::check(&mut writer, &write, &guard).await.unwrap();
+        writer.execute("UPDATE app.p SET ukey = 'k2' WHERE code = 'first'").await.unwrap();
+        writer.commit(dialect.transaction_framing()).await.unwrap();
+        // After release the same replacement succeeds, proving the first
+        // failure came from the guard's lock, not invalid DDL or permissions.
+        let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
+        other.execute(replace).await.unwrap();
+        writer.begin(dialect.transaction_framing()).await.unwrap();
+        let refused = pbps_pg::data_triggers::prepare(&mut writer, &[write], &baseline, &Default::default()).await;
+        assert!(refused.is_err(), "a replaced trigger on the cascade's table must refuse the next write");
+        writer.rollback(dialect.transaction_framing()).await.unwrap();
+    });
+}
+
+/// The guard holds every table it authenticates, and a table it cannot hold is
+/// a refusal with a name in it rather than a bare `permission denied`.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    struct Roles(String, String);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let admin = server();
+    let own = OwnDatabase::new(&admin, "fk_lock_denied");
+    let connection = own.connection();
+    let deployer = format!("pbps_fk_locker_{}", std::process::id());
+    let _roles = Roles(admin.clone(), deployer.clone());
+    on_server(
+        &admin,
+        &format!("CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'"),
+    );
+    // The child belongs to someone else, and the deployment role may only read
+    // it. PostgreSQL runs the action as the child's owner and needs nothing
+    // from the deployer, so only the guard's own lock is missing.
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; GRANT CREATE ON SCHEMA public TO {deployer}; \
+            CREATE TABLE public.c(id integer PRIMARY KEY, ukey text); \
+            GRANT SELECT ON public.c TO {deployer}"
+        ),
+    );
+    let deployment = format!(
+        "{} user={deployer} password=trigger-test",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    on_server(
+        &deployment,
+        "CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE)",
+    );
+    on_server(
+        connection,
+        "ALTER TABLE public.c ADD FOREIGN KEY (ukey) REFERENCES app.p(ukey) ON UPDATE CASCADE",
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &deployment)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            let write = RowWrite {
+                table: pbps_model::TableName::new("app", "p"),
+                operation: RowOperation::Update {
+                    columns: ["ukey".to_owned()].into(),
+                },
+            };
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let refused = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                &[write],
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            assert!(
+                refused.contains("cannot lock") && refused.contains("public.c"),
+                "{refused}"
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+        });
+}
