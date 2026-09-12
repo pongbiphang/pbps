@@ -507,6 +507,7 @@ impl Dialect for Postgres {
     /// unspellable columns should need one pass, not three.
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
         let mut found = Vec::new();
+        found.extend(validate::table_structure(table));
         // The names first, and this is not a formality: `quote_ident` refuses
         // an identifier over [`MAX_IDENT_BYTES`], so a table this method called
         // clean is one the emitter cannot spell. `validate` is the command that
@@ -1644,6 +1645,270 @@ mod tests {
                 .validate_table(&"app.t".parse().unwrap(), &ok)
                 .is_empty()
         );
+    }
+
+    fn structural_table() -> Table {
+        let mut table = Table::default();
+        for name in ["a", "b"] {
+            table.columns.insert(
+                name.into(),
+                pbps_model::Column::new(ty("integer")).not_null(),
+            );
+        }
+        table
+            .columns
+            .insert("j".into(), pbps_model::Column::new(ty("JSON")));
+        table
+    }
+
+    fn structural_errors(table: &Table) -> Vec<String> {
+        Postgres::new()
+            .validate_table(&TableName::new("app", "t"), table)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn every_independent_key_structure_mistake_is_reported_in_one_pass() {
+        let mut table = structural_table();
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["missing".into()],
+        });
+        table.unique.insert(
+            "empty".into(),
+            pbps_model::UniqueConstraint { columns: vec![] },
+        );
+        table.unique.insert(
+            "repeated".into(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["a".into(), "a".into()],
+            },
+        );
+        table.indexes.insert(
+            "json_key".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    name: "j".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        let errors = structural_errors(&table);
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        for expected in [
+            "not a column",
+            "names no columns",
+            "twice",
+            "no default btree",
+        ] {
+            assert_eq!(
+                errors.iter().filter(|e| e.contains(expected)).count(),
+                1,
+                "{errors:?}"
+            );
+        }
+        assert!(structural_errors(&structural_table()).is_empty());
+    }
+
+    #[test]
+    fn primary_and_unique_keys_require_nonempty_existing_distinct_indexable_columns() {
+        for primary in [true, false] {
+            for (columns, expected) in [
+                (vec![], "names no columns"),
+                (vec!["missing"], "not a column"),
+                (vec!["a", "a"], "twice"),
+                (vec!["j"], "no default btree"),
+                (vec!["a", "b"], ""),
+            ] {
+                let mut table = structural_table();
+                // The nullable-PK rule is independently pinned; isolate type here.
+                table.columns.get_mut("j").unwrap().nullable = false;
+                let columns = columns.into_iter().map(String::from).collect();
+                if primary {
+                    table.primary_key = Some(pbps_model::PrimaryKey {
+                        name: None,
+                        columns,
+                    });
+                } else {
+                    table
+                        .unique
+                        .insert("uq".into(), pbps_model::UniqueConstraint { columns });
+                }
+                let errors = structural_errors(&table);
+                if expected.is_empty() {
+                    assert!(errors.is_empty(), "{errors:?}");
+                } else {
+                    assert_eq!(errors.len(), 1, "{errors:?}");
+                    assert!(errors[0].contains(expected), "{errors:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_keys_require_local_columns_and_matching_nonempty_lists_but_allow_repetition() {
+        for (local, remote, expected) in [
+            (vec![], vec![], "names no columns"),
+            (vec!["a"], vec![], "referenced table"),
+            (vec!["missing"], vec!["a"], "not a column"),
+            (vec!["j"], vec!["a"], "no default btree"),
+            (vec!["a", "b"], vec!["a"], "must line up"),
+            (vec!["a", "a"], vec!["a", "b"], ""),
+        ] {
+            let mut table = structural_table();
+            table.foreign_keys.insert(
+                "fk".into(),
+                pbps_model::ForeignKey {
+                    columns: local.into_iter().map(String::from).collect(),
+                    references_table: TableName::new("app", "parent"),
+                    references_columns: remote.into_iter().map(String::from).collect(),
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            let errors = structural_errors(&table);
+            if expected.is_empty() {
+                assert!(errors.is_empty(), "{errors:?}");
+            } else {
+                assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn indexes_require_local_keys_and_includes_but_accept_repetition_and_json_payloads() {
+        for (keys, include, expected) in [
+            (vec![], vec![], "names no columns"),
+            (vec!["missing"], vec![], "not a column"),
+            (vec!["j"], vec![], "no default btree"),
+            (vec!["a"], vec!["missing"], "includes `missing`"),
+            (vec!["a", "a"], vec!["a", "b", "b", "j"], ""),
+        ] {
+            let mut table = structural_table();
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: keys
+                        .into_iter()
+                        .map(|name| pbps_model::IndexColumn {
+                            name: name.into(),
+                            descending: false,
+                        })
+                        .collect(),
+                    include: include.into_iter().map(String::from).collect(),
+                    unique: false,
+                    filter: None,
+                },
+            );
+            let errors = structural_errors(&table);
+            if expected.is_empty() {
+                assert!(errors.is_empty(), "{errors:?}");
+            } else {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert!(errors[0].contains(expected), "{errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_index_limit_counts_key_and_include_columns_together() {
+        for count in [32, 33] {
+            for kind in ["primary", "unique", "index", "include"] {
+                let mut table = structural_table();
+                let columns: Vec<_> = (0..count).map(|i| format!("c{i}")).collect();
+                for column in &columns {
+                    table.columns.insert(
+                        column.clone(),
+                        pbps_model::Column::new(ty("integer")).not_null(),
+                    );
+                }
+                match kind {
+                    "primary" => {
+                        table.primary_key = Some(pbps_model::PrimaryKey {
+                            name: None,
+                            columns,
+                        })
+                    }
+                    "unique" => {
+                        table
+                            .unique
+                            .insert("uq".into(), pbps_model::UniqueConstraint { columns });
+                    }
+                    _ => {
+                        let (keys, include) = if kind == "include" {
+                            (columns[..1].to_vec(), columns[1..].to_vec())
+                        } else {
+                            (columns, vec![])
+                        };
+                        table.indexes.insert(
+                            "ix".into(),
+                            pbps_model::Index {
+                                columns: keys
+                                    .into_iter()
+                                    .map(|name| pbps_model::IndexColumn {
+                                        name,
+                                        descending: false,
+                                    })
+                                    .collect(),
+                                include,
+                                unique: false,
+                                filter: None,
+                            },
+                        );
+                    }
+                }
+                let errors = structural_errors(&table);
+                assert_eq!(
+                    errors.len(),
+                    usize::from(count > 32),
+                    "{kind} {count}: {errors:?}"
+                );
+                if count > 32 {
+                    assert!(errors[0].contains("at most 32"), "{errors:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_checks_and_filters_are_reported_together_with_other_structural_errors() {
+        let mut table = structural_table();
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["missing".into()],
+        });
+        table.checks.insert(
+            "ck".into(),
+            pbps_model::CheckConstraint {
+                expression: " \n ".into(),
+            },
+        );
+        table.indexes.insert(
+            "ix".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    name: "a".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: Some(" \t".into()),
+            },
+        );
+        let errors = structural_errors(&table);
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        for expected in ["not a column", "empty expression", "empty filter"] {
+            assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+        }
+        table.primary_key = None;
+        table.checks.get_mut("ck").unwrap().expression = "a > 0".into();
+        table.indexes.get_mut("ix").unwrap().filter = Some("b IS NOT NULL".into());
+        assert!(structural_errors(&table).is_empty());
     }
 
     /// The names a table owns are not only its own and its columns'. Each of
