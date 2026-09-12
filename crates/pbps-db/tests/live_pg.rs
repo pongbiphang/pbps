@@ -73,27 +73,37 @@ async fn a_server_refusal_carries_the_servers_own_sentence() {
 /// contains it. The fixture uses a **named, non-temporary** schema rather
 /// than the session's temporary one so there is a schema name worth pinning
 /// at all: `pg_temp_NNN`'s number is assigned per backend.
+///
+/// The schema name carries `std::process::id()`, the convention every
+/// non-temporary fixture in `crates/pbps-pg/tests/live.rs` already follows
+/// (`pbps_serial_{}`, `pbps_types_{}`, and so on): two runs of this suite
+/// against the same reused database would otherwise collide on a fixed name,
+/// one dropping the schema out from under the other's still-running
+/// assertions. `DROP SCHEMA … CASCADE` up front is safe once the name is
+/// unique to this process, and it is what lets a crashed prior run of *this*
+/// process leave nothing behind.
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not() {
     let mut conn = connect().await;
-    conn.execute("DROP SCHEMA IF EXISTS issue167_enrichment CASCADE")
+    let schema = format!("issue167_enrichment_{}", std::process::id());
+    conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .await
         .expect("clean up any previous run's schema");
-    conn.execute("CREATE SCHEMA issue167_enrichment")
+    conn.execute(&format!("CREATE SCHEMA {schema}"))
         .await
         .expect("create the fixture schema");
-    conn.execute("CREATE TABLE issue167_enrichment.nn (required int NOT NULL)")
+    conn.execute(&format!("CREATE TABLE {schema}.nn (required int NOT NULL)"))
         .await
         .expect("create the fixture table");
     let error = match conn
-        .execute("INSERT INTO issue167_enrichment.nn DEFAULT VALUES")
+        .execute(&format!("INSERT INTO {schema}.nn DEFAULT VALUES"))
         .await
     {
         Ok(()) => panic!("a NOT NULL column left to its default of NULL must fail"),
         Err(e) => e,
     };
-    conn.execute("DROP SCHEMA issue167_enrichment CASCADE")
+    conn.execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .expect("drop the fixture schema");
 
@@ -107,7 +117,7 @@ async fn a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not
         .next()
         .expect("splitting on a literal always yields at least one piece");
     assert!(
-        !primary_sentence.contains("issue167_enrichment"),
+        !primary_sentence.contains(&schema),
         "the fixture is broken: the schema must not already be in the message \
          or the detail, or the identifier assertion below would pass without \
          the identifiers block ever running: {message}"
@@ -117,7 +127,7 @@ async fn a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not
         "expected the detail folded in under its own label, got: {message}"
     );
     assert!(
-        message.contains("OBJECT: schema \"issue167_enrichment\""),
+        message.contains(&format!("OBJECT: schema \"{schema}\"")),
         "expected the schema identifier folded in under its own label, got: {message}"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("23502"));
@@ -155,24 +165,32 @@ async fn a_misspelled_column_carries_the_servers_own_hint() {
 /// error raised inside a PL/pgSQL function. **Measured** on 18.6, this shape
 /// carries `where_()` and none of `detail()`, `hint()`, or an object
 /// identifier, isolating it the same way the hint case isolates `hint()`.
+///
+/// The function name carries `std::process::id()` for the reason
+/// [`a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not`]'s
+/// schema does: `CREATE OR REPLACE FUNCTION` is not temporary — there is no
+/// `pg_temp` equivalent for functions this fixture uses — so a fixed name
+/// would let two runs against the same database race `CREATE OR REPLACE`
+/// against `DROP FUNCTION`.
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn an_exception_inside_a_function_carries_its_call_stack_as_context() {
     let mut conn = connect().await;
-    conn.execute(
-        "CREATE OR REPLACE FUNCTION issue167_ctx() RETURNS void LANGUAGE plpgsql AS $$
+    let function = format!("issue167_ctx_{}", std::process::id());
+    conn.execute(&format!(
+        "CREATE OR REPLACE FUNCTION {function}() RETURNS void LANGUAGE plpgsql AS $$
          BEGIN
            RAISE EXCEPTION 'boom from function';
          END;
-         $$",
-    )
+         $$"
+    ))
     .await
     .expect("create the fixture function");
-    let error = match conn.query("SELECT issue167_ctx()").await {
+    let error = match conn.query(&format!("SELECT {function}()")).await {
         Ok(_) => panic!("a function that raises must fail"),
         Err(e) => e,
     };
-    conn.execute("DROP FUNCTION issue167_ctx()")
+    conn.execute(&format!("DROP FUNCTION {function}()"))
         .await
         .expect("drop the fixture function");
     let message = error.to_string();
@@ -181,7 +199,9 @@ async fn an_exception_inside_a_function_carries_its_call_stack_as_context() {
         "expected the server's own sentence, got: {message}"
     );
     assert!(
-        message.contains("CONTEXT: PL/pgSQL function issue167_ctx() line 3 at RAISE"),
+        message.contains(&format!(
+            "CONTEXT: PL/pgSQL function {function}() line 3 at RAISE"
+        )),
         "expected the call stack folded in under its own label, got: {message}"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("P0001"));
