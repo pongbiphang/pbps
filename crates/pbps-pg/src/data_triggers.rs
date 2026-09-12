@@ -113,6 +113,9 @@ async fn read_locked(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, 
         .to_owned();
     conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
         .await?;
+    // INHERIT can confer function ownership rights without a SET ROLE path.
+    // Check every effective owner, including the direct owner, because replacing
+    // a function preserves its OID and does not conflict with the table lock.
     let result: Result<Vec<Trigger>, DbError> = async {
         let rows = conn.query(&format!(
             "WITH RECURSIVE relations(oid) AS (
@@ -128,7 +131,11 @@ async fn read_locked(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, 
              SELECT t.oid::int8 AS oid, t.tgfoid::int8 AS function_oid,
                     n.nspname AS schema_name, c.relname AS table_name,
                     t.tgname AS name, pg_catalog.pg_get_triggerdef(t.oid) AS definition,
-                    pg_catalog.pg_has_role(p.proowner, current_user::regrole::oid, 'SET') AS trusted_owner
+                    NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_roles editor
+                        WHERE pg_catalog.pg_has_role(editor.oid, p.proowner, 'USAGE')
+                          AND NOT pg_catalog.pg_has_role(editor.oid, current_user::regrole::oid, 'SET')
+                    ) AS trusted_owner
              FROM pg_catalog.pg_trigger t
              JOIN relations r ON r.oid = t.tgrelid
              JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
@@ -191,7 +198,7 @@ fn refused(table: &TableName, trigger: &str) -> DbError {
     DbError::Driver {
         code: None,
         message: format!(
-            "unsafe data trigger `{trigger}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function owner can act as the deployment role. Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
+            "unsafe data trigger `{trigger}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role. Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
         ),
     }
 }

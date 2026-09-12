@@ -10330,3 +10330,16 @@ SPEC is in sync with all of these.
     `AlterColumnType` conversion probe as the one that counts what this one
     does not. A probe with nothing to exclude carries no such clause: the
     count still means exactly what it always did.
+
+450. **Trigger-function trust includes inherited ownership rights.** The direct
+     owner check in 445 misses PostgreSQL memberships with INHERIT TRUE and
+     SET FALSE: a member can replace the function without being able to act as
+     the deployer. Function replacement preserves its OID and does not conflict
+     with the guarded table's ROW EXCLUSIVE lock. Authenticate every role for
+     which `pg_has_role(role, function_owner, 'USAGE')` is true, including the
+     direct owner and transitive inheritors; each must have a SET path to the
+     deploying role. Both planning and the immediate pre-write check use this
+     predicate. Disabled inheritance confers no effective ownership rights;
+     inheritors that can already act as the deployer remain trusted. This
+     narrows the execution policy without granting any additional privileges
+     or extending the guard to transitive routine calls and indirect writes.
