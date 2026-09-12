@@ -5119,6 +5119,66 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 );
                 conn.rollback(dialect.transaction_framing()).await.unwrap();
             }
+            // The same two with a partitioned referencing side. The copy
+            // PostgreSQL catalogues on each partition owns no action trigger:
+            // measured on 18.6, the referenced side carries one pair for the
+            // *declared* constraint and nothing for the copies. Enablement
+            // asked of the copy therefore finds no trigger at all and reads a
+            // disabled action as a firing one, which drags a partition nothing
+            // writes into the closure and refuses a valid plan.
+            conn.execute(
+                "DROP TABLE app.c; \
+                 CREATE TABLE app.parted(id integer, ukey text) PARTITION BY RANGE (id); \
+                 CREATE TABLE app.parted1 PARTITION OF app.parted FOR VALUES FROM (0) TO (10); \
+                 ALTER TABLE app.parted ADD CONSTRAINT fk_parted FOREIGN KEY (ukey) \
+                     REFERENCES app.p(ukey) ON UPDATE CASCADE; \
+                 CREATE TRIGGER hook AFTER UPDATE ON app.parted1 \
+                     FOR EACH ROW EXECUTE FUNCTION public.hook()",
+            )
+            .await
+            .unwrap();
+            for (label, sql, reset) in [
+                (
+                    "partitioned, the declared action's trigger is disabled",
+                    "ALTER TABLE app.p DISABLE TRIGGER ALL",
+                    "ALTER TABLE app.p ENABLE TRIGGER ALL",
+                ),
+                (
+                    "partitioned, the session is a replica",
+                    "SET session_replication_role = 'replica'",
+                    "RESET session_replication_role",
+                ),
+            ] {
+                conn.execute(sql).await.unwrap();
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    &Default::default(),
+                    &Dropped::default(),
+                )
+                .await;
+                assert!(
+                    checked.is_ok(),
+                    "{label}: {:?}",
+                    checked.err().map(|e| e.to_string())
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.execute(reset).await.unwrap();
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    &Default::default(),
+                    &Dropped::default(),
+                )
+                .await;
+                assert!(
+                    checked.is_err(),
+                    "{label}: restored, the action fires again"
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+            }
         });
 }
 

@@ -604,10 +604,24 @@ async fn read_actions(
                    -- origin trigger under `session_replication_role = replica`
                    -- cascades at all. The same test `preflight`'s
                    -- DELETE_ACTION_FIRES makes, by the event this write raises.
+                   --
+                   -- Asked of the constraint that *owns* the trigger, which is
+                   -- not always the row the walk matched. Measured on 18.6: a
+                   -- partitioned referencing side catalogues a copy per
+                   -- partition and the referenced side carries one pair of
+                   -- action triggers for the declared constraint alone, so
+                   -- `tgconstraint = con.oid` finds nothing for a copy and
+                   -- reads a disabled action as a firing one. A partitioned
+                   -- *referenced* side is the other way: each level owns its
+                   -- own pair, on its own relation. `tgrelid` separates those
+                   -- two, and the ancestry chain covers both -- and
+                   -- `preflight` needs neither, because every probe there
+                   -- filters `con.conparentid = 0`.
                    AND NOT EXISTS (
                        SELECT 1 FROM pg_catalog.pg_trigger action
-                       WHERE action.tgconstraint = con.oid
-                         AND action.tgrelid = con.confrelid
+                       JOIN ancestry owner
+                         ON owner.copy = con.oid AND owner.above = action.tgconstraint
+                       WHERE action.tgrelid = con.confrelid
                          AND (action.tgtype & {events}) <> 0
                          AND NOT (action.tgenabled = 'A'
                              OR (action.tgenabled = 'O' AND pg_catalog.current_setting('session_replication_role') <> 'replica')

@@ -10484,7 +10484,17 @@ SPEC is in sync with all of these.
      trigger nor an origin trigger under `session_replication_role = replica`
      cascades at all, and the child row is left untouched. The closure applies
      the same enabled test `preflight::DELETE_ACTION_FIRES` makes, by the event
-     this write raises rather than by the delete event alone.
+     this write raises rather than by the delete event alone — but asks it of
+     the constraint that *owns* the trigger, which the probe one crate over
+     never has to: every probe there filters `con.conparentid = 0` and so only
+     ever holds a declared row. Measured on 18.6, a partitioned referencing
+     side puts one pair of action triggers on the referenced table for the
+     declared constraint and none at all for the copies, so asking a copy for
+     its own trigger finds nothing and reads a disabled action as a firing one;
+     a partitioned *referenced* side is the other way about, each level owning
+     its pair on its own relation. The test is therefore the constraint's
+     ancestry chain narrowed by the relation the trigger is on, which is right
+     in both shapes and in the one where both sides are partitioned.
 
      A partitioned side is catalogued as the declared foreign key plus a copy
      per partition, and a copy can carry another name (`qc_a_id_fkey_1`,
@@ -10518,7 +10528,9 @@ SPEC is in sync with all of these.
      writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
      cascade-reached table blocked until the write commits; the cannot-lock
      refusal naming its table; and the removals and the two not-firing actions,
-     each paired with the state in which the same closure does follow it; the
+     each paired with the state in which the same closure does follow it, and
+     each again with the referencing side partitioned, where the action trigger
+     belongs to the declared constraint and not to the copy the walk matched; the
      partitions a row movement leaves and lands in, against the partition key
      the write does not touch and the statement-level trigger no movement
      fires, on an action's target and on the named table alike; a foreign key
