@@ -4306,6 +4306,32 @@ struct TestDb {
 
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
+async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() {
+    let mut db = TestDb::create("migration_trigger455").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    db.conn
+        .execute("ALTER TABLE public.__pbps_state DROP COLUMN state_version;")
+        .await
+        .unwrap();
+    db.conn.execute("CREATE FUNCTION deny_migration() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'migration denied by event trigger' USING ERRCODE = '42501'; END $$; CREATE EVENT TRIGGER deny_migration ON ddl_command_start WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION deny_migration();").await.unwrap();
+    let error = state::ensure_tables(&mut db.conn).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("timeline-column migration failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("this role could not add them: db error"),
+        "{message}"
+    );
+    assert!(!message.contains("needs ownership"), "{message}");
+    assert!(!message.contains("right it reports"), "{message}");
+    assert_eq!(error.server_error_code().as_deref(), Some("42501"));
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
 async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {
     let mut db = TestDb::create("migration_disconnect445").await;
     state::ensure_tables(&mut db.conn).await.unwrap();

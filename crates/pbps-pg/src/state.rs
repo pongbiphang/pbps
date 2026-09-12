@@ -655,16 +655,37 @@ async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
         }
         Err(e) => {
             guard.rewind_quietly(conn).await;
-            Err(migration_error(e))
+            let ownership_missing =
+                if e.server_error_code().as_deref() == Some(INSUFFICIENT_PRIVILEGE) {
+                    migration_ownership_missing(conn).await == Some(true)
+                } else {
+                    false
+                };
+            Err(migration_error(e, ownership_missing))
         }
     }
 }
 
-fn migration_error(e: DbError) -> DbError {
+async fn migration_ownership_missing(conn: &mut Conn) -> Option<bool> {
+    // 42501 also comes from event triggers. Only prescribe ownership when
+    // the catalog establishes its absence; a failed diagnostic must retain
+    // the original migration error and leave the caller's transaction usable.
+    let guard = Recoverable::take(conn).await.ok()?;
+    let result = conn
+        .query(
+            "SELECT NOT pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE') AS missing
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public' AND c.relname = '__pbps_state'",
+        )
+        .await;
+    guard.rewind_quietly(conn).await;
+    result.ok()?.first()?.try_get::<bool>("missing").ok()?
+}
+
+fn migration_error(e: DbError, ownership_missing: bool) -> DbError {
     let code = e.server_error_code();
-    // Ownership refusals carry 42501 (DECISIONS 435); connection failures
-    // cannot establish that the role lacks a migration right.
-    let guidance = if code.as_deref() == Some(INSUFFICIENT_PRIVILEGE) {
+    let guidance = if code.as_deref() == Some(INSUFFICIENT_PRIVILEGE) && ownership_missing {
         "This is a one-time migration that needs ownership of \
          public.__pbps_state — PostgreSQL authorizes ALTER TABLE by ownership, \
          not by a grantable privilege. Run `pbps doctor` and obtain the \
@@ -1302,21 +1323,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_permission_migration_failures_recommend_obtaining_rights() {
-        for code in [Some("42501"), Some("40P01"), None] {
-            let original = "original driver failure";
-            let error = migration_error(DbError::Driver {
-                message: original.into(),
-                code: code.map(str::to_owned),
-            });
-            assert_eq!(error.server_error_code().as_deref(), code);
-            let message = error.to_string();
-            assert!(message.contains(original));
-            assert_eq!(message.contains("right it reports"), code == Some("42501"));
-            assert_eq!(
-                message.contains("Investigate the original"),
-                code != Some("42501")
-            );
+    fn only_verified_missing_ownership_recommends_obtaining_rights() {
+        for ownership_missing in [false, true] {
+            for code in [Some("42501"), Some("40P01"), None] {
+                let original = "original driver failure";
+                let error = migration_error(
+                    DbError::Driver {
+                        message: original.into(),
+                        code: code.map(str::to_owned),
+                    },
+                    ownership_missing,
+                );
+                assert_eq!(error.server_error_code().as_deref(), code);
+                let message = error.to_string();
+                assert!(message.contains(original));
+                assert_eq!(
+                    message.contains("right it reports"),
+                    code == Some("42501") && ownership_missing
+                );
+                assert_eq!(
+                    message.contains("Investigate the original"),
+                    code != Some("42501") || !ownership_missing
+                );
+            }
         }
     }
 
