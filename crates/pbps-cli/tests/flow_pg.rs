@@ -585,6 +585,17 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
 /// read would pass whether or not the rebuild restored anything (DECISIONS
 /// 375, the live suite's own correction of exactly that mistake). Only a
 /// query that can fail on a missing grant is evidence the grant came back.
+///
+/// The refusal itself reads the plan: `read_acl` calls a grant restorable only
+/// when the plan's own `ChangeSet` carries a matching `Grant`, so a plan that
+/// does not restate this grant is exactly the plan that still refuses to
+/// rebuild — there is no reachable path where the apply proceeds and the
+/// grant is silently lost. That coupling is why reverting the differ's
+/// restatement fails this test at the `plan --db` step, not at the final
+/// read below — the refusal proves the plan *contains* the `Grant`; only the
+/// role's own read after the apply proves the emitted statement lands on the
+/// rebuilt object, with the declared permission, *after* the `CREATE` rather
+/// than before it. Two different facts, and this test is both of them.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it() {
