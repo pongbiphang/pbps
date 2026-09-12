@@ -1546,6 +1546,13 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_module_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a third whole-schema question, on the same engines-differ shape: an
+    // index (or the index behind a named primary key or unique constraint)
+    // shares a schema's relation namespace with tables and views on
+    // PostgreSQL, but only a table's own namespace on SQL Server (issue #176).
+    for problem in pbps_dialect::check_index_names(schema, dialect) {
+        out.push(("schema.name-collision", problem));
+    }
     // Roles (ADR-0005): a grant on an object nobody declares is the
     // foreign-key-target rule applied to permissions.
     for problem in pbps_model::role::check(schema) {

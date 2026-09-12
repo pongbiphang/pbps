@@ -10576,3 +10576,29 @@ SPEC is in sync with all of these.
      so the refusal can only be the table its cascade reaches. They
      pass on 16.15 as well as 18.6: the one catalogue column the closure needs
      that is not ancient, `confdelsetcols`, arrived in 15.
+
+452. **An index — and the index behind a named primary key or unique
+    constraint — is a third case of 201's rule, not a new one.** `check_names`
+    already moved namespace-sharing questions to the dialect because both
+    halves are engine-specific; an index is the same shape a third time.
+    Measured on PostgreSQL 18.6 (issue #176): `CREATE INDEX ix_n` on two
+    tables in one schema, an index named after a table, a named unique
+    constraint sharing a name with an index, and a unique constraint named
+    after a table are all refused with `relation "..." already exists` — an
+    index lives in `pg_class` beside tables and views, and a named primary key
+    or unique constraint is backed by an index of that name. On SQL Server an
+    index name only has to be unique per table, so the same declarations are
+    valid there, which is why `Dialect::indexes_share_namespace_with_tables`
+    defaults to `false` and only PostgreSQL overrides it. A check or
+    foreign-key constraint has no backing index and stays out of the
+    question — measured beside the collisions above, `ALTER TABLE ... ADD
+    CONSTRAINT t2 CHECK (n > 0)` is accepted where the table is named `t2` —
+    those are per-table and are issue #179's subject.
+
+    `pbps_dialect::check_index_names` seeds the namespace with every table and
+    every module kind `shares_namespace_with_tables` already says belongs
+    there (a view, on PostgreSQL), then folds in each table's declared index,
+    primary-key and unique-constraint names, checking each against everything
+    already claimed. It is called from `declaration_problems` beside
+    `check_module_names`, so `validate`, `init`, `plan --db` and `bootstrap`
+    all ask it (141).

@@ -765,6 +765,19 @@ impl Dialect for Postgres {
         }
     }
 
+    /// An index lives in `pg_class` beside tables and views, not in a
+    /// per-table namespace.
+    ///
+    /// **Measured on 18.6** (issue #176): two tables in one schema each
+    /// declaring `CREATE INDEX ix_n`, an index named after a table, a unique
+    /// constraint sharing a name with an index, and a unique constraint named
+    /// after a table are all refused with `relation "..." already exists` —
+    /// the constraint cases because a named primary key or unique constraint
+    /// is backed by an index of that name.
+    fn indexes_share_namespace_with_tables(&self) -> bool {
+        true
+    }
+
     /// The write path: the object's own schema first, then the configured
     /// extras in order, which is the `search_path` every statement of this
     /// dialect runs under (DECISIONS 276). A bare name resolves through it
