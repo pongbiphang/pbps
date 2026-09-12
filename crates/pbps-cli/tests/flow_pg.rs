@@ -3687,7 +3687,7 @@ impl Drop for ClusterRoles {
     }
 }
 
-/// The membership topology DECISIONS 447 is about: `owner` owns the trigger
+/// The membership topology DECISIONS 450 is about: `owner` owns the trigger
 /// function and can act as the deployer, and `inheritor` and `distant` are the
 /// roles each case hands the owner's rights to. Fields drop in declaration
 /// order, so the database goes before the roles that own objects inside it.
@@ -3813,7 +3813,7 @@ fn recorded_audit_trigger(topology: &Topology, event: &str) -> pbps_model::Schem
     recorded
 }
 
-/// DECISIONS 447. A role that inherits the function owner's rights can replace
+/// DECISIONS 450. A role that inherits the function owner's rights can replace
 /// the body — the OID and the recorded trigger definition do not move — so the
 /// direct owner's `SET` path is not the question the guard has to answer.
 ///
@@ -3991,7 +3991,7 @@ fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
         });
 }
 
-/// The path a user types, on the topology of DECISIONS 447. The trigger is
+/// The path a user types, on the topology of DECISIONS 450. The trigger is
 /// installed and adopted while nothing can replace its function, so the
 /// recording check and the direct owner's `SET` path both pass; only then does a
 /// role that inherits the owner's rights take the body over. Every row DML kind
