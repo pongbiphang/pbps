@@ -10735,3 +10735,115 @@ SPEC is in sync with all of these.
      and `pbps-db` had no live suite of its own to reach them, so
      `scripts/live-tests-pg.sh` and `scripts/live-tests.sh` each gained one
      line invoking it.
+
+454. **What the operator's own terminal sees and what `pbps` writes down are
+     deliberately different, from PR #464's apply failure path onward.**
+     DECISIONS 453 redacts `detail()`, `hint()` and `where_()` at the seam
+     because those three are optional enrichment this crate can drop without
+     losing anything issue #167 asked for. `message()` cannot be dropped the
+     same way — it is the sentence #167 exists to surface — and ready-phase
+     review of PR #464 measured that `message()` is not always safe either: a
+     failed type conversion names the value it could not convert
+     (`invalid input syntax for type integer: "…"` on 18.6,
+     `Conversion failed when converting the varchar value '…' to data type
+     int.` on SQL Server 2025 — **measured on both engines**, since
+     `crates/pbps-db/src/mssql.rs`'s `From<tiberius::error::Error>` builds the
+     same `DbError::Driver` the PostgreSQL side does), and
+     `crates/pbps-pg/src/emit.rs`'s own comment on `Held::as_stored` already
+     said a retyped column's read-back re-parses a reference-data row's
+     recorded text through its old type before its new one, and "the engine's
+     conversion error names the value" when that parse fails.
+
+     A first reflex here would be to redact `message()` at the seam too,
+     matching 453's answer for the other three fields. That would silence
+     issue #167's own deliverable: an operator running `apply` against a
+     database they already hold credentials for would be back to a message
+     with nothing in it, for every failure, not only the rare one that names a
+     value. The fix instead is **where** the message goes, not what it says:
+     `crates/pbps-cli/src/main.rs`'s stderr print (`{e:#}`) is unaffected — an
+     operator already holding credentials to the target sees everything, the
+     server's sentence included, which is what issue #167 asked for and
+     nothing this decision takes back. What changes is the two places a
+     failure's text is written **durably or outward** rather than shown once
+     to whoever is already looking: `failed_apply_snapshot` and
+     `record_failed_bootstrap` in `crates/pbps-cli/src/deploy.rs`, which write
+     into the ledger's `reason` column — SPEC's own audit trail, read later by
+     people who were not necessarily the one running that `apply` — and the
+     `on_apply_attempt` hook, whose own doc comment calls its payload "stable
+     input" a `pbps.yml` author wires to an arbitrary shell command, which can
+     relay it anywhere.
+
+     `crates/pbps-cli/src/engine.rs::ledger_safe_reason` is the one function
+     both sinks now go through, in place of `error.to_string()`. It walks the
+     failing `anyhow::Error`'s `.chain()` and rewrites only a `DbError::Driver`
+     frame — the one shape a driver's own server-supplied sentence can reach
+     this chain through — to its SQLSTATE and a fixed marker; every other
+     frame, `DbError` or not, is this tool's own composed text (a malformed
+     connection string, an unreachable host, a catalog row the introspection
+     SQL got wrong, or a `.context()` sentence naming the statement that
+     failed) and passes through unchanged. Object identifiers stay redacted
+     the way 453 already decided; SQLSTATE is not a value either, and is kept
+     because it is the one thing a reader of a *redacted* ledger row can still
+     act on.
+
+     This is why `execute_statements` and `apply_staged_under_lock`'s
+     per-statement loop changed from `anyhow::anyhow!("...{e}")` to
+     `anyhow::Error::new(e).context(...)` / `.context(...)`: the macro's string
+     interpolation bakes a driver error's `Display` into a new, sourceless
+     string before `ledger_safe_reason` ever runs, which is indistinguishable
+     from this tool's own text once it happens — there is no error left inside
+     to downcast. Every other call site already reached `anyhow::Error`
+     through a bare `?`, which keeps the source intact without needing this
+     change; these two were the only ones written the other way, and are now
+     the shape every future statement-execution failure should copy.
+
+     The plan's own emitted SQL is not the same category and is not touched:
+     `stmt.sql` — embedded in `execute_statements`' `.context()` sentence — is
+     this tool's own generated text, deterministic from the checksum-pinned
+     plan and the declarations already in git, never a value the server
+     computed or a row nobody declared. A reference-data literal a deployer
+     wrote in YAML belongs in the ledger the same way it already belongs in
+     the plan; a value PostgreSQL or SQL Server hands back from its own
+     catalog or an existing row does not, and only the latter is what this
+     decision withholds.
+
+     `crates/pbps-cli/src/engine.rs`'s four unit tests pin `ledger_safe_reason`
+     directly: a `DbError::Driver` frame with a SQLSTATE redacts to it and
+     nothing else; one with none is redacted without inventing a code; a
+     non-`Driver` `DbError` frame passes through unchanged; and a
+     `.context()`-wrapped driver frame keeps the context and redacts only the
+     source. `crates/pbps-cli/tests/flow_pg.rs`'s
+     `a_triggers_own_exception_keeps_the_row_value_off_the_ledger_but_not_off_the_operator`
+     pins the same property end to end: a data trigger this tool's own guard
+     already treats as approved (`crates/pbps-pg/src/data_triggers.rs`) reads
+     an undeclared value from a side table and names it in its own
+     `RAISE EXCEPTION`, and the resulting apply's ledger `reason` carries the
+     SQLSTATE and this tool's own framing but not the value, while the
+     operator's stderr carries all of it. A first draft of that fixture put
+     the secret in the *declared* row instead of a side table, and its
+     failure was itself a useful measurement: pbps's own emitted `INSERT`
+     necessarily restates what was declared, so a secret placed there also
+     appeared in `execute_statements`' own `.context()` framing — correctly,
+     since that framing is the plan's own checksummed text, not a value this
+     decision has any business withholding.
+
+     Column retype was tried first, matching the shape ready-phase review
+     named literally ("an apply encounters a conversion error"), and
+     **measured** not to be reachable through this tool's own emitted DDL:
+     `ALTER COLUMN ... TYPE` without an explicit `USING` — which is all pbps
+     ever emits, ADR-0012 §5 refusing any retype no automatic cast covers —
+     fails a real out-of-range or over-length row with a *generic* message on
+     18.6 (`integer out of range`, `value too long for type character varying
+     (10)`, `numeric field overflow`), none of which named the value; only a
+     bare `CAST('text' AS type)` from an untyped literal does that, which is
+     what `Held::as_stored`'s read-back predicate builds from a reference-data
+     row's *recorded* text, not what the retyping `ALTER` itself runs against
+     existing data. The trigger-exception shape is the same finding's own
+     second-named case and reaches the identical `DbError::Driver` this crate
+     cannot tell apart from the first, so pinning it is pinning the fix, not a
+     different one.
+
+     SPEC has no section describing what a failed ledger entry's `reason`
+     holds — `pbps-model`'s own `StateKind::Failed` doc comment says only
+     "`reason` records the failure," which stays true; nothing there needed
+     correcting.
