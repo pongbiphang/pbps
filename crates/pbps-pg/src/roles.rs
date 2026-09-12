@@ -215,23 +215,23 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
              and not `{from}` under a new name. pbps does not own the principal (ADR-0010 §3), \
              and it cannot tell which of the two its declarations mean: renaming the role would \
              move the grants, while granting to `{to}` would leave `{from}` holding everything \
-             it holds now. Rename the role, or drop `{to}` if it was created by mistake"
+             it holds now. Resolve the name collision by hand, preserving the intended \
+             principal and its grants, then plan again."
         ),
         RenameEvidence::NeitherPresent => format!(
             "neither `{from}` nor `{to}` is in the cluster, so there is no principal to rename \
-             and none to grant on (ADR-0010 §3)"
+             and none to grant on (ADR-0010 §3). Restore the intended principal or correct \
+             the declarations, then plan again."
         ),
         RenameEvidence::NotRunYet => format!(
             "`{from}` is still in the cluster and `{to}` is not: the rename this revision \
              declares has not been run. A PostgreSQL role is a cluster object and pbps does not \
              own it (ADR-0010 §3); the grants follow the role's oid, so nothing has to be \
-             re-granted afterwards"
+             re-granted afterwards. Run it by hand, then plan again:\n\n    ALTER ROLE \
+             {quoted_from} RENAME TO {quoted_to};"
         ),
     };
-    Some(invalid(format!(
-        "{why}. Run it by hand, then plan again:\n\n    ALTER ROLE {quoted_from} RENAME TO \
-         {quoted_to};"
-    )))
+    Some(invalid(why))
 }
 
 /// One reason the cluster will refuse `DROP ROLE`.
@@ -444,18 +444,33 @@ mod tests {
             .expect("two principals")
             .to_string();
         assert!(both.contains("different principal"), "{both}");
-        assert!(
-            both.contains(r#"ALTER ROLE "old" RENAME TO "new";"#),
-            "{both}"
-        );
+        assert!(!both.contains("ALTER ROLE"), "{both}");
+        assert!(both.contains("then plan again"), "{both}");
         let not_yet = refuse_rename("old", "new", RenameEvidence::NotRunYet)
             .expect("the rename has not been run")
             .to_string();
         assert!(not_yet.contains("has not been run"), "{not_yet}");
+        assert!(
+            not_yet.contains(r#"ALTER ROLE "old" RENAME TO "new";"#),
+            "{not_yet}"
+        );
         let neither = refuse_rename("old", "new", RenameEvidence::NeitherPresent)
             .expect("no principal at all")
             .to_string();
         assert!(neither.contains("no principal to rename"), "{neither}");
+        assert!(!neither.contains("ALTER ROLE"), "{neither}");
+        assert!(neither.contains("then plan again"), "{neither}");
+    }
+
+    #[test]
+    fn an_outstanding_role_rename_quotes_both_identifiers() {
+        let message = refuse_rename("old \"reader", "new \"reader", RenameEvidence::NotRunYet)
+            .expect("the rename has not been run")
+            .to_string();
+        assert!(
+            message.contains(r#"ALTER ROLE "old ""reader" RENAME TO "new ""reader";"#),
+            "{message}"
+        );
     }
 
     /// The refusal carries the statement, not a description of it.
