@@ -579,7 +579,10 @@ locked-copy `update-index` ran it), so every `git` also takes
    in any case be a moment older than the unlink it guarded. Since an
    intent may edit more than one file,
    a refusal that left some of them replaced would be a partial edit
-   nobody asked for. The replacements are then retained under
+   nobody asked for. Every undo described here first publishes the
+   `rolling-back` record below, including refusals before step 5; the
+   record's per-path evidence makes retrying an interrupted undo safe.
+   The replacements are then retained under
    `<git-dir>/pbps-ui/previous/` exactly as a swapped-out original is
    below, named on the page as what a refused compose had placed, and
    never deleted: an editor that opened the replacement in the window it
@@ -950,9 +953,17 @@ locked-copy `update-index` ran it), so every `git` also takes
    the same blob at `100755` is a file the placed one does not match,
    and a `120000` or `160000` entry with that id is not a file at all)
    and keeps the placed file where that tip holds exactly what step 3
-   recorded, and undoes step 2 for the path where it does not — which on
-   the `HEAD`-moved-away path is the ordinary case, since the UI's
-   commit is on a branch nobody is standing on. Each path is left where
+   recorded, and selects undo of step 2 for the path where it does not —
+   which on the `HEAD`-moved-away path is the ordinary case, since the UI's
+   commit is on a branch nobody is standing on. Before the first selected
+   path is undone, it publishes and flushes the `rolling-back` phase
+   described below, recording the complete per-path decision under those
+   locks. Failure to publish that record leaves every placement as it is
+   and reports the failure; it must not start an undo whose direction
+   recovery cannot know. The decision is not recomputed after a crash:
+   `HEAD` being pointed back at the composed commit cannot turn a partial
+   undo into permission to install the prepared index (#152). Each path
+   selected for undo is left where
    the UI found it — the bytes step 2 saved, from the tree the checkout
    was on when the compose began — and not at what the deciding ref
    records, which undoing a placement cannot do: where `HEAD` was
@@ -1004,7 +1015,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    were left alone by git. What the working tree keeps there is the rule
    above and not that measurement: the sibling's tip does not hold the
    placed bytes, so step 2 is undone for every such path.
-6. It installs the locked copy of the index that step 3 prepared by
+6. Only a compose that has never entered `rolling-back` installs the
+   locked copy of the index that step 3 prepared by
    renaming `<index>.lock` to `<index>`, which is exactly the commit step
    of `git`'s own lock. Now
    `git status` is clean for what the UI did and untouched for everything
@@ -1064,17 +1076,51 @@ worst one step ahead of the disk and never behind it:
   the record describes, and a machine that stopped with the branch moved
   and the placements still in a cache would be recovered into a checkout
   holding the old bytes.
+- `rolling-back`, before any refusal or recovery starts undoing step 2,
+  from `placing` or `composed`. It records the paths to restore, in undo
+  order, and those to keep under step 5's decision; an earlier refusal
+  restores every placement. The saved originals, replacements, temporary
+  names and identities remain in the record, together with each undo's
+  retention destination, recorded before that name is used. Publication
+  uses the complete-file write, flush, rename and directory flush above,
+  and must finish before the first undo operation, including an exchange,
+  rename or Windows restoration write. This phase is irreversible: later
+  versions may record undo progress but never return to `placing` or
+  `composed`, advance to `installed`, or authorize a push. A crash before
+  publication has undone nothing; one after it can only resume rollback,
+  even where no path needed restoration.
 - `installed`, before the cleanup, once the rename has happened.
 
 Step 6 removes the record, last, after the cleanup below. A record found
 in `locking` has nothing placed and is finished by removing the locks it
 names and the record. A record found
 in `placing` or `composed` with the branch still at the leased tip is a
-compose that never reached its `update-ref`: the UI undoes step 2 from
-the names in the record, exactly as a refusal in those steps does, and
-removes the record. A record in `composed` with the branch at the
+compose that never reached its `update-ref`: the UI first publishes
+`rolling-back`, then undoes step 2 from the names in the record, exactly
+as a refusal in those steps does. A record in `rolling-back` resumes that
+undo, never the success path, regardless of the current `HEAD`, branch
+tip or prepared-index hash. A record in `composed` with the branch at the
 commit, or in `installed`, is the interval steps 5 and 6 span, and is
 finished as below.
+
+Rollback recovery uses the recorded per-path decision, not a new decision
+from the refs. It reads the original and replacement identities as
+`placing` recovery does, so an exchange already undone is not exchanged
+again. Every undo and retention operation is flushed, including the
+directories whose names changed, before its completion is published in
+the record; a crash before that progress update is answered by the
+recorded identities at the source and destination names. A name already
+moved is skipped only when that evidence proves the recorded operation
+completed, not merely because a lookup failed. Where neither the pending
+nor completed state matches, recovery keeps the record, reports what
+differs and leaves that path alone. The same rule applies after every
+repeated crash, including during retention cleanup. Once all selected
+paths are restored and all displaced files retained under step 2's rules,
+the UI discards its prepared index without installing it, releases the
+locks the record proves its own, and removes the record last. Kept paths
+get step 2's retention cleanup without being restored. The user's index and refs are
+not changed by rollback recovery, and it never runs success cleanup over
+a partly restored tree.
 
 Each *ref* lock the UI creates — `HEAD.lock`, the branch's, and, where
 step 5 takes one, the deciding ref's — carries the record's id as its
@@ -1122,16 +1168,19 @@ transaction's, and where it is, an empty `HEAD.lock` beside it is the
 same transaction's too; both are reclaimed like the UI's own. A lock
 holding anything else belongs to a running `git`, and the UI reports and
 changes nothing. For a record still in `placing` that is the whole of
-what it needs, since its rollback touches no ref. In `composed` the
-rollback can hold one lock more: where the checks after `update-ref`
-failed, the deciding ref's, which the record names before it is
+what it needs, since its rollback touches no ref. In `composed` or
+`rolling-back` the rollback can hold one lock more: where the checks after
+`update-ref` failed, the deciding ref's, which the record names before it is
 published, so a leftover holding this record's id is the UI's own and
 goes with the rest, and one holding anything else is a running `git`'s.
 Every lock the record proves its own is released whatever the outcome
 below, that one included: the process that took it is gone, so it holds
 nothing together and only stops every other `git` on that ref, where
 what the outcome below weighs is the files and the refs, which the
-record still describes and the page still shows. For the rest it
+record still describes and the page still shows. The success path accepts
+only `composed` or `installed`, never a record that reached `rolling-back`;
+the latter follows the rollback rule above even if all the checks below
+would now pass. For the success path it
 requires all of what step 5 required after its own `update-ref`: that
 `HEAD` is still symbolic to the record's branch, that the branch is
 still a direct ref and not a symbolic one, and that it still names the
@@ -1478,6 +1527,27 @@ What this ADR reasons about and has not measured, in the order the steps of
   branch, with `git status` then reporting the composed paths staged —
   the difference nobody made that the refusal
   exists to prevent.
+- **A crash during step 5's per-path undo (#152).** The compose and its
+  recovery harness do not exist yet; this amendment specifies the
+  protocol, not an implemented or measured recovery. Step 4 of #64 must
+  place two paths, redirect `HEAD` in step 5's gap to a direct branch
+  whose tip requires both placements undone, and stop after rollback
+  restores the first path. With the compose process gone, point `HEAD`
+  back at the record's branch, which still holds the composed commit,
+  and run recovery. Assert that the prepared index is never installed,
+  the user's index is unchanged, both paths hold their saved originals,
+  the displaced replacements are retained, and a second recovery changes
+  nothing. Revert the phase publication and dispatch rule together:
+  recovery then sees `composed`, takes the success path, installs the
+  prepared index and leaves the second path unrestored, failing those
+  assertions. Extend the same test across the record publication, each
+  undo operation, its flush and progress update, and retention cleanup:
+  an interruption before durable publication must have undone nothing;
+  every interruption after it must remain on rollback. Include a
+  conflicting third-party path that is reported and retained for the
+  user rather than overwritten, and an undisturbed `composed` recovery
+  that still installs its prepared index. These are required tests when
+  #64 builds compose, not coverage supplied by this design-only change.
 - **The same-tip symbolic rewrite step 5's compare-and-swap does not
   catch.** Tracked as #385, not fixed here: a branch a sibling worktree
   turns into a symbolic ref pointing at another branch *at exactly the
