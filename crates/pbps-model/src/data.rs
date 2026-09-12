@@ -553,8 +553,36 @@ impl crate::schema::Schema {
     /// for a drift check, the declarations for a rehearsal — because its rows
     /// say which cells that side spells explicitly ([`ObservedRow`]).
     ///
-    /// Two keys the side spells that the engine calls one row is an error
-    /// ([`RowConflict`]), never a choice between them.
+    /// Two keys `reference` spells that the engine calls one row is an error
+    /// ([`RowConflict`]), never a choice between them — but `scope` is not
+    /// always `reference`'s own: a connected plan pins projection to the union
+    /// of the recorded and declared scopes, wider than either side alone
+    /// (DECISIONS 98), and asking whether that union collides tests one side's
+    /// spelling against the other's. `01` recorded and `1` declared alias to
+    /// one row in the union and are refused, even though each side names it
+    /// once — precisely what [`ObservedTable::conflict`]'s own doc says is not
+    /// a conflict (issue #106).
+    ///
+    /// So the conflict test narrows to `reference`'s own keys for this table,
+    /// falling back to `scope` only when `reference` has no `data` block for
+    /// it at all. That fallback is safe, not a loophole, because of how a
+    /// union scope is built ([`DataScope::union`], `pinned_scopes` in
+    /// `pbps-cli`): a table's scope is ever a union of two sides' keys only
+    /// where *both* sides declare rows for it. If `reference` — one of the two
+    /// schemas the union was built from — declares nothing for this table,
+    /// the union contributed nothing from `reference`'s side, so `scope` here
+    /// already holds only the *other* side's keys. There is no second
+    /// spelling to smuggle in, and testing `scope` directly is exactly the
+    /// same question as testing `reference`'s own (empty) keys plus that other
+    /// side's, i.e. asking `reference`'s own side about a table it never
+    /// mentions is asking about a keyset that does not exist.
+    ///
+    /// This narrows only the *conflict test*; `scope.project` below still
+    /// hands the unnarrowed `scope` to [`ObservedTable::rows_as`], which picks
+    /// a canonical spelling among several aliasing to one row by sorting them
+    /// (issue #107) rather than by which side asked. #107 stays open and
+    /// stays exactly as broken after this change — fixing it is a different
+    /// PR, against `rows_as` itself, not this narrowing.
     pub fn with_observed_rows(
         mut self,
         rows: &ObservedRows,
@@ -565,7 +593,9 @@ impl crate::schema::Schema {
             let own = reference.tables.get(name).and_then(|t| t.data.as_ref());
             table.data = match (scopes.get(name), rows.get(name)) {
                 (Some(scope), Some(observed)) => {
-                    if let Some((first, second, canonical)) = observed.conflict(&scope.keys) {
+                    let own_scope = own.map(DataScope::of);
+                    let own_keys = own_scope.as_ref().map_or(&scope.keys, |s| &s.keys);
+                    if let Some((first, second, canonical)) = observed.conflict(own_keys) {
                         return Err(RowConflict {
                             table: name.clone(),
                             first,
@@ -1222,6 +1252,60 @@ mod tests {
         assert!(err.to_string().contains("declare it once"), "{err}");
         let err = plan_base(&live, &observed, &BTreeMap::new(), &schema).unwrap_err();
         assert_eq!(err.canonical, RowKey::from("1"));
+    }
+
+    /// A connected plan's baseline is pinned to the *union* of the recorded
+    /// and declared scopes, wider than either side alone (DECISIONS 98). One
+    /// side spelling `1` and the other `01` is still not a conflict there: the
+    /// rule is "each side is asked about its own keys" (the test above), and
+    /// pinning to a union must not smuggle the other side's spelling into that
+    /// question (issue #106).
+    #[test]
+    fn one_spelling_per_side_in_a_pinned_union_is_not_a_conflict() {
+        let mut seen = observed(&["1"]);
+        seen.aliases.insert(RowKey::from("01"), RowKey::from("1"));
+        seen.aliases.insert(RowKey::from("1"), RowKey::from("1"));
+
+        let mut recorded = crate::schema::Schema::default();
+        recorded
+            .tables
+            .insert(name(), table(Some(vec!["code"]), vec![("1", vec![])]));
+        let mut declared = crate::schema::Schema::default();
+        declared
+            .tables
+            .insert(name(), table(Some(vec!["code"]), vec![("01", vec![])]));
+
+        let recorded_scope = recorded.data_scopes().remove(&name()).unwrap();
+        let declared_scope = declared.data_scopes().remove(&name()).unwrap();
+        // The union a connected plan is pinned under (`pinned_scopes` in
+        // `pbps-cli`), rebuilt here with `DataScope::union` directly so the
+        // test does not have to cross the crate boundary: both spellings are
+        // in scope, exactly as they would be for the plan's baseline.
+        let pinned = recorded_scope.union(declared_scope);
+        assert_eq!(
+            pinned.keys,
+            ["01", "1"].into_iter().map(RowKey::from).collect()
+        );
+        // The union itself *does* alias both spellings to one row — the shape
+        // `with_observed_rows` must not hand to `conflict` directly, or it
+        // reproduces #106's false refusal from `plan --db`.
+        assert!(seen.conflict(&pinned.keys).is_some());
+        let scopes: DataScopes = [(name(), pinned)].into_iter().collect();
+
+        let mut live = crate::schema::Schema::default();
+        live.tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let observed_rows: ObservedRows = [(name(), seen)].into_iter().collect();
+
+        // Each side asked about its own keys alone passes, whichever side is
+        // `reference` — reverting the narrowing in `with_observed_rows` to
+        // test the pinned scope directly makes both of these fail with
+        // `RowConflict` instead.
+        live.clone()
+            .with_observed_rows(&observed_rows, &scopes, &recorded)
+            .expect("recorded's own spelling `1` alone is not a conflict");
+        live.with_observed_rows(&observed_rows, &scopes, &declared)
+            .expect("declared's own spelling `01` alone is not a conflict");
     }
 
     /// The catalog cannot tell `label: Unlabelled` from an omitted `label`

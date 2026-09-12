@@ -7539,6 +7539,109 @@ data:
     assert!(strict.dir.join("schema").join("dbo.t.yml").is_file());
 }
 
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_row_the_declarations_spell_differently_from_the_recorded_ledger_still_plans() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    // A database of its own: the aliasing this test measures is a property of
+    // the server's default collation, and another test's rows in a shared
+    // database could make that ambiguous.
+    let own = OwnDatabase::new(&server, "rowspell");
+    let connection = own.connection().to_owned();
+
+    // SQL Server's default collation is case-insensitive, so `new` and `NEW`
+    // name one row to the engine (verified here rather than assumed —
+    // DECISIONS: "measure against a real engine before believing yourself").
+    let declared = "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    new: {label: New}
+";
+    let d = Demo::new("rowspell-live");
+    d.table(declared);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Re-spell the same row's key, upper case, in the declarations only — the
+    // recorded ledger still holds `new`. This is exactly issue #106: a plan
+    // that declares the row once, spelled the way this side spells it, must
+    // not be refused because the *other* side (the ledger) spells the same
+    // engine row differently. `plan --db` pins its baseline to the union of
+    // the recorded and declared scopes (DECISIONS 98), and testing that union
+    // for a conflict instead of each side's own is exactly the bug: `new` and
+    // `NEW` appear on different sides of the union, not declared twice by one
+    // side.
+    d.table(
+        "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    NEW: {label: New}
+",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a row spelled once on each side must plan, not refuse: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    assert!(
+        !stderr(&o).contains("declare it once"),
+        "the false RowConflict issue #106 reports: {}",
+        stderr(&o)
+    );
+
+    // The guard itself must still catch a *real* conflict: one side spelling
+    // the same row two ways. Declaring `new` and `NEW` side by side is the
+    // case `two_spellings_of_one_row_are_refused_not_reconciled` pins at the
+    // unit level; checked again here against the real engine's collation,
+    // since that is what decides the two are one row at all.
+    d.table(
+        "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    new: {label: New}
+    NEW: {label: New}
+",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(
+        code(&o),
+        0,
+        "one side spelling the same row twice is still a conflict: {}",
+        stdout(&o)
+    );
+    assert!(stderr(&o).contains("declare it once"), "{}", stderr(&o));
+}
+
 // ---- Roles and grants, ADR-0005 ----
 
 const A_TABLE_AND_A_ROLE: [(&str, &str); 2] = [
