@@ -353,6 +353,9 @@ pinned image. Nothing below contradicts §1; each is a row it did not have.
   never came up. A `ColumnType` cannot hold it, and the declaration is refused
   rather than folded into the unmodified type — DECISIONS 242, model change
   in issue #130.
+  Issue #130 subsequently adds a word-boundary argument position to
+  `ColumnType` (DECISIONS 446), so these four types now admit precision 0–6.
+  Arrays remain outside the column model; argument position is not dimension.
 - **`numeric`'s scale may be negative, and may exceed the precision.**
   `numeric(10,-5)` reads back as itself. SQL Server's `0 <= scale <= precision`
   would refuse a column this engine makes (DECISIONS 240).

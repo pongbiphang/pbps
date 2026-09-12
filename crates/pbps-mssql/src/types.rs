@@ -175,6 +175,12 @@ fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
 /// Expands aliases, fills in the arguments SQL Server fills in itself, and
 /// collapses the spellings the engine collapses.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    if ty.args_after_word().is_some() {
+        return Err(arity(
+            ty,
+            "SQL Server type arguments must follow the complete type name",
+        ));
+    }
     // `ColumnType` already lowercases and squeezes whitespace inside arguments,
     // but a multi-word base name such as `national  character` can still carry
     // runs of spaces.
@@ -656,6 +662,15 @@ mod tests {
         assert_eq!(norm("character varying(50)"), "varchar(50)");
         assert_eq!(norm("national character varying(50)"), "nvarchar(50)");
         assert_eq!(norm("rowversion"), "timestamp");
+    }
+
+    #[test]
+    fn a_modifier_inside_a_type_name_is_refused() {
+        for spelling in ["national character(20) varying", "nvarchar(20) junk"] {
+            assert!(normalize(&ty(spelling)).is_err(), "{spelling}");
+        }
+        assert_eq!(norm("nvarchar(20)"), "nvarchar(20)");
+        assert_eq!(norm("national character varying(20)"), "nvarchar(20)");
     }
 
     /// A multi-word alias survives whatever spacing the user typed.

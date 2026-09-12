@@ -14,15 +14,16 @@
 //!
 //! ADR-0011 Amendment 3: normalization is idempotent, **and its output is what
 //! introspection reads back for a column declared that way**. A spelling for
-//! which that is impossible is an error, not something to normalize. Three
+//! which that is impossible is an error, not something to normalize. Two
 //! families of spelling are refused for exactly that reason, each measured on
 //! PostgreSQL 18.6:
 //!
 //! - the `serial` family, which is a macro and not a type — see
 //!   [`refuse_serial`];
-//! - **arrays**, which the model has nowhere to put (ADR-0012 §1);
-//! - **a precision on the four `time`/`timestamp` spellings**, which the engine
-//!   spells *inside* the name — see [`ArgShape::NoModifier`].
+//! - **arrays**, which the model has nowhere to put (ADR-0012 §1).
+//!
+//! Time precision is positioned after the first name word, so its canonical
+//! spelling parses and renders identically to the catalog's spelling.
 //!
 //! # Why the catalogue is closed
 //!
@@ -75,18 +76,8 @@ enum ArgShape {
     /// with no arguments at all — unbounded, and *not* the `(18,0)` SQL Server
     /// fills in — while `numeric(10)` reads back as `numeric(10,0)`.
     Numeric,
-    /// `interval[(p)]`, `p` in `0..=MAX_INTERVAL_PRECISION`.
-    IntervalPrecision,
-    /// A type whose modifier the engine spells **inside** the name.
-    ///
-    /// Measured: `timestamptz(3)` reads back as `timestamp(3) with time zone`,
-    /// and `timestamp with time zone(3)` is a *syntax error*. A `ColumnType` is
-    /// a name followed by its arguments and has nowhere to put a modifier in
-    /// the middle, so there is no value this normalizer could return that both
-    /// introspection would read back and the emitter could spell. The
-    /// declaration is refused, and the refusal says what to write instead
-    /// (DECISIONS 242; lifting it is the model change in issue #130).
-    NoModifier,
+    /// Seconds precision, bounded because the engine silently clamps excess.
+    Precision { max: i64 },
 }
 
 /// Every type name this dialect admits, spelled as the engine spells it back,
@@ -116,14 +107,16 @@ const CATALOGUE: &[(&str, ArgShape)] = &[
     ("character varying", ArgShape::Length { fills_in: None }),
     ("text", ArgShape::None),
     ("bytea", ArgShape::None),
-    // Date and time. The four with a `NoModifier` shape are the ones whose
-    // precision the engine spells inside the name.
+    // Date and time. Precision follows the first word of a time type's name.
     ("date", ArgShape::None),
-    ("time without time zone", ArgShape::NoModifier),
-    ("time with time zone", ArgShape::NoModifier),
-    ("timestamp without time zone", ArgShape::NoModifier),
-    ("timestamp with time zone", ArgShape::NoModifier),
-    ("interval", ArgShape::IntervalPrecision),
+    ("time without time zone", ArgShape::Precision { max: 6 }),
+    ("time with time zone", ArgShape::Precision { max: 6 }),
+    (
+        "timestamp without time zone",
+        ArgShape::Precision { max: 6 },
+    ),
+    ("timestamp with time zone", ArgShape::Precision { max: 6 }),
+    ("interval", ArgShape::Precision { max: 6 }),
     // Everything else.
     ("uuid", ArgShape::None),
     ("json", ArgShape::None),
@@ -270,8 +263,8 @@ fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
 /// A spelling the *model* cannot hold, as distinct from one the engine lacks.
 ///
 /// [`DialectError::NotBuilt`] rather than `Unsupported`, and the distinction is
-/// the one that variant exists for: PostgreSQL has arrays and it has
-/// `timestamp(3)`. What is missing is a `pbps-model` representation, and a
+/// the one that variant exists for: PostgreSQL has arrays. What is missing
+/// is a `pbps-model` representation, and a
 /// reader sent to the engine's documentation for a limitation of this tool
 /// would look in the wrong place.
 fn needs_a_model_change(part: impl Into<String>) -> DialectError {
@@ -355,6 +348,29 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
              (ADR-0012 §1)",
         ));
     }
+    let temporal_name = matches!(
+        canonical_base(&base),
+        "time without time zone"
+            | "time with time zone"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+    );
+    if let Some(position) = ty.args_after_word() {
+        if !temporal_name
+            || position != 1
+            || !matches!(base_words.first(), Some(&"time" | &"timestamp"))
+        {
+            return Err(arity(
+                ty,
+                "the modifier is not at a valid position in the type name",
+            ));
+        }
+    } else if temporal_name && !ty.args.is_empty() && base_words.len() > 1 {
+        return Err(arity(
+            ty,
+            "time and timestamp precision must follow the first word of the type name",
+        ));
+    }
     let base = canonical_base(&base).to_owned();
     // `float(n)` is resolved before the catalogue is consulted, and is not in
     // it: the spelling is not a type this dialect ever returns, and which type
@@ -415,41 +431,34 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             }
         },
 
-        ArgShape::IntervalPrecision => match ty.args.as_slice() {
+        ArgShape::Precision { max } => match ty.args.as_slice() {
             [] => Vec::new(),
-            [TypeArg::Int(n)] if (0..=MAX_INTERVAL_PRECISION).contains(n) => {
+            [TypeArg::Int(n)] if (0..=max).contains(n) => {
                 vec![TypeArg::Int(*n)]
             }
             [TypeArg::Int(n)] => {
                 return Err(arity(
                     ty,
                     format!(
-                        "the precision of `interval` must be between 0 and \
-                         {MAX_INTERVAL_PRECISION}, got {n}. The engine does not refuse a larger \
-                         one — it stores `interval({MAX_INTERVAL_PRECISION})` and says nothing, \
+                        "the precision of `{base}` must be between 0 and \
+                         {max}, got {n}. The engine does not refuse a larger \
+                         one — it stores precision {max} and says nothing, \
                          so a declaration that kept it would read back as something else"
                     ),
                 ));
             }
-            _ => return Err(arity(ty, "`interval` takes one precision")),
+            _ => return Err(arity(ty, format!("`{base}` takes one precision"))),
         },
-
-        ArgShape::NoModifier => {
-            if !ty.args.is_empty() {
-                return Err(needs_a_model_change(format!(
-                    "a precision on `{base}`. The engine spells the modifier **inside** the \
-                     name — `timestamptz(3)` reads back as `timestamp(3) with time zone`, and \
-                     `timestamp with time zone(3)` is a syntax error — and a `ColumnType` is a \
-                     name followed by its arguments, with nowhere to put one in the middle. \
-                     Declare `{base}` without a precision, which is the engine's own default \
-                     of microseconds"
-                )));
-            }
-            Vec::new()
-        }
     };
 
-    Ok(ColumnType::new(base, args))
+    let normalized = ColumnType::new(base, args);
+    if temporal_name && !normalized.args.is_empty() {
+        Ok(normalized
+            .with_args_after_word(1)
+            .expect("canonical temporal name has multiple words"))
+    } else {
+        Ok(normalized)
+    }
 }
 
 /// `float(n)` is not stored as written: 1..=24 becomes `real` and 25..=53
@@ -575,8 +584,8 @@ enum Family {
         fixed: bool,
     },
     Bytea,
-    /// Date and time, described by which components it stores and how far its
-    /// date part reaches.
+    /// Date and time, described by its components, calendar reach and seconds
+    /// precision. Reducing precision rounds, so it cannot be a safe widening.
     ///
     /// The reach is not decoration: measured, a `date` runs to 5874897 AD and a
     /// `timestamp` stops at 294276 AD, so `'300000-01-01'::date` into a
@@ -587,6 +596,7 @@ enum Family {
         has_time: bool,
         has_offset: bool,
         last_year: Option<i64>,
+        precision: i64,
     },
     /// `interval`, which carries a seconds precision the engine converts
     /// between. The unmodified type is `interval(6)` in every way that matters
@@ -791,6 +801,7 @@ fn family(t: &ColumnType) -> Family {
         has_time,
         has_offset,
         last_year,
+        precision: int_arg(0).unwrap_or(6),
     };
     // Measured on 18.6: `'5874897-01-01'::date` is accepted and
     // `'294276-12-31'::date::timestamp` is the last one that converts.
@@ -1023,12 +1034,14 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_time: at,
                 has_offset: ao,
                 last_year: ay,
+                precision: ap,
             },
             Family::Temporal {
                 has_date: bd,
                 has_time: bt,
                 has_offset: bo,
                 last_year: by,
+                precision: bp,
             },
         ) => {
             if !temporal_cast_exists((ad, at, ao), (bd, bt, bo)) {
@@ -1053,7 +1066,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 (Some(_), None) => false,
                 (Some(a), Some(b)) => a <= b,
             };
-            safe_if((!ad || bd) && (!at || bt) && ao == bo && reaches)
+            safe_if((!ad || bd) && (!at || bt) && ao == bo && reaches && (!at || bp >= ap))
         }
 
         // `time without time zone` and nothing else, in both of these arms:
@@ -1092,10 +1105,11 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_date: false,
                 has_time: true,
                 has_offset: false,
+                precision: source_precision,
                 ..
             },
             Family::Interval { precision },
-        ) => safe_if(precision >= MAX_INTERVAL_PRECISION),
+        ) => safe_if(precision >= source_precision),
 
         // One `interval` into another is a question about the seconds
         // precision, which the engine will convert either way. Measured:
@@ -1378,13 +1392,14 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
         // and `'294277-01-01'` is `date out of range for timestamp`.
         (
             Family::Temporal {
-                last_year: Some(_), ..
+                last_year: Some(source_last),
+                ..
             },
             Family::Temporal {
                 last_year: Some(last),
                 ..
             },
-        ) => {
+        ) if source_last > last => {
             // `infinity` has to come out by name, exactly as it does for the
             // numeric families above: it sorts after every finite value, so a
             // plain range test flags it, and **measured on 18.6** the engine
@@ -2640,7 +2655,12 @@ mod tests {
         assert!("text[]".parse::<ColumnType>().is_err());
         assert!("integer[]".parse::<ColumnType>().is_err());
         // The standard form parses, and this is where it stops.
-        for spelling in ["text ARRAY", "integer array", "double precision array"] {
+        for spelling in [
+            "text ARRAY",
+            "integer array",
+            "double precision array",
+            "time(3) ARRAY",
+        ] {
             let message = refused(spelling);
             assert!(message.contains("array"), "{message}");
             assert!(message.contains("dimension"), "{message}");
@@ -2649,28 +2669,68 @@ mod tests {
         assert!(refused("arrayish").contains("has no type"));
     }
 
-    /// The modifier the engine spells inside the name. Measured:
-    /// `timestamptz(3)` reads back as `timestamp(3) with time zone`, and
-    /// `timestamp with time zone(3)` is a syntax error — so there is no value
-    /// this normalizer could return that satisfies the contract.
     #[test]
-    fn a_precision_on_a_time_type_is_refused_rather_than_spelled_wrongly() {
-        for spelling in [
-            "time(3)",
-            "timetz(3)",
-            "timestamp(3)",
-            "timestamptz(3)",
-            "timestamp without time zone(3)",
+    fn temporal_precision_normalizes_to_the_engine_modifier_position() {
+        for (alias, base) in [
+            ("time", "time without time zone"),
+            ("timetz", "time with time zone"),
+            ("timestamp", "timestamp without time zone"),
+            ("timestamptz", "timestamp with time zone"),
         ] {
-            let message = refused(spelling);
-            assert!(message.contains("does not implement"), "{message}");
-            assert!(message.contains("inside"), "{message}");
+            for precision in [0, 3, 6] {
+                let expected = ColumnType::new(base, vec![TypeArg::Int(precision)])
+                    .with_args_after_word(1)
+                    .unwrap();
+                let got = normalize(&ty(&format!("{alias}({precision})"))).unwrap();
+                assert_eq!(got, expected);
+                assert_eq!(normalize(&ty(&got.to_string())).unwrap(), got);
+            }
+            for arguments in ["-1", "7", "max", "3, 2"] {
+                assert!(normalize(&ty(&format!("{alias}({arguments})"))).is_err());
+            }
         }
-        // The engine's own spelling of the same thing does not even parse, so
-        // both ways of writing it fail — neither is silently accepted.
-        assert!("timestamp(3) with time zone".parse::<ColumnType>().is_err());
-        // Without a precision they are ordinary types.
-        assert_eq!(norm("timestamptz"), "timestamp with time zone");
+        for spelling in [
+            "timestamp without time zone(3)",
+            "timestamp with(3) time zone",
+            "character(3) varying",
+            "nvarchar(100) junk",
+            "timestamp(3) junk",
+        ] {
+            assert!(normalize(&ty(spelling)).is_err(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn temporal_precision_loss_is_narrowing_and_widening_keeps_values() {
+        for base in ["time", "timetz", "timestamp", "timestamptz"] {
+            assert_eq!(
+                risk(&format!("{base}(6)"), &format!("{base}(3)")),
+                TypeChangeRisk::Narrowing
+            );
+            assert_eq!(risk(base, &format!("{base}(3)")), TypeChangeRisk::Narrowing);
+            assert_eq!(
+                risk(&format!("{base}(3)"), &format!("{base}(6)")),
+                TypeChangeRisk::Safe
+            );
+            assert_eq!(risk(&format!("{base}(6)"), base), TypeChangeRisk::Safe);
+        }
+    }
+
+    #[test]
+    fn temporal_precision_narrowing_does_not_probe_for_a_shorter_calendar() {
+        for base in ["time", "timetz", "timestamp", "timestamptz"] {
+            let from = normalize(&ty(&format!("{base}(6)"))).unwrap();
+            let to = normalize(&ty(&format!("{base}(3)"))).unwrap();
+            assert_eq!(cannot_become(&from, &to, "c"), None, "{base}");
+        }
+        assert!(
+            cannot_become(
+                &normalize(&ty("date")).unwrap(),
+                &normalize(&ty("timestamp(3)")).unwrap(),
+                "c"
+            )
+            .is_some()
+        );
     }
 
     /// The two string types disagree about the omitted length, and guessing
