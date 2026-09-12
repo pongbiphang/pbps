@@ -10060,18 +10060,48 @@ SPEC is in sync with all of these.
      one nobody re-reads, and the next person to touch this code would have
      no way to tell a defensive skip from a forgotten one.
 
-     The SQL prefilter (`TEXT_BODIED_ROUTINES`) keeps its own exact quoted
-     `strpos` test beside the new case-insensitive one for a different reason:
-     the case-insensitive side runs the *database's* `lower()`, under
-     whatever collation the database was created with, not this engine's
-     identifier fold. An ICU collation's full case mapping is not guaranteed
-     substring-preserving — the Greek final sigma is DECISIONS 245's standing
-     counterexample for exactly this kind of fold. Keeping the exact test
-     beside the folded one means the prefilter can never drop a row
-     `mentions` would have accepted, whatever the database's collation turns
-     out to be; the folded test only ever widens the candidate set, and
-     `mentions` still does the precise, ASCII-only filtering in Rust.
+     **Amended: the SQL prefilter's fold has to be pinned to `COLLATE "C"`,
+     not left to the database's default.** `prosrc` is plain `text`, so an
+     unqualified `lower()` in `TEXT_BODIED_ROUTINES` ran under whatever
+     collation the database was created with — and on one with Turkish
+     casing rules that is measurably a different fold than the engine's own
+     identifier rule:
 
-     The scan's character-width stepping (408) needed no change: ASCII-only
-     folding never changes a string's byte length or its char boundaries, so
-     the same stepping rule runs unchanged on the folded body.
+     ```text
+     lower('I')                                                        -> i
+     lower('I' COLLATE "tr-TR-x-icu")                                  -> ı
+     lower('I' COLLATE "C")                                            -> i
+     strpos(lower('SELECT I FROM t' COLLATE "tr-TR-x-icu"),
+            lower('i' COLLATE "tr-TR-x-icu"))                          -> 0
+     strpos(lower('SELECT I FROM t' COLLATE "C"),
+            lower('i' COLLATE "C"))                                    -> 8
+     ```
+
+     A routine on such a database naming the target with a bare, differently
+     cased ASCII letter was excluded by the prefilter before the ASCII-correct
+     Rust scan ever saw it — the exact silence #260 exists to remove, produced
+     by the fix meant to remove it. The first cut of this entry called the
+     unqualified `lower()` a "safe superset" and reasoned that any fold is
+     wider than none; that assumed the fold was locale-independent, and
+     measured, it is not.
+
+     `COLLATE "C"` on both `strpos` arguments is what fixes it: `C` folds
+     ASCII only and never depends on the database's locale, which is *exactly*
+     the engine's own identifier fold (230, 313) rather than an approximation
+     of it. That makes the earlier "keep the exact quoted test beside the
+     folded one, in case the fold loses a real match" hedge pointless rather
+     than merely redundant: an ASCII, per-byte fold cannot turn a string that
+     contains `$1` into one that does not, for any `$1` or body, so the
+     folded test is now a superset by construction and not by hope, and there
+     is nothing left for a second test to catch. The exact-quoted `strpos`
+     test is removed rather than kept — a filter whose reason has gone is one
+     nobody re-reads, the same rule this entry already applied to the
+     mixed-case-target skip above, and keeping a now-pointless test beside a
+     provably sufficient one would only invite the next reader to wonder what
+     it was for. 245's Greek-final-sigma counterexample was never wrong; it
+     was the reason for pinning the collation, not for keeping a redundant
+     test beside an unpinned fold.
+
+     The scan's character-width stepping (408) needed no change either way:
+     ASCII-only folding never changes a string's byte length or its char
+     boundaries, so the same stepping rule runs unchanged on the folded body.

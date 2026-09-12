@@ -179,24 +179,27 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
 /// silently matches nothing. This is the cheap filter; [`mentions`] is the
 /// exact one, and it runs here where the rules are testable without a server.
 ///
-/// The filter is two `strpos` tests rather than one, because an unquoted
-/// identifier and a quoted one are not folded the same way (DECISIONS 449).
-/// The first tests the exact quoted spelling, case untouched, and stays even
-/// though the second test alone would ordinarily catch it too. It is not
-/// there for harmless redundancy: the second test runs the *database's own*
-/// `lower()`, under whatever collation the database was created with, and a
-/// full Unicode case mapping under an ICU collation is not guaranteed to be
-/// substring-preserving — the Greek final sigma is DECISIONS 245's standing
-/// counterexample for exactly this kind of fold. Keeping the exact test
-/// beside the folded one means this query can never drop a row [`mentions`]
-/// would have accepted, whatever the collation turns out to be. The folded
-/// test is deliberately *wider* than the engine's own identifier fold, which
-/// downcases an unquoted identifier ASCII byte by byte and leaves the rest
-/// alone (DECISIONS 230, 313): that is safe here because this query only
-/// narrows which rows are worth fetching, [`mentions`] is where the engine's
-/// own ASCII-only rule is applied exactly, and a prefilter that is too wide
-/// costs an extra row scanned in Rust where one too narrow costs a referrer
-/// never reported at all.
+/// The case-insensitive half of the filter folds under `COLLATE "C"`
+/// explicitly, on both sides, rather than trusting the unqualified `lower()`
+/// this query used to call (DECISIONS 449). `prosrc` is plain `text`, so an
+/// unqualified `lower()` runs under the *database's* default collation, and
+/// that is measurably the wrong fold: on a database created with Turkish
+/// casing rules, `lower('I')` is dotless `ı` while `lower('i')` stays `i`, so
+/// `strpos(lower('SELECT I FROM t'), lower('i'))` is `0` where the ASCII fold
+/// gives `8` — a routine naming the target with a bare, differently-cased
+/// letter would have been excluded here before [`mentions`] ever saw it,
+/// which is the exact silence #260 exists to remove. `COLLATE "C"` folds
+/// ASCII only and is locale-independent, which is *exactly* the engine's own
+/// identifier fold (DECISIONS 230, 313) rather than an approximation of it,
+/// so this half of the filter is now a strict superset of what [`mentions`]
+/// accepts by construction, not by hope: an ASCII, per-byte fold cannot turn
+/// a real occurrence of `$1` into a string that no longer contains it,
+/// whatever `$1` or the body hold. That is also why there is only one test
+/// here and not two — an exact quoted-spelling test beside this one was kept
+/// in an earlier revision as a hedge against the unqualified `lower()`'s
+/// locale dependence, and there is nothing left for it to hedge against once
+/// the fold itself is exact: an exact match is a special case of a fold that
+/// cannot lose it.
 ///
 /// **Every schema the tool did not rule out**, and not only the managed ones:
 /// an undeclared `plpgsql` function that reads a managed table is exactly the
@@ -223,8 +226,7 @@ SELECT n.nspname AS schema_name,
    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                     WHERE d.classid = 'pg_catalog.pg_proc'::regclass
                       AND d.objid = p.oid AND d.deptype = 'e')
-   AND (pg_catalog.strpos(p.prosrc, '\"' || $1 || '\"') > 0
-        OR pg_catalog.strpos(pg_catalog.lower(p.prosrc), pg_catalog.lower($1)) > 0)
+   AND pg_catalog.strpos(pg_catalog.lower(p.prosrc COLLATE \"C\"), pg_catalog.lower($1 COLLATE \"C\")) > 0
  ORDER BY n.nspname, p.proname";
 
 /// Everything the catalog holds an edge to, described in the engine's own
@@ -724,6 +726,25 @@ mod tests {
             TEXT_BODIED_ROUTINES.contains("d.deptype = 'e'"),
             "extensions"
         );
+        // DECISIONS 449: an unqualified `lower()` runs under the database's
+        // default collation, and on a Turkish one it folds `I` to dotless
+        // `ı`, not `i` — measured, `strpos(lower('SELECT I FROM t'),
+        // lower('i'))` is `0` where the ASCII fold gives `8`, excluding a
+        // routine that really does mention the target before `mentions` ever
+        // sees it. `COLLATE "C"` on both sides is what makes the fold ASCII
+        // and locale-independent, matching the engine's own identifier fold
+        // rather than approximating it. This cannot be exercised against the
+        // live suite's own database without changing its collation, so it is
+        // pinned here instead, the way the repo pins other spellings it
+        // cannot exercise end to end.
+        for side in ["p.prosrc COLLATE \"C\"", "$1 COLLATE \"C\""] {
+            assert!(
+                TEXT_BODIED_ROUTINES.contains(side),
+                "the case-insensitive fold must run under the C collation on \
+                 both sides, or a locale-specific default collation folds it \
+                 differently from the engine's own identifier rule: {side}"
+            );
+        }
         assert!(
             CARRIED.contains("d.deptype <> 'i'"),
             "an internal edge is the object's own parts"
