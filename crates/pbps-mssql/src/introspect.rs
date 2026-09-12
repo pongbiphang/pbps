@@ -297,13 +297,15 @@ pub struct RawCatalog {
     pub permissions: Vec<RawPermission>,
     /// `DATABASEPROPERTYEX(DB_NAME(), 'Collation')` of the connected
     /// (source) database, read once. The baseline [`RawColumn::collation`] is
-    /// measured against: a character column with no explicit `COLLATE`
-    /// inherits exactly this name, so a column whose collation differs from
-    /// it is the one case that needs a word — a matching collation, explicit
-    /// or inherited, is indistinguishable in the catalog and, emitting no
-    /// `COLLATE` clause, is reproduced for free *onto a database whose own
-    /// default is this same name*. Bootstrapping onto one whose default
-    /// differs is a separate gap this baseline does not cover (issue #406).
+    /// measured against — the source's own default, not any explicit
+    /// `COLLATE` and not every collated column (DECISIONS 443): a character
+    /// column with no explicit `COLLATE` inherits exactly this name, so a
+    /// column whose collation differs from it is the one case that needs a
+    /// word — a matching collation, explicit or inherited, is
+    /// indistinguishable in the catalog and, emitting no `COLLATE` clause, is
+    /// reproduced for free *onto a database whose own default is this same
+    /// name*. Bootstrapping onto one whose default differs is a separate gap
+    /// this baseline does not cover (issue #406).
     pub database_collation: String,
 }
 
@@ -738,19 +740,20 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
         };
 
-        // A collation matching the database default — whether inherited or
-        // spelled out explicitly — round-trips for free *onto a database
-        // whose own default is the same*: the emitter writes no `COLLATE`,
-        // so the column is created under whatever default the target has.
+        // The baseline is the *source* database's own default, not "any
+        // explicit COLLATE" or "every collated column" (DECISIONS 443). A
+        // collation matching it — whether inherited or spelled out
+        // explicitly — round-trips for free *onto a database whose own
+        // default is the same*: the emitter writes no `COLLATE`, so the
+        // column is created under whatever default the target has.
         // Bootstrapping onto a database with a different default is not
-        // covered here — this baseline is the source database's, and nothing
-        // compares it with the target's (issue #406). Anything that differs
-        // from the source's own default is a difference the declaration
-        // cannot hold regardless of target; reported here rather than
-        // dropped, the way a clustered index is (`index_type_name` above),
-        // so an operator can find it instead of a bootstrap changing what
-        // `=` and a unique constraint on the column mean without a word
-        // (issue #94).
+        // covered here — nothing compares this baseline with the target's
+        // (issue #406). Anything that differs from the source's own default
+        // is a difference the declaration cannot hold regardless of target;
+        // reported here rather than dropped, the way a clustered index is
+        // (`index_type_name` above), so an operator can find it instead of a
+        // bootstrap changing what `=` and a unique constraint on the column
+        // mean without a word (issue #94).
         if let Some(collation) = c.collation.as_deref()
             && collation != raw.database_collation
         {
