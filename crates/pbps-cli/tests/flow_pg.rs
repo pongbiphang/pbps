@@ -3670,3 +3670,517 @@ fn update_of_generated_columns_follows_their_source_columns() {
         conn.rollback(dialect.transaction_framing()).await.unwrap();
     });
 }
+
+/// Cluster-wide roles outlive the database that uses them, so a test holding
+/// both drops the database first: `DROP ROLE` fails while the role still owns
+/// an object anywhere in the cluster.
+struct ClusterRoles {
+    server: String,
+    names: Vec<String>,
+}
+
+impl Drop for ClusterRoles {
+    fn drop(&mut self) {
+        for name in &self.names {
+            let _ = try_on_server(&self.server, &format!("DROP ROLE IF EXISTS {name}"));
+        }
+    }
+}
+
+/// The membership topology DECISIONS 447 is about: `owner` owns the trigger
+/// function and can act as the deployer, and `inheritor` and `distant` are the
+/// roles each case hands the owner's rights to. Fields drop in declaration
+/// order, so the database goes before the roles that own objects inside it.
+struct Topology {
+    own: OwnDatabase,
+    _roles: ClusterRoles,
+    deployer: String,
+    owner: String,
+    inheritor: String,
+    distant: String,
+    deployment: String,
+}
+
+impl Topology {
+    fn connection(&self) -> &str {
+        self.own.connection()
+    }
+}
+
+/// A non-superuser deployer, a separate function owner that can `SET ROLE` to
+/// it, and two roles that hold no membership yet. The trigger function is
+/// `hook.audit`, owned by `owner` and invoker-rights like any plpgsql trigger
+/// function, so its body runs with whatever privileges the deployer brings.
+fn inherited_owner_topology(admin: &str, slug: &str) -> Topology {
+    let pid = std::process::id();
+    let deployer = format!("pbps_{slug}_deployer_{pid}");
+    let owner = format!("pbps_{slug}_owner_{pid}");
+    let inheritor = format!("pbps_{slug}_inheritor_{pid}");
+    let distant = format!("pbps_{slug}_distant_{pid}");
+    let roles = ClusterRoles {
+        server: admin.to_owned(),
+        names: vec![
+            distant.clone(),
+            inheritor.clone(),
+            owner.clone(),
+            deployer.clone(),
+        ],
+    };
+    on_server(
+        admin,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'trigger-test'; \
+             CREATE ROLE {owner} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION; \
+             CREATE ROLE {inheritor} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'trigger-test'; \
+             CREATE ROLE {distant} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION; \
+             GRANT {deployer} TO {owner} WITH INHERIT FALSE, SET TRUE"
+        ),
+    );
+    let own = OwnDatabase::new(admin, slug);
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; CREATE SCHEMA hook AUTHORIZATION {owner}; \
+             GRANT USAGE ON SCHEMA hook TO {deployer}; GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE hook.calls (value integer); ALTER TABLE hook.calls OWNER TO {owner}; \
+             GRANT INSERT, SELECT ON hook.calls TO {deployer}; \
+             CREATE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN INSERT INTO hook.calls VALUES (1); \
+             IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$; \
+             ALTER FUNCTION hook.audit() OWNER TO {owner}"
+        ),
+    );
+    let deployment = as_role(own.connection(), &deployer);
+    assert_eq!(
+        scalar(
+            &deployment,
+            "SELECT count(*) FROM pg_roles WHERE rolname = current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication)"
+        ),
+        0
+    );
+    Topology {
+        own,
+        _roles: roles,
+        deployer,
+        owner,
+        inheritor,
+        distant,
+        deployment,
+    }
+}
+
+/// The same server, reached as another role: the libpq keyword form the suite
+/// is configured with, with its `user` and `password` words replaced.
+fn as_role(connection: &str, role: &str) -> String {
+    let kept: Vec<&str> = connection
+        .split_whitespace()
+        .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+        .collect();
+    format!("{} user={role} password=trigger-test", kept.join(" "))
+}
+
+/// A trigger on `app.t` whose function the deployer only executes, recorded as
+/// the tool would record it, so nothing but ownership rights can refuse it.
+fn recorded_audit_trigger(topology: &Topology, event: &str) -> pbps_model::Schema {
+    on_server(
+        &topology.deployment,
+        &format!(
+            "CREATE TABLE app.t (id integer); \
+             CREATE TRIGGER audit BEFORE {event} ON app.t FOR EACH ROW EXECUTE FUNCTION hook.audit()"
+        ),
+    );
+    let recorded = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &topology.deployment)
+                .await
+                .unwrap();
+            pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .unwrap()
+                .schema
+        });
+    let id = pbps_model::ModuleId::Trigger {
+        on: pbps_model::TableName::new("app", "t"),
+        name: "audit".to_owned(),
+    };
+    assert!(
+        recorded.modules.contains_key(&id),
+        "the trigger has to be recorded, or the recording check is what refuses"
+    );
+    recorded
+}
+
+/// DECISIONS 447. A role that inherits the function owner's rights can replace
+/// the body — the OID and the recorded trigger definition do not move — so the
+/// direct owner's `SET` path is not the question the guard has to answer.
+///
+/// The cases are ordered so that each one differs from the last in one grant,
+/// and the trusted ones are the control: a predicate that simply refused every
+/// membership would pass the refusals and fail here.
+fn effective_ownership_decides_trust(admin: &str, slug: &str) {
+    let topology = inherited_owner_topology(admin, slug);
+    let recorded = recorded_audit_trigger(&topology, "INSERT");
+    let Topology {
+        deployer,
+        owner,
+        inheritor,
+        distant,
+        ..
+    } = &topology;
+    let cases: [(&str, String, bool); 6] = [
+        (
+            "a direct owner that can act as the deployer is trusted",
+            String::new(),
+            true,
+        ),
+        (
+            "a role inheriting the owner's rights without a SET path is not",
+            format!("GRANT {owner} TO {inheritor} WITH INHERIT TRUE, SET FALSE"),
+            false,
+        ),
+        (
+            "an inheritor that can itself act as the deployer is trusted",
+            format!("GRANT {deployer} TO {inheritor} WITH INHERIT FALSE, SET TRUE"),
+            true,
+        ),
+        (
+            "disabled inheritance confers no ownership rights",
+            format!(
+                "REVOKE {deployer} FROM {inheritor}; REVOKE {owner} FROM {inheritor}; \
+                 GRANT {owner} TO {inheritor} WITH INHERIT FALSE, SET FALSE"
+            ),
+            true,
+        ),
+        (
+            "inheritance reaches through a trusted inheritor to an untrusted one",
+            format!(
+                "REVOKE {owner} FROM {inheritor}; \
+                 GRANT {owner} TO {inheritor} WITH INHERIT TRUE, SET FALSE; \
+                 GRANT {deployer} TO {inheritor} WITH INHERIT FALSE, SET TRUE; \
+                 GRANT {inheritor} TO {distant} WITH INHERIT TRUE, SET FALSE"
+            ),
+            false,
+        ),
+        (
+            "the direct owner still needs a SET path of its own",
+            format!(
+                "REVOKE {inheritor} FROM {distant}; REVOKE {owner} FROM {inheritor}; \
+                 REVOKE {deployer} FROM {inheritor}; REVOKE {deployer} FROM {owner}"
+            ),
+            false,
+        ),
+    ];
+    let connection = topology.connection().to_owned();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use pbps_dialect::Dialect;
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &topology.deployment)
+                .await
+                .unwrap();
+            // Inside this runtime rather than through `on_server`: a nested
+            // `block_on` panics, and the grants have to land between the checks.
+            let mut admin = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            for (property, grant, trusted) in cases {
+                if !grant.is_empty() {
+                    admin.execute(&grant).await.unwrap();
+                }
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    &[pbps_dialect::RowWrite {
+                        table: pbps_model::TableName::new("app", "t"),
+                        operation: pbps_dialect::RowOperation::Insert,
+                    }],
+                    &recorded,
+                    &Default::default(),
+                )
+                .await;
+                let refusal = checked.as_ref().err().map(|e| e.to_string());
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                assert_eq!(checked.is_ok(), trusted, "{property}: {refusal:?}");
+                if let Some(message) = refusal {
+                    assert!(message.contains("unsafe data trigger"), "{message}");
+                }
+            }
+        });
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn effective_function_ownership_not_the_direct_owner_decides_trigger_trust() {
+    effective_ownership_decides_trust(&server(), "effective_owner");
+}
+
+/// The `INHERIT`/`SET` grant options arrived together in PostgreSQL 16, and the
+/// predicate has to mean the same thing on the oldest engine that has them: a
+/// release where it silently read as "always trusted" would leave the hole open
+/// on every supported server but one.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn effective_function_ownership_decides_trigger_trust_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    effective_ownership_decides_trust(&server, "effective_owner_old");
+}
+
+/// Planning is not the last word: a membership granted after the plan was
+/// approved is caught by the re-read the writer does under its own lock. The
+/// lock cannot help here — `GRANT` does not touch the guarded table — which is
+/// why the check is repeated rather than trusted from planning time.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
+    let topology = inherited_owner_topology(&server(), "late_membership");
+    let recorded = recorded_audit_trigger(&topology, "INSERT");
+    let connection = topology.connection().to_owned();
+    let grant = format!(
+        "GRANT {} TO {} WITH INHERIT TRUE, SET FALSE",
+        topology.owner, topology.inheritor
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use pbps_dialect::Dialect;
+            let mut writer =
+                pbps_db::Conn::connect(pbps_db::Driver::Postgres, &topology.deployment)
+                    .await
+                    .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            let write = pbps_dialect::RowWrite {
+                table: pbps_model::TableName::new("app", "t"),
+                operation: pbps_dialect::RowOperation::Insert,
+            };
+            writer.begin(dialect.transaction_framing()).await.unwrap();
+            let guard = pbps_pg::data_triggers::prepare(
+                &mut writer,
+                std::slice::from_ref(&write),
+                &recorded,
+                &Default::default(),
+            )
+            .await
+            .expect("the topology is trusted while planning");
+            // From another session, so the guarded table's lock is the one thing
+            // that could have stopped it, and it does not.
+            pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+                .await
+                .unwrap()
+                .execute(&grant)
+                .await
+                .unwrap();
+            let refused = pbps_pg::data_triggers::check(&mut writer, &write, &guard).await;
+            writer
+                .rollback(dialect.transaction_framing())
+                .await
+                .unwrap();
+            let message = refused.expect_err("the write must not run").to_string();
+            assert!(message.contains("unsafe data trigger"), "{message}");
+        });
+}
+
+/// The path a user types, on the topology of DECISIONS 447. The trigger is
+/// installed and adopted while nothing can replace its function, so the
+/// recording check and the direct owner's `SET` path both pass; only then does a
+/// role that inherits the owner's rights take the body over. Every row DML kind
+/// has to refuse, and refuse before the body copies a secret that only the
+/// deployment role can read.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
+    let admin = server();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    for (operation, before, after, allow) in [
+        (
+            "INSERT",
+            "",
+            "data:\n  mode: exact\n  rows:\n    new: {label: New}\n",
+            "",
+        ),
+        (
+            "UPDATE",
+            "data:\n  mode: exact\n  rows:\n    old: {label: Old}\n",
+            "data:\n  mode: exact\n  rows:\n    old: {label: New}\n",
+            "data-update",
+        ),
+        (
+            "DELETE",
+            "data:\n  mode: exact\n  rows:\n    old: {label: Old}\n",
+            "data:\n  mode: exact\n  rows: {}\n",
+            "data-delete",
+        ),
+    ] {
+        let slug = format!("inherited_{}", operation.to_lowercase());
+        let topology = inherited_owner_topology(&admin, &slug);
+        let connection = topology.connection().to_owned();
+        let deployment = topology.deployment.clone();
+        let d = Demo::new(&slug);
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            "dialect: postgres\nunmanaged: ignore\n",
+        )
+        .unwrap();
+        d.table(declared);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", &deployment]));
+        // The trigger arrives the way an operator installs one, and is adopted
+        // from the engine rather than written by hand: the guard compares the
+        // deparsed definition, and only a pulled one is that text exactly.
+        on_server(
+            &deployment,
+            &format!(
+                "CREATE TRIGGER audit BEFORE {operation} ON app.t FOR EACH ROW EXECUTE FUNCTION hook.audit()"
+            ),
+        );
+        // Pulled into a project of its own, and only the trigger is carried
+        // across. The function stays unmanaged: a managed body would make the
+        // replacement read as ordinary drift, and the refusal under test would
+        // never be the thing that stopped the write. Deleting the pulled files
+        // instead would ask for drop intent, which is a different test.
+        let pulled = Demo::new(&format!("{slug}-pull"));
+        succeeds(pulled.run(&["pull", "--db", &deployment]));
+        let module = std::fs::read_dir(pulled.dir.join("schema"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                let body = std::fs::read_to_string(&path).ok()?;
+                body.lines()
+                    .any(|line| line.starts_with("trigger:"))
+                    .then_some(body)
+            })
+            .next()
+            .expect("the engine's own spelling of the trigger");
+        std::fs::write(d.dir.join("schema/audit.yml"), module).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            &deployment,
+            "--reason",
+            "adopt the audit trigger",
+        ]));
+        succeeds(d.run(&["verify", "--db", &deployment]));
+        // Built after the adoption, so none of it is managed or recorded: a
+        // secret the deployer alone can read, and a table only the inheritor
+        // owns to read it back out of.
+        let Topology {
+            deployer,
+            owner,
+            inheritor,
+            ..
+        } = &topology;
+        on_server(
+            &connection,
+            &format!(
+                "CREATE SCHEMA secrets; CREATE TABLE secrets.vault (value text); \
+                 INSERT INTO secrets.vault VALUES ('test-only-secret'); \
+                 GRANT USAGE ON SCHEMA secrets TO {deployer}; GRANT SELECT ON secrets.vault TO {deployer}; \
+                 CREATE SCHEMA leak AUTHORIZATION {inheritor}; CREATE TABLE leak.copied (value text); \
+                 ALTER TABLE leak.copied OWNER TO {inheritor}; \
+                 GRANT USAGE ON SCHEMA leak TO {deployer}; GRANT INSERT ON leak.copied TO {deployer}"
+            ),
+        );
+        let attack = as_role(&connection, inheritor);
+        assert!(try_on_server(&attack, "SELECT * FROM secrets.vault").is_err());
+        if !before.is_empty() {
+            d.table(&format!("{declared}{before}"));
+            let seed = connected_artifact(&d, &deployment, false);
+            succeeds(approved_apply(&d, &deployment, &seed, &[]));
+        }
+        d.table(&format!("{declared}{after}"));
+        let plan = connected_artifact(&d, &deployment, false);
+        let applies = scalar(
+            &connection,
+            "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'",
+        );
+        // Approved, recorded, unchanged — and now owned in effect by a role
+        // that cannot act as the deployer.
+        on_server(
+            &connection,
+            &format!("GRANT {owner} TO {inheritor} WITH INHERIT TRUE, SET FALSE"),
+        );
+        on_server(
+            &attack,
+            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN INSERT INTO leak.copied SELECT value FROM secrets.vault; \
+             IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
+        );
+        let blocked = d.run(&["plan", "--db", &deployment]);
+        assert_eq!(
+            code(&blocked),
+            1,
+            "{}{}",
+            stdout(&blocked),
+            stderr(&blocked)
+        );
+        assert!(
+            stderr(&blocked).contains("unsafe data trigger"),
+            "{}",
+            stderr(&blocked)
+        );
+        let mut extra = Vec::new();
+        if !allow.is_empty() {
+            extra.extend(["--allow", allow]);
+        }
+        let refused = approved_apply(&d, &deployment, &plan, &extra);
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM leak.copied"),
+            0,
+            "{operation} copied the secret: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("unsafe data trigger") && stderr(&refused).contains("audit"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            applies,
+            "a refused write must not record an apply"
+        );
+        // The control: the same plan, the same recorded trigger, once the
+        // inherited rights are gone and the legitimate body is back. Replacing
+        // a function does not move its ownership, so `owner` still owns it.
+        on_server(&connection, &format!("REVOKE {owner} FROM {inheritor}"));
+        on_server(
+            &connection,
+            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN INSERT INTO hook.calls VALUES (1); \
+             IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
+        );
+        succeeds(approved_apply(&d, &deployment, &plan, &extra));
+        assert_eq!(scalar(&connection, "SELECT count(*) FROM leak.copied"), 0);
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM hook.calls"),
+            1,
+            "the trusted trigger has to have run, or nothing was proved"
+        );
+        succeeds(d.run(&["verify", "--db", &deployment]));
+    }
+}
