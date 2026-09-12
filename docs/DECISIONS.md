@@ -10102,6 +10102,33 @@ SPEC is in sync with all of these.
      was the reason for pinning the collation, not for keeping a redundant
      test beside an unpinned fold.
 
+     **Amended again: `"C"`, unqualified, is a name and not a fact — it
+     resolves through `search_path` like any other identifier, and a schema
+     earlier on the path can hold its own collation named `"C"`.** Measured:
+
+     ```text
+     CREATE SCHEMA shad;
+     CREATE COLLATION shad."C" (provider = icu, locale = 'tr-TR', deterministic = false);
+     SET search_path = shad, pg_catalog;
+     SELECT lower('I' COLLATE "C");               -- ı      <- hijacked
+     SELECT lower('I' COLLATE pg_catalog."C");    -- i      <- pinned
+     ```
+
+     With a shadow collation on the path, `COLLATE "C"` folds `I` to `ı`
+     again — the identical defect this entry exists to fix, one schema-lookup
+     away. The "superset by construction" claim two paragraphs up was true of
+     the *fold*, ASCII versus Unicode, and silently assumed the collation
+     named `"C"` was always `pg_catalog`'s; under a hostile or merely unusual
+     `search_path` it is not, and the claim was false until the name was
+     qualified. `pg_catalog."C"` cannot be shadowed by anything on the path,
+     and it matches every other name in this query, all of them already
+     schema-qualified (`pg_catalog.strpos`, `pg_catalog.lower`,
+     `pg_catalog.pg_proc`, `pg_catalog.pg_depend`) — the collation was the one
+     unqualified name in a query whose whole style is that nothing resolves
+     through the path, and it is now qualified the same way. The unit
+     assertion pinning this SQL literal was tightened to require the
+     qualified spelling: the unqualified one would have passed it.
+
      The scan's character-width stepping (408) needed no change either way:
      ASCII-only folding never changes a string's byte length or its char
      boundaries, so the same stepping rule runs unchanged on the folded body.

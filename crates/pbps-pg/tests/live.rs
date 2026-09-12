@@ -18280,7 +18280,7 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
 /// names the same column as `email`, and the advisory scan has to find it
 /// under that spelling.
 ///
-/// The negative half is the trap the fix exists to avoid (DECISIONS 449): a
+/// The negative half is the trap the fix exists to avoid (DECISIONS 448): a
 /// *quoted* `"EMAIL"` is a different column, case preserved, and folding it
 /// too would report a routine that does not actually break.
 #[tokio::test]
