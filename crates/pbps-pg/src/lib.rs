@@ -1734,13 +1734,8 @@ mod tests {
             },
         );
         let errors = structural_errors(&table);
-        assert_eq!(errors.len(), 4, "{errors:?}");
-        for expected in [
-            "not a column",
-            "names no columns",
-            "twice",
-            "no default btree",
-        ] {
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        for expected in ["not a column", "names no columns", "twice"] {
             assert_eq!(
                 errors.iter().filter(|e| e.contains(expected)).count(),
                 1,
@@ -1751,13 +1746,13 @@ mod tests {
     }
 
     #[test]
-    fn primary_and_unique_keys_require_nonempty_existing_distinct_indexable_columns() {
+    fn primary_and_unique_keys_require_nonempty_existing_distinct_columns() {
         for primary in [true, false] {
             for (columns, expected) in [
                 (vec![], "names no columns"),
                 (vec!["missing"], "not a column"),
                 (vec!["a", "a"], "twice"),
-                (vec!["j"], "no default btree"),
+                (vec!["j"], ""),
                 (vec!["a", "b"], ""),
             ] {
                 let mut table = structural_table();
@@ -1791,7 +1786,7 @@ mod tests {
             (vec![], vec![], "names no columns"),
             (vec!["a"], vec![], "referenced table"),
             (vec!["missing"], vec!["a"], "not a column"),
-            (vec!["j"], vec!["a"], "no default btree"),
+            (vec!["j"], vec!["a"], ""),
             (vec!["a", "b"], vec!["a"], "must line up"),
             (vec!["a", "a"], vec!["a", "b"], ""),
         ] {
@@ -1820,7 +1815,7 @@ mod tests {
         for (keys, include, expected) in [
             (vec![], vec![], "names no columns"),
             (vec!["missing"], vec![], "not a column"),
-            (vec!["j"], vec![], "no default btree"),
+            (vec!["j"], vec![], ""),
             (vec!["a"], vec!["missing"], "includes `missing`"),
             (vec!["a", "a"], vec!["a", "b", "b", "j"], ""),
         ] {

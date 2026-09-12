@@ -34,9 +34,9 @@ fn invalid(message: impl Into<String>) -> DialectError {
 /// Structural declaration errors, measured on PostgreSQL 18.6. Unlike SQL
 /// Server, repeated index keys, repeated INCLUDE columns, a key in INCLUDE,
 /// and repeated local FK columns are legal here. Only PK/UNIQUE lists reject
-/// duplicates. INCLUDE contributes to the 32-column limit but needs no btree
-/// operator class, so a json payload is legal even though a json key is not
-/// (DECISIONS 452).
+/// duplicates. INCLUDE contributes to the 32-column limit. Key-type eligibility
+/// depends on installed operator classes and is left to the server, not guessed
+/// from the stock catalogue by an offline validator (DECISIONS 452).
 pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     let mut found = Vec::new();
     if let Some(pk) = &table.primary_key {
@@ -111,19 +111,10 @@ fn key_columns(what: &str, columns: &[String], table: &Table, distinct: bool) ->
     }
     let mut seen = BTreeSet::new();
     for name in columns {
-        match table.columns.get(name) {
-            None => found.push(invalid(format!(
+        if !table.columns.contains_key(name) {
+            found.push(invalid(format!(
                 "{what} references `{name}`, which is not a column of this table"
-            ))),
-            // Unknown/invalid types already have their own catalogue finding.
-            Some(column)
-                if crate::types::normalize(&column.ty).is_ok_and(|ty| ty.base == "json") =>
-            {
-                found.push(invalid(format!(
-                    "{what} uses `{name}`, whose type `json` cannot be part of a key: PostgreSQL has no default btree operator class for json"
-                )));
-            }
-            Some(_) => {}
+            )));
         }
         if distinct && !seen.insert(name) {
             found.push(invalid(format!("{what} names `{name}` twice")));

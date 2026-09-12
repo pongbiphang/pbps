@@ -10581,7 +10581,7 @@ SPEC is in sync with all of these.
      validator.** Issue #156 adds the missing structural checks to
      `Postgres::validate_table`: nonempty existing local key columns, matching
      nonempty foreign-key lists, nonempty check/filter expressions, and the
-     engine's index-width and key-type restrictions. The nullable primary-key
+     engine's index-width restrictions. The nullable primary-key
      rule remains 266's distinct refusal of a silent rewrite.
 
      **Measured on PostgreSQL 18.6:** primary and unique constraints reject a
@@ -10591,10 +10591,15 @@ SPEC is in sync with all of these.
      Refusing these would reject valid declarations. The limit is 32 columns
      **including INCLUDE**, not 32 key columns plus unlimited payload: 32
      accepts and 33 refuses with `54011`, for indexes and constraint-backed
-     indexes alike. `json` lacks a default btree operator class (`42704`) and
-     cannot be a key, but is legal as included payload; the other admitted
-     type families can be keys. Unknown types keep the catalogue's own finding
-     rather than acquiring a second speculative key-type error.
+     indexes alike. Stock PostgreSQL refuses `json` keys for lack of a default
+     btree operator class (`42704`), but accepts json included payload and the
+     other admitted type families as keys. That is **not an offline refusal**:
+     measured, installing a default json btree operator class makes primary,
+     unique, foreign and index keys legal, and the catalog reader resolves
+     installed default classes rather than hard-coding the stock ones. Key-type
+     eligibility therefore stays with the server; refusing json offline would
+     reject a valid declaration on such a server. Unknown types retain the
+     ordinary closed-catalogue finding, independently of their use in a key.
 
      Empty expressions mean ASCII whitespace only: measured, a non-breaking
      space can name a boolean column and is a legal unquoted check/filter

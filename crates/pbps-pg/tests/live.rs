@@ -3795,7 +3795,10 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         let problems = pg.validate_table(&name, &table);
         assert_eq!(
             problems.is_empty(),
-            expected.is_none(),
+            // Operator classes and FK type compatibility belong to this
+            // server, not to the offline declaration's structure. Stock json
+            // is refused here; the custom-opclass test pins the legal case.
+            expected.is_none() || matches!(expected, Some("42704" | "42804")),
             "{label}: {problems:?}"
         );
         let statements = pg
@@ -3825,6 +3828,102 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             .unwrap();
     }
     drop_schema(&mut conn, &s).await;
+}
+
+/// A server can give json a default btree class. The offline validator must
+/// not refuse a declaration that the catalog can pull and this engine creates.
+/// Roll the class back with the test: other live tests measure stock json.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn installed_default_operator_classes_can_make_json_keys_valid() {
+    let mut conn = connect().await;
+    conn.execute("BEGIN").await.unwrap();
+    let s = emit_schema("json_opclass");
+    conn.execute(&format!("CREATE SCHEMA {s}")).await.unwrap();
+    conn.execute(&format!("CREATE FUNCTION {s}.cmp(json,json) RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS 'SELECT pg_catalog.jsonb_cmp($1::jsonb,$2::jsonb)'")).await.unwrap();
+    for (function, operator) in [
+        ("lt", "<"),
+        ("le", "<="),
+        ("eq", "="),
+        ("ge", ">="),
+        ("gt", ">"),
+    ] {
+        conn.execute(&format!("CREATE FUNCTION {s}.{function}(json,json) RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS 'SELECT $1::jsonb {operator} $2::jsonb'")).await.unwrap();
+        conn.execute(&format!(
+            "CREATE OPERATOR {s}.{operator} (LEFTARG=json, RIGHTARG=json, FUNCTION={s}.{function})"
+        ))
+        .await
+        .unwrap();
+    }
+    conn.execute(&format!("CREATE OPERATOR CLASS {s}.json_ops DEFAULT FOR TYPE json USING btree AS OPERATOR 1 {s}.<, OPERATOR 2 {s}.<=, OPERATOR 3 {s}.=, OPERATOR 4 {s}.>=, OPERATOR 5 {s}.>, FUNCTION 1 {s}.cmp(json,json)")).await.unwrap();
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("j".into(), Column::new(ty("json")).not_null());
+    parent.primary_key = Some(PrimaryKey {
+        name: Some("pk".into()),
+        columns: vec!["j".into()],
+    });
+    let mut child = Table::default();
+    child.columns.insert("j".into(), Column::new(ty("json")));
+    child.unique.insert(
+        "uq".into(),
+        UniqueConstraint {
+            columns: vec!["j".into()],
+        },
+    );
+    child.indexes.insert(
+        "ix".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "j".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        },
+    );
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["j".into()],
+            references_table: TableName::new(&s, "parent"),
+            references_columns: vec!["j".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let pg = Postgres::new();
+    for (name, table) in [("parent", parent), ("child", child)] {
+        let name = TableName::new(&s, name);
+        let problems = pg.validate_table(&name, &table);
+        assert!(
+            problems.is_empty(),
+            "installed default json opclass: {problems:?}"
+        );
+        let statements = pg
+            .emit(
+                &pbps_model::Change::CreateTable {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                    name,
+                    table: Box::new(table),
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+        for statement in statements {
+            conn.execute(&statement.sql)
+                .await
+                .expect("the server supports these json keys");
+        }
+    }
+    conn.execute(&format!(
+        "INSERT INTO {s}.parent VALUES ('1'); INSERT INTO {s}.child VALUES ('1')"
+    ))
+    .await
+    .unwrap();
+    conn.execute("ROLLBACK").await.unwrap();
 }
 
 /// A rename that crosses a schema takes two statements, and each says what it
