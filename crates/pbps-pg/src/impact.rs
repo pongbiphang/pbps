@@ -179,6 +179,25 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
 /// silently matches nothing. This is the cheap filter; [`mentions`] is the
 /// exact one, and it runs here where the rules are testable without a server.
 ///
+/// The filter is two `strpos` tests rather than one, because an unquoted
+/// identifier and a quoted one are not folded the same way (DECISIONS 449).
+/// The first tests the exact quoted spelling, case untouched, and stays even
+/// though the second test alone would ordinarily catch it too. It is not
+/// there for harmless redundancy: the second test runs the *database's own*
+/// `lower()`, under whatever collation the database was created with, and a
+/// full Unicode case mapping under an ICU collation is not guaranteed to be
+/// substring-preserving — the Greek final sigma is DECISIONS 245's standing
+/// counterexample for exactly this kind of fold. Keeping the exact test
+/// beside the folded one means this query can never drop a row [`mentions`]
+/// would have accepted, whatever the collation turns out to be. The folded
+/// test is deliberately *wider* than the engine's own identifier fold, which
+/// downcases an unquoted identifier ASCII byte by byte and leaves the rest
+/// alone (DECISIONS 230, 313): that is safe here because this query only
+/// narrows which rows are worth fetching, [`mentions`] is where the engine's
+/// own ASCII-only rule is applied exactly, and a prefilter that is too wide
+/// costs an extra row scanned in Rust where one too narrow costs a referrer
+/// never reported at all.
+///
 /// **Every schema the tool did not rule out**, and not only the managed ones:
 /// an undeclared `plpgsql` function that reads a managed table is exactly the
 /// referrer nobody will notice, and it breaks the same way.
@@ -204,7 +223,8 @@ SELECT n.nspname AS schema_name,
    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                     WHERE d.classid = 'pg_catalog.pg_proc'::regclass
                       AND d.objid = p.oid AND d.deptype = 'e')
-   AND pg_catalog.strpos(p.prosrc, $1) > 0
+   AND (pg_catalog.strpos(p.prosrc, '\"' || $1 || '\"') > 0
+        OR pg_catalog.strpos(pg_catalog.lower(p.prosrc), pg_catalog.lower($1)) > 0)
  ORDER BY n.nspname, p.proname";
 
 /// Everything the catalog holds an edge to, described in the engine's own
@@ -416,6 +436,34 @@ fn text(row: &Row, column: &str) -> Result<String, DbError> {
 /// is where this parts company with the SQL Server rule it is otherwise the
 /// same as.
 ///
+/// # Unquoted folds, quoted does not (DECISIONS 449)
+///
+/// The engine downcases an *unquoted* identifier before it is stored
+/// (DECISIONS 230, 313), so a bare `EMAIL` in a routine body names the same
+/// column as `email`. A *quoted* identifier is stored exactly as written, so
+/// `"EMAIL"` and `"email"` are two different columns, and folding the quoted
+/// form too would report a routine that does not actually break — the trap
+/// this scan exists to avoid, not the one it should fall into.
+///
+/// This is why the fold only ever runs when `name` itself has no **ASCII**
+/// uppercase letter left in it. A name that does can only be in the catalog
+/// because it was created quoted: no unquoted spelling folds to it, so a bare
+/// mention that happens to share its letters case-insensitively is always
+/// naming a *different*, lower-spelled column, not this one. The test is
+/// ASCII-only on purpose and not "any uppercase letter": measured (DECISIONS
+/// 230), an unquoted `CREATE TABLE AÄ` still makes the relation `aÄ`, so a
+/// non-ASCII uppercase letter does not block the fold — only an ASCII one,
+/// which the engine's own downcasing would always have removed, does.
+///
+/// The fold is ASCII-only, [`str::to_ascii_lowercase`] rather than
+/// [`str::to_lowercase`], for the same reason `RoutineArg` and the reference
+/// scan both are (DECISIONS 230, 313): the engine downcases an unquoted
+/// identifier byte by byte and leaves the high bit alone, where Rust's
+/// Unicode fold turns one character into a name the engine never produces.
+/// `to_ascii_lowercase` also never changes a string's byte length or its char
+/// boundaries, which is what keeps the stepping rule below correct on the
+/// folded body without change.
+///
 /// # Why the step is a character and not a byte
 ///
 /// A rejected match is stepped over by the width of the name's **first
@@ -438,6 +486,28 @@ fn mentions(body: &str, name: &str) -> bool {
     if body.contains(&format!("\"{name}\"")) {
         return true;
     }
+    if bounded_match(body, name, first, false) {
+        return true;
+    }
+    // See "Unquoted folds, quoted does not" above: a name with an ASCII
+    // uppercase letter could only exist quoted, so no unquoted spelling ever
+    // names it and the fold below must not run.
+    if name != name.to_ascii_lowercase() {
+        return false;
+    }
+    bounded_match(&body.to_ascii_lowercase(), name, first, true)
+}
+
+/// One scan for a stand-alone occurrence of `name` in `body`, shared by the
+/// exact-case pass and the case-folded one.
+///
+/// `reject_quoted` is what keeps them from stepping on each other: a match
+/// immediately bounded by `"` on both sides is a quoted identifier, whose
+/// exactness is the earlier `"{name}"` check's job alone. The exact-case pass
+/// leaves it in (a same-case quoted match is also caught here, harmlessly,
+/// same as before this function existed); the case-folded pass must reject
+/// it, or `"EMAIL"` would count as the same column as `email`.
+fn bounded_match(body: &str, name: &str, first: char, reject_quoted: bool) -> bool {
     let bytes = body.as_bytes();
     let mut from = 0;
     while let Some(offset) = body[from..].find(name) {
@@ -446,7 +516,11 @@ fn mentions(body: &str, name: &str) -> bool {
         let before = start == 0 || !is_ident_byte(bytes[start - 1]);
         let after = end == bytes.len() || !is_ident_byte(bytes[end]);
         if before && after {
-            return true;
+            let quoted =
+                start > 0 && bytes[start - 1] == b'"' && end < bytes.len() && bytes[end] == b'"';
+            if !(reject_quoted && quoted) {
+                return true;
+            }
         }
         from = start + first.len_utf8();
     }
@@ -592,6 +666,48 @@ mod tests {
         assert!(mentions("SELECT @email FROM t", "email"));
         // A non-ASCII byte continues one too: `emailä` is one name.
         assert!(!mentions("SELECT emailä FROM t", "email"));
+    }
+
+    /// The engine folds an *unquoted* identifier before storing it, so a body
+    /// naming `EMAIL` or `Email` bare still names the column `email`
+    /// (DECISIONS 230, 313). The trap is the negative case: a *quoted*
+    /// `"EMAIL"` is a different column from `email`, case preserved, and
+    /// folding it too would report a routine that does not actually break.
+    #[test]
+    fn an_unquoted_mention_folds_case_and_a_quoted_one_does_not() {
+        assert!(mentions("SELECT EMAIL FROM customer", "email"));
+        assert!(mentions("SELECT Email FROM customer", "email"));
+        assert!(!mentions("SELECT \"EMAIL\" FROM customer", "email"));
+        assert!(!mentions("SELECT \"Email\" FROM customer", "email"));
+
+        // The quoted spelling still matches itself exactly, unfolded.
+        assert!(mentions("SELECT \"EMAIL\" FROM customer", "EMAIL"));
+
+        // A target whose own name carries an ASCII uppercase letter can only
+        // be in the catalog because it was created quoted — no unquoted
+        // spelling ever folds to it, so a bare, differently-cased mention
+        // names a different, lower-spelled column and must not match.
+        assert!(!mentions("SELECT EMAIL FROM customer", "Email"));
+        assert!(!mentions("SELECT email FROM customer", "Email"));
+        assert!(mentions("SELECT \"Email\" FROM customer", "Email"));
+
+        // Bounded the same way a same-case match is: `EMAILX` is one longer
+        // name, not this one, whatever the case.
+        assert!(!mentions("SELECT EMAILX FROM t", "email"));
+
+        // The regression this refactor could have introduced: a same-case
+        // quoted mention is caught by the exact `"name"` check before the
+        // case-folded scan ever runs, so its `reject_quoted` must never be
+        // allowed to shadow that earlier, unconditional acceptance.
+        assert!(mentions("SELECT \"email\" FROM customer", "email"));
+
+        // The other side of the ASCII-only line (DECISIONS 230): an
+        // unquoted `CREATE TABLE AÄ` still makes the relation `aÄ`, so a
+        // target whose name carries a *non-ASCII* uppercase letter can come
+        // from an unquoted spelling, and the fold must still run for it.
+        // Guards this against being "simplified" to
+        // `name.chars().all(char::is_lowercase)`, which would wrongly skip it.
+        assert!(mentions("SELECT AÄ FROM t", "aÄ"));
     }
 
     /// The queries have to keep the two properties the module documentation

@@ -10034,3 +10034,44 @@ SPEC is in sync with all of these.
      plainly — the model has no flag for it), a column-level grant, an owner a
      rebuild would transfer, `reloptions`, a view column default and a
      trigger's `tgenabled`.
+
+448. **The rename-impact text-body scan folds an unquoted mention, never a
+     quoted one, and only when the target's own name could have come from an
+     unquoted spelling.** 230 and 313 already settle *which* fold this engine
+     uses on an unquoted identifier — ASCII, byte by byte, high bit untouched;
+     measured, `CREATE TABLE AÄ` makes the relation `aÄ`, not `aä`. They do not
+     settle *when* `impact::mentions` should fold at all, which is this entry.
+
+     A quoted identifier is stored exactly as written, so `"EMAIL"` and
+     `email` are two different columns; folding the quoted spelling too would
+     report a routine that does not actually break, which is the finding
+     #260 was opened over. So the fold runs on the bare scan only, and the
+     `"name"` exact-quoted check stays unfolded beside it.
+
+     A target whose own catalog name still carries an ASCII uppercase letter
+     — `Email`, not `email` — got that name from being created quoted: 230's
+     `aÄ` measurement shows an unquoted spelling can leave a *non-ASCII*
+     uppercase letter in place, but never an ASCII one, since the engine
+     downcases exactly that range. So no unquoted spelling in a body could
+     ever refer to such a target, and a bare mention that happens to match it
+     case-insensitively is always naming a different, lower-spelled column.
+     The scan skips the fold entirely for such a target rather than run it and
+     rely on the quoted check to save it — a filter whose reason has gone is
+     one nobody re-reads, and the next person to touch this code would have
+     no way to tell a defensive skip from a forgotten one.
+
+     The SQL prefilter (`TEXT_BODIED_ROUTINES`) keeps its own exact quoted
+     `strpos` test beside the new case-insensitive one for a different reason:
+     the case-insensitive side runs the *database's* `lower()`, under
+     whatever collation the database was created with, not this engine's
+     identifier fold. An ICU collation's full case mapping is not guaranteed
+     substring-preserving — the Greek final sigma is DECISIONS 245's standing
+     counterexample for exactly this kind of fold. Keeping the exact test
+     beside the folded one means the prefilter can never drop a row
+     `mentions` would have accepted, whatever the database's collation turns
+     out to be; the folded test only ever widens the candidate set, and
+     `mentions` still does the precise, ASCII-only filtering in Rust.
+
+     The scan's character-width stepping (408) needed no change: ASCII-only
+     folding never changes a string's byte length or its char boundaries, so
+     the same stepping rule runs unchanged on the folded body.
