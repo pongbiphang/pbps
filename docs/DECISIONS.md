@@ -10662,7 +10662,7 @@ SPEC is in sync with all of these.
      abbreviation dictionary locally; it does not change write framing.
 
      A String alone cannot distinguish a declaration from that engine answer.
-     `PlannedChange.defaults` therefore carries the column type, source, and
+     `PlannedChange.default_resolutions` therefore carries the column type, source, and
      unresolved/canonical state keyed by full column reference. The differ
      supplies the type that `AlterColumnDefault` itself does not carry.
      `emit_planned` validates coverage and source consistency before using a

@@ -2067,7 +2067,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
                 risks: Default::default(),
                 strategy: Default::default(),
                 findings: Default::default(),
-                defaults: Default::default(),
+                default_resolutions: Default::default(),
             }],
         },
         pbps_model::IdsFile::default(),

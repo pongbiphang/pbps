@@ -378,7 +378,7 @@ pub fn diff_partial(
                 .get(&column.table)
                 .and_then(|table| table.columns.get(&column.name))
         {
-            p.defaults.insert(
+            p.default_resolutions.insert(
                 column.clone(),
                 pbps_model::PlannedDefault {
                     column_type: declaration.ty.clone(),
@@ -4186,7 +4186,11 @@ mod tests {
                 to: "new".into(),
             }],
         );
-        let defaults: BTreeMap<_, _> = cs.changes.iter().flat_map(|p| p.defaults.iter()).collect();
+        let defaults: BTreeMap<_, _> = cs
+            .changes
+            .iter()
+            .flat_map(|p| p.default_resolutions.iter())
+            .collect();
         assert_eq!(defaults.len(), 2);
         for at in ["dbo.t.new", "other.t.new"] {
             let d = defaults[&at.parse::<pbps_model::ColumnRef>().unwrap()];
@@ -4196,7 +4200,12 @@ mod tests {
         }
         assert!(!defaults.contains_key(&"dbo.t.old".parse::<pbps_model::ColumnRef>().unwrap()));
         let unchanged = run(&want, &want, &[]);
-        assert!(unchanged.changes.iter().all(|p| p.defaults.is_empty()));
+        assert!(
+            unchanged
+                .changes
+                .iter()
+                .all(|p| p.default_resolutions.is_empty())
+        );
     }
 
     /// A new table's columns ride along in CreateTable; no per-column AddColumn

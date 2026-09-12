@@ -87,7 +87,7 @@ async fn canonical_default_plan_replays_under_hostile_settings_for_every_sensiti
     let replay: pbps_model::ChangeSet = serde_json::from_str(&json).unwrap();
     assert_eq!(
         replay.changes[0]
-            .defaults
+            .default_resolutions
             .values()
             .filter(|d| matches!(
                 d.resolution,

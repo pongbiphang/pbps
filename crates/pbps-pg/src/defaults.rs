@@ -81,13 +81,13 @@ fn declared(p: &PlannedChange) -> BTreeMap<ColumnRef, (&str, Option<&ColumnType>
 
 fn validate(p: &PlannedChange) -> Result<(), DialectError> {
     let expected = declared(p);
-    if expected.len() != p.defaults.len() {
+    if expected.len() != p.default_resolutions.len() {
         return Err(invalid(
             "default plan context is missing or contains extra entries; regenerate the plan",
         ));
     }
     for (at, (source, ty)) in expected {
-        let Some(d) = p.defaults.get(&at) else {
+        let Some(d) = p.default_resolutions.get(&at) else {
             return Err(invalid(format!("default plan context is missing {at}")));
         };
         if source != d.source || ty.is_some_and(|ty| ty != &d.column_type) {
@@ -111,7 +111,7 @@ pub(crate) fn emit(
 ) -> Result<Vec<Statement>, DialectError> {
     validate(p)?;
     let mut change = p.change.clone();
-    for (at, d) in &p.defaults {
+    for (at, d) in &p.default_resolutions {
         match (&d.resolution, needs_resolution(&d.column_type, &d.source)?) {
             (DefaultResolution::Unresolved, true) => {
                 return Err(invalid(format!(
@@ -265,7 +265,7 @@ pub async fn resolve(conn: &mut pbps_db::Conn, cs: &mut ChangeSet) -> Result<(),
         validate(p)?;
     }
     if !cs.changes.iter().any(|p| {
-        p.defaults
+        p.default_resolutions
             .values()
             .any(|d| needs_resolution(&d.column_type, &d.source).unwrap_or(false))
     }) {
@@ -278,7 +278,7 @@ pub async fn resolve(conn: &mut pbps_db::Conn, cs: &mut ChangeSet) -> Result<(),
         conn.execute("SET LOCAL timezone_abbreviations = 'Default'").await?;
         let mut resolved = cs.clone();
         for p in &mut resolved.changes {
-            for d in p.defaults.values_mut() {
+            for d in p.default_resolutions.values_mut() {
                 if !needs_resolution(&d.column_type, &d.source)? { continue; }
                 let ty = builtin(&d.column_type.to_string())?;
                 let expression = input(&d.source)?;
@@ -340,7 +340,11 @@ mod tests {
     #[test]
     fn saved_resolution_emits_canonical_text_but_records_the_declaration() {
         let mut p = add("date", "'01/02/2026'::date");
-        p.defaults.values_mut().next().unwrap().resolution = DefaultResolution::Canonical {
+        p.default_resolutions
+            .values_mut()
+            .next()
+            .unwrap()
+            .resolution = DefaultResolution::Canonical {
             rendered: "'2026-01-02'::date".into(),
         };
         let cs = ChangeSet { changes: vec![p] };
@@ -364,21 +368,23 @@ mod tests {
         let pg = crate::Postgres::new();
         let p = add("date", "'01/02/2026'::date");
         let mut missing = p.clone();
-        missing.defaults.clear();
+        missing.default_resolutions.clear();
         assert!(pg.emit_planned(&missing).is_err());
         let mut wrong = p.clone();
-        let (_, d) = wrong.defaults.pop_first().unwrap();
-        wrong.defaults.insert("other.t.d".parse().unwrap(), d);
+        let (_, d) = wrong.default_resolutions.pop_first().unwrap();
+        wrong
+            .default_resolutions
+            .insert("other.t.d".parse().unwrap(), d);
         assert!(pg.emit_planned(&wrong).is_err());
         let mut extra = p.clone();
-        extra.defaults.insert(
+        extra.default_resolutions.insert(
             "public.t.other".parse().unwrap(),
-            p.defaults.values().next().unwrap().clone(),
+            p.default_resolutions.values().next().unwrap().clone(),
         );
         assert!(pg.emit_planned(&extra).is_err());
         for field in ["source", "type"] {
             let mut stale = p.clone();
-            let d = stale.defaults.values_mut().next().unwrap();
+            let d = stale.default_resolutions.values_mut().next().unwrap();
             if field == "source" {
                 d.source = "'other'".into();
             } else {

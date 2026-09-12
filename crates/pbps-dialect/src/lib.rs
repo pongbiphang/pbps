@@ -1534,7 +1534,7 @@ pub trait Dialect {
         &self,
         planned: &pbps_model::PlannedChange,
     ) -> Result<Vec<Statement>, DialectError> {
-        if planned.defaults.values().any(|d| {
+        if planned.default_resolutions.values().any(|d| {
             matches!(
                 d.resolution,
                 pbps_model::DefaultResolution::Canonical { .. }

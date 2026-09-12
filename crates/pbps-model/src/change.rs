@@ -1861,7 +1861,7 @@ pub struct PlannedChange {
     /// Plan-time facts, not declaration state: the source remains in `change`
     /// so recording a deployment never replaces the human's declaration.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defaults: BTreeMap<ColumnRef, PlannedDefault>,
+    pub default_resolutions: BTreeMap<ColumnRef, PlannedDefault>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1944,7 +1944,7 @@ impl PlannedChange {
             risks,
             strategy: Strategy::default(),
             findings: Vec::new(),
-            defaults,
+            default_resolutions: defaults,
         }
     }
 
