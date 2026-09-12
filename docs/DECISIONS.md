@@ -9848,3 +9848,31 @@ SPEC is in sync with all of these.
     diffing the original baseline against the final state, pin both name-reuse
     cases, and require both dialects to ignore dropped cells even when their
     names coincide with surviving predicate cells.
+
+443. **A column's collation is reported against the connected database's own
+    default, not against every explicit `COLLATE`.**
+    `sys.columns.collation_name` was read nowhere before this fix (#94): a
+    column `COLLATE`d away from its declared type read back as the plain
+    type, with no word, so a bootstrap onto a fresh database silently changed
+    what every comparison, unique constraint and index seek on it meant. The
+    model still holds no collation — modelling it ripples into the emitter,
+    the differ and the risk classifier, a larger and separate issue — so the
+    fix reports a `Limitation` naming the column, the shape already used for
+    a clustered index and a computed column, rather than modelling it.
+
+    The baseline is `DATABASEPROPERTYEX(DB_NAME(), 'Collation')`, the
+    connected (source) database's own default — not "any explicit `COLLATE`"
+    and not "every collated column." Measured on a live server: a character
+    column declared with no `COLLATE` at all, and one declared with an
+    explicit `COLLATE` that happens to repeat the database's own default, are
+    byte-for-byte identical in `sys.columns.collation_name` — the catalog does
+    not remember whether a matching collation was inherited or spelled out.
+    "Any explicit `COLLATE`" as the baseline would flag the second column
+    though the emitter reproduces it for free by writing none at all; "every
+    collated column" would flag both, and every ordinary character column in
+    the database besides, drowning the one that matters in noise.
+
+    This closes only the column-level gap. A column that matches its *source*
+    database's default still lands under whatever default the *target* a
+    bootstrap runs against happens to have, and nothing here compares the two
+    — that mismatch is #406, not this entry.

@@ -916,7 +916,8 @@ async fn pull_warns_about_what_it_cannot_express() {
                  price money NOT NULL,
                  qty int NOT NULL,
                  total AS (price * qty),
-                 doc xml NULL
+                 doc xml NULL,
+                 code varchar(20) COLLATE Latin1_General_BIN2 NULL
              );",
         )
         .await
@@ -954,6 +955,19 @@ async fn pull_warns_about_what_it_cannot_express() {
             .iter()
             .any(|w| w.contains("cx_plain") && w.contains("clustered")),
         "{:?}",
+        pulled.warnings
+    );
+    assert!(
+        legacy.columns.contains_key("code"),
+        "a non-default collation is unmodelled, not the column itself"
+    );
+    assert!(
+        pulled
+            .warnings
+            .iter()
+            .any(|w| w.contains("code") && w.contains("Latin1_General_BIN2")),
+        "a column pulled off a real server with an explicit COLLATE must be \
+         reported, the way issue #94 asked for: {:?}",
         pulled.warnings
     );
 }
