@@ -300,12 +300,12 @@ pub struct RawCatalog {
     /// measured against — the source's own default, not any explicit
     /// `COLLATE` and not every collated column (DECISIONS 443): a character
     /// column with no explicit `COLLATE` inherits exactly this name, so a
-    /// column whose collation differs from it is the one case that needs a
-    /// word — a matching collation, explicit or inherited, is
+    /// column whose collation differs from it needs an object-level
+    /// limitation. A matching collation, explicit or inherited, is
     /// indistinguishable in the catalog and, emitting no `COLLATE` clause, is
     /// reproduced for free *onto a database whose own default is this same
-    /// name*. Bootstrapping onto one whose default differs is a separate gap
-    /// this baseline does not cover (issue #406).
+    /// name*. A database-level warning names this default whenever character
+    /// columns exist, because the declarations cannot carry it to a target.
     pub database_collation: String,
 }
 
@@ -643,6 +643,30 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut unsupported_temporal_tables = BTreeSet::new();
     let mut unavailable_object_ids = BTreeSet::new();
 
+    // This is source-database context, not a limitation of a managed object:
+    // attributing it to a table would refuse valid same-default deployments.
+    // COLUMNS also reads system objects and the ledger; only inventoried user
+    // tables count. Collation covers character aliases and computed columns too.
+    let user_table_ids: BTreeSet<_> = raw.tables.iter().map(|table| table.object_id).collect();
+    if raw
+        .columns
+        .iter()
+        .any(|column| column.collation.is_some() && user_table_ids.contains(&column.object_id))
+    {
+        push_limitation(
+            &mut warnings,
+            &mut limitations,
+            None,
+            format!(
+                "source database default collation `{}` is not recorded in the declarations; \
+                 character columns bootstrapped onto a target with a different default \
+                 may have different comparison semantics; ensure the target database \
+                 uses this default before bootstrapping",
+                raw.database_collation
+            ),
+        );
+    }
+
     for t in &raw.tables {
         // Both halves of active versioning, and a current table whose period
         // remains after versioning is disabled, must stay unmanaged. Declaring
@@ -746,9 +770,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // explicitly — round-trips for free *onto a database whose own
         // default is the same*: the emitter writes no `COLLATE`, so the
         // column is created under whatever default the target has.
-        // Bootstrapping onto a database with a different default is not
-        // covered here — nothing compares this baseline with the target's
-        // (issue #406). Anything that differs from the source's own default
+        // The database-level warning above names that source default; nothing
+        // compares it with the target's. Anything differing from the source default
         // is a difference the declaration cannot hold regardless of target;
         // reported here rather than dropped, the way a clustered index is
         // (`index_type_name` above), so an operator can find it instead of a
@@ -1442,6 +1465,10 @@ mod tests {
             "only the collation is unmodelled; the column itself stays declared"
         );
         assert_eq!(pulled.limitations.len(), 1, "{:?}", pulled.limitations);
+        assert_eq!(pulled.warnings.len(), 2, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("source database default collation `Latin1_General_CI_AS`")
+        );
         assert_eq!(
             pulled.limitations[0].target.object_name(),
             TableName::new("dbo", "customer")
@@ -1457,12 +1484,10 @@ mod tests {
         );
     }
 
-    /// The common case — no explicit `COLLATE`, or one that only repeats the
-    /// database's own default — must not be reported: every character column
-    /// in an ordinary database would otherwise carry a limitation, drowning
-    /// the one that matters.
+    /// Matching columns need one database-level notice, not one limitation per
+    /// column: the declarations cannot carry the source's default to a target.
     #[test]
-    fn a_column_collation_matching_the_database_default_is_not_reported() {
+    fn matching_character_columns_report_the_source_default_once() {
         let mut inherited = raw_column(10, "code", "varchar");
         inherited.collation = Some("Latin1_General_CI_AS".into());
         let mut explicit = raw_column(10, "code2", "varchar");
@@ -1480,7 +1505,51 @@ mod tests {
         let pulled = assemble(&raw);
 
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("source database default collation `Latin1_General_CI_AS`")
+        );
+        assert!(pulled.warnings[0].contains("target"));
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("dbo", "customer")]
+                .columns
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn catalogs_without_character_columns_do_not_report_a_database_collation() {
+        for columns in [vec![], vec![raw_column(10, "amount", "int")]] {
+            let raw = RawCatalog {
+                tables: if columns.is_empty() {
+                    vec![]
+                } else {
+                    vec![raw_table(10, "dbo", "customer")]
+                },
+                columns,
+                database_collation: "Latin1_General_CI_AS".into(),
+                ..Default::default()
+            };
+            let pulled = assemble(&raw);
+            assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+            assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+        }
+    }
+
+    #[test]
+    fn character_columns_outside_the_user_table_inventory_do_not_report_a_database_collation() {
+        let mut system_column = raw_column(99, "name", "nvarchar");
+        system_column.collation = Some("Latin1_General_CI_AS".into());
+        let raw = RawCatalog {
+            tables: vec![raw_table(10, "dbo", "numeric_only")],
+            columns: vec![raw_column(10, "amount", "int"), system_column],
+            database_collation: "Latin1_General_CI_AS".into(),
+            ..Default::default()
+        };
+        let pulled = assemble(&raw);
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
     }
 
     fn one_table_catalog() -> RawCatalog {
