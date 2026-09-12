@@ -5499,10 +5499,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(read_back_under_concurrent_ddl());
+        rt.block_on(async {
+            read_back_under_concurrent_ddl(false).await;
+            read_back_under_concurrent_ddl(true).await;
+        });
     }
 
-    async fn read_back_under_concurrent_ddl() {
+    async fn read_back_under_concurrent_ddl(interrupted: bool) {
         let database = crate::test_pg::TestDb::create("capture").await;
         let mut reader = database.connect().await;
         let mut writer = database.connect().await;
@@ -5522,6 +5525,20 @@ mod tests {
             shared[0].try_get::<&str>("name").unwrap()
         );
         let churn_schema = format!("pbps_sibling_{}", std::process::id());
+        if interrupted {
+            sibling
+                .execute(&format!(
+                    "CREATE SCHEMA {churn_schema}; CREATE TABLE {churn_schema}.t (id integer)"
+                ))
+                .await
+                .unwrap();
+        }
+        // The shared server survives interrupted runs, including their last
+        // churn table; PID reuse must not prevent the read-back assertions.
+        sibling
+            .execute(&format!("DROP SCHEMA IF EXISTS {churn_schema} CASCADE"))
+            .await
+            .unwrap();
         sibling
             .execute(&format!("CREATE SCHEMA {churn_schema}"))
             .await
