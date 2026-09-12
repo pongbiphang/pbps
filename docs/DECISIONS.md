@@ -10228,6 +10228,56 @@ SPEC is in sync with all of these.
     parent row is therefore always independently caught, on the same plan,
     by a probe that does not depend on `planned_key_probes` at all.
 
+    **A later round found a second, distinct parent-side gap: the exclusion
+    is a count-time filter, not an evaluation barrier, and this entry
+    should not be read as claiming otherwise.** `excluded_p`/`excluded_q`
+    are `AND NOT` terms in the *same* flat `WHERE`-clause conjunct list,
+    inside the *same* correlated `EXISTS` subquery, as the
+    `CAST(p.<column> AS ...)` / `CAST(q.<column> AS ...)` that `tuple()`
+    emits for the comparison itself. PostgreSQL does not promise an
+    evaluation order for the conjuncts of a `WHERE` clause: nothing here
+    guarantees the guard runs before the cast beside it, so on the parent
+    side an out-of-range value can still raise, leaving this key's own
+    probe reported as *unchecked* rather than counted or excluded. **This
+    repo has already been bitten by exactly this class**, and the fence for
+    it is a precedent, not a surprise: DECISIONS 324 records the spelling
+    queries needed an `OFFSET 0` fence because the planner folded a
+    single-row `VALUES` list into a `Result` node and evaluated a cast at
+    planning time, before the guard meant to protect it ran. Same shape —
+    an `AND`/`CASE` beside a raising expression is not a barrier unless
+    something forces the order — a different query and a different guard
+    here.
+
+    The bound is the same rank-9 argument just given, aimed at *this* risk
+    instead of the over-count one: `raise_guard` only fires for a column
+    the same plan retypes, so a parent row this ordering hazard can reach
+    belongs to a table whose `AlterColumnType` change carries its own,
+    unconditional conversion probe (387) — one that counts by evaluating
+    `cannot_become`'s predicate directly, never attempting the `CAST`
+    itself, so it cannot raise the way this key's own guarded comparison
+    can. That `ALTER` runs at rank 9, strictly before any `DELETE`
+    (DECISIONS 340), so a row that cannot survive the retype has already
+    refused the whole plan before any delete this key's probe exists to
+    protect could run. What a parent-side raise costs here is only this
+    key's own report of a row a different, unconditional probe was always
+    going to refuse the plan over — not an orphan escaping undetected, not
+    a wrong recording — which is why it is deferred rather than fixed on
+    this PR (issue #435), not answered by the rank-9 bound being reused
+    from above: the bound is the same, the risk it is bounding is not.
+
+    **The child-side guard is not exposed to this.** `excluded_ch` is not a
+    conjunct inside the correlated `EXISTS`'s own `WHERE` list at all — it
+    is ANDed against the *result* of the whole parenthesized
+    `EXISTS`-based expression, one level outside it (`as_backfilled =
+    format!("({}){excluded_ch}", references(&|_| None))`). The child's own
+    `CAST`, reached only from inside that subquery, does not share a flat
+    conjunct list with its guard the way `p`/`q` do, so this hazard has no
+    child-side counterpart. This PR's own live coverage narrows only the
+    child column — the shape that cannot hit this gap — so it exercises
+    none of what this paragraph describes; a fixture that narrows the
+    *parent*'s column is what issue #435 needs before an expression barrier
+    there can be verified.
+
     **Where `cannot_become` returns `None` for a pair that is `Narrowing`
     (not `Safe`), this builds the plain, unguarded `CAST` — exactly
     `origin/master`'s own behaviour, left alone rather than papered over.**
