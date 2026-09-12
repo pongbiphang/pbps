@@ -97,6 +97,9 @@ pub enum Needed {
     /// `public` for the rest of the project's life.
     LedgerCreation,
 
+    /// Ownership of an existing state ledger only while its columns need migration.
+    LedgerMigration,
+
     /// Held on the ledger's schema for as long as the ledger is used.
     ///
     /// `USAGE`, which is not spent when the tables are created and is not
@@ -156,7 +159,12 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// or `GRANT <owning role> TO <deployer>`, and the caller writes it.
 pub const OWNERSHIP: &str = "OWNERSHIP";
 
-pub const REQUIRED: [Requirement; 12] = [
+pub const REQUIRED: [Requirement; 13] = [
+    req(
+        OWNERSHIP,
+        "adding the timeline columns to an existing pre-migration state ledger",
+        Needed::LedgerMigration,
+    ),
     req(
         "USAGE",
         "naming anything inside a schema pbps manages",
@@ -334,6 +342,9 @@ pub struct Held {
     /// Per ledger table that exists, what is held on it. Empty before the
     /// first deployment, in which case [`missing`] falls back to the schema.
     pub ledger_objects: BTreeMap<ObjectName, TableRights>,
+
+    /// The existing state table lacks the columns `ensure_tables` adds.
+    pub ledger_migration_needed: bool,
 
     /// Per managed table that exists, what is held on it.
     pub tables: BTreeMap<ObjectName, TableRights>,
@@ -629,6 +640,9 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
         }
     }
 
+    held.ledger_migration_needed = held.ledger_objects.contains_key(&ledger_tables()[0])
+        && !crate::state::timeline_columns_present(conn).await?;
+
     for (object, present, rights) in read_tables(conn, ask.referenced, &REFERENCED_KINDS).await? {
         if present {
             held.referenced_objects.insert(object, rights);
@@ -790,6 +804,19 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 }
             }
             Needed::LedgerCreation => {}
+            Needed::LedgerMigration => {
+                let state = &ledger_tables()[0];
+                if held.ledger_migration_needed
+                    && let Some(rights) = held.ledger_objects.get(state)
+                    && !rights.owned
+                {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Object(state.clone()),
+                    });
+                }
+            }
             // Not spent when the ledger is created, unlike the branch above:
             // every statement that names the ledger needs it, for as long as
             // the ledger is used.
@@ -888,6 +915,37 @@ fn optional_flag(row: &pbps_db::Row, column: &str) -> Result<Option<bool>, DbErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_ownership_is_scoped_to_the_existing_state_table() {
+        let mut held = Held {
+            ledger_migration_needed: true,
+            ledger_schema: Some(SchemaRights {
+                usage: true,
+                create: true,
+            }),
+            ..Held::default()
+        };
+        for existing in [
+            None,
+            Some(ledger_tables()[1].clone()),
+            Some(ledger_tables()[0].clone()),
+        ] {
+            held.ledger_objects.clear();
+            if let Some(object) = existing.clone() {
+                held.ledger_objects
+                    .insert(object, rights(false, &["SELECT", "INSERT", "DELETE"]));
+            }
+            let gaps = missing(&held);
+            assert_eq!(
+                gaps.len(),
+                usize::from(existing == Some(ledger_tables()[0].clone())),
+                "{gaps:?}"
+            );
+        }
+        held.ledger_migration_needed = false;
+        assert!(missing(&held).is_empty());
+    }
 
     fn object(schema: &str, name: &str) -> ObjectName {
         ObjectName {

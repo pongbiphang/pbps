@@ -210,7 +210,7 @@ SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at,
 const TIMELINE_COLUMNS_PROBE: &str = "SELECT CASE WHEN COL_LENGTH('dbo.__pbps_state', 'state_version') IS NULL \
      THEN 0 ELSE 1 END AS present;";
 
-async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
+pub(crate) async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
     let rows = conn.query(TIMELINE_COLUMNS_PROBE).await?;
     let present: i32 = get(&rows[0], "present")?;
     Ok(present != 0)
@@ -270,11 +270,8 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
 ///
 /// The driver's own message for a denied `ALTER` — measured, Msg 1088,
 /// "Cannot find the object ... because it does not exist or you do not have
-/// permissions" — names neither. `doctor` does not yet ask for `ALTER` on an
-/// existing ledger (it asks only while the table is being created,
-/// [`crate::doctor::Needed::LedgerCreation`]), so an operator meeting this for
-/// the first time has no readiness check that would have warned them; that
-/// gap is reported beside this change, not closed by it.
+/// permissions" — names neither. `doctor` asks for this right before migration,
+/// but callers that deploy without running it still need an actionable error.
 async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
     conn.execute(ADD_TIMELINE_COLUMNS).await.map_err(|e| {
         let code = e.server_error_code();

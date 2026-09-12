@@ -615,7 +615,7 @@ fn relkind_name(relkind: &str) -> &'static str {
 /// this can be asked before [`migrate_timeline_columns`] decides whether to
 /// send `ALTER TABLE` at all — which this engine's ownership rule makes
 /// mandatory rather than an optimization (see that function's doc comment).
-async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
+pub(crate) async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
     let rows = conn.query(&timeline_columns_probe()).await?;
     let present: i64 = rows
         .first()
@@ -640,10 +640,9 @@ fn timeline_columns_probe() -> String {
 /// [`timeline_columns_present`] says they are not there yet.
 ///
 /// The failure is rewritten rather than passed through: `must be owner of
-/// table t` names neither the ledger nor what the `ALTER` was for, and
-/// `doctor` does not yet ask for ownership of an *existing* ledger (only
-/// [`crate::doctor::Needed::LedgerCreation`], while it does not exist yet) —
-/// a gap reported alongside this change, not closed by it.
+/// table t` names neither the ledger nor what the `ALTER` was for. `doctor`
+/// asks for ownership before migration, but callers that deploy without
+/// running it still need an actionable error.
 async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
     if timeline_columns_present(conn).await? {
         return Ok(());

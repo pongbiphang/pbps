@@ -64,6 +64,9 @@ pub enum Needed {
     /// the over-demand coming back.
     LedgerCreation,
 
+    /// Held on an existing state ledger only while its columns need migration.
+    LedgerMigration,
+
     /// Needed only on the ledger and the lock themselves.
     ///
     /// Asked for on those two **objects**, not on their schema. A careful DBA
@@ -211,7 +214,12 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 20] = [
+pub const REQUIRED: [Requirement; 21] = [
+    req(
+        "ALTER",
+        "adding the timeline columns to an existing pre-migration state ledger",
+        Needed::LedgerMigration,
+    ),
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -418,6 +426,9 @@ pub struct Held {
     /// Empty when the ledger does not exist yet, in which case [`missing`]
     /// falls back to the schema answer.
     pub ledger_objects: BTreeMap<ObjectName, BTreeSet<String>>,
+
+    /// The existing state table lacks the columns `ensure_tables` adds.
+    pub ledger_migration_needed: bool,
 
     /// Per foreign-key target outside the managed schemas, the permissions
     /// effective on that **object**.
@@ -1103,7 +1114,7 @@ pub async fn permissions(
         .collect();
     let ledger_perms: Vec<&str> = REQUIRED
         .iter()
-        .filter(|r| matches!(r.needed, Needed::Ledger))
+        .filter(|r| matches!(r.needed, Needed::Ledger | Needed::LedgerMigration))
         .map(|r| r.name)
         .collect();
 
@@ -1172,6 +1183,10 @@ pub async fn permissions(
         Columns::Catalog,
     )
     .await?;
+    // Only a visible existing table can need this migration. Absent or hidden
+    // ledger objects retain their existing creation/DML readiness reports.
+    let ledger_migration_needed = ledger_objects.contains_key(&ledger_tables()[0])
+        && !crate::state::timeline_columns_present(conn).await?;
 
     // The declared data tables at object scope, `Existing::Only` like the
     // ledger and for the ledger's reason: a table this deployment has still to
@@ -1426,6 +1441,7 @@ pub async fn permissions(
         absent_schemas,
         ledger_schema,
         ledger_objects,
+        ledger_migration_needed,
         referenced_objects,
         roles_declared,
         granted_objects,
@@ -1560,6 +1576,19 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 }
             }
             Needed::LedgerCreation => {}
+            Needed::LedgerMigration => {
+                let state = &ledger_tables()[0];
+                if held.ledger_migration_needed
+                    && let Some(granted) = held.ledger_objects.get(state)
+                    && !granted.contains(r.name)
+                {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Object(state.clone()),
+                    });
+                }
+            }
             // The scope is chosen per table, not once for the pair. A table
             // that exists can only be answered at object scope, because that is
             // where a careful DBA's grant sits; a table that does not exist yet
@@ -1732,6 +1761,36 @@ mod tests {
     use super::*;
     use pbps_model::schema::Table;
 
+    #[test]
+    fn migration_alter_is_scoped_to_the_existing_state_table() {
+        let mut held = everything(&[]);
+        held.ledger_migration_needed = true;
+        for existing in [
+            None,
+            Some(ledger_tables()[1].clone()),
+            Some(ledger_tables()[0].clone()),
+        ] {
+            held.ledger_objects.clear();
+            if let Some(object) = existing.clone() {
+                held.ledger_objects.insert(
+                    object,
+                    ["SELECT", "INSERT", "DELETE"]
+                        .map(str::to_owned)
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            let gaps = missing(&held);
+            assert_eq!(
+                gaps.len(),
+                usize::from(existing == Some(ledger_tables()[0].clone())),
+                "{gaps:?}"
+            );
+        }
+        held.ledger_migration_needed = false;
+        assert!(missing(&held).is_empty());
+    }
+
     /// Every schema-scoped permission on every asked schema, and every
     /// database-scoped one on the database.
     fn everything(schemas: &[&str]) -> Held {
@@ -1763,6 +1822,7 @@ mod tests {
                 .map(|r| r.name.to_owned())
                 .collect(),
             ledger_objects: BTreeMap::new(),
+            ledger_migration_needed: false,
             referenced_objects: BTreeMap::new(),
             roles_declared: false,
             granted_objects: BTreeMap::new(),
@@ -3016,6 +3076,7 @@ mod tests {
             absent_schemas: BTreeSet::new(),
             ledger_schema: BTreeSet::new(),
             ledger_objects: BTreeMap::new(),
+            ledger_migration_needed: false,
             referenced_objects: BTreeMap::new(),
             roles_declared: false,
             granted_objects: BTreeMap::new(),
@@ -3034,6 +3095,7 @@ mod tests {
                 !matches!(
                     r.needed,
                     Needed::Referenced
+                        | Needed::LedgerMigration
                         | Needed::RoleAdmin
                         | Needed::Granted
                         | Needed::DataInsert

@@ -1177,6 +1177,12 @@ create-time `ALTER` on the ledger's schema is required only while the ledger
 tables are still missing — per table, since `ensure_tables` recreates whichever
 one is gone.
 
+An existing `__pbps_state` that still needs the timeline columns also requires
+`ALTER` on that object (SQL Server), or ownership/equivalent (PostgreSQL).
+Readiness uses the same read-only shape probe as the ledger migration. Once
+the columns exist, this migration right is no longer required; `__pbps_lock`
+does not need it.
+
 **One permission is deliberately absent, and the gap is recorded rather than
 covered.** A rename that moves a table between schemas is emitted as
 `ALTER SCHEMA ... TRANSFER`, which the engine authorizes with `CONTROL` on the
