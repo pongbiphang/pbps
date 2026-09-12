@@ -31,6 +31,13 @@ use pbps_model::{
 /// A situation that cannot be decided automatically and needs a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
+    /// A later diagnosis depends on this contested table rename having won.
+    /// Keep the diagnosis visible without presenting declaration order as intent.
+    ProvisionalTableIdentity {
+        from: TableName,
+        to: TableName,
+        blocker: Box<Blocker>,
+    },
     /// One table both lost and gained columns.
     AmbiguousColumns {
         table: TableName,
@@ -210,6 +217,30 @@ fn resolve_with_provenance(
         &mut blockers,
         &mut used,
     );
+    let mut provisional_tables: BTreeMap<TableName, BTreeSet<(TableName, TableName)>> =
+        BTreeMap::new();
+    for (_, from, to) in &r.renamed_tables {
+        for b in &blockers {
+            if let Blocker::ConflictingRenameIntents { intents, .. } = b
+                && intents.contains(&Intent::RenameTable {
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+            {
+                // The losing destination being new is provisional too: its
+                // column annotations could match if it received this identity.
+                for intent in intents {
+                    if let Intent::RenameTable { to: scope, .. } = intent {
+                        provisional_tables
+                            .entry(scope.clone())
+                            .or_default()
+                            .insert((from.clone(), to.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let column_blockers_start = blockers.len();
     resolve_columns(
         declared,
         intents,
@@ -219,6 +250,7 @@ fn resolve_with_provenance(
         &mut blockers,
         &mut used,
     );
+    let column_blockers = column_blockers_start..blockers.len();
     // Not "appeared" like tables and columns: a module carries no identity
     // to mint (ADR-0002, DECISIONS 200 — a view/routine/trigger is compared
     // by its own name every run, never assigned a `Uid`), so there is no
@@ -321,6 +353,56 @@ fn resolve_with_provenance(
         sort_resolution(&mut r);
         Ok(r)
     } else {
+        // Annotate only after bookkeeping has seen the original blockers:
+        // contenders must still be excluded from the unused-intent sweep.
+        // Roles and invalid names do not depend on a table identity.
+        for (index, blocker) in blockers.iter_mut().enumerate() {
+            let table = match blocker {
+                Blocker::AmbiguousColumns { table, .. } => Some(table.clone()),
+                Blocker::DropColumnNeedsReason { column } => Some(column.table.clone()),
+                Blocker::ConflictingRenameIntents { intents, .. } => {
+                    intents.first().and_then(|i| {
+                        if let Intent::RenameColumn { table, .. } = i {
+                            Some(table.clone())
+                        } else {
+                            None
+                        }
+                    })
+                }
+                Blocker::UnusedIntent { intent } => match intent {
+                    Intent::RenameColumn { table, .. } => Some(table.clone()),
+                    Intent::DropColumn { column, .. } => Some(column.table.clone()),
+                    Intent::RenameTable { .. }
+                    | Intent::DropTable { .. }
+                    | Intent::RenameRole { .. }
+                    | Intent::DropRole { .. } => None,
+                },
+                Blocker::RenameTargetExists { target } if column_blockers.contains(&index) => {
+                    provisional_tables
+                        .keys()
+                        .find(|table| target.starts_with(&format!("{table}.")))
+                        .cloned()
+                }
+                Blocker::ProvisionalTableIdentity { .. }
+                | Blocker::AmbiguousTables { .. }
+                | Blocker::DropTableNeedsReason { .. }
+                | Blocker::AmbiguousRoles { .. }
+                | Blocker::DropRoleNeedsReason { .. }
+                | Blocker::RenameTargetExists { .. }
+                | Blocker::UnrepresentableName { .. } => None,
+            };
+            if let Some(table) = table
+                && let Some(assumptions) = provisional_tables.get(&table)
+            {
+                for (from, to) in assumptions.iter().rev() {
+                    *blocker = Blocker::ProvisionalTableIdentity {
+                        from: from.clone(),
+                        to: to.clone(),
+                        blocker: Box::new(blocker.clone()),
+                    };
+                }
+            }
+        }
         Err(blockers)
     }
 }

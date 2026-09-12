@@ -47,25 +47,28 @@ pub fn blockers(list: &[Blocker]) -> String {
 /// of how to resolve an ambiguity, and a second one written for JSON would drift
 /// from it the first time a command gained a flag.
 pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
-    let id = match b {
-        Blocker::AmbiguousColumns { .. } => "identity.ambiguous-columns",
-        Blocker::AmbiguousTables { .. } => "identity.ambiguous-tables",
-        Blocker::DropColumnNeedsReason { .. } => "identity.drop-column-needs-reason",
-        Blocker::DropTableNeedsReason { .. } => "identity.drop-table-needs-reason",
-        Blocker::AmbiguousRoles { .. } => "identity.ambiguous-roles",
-        Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
-        Blocker::UnusedIntent { .. } => "identity.unused-intent",
-        Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
-        Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
-        Blocker::UnrepresentableName { .. } => "identity.unrepresentable-name",
-    };
+    fn id(b: &Blocker) -> &'static str {
+        match b {
+            Blocker::ProvisionalTableIdentity { blocker, .. } => id(blocker),
+            Blocker::AmbiguousColumns { .. } => "identity.ambiguous-columns",
+            Blocker::AmbiguousTables { .. } => "identity.ambiguous-tables",
+            Blocker::DropColumnNeedsReason { .. } => "identity.drop-column-needs-reason",
+            Blocker::DropTableNeedsReason { .. } => "identity.drop-table-needs-reason",
+            Blocker::AmbiguousRoles { .. } => "identity.ambiguous-roles",
+            Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
+            Blocker::UnusedIntent { .. } => "identity.unused-intent",
+            Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
+            Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
+            Blocker::UnrepresentableName { .. } => "identity.unrepresentable-name",
+        }
+    }
     let text = one_blocker(b);
     // The first line says what happened; the rest are the commands.
     let (message, remedy) = match text.split_once("\n\n") {
         Some((head, tail)) => (head.trim().to_owned(), tail.trim().to_owned()),
         None => (text.trim().to_owned(), String::new()),
     };
-    let f = crate::output::Finding::error(id, message);
+    let f = crate::output::Finding::error(id(b), message);
     if remedy.is_empty() {
         f
     } else {
@@ -76,6 +79,10 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
 fn one_blocker(b: &Blocker) -> String {
     let why = placeholder("why");
     match b {
+        Blocker::ProvisionalTableIdentity { from, to, blocker } => format!(
+            "  if {from} -> {to} is what you meant (provisional table identity):\n{}",
+            one_blocker(blocker)
+        ),
         Blocker::AmbiguousColumns {
             table,
             disappeared,
@@ -1109,6 +1116,49 @@ mod tests {
         assert!(
             f.remedy.as_deref().is_some_and(|r| r.contains("keep one")),
             "{f:?}"
+        );
+    }
+
+    #[test]
+    fn provisional_blockers_keep_their_finding_id_and_render_the_assumption_in_human_and_json() {
+        let conflict = Blocker::ConflictingRenameIntents {
+            side: RenameSide::Source,
+            name: "dbo.a.x".into(),
+            intents: ["p", "q"]
+                .map(|to| Intent::RenameColumn {
+                    table: "dbo.a".parse().unwrap(),
+                    from: "x".into(),
+                    to: to.into(),
+                })
+                .to_vec(),
+        };
+        let ordinary = blocker_finding(&conflict);
+        assert!(!ordinary.message.contains("provisional"));
+        assert!(!one_blocker(&conflict).contains("if dbo.old"));
+        let derived = Blocker::ProvisionalTableIdentity {
+            from: "dbo.old".parse().unwrap(),
+            to: "dbo.a".parse().unwrap(),
+            blocker: Box::new(conflict),
+        };
+        let text = one_blocker(&derived);
+        assert!(
+            text.contains("if dbo.old -> dbo.a is what you meant"),
+            "{text}"
+        );
+        assert!(
+            text.contains("dbo.a.p") && text.contains("dbo.a.q"),
+            "{text}"
+        );
+        let finding = blocker_finding(&derived);
+        assert_eq!(finding.id, ordinary.id);
+        assert_eq!(finding.remedy, ordinary.remedy);
+        let json = serde_json::to_value(&finding).unwrap();
+        assert_eq!(json["id"], "identity.conflicting-rename-intents");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("provisional table identity")
         );
     }
 
