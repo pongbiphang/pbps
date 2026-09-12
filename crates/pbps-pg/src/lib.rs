@@ -1855,7 +1855,11 @@ mod tests {
     #[test]
     fn validating_a_table_reports_every_type_it_cannot_spell() {
         let mut table = Table::default();
-        for (name, ty_) in [("a", "widget"), ("b", "timestamp(3)"), ("c", "integer")] {
+        for (name, ty_) in [
+            ("a", "widget"),
+            ("b", "timestamp(7)"),
+            ("c", "timestamp(3)"),
+        ] {
             table
                 .columns
                 .insert(name.to_owned(), pbps_model::Column::new(ty(ty_)));

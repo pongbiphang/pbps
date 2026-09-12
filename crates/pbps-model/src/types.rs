@@ -27,6 +27,9 @@ pub enum TypeParseError {
 
     #[error("the type name in `{0}` is not a valid identifier")]
     BadBaseName(String),
+
+    #[error("the argument position in type `{0}` must be between name words")]
+    BadArgumentPosition(String),
 }
 
 /// A type argument.
@@ -68,6 +71,9 @@ impl fmt::Display for TypeArg {
 pub struct ColumnType {
     pub base: String,
     pub args: Vec<TypeArg>,
+    // A word boundary, not a byte offset or an engine-specific suffix. Array
+    // dimensions can later be represented independently of this modifier.
+    args_after_word: Option<usize>,
 }
 
 impl ColumnType {
@@ -75,12 +81,29 @@ impl ColumnType {
         Self {
             base: base.into().to_ascii_lowercase(),
             args,
+            args_after_word: None,
         }
     }
 
     /// A type with no arguments, such as `bigint`.
     pub fn simple(base: impl Into<String>) -> Self {
         Self::new(base, Vec::new())
+    }
+
+    /// Move the arguments between words of the base name. The default position
+    /// remains after the complete name, preserving existing serialized types.
+    pub fn with_args_after_word(mut self, words: usize) -> Result<Self, TypeParseError> {
+        if self.args.is_empty() || words == 0 || words >= self.base.split_whitespace().count() {
+            return Err(TypeParseError::BadArgumentPosition(self.to_string()));
+        }
+        self.base = self.base.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.args_after_word = Some(words);
+        Ok(self)
+    }
+
+    /// An in-name modifier position, counted in complete base-name words.
+    pub fn args_after_word(&self) -> Option<usize> {
+        self.args_after_word
     }
 
     /// The first integer argument, which is what a dialect most often needs when
@@ -100,7 +123,11 @@ impl ColumnType {
 
 impl fmt::Display for ColumnType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.base)?;
+        let boundary = self
+            .args_after_word
+            .and_then(|words| self.base.match_indices(' ').nth(words - 1).map(|(i, _)| i));
+        let (before, after) = boundary.map_or((self.base.as_str(), ""), |i| self.base.split_at(i));
+        f.write_str(before)?;
         if !self.args.is_empty() {
             f.write_str("(")?;
             for (i, a) in self.args.iter().enumerate() {
@@ -111,6 +138,7 @@ impl fmt::Display for ColumnType {
             }
             f.write_str(")")?;
         }
+        f.write_str(after)?;
         Ok(())
     }
 }
@@ -134,7 +162,13 @@ impl FromStr for ColumnType {
         if close < open {
             return Err(TypeParseError::UnclosedParen(s.to_owned()));
         }
-        if !s[close + 1..].trim().is_empty() {
+        let suffix = s[close + 1..].trim();
+        if !suffix.is_empty()
+            && (!s[close + 1..].starts_with(char::is_whitespace)
+                || !suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' '))
+        {
             return Err(TypeParseError::TrailingContent(s.to_owned()));
         }
 
@@ -145,13 +179,23 @@ impl FromStr for ColumnType {
             if a.is_empty() {
                 return Err(TypeParseError::EmptyArg(s.to_owned()));
             }
+            if a.contains(['(', ')']) {
+                return Err(TypeParseError::TrailingContent(s.to_owned()));
+            }
             args.push(match a.parse::<i64>() {
                 Ok(n) => TypeArg::Int(n),
                 Err(_) if a.eq_ignore_ascii_case("max") => TypeArg::Max,
                 Err(_) => TypeArg::Ident(a.to_ascii_lowercase()),
             });
         }
-        finish_base(s, base, args)
+        if suffix.is_empty() {
+            finish_base(s, base, args)
+        } else {
+            let prefix = finish_base(s, base, Vec::new())?;
+            let base = format!("{} {suffix}", prefix.base);
+            finish_base(s, &base, args)?
+                .with_args_after_word(prefix.base.split_whitespace().count())
+        }
     }
 }
 
@@ -167,10 +211,7 @@ fn finish_base(whole: &str, base: &str, args: Vec<TypeArg>) -> Result<ColumnType
     if !ok {
         return Err(TypeParseError::BadBaseName(whole.to_owned()));
     }
-    Ok(ColumnType {
-        base: base.to_ascii_lowercase(),
-        args,
-    })
+    Ok(ColumnType::new(base, args))
 }
 
 impl TryFrom<String> for ColumnType {
@@ -246,10 +287,65 @@ mod tests {
     }
 
     #[test]
+    fn in_name_modifiers_preserve_position_and_string_serialization() {
+        for name in ["time", "timestamp"] {
+            for zone in ["with", "without"] {
+                let spelling = format!("{name}(3) {zone} time zone");
+                let ty = p(&spelling);
+                assert_eq!(ty.base, format!("{name} {zone} time zone"));
+                assert_eq!(ty.args_after_word(), Some(1));
+                assert_eq!(ty.to_string(), spelling);
+                assert_eq!(p(&ty.to_string()), ty);
+                let json = serde_json::to_string(&ty).unwrap();
+                assert_eq!(json, format!("\"{spelling}\""));
+                assert_eq!(serde_json::from_str::<ColumnType>(&json).unwrap(), ty);
+                assert_ne!(ty, ColumnType::new(ty.base.clone(), ty.args.clone()));
+            }
+        }
+        assert_eq!(p("custom name(4) qualifier").args_after_word(), Some(2));
+        assert_eq!(
+            p("timestamp (3)  with  time zone"),
+            p("timestamp(3) with time zone")
+        );
+        for spelling in ["nvarchar(100)", "decimal(18, 2)", "datetime2(7)"] {
+            assert_eq!(
+                serde_json::to_string(&p(spelling)).unwrap(),
+                format!("\"{spelling}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn modifiers_need_name_boundaries_and_arrays_remain_unrepresented() {
+        for spelling in [
+            "timestamp(3)with time zone",
+            "timestamp(3) with time zone;",
+            "timestamp(3)(4)",
+            "timestamp(3) with (4)",
+            "timestamp(3) with time zone[]",
+            "text[]",
+        ] {
+            assert!(spelling.parse::<ColumnType>().is_err(), "{spelling}");
+        }
+        for position in [0, 4, usize::MAX] {
+            assert!(
+                ColumnType::new("timestamp with time zone", vec![TypeArg::Int(3)])
+                    .with_args_after_word(position)
+                    .is_err()
+            );
+        }
+        assert!(
+            ColumnType::simple("timestamp with time zone")
+                .with_args_after_word(1)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_types_are_rejected() {
         assert!("".parse::<ColumnType>().is_err());
         assert!("nvarchar(100".parse::<ColumnType>().is_err());
-        assert!("nvarchar(100) junk".parse::<ColumnType>().is_err());
+        assert!("nvarchar(100) junk;".parse::<ColumnType>().is_err());
         assert!("nvarchar(,)".parse::<ColumnType>().is_err());
         assert!("nvarchar()".parse::<ColumnType>().is_err());
     }

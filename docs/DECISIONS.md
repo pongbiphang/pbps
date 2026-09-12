@@ -9965,3 +9965,27 @@ SPEC is in sync with all of these.
      ignore/warn, both apply modes, no secret leak or success ledger on refusal,
      successful retry, managed-trigger execution, post-approval replacement and
      an independent connection blocked only until the write releases its lock.
+
+446. **A column type's argument position is a word boundary in its base name.**
+    Supersedes 242 for PostgreSQL's four time and timestamp forms (#130).
+    `ColumnType` keeps its complete base name for dialect lookup and comparison,
+    and a validated optional position puts its arguments between name words.
+    The model knows no PostgreSQL suffixes: `timestamp(3) with time zone` is
+    syntax, while accepted names, positions and precision bounds belong to
+    the dialect. SQL Server continues to require arguments after the full name.
+    A trailing identifier can therefore be syntactically representable without
+    being a type either closed catalogue accepts.
+
+    Serialization remains a string. Existing types retain their exact encoded
+    shape and meaning, so schema, plan and state versions do not move; older
+    readers reject the new in-name strings rather than discard their modifier.
+    Arrays still need an independent dimension representation and remain
+    refused: an argument position does not stand in for an array suffix.
+
+    PostgreSQL admits precision 0 through 6 and preserves explicit 6, as
+    `format_type` does. Reducing it rounds stored values and is narrowing;
+    widening keeps them. Precision does not shorten a timestamp's calendar,
+    so the date-range preflight predicate is restricted to an actual calendar
+    narrowing. A last-calendar-day timestamp with reduced precision remains
+    a valid change. Live tests pin all four canonical forms and their aliases,
+    rendering back into executable SQL, bounds, and precision loss.

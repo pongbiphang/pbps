@@ -1505,10 +1505,9 @@ fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Ve
 /// more usable than one whose own name cannot.
 fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn]) -> Option<String> {
     // The same question of a column's *type*. A spelling the catalogue cannot
-    // read is kept as the engine wrote it (issue #130) — and `app.money_amount`
-    // and `timestamp(3) with time zone` are both written out as themselves and
-    // both refused on the way back, one for the dot and one for the words after
-    // the parenthesis. Carrying them produces exactly the failure the name
+    // read is kept as the engine wrote it — `app.money_amount` is written out
+    // as itself and refused on the way back because of the dot.
+    // Carrying it produces exactly the failure the name
     // check exists to prevent, one field over.
     // The question is whether the type comes back as **the same value**, not
     // whether it parses: `bit(3)` stored opaque writes out as `bit(3)` and
@@ -3814,16 +3813,11 @@ mod tests {
         );
     }
 
-    /// A type the catalogue cannot spell is the one #130 is about, and #130
-    /// says what the pull owes it: "`pull` will have to report it as unmanaged
-    /// rather than adopt it". Kept as the engine spelled it, the column made a
-    /// schema that can be written and not loaded — `app.money_amount` is
-    /// refused for the dot and `timestamp(3) with time zone` for the words
-    /// after the parenthesis. Silence would be worse than either.
+    /// Kept as an opaque spelling, an unsupported type makes a schema that can
+    /// be written but not loaded. Report its table as unmanaged instead.
     #[test]
     fn a_type_the_catalogue_cannot_spell_takes_its_table_out_and_is_named() {
         for spelling in [
-            "timestamp(3) with time zone",
             "app.money_amount",
             // The one that *parses* and comes back a different value: stored
             // opaque as the base `bit(3)` with no arguments, it reads back as
@@ -4685,15 +4679,23 @@ mod tests {
         );
         assert!(!survives_the_declaration(&opaque));
 
-        // And the two that do not even parse.
-        for spelling in ["app.money_amount", "timestamp(3) with time zone"] {
+        // Other unsupported spellings cannot survive as opaque values either.
+        for spelling in ["app.money_amount", "bit varying(3)"] {
             let opaque = stored_type(spelling).expect_err(spelling);
             assert!(!survives_the_declaration(&opaque), "{spelling}");
         }
 
         // The negative case: a type the catalogue reads survives, and so does
         // one it reads with arguments.
-        for spelling in ["integer", "numeric(10,2)", "timestamp with time zone"] {
+        for spelling in [
+            "integer",
+            "numeric(10,2)",
+            "timestamp with time zone",
+            "timestamp(3) with time zone",
+            "timestamp(3) without time zone",
+            "time(3) with time zone",
+            "time(3) without time zone",
+        ] {
             let ty = stored_type(spelling).expect(spelling);
             assert!(survives_the_declaration(&ty), "{spelling}");
         }
