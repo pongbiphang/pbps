@@ -31,6 +31,25 @@ pub struct Guard {
     approved: BTreeMap<i64, i64>,
 }
 
+/// What the plan takes away before its row statements run, in the spelling the
+/// catalog still holds.
+///
+/// Every kind here is ordered ahead of the row changes (`order_key` classes 0,
+/// 2 and 6 against 11 and 12), so by the time a row statement runs the trigger
+/// is gone, the referential action is gone, or the table carrying it is. A
+/// closure that followed them anyway would refuse a plan for a table the write
+/// cannot reach — the same fault `gone_keys` exists to avoid in the delete
+/// probe (DECISIONS 128). The allowance is `prepare`'s alone: `check` reads the
+/// catalog as it is immediately before the write, where what the plan promised
+/// to remove has to actually be absent.
+#[derive(Default)]
+pub struct Dropped {
+    pub modules: BTreeSet<ModuleId>,
+    /// Referencing table and constraint name, as `pg_constraint` spells them.
+    pub foreign_keys: BTreeSet<(TableName, String)>,
+    pub tables: BTreeSet<TableName>,
+}
+
 /// Authenticate existing triggers before any plan statement changes names.
 /// New tables have no baseline trigger allowance. A trigger the plan drops is
 /// not allowed: it must actually be gone by the time a row statement runs.
@@ -38,19 +57,19 @@ pub async fn prepare(
     conn: &mut Conn,
     writes: &[RowWrite],
     baseline: &Schema,
-    dropped: &BTreeSet<ModuleId>,
+    dropped: &Dropped,
 ) -> Result<Guard, DbError> {
     let mut writes = writes.to_vec();
     writes.sort_by(|a, b| a.table.cmp(&b.table).then(a.operation.cmp(&b.operation)));
     writes.dedup();
     let mut guard = Guard::default();
     for write in writes {
-        for trigger in reachable(conn, &write).await? {
+        for trigger in reachable(conn, &write, dropped).await? {
             let id = ModuleId::Trigger {
                 on: trigger.table.clone(),
                 name: trigger.name.clone(),
             };
-            if dropped.contains(&id) {
+            if dropped.modules.contains(&id) {
                 continue;
             }
             let matches_record = baseline.modules.get(&id).is_some_and(|m| {
@@ -70,7 +89,7 @@ pub async fn prepare(
 /// Recheck immediately before each row statement, including on a newly created
 /// or renamed table. The lock stays held through that statement's transaction.
 pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(), DbError> {
-    for trigger in reachable(conn, write).await? {
+    for trigger in reachable(conn, write, &Dropped::default()).await? {
         if guard.approved.get(&trigger.oid) != Some(&trigger.function_oid) || !trigger.trusted_owner
         {
             return Err(refused(&trigger, &write.table));
@@ -118,7 +137,11 @@ struct Statement {
 /// The named table is locked under the caller's `search_path` because that is
 /// the name the plan will write; everything the closure reaches afterwards is
 /// followed by oid, so a rename cannot move the guard onto another relation.
-async fn reachable(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError> {
+async fn reachable(
+    conn: &mut Conn,
+    write: &RowWrite,
+    dropped: &Dropped,
+) -> Result<Vec<Trigger>, DbError> {
     let table = &write.table;
     // No ONLY: PostgreSQL DML can reach inheritance descendants, and locking
     // the descendants is what keeps their triggers from being replaced too.
@@ -136,7 +159,7 @@ async fn reachable(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, Db
         .to_owned();
     conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
         .await?;
-    let result = walk(conn, write).await;
+    let result = walk(conn, write, dropped).await;
     // On a query error the caller must roll back the transaction. On success,
     // restore its path before returning; no setting leaks into emitted SQL.
     if result.is_ok() {
@@ -149,7 +172,11 @@ async fn reachable(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, Db
     result
 }
 
-async fn walk(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError> {
+async fn walk(
+    conn: &mut Conn,
+    write: &RowWrite,
+    dropped: &Dropped,
+) -> Result<Vec<Trigger>, DbError> {
     let table = &write.table;
     let rows = conn
         .query(&format!(
@@ -197,7 +224,7 @@ async fn walk(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError
         // An INSERT fires no referential action: the row it adds is the one a
         // foreign key checks, never one another row already refers to.
         if statement.event != INSERT {
-            queue.extend(read_actions(conn, &statement).await?);
+            queue.extend(read_actions(conn, &statement, dropped).await?);
         }
     }
     Ok(triggers)
@@ -372,7 +399,11 @@ async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Tri
 /// changed, an ON DELETE SET NULL/DEFAULT with a column list writes that list
 /// (`confdelsetcols`, PostgreSQL 15 and later), and the statement names the
 /// root of the referencing side's partition tree, never a partition of it.
-async fn read_actions(conn: &mut Conn, statement: &Statement) -> Result<Vec<Statement>, DbError> {
+async fn read_actions(
+    conn: &mut Conn,
+    statement: &Statement,
+    dropped: &Dropped,
+) -> Result<Vec<Statement>, DbError> {
     let rows = conn
         .query(&format!(
             "{ctes},
@@ -384,6 +415,8 @@ async fn read_actions(conn: &mut Conn, statement: &Statement) -> Result<Vec<Stat
                              THEN con.confdelsetcols ELSE con.conkey END
                  FROM pg_catalog.pg_constraint con
                  JOIN relations r ON r.oid = con.confrelid
+                 JOIN pg_catalog.pg_class child ON child.oid = con.conrelid
+                 JOIN pg_catalog.pg_namespace childns ON childns.oid = child.relnamespace
                  WHERE con.contype = 'f'
                    AND (CASE WHEN {events} = {delete} THEN con.confdeltype ELSE con.confupdtype END)
                        IN ('c', 'n', 'd')
@@ -391,6 +424,22 @@ async fn read_actions(conn: &mut Conn, statement: &Statement) -> Result<Vec<Stat
                        SELECT 1 FROM touched
                        WHERE touched.attrelid = con.confrelid AND touched.attnum = ANY(con.confkey)
                    ))
+                   -- The action is the constraint's own trigger on the
+                   -- referenced side, and a trigger that does not fire writes
+                   -- nothing: measured on 18.6, neither a disabled one nor an
+                   -- origin trigger under `session_replication_role = replica`
+                   -- cascades at all. The same test `preflight`'s
+                   -- DELETE_ACTION_FIRES makes, by the event this write raises.
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_trigger action
+                       WHERE action.tgconstraint = con.oid
+                         AND action.tgrelid = con.confrelid
+                         AND (action.tgtype & {events}) <> 0
+                         AND NOT (action.tgenabled = 'A'
+                             OR (action.tgenabled = 'O' AND pg_catalog.current_setting('session_replication_role') <> 'replica')
+                             OR (action.tgenabled = 'R' AND pg_catalog.current_setting('session_replication_role') = 'replica'))
+                   )
+                   AND NOT ({gone})
              ),
              up(constraint_oid, oid) AS (
                  SELECT e.constraint_oid, e.referencing FROM edges e
@@ -417,6 +466,7 @@ async fn read_actions(conn: &mut Conn, statement: &Statement) -> Result<Vec<Stat
             events = statement.event,
             delete = DELETE,
             update = UPDATE,
+            gone = gone(dropped),
         ))
         .await?;
     // One statement per constraint: merging two constraints' column sets would
@@ -442,6 +492,30 @@ async fn read_actions(conn: &mut Conn, statement: &Statement) -> Result<Vec<Stat
             partitions_only: true,
         })
         .collect())
+}
+
+/// The removals this plan performs before the row statement, as a filter on
+/// the constraint's own referencing table. `false` when there are none: an
+/// empty `OR` list is not valid SQL, and the caller negates this.
+fn gone(dropped: &Dropped) -> String {
+    let of_table = |table: &TableName| {
+        format!(
+            "childns.nspname = {} AND child.relname = {}",
+            literal(&table.schema),
+            literal(&table.name)
+        )
+    };
+    let mut clauses: Vec<String> = dropped
+        .foreign_keys
+        .iter()
+        .map(|(table, name)| format!("({} AND con.conname = {})", of_table(table), literal(name)))
+        .collect();
+    clauses.extend(dropped.tables.iter().map(|t| format!("({})", of_table(t))));
+    if clauses.is_empty() {
+        "false".to_owned()
+    } else {
+        clauses.join(" OR ")
+    }
 }
 
 fn ident(value: &str) -> String {

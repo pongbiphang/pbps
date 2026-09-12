@@ -4858,3 +4858,135 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
             conn.rollback(dialect.transaction_framing()).await.unwrap();
         });
 }
+
+/// A referential action that the plan removes, or that this session cannot
+/// fire, writes nothing — and a closure that followed it anyway would refuse a
+/// plan for a table the write never reaches.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_action_that_cannot_write_is_not_in_the_closure() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    use pbps_pg::data_triggers::Dropped;
+    let own = OwnDatabase::new(&server(), "fk_not_firing");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$; \
+        CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE); \
+        CREATE TABLE app.c(id integer PRIMARY KEY, ukey text, \
+            CONSTRAINT fk_c FOREIGN KEY (ukey) REFERENCES app.p(ukey) ON UPDATE CASCADE); \
+        CREATE TRIGGER hook AFTER UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION public.hook()",
+    );
+    let child: pbps_model::TableName = pbps_model::TableName::new("app", "c");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            let write = RowWrite {
+                table: pbps_model::TableName::new("app", "p"),
+                operation: RowOperation::Update {
+                    columns: ["ukey".to_owned()].into(),
+                },
+            };
+            let key = Dropped {
+                foreign_keys: [(child.clone(), "fk_c".to_owned())].into(),
+                ..Default::default()
+            };
+            let table = Dropped {
+                tables: [child.clone()].into(),
+                ..Default::default()
+            };
+            for (label, dropped, refused) in [
+                ("nothing removed", Dropped::default(), true),
+                ("the key the plan drops first", key, false),
+                ("the table the plan drops first", table, false),
+            ] {
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    &Default::default(),
+                    &dropped,
+                )
+                .await;
+                assert_eq!(
+                    checked.is_err(),
+                    refused,
+                    "{label}: {:?}",
+                    checked.err().map(|e| e.to_string())
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+            }
+            // The allowance is the plan's promise, and `check` is where the
+            // promise is kept: a key still in the catalog at the write is
+            // followed whatever the plan said about it.
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let guard = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                std::slice::from_ref(&write),
+                &Default::default(),
+                &Dropped {
+                    tables: [child.clone()].into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the dropped table is not followed");
+            let refused = pbps_pg::data_triggers::check(&mut conn, &write, &guard).await;
+            assert!(
+                refused.is_err(),
+                "a foreign key the plan promised to remove must actually be gone by the write"
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            // An action whose own trigger does not fire writes nothing.
+            // Measured on 18.6: neither of these cascades at all.
+            for (label, sql, reset) in [
+                (
+                    "the action's trigger is disabled",
+                    "ALTER TABLE app.p DISABLE TRIGGER ALL",
+                    "ALTER TABLE app.p ENABLE TRIGGER ALL",
+                ),
+                (
+                    "the session is a replica",
+                    "SET session_replication_role = 'replica'",
+                    "RESET session_replication_role",
+                ),
+            ] {
+                conn.execute(sql).await.unwrap();
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    &Default::default(),
+                    &Dropped::default(),
+                )
+                .await;
+                assert!(
+                    checked.is_ok(),
+                    "{label}: {:?}",
+                    checked.err().map(|e| e.to_string())
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+                conn.execute(reset).await.unwrap();
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    &Default::default(),
+                    &Dropped::default(),
+                )
+                .await;
+                assert!(
+                    checked.is_err(),
+                    "{label}: restored, the action fires again"
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+            }
+        });
+}

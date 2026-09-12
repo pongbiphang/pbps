@@ -891,10 +891,32 @@ pub async fn prepare_data_writes(
             use pbps_dialect::{RowOperation, RowWrite};
             use pbps_model::Change;
             let mut writes = Vec::new();
-            let mut dropped = BTreeSet::new();
+            let mut dropped = pbps_pg::data_triggers::Dropped::default();
+            // The plan's own name for a table, in the spelling the catalog
+            // still holds: the guard runs before the renames (DECISIONS 445).
+            let stored = |table: &pbps_model::TableName| {
+                planned_ids
+                    .table_uid(table)
+                    .or_else(|| baseline.ids.table_uid(table))
+                    .and_then(|uid| baseline.ids.tables.get(uid))
+                    .cloned()
+            };
             for planned in &changes.changes {
                 if let Change::DropModule { id, .. } = &planned.change {
-                    dropped.insert(id.clone());
+                    dropped.modules.insert(id.clone());
+                }
+                // Both are ordered ahead of every row change, so the
+                // referential action they carry cannot write when the row
+                // statement runs (DECISIONS 449).
+                if let Change::DropForeignKey { table, name } = &planned.change
+                    && let Some(old) = stored(table)
+                {
+                    dropped.foreign_keys.insert((old, name.clone()));
+                }
+                if let Change::DropTable { name, .. } = &planned.change {
+                    dropped
+                        .tables
+                        .insert(stored(name).unwrap_or_else(|| name.clone()));
                 }
                 let (table, mut operation) =
                     if let Change::InsertRow { table, .. } = &planned.change {
@@ -914,11 +936,7 @@ pub async fn prepare_data_writes(
                 // The logical target has the plan's final spelling; locks are
                 // acquired before any rename, through the stable table uid.
                 // New tables receive no existing-trigger allowance.
-                if let Some(old) = planned_ids
-                    .table_uid(table)
-                    .or_else(|| baseline.ids.table_uid(table))
-                    .and_then(|uid| baseline.ids.tables.get(uid))
-                {
+                if let Some(old) = stored(table).as_ref() {
                     // Like the table, an updated column may still carry its
                     // pre-plan name while the guard authenticates triggers.
                     if let RowOperation::Update { columns } = &mut operation {

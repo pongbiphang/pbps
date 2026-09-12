@@ -10412,6 +10412,28 @@ SPEC is in sync with all of these.
      guard that is right about who may write beats one that is clever about
      when it need not look.
 
+     Two things take a constraint back out of the closure, and both are the
+     shape 128 and `DELETE_ACTION_FIRES` already established one crate over.
+     **A foreign key the plan removes before the row statement** — a
+     `DropForeignKey`, or a `DropTable` carrying one, both ordered at
+     `order_key` 2 and 6 against the row classes 11 and 12 — cannot write when
+     that statement runs, and following it would refuse a plan for a table the
+     write never reaches. The allowance is `prepare`'s alone: `check` reads the
+     catalog immediately before the write, where what the plan promised to
+     remove has to actually be absent, exactly as 445 requires of a dropped
+     trigger. **An action whose own trigger does not fire** writes nothing
+     either; measured on 18.6, neither a disabled parent-side constraint
+     trigger nor an origin trigger under `session_replication_role = replica`
+     cascades at all, and the child row is left untouched. The closure applies
+     the same enabled test `preflight::DELETE_ACTION_FIRES` makes, by the event
+     this write raises rather than by the delete event alone.
+
+     The lock a reached table takes is `LOCK TABLE` without `ONLY`, which also
+     locks descendants the action itself will not write. Measured, that costs
+     no privilege — PostgreSQL checks the named table's and takes the
+     descendants' locks regardless — and it is atomic over the descendant set,
+     which enumerate-then-lock is not.
+
      Live regressions: the escalation through `ON UPDATE CASCADE`, `SET NULL`
      and `SET DEFAULT` and through `ON DELETE CASCADE` and `SET NULL`, at row
      and statement level, two foreign keys deep, under both apply modes and
@@ -10420,7 +10442,8 @@ SPEC is in sync with all of these.
      a table of closure membership cases pairing every non-writing action,
      unreached event, untouched column and unreachable descendant with the
      writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
-     cascade-reached table blocked until the write commits; and the
-     cannot-lock refusal naming its table. They pass on 16.15 as well as 18.6:
-     the one catalogue column the closure needs that is not ancient,
-     `confdelsetcols`, arrived in 15.
+     cascade-reached table blocked until the write commits; the cannot-lock
+     refusal naming its table; and the removals and the two not-firing actions,
+     each paired with the state in which the same closure does follow it. They
+     pass on 16.15 as well as 18.6: the one catalogue column the closure needs
+     that is not ancient, `confdelsetcols`, arrived in 15.

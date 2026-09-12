@@ -904,9 +904,12 @@ The tables checked are every table the row operation makes the engine write,
 not only the one it names: a foreign key whose `ON UPDATE` or `ON DELETE`
 action is `CASCADE`, `SET NULL` or `SET DEFAULT` writes the referencing side,
 and that write is followed recursively, with the columns and events each action
-produces (DECISIONS 451). Holding a reached table needs `INSERT`, `UPDATE`,
-`DELETE` or `TRUNCATE` on it, which the action itself does not, so a plan whose
-cascade reaches a table the deployment role may not write is refused by name.
+produces (DECISIONS 451). A foreign key the plan removes before the row
+statement, and one whose action cannot fire in this session, are left out of
+that set; at apply time the removal has to have happened, as a planned trigger
+drop does. Holding a reached table needs `INSERT`, `UPDATE`, `DELETE` or
+`TRUNCATE` on it, which the action itself does not, so a plan whose cascade
+reaches a table the deployment role may not write is refused by name.
 This boundary does not sandbox transitive routine calls, defaults, CHECK
 expressions or event triggers.
 
