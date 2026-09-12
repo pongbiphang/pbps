@@ -418,9 +418,140 @@ pub fn diff_partial(
     let data_rank = rank_of_tables(&pbps_model::data::insertion_order(declared.schema));
     // Roles that are dropped together are ordered parent before member.
     let role_rank = member_depth(&planned);
+    // A table renamed onto a name a drop in this same plan vacates is
+    // otherwise refused mid-apply: PostgreSQL keeps an index — and the index
+    // behind a named primary key or unique constraint — in the schema's
+    // relation namespace (issue #176), so `RenameTable`'s class-1 ordering
+    // ahead of `DropIndex`/`DropUnique`/a primary-key drop's class 2 claims
+    // that name before the drop frees it. Measured end to end: `app.old`
+    // renamed to `app.target` while `app.other` drops an index named
+    // `target` plans `rename_table` then `drop_index`, and PostgreSQL
+    // refuses the rename with `42P07: relation "target" already exists` —
+    // even though `check_index_names` (176) sees no collision at all in the
+    // plan's *final* declared schema. A valid plan refused is always fixed
+    // (AGENTS.md), regardless of which pass the defect is in.
+    //
+    // Only these three drops move, and only into class 1 itself, beside the
+    // renames: they are the ones backed by a relation this namespace holds
+    // at all — the same boundary `check_index_names` draws, so a check or
+    // foreign-key constraint (no backing index) never moves.
+    //
+    // Two guards keep the move safe rather than trading one ordering bug for
+    // another:
+    //
+    // - A drop stays where it was if its own table is itself some
+    //   `RenameTable`'s target in this plan. That rename must still precede
+    //   it — the same reason class 1 precedes class 2 at all: the drop's
+    //   statement names the table by its post-rename spelling, which only
+    //   exists once that rename has run.
+    // - Nothing moves if the plan contains any `DropForeignKey` at all.
+    //   `dependency_rank` below keeps every foreign-key drop ahead of every
+    //   candidate-key drop as a blanket layering rather than a per-object
+    //   graph (its own comment: "matching suppliers by name would add a way
+    //   to fail... and buy nothing"), so moving one supplier's drop into
+    //   class 1 without knowing which foreign key, if any, actually
+    //   references it risks dropping that key while the foreign key
+    //   referencing it still stands. Left for a future pass that can tell
+    //   the two apart; the direct collision this measures is fixed either
+    //   way, since a plan with no foreign-key drop is the common case.
+    let renamed_to: BTreeSet<TableName> = planned
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { to, .. } => Some(to.clone()),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect();
+    let can_free_a_renamed_target = dialect.indexes_share_namespace_with_tables()
+        && !renamed_to.is_empty()
+        && !planned
+            .iter()
+            .any(|p| matches!(p.change, Change::DropForeignKey { .. }));
+    let frees_a_renamed_target = |c: &Change| -> bool {
+        if !can_free_a_renamed_target {
+            return false;
+        }
+        let (table, freed_name) = match c {
+            Change::DropIndex { table, name } | Change::DropUnique { table, name } => {
+                (table, name.as_str())
+            }
+            Change::SetPrimaryKey {
+                table,
+                to: None,
+                from: Some(pk),
+            } => match pk.name.as_deref() {
+                Some(name) => (table, name),
+                None => return false,
+            },
+            Change::SetPrimaryKey { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::AddUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => return false,
+        };
+        !renamed_to.contains(table)
+            && renamed_to.contains(&TableName::new(table.schema.clone(), freed_name.to_owned()))
+    };
     planned.sort_by_key(|p| {
         (
-            order_key(&p.change),
+            if frees_a_renamed_target(&p.change) {
+                1
+            } else {
+                order_key(&p.change)
+            },
+            u8::from(!frees_a_renamed_target(&p.change)),
             dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank),
             p.change.subject(),
             format!("{:?}", p.change),
@@ -1808,6 +1939,19 @@ mod tests {
     /// Reproduces the real flow: the base side's identity file is the one from
     /// that version, and the declared side's is the resolved result.
     fn run(base: &Schema, declared: &Schema, intents: &[Intent]) -> ChangeSet {
+        run_with(&MinimalDialect, base, declared, intents)
+    }
+
+    /// [`run`], against a caller-chosen dialect — for the one shape whose
+    /// ordering answer differs by dialect: whether an index shares the
+    /// schema's relation namespace with tables at all
+    /// (`Dialect::indexes_share_namespace_with_tables`, issue #176).
+    fn run_with(
+        dialect: &dyn Dialect,
+        base: &Schema,
+        declared: &Schema,
+        intents: &[Intent],
+    ) -> ChangeSet {
         let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
@@ -1823,7 +1967,7 @@ mod tests {
                 schema: declared,
                 ids: &declared_ids,
             },
-            &MinimalDialect,
+            dialect,
             &Hints::default(),
         )
         .unwrap()
@@ -4328,6 +4472,191 @@ mod tests {
             ["RenameTable", "DropCheck", "RenameColumn", "AddCheck"],
             "the drop names the table, so it follows the rename that gives it \
              that name"
+        );
+    }
+
+    /// A dialect that keeps an index in the schema's relation namespace —
+    /// PostgreSQL's answer (issue #176). Everything else is `MinimalDialect`'s,
+    /// so what a test using it shows is exactly the difference this one
+    /// capability makes to the plan's statement order.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SharesIndexNamespace;
+
+    impl Dialect for SharesIndexNamespace {
+        fn name(&self) -> &'static str {
+            "shares-index-namespace"
+        }
+        fn indexes_share_namespace_with_tables(&self) -> bool {
+            true
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn emit(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+            MinimalDialect.emit(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing()
+        }
+    }
+
+    /// The finding from round 3 of #462 (issue #176): a table renamed onto a
+    /// name a *different* table's dropped index vacates in the same plan is a
+    /// declaration whose final schema `check_index_names` sees no collision
+    /// in at all — and until this test, the plan sorter put `RenameTable`
+    /// (class 1) ahead of `DropIndex` (class 2) regardless, so the emitted
+    /// `ALTER TABLE ... RENAME TO "target"` ran while `app.other`'s index
+    /// `target` still existed.
+    ///
+    /// Measured end to end on PostgreSQL 18.6: bootstrap `app.old` and
+    /// `app.other` (with its index `target`), then plan renaming `app.old` to
+    /// `app.target` while dropping that index — the live apply failed with
+    /// `42P07: relation "target" already exists` before this fix, and
+    /// succeeds after it, in the order this test pins.
+    ///
+    /// On SQL Server an index name is scoped to its own table
+    /// (`indexes_share_namespace_with_tables` is `false`), so the same plan
+    /// never collides there and the drop stays in its ordinary class-2 place
+    /// — `MinimalDialect` is that answer, and the second assertion pins it.
+    #[test]
+    fn a_drop_that_frees_a_renamed_targets_name_precedes_the_rename_where_indexes_share_it() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let mut other_base = table(&[("n", Column::new(ty("int")))]);
+        other_base.indexes.insert(
+            "target".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "n".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+
+        let target_t = old_t;
+        let other_declared = table(&[("n", Column::new(ty("int")))]);
+        let declared = two_tables(("app.target", target_t), ("app.other", other_declared));
+
+        let intents = [Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }];
+
+        let cs = run_with(&SharesIndexNamespace, &base, &declared, &intents);
+        assert_eq!(
+            kinds(&cs),
+            ["DropIndex", "RenameTable"],
+            "the index has to be gone before the engine will let the rename claim its name: {cs:?}"
+        );
+
+        let cs = run_with(&MinimalDialect, &base, &declared, &intents);
+        assert_eq!(
+            kinds(&cs),
+            ["RenameTable", "DropIndex"],
+            "an index name is only unique per table on SQL Server, so nothing moves: {cs:?}"
+        );
+    }
+
+    /// The same shape for a named unique constraint, which is backed by an
+    /// index of that name (the review-widened half of #176): dropping it
+    /// frees the relation name just as dropping a plain index does.
+    #[test]
+    fn a_dropped_unique_constraint_that_frees_a_renamed_targets_name_precedes_the_rename() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let mut other_base = table(&[("n", Column::new(ty("int")))]);
+        other_base.unique.insert("target".into(), unique(&["n"]));
+        let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+
+        let declared = two_tables(
+            ("app.target", old_t),
+            ("app.other", table(&[("n", Column::new(ty("int")))])),
+        );
+
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["DropUnique", "RenameTable"], "{cs:?}");
+    }
+
+    /// The guard that keeps this fix from trading one ordering bug for
+    /// another: `dependency_rank` keeps every foreign-key drop ahead of every
+    /// candidate-key drop as a blanket layering, not a per-object graph, so a
+    /// plan that also drops a foreign key is left exactly as it was — moving
+    /// only the colliding constraint drop could otherwise drop a key while an
+    /// undropped foreign key still referenced it.
+    #[test]
+    fn a_plan_that_also_drops_a_foreign_key_is_not_reordered() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let mut other_base = table(&[("n", Column::new(ty("int")))]);
+        other_base.unique.insert("target".into(), unique(&["n"]));
+        let mut child_base = table(&[("n", Column::new(ty("int")))]);
+        child_base
+            .foreign_keys
+            .insert("fk_c".into(), fk(&["n"], "app.other", &["n"]));
+        let mut base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+        base.tables.insert("app.child".parse().unwrap(), child_base);
+
+        let mut declared = two_tables(
+            ("app.target", old_t),
+            ("app.other", table(&[("n", Column::new(ty("int")))])),
+        );
+        declared.tables.insert(
+            "app.child".parse().unwrap(),
+            table(&[("n", Column::new(ty("int")))]),
+        );
+
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["RenameTable", "DropForeignKey", "DropUnique"],
+            "with a foreign-key drop in the plan, nothing is reordered: {cs:?}"
         );
     }
 
