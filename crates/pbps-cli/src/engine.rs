@@ -240,13 +240,41 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 /// before this function ever runs, which is exactly the shape that lost the
 /// two calls above their downcast target until this fix.
 ///
+/// `.chain().rev()`, not `.chain()`: `reason` is a bounded column
+/// (`crate::engine::truncate_reason` keeps only the *first* `REASON_CHARS`
+/// characters of what it is handed, never the last), so its content has to be
+/// ordered by diagnostic value per character, highest first — not by the
+/// order this tool happened to build the chain in. The redacted driver
+/// marker is the highest: it is the one fact that identifies *why* the
+/// server refused, and it exists nowhere else once `message()` is gone.
+/// `stmt.sql` in `execute_statements`' own `.context()` sentence is the
+/// lowest: it is this tool's own generated text, deterministic from the
+/// checksum-pinned plan and the declarations already in git, so a partial
+/// copy of it in the ledger tells a reader nothing they cannot read better
+/// from the plan itself. Putting the marker last, where an un-reversed
+/// `error.chain()` (outermost-first) leaves it, ordered the column by build
+/// order instead — and a third ready-phase round measured the consequence:
+/// a `CREATE VIEW` or a large reference-data block puts a `stmt.sql` past
+/// `REASON_CHARS` on its own, so truncation cut before it ever reached the
+/// marker, leaving a `Failed` row with a fragment of the emitted SQL and
+/// neither the server's message nor its code. "Absent, empty and unreadable
+/// are three different things," and a redaction result that reads as
+/// *nothing was ever recorded* is the third one wearing the first one's
+/// face. Reversing is the fix that cannot be quietly undone by a future
+/// caller composing a longer chain: the priority order is structural, not a
+/// truncation workaround this function has to remember to preserve.
+///
 /// The operator's own stderr is unaffected: `main.rs` prints `{e:#}`, which
-/// walks the same chain and shows every frame, driver sentence included —
+/// walks the chain outermost-first — the natural reading order for a person,
+/// who is never truncated — and shows every frame, driver sentence included;
 /// that is issue #167's deliverable, and it is still what someone running an
 /// apply against a database they already hold credentials for sees.
 pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
     error
         .chain()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .map(|frame| match frame.downcast_ref::<DbError>() {
             Some(DbError::Driver { code, .. }) => match code {
                 Some(code) => {
@@ -1216,6 +1244,46 @@ mod tests {
         );
         assert!(!rendered.contains("super-secret-abc"), "{rendered}");
         assert!(rendered.contains("22P02"), "{rendered}");
+    }
+
+    /// The boundary a ready-phase round found: a `.context()` sentence long
+    /// enough on its own to fill the ledger's `reason` column — a `CREATE
+    /// VIEW` or a large reference-data block, not a contrived string — used
+    /// to push the redacted driver marker past where `truncate_reason` cuts,
+    /// leaving a `Failed` row with a fragment of the emitted SQL and neither
+    /// the server's message nor its code. `ledger_safe_reason` now orders the
+    /// marker first for exactly this reason, so this test builds a context
+    /// frame longer than *both* engines' column widths and checks the code
+    /// still survives `truncate_reason` for each.
+    #[test]
+    fn a_context_frame_longer_than_the_column_does_not_crowd_out_the_code() {
+        assert_eq!(
+            pbps_pg::state::REASON_CHARS,
+            pbps_mssql::state::REASON_UTF16_UNITS,
+            "this test's one oversized context frame must outgrow both engines' columns"
+        );
+        let long_statement = "x".repeat(pbps_pg::state::REASON_CHARS * 2);
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(db).context(format!(
+            "the database rejected this statement, and the whole plan was rolled back:\n{long_statement}"
+        ));
+        let rendered = ledger_safe_reason(&wrapped);
+
+        for driver in [Driver::Postgres, Driver::Mssql] {
+            let cut = truncate_reason(driver, &rendered);
+            assert!(
+                cut.contains("22P02"),
+                "{driver:?}: the code is the highest-value fact in a bounded column \
+                 and must survive truncation even behind an oversized context frame: {cut}"
+            );
+            assert!(
+                !cut.contains("super-secret-abc"),
+                "{driver:?}: redaction must still hold after reordering: {cut}"
+            );
+        }
     }
 
     #[test]

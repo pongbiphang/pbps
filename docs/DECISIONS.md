@@ -10894,3 +10894,37 @@ SPEC is in sync with all of these.
      declared to this tool, the operator's stderr still gets the full
      sentence, and the ledger keeps `50000` without calling it something SQL
      Server never sent.
+
+     A third ready-phase round, on the pushed fix for the first two defects,
+     found `ledger_safe_reason` itself composing the bounded `reason` column
+     in the wrong priority order. It maps `error.chain()` outermost-first,
+     which put `execute_statements`' own `.context()` sentence — carrying
+     `stmt.sql`, unbounded — ahead of the redacted driver marker it wraps.
+     `truncate_reason` (both engines: `pbps_pg::state::REASON_CHARS` and
+     `pbps_mssql::state::REASON_UTF16_UNITS`, each 1000) keeps only the
+     *first* N units of what it is handed, so a `CREATE VIEW` or a large
+     reference-data block put enough SQL ahead of the marker to push it past
+     the cut entirely — a `Failed` row left with a fragment of the emitted
+     statement and neither the server's message nor its code, the one thing
+     that identifies why the server refused. The fix orders by diagnostic
+     value per character rather than build order: `.chain().rev()` puts the
+     redacted marker first, because `stmt.sql` is this tool's own generated
+     text — deterministic from the checksum-pinned plan and the declarations
+     already in git — and a partial copy of it in the ledger tells a reader
+     nothing they cannot read better from the plan itself, while the marker
+     exists nowhere else once `message()` is gone. This is a priority order,
+     not a truncation workaround the next author could reorder away without
+     noticing what it was protecting.
+
+     `record_failed_bootstrap` and the `on_apply_attempt` hook were checked
+     alongside `failed_apply_snapshot`, since a fix that lands on one sink and
+     not the other two is a shape this repo's review keeps catching: both
+     already compose their message through this same function (the hook's
+     unbounded, since its payload is not a fixed-width column), so the
+     reordering covers all three without a separate change at either.
+
+     `crates/pbps-cli/src/engine.rs`'s
+     `a_context_frame_longer_than_the_column_does_not_crowd_out_the_code`
+     pins the boundary directly: a context frame built to outgrow both
+     engines' column widths, run through each engine's own `truncate_reason`,
+     with the code still present in the result for both.
