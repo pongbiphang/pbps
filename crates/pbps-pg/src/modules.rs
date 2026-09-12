@@ -21,23 +21,30 @@
 //! would put "the application lost access" behind a line of output nobody reads
 //! at 3am.
 //!
-//! # Why every carried item still refuses, and what changes that
+//! # Why a grant no longer refuses on its own, and what still does
 //!
 //! ADR-0009 §3 decides that a grant **to a declared role** comes back, by the
 //! machinery ADR-0005 built. Step 6 (#81) landed the half that makes such a
 //! grant expressible at all: the declarations hold it, `pull` reads it back,
-//! and the differ compares it. The other half has not landed — "comes back"
-//! means the rebuild re-emitting the declared grants *after* the `CREATE`, in
-//! the same plan, and `Change::AlterModule` carries the module and no role, so
-//! the statement list has to be built where the declared roles are visible
-//! (#248). Until then an object carrying anything at all is one this dialect
-//! cannot rebuild, and it says so by name.
+//! and the differ compares it. The other half landed with #248:
+//! `pbps_diff::diff_roles` restates a declared role's full permission set on
+//! a target this dialect is about to rebuild — gated by
+//! `Dialect::rebuilds_modules`, so `Change::AlterModule` sorts a `Grant` after
+//! itself in the same plan, exactly where a human approving it can see what
+//! access is restored. `read_acl` below is the other side of that decision: it
+//! reads the object's ACL the same structured way `pull` does — `aclexplode`,
+//! never text — and stops refusing an entry the plan is about to re-issue.
 //!
-//! That narrowing will not remove the refusal, only shrink it: ADR-0010 §5
-//! records that pbps cannot express "revoked from `PUBLIC`" — the state is the
-//! *absence* of the engine's default rather than a row — and a rebuild
-//! restores the default, so that case stays on the refusing side for good
-//! (DECISIONS 306).
+//! What still refuses is everything that restatement cannot reach: a grant to
+//! a role the declarations do not name on this target, a column-level grant
+//! (`pg_attribute.attacl`), `WITH GRANT OPTION` (the model holds no such
+//! flag), an owner a rebuild would transfer, `reloptions`, a view column
+//! default and a trigger's `tgenabled`. And the direction that is easy to
+//! miss stays a refusal *for good*, not merely until the model catches up:
+//! ADR-0010 §5 records that pbps cannot express "revoked from `PUBLIC`" — the
+//! state is the *absence* of the engine's default rather than a row, so there
+//! is no grantee named `PUBLIC` to re-emit a revoke from — and a rebuild
+//! restores the default (DECISIONS 306).
 //!
 //! # The connected caller
 //!
@@ -47,9 +54,12 @@
 //! integration is tracked separately.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
 use pbps_db::{Conn, DbError, Param, Row};
-use pbps_model::{ModuleId, ModuleKind, ObjectName, Schema, TableName};
+use pbps_model::{
+    Change, ChangeSet, GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Schema, TableName,
+};
 
 /// The reads run under the same empty `search_path` the pull pins, and for the
 /// same reason (DECISIONS 253): `format_type` and `pg_describe_object` qualify
@@ -173,9 +183,18 @@ pub async fn before_a_rebuild(
     conn: &mut Conn,
     id: &ModuleId,
     kind: ModuleKind,
+    changes: &ChangeSet,
 ) -> Result<Rebuild, DbError> {
     require_the_callers_transaction(conn).await?;
     conn.query(CANONICAL_PATH).await?;
+    // What the plan will hold on this target once the rebuild's own `Grant`s
+    // run — the full declared set, not a delta, because `diff_roles` treats
+    // this rebuild exactly as it treats a `DropModule` (#248). A grant the
+    // live ACL holds that is not in here is one this plan is not about to
+    // restate, whatever the reason.
+    let declared = grant_target(id)
+        .map(|target| declared_grants(changes, &target))
+        .unwrap_or_default();
     // Resolved **once**, and every read below is keyed by the oid rather than
     // by the name again. Two independent name matches would be two chances to
     // disagree, and the direction they fail in is the worst one available: a
@@ -202,7 +221,7 @@ pub async fn before_a_rebuild(
     let mut carries = Vec::new();
     match kind {
         ModuleKind::View => {
-            read_relation(conn, oid, &mut carries).await?;
+            read_relation(conn, oid, &declared, &mut carries).await?;
             read_column_acls(conn, oid, &mut carries).await?;
             read_view_column_defaults(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "r", &mut carries).await?;
@@ -210,7 +229,7 @@ pub async fn before_a_rebuild(
             read_extension_ties(conn, oid, "pg_class", &mut carries).await?;
         }
         ModuleKind::Function | ModuleKind::Procedure => {
-            read_routine(conn, oid, &mut carries).await?;
+            read_routine(conn, oid, &declared, &mut carries).await?;
             read_arriving_grants(conn, id, "f", &mut carries).await?;
             read_attached(conn, oid, "pg_proc", &mut carries).await?;
             read_extension_ties(conn, oid, "pg_proc", &mut carries).await?;
@@ -328,6 +347,7 @@ async fn serialize(
 async fn read_relation(
     conn: &mut Conn,
     oid: i64,
+    declared: &BTreeMap<String, BTreeSet<Permission>>,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
     let rows = conn
@@ -346,7 +366,15 @@ async fn read_relation(
     // be the same silence `not_in_the_catalog` exists to refuse.
     let row = rows.first().ok_or_else(|| vanished(oid))?;
     push_owner(row, carries)?;
-    push_acl(row, carries)?;
+    if !text(row, "acl")?.is_empty() {
+        let source = AclSource {
+            catalog: "pg_class",
+            acl_column: "relacl",
+            owner_column: "relowner",
+            objtype: "r",
+        };
+        read_acl(conn, oid, source, declared, carries).await?;
+    }
     // Measured: `security_invoker`, `security_barrier` and `check_option` live
     // here and in nothing else — `pg_get_viewdef` cannot show them, and
     // `Module::definition` starts after `AS`. And this one is not confined to
@@ -366,6 +394,7 @@ async fn read_relation(
 async fn read_routine(
     conn: &mut Conn,
     oid: i64,
+    declared: &BTreeMap<String, BTreeSet<Permission>>,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
     let rows = conn
@@ -381,7 +410,15 @@ async fn read_routine(
         .await?;
     let row = rows.first().ok_or_else(|| vanished(oid))?;
     push_owner(row, carries)?;
-    push_acl(row, carries)?;
+    if !text(row, "acl")?.is_empty() {
+        let source = AclSource {
+            catalog: "pg_proc",
+            acl_column: "proacl",
+            owner_column: "proowner",
+            objtype: "f",
+        };
+        read_acl(conn, oid, source, declared, carries).await?;
+    }
     Ok(())
 }
 
@@ -577,22 +614,191 @@ fn push_owner(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
     Ok(())
 }
 
-fn push_acl(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
-    let acl = text(row, "acl")?;
-    if acl.is_empty() {
-        return Ok(());
+/// The `GrantTarget` a module's own ACL is granted under, or `None` for a
+/// trigger — which has no ACL of its own (`read_trigger_enabled`'s doc).
+fn grant_target(id: &ModuleId) -> Option<GrantTarget> {
+    match id {
+        ModuleId::Named(n) => Some(GrantTarget::Object(n.clone())),
+        ModuleId::Routine(r) => Some(GrantTarget::Routine(r.clone())),
+        ModuleId::Trigger { .. } => None,
     }
-    // In **either** direction, and the second is the one that is easy to miss.
-    // A revocation is not a row in the ACL — it is the *absence* of the
-    // engine's default — so a rebuild restores the default and silently
-    // reopens a function somebody deliberately closed. Measured:
-    // `REVOKE EXECUTE … FROM PUBLIC` leaves `{postgres=X/postgres}`, and after
-    // a rebuild the ACL is `NULL` and the function answers a role that had
-    // been shut out.
-    carries.push(Carried {
-        what: "the object's ACL, which a `DROP` destroys and no declaration here can restore",
-        detail: acl,
-    });
+}
+
+/// The permissions this plan's own `Change::Grant` entries put on `target` —
+/// the **full** declared set for a target this dialect is rebuilding, not a
+/// delta, because `pbps_diff::diff_roles` treats an `AlterModule` exactly as
+/// it treats a `DropModule` once `Dialect::rebuilds_modules` answers `true`
+/// (#248). A role absent here is a role this plan is not about to grant
+/// anything to on this object, whatever the live ACL currently shows.
+fn declared_grants(
+    changes: &ChangeSet,
+    target: &GrantTarget,
+) -> BTreeMap<String, BTreeSet<Permission>> {
+    let mut by_role: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
+    for planned in &changes.changes {
+        if let Change::Grant {
+            role,
+            target: t,
+            permissions,
+        } = &planned.change
+            && t == target
+        {
+            by_role
+                .entry(role.clone())
+                .or_default()
+                .extend(permissions.iter().copied());
+        }
+    }
+    by_role
+}
+
+/// The four catalog spellings [`read_acl`] needs, bundled so the function
+/// stays under the arity clippy allows — a view and a routine each name their
+/// own class letter, ACL column and owner column, and passing the four
+/// separately reads as unrelated strings rather than one address.
+struct AclSource {
+    /// `"pg_class"` or `"pg_proc"`.
+    catalog: &'static str,
+    /// `"relacl"` or `"proacl"`.
+    acl_column: &'static str,
+    /// `"relowner"` or `"proowner"`.
+    owner_column: &'static str,
+    /// `acldefault`'s own letter for the kind: `"r"` or `"f"`.
+    objtype: &'static str,
+}
+
+/// The object's ACL, read structurally and narrowed against what the plan's
+/// own `Grant`s will restore after the `CREATE` (#248).
+///
+/// Never parsed as text. `aclexplode` is the engine's own reader, used the way
+/// `pull` already uses it (`crate::introspect::RawGrant`): the ACL's text form
+/// packs a role, a permission letter and a grant-option flag into one run of
+/// characters, and a letter this code did not know would silently read as no
+/// permission granted at all.
+///
+/// Compared **structurally against the engine's own default**, not against
+/// text equality, and in both directions — the second is the one ADR-0009 §3
+/// and ADR-0010 §5 both say is easy to miss. A row the live ACL holds beyond
+/// the default is a grant to explain; a row the default holds that the live
+/// ACL does not is something a human took away, and that direction is *never*
+/// explained by a declaration, because the model has no grantee to revoke it
+/// from again. That is exactly `REVOKE EXECUTE … FROM PUBLIC`: the array
+/// becomes non-`NULL`, and the only entry left in it is the owner's own — so a
+/// check that stopped at "does every remaining row match a declared role"
+/// would see nothing to explain and wave the rebuild through, restoring the
+/// very access somebody deliberately took away. Comparing against the default
+/// is what catches the row that is missing rather than the row that is there.
+async fn read_acl(
+    conn: &mut Conn,
+    oid: i64,
+    source: AclSource,
+    declared: &BTreeMap<String, BTreeSet<Permission>>,
+    carries: &mut Vec<Carried>,
+) -> Result<(), DbError> {
+    let AclSource {
+        catalog,
+        acl_column,
+        owner_column,
+        objtype,
+    } = source;
+    // Each side exploded by the engine, never joined to itself on `NULL` —
+    // `aclexplode(NULL)` is refused by the caller having already checked the
+    // raw ACL text is non-empty.
+    let rows = conn
+        .query_with(
+            &format!(
+                "WITH live AS (
+                    SELECT a.grantee, a.privilege_type, a.is_grantable
+                      FROM pg_catalog.{catalog} c
+                      CROSS JOIN LATERAL pg_catalog.aclexplode(c.{acl_column}) a
+                     WHERE c.oid = ($1::int8)::oid
+                 ), zero AS (
+                    SELECT a.grantee, a.privilege_type
+                      FROM pg_catalog.{catalog} c
+                      CROSS JOIN LATERAL pg_catalog.aclexplode(
+                               pg_catalog.acldefault('{objtype}'::\"char\", c.{owner_column})) a
+                     WHERE c.oid = ($1::int8)::oid
+                 )
+                 SELECT 'extra' AS side,
+                        COALESCE(CASE WHEN live.grantee = 0 THEN NULL
+                                      ELSE pg_catalog.pg_get_userbyid(live.grantee) END, '')
+                          AS grantee,
+                        live.privilege_type AS permission,
+                        live.is_grantable AS grantable
+                   FROM live
+                  WHERE live.is_grantable
+                     OR NOT EXISTS (
+                          SELECT 1 FROM zero
+                           WHERE zero.grantee = live.grantee
+                             AND zero.privilege_type = live.privilege_type)
+                 UNION ALL
+                 SELECT 'missing',
+                        COALESCE(CASE WHEN zero.grantee = 0 THEN NULL
+                                      ELSE pg_catalog.pg_get_userbyid(zero.grantee) END, ''),
+                        zero.privilege_type,
+                        false
+                   FROM zero
+                  WHERE NOT EXISTS (
+                          SELECT 1 FROM live
+                           WHERE live.grantee = zero.grantee
+                             AND live.privilege_type = zero.privilege_type)
+                 ORDER BY 1, 2, 3"
+            ),
+            &[Param::I64(oid)],
+        )
+        .await?;
+    for row in rows {
+        let side = text(&row, "side")?;
+        let grantee = text(&row, "grantee")?;
+        let permission = text(&row, "permission")?;
+        let grantable = matches!(row.try_get::<bool>("grantable"), Ok(Some(true)));
+        let who = if grantee.is_empty() {
+            "PUBLIC"
+        } else {
+            &grantee
+        };
+        if side == "missing" {
+            // The direction that is easy to miss (ADR-0009 §3, ADR-0010 §5):
+            // not a row to compare, but the absence of one `acldefault` would
+            // otherwise put there. Always a refusal — the model has no
+            // grantee to re-emit a revoke from, `PUBLIC` least of all
+            // (DECISIONS 306) — whoever the row names.
+            carries.push(Carried {
+                what: "a grant the object's own default ACL holds and this one does not, which a \
+                       rebuild restores and no declaration here can take away again",
+                detail: format!(
+                    "{who} no longer holds `{permission}`, which `acldefault` grants a freshly \
+                     created object of this kind"
+                ),
+            });
+            continue;
+        }
+        if grantee.is_empty() {
+            carries.push(Carried {
+                what: "a grant to PUBLIC, which is not a role the declarations can name and \
+                       ADR-0010 §5 keeps off the restorable path for good",
+                detail: format!("PUBLIC holds `{permission}`"),
+            });
+            continue;
+        }
+        if grantable {
+            carries.push(Carried {
+                what: "a grant `WITH GRANT OPTION`, which the declarations hold no flag for",
+                detail: format!("`{grantee}` holds `{permission}` with the option to grant it on"),
+            });
+            continue;
+        }
+        let restorable = Permission::from_str(&permission)
+            .ok()
+            .is_some_and(|p| declared.get(&grantee).is_some_and(|held| held.contains(&p)));
+        if !restorable {
+            carries.push(Carried {
+                what: "a grant the declarations do not hold on this target, which a rebuild \
+                       would destroy without the plan restoring it",
+                detail: format!("`{grantee}` holds `{permission}`"),
+            });
+        }
+    }
     Ok(())
 }
 

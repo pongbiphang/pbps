@@ -881,6 +881,19 @@ impl Dialect for Postgres {
         false
     }
 
+    /// **Yes.** Every module edit on this engine is a `DROP` and a `CREATE`
+    /// (ADR-0009 §3), so an object about to be rebuilt has no ACL until the
+    /// declared grants on it are re-emitted after the `CREATE` — the same
+    /// state a `DropModule` leaves it in, and `diff_roles` compares against
+    /// it the same way (#248). `crate::modules::before_a_rebuild` is the
+    /// connected half: it still refuses whatever the declarations cannot
+    /// reproduce (an ungranted role, `PUBLIC`, `WITH GRANT OPTION`, a column
+    /// grant), and this only stops it refusing a grant this plan is about to
+    /// restate anyway.
+    fn rebuilds_modules(&self) -> bool {
+        true
+    }
+
     /// Every problem with a role, before anything connects (ADR-0010 §1, §2
     /// and §6). See [`validate::role`].
     fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {

@@ -577,6 +577,91 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// #248, end to end: a rebuild forced by an ordinary view edit still lets a
+/// declared, least-privilege role read the view afterwards.
+///
+/// Read as the granted role itself, never as `postgres` — a superuser passes
+/// every privilege check without consulting an ACL at all, so a superuser
+/// read would pass whether or not the rebuild restored anything (DECISIONS
+/// 375, the live suite's own correction of exactly that mistake). Only a
+/// query that can fail on a missing grant is evidence the grant came back.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_view_reader_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "view-rebuild-grant");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION \
+             PASSWORD 'view-rebuild-grant'; CREATE SCHEMA app",
+            role.1
+        ),
+    );
+    // The same connection, reissued under the least-privilege role's own
+    // credentials rather than the admin's (`doctor_reports_data_and_role_grant_gaps_from_the_declarations`'s
+    // idiom for the same reason).
+    let login = format!(
+        "{} user={} password=view-rebuild-grant",
+        connection
+            .split_whitespace()
+            .filter(|word| !word.starts_with("user=") && !word.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+
+    let d = Demo::new("view-rebuild-grant");
+    d.table(ONE_COLUMN);
+    let view = d.dir.join("schema/v.yml");
+    std::fs::write(&view, "view: app.v\ndefinition: SELECT id FROM app.t\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!(
+            "role: {}\ngrants:\n  schema::app: [usage]\n  app.v: [select]\n",
+            role.1
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    // Granted from the start: the ordinary path, unaffected by #248.
+    on_server(&login, "SELECT id FROM app.v");
+
+    // The view's return shape changes — every edit is a rebuild on this
+    // engine, with no `CREATE OR REPLACE` fallback (ADR-0009 §3) — and the
+    // role's declared grant is unchanged by this revision, so before #248 the
+    // connected plan would have refused rather than silently drop it.
+    std::fs::write(
+        &view,
+        "view: app.v\ndefinition: SELECT id, id * 2 AS doubled FROM app.t\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(apply_plan(&d, connection, &plan, false));
+
+    // The rebuilt object, read by the role the plan declared — not by the
+    // admin connection that ran the apply.
+    on_server(&login, "SELECT doubled FROM app.v");
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn routine_rebuilds_do_not_restore_revoked_public_execute() {
