@@ -73,6 +73,11 @@ export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password
 # seconds is what proves the wait is bounded. It is why this suite takes half a
 # minute for six tests.
 cargo test -p pbps-pg --test live -- --ignored "$@"
+# The seam's own error conversion (issue #167): a real server error must
+# render its own sentence, not tokio_postgres's literal `db error`. `pbps-db`
+# has no other live suite of its own, so this is the one place its `From`
+# impls are ever run against a real server.
+cargo test -p pbps-db --test live_pg -- --ignored "$@"
 # And the CLI's own PostgreSQL-dependent test, which lives in the bin target
 # rather than in `tests/`: `deploy::preflight` and `deploy::run_probes` are
 # private, and the thing under test is that the second pins the session before

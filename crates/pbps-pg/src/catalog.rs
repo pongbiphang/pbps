@@ -1532,9 +1532,15 @@ async fn close<T>(
 ///
 /// That is the snapshot doing its job in the only direction it can. Without the
 /// transaction the pull would have returned a table with no columns and called
-/// it a schema; with it, the read fails. What is left is to say so, because the
-/// driver renders `XX000` as `db error` and an unreadable failure is the third
-/// thing CLAUDE.md's rule names (issue #167).
+/// it a schema; with it, the read fails. What is left is to say so — and
+/// legibly: this seam's `From<tokio_postgres::Error>` used to render `XX000`
+/// as the literal `db error`, an unreadable failure being the third thing
+/// CLAUDE.md's rule names, until issue #167 read the server's own sentence
+/// off `as_db_error()` instead of `Display`. [`schema_changed_underneath`]
+/// below still folds that sentence into a sentence of its own: the server's
+/// text says a cache lookup failed, and what a reader needs is why — that
+/// this snapshot cannot see a concurrent `DROP` and is refusing rather than
+/// guessing.
 /// The one question that has to be asked **before** `BEGIN`.
 ///
 /// PostgreSQL does not nest: inside an open transaction a plain `BEGIN` is a
@@ -1580,9 +1586,11 @@ fn schema_changed_underneath(e: DbError) -> DbError {
                  this is that guard firing. Run it again when the other change has finished."
             ),
         },
-        // A deadlock, which reaches an operator as `db error` and nothing
-        // else. It is the third way the catalog moves under this read, and
-        // the only one where the engine has already decided the outcome.
+        // A deadlock, which — before issue #167 — reached an operator as
+        // `db error` and nothing else, and now carries the server's own
+        // "deadlock detected" sentence besides. It is the third way the
+        // catalog moves under this read, and the only one where the engine
+        // has already decided the outcome.
         //
         // The pull deparses every view in the database, and
         // `pg_get_viewdef` opens each one — so the read holds `ACCESS SHARE`

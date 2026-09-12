@@ -1724,7 +1724,9 @@ const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
 /// Process B: SELECT … pg_get_viewdef(c.oid, true) …
 /// ```
 ///
-/// Reaching a caller as `db error`, that is unactionable — and the action is
+/// Before issue #167, that reached a caller as `db error` alone, which is
+/// unactionable; now it carries the server's own "deadlock detected" text
+/// too. Either way this function's own message is what says the action is
 /// exactly one thing: run it again. Nothing was half-done; the engine rolled
 /// the victim back whole before either side wrote.
 fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
