@@ -46,6 +46,8 @@ async fn canonical_default_plan_replays_under_hostile_settings_for_every_sensiti
         ("d", "date", "'01/02/2026'::date"),
         ("d2", "date", "DATE '01/02/2026'"),
         ("d3", "date", "CAST('01/02/2026' AS date)"),
+        ("d4", "date", r#"'01/02/2026'::"date""#),
+        ("d5", "date", r#"CAST('01/02/2026' AS "pg_catalog"."date")"#),
         ("t", "time", "'12:34:56.789'::time"),
         ("tz", "timetz", "'12:00 CST'::timetz"),
         ("ts", "timestamp", "TIMESTAMP '01/02/2026 03:04'"),
@@ -94,7 +96,7 @@ async fn canonical_default_plan_replays_under_hostile_settings_for_every_sensiti
                 pbps_model::DefaultResolution::Canonical { .. }
             ))
             .count(),
-        10
+        12
     );
     let statements = Postgres::new().emit_planned(&replay.changes[0]).unwrap();
     assert!(statements[0].sql.contains("'2026-01-02'::date"));
@@ -108,7 +110,7 @@ async fn canonical_default_plan_replays_under_hostile_settings_for_every_sensiti
         conn.execute(&format!("INSERT INTO {s}.t DEFAULT VALUES"))
             .await
             .unwrap();
-        assert!(truth(&mut conn, &format!("SELECT d = DATE '2026-01-02' AND d2 = d AND d3 = d AND t = TIME '12:34:56.789' AND tz = TIMETZ '12:00:00-06' AND ts = TIMESTAMP '2026-01-02 03:04:00' AND tstz = TIMESTAMPTZ '2026-01-02 09:04:00+00' AND extract(epoch from i) = -79200 AND r = '0.12345678'::real AND f = '0.12345678901234568'::double precision AND n = 7 FROM {s}.t")).await);
+        assert!(truth(&mut conn, &format!("SELECT d = DATE '2026-01-02' AND d2 = d AND d3 = d AND d4 = d AND d5 = d AND t = TIME '12:34:56.789' AND tz = TIMETZ '12:00:00-06' AND ts = TIMESTAMP '2026-01-02 03:04:00' AND tstz = TIMESTAMPTZ '2026-01-02 09:04:00+00' AND extract(epoch from i) = -79200 AND r = '0.12345678'::real AND f = '0.12345678901234568'::double precision AND n = 7 FROM {s}.t")).await);
         conn.execute(&format!("DROP TABLE {s}.t")).await.unwrap();
     }
     drop_schema(&mut conn, &s).await;

@@ -177,9 +177,15 @@ pub(crate) fn emit(
 /// Qualify the built-in type rather than letting a temporary type capture it.
 /// Arbitrary type input functions are not authorized by literal resolution.
 fn builtin(ty: &str) -> Result<String, DialectError> {
+    // Quoted identifiers are case-sensitive, and grammar aliases are not
+    // catalog names. Reuse the measured decoder rather than folding either.
+    let ty = crate::types::as_the_grammar_spells(ty).ok_or_else(|| {
+        invalid(format!(
+            "literal resolution requires a builtin type, got {ty}"
+        ))
+    })?;
     let lower = ty.to_ascii_lowercase();
     let ty = lower.as_str();
-    let ty = ty.strip_prefix("pg_catalog.").unwrap_or(ty);
     if let Some(fields) = ty.strip_prefix("interval ")
         && crate::rows::is_an_interval_qualifier(fields)
     {
@@ -412,6 +418,25 @@ mod tests {
             "CAST('x' AS public.custom_type)",
             "'x' || dangerous()",
             "1; SELECT dangerous()",
+        ] {
+            assert!(input(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn quoted_builtin_types_resolve_without_folding_quoted_custom_names() {
+        for source in [
+            r#"'01/02/2026'::"date""#,
+            r#"CAST('01/02/2026' AS "pg_catalog"."date")"#,
+            r#""date" '01/02/2026'"#,
+        ] {
+            assert!(input(source).is_ok(), "{source}");
+        }
+        for source in [
+            r#"'01/02/2026'::"DATE""#,
+            r#"'01/02/2026'::"public"."date""#,
+            "'1'::pg_catalog.integer",
+            "'1'::public.custom_type",
         ] {
             assert!(input(source).is_err(), "{source}");
         }
