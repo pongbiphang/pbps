@@ -1241,56 +1241,168 @@ async fn build(conn: &mut Conn, schema: &str, body: &str) {
     }
 }
 
-/// A pull, retried while another test in this same run is applying DDL.
-///
-/// The suite is its own concurrent writer: these tests run in parallel and each
-/// builds and drops a schema. A pull taken across another's `DROP` fails by
-/// design — `pg_get_constraintdef` reads through the syscache rather than the
-/// transaction's snapshot, so the object it is rendering can be gone. That is
-/// the guard firing, not a defect, and the assertion here is that it fires with
-/// the message that says so rather than as a bare driver error.
-async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
-    // Twenty, with a wait between them, and the number is not arbitrary: four
-    // in a row with no wait was enough while step 3 was the only thing building
-    // schemas here, and step 4's tests each build and drop one of their own. A
-    // retry budget sized to the suite as it was is a budget that expires the
-    // next time the suite grows, and it expires as a failure that reads like a
-    // defect in the pull.
-    for _ in 0..20 {
-        match pbps_pg::catalog::introspect(conn).await {
-            Ok(pulled) => return pulled,
-            Err(e) => {
-                assert!(
-                    e.to_string()
-                        .contains("the catalog changed while it was being read"),
-                    "the pull failed for a reason this suite does not cause: {e:?}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-    }
-    panic!("twenty pulls in a row were taken across another test's DDL");
+/// A pull of this test's private database. A schema alone cannot isolate a
+/// database-wide catalog scan from another test's DDL (issue #358).
+async fn pull(conn: &mut TestDb) -> pbps_pg::introspect::Pulled {
+    pbps_pg::catalog::introspect(conn)
+        .await
+        .expect("pull the isolated fixture without concurrent DDL")
 }
 
-/// The read-back inside the caller's transaction, with [`pull`]'s budget and
-/// for the same reason. One more thing is measured on every retry: a deadlock
-/// aborts the read's savepoint and not the caller's transaction, so the retry
-/// runs inside the *same* transaction and still sees its uncommitted build.
-async fn read_back_within(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
-    for _ in 0..20 {
-        match pbps_pg::catalog::introspect_within_transaction(conn).await {
-            Ok(pulled) => return pulled,
-            Err(e) => {
-                assert!(
-                    e.to_string()
-                        .contains("the catalog changed while it was being read"),
-                    "the read-back failed for a reason this suite does not cause: {e:?}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+/// The same isolation as [`pull`], while preserving the caller's transaction.
+async fn read_back_within(conn: &mut TestDb) -> pbps_pg::introspect::Pulled {
+    pbps_pg::catalog::introspect_within_transaction(conn)
+        .await
+        .expect("read back the isolated fixture inside the caller's transaction")
+}
+
+/// A repeatable-read snapshot makes the old shared fixture fail deterministically:
+/// the catalog rows survive a neighbour's DROP, but its deparsed definition does
+/// not (PITFALLS, "The snapshot the rendering functions do not read from").
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_isolated_read_back_cannot_inherit_a_neighbours_stale_catalog_rows() {
+    let mut conn = TestDb::create("pull_snapshot").await;
+    let mut neighbour = connect().await;
+    let foreign = probe_schema("snapshot_neighbour");
+    build(
+        &mut neighbour,
+        &foreign,
+        &format!("CREATE FUNCTION {foreign}.f() RETURNS int LANGUAGE sql AS 'SELECT 1'"),
+    )
+    .await;
+    conn.execute("CREATE TABLE public.kept (id integer)")
+        .await
+        .expect("our committed fixture");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("pin the read-back snapshot");
+    number(&mut conn, "SELECT count(*)::int FROM pg_catalog.pg_proc").await;
+    conn.execute("CREATE TABLE public.uncommitted (id integer)")
+        .await
+        .expect("our uncommitted fixture");
+    drop_schema(&mut neighbour, &foreign).await;
+
+    let pulled = read_back_within(&mut conn).await;
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("public", "kept"))
+    );
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("public", "uncommitted"))
+    );
+    assert!(our_modules(&pulled, &foreign).is_empty());
+    conn.execute("ROLLBACK")
+        .await
+        .expect("the caller still owns its transaction");
+    assert!(
+        !pull(&mut conn)
+            .await
+            .schema
+            .tables
+            .contains_key(&TableName::new("public", "uncommitted"))
+    );
+    conn.drop().await;
+}
+
+/// Four writers repeatedly replace 128 routine definitions without pacing.
+/// Completion counts and elapsed time measure the burst; the reader must work
+/// on its first attempt throughout it, including inside its own transaction.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn isolated_pulls_and_read_backs_survive_continuous_foreign_ddl() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let mut conn = TestDb::create("pull_churn").await;
+    conn.execute("CREATE TABLE public.kept (id integer PRIMARY KEY)")
+        .await
+        .expect("our fixture");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut writers = Vec::new();
+    let mut schemas = Vec::new();
+    for writer in 0..4 {
+        let schema = probe_schema(&format!("churn_{writer}"));
+        let mut other = connect().await;
+        build(
+            &mut other,
+            &schema,
+            &format!("CREATE TABLE {schema}.foreign_marker (id integer)"),
+        )
+        .await;
+        schemas.push(schema.clone());
+        let stop = Arc::clone(&stop);
+        let writes = Arc::clone(&writes);
+        writers.push(tokio::spawn(async move {
+            let padding = "-- ".to_owned() + &"pad ".repeat(500);
+            let create = (0..32).map(|n| format!(
+                "CREATE FUNCTION {schema}.f{n}() RETURNS int LANGUAGE sql AS $$\n{padding}\nSELECT 1 $$;"
+            )).collect::<String>();
+            let drop = (0..32).map(|n| format!("DROP FUNCTION {schema}.f{n}();")).collect::<String>();
+            while !stop.load(Ordering::Relaxed) {
+                other.execute(&create).await.expect("create the foreign routines");
+                other.execute(&drop).await.expect("drop the foreign routines");
+                writes.fetch_add(64, Ordering::Relaxed);
             }
-        }
+            drop_schema(&mut other, &schema).await;
+        }));
     }
-    panic!("twenty read-backs in a row were taken across another test's DDL");
+    let started = std::time::Instant::now();
+    while writes.load(Ordering::Relaxed) < 256 {
+        assert!(
+            writers.iter().all(|w| !w.is_finished()),
+            "a churn writer failed"
+        );
+        tokio::task::yield_now().await;
+    }
+    let before = writes.load(Ordering::Relaxed);
+    for _ in 0..10 {
+        let pulled = pull(&mut conn).await;
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&TableName::new("public", "kept"))
+        );
+        for schema in &schemas {
+            assert!(
+                ours(&pulled, schema).is_empty(),
+                "a neighbour entered the pull"
+            );
+        }
+        conn.execute("BEGIN").await.expect("begin");
+        conn.execute("CREATE TABLE public.uncommitted (id integer)")
+            .await
+            .expect("uncommitted fixture");
+        let pulled = read_back_within(&mut conn).await;
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&TableName::new("public", "uncommitted"))
+        );
+        conn.execute("ROLLBACK").await.expect("rollback");
+    }
+    let during = writes.load(Ordering::Relaxed) - before;
+    stop.store(true, Ordering::Relaxed);
+    for writer in writers {
+        writer.await.expect("the writer finished and cleaned up");
+    }
+    assert!(
+        during >= 256,
+        "the writers did not overlap the reads: {during} DDL statements"
+    );
+    eprintln!(
+        "20 single-attempt catalog reads overlapped {during} foreign DDL statements in {:?}",
+        started.elapsed()
+    );
+    conn.drop().await;
 }
 
 /// The limitations this suite's own schema earned.
@@ -1330,7 +1442,7 @@ fn ours(pulled: &pbps_pg::introspect::Pulled, schema: &str) -> Vec<pbps_model::T
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_table_built_by_hand_reads_back_field_by_field() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_fields").await;
     let s = probe_schema("fields");
     build(
         &mut conn,
@@ -1443,6 +1555,7 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     assert_eq!(fk.on_update, pbps_model::ReferentialAction::NoAction);
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// The reason ADR-0013 §3 pins the search path, measured rather than asserted.
@@ -1454,7 +1567,7 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_path").await;
     let s = probe_schema("path");
     build(
         &mut conn,
@@ -1549,6 +1662,7 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
     assert!(!in_transaction);
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// PostgreSQL does not nest transactions, so a pull that ran inside the
@@ -1556,7 +1670,7 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_pull_inside_the_callers_own_transaction_is_refused() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_xact").await;
     let s = probe_schema("xact");
     build(
         &mut conn,
@@ -1601,6 +1715,7 @@ async fn a_pull_inside_the_callers_own_transaction_is_refused() {
     assert!(ours(&pulled, &s).contains(&pbps_model::TableName::new(&s, "kept")));
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// Two settings that decide how the pull's *own SQL* is read, rather than how
@@ -1609,7 +1724,7 @@ async fn a_pull_inside_the_callers_own_transaction_is_refused() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_schema_a_broken_pattern_would_swallow_is_in_the_pull() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_schema_pattern").await;
     // Not under the probe schema: the name has to begin `pg`, which is what a
     // pattern of `pg_%` — what `'pg\_%'` becomes when the engine eats the
     // backslash — matches with its `_` acting as a wildcard.
@@ -1639,6 +1754,7 @@ async fn a_schema_a_broken_pattern_would_swallow_is_in_the_pull() {
     );
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// Every kind of object the model cannot hold, in one database, each measured
@@ -1651,7 +1767,7 @@ async fn a_schema_a_broken_pattern_would_swallow_is_in_the_pull() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_limits").await;
     let s = probe_schema("limits");
     build(
         &mut conn,
@@ -2195,6 +2311,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     );
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,7 +2556,7 @@ async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
         "the plan has to create the tables it is about to read back"
     );
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_bootstrap").await;
     fresh(&mut conn, &s).await;
     apply(&mut conn, &Postgres::new(), &cs).await;
 
@@ -2469,6 +2586,7 @@ async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
     );
     assert_eq!(ours, normalized(&declared));
     assert_eq!(methods, "heap");
+    conn.drop().await;
 }
 
 /// Issue #79's third named live test: a bootstrap, and the plan straight after
@@ -2486,7 +2604,7 @@ async fn the_plan_straight_after_a_bootstrap_is_empty() {
     let declared = rich_schema(&s);
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_fixpoint").await;
     fresh(&mut conn, &s).await;
     apply(
         &mut conn,
@@ -2504,6 +2622,7 @@ async fn the_plan_straight_after_a_bootstrap_is_empty() {
         again.is_empty(),
         "the plan straight after a bootstrap must be empty: {again:#?}"
     );
+    conn.drop().await;
 }
 
 /// Issue #79's second named live test, and SPEC §11.5 invariant 3: a table that
@@ -2531,7 +2650,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
     a.tables.insert(TableName::new(&s, "child"), child);
     let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_converge").await;
     fresh(&mut conn, &s).await;
     apply(
         &mut conn,
@@ -2606,6 +2725,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
     assert_eq!(state_b, normalized(&b));
     let again = plan(&state_b, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+    conn.drop().await;
 }
 
 /// The write `search_path` is what makes an unqualified name in a declared
@@ -2629,7 +2749,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
 async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_path() {
     let s = emit_schema("writepath");
     let ext = format!("{s}_ext");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_writepath").await;
     fresh(&mut conn, &s).await;
     fresh(&mut conn, &ext).await;
     conn.execute(&format!(
@@ -2740,6 +2860,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
         .emit(&first.change, first.strategy)
         .expect_err("a path that lists pg_catalog moves it behind the object's own schema");
     assert!(refusal.to_string().contains("pg_catalog"), "{refusal}");
+    conn.drop().await;
 }
 
 /// A declared expression ending in a comment still runs, in every place this
@@ -2757,7 +2878,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_declared_expression_that_ends_in_a_comment_still_runs() {
     let s = emit_schema("trailingcomment");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_trailingcomment").await;
     fresh(&mut conn, &s).await;
 
     let mut n = Column::new(ty("integer")).not_null();
@@ -2826,6 +2947,7 @@ async fn a_declared_expression_that_ends_in_a_comment_still_runs() {
         read.contains('2'),
         "the new default has to be there: {read}"
     );
+    conn.drop().await;
 }
 
 /// `standard_conforming_strings` is pinned by the transaction framing, and the
@@ -3301,7 +3423,7 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
 async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table_went() {
     let s = emit_schema("rename");
     let to_schema = format!("{s}_to");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_rename").await;
     fresh(&mut conn, &s).await;
     fresh(&mut conn, &to_schema).await;
     conn.execute(&format!("CREATE TABLE {s}.before (id integer NOT NULL)"))
@@ -3337,6 +3459,7 @@ async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table
     drop_schema(&mut conn, &s).await;
     drop_schema(&mut conn, &to_schema).await;
     assert_eq!(landed.tables.keys().collect::<Vec<_>>(), vec![&to]);
+    conn.drop().await;
 }
 
 /// A primary key the declaration did not name is dropped by asking the catalog
@@ -3345,7 +3468,7 @@ async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
     let s = emit_schema("unnamedpk");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_unnamedpk").await;
     fresh(&mut conn, &s).await;
     // The constraint is named by hand as something no rule would derive, so a
     // guess cannot pass — and the table's own name carries every character that
@@ -3386,6 +3509,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
     let ours = ours_only(&pulled, &s);
     drop_schema(&mut conn, &s).await;
     assert_eq!(ours.tables[&table].primary_key, None);
+    conn.drop().await;
 }
 
 /// SPEC §11.5 invariant 3 over the altering half: a rename, a widening, a
@@ -3436,7 +3560,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
     a.tables.insert(TableName::new(&s, "t"), t);
     let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_alters").await;
     fresh(&mut conn, &s).await;
     apply(
         &mut conn,
@@ -3492,6 +3616,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
     assert_eq!(state_b, normalized(&b));
     let again = plan(&state_b, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+    conn.drop().await;
 }
 
 /// The other three settings the framing pins, and the reason they are pinned
@@ -3821,7 +3946,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
     let s = emit_schema("pkorder");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_pkorder").await;
     fresh(&mut conn, &s).await;
     let table = TableName::new(&s, "t");
 
@@ -3863,6 +3988,7 @@ async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
     assert_eq!(state, normalized(&b));
     let again = plan(&state, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+    conn.drop().await;
 }
 
 /// A declaration that replaces its primary key, adds the column the new key
@@ -3879,7 +4005,7 @@ async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
     let s = emit_schema("pkswap");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_pkswap").await;
     fresh(&mut conn, &s).await;
     let table = TableName::new(&s, "t");
 
@@ -3925,6 +4051,7 @@ async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
     assert_eq!(state, normalized(&b));
     let again = plan(&state, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+    conn.drop().await;
 }
 
 /// A conversion to text runs the stored value through the type's *output*
@@ -4001,7 +4128,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
     let s = emit_schema("retype");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_retype").await;
     fresh(&mut conn, &s).await;
     let table = TableName::new(&s, "t");
 
@@ -4041,6 +4168,7 @@ async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
     assert_eq!(state, normalized(&b));
     let again = plan(&state, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+    conn.drop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -4062,9 +4190,30 @@ use pbps_pg::{doctor, state};
 /// A **database**, not a schema: the ledger lives in `public` (SPEC §8.1, and
 /// `pbps_pg::state`'s header for why `public`), so there is exactly one of it
 /// per database and nothing smaller can isolate two tests from each other.
+/// Catalog pulls also scan the whole database, so their fixtures use this
+/// boundary to exclude incidental DDL from other tests (issue #358). Creating
+/// these fixtures requires CREATEDB, already supplied by the script's postgres
+/// role; callers close them explicitly with `drop().await`.
 struct TestDb {
     name: String,
     conn: Conn,
+}
+
+// Pull helpers require the owning fixture, so a shared connection cannot
+// accidentally reintroduce another test's catalog churn. Dereferencing keeps
+// the ordinary SQL helpers usable without opening an extra connection.
+impl std::ops::Deref for TestDb {
+    type Target = Conn;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for TestDb {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
 }
 
 impl TestDb {
@@ -5820,7 +5969,7 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let pg = Postgres::new();
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_modules").await;
     fresh(&mut conn, &s).await;
     apply(
         &mut conn,
@@ -5887,6 +6036,7 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
         second, first,
         "the text this engine deparsed did not rebuild into the same object"
     );
+    conn.drop().await;
 }
 
 /// ADR-0009 §1's whole reason for a typed `ModuleId`: on this engine a name is
@@ -5919,7 +6069,7 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let pg = Postgres::new();
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_overload").await;
     fresh(&mut conn, &s).await;
     apply(
         &mut conn,
@@ -5963,6 +6113,7 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
         vec![format!("{s}.f(text)")],
         "the drop with a signature took the wrong object, or both"
     );
+    conn.drop().await;
 }
 
 /// Opens a transaction, because [`pbps_pg::modules::before_a_rebuild`] takes
@@ -6946,7 +7097,7 @@ async fn every_catalog_keyed_by_an_object_is_read() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_session_setting_left_behind_cannot_answer_the_transaction_probe() {
     let s = emit_schema("probe");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_probe").await;
     fresh(&mut conn, &s).await;
     conn.execute(&format!("CREATE TABLE {s}.t (id int)"))
         .await
@@ -7000,9 +7151,8 @@ async fn a_session_setting_left_behind_cannot_answer_the_transaction_probe() {
     // And the same setting must not make the pull refuse a connection that is
     // doing nothing wrong: the pull asks the opposite question of the same
     // probe, so a constant defeats it in the opposite direction.
-    // Through the suite's retry helper, because the rest of this file is
-    // applying DDL while this runs — what is being asserted is that the pull
-    // is *not refused*, not that nothing else is happening.
+    // The fixture's own database keeps the rest of the suite's DDL outside
+    // this read, so a refusal here belongs to the transaction probe.
     let pulled = pull(&mut conn).await;
     assert!(
         pulled.schema.modules.contains_key(&v),
@@ -7019,6 +7169,7 @@ async fn a_session_setting_left_behind_cannot_answer_the_transaction_probe() {
     assert_eq!(rebuild.refusal(), None, "{:?}", rebuild.carries);
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// The limit of "enumerate from the catalog", measured: `pg_depend` records an
@@ -7266,7 +7417,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_still_runs() {
     let s = emit_schema("unheld");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_unheld").await;
     fresh(&mut conn, &s).await;
     for sql in [
         format!("CREATE TABLE {s}.t (id int primary key)"),
@@ -7333,6 +7484,7 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
         assert_eq!(entry.kind, kind);
         assert!(pulled.warnings.contains(&entry.why), "{entry:?}");
     }
+    conn.drop().await;
 }
 
 /// A module the catalog scan saw and the deparse could not: the third of
@@ -7858,7 +8010,7 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     let s = emit_schema("identity");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_identity").await;
     fresh(&mut conn, &s).await;
     conn.execute(&format!("CREATE TYPE {s}.\"odd(name)\" AS ENUM ('a')"))
         .await
@@ -8097,6 +8249,7 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         unfolded, expected,
         "this fixture has to exercise the fold, and these spellings do not"
     );
+    conn.drop().await;
 }
 
 /// The trigger check reads the name after `ON`, and this is why it has to.
@@ -8314,7 +8467,7 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_named() {
     let s = emit_schema("trigger_unheld");
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_trigger_unheld").await;
     fresh(&mut conn, &s).await;
     for sql in [
         format!(
@@ -8446,6 +8599,7 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     );
 
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// A routine that takes the view's row type, or an array of it, or returns
@@ -9216,7 +9370,7 @@ async fn counted(conn: &mut Conn, sql: &str) -> i64 {
 
 /// The base a connected plan is made against: the live schema with the rows
 /// the read-back found, resolved the way `plan --db` resolves them.
-async fn connected_base(conn: &mut Conn, declared: &Schema, schema: &str) -> Schema {
+async fn connected_base(conn: &mut TestDb, declared: &Schema, schema: &str) -> Schema {
     let live = ours_only(&pull(conn).await, schema);
     let scopes = declared.data_scopes();
     let rows = pbps_pg::catalog::read_rows(
@@ -9232,7 +9386,7 @@ async fn connected_base(conn: &mut Conn, declared: &Schema, schema: &str) -> Sch
 
 /// The rows of one table as the engine holds them, keyed by its own spelling.
 async fn observed(
-    conn: &mut Conn,
+    conn: &mut TestDb,
     declared: &Schema,
     schema: &str,
     name: &TableName,
@@ -9261,7 +9415,7 @@ async fn observed(
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn declared_rows_reach_the_engine_and_read_back_as_declared() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_roundtrip").await;
     let s = data_schema("roundtrip");
     fresh(&mut conn, &s).await;
 
@@ -9363,6 +9517,7 @@ async fn declared_rows_reach_the_engine_and_read_back_as_declared() {
         .await
         .expect("drop");
     assert!(again.is_empty(), "the plan after the apply: {again:#?}");
+    conn.drop().await;
 }
 
 /// A hand edit to a declared row is seen, and the row is put back — and the
@@ -9371,7 +9526,7 @@ async fn declared_rows_reach_the_engine_and_read_back_as_declared() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_drift").await;
     let s = data_schema("drift");
     fresh(&mut conn, &s).await;
 
@@ -9452,6 +9607,7 @@ async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded()
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// ADR-0013 §1: `NOT VALID` is not `NOCHECK`, and the probe that assumed it
@@ -9465,7 +9621,7 @@ async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded()
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enforcing() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_notvalid").await;
     let s = data_schema("notvalid");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -9570,6 +9726,7 @@ async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enf
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// ADR-0013 §2, measured rather than asserted: the construct SQL Server
@@ -10039,7 +10196,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_arrival").await;
     let s = data_schema("arrival");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -10081,7 +10238,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
 
     // Another session inserts a child between the probe and the apply. With
     // `ON DELETE CASCADE` the engine would take it away silently.
-    let mut other = connect().await;
+    let mut other = conn.second().await;
     other
         .execute(&format!("INSERT INTO {s}.child VALUES (1, 'old')"))
         .await
@@ -10104,6 +10261,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A cell left to a *typed* default, and one the engine deparses without a
@@ -10123,7 +10281,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_cell_left_to_a_default_is_compared_as_the_column_stores_it() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_defaults").await;
     let s = data_schema("defaults");
     fresh(&mut conn, &s).await;
 
@@ -10196,6 +10354,7 @@ async fn a_cell_left_to_a_default_is_compared_as_the_column_stores_it() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A plan that unpicks a child's reference and then deletes the parent is the
@@ -10208,7 +10367,7 @@ async fn a_cell_left_to_a_default_is_compared_as_the_column_stores_it() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delete() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_tonull").await;
     let s = data_schema("tonull");
     fresh(&mut conn, &s).await;
 
@@ -10305,15 +10464,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
-}
-
-/// The same connection string, as another role.
-///
-/// A `password=` is appended rather than substituted: libpq takes the last
-/// value of a repeated keyword, so this works whether or not the original
-/// carries one.
-fn as_role(role: &str, password: &str) -> String {
-    format!("{} user={role} password={password}", conn_str())
+    conn.drop().await;
 }
 
 /// A child table whose rows the deploying session cannot see is not a child
@@ -10326,7 +10477,7 @@ fn as_role(role: &str, password: &str) -> String {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_rls").await;
     let s = data_schema("rls");
     fresh(&mut conn, &s).await;
     let role = format!("{s}_dep");
@@ -10382,7 +10533,7 @@ async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
         .remove(0);
 
     // As the deploying role, the count is filtered to nothing…
-    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+    let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
         .expect("connect as the deploying role");
     assert_eq!(
@@ -10477,6 +10628,7 @@ async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
     conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .expect("drop the role");
+    conn.drop().await;
 }
 
 /// A cell the column's own collation calls equal to its default is still a
@@ -10492,7 +10644,7 @@ async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_cell_a_collation_calls_equal_to_its_default_is_still_drift() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_cidefault").await;
     let s = data_schema("cidefault");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -10570,6 +10722,7 @@ async fn a_cell_a_collation_calls_equal_to_its_default_is_still_drift() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A row that references itself is not a child that survives its own delete.
@@ -10585,7 +10738,7 @@ async fn a_cell_a_collation_calls_equal_to_its_default_is_still_drift() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_row_that_references_only_itself_can_be_deleted() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_selfref").await;
     let s = data_schema("selfref");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -10683,6 +10836,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// DECISIONS 124 on this engine: a write left to a default the probe cannot
@@ -10696,7 +10850,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans_it() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_unprobeable").await;
     let s = data_schema("unprobeable");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -10852,6 +11006,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A `json` cell left to its default is compared like any other, because the
@@ -10865,7 +11020,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_json_cell_at_its_default_is_told_from_a_hand_edited_one() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_jsondefault").await;
     let s = data_schema("jsondefault");
     fresh(&mut conn, &s).await;
 
@@ -10927,6 +11082,7 @@ async fn a_json_cell_at_its_default_is_told_from_a_hand_edited_one() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// The key a write puts there is held to its exact spelling, like every other
@@ -10941,7 +11097,7 @@ async fn a_json_cell_at_its_default_is_told_from_a_hand_edited_one() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_trigger_that_respells_the_written_key_rolls_the_statement_back() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_keycase").await;
     let s = data_schema("keycase");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11022,6 +11178,7 @@ async fn a_trigger_that_respells_the_written_key_rolls_the_statement_back() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A relation is scanned the way its foreign key covers it: `ONLY` for an
@@ -11038,7 +11195,7 @@ async fn a_trigger_that_respells_the_written_key_rolls_the_statement_back() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_inherit").await;
     let s = data_schema("inherit");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11160,6 +11317,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A key is a tuple, and so is the question the unprobeable-default refusal
@@ -11181,7 +11339,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_tuplenull").await;
     let s = data_schema("tuplenull");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11293,6 +11451,7 @@ async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A referencing table this session cannot read is not a referencing table
@@ -11306,7 +11465,7 @@ async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_unreadable").await;
     let s = data_schema("unreadable");
     fresh(&mut conn, &s).await;
     let role = format!("{s}_dep");
@@ -11352,7 +11511,7 @@ async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
     let probes = pg.preflight(&cs);
     assert_eq!(probes.len(), 2, "{probes:#?}");
 
-    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+    let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
         .expect("connect as the deploying role");
     // The count itself is an error to this session — which `apply` would read
@@ -11381,6 +11540,7 @@ async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
     conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .expect("drop the role");
+    conn.drop().await;
 }
 
 /// A `DEFAULT` whose default is NULL is a NULL the probe compares, exactly as
@@ -11394,7 +11554,7 @@ async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delete() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_nulldefault").await;
     let s = data_schema("nulldefault");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11486,6 +11646,7 @@ async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delet
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A foreign key this plan adds is a foreign key the probe counts through.
@@ -11502,7 +11663,7 @@ async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delet
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_break_it() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_plannedkey").await;
     let s = data_schema("plannedkey");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11650,6 +11811,7 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A foreign key this plan adds on a column it also adds is counted through
@@ -11669,7 +11831,7 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_backfilled").await;
     let s = data_schema("backfilled");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11846,6 +12008,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A stored child row this plan updates to a NULL in one column of a key and
@@ -11860,7 +12023,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_updnull").await;
     let s = data_schema("updnull");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -11970,6 +12133,7 @@ async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count(
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A key this plan adds into a column it adds to the *parent* is counted
@@ -11985,7 +12149,7 @@ async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count(
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_backfill() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_parentfill").await;
     let s = data_schema("parentfill");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12110,6 +12274,7 @@ async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_bac
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// An inserted row that omits a column of a key the table gives no default
@@ -12124,7 +12289,7 @@ async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_bac
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_omitnull").await;
     let s = data_schema("omitnull");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12212,6 +12377,7 @@ async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A planned column backfilled with a typed NULL — `NULL::text` — is a NULL.
@@ -12223,7 +12389,7 @@ async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_typednull").await;
     let s = data_schema("typednull");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12313,6 +12479,7 @@ async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// The survivors a planned key's backfilled parent side is checked against
@@ -12326,7 +12493,7 @@ async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_survivor").await;
     let s = data_schema("survivor");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12479,6 +12646,7 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A backfilled literal is compared through its column's type, as every other
@@ -12494,7 +12662,7 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_backfilled_literal_is_compared_through_its_columns_type() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_typedfill").await;
     let s = data_schema("typedfill");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12592,6 +12760,7 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A column added as an identity is backfilled by the sequence, and no probe
@@ -12605,7 +12774,7 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_identfill").await;
     let s = data_schema("identfill");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12711,6 +12880,7 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A key this plan adds on columns it retypes compares the values the retype
@@ -12724,7 +12894,7 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_values() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_retyped").await;
     let s = data_schema("retyped");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -12842,6 +13012,7 @@ async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_valu
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A session that can read the columns the count reads can count, and is
@@ -12856,7 +13027,7 @@ async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_valu
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_colgrant").await;
     let s = data_schema("colgrant");
     fresh(&mut conn, &s).await;
     let role = format!("{s}_dep");
@@ -12901,7 +13072,7 @@ async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
     let pg = Postgres::new();
     let probes = pg.preflight(&cs);
     assert_eq!(probes.len(), 2, "{probes:#?}");
-    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+    let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
         .expect("connect as the deploying role");
     assert_eq!(
@@ -12934,6 +13105,7 @@ async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
     conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .expect("drop the role");
+    conn.drop().await;
 }
 
 /// A surviving parent row that holds the converted value is a survivor.
@@ -12948,7 +13120,7 @@ async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_retypedsurv").await;
     let s = data_schema("retypedsurv");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13051,6 +13223,7 @@ async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A parent row this plan inserts and a child row it inserts, spelling one
@@ -13067,7 +13240,7 @@ async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_type() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_typedsurv").await;
     let s = data_schema("typedsurv");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13180,6 +13353,7 @@ async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_typ
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A referencing table in a schema the session may not use is one it cannot
@@ -13194,7 +13368,7 @@ async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_typ
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_delete() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_nousage").await;
     let s = data_schema("nousage");
     let other = format!("{s}_other");
     fresh(&mut conn, &s).await;
@@ -13241,7 +13415,7 @@ async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_dele
     let pg = Postgres::new();
     let probes = pg.preflight(&cs);
     assert_eq!(probes.len(), 2, "{probes:#?}");
-    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+    let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
         .expect("connect as the deploying role");
     let denied = match deployer.query(&probes[0].sql).await {
@@ -13270,6 +13444,7 @@ async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_dele
     conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .expect("drop the role");
+    conn.drop().await;
 }
 
 /// A child table this plan creates, with a key into an existing parent and
@@ -13285,7 +13460,7 @@ async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_dele
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_createdchild").await;
     let s = data_schema("createdchild");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13409,6 +13584,7 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// An inserted row that leaves a key column to an identity the table already
@@ -13425,7 +13601,7 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_identinsert").await;
     let s = data_schema("identinsert");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13573,6 +13749,7 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A foreign key whose delete action is switched off is not one the delete
@@ -13589,7 +13766,7 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_whose_delete_action_is_switched_off_is_not_counted() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_triggeroff").await;
     let s = data_schema("triggeroff");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13663,6 +13840,7 @@ async fn a_key_whose_delete_action_is_switched_off_is_not_counted() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A key this plan adds on columns it leaves alone is asked about with the
@@ -13678,7 +13856,7 @@ async fn a_key_whose_delete_action_is_switched_off_is_not_counted() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_plainsurv").await;
     let s = data_schema("plainsurv");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13775,6 +13953,7 @@ async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A child row arriving against a parent backfill the probe cannot evaluate
@@ -13788,7 +13967,7 @@ async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_arrivefill").await;
     let s = data_schema("arrivefill");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -13902,6 +14081,7 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A policy on one partition of a referencing table does not make the count
@@ -13918,7 +14098,7 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_parent() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_leafrls").await;
     let s = data_schema("leafrls");
     fresh(&mut conn, &s).await;
     let role = format!("{s}_dep");
@@ -13968,7 +14148,7 @@ async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_pa
     let pg = Postgres::new();
     let probes = pg.preflight(&cs);
     assert_eq!(probes.len(), 2, "{probes:#?}");
-    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+    let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
         .expect("connect as the deploying role");
     assert_eq!(counted(&mut deployer, &probes[0].sql).await, 0);
@@ -14008,6 +14188,7 @@ async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_pa
     conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .expect("drop the role");
+    conn.drop().await;
 }
 
 /// A row that spells a value into a column whose backfill is NULL is a row
@@ -14022,7 +14203,7 @@ async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_pa
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_overnull").await;
     let s = data_schema("overnull");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -14136,6 +14317,7 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A stored child row holding NULL in a column of the key references nothing,
@@ -14149,7 +14331,7 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_never_meets() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_nullstored").await;
     let s = data_schema("nullstored");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -14291,6 +14473,7 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A NULL an update leaves alone in one column of a key is a NULL of the
@@ -14305,7 +14488,7 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_heldnull").await;
     let s = data_schema("heldnull");
     fresh(&mut conn, &s).await;
     let fixture = |b: &str| {
@@ -14447,6 +14630,7 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// The same NULL, under a key this plan adds: the update's row is not one the
@@ -14458,7 +14642,7 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_heldnullkey").await;
     let s = data_schema("heldnullkey");
     fresh(&mut conn, &s).await;
     let fixture = |b: &str| {
@@ -14594,6 +14778,7 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A default spelled `CAST(NULL AS text)` is the NULL it is, and a row left
@@ -14608,7 +14793,7 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_castnull").await;
     let s = data_schema("castnull");
     fresh(&mut conn, &s).await;
     let fixture = format!(
@@ -14750,6 +14935,7 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A default that is NULL is one this engine does not keep, in any spelling,
@@ -14764,7 +14950,7 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_null_default_is_one_this_engine_does_not_keep() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_nulldef").await;
     let s = data_schema("nulldef");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -14896,6 +15082,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A child collated differently from the column it references is counted
@@ -14914,7 +15101,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_child_collated_differently_from_its_parent_is_still_counted() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_collated").await;
     let s = data_schema("collated");
     let other = format!("{s}_other");
     fresh(&mut conn, &s).await;
@@ -15000,6 +15187,7 @@ async fn a_child_collated_differently_from_its_parent_is_still_counted() {
     ))
     .await
     .expect("drop");
+    conn.drop().await;
 }
 
 /// A parent row this plan inserts and a child row it inserts meet under the
@@ -15016,7 +15204,7 @@ async fn a_child_collated_differently_from_its_parent_is_still_counted() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_collation() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_cisurv").await;
     let s = data_schema("cisurv");
     let declare = |s: &str| {
         let parent_name = TableName::new(s, "parent");
@@ -15130,6 +15318,7 @@ async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_colla
             .await
             .expect("drop");
     }
+    conn.drop().await;
 }
 
 /// A key this plan adds between two stored columns collated differently is
@@ -15145,7 +15334,7 @@ async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_colla
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_planned_key_across_collations_is_counted_under_the_referenced_collation() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_plancoll").await;
     let s = data_schema("plancoll");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -15256,6 +15445,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A parent whose referenced columns the session cannot read is one whose
@@ -15269,7 +15459,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_delete() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_noparentread").await;
     let s = data_schema("noparentread");
     fresh(&mut conn, &s).await;
     let role = format!("{s}_dep");
@@ -15337,7 +15527,7 @@ async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_d
         .iter()
         .find(|p| p.description.starts_with("tables with a foreign key into"))
         .expect("the refusal");
-    let mut deployer = Conn::connect(Driver::Postgres, &as_role(&role, "x"))
+    let mut deployer = Conn::connect(Driver::Postgres, &conn_str_as(&role, "x", &conn.name))
         .await
         .expect("connect as the deploying role");
     let denied = match deployer.query(&count.sql).await {
@@ -15365,6 +15555,7 @@ async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_d
     conn.execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .expect("drop the role");
+    conn.drop().await;
 }
 
 /// A default spelled as an escape string, a Unicode string or a dollar-quoted
@@ -15378,7 +15569,7 @@ async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_d
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_escdef").await;
     let s = data_schema("escdef");
     fresh(&mut conn, &s).await;
     let fixture = format!(
@@ -15552,6 +15743,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A default spelled as a number in any form this engine reads — underscores
@@ -15566,7 +15758,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_numdef").await;
     let s = data_schema("numdef");
     fresh(&mut conn, &s).await;
     let fixture = format!(
@@ -15712,6 +15904,7 @@ async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -17449,7 +17642,7 @@ async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
 async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absence() {
     use pbps_model::{Change, ChangeSet, DataMode, Value};
 
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_data_supplied_parent").await;
     let s = probe_schema_9("arrives");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -17568,6 +17761,7 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// Two columns collated differently cannot be compared without saying which
@@ -19382,7 +19576,7 @@ async fn a_declared_schema_is_spelled_as_declared_or_is_not_there() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_read_back_inside_the_callers_transaction_sees_its_uncommitted_build() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("pull_within").await;
     let s = probe_schema("within");
     build(
         &mut conn,
@@ -19476,6 +19670,7 @@ async fn a_read_back_inside_the_callers_transaction_sees_its_uncommitted_build()
     );
     conn.execute("RESET search_path").await.expect("reset");
     drop_schema(&mut conn, &s).await;
+    conn.drop().await;
 }
 
 /// The savepoint keeps the read read-only for exactly its own life: a write
