@@ -9763,7 +9763,7 @@ SPEC is in sync with all of these.
     creates the key as that role — the check and the engine pinned to the
     same answer.
 
-442. **A relation of another kind occupying a ledger name is caught after
+441. **A relation of another kind occupying a ledger name is caught after
     `ensure_tables`'s DDL, not by narrowing `ledger_is_there`'s probe.**
     Deferred from a review finding on #205 (issue #217): that probe joins
     `pg_class` on the two ledger names without filtering `relkind`, so a view
@@ -9800,6 +9800,16 @@ SPEC is in sync with all of these.
     later — `must be owner of table t` from `migrate_timeline_columns`'s
     `ALTER` on a view, or a confusing insert failure — not a guarantee that
     whatever answers `relkind = 'r'` is the tool's own ledger.
+
+    Nor does the confirmation cover every path: it runs on `ensure_tables`,
+    which only `record` and `lock` call. `prune` and `unlock` reach
+    `is_initialized` (or, for `unlock`, nothing) instead and never call
+    `ensure_tables`, so a decoy view still lets `prune`'s `DELETE_UP_TO` and
+    `unlock`'s `DELETE_LOCK` write through it into the view's base table —
+    measured on 18.6 on both, not assumed. Adding an `ensure_tables` call to
+    either would make a command whose whole point is to delete also create
+    ledger infrastructure, which this PR does not do; the gap is tracked as
+    issue #396.
 
     A live test creates a view named `public.__pbps_state` over a table with
     the ledger's columns and asserts `ensure_tables` fails naming the view's

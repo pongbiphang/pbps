@@ -353,7 +353,7 @@ const PROBE_STATE: &str = "SELECT 1 AS present FROM public.__pbps_state LIMIT 0"
 /// it predict `CREATE TABLE IF NOT EXISTS` wrong, since that statement skips a
 /// same-named view exactly the way an unfiltered probe does. See
 /// [`confirm_ledger_relations`], which asks that question after the DDL
-/// instead (DECISIONS 442).
+/// instead (DECISIONS 441).
 fn ledger_is_there() -> String {
     format!(
         "SELECT count(*)::int8 AS present
@@ -515,7 +515,7 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
 /// (issue #217).
 ///
 /// This is a **different** question from [`ledger_is_there`]'s, asked
-/// **after** the DDL rather than by narrowing that probe (DECISIONS 442):
+/// **after** the DDL rather than by narrowing that probe (DECISIONS 441):
 /// `ledger_is_there` predicts whether `CREATE TABLE IF NOT EXISTS` would do
 /// anything, and measured on 18.6 that statement silently skips a view of the
 /// ledger's name — `NOTICE: relation "__pbps_state" already exists,
@@ -536,6 +536,16 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
 /// [`migrate_timeline_columns`]'s `ALTER`, or a confusing insert failure from
 /// [`record`]) or not at all for the matching decoy table — into a clear,
 /// named refusal for the loud case, rather than a reported success.
+///
+/// It is also bounded to the two callers that reach it. This runs on the
+/// [`ensure_tables`] path, which only [`record`] and [`lock`] take; [`prune`]
+/// and [`unlock`] ask [`is_initialized`] (or, for `unlock`, nothing) and never
+/// call [`ensure_tables`], so a decoy view at either ledger name still lets
+/// `prune`'s `DELETE_UP_TO` and `unlock`'s `DELETE_LOCK` write through it into
+/// the view's base table — measured on 18.6, not assumed. That gap is
+/// deliberately not closed here by adding an `ensure_tables` call to two
+/// commands whose whole point is to delete, not to create; it is tracked as
+/// issue #396 instead.
 async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
     let rows = conn.query(&ledger_occupants()).await?;
     if rows.is_empty() {
@@ -556,9 +566,9 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
         code: None,
         message: format!(
             "{}.\n\
-             A ledger name is occupied by a relation pbps did not create and will not write to. \
-             Rename or drop the existing relation, or point pbps at a database where \
-             {STATE_TABLE} and {LOCK_TABLE} are free.",
+             A ledger name is occupied by a relation pbps did not create; this call refuses to \
+             use it as the ledger. Rename or drop the existing relation, or point pbps at a \
+             database where {STATE_TABLE} and {LOCK_TABLE} are free.",
             occupants.join("; ")
         ),
     })
@@ -1482,7 +1492,7 @@ mod tests {
     /// predict `CREATE TABLE IF NOT EXISTS` wrong (issue #217), because that
     /// statement skips a same-named relation of *any* kind. The check that
     /// belongs to `relkind` lives in [`ledger_occupants`] instead, asked after
-    /// the DDL rather than by narrowing this probe (DECISIONS 442).
+    /// the DDL rather than by narrowing this probe (DECISIONS 441).
     #[test]
     fn the_presence_probe_does_not_filter_by_relkind() {
         assert!(
