@@ -10406,7 +10406,14 @@ SPEC is in sync with all of these.
        own: measured, a moved row's children are cascaded as an UPDATE and not
        deleted. A partition key written as an expression counts as always
        movable, because which columns feed it is a question this tool does not
-       parse (174).
+       parse (174). A BEFORE ROW UPDATE trigger picks the destination partition
+       too — measured, one assigning the key moved a row whose statement
+       touched nothing near it — and the closure deliberately does *not* carry
+       that rule: such a trigger is on a partitioned relation or a partition,
+       and `ORDINARY_TABLE` holds no relation that appears in `pg_inherits` at
+       all, so it can never be a recorded managed trigger and the guard has
+       already refused it by the time the question could arise. A filter that
+       cannot change an answer is one nobody re-reads.
      - The action's statement runs even when it matches no row, so a
        statement-level trigger on the referencing table fires with zero
        referencing rows. This is why the delete side is guarded at all: the
@@ -10462,14 +10469,19 @@ SPEC is in sync with all of these.
 
      A partitioned side is catalogued as the declared foreign key plus a copy
      per partition, and a copy can carry another name (`qc_a_id_fkey_1`,
-     measured). Only the declared one is a name the plan can write, so a
-     removal is matched against it and not against the copy the walk happened
-     to reach — otherwise the guard follows an action the plan has already
-     taken away, which is the refusal this allowance exists to prevent. The
-     copies are not skipped outright, which was the first thing tried: when the
-     write names a partition of the *referenced* side, the copy is the only row
-     that matches it at all, and dropping copies from the scan would lose that
-     edge entirely.
+     measured). The declared row answers both questions asked of a constraint:
+     it is the only name the plan can remove, so a removal is matched against
+     it rather than against the copy the walk happened to reach, and its
+     `conrelid` is the relation the action's own statement names — measured,
+     the cascade into a partitioned referencing table ran against the
+     partitioned parent and fired its statement trigger, not the partition's.
+     Following `pg_inherits` upward instead was the first shape and is wrong
+     the other way: a foreign key somebody declared on a single partition is
+     its own declared row, and promoting it to the root drags in the root's
+     statement triggers and every sibling partition, refusing a plan for
+     tables that action cannot touch. The copies are not skipped outright
+     either: when the write names a partition of the *referenced* side, the
+     copy is the only row that matches it at all.
 
      The lock a reached table takes is `LOCK TABLE` without `ONLY`, which also
      locks descendants the action itself will not write. Measured, that costs
@@ -10490,7 +10502,9 @@ SPEC is in sync with all of these.
      each paired with the state in which the same closure does follow it; the
      partitions a row movement leaves and lands in, against the partition key
      the write does not touch and the statement-level trigger no movement
-     fires, on an action's target and on the named table alike; and
+     fires, on an action's target and on the named table alike; a foreign key
+     declared on one partition, against a trigger on its sibling and a
+     statement trigger on their root; and
      the key a BEFORE trigger rewrites, with the engine's own behaviour
      asserted first and the trigger doing the rewriting recorded and approved,
      so the refusal can only be the table its cascade reaches. They

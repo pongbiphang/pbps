@@ -4736,6 +4736,27 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
             false,
         ),
         (
+            "a_foreign_key_declared_on_one_partition",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY RANGE (id); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES FROM (0) TO (10); \
+                    CREATE TABLE {{s}}.there PARTITION OF {{s}}.c FOR VALUES FROM (10) TO (20); \
+                    ALTER TABLE {{s}}.here ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.here FOR EACH ROW EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "a_sibling_of_the_partition_the_key_was_declared_on",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY RANGE (id); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES FROM (0) TO (10); \
+                    CREATE TABLE {{s}}.there PARTITION OF {{s}}.c FOR VALUES FROM (10) TO (20); \
+                    ALTER TABLE {{s}}.here ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.there FOR EACH ROW EXECUTE FUNCTION public.hook(); \
+                    CREATE TRIGGER also AFTER UPDATE ON {{s}}.c FOR EACH STATEMENT EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            false,
+        ),
+        (
             "a_generated_referenced_column_of_a_set_column",
             "CREATE TABLE {s}.p(code text PRIMARY KEY, label text, ukey text GENERATED ALWAYS AS (upper(label)) STORED UNIQUE); \
                     CREATE TABLE {s}.c(id int PRIMARY KEY, ukey text REFERENCES {s}.p(ukey) ON UPDATE CASCADE); \

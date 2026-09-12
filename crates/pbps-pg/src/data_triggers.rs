@@ -455,7 +455,9 @@ async fn can_move(conn: &mut Conn, statement: &Statement) -> Result<bool, DbErro
 /// writes every column of the foreign key even when one referenced column
 /// changed, an ON DELETE SET NULL/DEFAULT with a column list writes that list
 /// (`confdelsetcols`, PostgreSQL 15 and later), and the statement names the
-/// root of the referencing side's partition tree, never a partition of it.
+/// relation the constraint was *declared* on: for a copy PostgreSQL made on a
+/// partition that is the partitioned parent, measured, while a foreign key
+/// declared on one partition by hand keeps its own leaf.
 async fn read_actions(
     conn: &mut Conn,
     statement: &Statement,
@@ -466,12 +468,13 @@ async fn read_actions(
             "{ctes},
              -- A partitioned side catalogues the declared foreign key and a
              -- copy of it per partition, and a copy can even carry another
-             -- name (`qc_a_id_fkey_1`, measured). The plan can only name the
-             -- declared one, so a removal is matched against that: matching
-             -- the copy would follow an action the plan has already taken
-             -- away. Copies are not skipped outright -- when the write names
-             -- a partition of the *referenced* side, the copy is the only row
-             -- that matches it at all.
+             -- name (`qc_a_id_fkey_1`, measured). The declared one is what the
+             -- action's own statement names and the only one the plan can
+             -- remove by name, so both questions are asked of it. Copies are
+             -- not skipped outright -- when the write names a partition of the
+             -- *referenced* side, the copy is the only row that matches it at
+             -- all -- and a foreign key somebody declared on a single
+             -- partition is its own declared row, so it stays on that leaf.
              ancestry(copy, above) AS (
                  SELECT con.oid, con.oid
                  FROM pg_catalog.pg_constraint con
@@ -489,8 +492,8 @@ async fn read_actions(
                  JOIN pg_catalog.pg_constraint declared ON declared.oid = a.above
                  WHERE declared.conparentid = 0
              ),
-             edges(constraint_oid, referencing, cascades, written) AS (
-                 SELECT con.oid, con.conrelid,
+             edges(constraint_oid, referencing, declared_on, cascades, written) AS (
+                 SELECT con.oid, con.conrelid, declared.conrelid,
                         {events} = {delete} AND con.confdeltype = 'c',
                         CASE WHEN {events} = {delete} AND con.confdelsetcols IS NOT NULL
                                   AND con.confdelsetcols <> '{{}}'::pg_catalog.int2[]
@@ -551,27 +554,14 @@ async fn read_actions(
                              OR (action.tgenabled = 'R' AND pg_catalog.current_setting('session_replication_role') = 'replica'))
                    )
                    AND NOT ({gone})
-             ),
-             up(constraint_oid, oid) AS (
-                 SELECT e.constraint_oid, e.referencing FROM edges e
-                 UNION
-                 SELECT u.constraint_oid, i.inhparent
-                 FROM up u
-                 JOIN pg_catalog.pg_inherits i ON i.inhrelid = u.oid
-                 JOIN pg_catalog.pg_class p ON p.oid = i.inhparent AND p.relkind = 'p'
              )
-             SELECT DISTINCT e.constraint_oid::int8 AS constraint_oid, u.oid::int8 AS relation,
+             SELECT DISTINCT e.constraint_oid::int8 AS constraint_oid,
+                    e.declared_on::int8 AS relation,
                     (CASE WHEN e.cascades THEN {delete} ELSE {update} END)::int2 AS event,
                     a.attname AS column_name
-             FROM up u
-             JOIN edges e ON e.constraint_oid = u.constraint_oid
+             FROM edges e
              LEFT JOIN pg_catalog.pg_attribute a
                     ON NOT e.cascades AND a.attrelid = e.referencing AND a.attnum = ANY(e.written)
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM pg_catalog.pg_inherits i
-                 JOIN pg_catalog.pg_class p ON p.oid = i.inhparent AND p.relkind = 'p'
-                 WHERE i.inhrelid = u.oid
-             )
              ORDER BY constraint_oid, relation, event",
             ctes = reached(statement),
             events = statement.event,
