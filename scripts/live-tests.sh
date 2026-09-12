@@ -53,6 +53,11 @@ export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
 # The dialect's live tests, then the CLI's dev-database rehearsal (SPEC §9.3),
 # which needs the same server and is `#[ignore]`d for the same reason.
 cargo test -p pbps-mssql --test live -- --ignored "$@"
+# The seam's own error conversion on this driver (issue #167): measured
+# against a real server, `tiberius`'s `Display` already carries the server's
+# sentence, so this is a regression guard rather than a fix — see
+# `crates/pbps-db/src/mssql.rs` for the comparison against the PostgreSQL side.
+cargo test -p pbps-db --test live_mssql -- --ignored "$@"
 # `--test-threads=1`: these share one SQL Server, and the deployment lock is a
 # single row in it. Two tests taking it concurrently make each other fail, and
 # the failure reads as a bug in the lock rather than in the test schedule.

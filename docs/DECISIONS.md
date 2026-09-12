@@ -10576,3 +10576,46 @@ SPEC is in sync with all of these.
      so the refusal can only be the table its cascade reaches. They
      pass on 16.15 as well as 18.6: the one catalogue column the closure needs
      that is not ancient, `confdelsetcols`, arrived in 15.
+
+453. **`From<tokio_postgres::Error> for DbError` reads the server's own
+     sentence off `as_db_error()`, not `Display`.** Measured: `tokio_postgres`
+     keeps a server-side failure's message in the error's *source*
+     (`DbError`, the driver's own type of that name) and renders `Kind::Db`
+     as the literal five-character string `db error` on `Display` — `e.code()`
+     still answered the right SQLSTATE, so the bug passed every test that only
+     checked the code. `message()` alone would have closed issue #167;
+     `detail()`, `hint()`, and the object identifiers (`schema()`, `table()`,
+     `column()`, `datatype()`, `constraint()`) are folded in on their own
+     lines too, because a NOT NULL violation carries no `detail` at all and
+     its column name is reachable only through `column()` — the shape the
+     live suite pins beside the `42P01` shape the issue itself measured. The
+     fallback to `e.to_string()` is unchanged for a failure `as_db_error()`
+     answers `None` for: those never reached the server, and the driver's own
+     text for them (`"connection closed"`, and so on) was never `db error` to
+     begin with.
+
+     `pbps-pg`'s `schema_changed_underneath` and `the_engine_broke_a_tie` each
+     wrap this seam's `DbError::Driver` in a sentence of their own for a
+     SQLSTATE it recognizes (`XX000`, `40P01`) — written when the wrapped
+     message was unconditionally `db error` and the wrapping was reconstructing
+     by SQLSTATE alone what the server had already said. Both stay: what they
+     add is domain framing an `as_db_error()` fix cannot supply on its own —
+     that a `REPEATABLE READ` snapshot cannot see a concurrent `DROP`, that a
+     deadlock here is a tie the engine already broke — not a restatement of
+     the server's sentence, which the wrapped `{e}` now carries for the first
+     time instead of `db error`. Only the doc comments explaining *why* they
+     existed needed correcting, not the wrapping itself.
+
+     The SQL Server side does not have this defect: measured on 17.0.4075.5,
+     `tiberius::error::Error::Server`'s `Display` is `TokenError`'s own, which
+     interpolates its `message` field directly — there is no `Kind::Db`
+     standing in for the server's sentence the way `tokio_postgres::Error` has
+     one. `crates/pbps-db/src/mssql.rs` carries this measurement as a comment
+     and `crates/pbps-db/tests/live_mssql.rs` pins it as a regression guard,
+     not a fix.
+
+     The new live tests live in `crates/pbps-db/tests/`, not in `pbps-pg`'s or
+     `pbps-mssql`'s own live suites: the seam's `From` impls are what changed,
+     and `pbps-db` had no live suite of its own to reach them, so
+     `scripts/live-tests-pg.sh` and `scripts/live-tests.sh` each gained one
+     line invoking it.

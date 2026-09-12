@@ -40,12 +40,68 @@ impl From<tokio_postgres::Error> for DbError {
     /// `42P01` has a letter in it, which is why the seam carries the code as
     /// text: an `Option<u32>` here was a T-SQL shape under a neutral name
     /// (ADR-0014 §1, DECISIONS 193).
+    ///
+    /// The text is not `e.to_string()`. **Measured**: `tokio_postgres::Error`'s
+    /// `Display` keeps the server's own sentence in the error's *source*, not
+    /// in its message — for a server-side failure it renders the literal `db
+    /// error`, five characters wearing the clothes of a real answer while the
+    /// SQLSTATE beside it is the only thing still true (issue #167). What the
+    /// server actually said is behind [`tokio_postgres::Error::as_db_error`],
+    /// which is `None` exactly when the failure never reached the server — a
+    /// closed connection, a broken handshake — and `e.to_string()` already
+    /// carries its own text for those (`"connection closed"`, and so on), so
+    /// the fallback is unchanged (DECISIONS 453).
     fn from(e: tokio_postgres::Error) -> Self {
+        let message = e
+            .as_db_error()
+            .map(server_error_message)
+            .unwrap_or_else(|| e.to_string());
         DbError::Driver {
             code: e.code().map(|c| c.code().to_owned()),
-            message: e.to_string(),
+            message,
         }
     }
+}
+
+/// Renders a server-side PostgreSQL error the way `psql` does, not the one
+/// line `Display` on `tokio_postgres::error::DbError` gives.
+///
+/// `message()` alone is what the fix in issue #167 asks for and would already
+/// beat `db error`. `detail()` and `hint()` are folded in on the next lines
+/// because several diagnostics this workspace builds today reconstruct by
+/// hand exactly what these carry — `pbps-pg`'s own `schema_changed_underneath`
+/// used to guess a whole sentence from a bare SQLSTATE because the sentence
+/// the server sent was unreachable through this seam. The object identifiers
+/// PostgreSQL tags on for some errors — schema, table, column, data type,
+/// constraint — are appended the same way for the same reason: a unique
+/// violation's `detail` already names the columns, but a NOT NULL violation
+/// carries no `detail` at all and the column name is only reachable through
+/// `column()` (measured on 18.6, DECISIONS 453).
+fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
+    let mut message = db.message().to_owned();
+    if let Some(detail) = db.detail() {
+        message.push_str("\nDETAIL: ");
+        message.push_str(detail);
+    }
+    if let Some(hint) = db.hint() {
+        message.push_str("\nHINT: ");
+        message.push_str(hint);
+    }
+    let identifiers: Vec<String> = [
+        db.schema().map(|v| format!("schema \"{v}\"")),
+        db.table().map(|v| format!("table \"{v}\"")),
+        db.column().map(|v| format!("column \"{v}\"")),
+        db.datatype().map(|v| format!("type \"{v}\"")),
+        db.constraint().map(|v| format!("constraint \"{v}\"")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !identifiers.is_empty() {
+        message.push_str("\nWHERE: ");
+        message.push_str(&identifiers.join(", "));
+    }
+    message
 }
 
 impl Conn {

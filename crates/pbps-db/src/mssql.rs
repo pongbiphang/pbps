@@ -28,6 +28,15 @@ impl From<tiberius::error::Error> for DbError {
     /// error and a variant holding one driver's type would put that driver's
     /// name back in every signature the seam exists to keep it out of. The
     /// code is text for the reason `server_error_code` states.
+    ///
+    /// `e.to_string()`, unlike the PostgreSQL side, already carries the
+    /// server's own sentence: issue #167 asked this shape be checked here too
+    /// before it closed, and **measured** on 17.0.4075.5, `tiberius::Error`'s
+    /// `Display` for `Error::Server` is `TokenError`'s own `Display`, which
+    /// interpolates its `message` field straight in — there is no `Kind::Db`
+    /// standing in for it the way `tokio_postgres::Error` has one. Pinned by
+    /// the live suite alongside the PostgreSQL fix, as a regression guard
+    /// rather than a second fix (DECISIONS 453).
     fn from(e: tiberius::error::Error) -> Self {
         DbError::Driver {
             code: e.code().map(|c| c.to_string()),
