@@ -1160,6 +1160,19 @@ pub trait Dialect {
     /// modifier as one the engine would accept and can call it `Safe`.
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
 
+    /// Derives the complete risk set for planning and saved-plan verification.
+    /// Defaults use this engine's identifier boundary; persisted risks are
+    /// checked against this same answer so artifact validation cannot disagree.
+    fn change_risks(&self, change: &Change) -> std::collections::BTreeSet<RiskClass> {
+        let mut risks = change.intrinsic_risks_with(self.lexicon().identifier_continues);
+        if let Change::AlterColumnType { from, to, .. } = change
+            && let Some(risk) = self.type_change_risk(from, to).risk_class()
+        {
+            risks.insert(risk);
+        }
+        risks
+    }
+
     /// The canonical form of an unquoted identifier in this dialect.
     ///
     /// PostgreSQL folds to lowercase; SQL Server keeps it as written. Name

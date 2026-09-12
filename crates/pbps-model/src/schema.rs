@@ -206,11 +206,9 @@ impl Column {
     ///
     /// Boundaries an identifier by [`crate::module::is_regular_identifier_continue`]
     /// — SQL Server's own rule. That is right for SQL Server's own caller.
-    /// It is **not** right for the model's dialect-free risk classification
-    /// (`Change::intrinsic_risks`), which runs before a dialect is chosen and
-    /// still reads every dialect's defaults by this rule regardless — a known
-    /// gap, tracked separately as issue #343, not a decision that this answer
-    /// is correct there. A caller that does have a dialect uses
+    /// The compatibility risk classifier (`Change::intrinsic_risks`) keeps
+    /// this boundary too. Planning and saved-plan validation instead pass
+    /// the selected dialect's boundary. A caller that has a dialect uses
     /// [`Self::has_required_add_value_source_with`] instead, the same split
     /// ADR-0011 Amendment 2 made for `normalize_definition` (DECISIONS 226,
     /// 433).

@@ -2781,12 +2781,7 @@ pub(crate) fn validate_saved_plan(
         .context("the plan's post-apply identity mapping is inconsistent")?;
 
     for (index, planned) in plan.changes.changes.iter().enumerate() {
-        let mut expected = planned.change.intrinsic_risks();
-        if let pbps_model::Change::AlterColumnType { from, to, .. } = &planned.change
-            && let Some(risk) = dialect.type_change_risk(from, to).risk_class()
-        {
-            expected.insert(risk);
-        }
+        let expected = dialect.change_risks(&planned.change);
         if planned.risks != expected {
             let names = |risks: &std::collections::BTreeSet<pbps_model::RiskClass>| {
                 risks
@@ -2875,6 +2870,56 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_add_column_risks_use_the_selected_dialect_and_reject_edits() {
+        use pbps_model::{
+            Change, ChangeSet, Column, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, RiskClass,
+            SavedPlan, Uid, UidKind,
+        };
+
+        for name in [DialectName::Postgres, DialectName::Mssql] {
+            let dialect = dialect_for(name);
+            for default in [Some("zz.null\u{301}x()"), None, Some("NULL")] {
+                let mut column = Column::new("integer".parse().unwrap()).not_null();
+                column.default = default.map(str::to_owned);
+                let mut planned = PlannedChange::new(Change::AddColumn {
+                    uid: Uid::generate(UidKind::Column),
+                    table: "app.t".parse().unwrap(),
+                    name: "added".into(),
+                    column: Box::new(column),
+                });
+                planned.risks = dialect.change_risks(&planned.change);
+                let mut plan = SavedPlan::new(
+                    PlanOrigin::Database,
+                    dialect.name(),
+                    "2026-09-12T00:00:00Z",
+                    PlanBaseline {
+                        description: "test".into(),
+                        checksum: "a".repeat(64),
+                    },
+                    ChangeSet {
+                        changes: vec![planned],
+                    },
+                    IdsFile::default(),
+                );
+                assert!(
+                    validate_saved_plan(&plan, dialect.as_ref()).is_ok(),
+                    "{default:?}"
+                );
+                let risks = &mut plan.changes.changes[0].risks;
+                if !risks.remove(&RiskClass::NotNull) {
+                    risks.insert(RiskClass::NotNull);
+                }
+                assert!(
+                    validate_saved_plan(&plan, dialect.as_ref())
+                        .unwrap_err()
+                        .to_string()
+                        .contains("inconsistent risks")
+                );
+            }
+        }
+    }
 
     /// `pull` draws its size line from the rule, not from the field that is
     /// only the rule's default: raising the threshold, lowering it and

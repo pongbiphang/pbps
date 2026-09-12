@@ -1709,11 +1709,17 @@ impl Change {
         }
     }
 
-    /// Risks that follow from the kind of change alone, with no dialect knowledge.
+    /// Risks using SQL Server's identifier boundary for column defaults.
     ///
-    /// Risks that require comparing types (narrowing) are not here; the differ
-    /// adds those.
+    /// Retained for dialect-free callers. Planning must use the selected
+    /// dialect's risk classifier, which also adds type-comparison risks.
     pub fn intrinsic_risks(&self) -> BTreeSet<RiskClass> {
+        self.intrinsic_risks_with(crate::module::is_regular_identifier_continue)
+    }
+
+    /// Intrinsic risks with the selected dialect's default identifier boundary.
+    /// Type comparison risks are added by the dialect, not the model.
+    pub fn intrinsic_risks_with(&self, continues_ident: fn(char) -> bool) -> BTreeSet<RiskClass> {
         let mut r = BTreeSet::new();
         match self {
             Change::DropTable { .. }
@@ -1773,11 +1779,11 @@ impl Change {
                 r.insert(RiskClass::DataDelete);
             }
             Change::AddColumn { column, .. } => {
-                // Existing rows have no value for a newly added column. SQL
-                // Server can populate one from a DEFAULT or IDENTITY; without
+                // Existing rows have no value for a newly added column. The
+                // engine can populate one from a DEFAULT or IDENTITY; without
                 // either, a NOT NULL addition is the same data hazard as
                 // tightening an existing nullable column (SPEC §7.1).
-                if !column.nullable && !column.has_required_add_value_source() {
+                if !column.nullable && !column.has_required_add_value_source_with(continues_ident) {
                     r.insert(RiskClass::NotNull);
                 }
             }
@@ -1847,8 +1853,8 @@ pub struct PlannedChange {
 }
 
 impl PlannedChange {
-    /// Builds from the risks the change itself implies. Risks that need dialect
-    /// knowledge are added separately by the differ.
+    /// Builds with the SQL Server-compatible intrinsic risk default.
+    /// The differ replaces this set with the selected dialect's complete risks.
     pub fn new(change: Change) -> Self {
         let risks = change.intrinsic_risks();
         Self {

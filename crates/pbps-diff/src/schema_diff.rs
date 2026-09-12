@@ -367,11 +367,7 @@ pub fn diff_partial(
     // exactly as a plan would be.
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
-        if let Change::AlterColumnType { from, to, .. } = &p.change
-            && let Some(r) = dialect.type_change_risk(from, to).risk_class()
-        {
-            p.risks.insert(r);
-        }
+        p.risks = dialect.change_risks(&p.change);
         // Attached here, not looked up at emit time: the plan file is the
         // artifact the deployment gate reviews, and a hint resolved later
         // against a YAML file the deployment host may not have is a hint
