@@ -10576,3 +10576,45 @@ SPEC is in sync with all of these.
      so the refusal can only be the table its cascade reaches. They
      pass on 16.15 as well as 18.6: the one catalogue column the closure needs
      that is not ancient, `confdelsetcols`, arrived in 15.
+
+452. **Declaration key rules follow PostgreSQL's engine, not the sibling
+     validator.** Issue #156 adds the missing structural checks to
+     `Postgres::validate_table`: nonempty existing local key columns, matching
+     nonempty foreign-key lists, and nonempty check/filter expressions. The nullable primary-key
+     rule remains 266's distinct refusal of a silent rewrite.
+
+     **Measured on PostgreSQL 18.6:** primary and unique constraints reject a
+     repeated column (`42701`), but an index accepts repeated keys, repeated
+     included columns, and a key repeated in `INCLUDE`. A foreign key also
+     accepts repeated local columns against a distinct composite unique key.
+     Refusing these would reject valid declarations. The stock build's limit is 32 columns
+     **including INCLUDE**, not 32 key columns plus unlimited payload: 32
+     accepts and 33 refuses with `54011`, for indexes and constraint-backed
+     indexes alike. `SHOW max_index_keys` pins that test engine's capability:
+     the limit is a build setting, not an offline dialect invariant. Wider
+     declarations are therefore left to the target engine rather than refused
+     against a stock-build constant. The tests assert offline acceptance at
+     32 and 33 and stock-engine refusal at 33; they do not claim a rebuilt
+     64-column server was tested.
+
+     Stock PostgreSQL refuses `json` keys for lack of a default
+     btree operator class (`42704`), but accepts json included payload and the
+     other admitted type families as keys. That is **not an offline refusal**:
+     measured, installing a default json btree operator class makes primary,
+     unique, foreign and index keys legal, and the catalog reader resolves
+     installed default classes rather than hard-coding the stock ones. Key-type
+     eligibility therefore stays with the server; refusing json offline would
+     reject a valid declaration on such a server. Unknown types retain the
+     ordinary closed-catalogue finding, independently of their use in a key.
+
+     Empty expressions mean ASCII whitespace only: measured, a non-breaking
+     space can name a boolean column and is a legal unquoted check/filter
+     expression. Rust's Unicode `trim` would refuse that valid declaration, so
+     both expression checks use `trim_ascii` and pin Unicode identifier cases.
+
+     The unit tests pin each structural rule and aggregate independent errors.
+     The live declaration matrix sends the emitter's statements to the engine,
+     asserting the exact SQLSTATE for refusals and successful creation for
+     legal repetitions, type families, and the 32-column boundary. This is why
+     the broader #156 and the overlapping #175 cannot be implemented by copying
+     SQL Server's `key_columns` unchanged.

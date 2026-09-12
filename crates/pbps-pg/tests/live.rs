@@ -3521,6 +3521,416 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
     );
 }
 
+/// The declaration validator must agree with emitted DDL, including the legal
+/// PostgreSQL repetitions that SQL Server's key-column helper would refuse.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repetitions() {
+    let s = emit_schema("structure");
+    let mut conn = connect().await;
+    assert_eq!(
+        text(&mut conn, "SHOW max_index_keys").await,
+        "32",
+        "the boundary cases below measure the pinned stock build, not an offline dialect invariant"
+    );
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (a integer PRIMARY KEY, b integer, UNIQUE(a,b))"
+    ))
+    .await
+    .unwrap();
+    let base = || {
+        let mut table = Table::default();
+        for name in ["a", "b"] {
+            table
+                .columns
+                .insert(name.into(), Column::new(ty("integer")).not_null());
+        }
+        table
+            .columns
+            .insert("j".into(), Column::new(ty("json")).not_null());
+        table
+    };
+    let mut cases: Vec<(String, Table, Option<&str>)> = Vec::new();
+    for kind in ["primary", "unique", "index", "foreign"] {
+        for (columns, code) in [
+            (vec![], Some("42601")),
+            (vec!["missing"], Some("42703")),
+            (
+                vec!["a", "a"],
+                if matches!(kind, "primary" | "unique") {
+                    Some("42701")
+                } else {
+                    None
+                },
+            ),
+            (
+                vec!["j"],
+                Some(if kind == "foreign" { "42804" } else { "42704" }),
+            ),
+            (vec!["a"], None),
+        ] {
+            let label = format!("{kind} {columns:?}");
+            let mut table = base();
+            let columns: Vec<String> = columns.into_iter().map(String::from).collect();
+            match kind {
+                "primary" => {
+                    table.primary_key = Some(PrimaryKey {
+                        name: Some("pk".into()),
+                        columns,
+                    })
+                }
+                "unique" => {
+                    table
+                        .unique
+                        .insert("uq".into(), UniqueConstraint { columns });
+                }
+                "index" => {
+                    table.indexes.insert(
+                        "ix".into(),
+                        Index {
+                            columns: columns
+                                .into_iter()
+                                .map(|name| IndexColumn {
+                                    name,
+                                    descending: false,
+                                })
+                                .collect(),
+                            include: vec![],
+                            unique: false,
+                            filter: None,
+                        },
+                    );
+                }
+                _ => {
+                    let references_columns = if columns.len() == 2 {
+                        vec!["a".into(), "b".into()]
+                    } else {
+                        vec!["a".into()]
+                    };
+                    table.foreign_keys.insert(
+                        "fk".into(),
+                        ForeignKey {
+                            columns,
+                            references_table: TableName::new(&s, "parent"),
+                            references_columns,
+                            on_delete: Default::default(),
+                            on_update: Default::default(),
+                        },
+                    );
+                }
+            }
+            cases.push((label, table, code));
+        }
+    }
+    for (remote, code) in [(vec![], "42601"), (vec!["a", "b"], "42830")] {
+        let mut table = base();
+        table.foreign_keys.insert(
+            "fk".into(),
+            ForeignKey {
+                columns: vec!["a".into()],
+                references_table: TableName::new(&s, "parent"),
+                references_columns: remote.into_iter().map(String::from).collect(),
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        cases.push((format!("foreign referenced list {code}"), table, Some(code)));
+    }
+    for (include, code) in [
+        (vec!["missing"], Some("42703")),
+        (vec!["a", "b", "b", "j"], None),
+    ] {
+        let mut table = base();
+        table.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "a".into(),
+                    descending: false,
+                }],
+                include: include.into_iter().map(String::from).collect(),
+                unique: false,
+                filter: None,
+            },
+        );
+        cases.push((format!("include {code:?}"), table, code));
+    }
+    for filter in [false, true] {
+        let mut table = base();
+        if filter {
+            table.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        name: "a".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: Some(" \n ".into()),
+                },
+            );
+        } else {
+            table.checks.insert(
+                "ck".into(),
+                CheckConstraint {
+                    expression: " \n ".into(),
+                },
+            );
+        }
+        cases.push((
+            format!("empty expression filter={filter}"),
+            table,
+            Some("42601"),
+        ));
+    }
+    for count in [32, 33] {
+        for kind in ["primary", "unique", "index", "include"] {
+            let mut table = base();
+            let columns: Vec<_> = (0..count).map(|n| format!("c{n}")).collect();
+            for column in &columns {
+                table
+                    .columns
+                    .insert(column.clone(), Column::new(ty("integer")).not_null());
+            }
+            match kind {
+                "primary" => {
+                    table.primary_key = Some(PrimaryKey {
+                        name: Some("pk".into()),
+                        columns,
+                    })
+                }
+                "unique" => {
+                    table
+                        .unique
+                        .insert("uq".into(), UniqueConstraint { columns });
+                }
+                _ => {
+                    let (keys, include) = if kind == "include" {
+                        (columns[..1].to_vec(), columns[1..].to_vec())
+                    } else {
+                        (columns, vec![])
+                    };
+                    table.indexes.insert(
+                        "ix".into(),
+                        Index {
+                            columns: keys
+                                .into_iter()
+                                .map(|name| IndexColumn {
+                                    name,
+                                    descending: false,
+                                })
+                                .collect(),
+                            include,
+                            unique: false,
+                            filter: None,
+                        },
+                    );
+                }
+            }
+            cases.push((
+                format!("{kind} width {count}"),
+                table,
+                if count == 33 { Some("54011") } else { None },
+            ));
+        }
+    }
+    // Every admitted type family other than json can be a btree key. Include
+    // aliases: varchar uses text's operator class, not one of its own.
+    for declared in [
+        "smallint",
+        "int",
+        "bigint",
+        "numeric",
+        "real",
+        "float8",
+        "bool",
+        "char(2)",
+        "varchar(20)",
+        "text",
+        "bytea",
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "uuid",
+        "jsonb",
+    ] {
+        let mut table = base();
+        table
+            .columns
+            .insert("a".into(), Column::new(ty(declared)).not_null());
+        table.primary_key = Some(PrimaryKey {
+            name: Some("pk".into()),
+            columns: vec!["a".into()],
+        });
+        cases.push((format!("key type {declared}"), table, None));
+    }
+    for expression in ["\u{a0}", "\u{2003}", "\t\u{a0}\n"] {
+        let mut table = base();
+        table
+            .columns
+            .insert(expression.trim_ascii().into(), Column::new(ty("boolean")));
+        table.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: expression.into(),
+            },
+        );
+        table.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "a".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: Some(expression.into()),
+            },
+        );
+        cases.push((format!("non-ASCII expression {expression:?}"), table, None));
+    }
+    let pg = Postgres::new();
+    let name = TableName::new(&s, "t");
+    for (label, table, expected) in cases {
+        let problems = pg.validate_table(&name, &table);
+        assert_eq!(
+            problems.is_empty(),
+            // Operator classes and FK type compatibility belong to this
+            // server, not to the offline declaration's structure. Stock json
+            // is refused here; the custom-opclass test pins the legal case.
+            expected.is_none() || matches!(expected, Some("42704" | "42804" | "54011")),
+            "{label}: {problems:?}"
+        );
+        let statements = pg
+            .emit(
+                &pbps_model::Change::CreateTable {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                    name: name.clone(),
+                    table: Box::new(table),
+                },
+                Strategy::default(),
+            )
+            .expect("emitter spells structural errors for the engine");
+        let mut refusal = None;
+        for statement in statements {
+            if let Err(error) = conn.execute(&statement.sql).await {
+                refusal = Some(error);
+                break;
+            }
+        }
+        assert_eq!(
+            refusal.as_ref().map(sqlstate),
+            expected,
+            "{label}: {refusal:?}"
+        );
+        conn.execute(&format!("DROP TABLE IF EXISTS {s}.t"))
+            .await
+            .unwrap();
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
+/// A server can give json a default btree class. The offline validator must
+/// not refuse a declaration that the catalog can pull and this engine creates.
+/// Roll the class back with the test: other live tests measure stock json.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn installed_default_operator_classes_can_make_json_keys_valid() {
+    let mut conn = connect().await;
+    conn.execute("BEGIN").await.unwrap();
+    let s = emit_schema("json_opclass");
+    conn.execute(&format!("CREATE SCHEMA {s}")).await.unwrap();
+    conn.execute(&format!("CREATE FUNCTION {s}.cmp(json,json) RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS 'SELECT pg_catalog.jsonb_cmp($1::jsonb,$2::jsonb)'")).await.unwrap();
+    for (function, operator) in [
+        ("lt", "<"),
+        ("le", "<="),
+        ("eq", "="),
+        ("ge", ">="),
+        ("gt", ">"),
+    ] {
+        conn.execute(&format!("CREATE FUNCTION {s}.{function}(json,json) RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS 'SELECT $1::jsonb {operator} $2::jsonb'")).await.unwrap();
+        conn.execute(&format!(
+            "CREATE OPERATOR {s}.{operator} (LEFTARG=json, RIGHTARG=json, FUNCTION={s}.{function})"
+        ))
+        .await
+        .unwrap();
+    }
+    conn.execute(&format!("CREATE OPERATOR CLASS {s}.json_ops DEFAULT FOR TYPE json USING btree AS OPERATOR 1 {s}.<, OPERATOR 2 {s}.<=, OPERATOR 3 {s}.=, OPERATOR 4 {s}.>=, OPERATOR 5 {s}.>, FUNCTION 1 {s}.cmp(json,json)")).await.unwrap();
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("j".into(), Column::new(ty("json")).not_null());
+    parent.primary_key = Some(PrimaryKey {
+        name: Some("pk".into()),
+        columns: vec!["j".into()],
+    });
+    let mut child = Table::default();
+    child.columns.insert("j".into(), Column::new(ty("json")));
+    child.unique.insert(
+        "uq".into(),
+        UniqueConstraint {
+            columns: vec!["j".into()],
+        },
+    );
+    child.indexes.insert(
+        "ix".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "j".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        },
+    );
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["j".into()],
+            references_table: TableName::new(&s, "parent"),
+            references_columns: vec!["j".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let pg = Postgres::new();
+    for (name, table) in [("parent", parent), ("child", child)] {
+        let name = TableName::new(&s, name);
+        let problems = pg.validate_table(&name, &table);
+        assert!(
+            problems.is_empty(),
+            "installed default json opclass: {problems:?}"
+        );
+        let statements = pg
+            .emit(
+                &pbps_model::Change::CreateTable {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                    name,
+                    table: Box::new(table),
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+        for statement in statements {
+            conn.execute(&statement.sql)
+                .await
+                .expect("the server supports these json keys");
+        }
+    }
+    conn.execute(&format!(
+        "INSERT INTO {s}.parent VALUES ('1'); INSERT INTO {s}.child VALUES ('1')"
+    ))
+    .await
+    .unwrap();
+    conn.execute("ROLLBACK").await.unwrap();
+}
+
 /// A rename that crosses a schema takes two statements, and each says what it
 /// does to the name so that a staged checkpoint can find the table in between.
 #[tokio::test]

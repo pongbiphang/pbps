@@ -1,4 +1,4 @@
-//! What PostgreSQL will refuse about a role, checked before anything connects.
+//! PostgreSQL declaration structure and roles, checked before anything connects.
 //!
 //! The counterpart of `pbps-mssql/src/validate.rs`'s role half, and the place
 //! [ADR-0010](../../../docs/ADR-0010-postgres-privileges.md) §1, §2 and §6
@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 
 use pbps_dialect::DialectError;
-use pbps_model::{GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema};
+use pbps_model::{GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table};
 
 use crate::quote;
 use crate::types::DIALECT;
@@ -29,6 +29,87 @@ fn invalid(message: impl Into<String>) -> DialectError {
         dialect: DIALECT,
         message: message.into(),
     }
+}
+
+/// Structural declaration errors, measured on PostgreSQL 18.6. Unlike SQL
+/// Server, repeated index keys, repeated INCLUDE columns, a key in INCLUDE,
+/// and repeated local FK columns are legal here. Only PK/UNIQUE lists reject
+/// duplicates. Index width depends on the server build and key-type eligibility
+/// on installed operator classes. Both stay with the server, not guessed from
+/// the stock catalogue by an offline validator (DECISIONS 452).
+pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    if let Some(pk) = &table.primary_key {
+        found.extend(key_columns("primary key", &pk.columns, table, true));
+    }
+    for (name, unique) in &table.unique {
+        let what = format!("unique constraint `{name}`");
+        found.extend(key_columns(&what, &unique.columns, table, true));
+    }
+    for (name, fk) in &table.foreign_keys {
+        let what = format!("foreign key `{name}`");
+        found.extend(key_columns(&what, &fk.columns, table, false));
+        if fk.columns.len() != fk.references_columns.len() {
+            found.push(invalid(format!(
+                "{what} has {} column(s) but references {}; the two sides must line up",
+                fk.columns.len(),
+                fk.references_columns.len()
+            )));
+        }
+        if fk.references_columns.is_empty() {
+            found.push(invalid(format!(
+                "{what} names no columns on the referenced table"
+            )));
+        }
+    }
+    for (name, check) in &table.checks {
+        // Non-ASCII whitespace can be an unquoted identifier in PostgreSQL;
+        // Rust's Unicode trim would reject a legal boolean-column expression.
+        if check.expression.trim_ascii().is_empty() {
+            found.push(invalid(format!(
+                "check constraint `{name}` has an empty expression"
+            )));
+        }
+    }
+    for (name, index) in &table.indexes {
+        let what = format!("index `{name}`");
+        let keys: Vec<_> = index.columns.iter().map(|c| c.name.clone()).collect();
+        found.extend(key_columns(&what, &keys, table, false));
+        for column in &index.include {
+            if !table.columns.contains_key(column) {
+                found.push(invalid(format!(
+                    "{what} includes `{column}`, which is not a column of this table"
+                )));
+            }
+        }
+        if index
+            .filter
+            .as_ref()
+            .is_some_and(|f| f.trim_ascii().is_empty())
+        {
+            found.push(invalid(format!("{what} has an empty filter expression")));
+        }
+    }
+    found
+}
+
+fn key_columns(what: &str, columns: &[String], table: &Table, distinct: bool) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    if columns.is_empty() {
+        found.push(invalid(format!("{what} names no columns")));
+    }
+    let mut seen = BTreeSet::new();
+    for name in columns {
+        if !table.columns.contains_key(name) {
+            found.push(invalid(format!(
+                "{what} references `{name}`, which is not a column of this table"
+            )));
+        }
+        if distinct && !seen.insert(name) {
+            found.push(invalid(format!("{what} names `{name}` twice")));
+        }
+    }
+    found
 }
 
 /// The permissions PostgreSQL has, among the words the model spells
