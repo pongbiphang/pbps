@@ -119,6 +119,10 @@ impl TypeChangeRisk {
 pub struct Statement {
     pub sql: String,
 
+    /// Reference-data writes that need an engine-specific execution guard.
+    /// Derived by the emitter, never inferred by parsing the SQL.
+    pub row_write: Option<RowWrite>,
+
     /// Must be sent as a batch of its own.
     ///
     /// Some SQL Server DDL cannot share a batch with statements that reference it
@@ -184,6 +188,20 @@ pub struct Statement {
     pub creates: Vec<Created>,
 }
 
+/// The reference-data operation performed by a guarded statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOperation {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowWrite {
+    pub table: TableName,
+    pub operation: RowOperation,
+}
+
 /// An object a statement creates, for a staged checkpoint to adopt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Created {
@@ -196,12 +214,18 @@ impl Statement {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
+            row_write: None,
             own_batch: false,
             transactional: true,
             renames: Vec::new(),
             role_renames: Vec::new(),
             creates: Vec::new(),
         }
+    }
+
+    pub fn writing_rows(mut self, table: TableName, operation: RowOperation) -> Self {
+        self.row_write = Some(RowWrite { table, operation });
+        self
     }
 
     /// Records that this statement moves `from` to `to`.

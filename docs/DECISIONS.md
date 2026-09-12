@@ -9921,3 +9921,39 @@ SPEC is in sync with all of these.
     change: a not-yet-planned declaration with a dotted column key now fails
     at load instead of loading silently and bricking `ids.yaml` the first
     time `plan` minted its identity — a deliberate fail-fast.
+
+445. **Reference-data writes do not authorize ambient PostgreSQL triggers.**
+     Measured on PostgreSQL 18.6 with separate non-superuser roles: a principal
+     with TRIGGER on a reference-data table, but no SELECT on a secret table,
+     can attach an invoker trigger that copies the secret under the deployer's
+     privileges. The approved row still matches and the old CLI records Apply.
+     `unmanaged: ignore` or `warn` controls comparison, not this execution trust.
+     Connected planning and apply now refuse an active non-internal trigger for
+     the row operation unless its definition matches a recorded managed trigger
+     and its function owner can SET ROLE to the deployer. That owner test means
+     a less-privileged function owner cannot replace the invoker body after the
+     check; a managed name or a current SECURITY DEFINER flag alone is no proof,
+     since the owner can replace the body or change that flag without a table lock.
+     External/transitive helper authentication remains separate (#319, #322).
+
+     TRIGGER privilege also permits CREATE OR REPLACE of an existing trigger,
+     measured even when the actor does not own the table. Take ROW EXCLUSIVE
+     before authenticating and retain it through the write: it conflicts with
+     trigger DDL, permits ordinary DML, and is available to an INSERT-only role.
+     Authenticate in the old table names before a plan renames them, retaining
+     catalog trigger/function identities within that transaction; recheck each
+     emitted row target, including a newly created table, before executing it.
+     The emitter supplies typed row-operation metadata so the runner never
+     guesses a write from SQL text. A trigger the plan drops gets no allowance
+     and must actually be absent at the write. Internal constraint triggers are
+     engine machinery; disabled triggers and other events do not run that write.
+
+     An ordinary apply holds its locks through the enclosing transaction and
+     ledger record. A staged row gets a transaction only around its guard and
+     one already-atomic row statement, committing before the existing checkpoint;
+     non-transactional DDL and the plan's per-statement commit contract remain.
+     Bootstrap checks each created row target with no pre-existing allowance.
+     The live regressions cover all three DML kinds, row/statement triggers,
+     ignore/warn, both apply modes, no secret leak or success ledger on refusal,
+     successful retry, managed-trigger execution, post-approval replacement and
+     an independent connection blocked only until the write releases its lock.

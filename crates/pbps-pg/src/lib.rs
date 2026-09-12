@@ -37,6 +37,7 @@ use pbps_model::{
 };
 
 pub mod catalog;
+pub mod data_triggers;
 pub mod doctor;
 mod drop_impact;
 mod emit;

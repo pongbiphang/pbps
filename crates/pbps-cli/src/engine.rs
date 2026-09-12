@@ -871,6 +871,82 @@ pub async fn check_module_rebuilds(
     }
 }
 
+/// Holds only trigger identities authenticated in the caller's open transaction.
+#[derive(Default)]
+pub struct DataWriteGuard {
+    postgres: Option<pbps_pg::data_triggers::Guard>,
+}
+
+pub async fn prepare_data_writes(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    baseline: &StateSnapshot,
+    planned_ids: &pbps_model::IdsFile,
+) -> anyhow::Result<DataWriteGuard> {
+    match conn.driver() {
+        // SQL Server keeps its existing reference-data execution policy.
+        Driver::Mssql => Ok(DataWriteGuard::default()),
+        Driver::Postgres => {
+            use pbps_dialect::{RowOperation, RowWrite};
+            use pbps_model::Change;
+            let mut writes = Vec::new();
+            let mut dropped = BTreeSet::new();
+            for planned in &changes.changes {
+                if let Change::DropModule { id, .. } = &planned.change {
+                    dropped.insert(id.clone());
+                }
+                let (table, operation) = if let Change::InsertRow { table, .. } = &planned.change {
+                    (table, RowOperation::Insert)
+                } else if let Change::UpdateRow { table, .. } = &planned.change {
+                    (table, RowOperation::Update)
+                } else if let Change::DeleteRow { table, .. } = &planned.change {
+                    (table, RowOperation::Delete)
+                } else {
+                    continue;
+                };
+                // The logical target has the plan's final spelling; locks are
+                // acquired before any rename, through the stable table uid.
+                // New tables receive no existing-trigger allowance.
+                if let Some(old) = planned_ids
+                    .table_uid(table)
+                    .or_else(|| baseline.ids.table_uid(table))
+                    .and_then(|uid| baseline.ids.tables.get(uid))
+                {
+                    writes.push(RowWrite {
+                        table: old.clone(),
+                        operation,
+                    });
+                }
+            }
+            Ok(DataWriteGuard {
+                postgres: Some(
+                    pbps_pg::data_triggers::prepare(conn, &writes, &baseline.schema, &dropped)
+                        .await?,
+                ),
+            })
+        }
+    }
+}
+
+pub async fn check_data_write(
+    conn: &mut Conn,
+    statement: &pbps_dialect::Statement,
+    guard: &DataWriteGuard,
+) -> anyhow::Result<()> {
+    let Some(write) = &statement.row_write else {
+        return Ok(());
+    };
+    match conn.driver() {
+        Driver::Mssql => Ok(()),
+        Driver::Postgres => {
+            let empty = pbps_pg::data_triggers::Guard::default();
+            pbps_pg::data_triggers::check(conn, write, guard.postgres.as_ref().unwrap_or(&empty))
+                .await?;
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
