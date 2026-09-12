@@ -10584,15 +10584,29 @@ SPEC is in sync with all of these.
      as the literal five-character string `db error` on `Display` — `e.code()`
      still answered the right SQLSTATE, so the bug passed every test that only
      checked the code. `message()` alone would have closed issue #167;
-     `detail()`, `hint()`, and the object identifiers (`schema()`, `table()`,
-     `column()`, `datatype()`, `constraint()`) are folded in on their own
-     lines too, because a NOT NULL violation carries no `detail` at all and
-     its column name is reachable only through `column()` — the shape the
-     live suite pins beside the `42P01` shape the issue itself measured. The
-     fallback to `e.to_string()` is unchanged for a failure `as_db_error()`
-     answers `None` for: those never reached the server, and the driver's own
-     text for them (`"connection closed"`, and so on) was never `db error` to
-     begin with.
+     `detail()`, `hint()`, `where_()`, and the object identifiers (`schema()`,
+     `table()`, `column()`, `datatype()`, `constraint()`) are folded in too,
+     because several diagnostics this workspace builds today reconstruct by
+     hand exactly what these carry. Each goes under its own label rather than
+     sharing one: `where_()` is `CONTEXT:` in `psql`'s own vocabulary — the
+     call stack of PL/pgSQL functions and internally generated queries active
+     when the error was raised — and a first draft of this fix folded the
+     object identifiers under a `WHERE:` label, mislabeling object metadata as
+     execution context and dropping the actual traceback `where_()` carries
+     (round-1 review of PR #464); the identifiers now render under `OBJECT:`
+     and `where_()` under `CONTEXT:`. **Measured** on 18.6, the two are
+     populated by disjoint shapes of error and never both at once: a NOT NULL
+     violation carries `detail()` (`"Failing row contains (null)."`, not
+     redundant with `message()`) and the object identifiers, including a
+     `schema()` that `message()` never names; a misspelled column carries
+     `hint()` alone; an exception raised inside a function carries `where_()`
+     alone. The live suite pins all four shapes, each isolated from the
+     others by the fixture that produces it — not a single fixture whose
+     assertions could pass off one field's overlap with another. The fallback
+     to `e.to_string()` is unchanged for a failure `as_db_error()` answers
+     `None` for: those never reached the server, and the driver's own text for
+     them (`"connection closed"`, and so on) was never `db error` to begin
+     with.
 
      `pbps-pg`'s `schema_changed_underneath` and `the_engine_broke_a_tie` each
      wrap this seam's `DbError::Driver` in a sentence of their own for a
