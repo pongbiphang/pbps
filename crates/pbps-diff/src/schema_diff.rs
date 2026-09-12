@@ -598,9 +598,80 @@ pub fn diff_partial(
     let frees_a_renamed_name = |table: &TableName, freed_name: &str| -> bool {
         claimed_by_a_rename.contains(&TableName::new(table.schema.clone(), freed_name.to_owned()))
     };
+    // A cross-schema `RenameTable`'s own table's final identity — the set
+    // `DropIndex` must *not* be exempted for, unlike the same-schema case
+    // round 2 fixed. `DropIndex`'s only field for its object's location is
+    // `table`, and `diff_constraints` always fills it with the table's
+    // *declared* (final, destination) schema, never wherever the table
+    // actually is when the drop runs. Within one schema that spelling is
+    // right throughout, which is why round 2's exemption is safe there.
+    // Across schemas it is not: `emit.rs` renders `DROP INDEX
+    // <table.schema>.<name>`, so a table's own index, moved ahead of that
+    // same table's cross-schema rename, becomes `DROP INDEX
+    // <destination>.<name>;` before `SET SCHEMA` has moved the object into
+    // that schema at all.
+    //
+    // Measured on `pbps-test-pg-cw`: `s1.old` (renaming to `s2.target`) owns
+    // a plain index literally named `target`. Moved fully ahead, `DROP
+    // INDEX "s2"."target";` refuses with `index "target" does not exist`
+    // (it is still `s1.target`); left fully behind (this fix's fallback),
+    // the rename's own `RENAME TO target` refuses first with the original
+    // `42P07` (the index has not moved yet). The only order that succeeds
+    // at all runs the drop *between* the rename's two statements — `SET
+    // SCHEMA` first, then the drop, then `RENAME TO` — which this sorter
+    // cannot express: `RenameTable` is one `Change`, not two independently
+    // orderable ones. Separately confirmed: `DROP INDEX "s1"."target";`
+    // (the *source* schema) ahead of the whole rename does apply clean, so
+    // the plan is genuinely satisfiable — the `Change` model just cannot
+    // say so yet. Tracked in #484, not attempted here.
+    //
+    // So none of a table's own indexes count as freeing anything while that
+    // table is mid a cross-schema rename, regardless of which name — final
+    // or intermediate — would otherwise match: every one of them is stamped
+    // with the same wrong-until-`SET SCHEMA` schema, not only the one whose
+    // name happens to collide.
+    let cross_schema_rename_targets: BTreeSet<TableName> = planned
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(to.clone()),
+            Change::RenameTable { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect();
     let is_a_freeing_drop = |c: &Change| -> bool {
         match c {
-            Change::DropIndex { table, name } => frees_a_renamed_name(table, name),
+            Change::DropIndex { table, name } => {
+                !cross_schema_rename_targets.contains(table) && frees_a_renamed_name(table, name)
+            }
             Change::DropUnique { table, name } => {
                 !needs_its_own_rename_first(table) && frees_a_renamed_name(table, name)
             }
@@ -4965,6 +5036,54 @@ mod tests {
             ["DropIndex", "RenameTable"],
             "the index has to be gone before the cross-schema rename's first \
              statement claims the intermediate name it collides with: {cs:?}"
+        );
+    }
+
+    /// Round-4 review finding: round 2's "`DropIndex` never needs its own
+    /// table's current name" conclusion was correct but incomplete — the
+    /// schema qualifier is still there, and for a cross-schema rename the
+    /// schema in `DropIndex`'s declared identity is the *destination*, not
+    /// wherever the table currently is. `s1.old` (renaming to `s2.target`)
+    /// owns a plain index literally named `target`; measured on
+    /// `pbps-test-pg-cw`, moving it fully ahead of the rename produces
+    /// `DROP INDEX "s2"."target";` while the index is still `s1.target`
+    /// (`index "target" does not exist`), and leaving it in place hits the
+    /// same `42P07` the rename was already refusing. Neither flat order
+    /// works — the only one that does runs the drop between the rename's
+    /// two statements, which this sorter cannot express — so this stays
+    /// refused rather than reordered unsafely.
+    #[test]
+    fn a_cross_schema_renames_own_index_is_not_moved_even_when_it_matches_the_final_name() {
+        let mut old_t = table(&[("id", Column::new(ty("int")))]);
+        old_t.indexes.insert(
+            "target".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "id".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        let base = schema_of("s1.old", old_t);
+        let declared = schema_of("s2.target", table(&[("id", Column::new(ty("int")))]));
+
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "s1.old".parse().unwrap(),
+                to: "s2.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["RenameTable", "DropIndex"],
+            "the drop's own table is mid a cross-schema rename, so it never \
+             counts as freeing anything and stays in its ordinary place: {cs:?}"
         );
     }
 
