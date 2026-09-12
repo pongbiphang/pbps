@@ -101,8 +101,26 @@ fn validate(p: &PlannedChange) -> Result<(), DialectError> {
 fn needs_resolution(ty: &ColumnType, source: &str) -> Result<bool, DialectError> {
     Ok(
         crate::emit::SETTING_SENSITIVE.contains(&crate::types::normalize(ty)?.base.as_str())
-            && crate::rows::is_constant(source),
+            && crate::rows::is_constant(source)
+            && !is_null_literal(source),
     )
+}
+
+/// NULL has no session-decided value, but its cast shape can decide whether
+/// PostgreSQL keeps a catalog default at all (DECISIONS 361). Preserve that
+/// shape, including casts around a signed NULL, rather than rendering it anew.
+pub(crate) fn is_null_literal(source: &str) -> bool {
+    let mut rest = source;
+    loop {
+        let (bare, _) = crate::rows::unwrapped_with_type(rest);
+        if bare.eq_ignore_ascii_case("null") {
+            return true;
+        }
+        let Some(after) = bare.strip_prefix(['+', '-']) else {
+            return false;
+        };
+        rest = after;
+    }
 }
 
 pub(crate) fn emit(
@@ -440,5 +458,37 @@ mod tests {
         ] {
             assert!(input(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn null_cast_shapes_remain_unchanged_while_non_null_literals_require_resolution() {
+        for (ty, source) in [
+            ("timestamptz", "NULL::timestamp(3) with time zone"),
+            ("timestamptz", "CAST(NULL AS timestamp(3) with time zone)"),
+            (
+                "timestamptz",
+                "((NULL /* kept */)::timestamp(3) with time zone)",
+            ),
+            ("real", "-NULL::real"),
+        ] {
+            assert!(
+                !needs_resolution(&ty.parse().unwrap(), source).unwrap(),
+                "{source}"
+            );
+            let sql = crate::Postgres::new()
+                .emit_planned(&add(ty, source))
+                .unwrap();
+            assert!(sql[0].sql.contains(source), "{}", sql[0].sql);
+        }
+        assert!(needs_resolution(&"date".parse().unwrap(), "'01/02/2026'::date").unwrap());
+        let mut column = pbps_model::Column::new("timestamptz".parse().unwrap());
+        column.default = Some("NULL::timestamptz".into());
+        let mut table = pbps_model::Table::default();
+        table.columns.insert("d".into(), column);
+        assert!(
+            !crate::Postgres::new()
+                .validate_table(&"public.t".parse().unwrap(), &table)
+                .is_empty()
+        );
     }
 }

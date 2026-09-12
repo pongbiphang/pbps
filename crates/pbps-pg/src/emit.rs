@@ -704,7 +704,10 @@ pub(crate) fn refuse_an_unresolved_default(
     ty: &ColumnType,
     default: &str,
 ) -> Option<DialectError> {
-    if !SETTING_SENSITIVE.contains(&ty.base.as_str()) || !crate::rows::is_constant(default) {
+    if !SETTING_SENSITIVE.contains(&ty.base.as_str())
+        || !crate::rows::is_constant(default)
+        || crate::defaults::is_null_literal(default)
+    {
         return None;
     }
     Some(invalid(format!(

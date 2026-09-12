@@ -685,13 +685,15 @@ merged diff of every skipped version, and intent surviving in the ids file is
 precisely what makes that possible. A plan computed offline (without `--db`) is
 always a preview and is never accepted by `apply`.
 
-PostgreSQL literal defaults on setting-sensitive types are resolved under the
+PostgreSQL non-NULL literal defaults on setting-sensitive types are resolved under the
 canonical read settings by connected planning and bootstrap. The saved change
 retains the declaration text and carries the resolved literal beside it as a
 plan fact. Both are checksum-pinned: replay emits the resolved literal, while
 the declaration ledger records the original text. Offline SQL emission refuses
 an unresolved literal rather than letting the applying session choose its
 value. These plan facts are not annotations on `Schema` or declaration YAML.
+NULL cast shapes remain unchanged: their value is setting-independent, but the
+cast can determine whether PostgreSQL retains the default in its catalog.
 
 Because the change set is pinned by checksum, a coarse flag like `--allow` is
 safe: **what gets approved is exactly the plan approved at the deployment gate,

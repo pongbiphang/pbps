@@ -10670,6 +10670,8 @@ SPEC is in sync with all of these.
      original `Change` is unchanged, so `Declared::advance` continues recording
      the human's text and the next plan does not propose the same default again.
      This supersedes decision 261's temporary permission for typed literals.
+     NULL literals are excluded: their value is setting-independent, and
+     rewriting their cast can erase a retained default (decision 361).
 
      Resolution is a connected free function in `pbps-pg`, routed by `engine`
      from planning and bootstrap. It owns a canonical read-only scope and

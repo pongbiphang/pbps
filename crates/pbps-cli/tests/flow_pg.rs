@@ -314,6 +314,31 @@ fn canonical_defaults_survive_bootstrap_saved_apply_and_the_next_plan() {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn retained_null_default_is_not_erased_by_connected_resolution() {
+    let own = OwnDatabase::new(&server(), "retained_null_default");
+    let connection = own.connection();
+    let source = "table: app.t\ncolumns:\n  d: {type: timestamptz, default: 'NULL::timestamp(3) with time zone'}\n";
+    let d = bootstrapped_demo(connection, "retained-null-default", source);
+    let count = "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.t'::regclass";
+    assert_eq!(scalar(connection, count), 1);
+    succeeds(d.run(&["verify", "--db", connection]));
+    d.table(&source.replace("timestamp(3)", "timestamp(2)"));
+    let path = connected_artifact(&d, connection, false);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("NULL::timestamp(2) with time zone"), "{raw}");
+    assert!(!raw.contains("\"canonical\""), "{raw}");
+    succeeds(approved_apply(&d, connection, &path, &[]));
+    assert_eq!(scalar(connection, count), 1);
+    succeeds(d.run(&["verify", "--db", connection]));
+    d.table(&source.replace("NULL::timestamp(3) with time zone", "NULL::timestamptz"));
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0);
+    assert!(stderr(&refused).contains("NULL"), "{}", stderr(&refused));
+    assert_eq!(scalar(connection, count), 1);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
     let own = OwnDatabase::new(&server(), "cost");
     let connection = own.connection();
