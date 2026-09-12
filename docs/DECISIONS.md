@@ -8121,8 +8121,9 @@ SPEC is in sync with all of these.
     So the elision has a precondition, and it is not "the new name exists":
     `pbps_pg::roles::rename_evidence` reads all four states and only
     `Done` — old gone, new present — lets the rename pass. `BothPresent`,
-    `NotRunYet` and `NeitherPresent` each refuse with the
-    `ALTER ROLE … RENAME TO …` to run.
+    `NotRunYet` and `NeitherPresent` each refuse. Only `NotRunYet` names the
+    `ALTER ROLE … RENAME TO …` to run; the other states require the operator
+    to resolve the name collision or missing principal before planning again.
 
     The remaining ambiguity is stated rather than hidden: `Done` cannot tell a
     rename from a drop-and-create. It does not have to. If the old role was

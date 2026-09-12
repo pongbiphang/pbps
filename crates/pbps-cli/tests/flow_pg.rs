@@ -1011,17 +1011,18 @@ fn completed_cluster_role_renames_are_pinned_and_recorded_without_role_sql() {
     d.commit();
     let plan = d.dir.join("plan.json");
     let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
-    let refused = |o: Output| {
+    let refused = |o: Output, remedy: &str, has_sql: bool| {
         assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
-        assert!(stderr(&o).contains("ALTER ROLE"), "{}", stderr(&o));
+        assert!(stderr(&o).contains(remedy), "{}", stderr(&o));
+        assert_eq!(stderr(&o).contains("ALTER ROLE"), has_sql, "{}", stderr(&o));
     };
-    refused(d.run(&planning)); // NotRunYet
+    refused(d.run(&planning), "has not been run", true); // NotRunYet
     refuses_connected_check_json(&d, connection, "rename_evidence (PostgreSQL)", "ALTER ROLE");
     on_server(&server, &format!("CREATE ROLE {new}"));
-    refused(d.run(&planning)); // BothPresent
+    refused(d.run(&planning), "Resolve the name collision", false); // BothPresent
     on_server(&server, &format!("DROP ROLE {new}"));
     on_server(&server, &format!("ALTER ROLE {old} RENAME TO {parked}"));
-    refused(d.run(&planning)); // NeitherPresent
+    refused(d.run(&planning), "Restore the intended principal", false); // NeitherPresent
     on_server(&server, &format!("ALTER ROLE {parked} RENAME TO {new}"));
     let check = passed_connected_check_json(&d, connection, "rename_evidence");
     assert!(
@@ -1036,7 +1037,11 @@ fn completed_cluster_role_renames_are_pinned_and_recorded_without_role_sql() {
         serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
     assert!(saved.changes.is_empty());
     on_server(&server, &format!("CREATE ROLE {old}"));
-    refused(apply_plan(&d, connection, &plan, false));
+    refused(
+        apply_plan(&d, connection, &plan, false),
+        "Resolve the name collision",
+        false,
+    );
     on_server(&server, &format!("DROP ROLE {old}"));
     succeeds(apply_plan(&d, connection, &plan, false));
     succeeds(d.run(&["verify", "--db", connection]));
