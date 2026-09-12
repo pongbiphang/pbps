@@ -1291,6 +1291,39 @@ pub trait Dialect {
         false
     }
 
+    /// Whether this engine keeps an index — and the index that backs an
+    /// explicitly named primary key or unique constraint — in the schema's
+    /// **relation** namespace, alongside tables, views and sequences, so that
+    /// two tables in one schema may not declare an index of one name, and an
+    /// index may not be named after a table.
+    ///
+    /// Measured on PostgreSQL 18.6 (issue #176):
+    ///
+    /// ```text
+    /// CREATE TABLE r2.t1 (n int); CREATE TABLE r2.t2 (n int);
+    /// CREATE INDEX ix_n ON r2.t1 (n);
+    /// CREATE INDEX ix_n ON r2.t2 (n);        -> ERROR: relation "ix_n" already exists
+    ///
+    /// CREATE TABLE coll.t1 (n int, CONSTRAINT ix_n PRIMARY KEY (n));
+    /// CREATE INDEX ix_n ON coll.t2 (n);      -> ERROR: relation "ix_n" already exists
+    ///
+    /// ALTER TABLE coll.t1 ADD CONSTRAINT t2 UNIQUE (n);
+    ///                                         -> ERROR: relation "t2" already exists
+    /// ```
+    ///
+    /// A primary key or unique constraint is in this question because a named
+    /// one is backed by an index of that name; a check or foreign-key
+    /// constraint is not backed by an index and stays out of it — those are
+    /// per-table, which is issue #179's subject.
+    ///
+    /// This is the second place the two engines' namespaces differ (the first
+    /// is routines against tables, ADR-0009 §1): on SQL Server an index name
+    /// only has to be unique per table, so the same declaration is valid
+    /// there — which is what the default, `false`, says.
+    fn indexes_share_namespace_with_tables(&self) -> bool {
+        false
+    }
+
     /// Where `to` sits on the path a bare name in a definition in `from` is
     /// looked up along, or `None` where it is not on that path at all
     /// (DECISIONS 317).
@@ -1600,6 +1633,68 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
     problems
 }
 
+/// The whole-schema question of whether a declared index, or the index behind
+/// a named primary key or unique constraint, collides with another relation
+/// in its schema — a third case of the namespace-sharing rule 201 moved to
+/// the dialect, not a new one (issue #176, DECISIONS 452).
+///
+/// `false` from [`Dialect::indexes_share_namespace_with_tables`] means this
+/// engine has no such namespace to collide in, so there is nothing to check —
+/// the same short-circuit `check_module_names` takes per module kind.
+///
+/// The namespace is seeded with every table and every module kind that shares
+/// it too (a view, on PostgreSQL) — the same boundary
+/// [`Dialect::shares_namespace_with_tables`] already draws — and then every
+/// table's declared index, primary-key and unique-constraint names are folded
+/// in, each checked against everything already claimed. A check or
+/// foreign-key constraint has no backing index and is not in this union
+/// (ADR-0009 §1; issue #179 owns per-table constraint-kind reuse).
+pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    if !dialect.indexes_share_namespace_with_tables() {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    let mut claimed: BTreeMap<ObjectName, String> = BTreeMap::new();
+    for name in schema.tables.keys() {
+        claimed.insert(name.clone(), format!("table `{name}`"));
+    }
+    for (id, module) in &schema.modules {
+        if dialect.shares_namespace_with_tables(module.kind) {
+            claimed.insert(id.object_name(), format!("{} `{id}`", module.kind));
+        }
+    }
+    for (table_name, table) in &schema.tables {
+        let mut declared: Vec<(&str, String)> = Vec::new();
+        for index_name in table.indexes.keys() {
+            declared.push((
+                index_name.as_str(),
+                format!("index `{table_name}.{index_name}`"),
+            ));
+        }
+        if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
+            declared.push((pk_name, format!("primary key `{table_name}.{pk_name}`")));
+        }
+        for unique_name in table.unique.keys() {
+            declared.push((
+                unique_name.as_str(),
+                format!("unique constraint `{table_name}.{unique_name}`"),
+            ));
+        }
+        for (name, descriptor) in declared {
+            let claim = ObjectName::new(table_name.schema.clone(), name);
+            if let Some(existing) = claimed.insert(claim.clone(), descriptor.clone()) {
+                problems.push(format!(
+                    "{existing} and {descriptor} are both named `{claim}`; {} keeps tables, \
+                     views and indexes in one namespace per schema, so it can hold only one of \
+                     them",
+                    dialect.name()
+                ));
+            }
+        }
+    }
+    problems
+}
+
 pub fn render_script(statements: &[Statement], separator: Option<&str>) -> String {
     let mut out = String::new();
     let mut previous_own_batch = false;
@@ -1622,6 +1717,8 @@ pub fn render_script(statements: &[Statement], separator: Option<&str>) -> Strin
 
 #[cfg(test)]
 mod tests {
+    use pbps_model::{CheckConstraint, Index, IndexColumn, PrimaryKey, UniqueConstraint};
+
     use super::*;
 
     #[test]
@@ -2078,6 +2175,9 @@ mod tests {
         fn overloads(&self, kind: ModuleKind) -> bool {
             matches!(kind, ModuleKind::Function | ModuleKind::Procedure)
         }
+        fn indexes_share_namespace_with_tables(&self) -> bool {
+            true
+        }
         /// The modifiers a column keeps: `varchar(10)` and `varchar(20)` are
         /// one function to this engine, and `f(varchar)` is what it calls
         /// both. Text in, text out — the argument of a routine identity is not
@@ -2244,6 +2344,179 @@ mod tests {
         );
         assert_eq!(OverloadingDialect.normalize_type(&ty).unwrap(), ty);
         assert_eq!(MinimalDialect.normalize_routine_arg(&arg).unwrap(), arg);
+    }
+
+    fn table() -> Table {
+        Table::default()
+    }
+
+    fn with_index(mut table: Table, name: &str) -> Table {
+        table.indexes.insert(
+            name.to_owned(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "n".to_owned(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+            },
+        );
+        table
+    }
+
+    fn with_primary_key(mut table: Table, name: &str) -> Table {
+        table.primary_key = Some(PrimaryKey {
+            name: Some(name.to_owned()),
+            columns: vec!["n".to_owned()],
+        });
+        table
+    }
+
+    fn with_unique(mut table: Table, name: &str) -> Table {
+        table.unique.insert(
+            name.to_owned(),
+            UniqueConstraint {
+                columns: vec!["n".to_owned()],
+            },
+        );
+        table
+    }
+
+    fn with_check(mut table: Table, name: &str) -> Table {
+        table.checks.insert(
+            name.to_owned(),
+            CheckConstraint {
+                expression: "n > 0".to_owned(),
+            },
+        );
+        table
+    }
+
+    fn schema_of(tables: &[(&str, Table)]) -> Schema {
+        let mut schema = Schema::default();
+        for (name, table) in tables {
+            schema.tables.insert(name.parse().unwrap(), table.clone());
+        }
+        schema
+    }
+
+    /// Two tables in one schema declaring an index of the same name is the
+    /// finding measured on PostgreSQL 18.6 in issue #176: the second
+    /// `CREATE INDEX ix_n` fails with `42P07`. SQL Server keeps an index name
+    /// unique per table, so the same declaration is valid there.
+    #[test]
+    fn two_tables_with_one_index_name_collide_only_where_indexes_share_the_namespace() {
+        let schema = schema_of(&[
+            ("coll.t1", with_index(table(), "ix_n")),
+            ("coll.t2", with_index(table(), "ix_n")),
+        ]);
+        let problems = check_index_names(&schema, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("coll.t1.ix_n"), "{problems:?}");
+        assert!(problems[0].contains("coll.t2.ix_n"), "{problems:?}");
+        assert!(problems[0].contains("coll.ix_n"), "{problems:?}");
+
+        assert!(
+            check_index_names(&schema, &MinimalDialect).is_empty(),
+            "an index name is only unique per table on SQL Server"
+        );
+    }
+
+    /// An index named after a table in the same schema is the same namespace
+    /// collision from the other direction (issue #176).
+    #[test]
+    fn an_index_named_after_a_table_collides_where_indexes_share_the_namespace() {
+        let schema = schema_of(&[("coll.t1", table()), ("coll.t2", with_index(table(), "t1"))]);
+        let problems = check_index_names(&schema, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("table `coll.t1`"), "{problems:?}");
+        assert!(problems[0].contains("index `coll.t2.t1`"), "{problems:?}");
+
+        assert!(check_index_names(&schema, &MinimalDialect).is_empty());
+    }
+
+    /// A named unique constraint is backed by an index of that name (the
+    /// review-widened half of issue #176), so it collides with a declared
+    /// index sharing its name.
+    #[test]
+    fn a_unique_constraint_and_an_index_sharing_a_name_collide() {
+        let schema = schema_of(&[
+            ("coll.t1", with_unique(table(), "uq_n")),
+            ("coll.t2", with_index(table(), "uq_n")),
+        ]);
+        let problems = check_index_names(&schema, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("unique constraint `coll.t1.uq_n`"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("index `coll.t2.uq_n`"), "{problems:?}");
+
+        assert!(check_index_names(&schema, &MinimalDialect).is_empty());
+    }
+
+    /// A named primary key is backed by an index too, and a unique constraint
+    /// named after a table collides with it from the other direction — both
+    /// measured on 18.6 in the widened issue.
+    #[test]
+    fn a_primary_key_and_a_unique_constraint_named_after_a_table_collide() {
+        let pk_schema = schema_of(&[
+            ("coll.t1", with_primary_key(table(), "ix_n")),
+            ("coll.t2", with_index(table(), "ix_n")),
+        ]);
+        let problems = check_index_names(&pk_schema, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("primary key `coll.t1.ix_n`"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("index `coll.t2.ix_n`"), "{problems:?}");
+        assert!(check_index_names(&pk_schema, &MinimalDialect).is_empty());
+
+        let uq_schema = schema_of(&[
+            ("coll.t1", with_unique(table(), "t2")),
+            ("coll.t2", table()),
+        ]);
+        let problems = check_index_names(&uq_schema, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("table `coll.t2`"), "{problems:?}");
+        assert!(
+            problems[0].contains("unique constraint `coll.t1.t2`"),
+            "{problems:?}"
+        );
+        assert!(check_index_names(&uq_schema, &MinimalDialect).is_empty());
+    }
+
+    /// The boundary, measured beside the collisions above: a check constraint
+    /// has no backing index, so it is not in this namespace at all, even when
+    /// it is named after a table. This is the negative case issue #176 names
+    /// explicitly.
+    #[test]
+    fn a_check_constraint_named_after_a_table_is_not_a_collision() {
+        let schema = schema_of(&[("coll.t1", with_check(table(), "t2")), ("coll.t2", table())]);
+        assert!(
+            check_index_names(&schema, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_index_names(&schema, &OverloadingDialect)
+        );
+        assert!(check_index_names(&schema, &MinimalDialect).is_empty());
+    }
+
+    /// A view is in `pg_class` beside tables, so an index named after one
+    /// collides too — the same boundary `shares_namespace_with_tables`
+    /// already draws for a module against a table.
+    #[test]
+    fn an_index_named_after_a_view_collides_where_views_share_the_namespace() {
+        let mut schema = schema_of(&[("coll.t1", with_index(table(), "v"))]);
+        schema
+            .modules
+            .insert("coll.v".parse().unwrap(), module(ModuleKind::View));
+        let problems = check_index_names(&schema, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("view `coll.v`"), "{problems:?}");
+        assert!(problems[0].contains("index `coll.t1.v`"), "{problems:?}");
     }
 }
 
