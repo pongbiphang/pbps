@@ -17,6 +17,8 @@ mod prompt;
 mod report;
 mod state_list;
 mod status;
+#[cfg(test)]
+mod test_pg;
 
 /// The command ran correctly and found something the user must act on.
 ///
