@@ -9762,3 +9762,65 @@ SPEC is in sync with all of these.
     least-privilege role itself, asserts `doctor` reports nothing, and then
     creates the key as that role — the check and the engine pinned to the
     same answer.
+
+441. **A relation of another kind occupying a ledger name is caught after
+    `ensure_tables`'s DDL, not by narrowing `ledger_is_there`'s probe.**
+    Deferred from a review finding on #205 (issue #217): that probe joins
+    `pg_class` on the two ledger names without filtering `relkind`, so a view
+    of either name counts, and `ensure_tables` returns `Ok(())` for a database
+    that has no ledger table at all.
+
+    The narrow fix does not fix it, and this is measured on 18.6, not assumed.
+    Filtering `relkind = 'r'` in the probe only makes it answer 0 where a view
+    occupies the name; `ensure_tables` then still runs `CREATE TABLE IF NOT
+    EXISTS public.__pbps_state`, which *also* skips a view of that name
+    (`NOTICE: relation "__pbps_state" already exists, skipping`) and reports
+    success. The probe deliberately asks the same question the DDL asks
+    (DECISIONS 288) — any relation of that name, whatever its kind, because the
+    point is to predict whether the DDL would do anything — so narrowing the
+    probe does not stop the wrong prediction, it only moves which of the two
+    questions gives it.
+
+    So the confirmation goes **after** the DDL block instead — once a relation
+    of each name exists, freshly created or already there, one catalog
+    question filtered to `relkind = 'r'` decides whether both are ordinary
+    tables, and names the occupant and its kind when one is not. That is a
+    question the probe cannot answer earlier, because before the DDL has run
+    or been skipped a view and an about-to-be-created table look the same to
+    it.
+
+    A kind check does not make the recording trustworthy, and is not asked to.
+    Measured on 18.6: a matching auto-updatable view over a table with the
+    ledger's own columns absorbs the insert (`INSERT 0 1`, `RETURNING id`
+    yields a row, the row lands in the view's base table) — a *kind* check
+    never sees this case fail, because the view answers correctly for `id`, and
+    an ordinary table of the ledger's name and columns passes `relkind = 'r'`
+    and does exactly the same silent redirection. What the confirmation buys is
+    a clear, named refusal in the cases that already fail loudly one step
+    later — `must be owner of table t` from `migrate_timeline_columns`'s
+    `ALTER` on a view, or a confusing insert failure — not a guarantee that
+    whatever answers `relkind = 'r'` is the tool's own ledger.
+
+    Nor does the confirmation cover every path: it runs on `ensure_tables`,
+    which only `record` and `lock` call. `prune` and `unlock` reach
+    `is_initialized` (or, for `unlock`, nothing) instead and never call
+    `ensure_tables`, so a decoy view still lets `prune`'s `DELETE_UP_TO` and
+    `unlock`'s `DELETE_LOCK` write through it into the view's base table —
+    measured on 18.6 on both, not assumed. Adding an `ensure_tables` call to
+    either would make a command whose whole point is to delete also create
+    ledger infrastructure, which this PR does not do; the gap is tracked as
+    issue #396.
+
+    A live test creates a view named `public.__pbps_state` over a table with
+    the ledger's columns and asserts `ensure_tables` fails naming the view's
+    kind, and that `record`'s `INSERT` never runs — the view's base table
+    stays empty. A negative case beside it holds two ordinary ledger tables
+    through both the creating and the already-there path of `ensure_tables`,
+    and confirms `record` still succeeds.
+
+    `pbps_mssql` does not share this shape, measured the same way: T-SQL's own
+    guard is `OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL`, already filtered
+    to `'U'` (user table), so a decoy view makes it evaluate true and send
+    `CREATE TABLE dbo.__pbps_state`, which then fails loudly — measured,
+    `Msg 2714: There is already an object named '__pbps_state' in the
+    database.` — rather than skip. No corresponding change was made there.

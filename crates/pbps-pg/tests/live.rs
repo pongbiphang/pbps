@@ -4839,6 +4839,99 @@ async fn a_name_collision_that_is_not_the_ledger_is_not_reported_as_a_ledger() {
     db.drop().await;
 }
 
+/// The finding this pins (issue #217, deferred from #205's review): a view of
+/// the ledger's own name, over a table with the ledger's own columns, is a
+/// decoy `ledger_is_there` cannot tell from the real thing and
+/// `CREATE TABLE IF NOT EXISTS` silently steps around — measured on 18.6,
+/// that statement leaves `NOTICE: relation "__pbps_state" already exists,
+/// skipping` and returns success. Without the post-DDL confirmation
+/// `ensure_tables` would report `Ok(())` for a database with no ledger table
+/// at all.
+///
+/// `record` must never reach its `INSERT`: that statement would go through the
+/// view and land in the base table underneath it (an auto-updatable view
+/// absorbs it, per the issue's own measurement), which is the wrong recording
+/// a kind check exists to keep from being reported as a success — not to
+/// prevent by some other means. The base table staying empty is how this test
+/// tells "refused before the insert" from "inserted somewhere unexpected".
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_occupying_the_ledgers_name_is_named_and_never_written_to() {
+    let mut db = TestDb::create("view_occupant").await;
+    db.conn
+        .execute(
+            "CREATE TABLE public.__pbps_state_base (
+                 id               bigint GENERATED ALWAYS AS IDENTITY
+                                  CONSTRAINT pk___pbps_state_base PRIMARY KEY,
+                 applied_at       timestamp(3)   NOT NULL
+                                  DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'),
+                 kind             varchar(16)    NOT NULL,
+                 git_sha          varchar(40)    NULL,
+                 plan_checksum    varchar(64)    NULL,
+                 state_json       text           NOT NULL,
+                 operator         varchar(128)   NOT NULL,
+                 reason           varchar(1000)  NULL,
+                 state_version    integer NULL,
+                 tables_count     integer NULL,
+                 modules_count    integer NULL,
+                 staged_completed integer NULL,
+                 staged_total     integer NULL
+             );
+             CREATE VIEW public.__pbps_state AS SELECT * FROM public.__pbps_state_base;",
+        )
+        .await
+        .expect("a decoy view over a table with the ledger's own columns");
+
+    let error = state::ensure_tables(&mut db.conn)
+        .await
+        .expect_err("a view of the ledger's name is not a ledger");
+    let message = format!("{error}");
+    assert!(
+        message.contains("public.__pbps_state") && message.contains("view"),
+        "the error must name the occupant and its kind: {message}"
+    );
+
+    let recorded = state::record(&mut db.conn, &snapshot(StateKind::Bootstrap)).await;
+    assert!(
+        matches!(recorded, Err(LedgerError::Db(_))),
+        "record must refuse before it ever inserts: {recorded:?}"
+    );
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM public.__pbps_state_base"
+        )
+        .await,
+        0,
+        "the view's base table must never receive the row: record's INSERT must not have run"
+    );
+
+    db.drop().await;
+}
+
+/// The negative case beside the one above: two ordinary tables of the ledger's
+/// names still pass the post-DDL confirmation, on both the path that creates
+/// them and the path that finds them already there.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn two_real_ledger_tables_still_pass_the_relkind_confirmation() {
+    let mut db = TestDb::create("real_ledger_kind").await;
+
+    state::ensure_tables(&mut db.conn)
+        .await
+        .expect("creating the pair from nothing passes the confirmation");
+    state::ensure_tables(&mut db.conn)
+        .await
+        .expect("finding the pair already there passes it too");
+
+    let id = state::record(&mut db.conn, &snapshot(StateKind::Bootstrap))
+        .await
+        .expect("a real ledger still accepts a recording");
+    assert!(id > 0);
+
+    db.drop().await;
+}
+
 /// `doctor` against a **real least-privilege role**, which is the only way this
 /// answer means anything: `postgres` is a superuser and passes every question
 /// without the catalog being asked.
