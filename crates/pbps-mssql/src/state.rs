@@ -284,7 +284,8 @@ fn migration_error(e: DbError) -> DbError {
     // A transport failure says nothing about the login's rights.
     let guidance = if code.as_deref() == Some("1088") {
         "This is a one-time migration that needs ALTER on dbo.__pbps_state. \
-             Run `pbps doctor` and obtain the ALTER right it reports before retrying."
+             Run `pbps doctor` with the same `--db` or `--env` target as the failed \
+             command and obtain the ALTER right it reports before retrying."
     } else {
         "The timeline-column migration failed. Investigate the original database \
              or connection error above before retrying."
@@ -856,6 +857,10 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains(original));
             assert_eq!(message.contains("right it reports"), code == Some("1088"));
+            assert_eq!(
+                message.contains("with the same `--db` or `--env` target as the failed command"),
+                code == Some("1088")
+            );
             assert_eq!(
                 message.contains("Investigate the original"),
                 code != Some("1088")

@@ -688,7 +688,8 @@ fn migration_error(e: DbError, ownership_missing: bool) -> DbError {
     let guidance = if code.as_deref() == Some(INSUFFICIENT_PRIVILEGE) && ownership_missing {
         "This is a one-time migration that needs ownership of \
          public.__pbps_state — PostgreSQL authorizes ALTER TABLE by ownership, \
-         not by a grantable privilege. Run `pbps doctor` and obtain the \
+         not by a grantable privilege. Run `pbps doctor` with the same `--db` or \
+         `--env` target as the failed command and obtain the \
          ownership right it reports before retrying."
     } else {
         "The timeline-column migration failed. Investigate the original database \
@@ -1337,6 +1338,11 @@ mod tests {
                 assert_eq!(error.server_error_code().as_deref(), code);
                 let message = error.to_string();
                 assert!(message.contains(original));
+                assert_eq!(
+                    message
+                        .contains("with the same `--db` or `--env` target as the failed command"),
+                    code == Some("42501") && ownership_missing
+                );
                 assert_eq!(
                     message.contains("right it reports"),
                     code == Some("42501") && ownership_missing

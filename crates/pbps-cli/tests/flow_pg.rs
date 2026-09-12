@@ -1449,6 +1449,93 @@ fn doctor_examines_a_postgres_environment() {
 }
 
 #[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+fn ledger_migration_guidance_keeps_the_explicit_or_configured_target() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_target444_{}", std::process::id()),
+    );
+    let password = "pbpsTarget444!1";
+    let own = OwnDatabase::new(&server, "migration_target444");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection()).await.unwrap();
+        pbps_pg::state::ensure_tables(&mut conn).await.unwrap();
+        conn.execute("ALTER TABLE public.__pbps_state DROP COLUMN state_version, DROP COLUMN tables_count, DROP COLUMN modules_count, DROP COLUMN staged_completed, DROP COLUMN staged_total").await.unwrap();
+    });
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE ROLE {0} LOGIN PASSWORD '{password}'; GRANT USAGE ON SCHEMA public TO {0}; GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {0};",
+            role.1
+        ),
+    );
+    let connection = format!(
+        "{} user={} password={password}",
+        own.connection()
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+    let d = Demo::new("migration-target444");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    // The first refusal has no configured environment that bare doctor could inspect.
+    for configured in [false, true] {
+        let output = if configured {
+            std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\nenvironments:\n  target:\n    url_env: PBPS_MIGRATION_TARGET444\n").unwrap();
+            d.commit();
+            d.run_with_env(
+                &["bootstrap", "--env", "target"],
+                &[("PBPS_MIGRATION_TARGET444", &connection)],
+            )
+        } else {
+            d.run(&["bootstrap", "--db", &connection])
+        };
+        let message = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(code(&output), 1, "{message}");
+        assert!(
+            message.contains("public.__pbps_state is missing the timeline columns"),
+            "{message}"
+        );
+        assert!(
+            message.contains("state_version") && message.contains("staged_total"),
+            "{message}"
+        );
+        assert!(
+            message.contains("needs ownership of public.__pbps_state"),
+            "{message}"
+        );
+        assert!(
+            message.contains("this role could not add them: db error"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "Run `pbps doctor` with the same `--db` or `--env` target as the failed command"
+            ),
+            "{message}"
+        );
+        assert!(
+            !message.contains(password) && !message.contains(&connection),
+            "credentials must stay out of guidance"
+        );
+    }
+}
+
+#[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn doctor_reports_data_and_role_grant_gaps_from_the_declarations() {
     struct Roles(String, Vec<String>);

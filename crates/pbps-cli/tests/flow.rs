@@ -11313,6 +11313,100 @@ fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
     );
 }
 
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn ledger_migration_guidance_keeps_the_explicit_or_configured_target() {
+    struct Login(String, String);
+    impl Drop for Login {
+        fn drop(&mut self) {
+            after_test_on_server(&self.0, &format!("DROP LOGIN [{}]", self.1));
+        }
+    }
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let login = Login(
+        server.clone(),
+        format!("pbps_target444_{}", std::process::id()),
+    );
+    let password = "pbpsTarget444!1";
+    let own = OwnDatabase::new(&server, "migration_target444");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = connect_live(own.connection()).await.unwrap();
+        pbps_mssql::state::ensure_tables(&mut conn).await.unwrap();
+        conn.execute("ALTER TABLE dbo.__pbps_state DROP COLUMN state_version, tables_count, modules_count, staged_completed, staged_total;").await.unwrap();
+    });
+    on_server(
+        &server,
+        &format!(
+            "CREATE LOGIN [{}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;",
+            login.1
+        ),
+    );
+    on_server(
+        own.connection(),
+        &format!(
+            "CREATE USER [{0}] FOR LOGIN [{0}]; GRANT SELECT, INSERT, DELETE ON dbo.__pbps_state TO [{0}]; GRANT SELECT, INSERT, DELETE ON dbo.__pbps_lock TO [{0}];",
+            login.1
+        ),
+    );
+    let connection = with_key(
+        &with_key(own.connection(), "User Id", &login.1),
+        "Password",
+        password,
+    );
+    let d = Demo::new("migration-target444");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    // The first refusal has no configured environment that bare doctor could inspect.
+    for configured in [false, true] {
+        let output = if configured {
+            std::fs::write(
+                d.dir.join("pbps.yml"),
+                "dialect: mssql\nenvironments:\n  target:\n    url_env: PBPS_MIGRATION_TARGET444\n",
+            )
+            .unwrap();
+            d.commit();
+            Command::new(BIN)
+                .arg("--project")
+                .arg(&d.dir)
+                .args(["bootstrap", "--env", "target"])
+                .env("PBPS_MIGRATION_TARGET444", &connection)
+                .output()
+                .unwrap()
+        } else {
+            d.run(&["bootstrap", "--db", &connection])
+        };
+        let message = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(code(&output), 1, "{message}");
+        assert!(
+            message.contains("dbo.__pbps_state is missing the timeline columns"),
+            "{message}"
+        );
+        assert!(
+            message.contains("state_version") && message.contains("staged_total"),
+            "{message}"
+        );
+        assert!(
+            message.contains("needs ALTER on dbo.__pbps_state"),
+            "{message}"
+        );
+        assert!(message.contains("Cannot find the object"), "{message}");
+        assert!(
+            message.contains(
+                "Run `pbps doctor` with the same `--db` or `--env` target as the failed command"
+            ),
+            "{message}"
+        );
+        assert!(
+            !message.contains(password) && !message.contains(&connection),
+            "credentials must stay out of guidance"
+        );
+    }
+}
+
 /// A real ledger comes back newest first, with the fields a timeline is drawn
 /// from, and the envelope matches the published schema.
 #[test]
