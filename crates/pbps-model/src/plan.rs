@@ -88,7 +88,11 @@ use crate::schema::Schema;
 /// this build derives `destructive`; without this bump, `validate_saved_plan`
 /// would reject it as an edited or broken artifact instead of identifying it as
 /// stale and asking for a new plan.
-pub const CURRENT_VERSION: u32 = 7;
+///
+/// Bumped to 8 for `DeleteRow::dropped`, a separate reviewer-only map of
+/// baseline cells whose columns are dropped. Older readers deny unknown
+/// change fields; the version identifies that format boundary (DECISIONS 442).
+pub const CURRENT_VERSION: u32 = 8;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -454,7 +458,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 7);
+        assert_eq!(CURRENT_VERSION, 8);
     }
 
     /// Sorting the keys must not sort away a difference. The same three

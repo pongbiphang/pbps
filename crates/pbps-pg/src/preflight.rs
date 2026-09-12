@@ -3191,6 +3191,7 @@ mod tests {
             key_column: "code".to_owned(),
             key: RowKey::from(key),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            dropped: Default::default(),
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: BTreeMap::new(),

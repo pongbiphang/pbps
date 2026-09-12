@@ -1019,17 +1019,17 @@ fn diff_data(
                 // The UID intersection above deliberately has no name for a
                 // dropped column. Keep its baseline cell for review under the
                 // only name it had, without inventing a declared identity or
-                // a predicate on a column that is already gone. The resolver
-                // rejects renames into an occupied baseline name, so a dropped
-                // name cannot collide with a surviving column's declared name.
+                // a predicate on a column that is already gone. A historical
+                // rename may reuse this base name for a surviving column, so
+                // reviewer-only cells need their own map (DECISIONS 442).
+                let mut dropped = BTreeMap::new();
                 for (base_column, spec) in &base.columns {
                     if spec.identity.is_some()
-                        || declared.columns.contains_key(base_column)
                         || base_name_of.values().any(|name| name == base_column)
                     {
                         continue;
                     }
-                    row.insert(base_column.clone(), cell(before, base_column, Some(spec)));
+                    dropped.insert(base_column.clone(), cell(before, base_column, Some(spec)));
                 }
                 changes.push(Change::DeleteRow {
                     table: name.clone(),
@@ -1037,6 +1037,7 @@ fn diff_data(
                     key: key.clone(),
                     cause: DeleteCause::Undeclared,
                     row,
+                    dropped,
                     types,
                     after_types,
                 });
@@ -2824,11 +2825,16 @@ mod tests {
             },
         ];
         let cs = run(&base, &declared, &intents);
-        let (row, types) = cs
+        let (row, types, dropped) = cs
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow { row, types, .. } => Some((row, types)),
+                Change::DeleteRow {
+                    row,
+                    types,
+                    dropped,
+                    ..
+                } => Some((row, types, dropped)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
@@ -2838,8 +2844,9 @@ mod tests {
             "{row:?}"
         );
         assert!(!row.contains_key("label"), "{row:?}");
+        assert!(!row.contains_key("note"), "{row:?}");
         assert_eq!(
-            row.get("note"),
+            dropped.get("note"),
             Some(&pbps_model::Cell::Value(Value::Text("dropped".to_owned()))),
             "the dropped cell remains visible to the reviewer: {row:?}"
         );
@@ -2858,7 +2865,161 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_baseline_name_cannot_alias_a_surviving_delete_cell() {
+    fn a_replaced_column_keeps_its_deleted_rows_baseline_cell() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut intermediate = declared.clone();
+        intermediate
+            .tables
+            .get_mut(&"dbo.s".parse().unwrap())
+            .unwrap()
+            .columns
+            .shift_remove("label");
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.label".parse().unwrap(),
+                reason: "replace".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(&declared, &intermediate_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(cs.changes.iter().any(
+            |p| matches!(&p.change, Change::DropColumn { column, .. } if column.name == "label")
+        ));
+        assert!(
+            cs.changes
+                .iter()
+                .any(|p| matches!(&p.change, Change::AddColumn { name, .. } if name == "label"))
+        );
+        let (row, types, dropped) = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow {
+                    row,
+                    types,
+                    dropped,
+                    ..
+                } => Some((row, types, dropped)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            dropped.get("label"),
+            Some(&pbps_model::Cell::Value(Value::Text("Old".into())))
+        );
+        assert!(!types.contains_key("label"));
+        assert!(!row.contains_key("label"));
+    }
+
+    #[test]
+    fn a_historical_drop_then_rename_can_reuse_a_baseline_cell_name() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "note".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let (row, types, dropped) = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow {
+                    row,
+                    types,
+                    dropped,
+                    ..
+                } => Some((row, types, dropped)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            row.get("note"),
+            Some(&pbps_model::Cell::Value(Value::Text("surviving".into())))
+        );
+        assert!(types.contains_key("note"));
+        assert_eq!(
+            dropped.get("note"),
+            Some(&pbps_model::Cell::Value(Value::Text("dropped".into())))
+        );
+    }
+
+    #[test]
+    fn a_single_revision_cannot_rename_into_an_occupied_baseline_name() {
         let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
         base_table
             .columns
