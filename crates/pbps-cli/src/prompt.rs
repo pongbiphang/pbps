@@ -188,6 +188,12 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         // the target, so the user must edit the declaration or choose another
         // rename target before planning again.
         Blocker::RenameTargetExists { .. } => {}
+        // Nothing to choose here either: the fix is renaming the object
+        // itself, outside pbps entirely (in the database, or in the
+        // declaration), and there is no intent this prompt could record that
+        // would let resolution proceed with a name pbps's own identity format
+        // cannot carry.
+        Blocker::UnrepresentableName { .. } => {}
     }
     out
 }
@@ -339,6 +345,13 @@ fn question(b: &Blocker) -> String {
         }
         Blocker::RenameTargetExists { target } => {
             format!("rename target {target} already exists in the declarations")
+        }
+        // Unreachable in practice (`ask_from` skips a blocker with no
+        // choices before ever calling this), but the match still has to
+        // cover it.
+        Blocker::UnrepresentableName { what, part, table } => {
+            let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
+            format!("{prefix}{what} `{part}` contains a `.`")
         }
     }
 }

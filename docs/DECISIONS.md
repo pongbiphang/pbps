@@ -9876,3 +9876,48 @@ SPEC is in sync with all of these.
     database's default still lands under whatever default the *target* a
     bootstrap runs against happens to have, and nothing here compares the two
     — that mismatch is #406, not this entry.
+
+444. **A name containing pbps's own `.` separator is refused where it enters,
+    not escaped in the serialized form.**
+    `TableName`, `ColumnRef` and `ModuleId` join their parts with `.` and
+    parse back by splitting on it, so a schema, table, column, or module
+    (view/routine/trigger) part that itself contains a `.` cannot round-trip:
+    a column literally named `a.b` on `dbo.customer` serializes as
+    `dbo.customer.a.b`, indistinguishable from a mistyped five-part name once
+    written, and a view literally named `a.b` serializes as `schema.a.b` —
+    three dotted parts, which `ModuleId::from_str`'s own shape rule reads back
+    as a *trigger*, not a refused view (#108). Escaping the separator in the
+    serialized form was considered and rejected: the `.`-joined spelling is
+    already an on-disk format ledger rows hold, so introducing an escape would
+    change what every existing row means, for the sake of a name nobody
+    actually wants to keep.
+
+    The check (`pbps_model::check_segment`) lives at the places a part is
+    built from something that never passed through this crate's own
+    `FromStr`: `pbps-load::convert`'s column loop for a declared column, and
+    `pbps-diff::identity::resolve` for a table, a column, or a module —
+    tables and columns at fresh-identity minting, modules in a dedicated
+    `resolve_modules` pass that re-validates every declared module on every
+    call, since a module carries no persisted identity to mint or compare
+    against (ADR-0002, DECISIONS 200). The choke point is a departure from the
+    issue's own suggestion, which named each dialect's introspection as the
+    seam for `pull`. `resolve` is instead the single point both `pbps pull`
+    and `pbps init --from` pass through to mint an identity — or, for a
+    module, simply accept the name — for whatever a dialect's introspection
+    handed back, so the check lives there: it catches every name family
+    `pull` can hand back without adding a line to either dialect's
+    introspection module. A routine's own argument *types* are deliberately
+    excluded from the module check: `RoutineArg` legitimately holds a `.` for
+    a schema-qualified type (`dl.money_type`), stores it as opaque text, and
+    never splits it apart the way a name is split — checking it would refuse
+    a routine that already round-trips correctly, the false-refusal direction
+    this decision exists to avoid, not produce.
+
+    This does not rescue a project whose `ids.yaml` already holds a dotted
+    table or column name: such a string already fails `TableName`/`ColumnRef`'s
+    `FromStr` on the very next read (the wrong segment count), so that
+    project's identity file is already unloadable today, independent of this
+    change, and repairing existing corruption is out of scope. What does
+    change: a not-yet-planned declaration with a dotted column key now fails
+    at load instead of loading silently and bricking `ids.yaml` the first
+    time `plan` minted its identity — a deliberate fail-fast.

@@ -208,6 +208,31 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
             }
         };
 
+        // A column name is a YAML mapping key, never parsed the way `table:`
+        // is, so a `.` in it reaches here unchecked. `ColumnRef` joins
+        // `schema.table.column` with the same character it splits on to read
+        // one back, and a column literally named `a.b` on `dbo.customer`
+        // would serialize as `dbo.customer.a.b` — indistinguishable, once
+        // written, from a mistyped five-part name (issue #108). Caught here,
+        // at the one place this name is minted, rather than left for the ids
+        // file or a saved plan to fail on reading its own output back with an
+        // error that names neither the column nor this file.
+        if let Err(e) = pbps_model::check_segment(&col_name) {
+            errs.push(
+                LoadError::semantic(
+                    src,
+                    to_span(&c.ty.defined),
+                    format!("column `{col_name}`: {e}"),
+                    e.to_string(),
+                )
+                .with_help(
+                    "rename the column without a `.`; pbps uses it to separate schema, table \
+                     and column and cannot store one inside a name",
+                ),
+            );
+            continue;
+        }
+
         if let (Some(table), Some(from)) = (&name, &c.renamed_from) {
             intents.push(Intent::RenameColumn {
                 table: table.clone(),

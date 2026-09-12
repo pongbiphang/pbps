@@ -24,7 +24,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{ColumnRef, IdsFile, Intent, Schema, TableName, Tombstone, Uid, UidKind};
+use pbps_model::{
+    ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
+};
 
 /// A situation that cannot be decided automatically and needs a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,44 @@ pub enum Blocker {
     /// declarations. The source is left available so a companion drop intent
     /// can still account for it, instead of making the rename look absorbed.
     RenameTargetExists { target: String },
+    /// A schema, table, column, or module (view/routine/trigger) name pbps's
+    /// own `.`-joined format cannot carry: it contains the separator that
+    /// format reserves, and minting an identity for it — or, for a module,
+    /// simply keeping it in the declarations, since a module's identity is
+    /// its name — would write something the next load cannot read back
+    /// (issue #108, DECISIONS 444, `pbps_model::check_segment`).
+    ///
+    /// Reached from both directions for a table or column: the loader
+    /// already refuses this shape for a declared column at the point it is
+    /// read (`pbps-load::convert`), but a *table* or *schema* part is never
+    /// split apart from a single string there — `table:` is one YAML
+    /// scalar, parsed whole — so it cannot carry an embedded `.` by
+    /// construction. A live database has no such restriction: `[a.b]` is a
+    /// legal bracket-quoted SQL Server identifier, and a dialect's
+    /// introspection builds `TableName` from the catalog's separate schema
+    /// and name columns directly, bypassing that parse. This is where every
+    /// fresh identity — declared or pulled alike — is actually minted, so it
+    /// is where an introspected name meets the same refusal a declared one
+    /// already got earlier.
+    ///
+    /// A module carries no such loader-side defense at all — `resolve_modules`
+    /// is the only check it gets, run every time rather than only on a fresh
+    /// name, because a module has no persisted identity to compare against
+    /// (see [`resolve_modules`]'s own doc comment).
+    UnrepresentableName {
+        /// `"schema"`, `"table"`, or `"column"` for the table/column case;
+        /// `"view"`, `"routine"`, or `"trigger"` for the object's own name in
+        /// the module case — which part, or which kind of module, contained
+        /// the separator.
+        what: &'static str,
+        /// The offending part itself, not a joined name: joining it is
+        /// exactly the operation that made it ambiguous in the first place.
+        part: String,
+        /// The table this part belongs to: the table a bad column is on, or
+        /// the table a bad trigger is on. `None` for a table's own schema or
+        /// name, a view's, or a routine's.
+        table: Option<TableName>,
+    },
 }
 
 /// The half of a rename that two intents fought over.
@@ -179,6 +219,17 @@ fn resolve_with_provenance(
         &mut blockers,
         &mut used,
     );
+    // Not "appeared" like tables and columns: a module carries no identity
+    // to mint (ADR-0002, DECISIONS 200 — a view/routine/trigger is compared
+    // by its own name every run, never assigned a `Uid`), so there is no
+    // "already known" set to skip. Every declared module is checked every
+    // time, which the sweep this round found the original fix had missed
+    // (issue #108, DECISIONS 444): `ModuleId` has the identical `.`-joined
+    // round-trip hazard `TableName`/`ColumnRef` do, and both `pull` and
+    // `init --from` can hand it a module name a live database allows but
+    // this format cannot carry.
+    resolve_modules(declared, &mut blockers);
+
     resolve_roles(
         declared,
         intents,
@@ -720,6 +771,30 @@ fn resolve_tables(
     }
 
     for name in appeared {
+        // The loader already refuses this shape for a table written as one
+        // `schema.table` scalar (`pbps-load::convert`), so a declared table
+        // never reaches here with an embedded `.`. A pulled one can: a
+        // dialect's introspection builds `TableName` straight from the
+        // catalog's separate schema and name columns, and `[a.b]` is a legal
+        // bracket-quoted identifier on the live database this name came from
+        // (issue #108). Caught here rather than minted: an identity for it
+        // would write a name the next load could not read back.
+        if pbps_model::check_segment(&name.schema).is_err() {
+            blockers.push(Blocker::UnrepresentableName {
+                what: "schema",
+                part: name.schema.clone(),
+                table: None,
+            });
+            continue;
+        }
+        if pbps_model::check_segment(&name.name).is_err() {
+            blockers.push(Blocker::UnrepresentableName {
+                what: "table",
+                part: name.name.clone(),
+                table: None,
+            });
+            continue;
+        }
         let uid = fresh_uid(&r.ids, UidKind::Table);
         r.ids.tables.insert(uid.clone(), name.clone());
         r.created_tables.push((uid, name));
@@ -875,11 +950,102 @@ fn resolve_columns(
         }
 
         for name in appeared {
+            // Same refusal as the loader's, reached from the other
+            // direction: a column pulled from a live database never went
+            // through `pbps-load::convert`'s check on the way in — a
+            // dialect's introspection reads the catalog's column name
+            // straight into `Table::columns`, and a double-quoted or
+            // bracket-quoted `a.b` is a legal identifier there too (issue
+            // #108). This is the one place a fresh column identity is
+            // minted, declared or pulled alike, so it is where that check
+            // has to live for pull.
+            if pbps_model::check_segment(&name).is_err() {
+                blockers.push(Blocker::UnrepresentableName {
+                    what: "column",
+                    part: name,
+                    table: Some(table_name.clone()),
+                });
+                continue;
+            }
             let uid = fresh_uid(&r.ids, UidKind::Column);
             let col = table_name.column(name);
             r.ids.columns.insert(uid.clone(), col.clone());
             r.added_columns.push((uid, col));
         }
+    }
+}
+
+/// Every declared module's identity, checked for the same `.`-joined
+/// round-trip hazard as a table or column name (issue #108, DECISIONS 444) —
+/// but validated only, never minted. A module is deliberately not
+/// identity-tracked (ADR-0002, DECISIONS 200): its key is recomputed from the
+/// declarations on every run rather than assigned a `Uid`, so there is no
+/// "already known" set the way `resolve_tables`/`resolve_columns` have, and
+/// nothing to skip. Every call re-checks every declared module; that costs
+/// nothing next to the `Vec<RoutineArg>` comparisons `Schema` equality
+/// already does on the same map.
+///
+/// A routine's own argument **types** are deliberately left unchecked. A `.`
+/// there is not this format's separator meeting itself — it is a legitimate
+/// schema-qualified type name (`dl.money$type`), which `RoutineArg` stores as
+/// opaque text and never splits apart on `.` to recover a schema and a type
+/// separately (see its own doc comment in `pbps-model::module`); the
+/// argument list is delimited by commas and balanced parentheses/brackets,
+/// not by `.`, so a dot inside one argument's text cannot be confused with
+/// the boundary between two arguments or between a schema and a name.
+/// Checking it would refuse a routine that already round-trips correctly —
+/// exactly the false-refusal direction issue #108 exists to avoid, not
+/// produce.
+fn resolve_modules(declared: &Schema, blockers: &mut Vec<Blocker>) {
+    for id in declared.modules.keys() {
+        match id {
+            ModuleId::Named(n) => check_object_name(n, "view", None, blockers),
+            ModuleId::Routine(r) => {
+                check_object_name(&r.name, "routine", None, blockers);
+                // `r.args` is not checked — see this function's doc comment.
+            }
+            ModuleId::Trigger { on, name } => {
+                check_object_name(on, "table", None, blockers);
+                if pbps_model::check_segment(name).is_err() {
+                    blockers.push(Blocker::UnrepresentableName {
+                        what: "trigger",
+                        part: name.clone(),
+                        table: Some(on.clone()),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Checks both parts of a `schema.name` identity — a table, a view, or a
+/// routine's own name, before its argument list — against the separator this
+/// format reserves, pushing one [`Blocker::UnrepresentableName`] per bad part.
+///
+/// `kind` names what a bad **name** part is (`"table"`, `"view"`,
+/// `"routine"`); a bad schema part is always reported as `"schema"`,
+/// regardless of `kind`, because the remedy is the same rename either way and
+/// the report is about the securable a `GRANT`-shaped remedy would need to
+/// name, not about which kind of object sits in it.
+fn check_object_name(
+    n: &TableName,
+    kind: &'static str,
+    table: Option<TableName>,
+    blockers: &mut Vec<Blocker>,
+) {
+    if pbps_model::check_segment(&n.schema).is_err() {
+        blockers.push(Blocker::UnrepresentableName {
+            what: "schema",
+            part: n.schema.clone(),
+            table: table.clone(),
+        });
+    }
+    if pbps_model::check_segment(&n.name).is_err() {
+        blockers.push(Blocker::UnrepresentableName {
+            what: kind,
+            part: n.name.clone(),
+            table,
+        });
     }
 }
 

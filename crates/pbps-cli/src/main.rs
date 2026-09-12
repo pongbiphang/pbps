@@ -1156,15 +1156,21 @@ fn cmd_pull(
     }
 
     // Mint fresh identity for everything pulled. resolve with an empty baseline
-    // can produce no blockers (nothing disappears from empty), so a failure here
-    // is a bug, not a user problem.
+    // and no intents leaves every *other* kind of blocker unreachable: they all
+    // need something to have disappeared, or a declared rename intent, and
+    // neither exists yet on a first pull. `UnrepresentableName` is the
+    // exception — it depends only on what the database handed back, not on any
+    // prior state, so a schema/table/column pbps's own `.`-joined identity
+    // format cannot carry is exactly the failure `pull` is expected to surface
+    // here (issue #108). Rendered in full, not just counted: the one case that
+    // can really happen is the one a bare count would hide the name of.
     let res = pbps_diff::resolve(
         &pulled.schema,
         &IdsFile::default(),
         &[],
         &context(project.root()),
     )
-    .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
+    .map_err(|b| anyhow::anyhow!("pull could not mint identities:\n{}", report::blockers(&b)))?;
 
     // Before the first file: two declarations whose names differ only in case
     // encode to filenames that differ only in case, and a filesystem that

@@ -85,6 +85,263 @@ mod tests {
         r.ids.validate().unwrap();
     }
 
+    /// A column name that never passed through the loader's own check
+    /// (`pbps-load::convert`) — exactly what a dialect's introspection hands
+    /// `resolve` on `pull`, since `[a.b]` is a legal bracket-quoted SQL Server
+    /// identifier — must not be minted an identity: `ColumnRef` would
+    /// serialize it as `dbo.customer.a.b`, indistinguishable from a mistyped
+    /// five-part name once written to the ids file (issue #108).
+    #[test]
+    fn a_column_name_containing_the_separator_is_not_minted() {
+        let s = schema(&[("dbo.customer", &["id", "a.b"])]);
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: Some(table) }
+                    if *what == "column" && part == "a.b" && table == &t("dbo.customer")
+            )),
+            "{errs:?}"
+        );
+        // All-or-nothing, like every other blocker here: nothing is minted
+        // for this call, including the table itself or its other, valid
+        // column — `pull` writes no file at all until every name resolves.
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::AmbiguousColumns { .. }))
+        );
+    }
+
+    /// The same refusal for a table (or schema) name, reached the same way a
+    /// pulled column is: a dialect's introspection builds `TableName` from
+    /// the catalog's separate schema and name columns directly, never through
+    /// `TableName::from_str` (issue #108).
+    #[test]
+    fn a_table_name_containing_the_separator_is_not_minted() {
+        let mut s = Schema::default();
+        s.tables.insert(
+            TableName::new("dbo", "a.b"),
+            Table {
+                columns: IndexMap::new(),
+                ..Default::default()
+            },
+        );
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: None }
+                    if *what == "table" && part == "a.b"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// A minimal module, just enough shape to sit in `Schema::modules`.
+    fn module() -> pbps_model::Module {
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            definition: "definition".into(),
+        }
+    }
+
+    /// A pulled view named `a.b` is not a table or a column, but it shares the
+    /// identical `.`-joined round-trip hazard: `ModuleId::Named`'s `Display`
+    /// writes `schema.a.b`, and `ModuleId::from_str`'s own doc comment says
+    /// three dotted parts mean a *trigger* — so this would not even fail to
+    /// load, it would silently come back as the wrong kind of module (issue
+    /// #108, DECISIONS 444; this is the finding the first round of review on
+    /// #108 caught that the original sweep missed).
+    #[test]
+    fn a_dotted_view_name_is_refused_not_silently_misread_as_a_trigger() {
+        let mut s = Schema::default();
+        s.modules.insert(
+            pbps_model::ModuleId::Named(pbps_model::ObjectName::new("dbo", "a.b")),
+            module(),
+        );
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: None }
+                    if *what == "view" && part == "a.b"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// Same hazard for a view's own schema part.
+    #[test]
+    fn a_dotted_view_schema_is_refused() {
+        let mut s = Schema::default();
+        s.modules.insert(
+            pbps_model::ModuleId::Named(pbps_model::ObjectName::new("a.b", "v")),
+            module(),
+        );
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: None }
+                    if *what == "schema" && part == "a.b"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// A routine's own qualified name gets the same check as a view's.
+    #[test]
+    fn a_dotted_routine_name_is_refused() {
+        let mut s = Schema::default();
+        let id = pbps_model::ModuleId::Routine(pbps_model::RoutineId::new(
+            pbps_model::ObjectName::new("dbo", "a.b"),
+            vec![],
+        ));
+        s.modules.insert(id, {
+            let mut m = module();
+            m.kind = pbps_model::ModuleKind::Function;
+            m
+        });
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: None }
+                    if *what == "routine" && part == "a.b"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// The measured negative case: a routine argument's type is legitimately
+    /// schema-qualified (`dl.money_type`), stored as opaque text and never
+    /// split on `.` the way a name is, so it must round-trip untouched rather
+    /// than being refused as if it were a name part. Checking it would be a
+    /// **false refusal** of a routine that already loads correctly — the
+    /// wrong direction for issue #108 to move in.
+    #[test]
+    fn a_schema_qualified_argument_type_is_not_refused() {
+        let mut s = Schema::default();
+        let arg: pbps_model::RoutineArg = "dl.money_type".parse().unwrap();
+        let id = pbps_model::ModuleId::Routine(pbps_model::RoutineId::new(
+            pbps_model::ObjectName::new("dbo", "f"),
+            vec![arg],
+        ));
+        s.modules.insert(id, {
+            let mut m = module();
+            m.kind = pbps_model::ModuleKind::Function;
+            m
+        });
+        let r = resolve(&s, &IdsFile::default(), &[], &ctx());
+
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// A trigger's underlying table gets the ordinary table/schema check,
+    /// named the table's own containing schema — a trigger has no schema of
+    /// its own, it lives in its table's (see `ModuleId::Trigger`'s doc
+    /// comment).
+    #[test]
+    fn a_dotted_trigger_table_is_refused() {
+        let mut s = Schema::default();
+        s.modules.insert(
+            pbps_model::ModuleId::Trigger {
+                on: pbps_model::ObjectName::new("dbo", "a.b"),
+                name: "audit".into(),
+            },
+            {
+                let mut m = module();
+                m.kind = pbps_model::ModuleKind::Trigger;
+                m
+            },
+        );
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: None }
+                    if *what == "table" && part == "a.b"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// A trigger's own name is a bare `String`, not a schema-qualified part,
+    /// but it still joins into the module's `Display` and has to be checked
+    /// too. Named with the table it is on, the way a bad column names its
+    /// table.
+    #[test]
+    fn a_dotted_trigger_name_is_refused_and_names_its_table() {
+        let mut s = Schema::default();
+        let on = pbps_model::ObjectName::new("dbo", "customer");
+        s.modules.insert(
+            pbps_model::ModuleId::Trigger {
+                on: on.clone(),
+                name: "a.b".into(),
+            },
+            {
+                let mut m = module();
+                m.kind = pbps_model::ModuleKind::Trigger;
+                m
+            },
+        );
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: Some(t) }
+                    if *what == "trigger" && part == "a.b" && t == &on
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// The negative case for every module kind: ordinary names, including a
+    /// routine with an ordinary (non-qualified) argument type, must still
+    /// resolve with nothing to report.
+    #[test]
+    fn ordinary_module_names_still_resolve() {
+        let mut s = Schema::default();
+        s.modules.insert(
+            pbps_model::ModuleId::Named(pbps_model::ObjectName::new("dbo", "active_customer")),
+            module(),
+        );
+        s.modules.insert(
+            pbps_model::ModuleId::Routine(pbps_model::RoutineId::new(
+                pbps_model::ObjectName::new("dbo", "f"),
+                vec!["integer".parse().unwrap()],
+            )),
+            {
+                let mut m = module();
+                m.kind = pbps_model::ModuleKind::Function;
+                m
+            },
+        );
+        s.modules.insert(
+            pbps_model::ModuleId::Trigger {
+                on: pbps_model::ObjectName::new("dbo", "customer"),
+                name: "audit".into(),
+            },
+            {
+                let mut m = module();
+                m.kind = pbps_model::ModuleKind::Trigger;
+                m
+            },
+        );
+
+        let r = resolve(&s, &IdsFile::default(), &[], &ctx());
+
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     /// No change must produce no identity-level action at all, or every run would
     /// show phantom changes.
     #[test]

@@ -18,6 +18,40 @@ pub enum NameError {
 
     #[error("`{0}` contains an empty identifier")]
     EmptySegment(String),
+
+    #[error(
+        "`{0}` contains a `.`, which pbps uses to separate schema, table and column; it cannot \
+         be stored as part of a name"
+    )]
+    ContainsSeparator(String),
+}
+
+/// Whether one already-separated name part — a schema, a table, or a column
+/// name — is one [`TableName`] or [`ColumnRef`] can carry.
+///
+/// Both types cross the JSON/YAML boundary as `.`-joined strings and parse
+/// back by splitting on that character (see their `Display`/`FromStr` below),
+/// so a `.` embedded in a part is not merely an odd identifier — once joined,
+/// it is indistinguishable from the separator between two real parts. A
+/// column literally named `a.b` on table `dbo.customer` serializes as
+/// `dbo.customer.a.b`, which parses back as four segments: exactly the string
+/// a mistyped five-part name would also produce, with no way to tell the two
+/// apart after the fact (issue #108, DECISIONS 444).
+///
+/// `FromStr` below never needs this: splitting on `.` cannot leave a `.`
+/// inside any one of its own parts, so every part it hands to
+/// [`TableName::new`]/[`ColumnRef::new`] is already clean. It matters only
+/// where a part is built from something that never went through `FromStr` —
+/// a YAML column key (`pbps-load::convert`), which is a mapping key rather
+/// than a parsed string, or a name a live database handed back
+/// (`pbps-diff::identity::resolve`, fed by a dialect's introspection). By the
+/// time either reaches `Display`, refusing is too late: the value has already
+/// been written into a plan or an ids file that cannot load it back.
+pub fn check_segment(part: &str) -> Result<(), NameError> {
+    if part.contains('.') {
+        return Err(NameError::ContainsSeparator(part.to_owned()));
+    }
+    Ok(())
 }
 
 /// A fully qualified table name, such as `dbo.customer`.
@@ -177,6 +211,35 @@ mod tests {
     fn over_qualified_names_are_rejected() {
         assert!("db.dbo.customer".parse::<TableName>().is_err());
         assert!("db.dbo.customer.email".parse::<ColumnRef>().is_err());
+    }
+
+    /// A column named `a.b` on `dbo.customer` would serialize as
+    /// `dbo.customer.a.b`, which is exactly the string a mistyped five-part
+    /// name also produces — `FromStr` cannot tell the two apart and must keep
+    /// refusing this shape (issue #108). The refusal has to happen where the
+    /// name is built (`check_segment`, used by the loader and by `pull`'s
+    /// identity resolution), not here — but this pins that `FromStr` itself
+    /// never grows a way to let it through.
+    #[test]
+    fn a_column_name_containing_the_separator_cannot_round_trip() {
+        assert!("dbo.customer.a.b".parse::<ColumnRef>().is_err());
+    }
+
+    #[test]
+    fn check_segment_rejects_an_embedded_separator() {
+        assert_eq!(
+            check_segment("a.b").unwrap_err(),
+            NameError::ContainsSeparator("a.b".into())
+        );
+    }
+
+    #[test]
+    fn check_segment_accepts_an_ordinary_part() {
+        assert!(check_segment("customer").is_ok());
+        // Emptiness is a different problem, with its own message at each
+        // caller ("a column must have a name", "a role must have a name")
+        // — this check is only about the separator.
+        assert!(check_segment("").is_ok());
     }
 
     #[test]

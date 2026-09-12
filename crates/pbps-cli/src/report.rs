@@ -56,6 +56,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
         Blocker::UnusedIntent { .. } => "identity.unused-intent",
         Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
         Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
+        Blocker::UnrepresentableName { .. } => "identity.unrepresentable-name",
     };
     let text = one_blocker(b);
     // The first line says what happened; the rest are the commands.
@@ -193,6 +194,23 @@ fn one_blocker(b: &Blocker) -> String {
         Blocker::RenameTargetExists { target } => format!(
             "  rename target {target} already exists in the declarations; choose a different target or remove the existing declaration\n"
         ),
+        // No command fixes this one: unlike an ambiguous rename or a drop
+        // missing a reason, the object itself has a name this tool's own
+        // `.`-joined identity format cannot carry, so the remedy is renaming
+        // the object, not resolving an ambiguity pbps can see both sides of.
+        // `what` already carries the right noun for every case (`"schema"`,
+        // `"table"`, `"column"`, `"view"`, `"routine"`, `"trigger"`), so one
+        // message covers them all; `table` only adds a `"dbo.t: "` prefix
+        // when there is a containing table worth naming (a column, or a
+        // trigger's own table).
+        Blocker::UnrepresentableName { what, part, table } => {
+            let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
+            format!(
+                "  {prefix}{what} `{part}` contains a `.`, which pbps uses to separate schema, \
+                 table and column; it cannot mint an identity for this {what}.\n\n    rename \
+                 the {what} so it no longer contains a `.`, then declare it (or pull) again\n"
+            )
+        }
     }
 }
 
@@ -1080,5 +1098,41 @@ mod tests {
             "{finding:?}"
         );
         assert!(!finding.message.contains("likely a typo"), "{finding:?}");
+    }
+
+    /// A column pbps cannot mint an identity for (issue #108) must name the
+    /// column and the table, not just count as one more blocker — this is the
+    /// one blocker `pull` can hit on an otherwise empty identity file, so its
+    /// text is the only thing standing between the user and a bare "1
+    /// blocker(s)".
+    #[test]
+    fn an_unrepresentable_column_names_the_table_and_the_part() {
+        let blocker = Blocker::UnrepresentableName {
+            what: "column",
+            part: "a.b".into(),
+            table: Some("dbo.customer".parse().unwrap()),
+        };
+        let text = one_blocker(&blocker);
+        assert!(text.contains("dbo.customer"), "{text}");
+        assert!(text.contains("`a.b`"), "{text}");
+
+        let finding = blocker_finding(&blocker);
+        assert_eq!(finding.id, "identity.unrepresentable-name");
+        assert!(finding.message.contains("a.b"), "{finding:?}");
+    }
+
+    /// The table-level case must not claim to be about a column.
+    #[test]
+    fn an_unrepresentable_table_name_does_not_mention_a_column() {
+        let blocker = Blocker::UnrepresentableName {
+            what: "table",
+            part: "a.b".into(),
+            table: None,
+        };
+        let text = one_blocker(&blocker);
+        assert!(text.contains("table `a.b`"), "{text}");
+        // The general "schema, table and column" explanation of the
+        // separator is fine here; claiming *this* name is a column is not.
+        assert!(!text.contains("mint an identity for this column"), "{text}");
     }
 }

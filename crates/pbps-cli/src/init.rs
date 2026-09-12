@@ -386,12 +386,17 @@ fn yaml_string(value: &str) -> String {
 }
 
 fn mint_ids(schema: &Schema, root: &Path) -> anyhow::Result<IdsFile> {
+    // Same adoption path as `pbps pull`, and the same reason to render every
+    // blocker rather than count them: an empty baseline with no intents makes
+    // every *other* blocker kind unreachable, but `UnrepresentableName`
+    // depends only on what the database handed back, and `init --from` is
+    // exactly the second place that can happen (issue #108).
     pbps_diff::resolve(schema, &IdsFile::default(), &[], &context(root))
         .map(|resolved| resolved.ids)
         .map_err(|blockers| {
             anyhow::anyhow!(
-                "init could not mint identities for the pulled schema: {} blocker(s)",
-                blockers.len()
+                "init could not mint identities for the pulled schema:\n{}",
+                crate::report::blockers(&blockers)
             )
         })
 }
