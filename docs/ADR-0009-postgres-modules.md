@@ -1317,3 +1317,61 @@ costs SQL Server nothing because the argument list is absent there.
   else**: every expression the engine stores is respelled (measured, DECISIONS
   208), which ADR-0013 §4 found on PostgreSQL and its Limits guessed for SQL
   Server. The fix for the two engines is the same field.
+
+## Amendment — what landing #248 changed
+
+§3 named the residual precisely: step 6 (#81) made a grant to a declared role
+*expressible*, but nothing yet re-emitted it after a rebuild's `CREATE`, so the
+connected check refused any object carrying an ACL at all rather than approve a
+plan that would silently drop it. This is that other half, and it is narrower
+than "the ACL round-trips" — it is "the plan is about to restate this exact
+grant".
+
+- **The differ decides what survives, not the connected check.**
+  `pbps_diff::diff_roles` already had the machinery: a target this plan drops
+  and recreates gets every declared permission granted again, because the two
+  grant sets reading the same in text is not the same as the object still
+  holding them (`a_grant_on_a_table_this_plan_drops_and_recreates_is_granted_again`,
+  landed for tables' own drop-and-recreate). What was missing was telling that
+  machinery an `AlterModule` is one of those drops on an engine where every
+  module edit is drop-and-create. `Dialect::rebuilds_modules` is the answer —
+  `false` by default (SQL Server's `CREATE OR ALTER` needs no such thing),
+  `true` on PostgreSQL — and `diff_roles` folds a rebuilt module's identity
+  into the same `dropped` set a `DropModule` already populates. The emitted
+  `Grant` sorts after the `AlterModule` by the existing ordering rules, with no
+  new rule to write.
+- **The connected check asks the plan, not the declarations file, what will be
+  restored.** `pbps_pg::modules::before_a_rebuild` takes the `ChangeSet` and
+  reads the `Grant` entries the differ already built for this exact
+  `GrantTarget` — the *plan's* promise, not a fresh lookup of `Schema.roles` —
+  because that promise is what the postcondition after the `CREATE` re-checks
+  against, and asking the same question of the same source both times is what
+  makes the two calls comparable.
+- **Read structurally, never as text, in both directions.** The live ACL and
+  the engine's own `acldefault` for the object are each exploded by
+  `aclexplode` and compared row by row — the same instrument `pull` already
+  uses (`crate::introspect::RawGrant`), because a hand-rolled parse of the ACL
+  string is a second, worse copy of a parser the engine already ships. A row
+  the live ACL holds beyond the default is a grant to explain against the
+  plan's promise; a row the default holds that the live ACL does not is a
+  human's revocation, and that row is checked for on **every** rebuild, not
+  only when the object's remaining ACL still names roles. That is what closes
+  the `REVOKE EXECUTE … FROM PUBLIC` case (ADR-0010 §5): after the revoke the
+  ACL is `{postgres=X/postgres}`, the sole remaining row is the owner's own
+  and would otherwise explain itself away, and only comparing against
+  `acldefault` surfaces the row that is *missing*.
+- **Exact permission, not role membership.** A declared role holding more of
+  the object than the plan's `Grant` promises — an out-of-band `INSERT`
+  alongside a declared `SELECT` — still refuses: the extra permission is not
+  one the plan is about to write again, so losing it is exactly the state this
+  guard exists to name. `WITH GRANT OPTION` refuses unconditionally, on a
+  declared role or not, because the model holds no flag for it to restate.
+- **The undeclared cases still refuse, and so do six the model cannot express
+  regardless of who holds them.** A grant to a role the plan does not carry on
+  this target has nothing to restate it from. `PUBLIC` stays off the
+  restorable path *for good* (DECISIONS 306): there is no grantee named
+  `PUBLIC` for a declaration to hold, so no `Grant` can ever restate on its
+  behalf. And unchanged from before #248, because none of them is
+  expressible at all: a column-level grant (`pg_attribute.attacl`), `WITH
+  GRANT OPTION`, an owner a rebuild would transfer, `reloptions`, a view
+  column default, and a trigger's `tgenabled`.

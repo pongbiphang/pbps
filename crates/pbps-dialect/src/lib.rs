@@ -1377,6 +1377,21 @@ pub trait Dialect {
         true
     }
 
+    /// Whether an `AlterModule` on this engine takes the object's existing
+    /// grants with it, the way a `DropModule` does (ADR-0009 §3, #248).
+    ///
+    /// SQL Server's `AlterModule` is `CREATE OR ALTER` — the grant-preserving
+    /// path ADR-0002 chose it for — so a grant a declared role already holds
+    /// and this plan does not touch needs no restatement: the default answers
+    /// `false`. On PostgreSQL every module edit is a `DROP` and a `CREATE`
+    /// (ADR-0009 §3): the object arrives with no ACL at all, so a grant that
+    /// would otherwise read as unchanged has to be written into the plan
+    /// again or it does not come back. `diff_roles` treats an `AlterModule`
+    /// exactly as it treats a `DropModule` when this answers `true`.
+    fn rebuilds_modules(&self) -> bool {
+        false
+    }
+
     /// Checks whether this dialect can express the role and its grants
     /// (ADR-0005). The same default, for the same reason. The schema is there
     /// so a grant can be checked against what its target *is*: which

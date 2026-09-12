@@ -1268,7 +1268,26 @@ fn diff_roles(
     // three identity changes are conditional and every `Grant` and `Revoke`
     // below is built the same on both engines.
     let manages_roles = dialect.manages_roles();
-    let dropped: Vec<pbps_model::Dropped> = changes.iter().filter_map(Change::drops).collect();
+    let mut dropped: Vec<pbps_model::Dropped> = changes.iter().filter_map(Change::drops).collect();
+    // `Change::drops` answers `None` for `AlterModule` — the object is
+    // restated, not removed, and every other reader of it wants exactly that
+    // (DECISIONS 158's caller, and the staged-run rewind in
+    // `pbps-cli::deploy`, both ask "is this identity gone for good"). But a
+    // dialect that rebuilds a module on every edit (`rebuilds_modules`,
+    // ADR-0009 §3, #248) takes the object's grants with it too, precisely as
+    // a `DropModule` does — so *this* comparison, and only this one, treats
+    // an `AlterModule` the same way: a grant unchanged by the declarations is
+    // still gone from the rebuilt object and has to be written into the plan
+    // again, or it silently does not come back.
+    if dialect.rebuilds_modules() {
+        dropped.extend(changes.iter().filter_map(|c| {
+            if let Change::AlterModule { id, .. } = c {
+                Some(pbps_model::Dropped::Module(id.clone()))
+            } else {
+                None
+            }
+        }));
+    }
     // Base table name -> the name it has after this plan, by uid.
     let renamed: BTreeMap<&TableName, &TableName> = base
         .ids
@@ -5336,6 +5355,133 @@ mod tests {
             );
             // And the grant comes after the create, which comes after the drop.
             assert!(drop < create && create < grant, "{drop} {create} {grant}");
+        }
+
+        /// A dialect whose `AlterModule` rebuilds the object, PostgreSQL's
+        /// answer (ADR-0009 §3, #248). Everything else is `MinimalDialect`'s,
+        /// the same isolation `ClusterRoles` gives `manages_roles` above.
+        #[derive(Debug, Clone, Copy, Default)]
+        struct Rebuilds;
+
+        impl pbps_dialect::Dialect for Rebuilds {
+            fn name(&self) -> &'static str {
+                "rebuilds-modules"
+            }
+            fn rebuilds_modules(&self) -> bool {
+                true
+            }
+            fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+                MinimalDialect.quote_ident(ident)
+            }
+            fn emit(
+                &self,
+                change: &Change,
+                strategy: pbps_model::Strategy,
+            ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+                MinimalDialect.emit(change, strategy)
+            }
+            fn normalize_type(
+                &self,
+                ty: &pbps_model::ColumnType,
+            ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+                MinimalDialect.normalize_type(ty)
+            }
+            fn type_change_risk(
+                &self,
+                from: &pbps_model::ColumnType,
+                to: &pbps_model::ColumnType,
+            ) -> pbps_dialect::TypeChangeRisk {
+                MinimalDialect.type_change_risk(from, to)
+            }
+            fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+                MinimalDialect.fold_ident(ident)
+            }
+            fn lexicon(&self) -> pbps_dialect::Lexicon {
+                MinimalDialect.lexicon()
+            }
+            fn validate_table(
+                &self,
+                name: &pbps_model::TableName,
+                table: &Table,
+            ) -> Vec<pbps_dialect::DialectError> {
+                MinimalDialect.validate_table(name, table)
+            }
+            fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+                MinimalDialect.transaction_framing()
+            }
+        }
+
+        /// The whole point of #248: a module rebuild takes the object's ACL
+        /// with it on this engine, so a role's grant that neither side's
+        /// declaration changed is still gone afterwards unless the plan
+        /// restates it. `diff_roles` treats the `AlterModule` as a drop only
+        /// when the dialect says the engine rebuilds modules — on one that
+        /// does not (SQL Server's `CREATE OR ALTER`), restating an unchanged
+        /// grant would be noise nobody asked for, since nothing there took it
+        /// away.
+        #[test]
+        fn a_rebuilding_dialect_restates_an_unchanged_grant_after_the_alter() {
+            let grants = role(&[("app.v", &[Permission::Select])]);
+            let mut base = side(&[("r_aaaaaa", "app_reader", grants.clone())]);
+            base.0.modules.insert(
+                "app.v".parse().unwrap(),
+                a_module(pbps_model::ModuleKind::View, "SELECT a FROM app.t"),
+            );
+            let mut declared = side(&[("r_aaaaaa", "app_reader", grants)]);
+            declared.0.modules.insert(
+                "app.v".parse().unwrap(),
+                a_module(pbps_model::ModuleKind::View, "SELECT a, b FROM app.t"),
+            );
+
+            let run = |dialect: &dyn pbps_dialect::Dialect| {
+                diff(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    dialect,
+                    &Hints::default(),
+                )
+                .unwrap()
+            };
+
+            let rebuilt = run(&Rebuilds);
+            let at = |cs: &ChangeSet, pred: &dyn Fn(&Change) -> bool| {
+                cs.changes.iter().position(|p| pred(&p.change))
+            };
+            let alter =
+                at(&rebuilt, &|c| matches!(c, Change::AlterModule { .. })).expect("the alter");
+            let grant =
+                at(&rebuilt, &|c| matches!(c, Change::Grant { .. })).expect("the grant again");
+            assert!(
+                alter < grant,
+                "the grant must sort after the rebuild it restores"
+            );
+            match &rebuilt.changes[grant].change {
+                Change::Grant {
+                    role,
+                    target,
+                    permissions,
+                } => {
+                    assert_eq!(role, "app_reader");
+                    assert_eq!(target.to_string(), "app.v");
+                    assert_eq!(permissions, &[Permission::Select].into_iter().collect());
+                }
+                other => panic!("expected a grant, got {other:?}"),
+            }
+
+            // The engine whose `AlterModule` does not rebuild the object
+            // restates nothing: the grant was never taken away, so writing it
+            // again would be a change nobody declared.
+            let altered = run(&MinimalDialect);
+            assert!(
+                at(&altered, &|c| matches!(c, Change::Grant { .. })).is_none(),
+                "CREATE OR ALTER preserves the grant; restating it here is noise"
+            );
         }
 
         /// A revoke still follows the column renames, though the constraint

@@ -852,6 +852,7 @@ pub async fn check_module_rebuilds(
                     conn,
                     id,
                     if after { *after_kind } else { *before_kind },
+                    changes,
                 )
                 .await?;
                 if let Some(reason) = found.refusal() {

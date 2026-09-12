@@ -9989,3 +9989,48 @@ SPEC is in sync with all of these.
     narrowing. A last-calendar-day timestamp with reduced precision remains
     a valid change. Live tests pin all four canonical forms and their aliases,
     rendering back into executable SQL, bounds, and precision loss.
+
+447. **A module rebuild restates a declared role's grant because the plan says
+     so, not because the declarations do.** ADR-0009 §3 refused any module
+     carrying an ACL at all, with the reason DECISIONS 306 gave: step 6 (#81)
+     had made a grant expressible but nothing yet re-emitted it after the
+     `CREATE`. That reason held only while true, and it stopped being true when
+     `pbps_diff::diff_roles` learned to treat an `AlterModule` as a drop for
+     grant-comparison purposes — a new `Dialect::rebuilds_modules` capability,
+     `false` by default (SQL Server's `CREATE OR ALTER` needs no such thing)
+     and `true` on PostgreSQL, folds the rebuilt identity into the same
+     `dropped` set a `DropModule` already populates, so every declared
+     permission on the target is granted again after the rebuild by the
+     mechanism ADR-0005 built for exactly this shape (table replacement).
+
+     The connected check in `pbps_pg::modules::before_a_rebuild` therefore asks
+     the plan's own `ChangeSet` what will be restored — the `Grant` entries the
+     differ already built for this `GrantTarget` — rather than re-deriving the
+     answer from `Schema.roles`. Asking the plan is what the postcondition
+     after the `CREATE` re-checks against, and a check that consulted the
+     declarations directly could pass while restating something the plan in
+     hand does not actually carry.
+
+     The ACL comparison itself moved from "any non-empty ACL refuses" to a
+     structural read: the live ACL and the engine's own `acldefault` for the
+     object are each exploded by `aclexplode` (never parsed as text, the same
+     instrument `pull`'s `RawGrant` reader already uses) and compared row by
+     row, in both directions, on **every** rebuild carrying any ACL at all —
+     not only when every remaining row can be explained away. That symmetry is
+     what still catches `REVOKE EXECUTE … FROM PUBLIC`: after the revoke the
+     only row left is the owner's own, which would read as nothing left to
+     explain if the check stopped there, and only the comparison against
+     `acldefault` surfaces the row that is *missing* rather than one that is
+     present. `PUBLIC` stays off the restorable path *for good*: there is no
+     grantee named `PUBLIC` for a declaration to hold, so no `Grant` can ever
+     restate on its behalf, whatever else the plan restates on the same object.
+
+     What still refuses: a grant to a role the plan's `ChangeSet` does not
+     carry on this exact target, and the same role holding more than that
+     `Grant` promises — an out-of-band permission would not come back, so
+     losing it is exactly the state this guard exists to name. And, unchanged
+     from before #248 because none of them is expressible at all, six other
+     shapes: `WITH GRANT OPTION` (held even by a role the plan does grant
+     plainly — the model has no flag for it), a column-level grant, an owner a
+     rebuild would transfer, `reloptions`, a view column default and a
+     trigger's `tgenabled`.

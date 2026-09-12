@@ -6347,10 +6347,11 @@ async fn read_a_rebuild(
     conn: &mut Conn,
     id: &pbps_model::ModuleId,
     kind: pbps_model::ModuleKind,
+    changes: &pbps_model::ChangeSet,
 ) -> pbps_pg::modules::Rebuild {
     for _ in 0..20 {
         in_a_transaction(conn).await;
-        match pbps_pg::modules::before_a_rebuild(conn, id, kind).await {
+        match pbps_pg::modules::before_a_rebuild(conn, id, kind, changes).await {
             Ok(rebuild) => {
                 rollback(conn).await;
                 return rebuild;
@@ -6405,19 +6406,33 @@ async fn rollback(conn: &mut Conn) {
 /// **by name** rather than reporting success while quietly changing who may use
 /// it.
 ///
-/// Six carried things, each measured on this branch and each in ADR-0009 §3's
-/// table: a grant, a revocation from `PUBLIC` (which is the *absence* of a row
-/// and the more dangerous of the two directions), `reloptions`, a view column
-/// default in `pg_attrdef`, a trigger's `tgenabled`, and grants the *new*
-/// object would arrive with from `pg_default_acl`. The last is the one every
+/// A grant to a role the plan is about to declare on this same target is no
+/// longer one of them (#248): `pbps_diff::diff_roles` restates it after the
+/// `AlterModule`, and this test's `declared` case exercises exactly that path
+/// by handing `read_a_rebuild` a `ChangeSet` carrying that `Grant`, the way the
+/// differ would have built it. End to end, without a hand-built `ChangeSet`,
+/// [`a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it`](../../pbps-cli/tests/flow_pg.rs)
+/// applies a real plan and reads the rebuilt view back as the granted role
+/// itself.
+///
+/// Everything else still refuses, each measured on this branch. Two shapes
+/// the plan simply does not carry: a grant to a role the plan does **not**
+/// carry on this target (nothing to restate it from, whether or not the role
+/// is declared for something else), and a declared role holding *more* than
+/// its `Grant` promises — an out-of-band permission the plan is not about to
+/// write again. `PUBLIC` stays on the refusing side for good (ADR-0010 §5,
+/// DECISIONS 306): the model has no grantee named `PUBLIC` to re-emit a
+/// revoke from, so a revocation from it (the *absence* of a row, and the more
+/// dangerous of the two directions) refuses whatever else the plan restates
+/// on the same object. And six shapes are unchanged because none of them is
+/// expressible at all: `WITH GRANT OPTION` (held even by a role the plan does
+/// grant plainly), a column-level grant, an owner a rebuild would transfer,
+/// `reloptions`, a view column default in `pg_attrdef`, and a trigger's
+/// `tgenabled`. One more refusal is unrelated to any of this — grants the
+/// *new* object would arrive with from `pg_default_acl`, the one every
 /// earlier version of the ADR missed: an object with no grants at all is the
 /// easiest case to wave through, and it is the one where a rebuild hands an
 /// unmanaged role `SELECT`.
-///
-/// Every one of these is still a refusal. Step 6 (#81) made a grant to a
-/// declared role expressible; what re-emits it after the `CREATE` is #248, and
-/// until that lands there is nothing to put an ACL back with. ADR-0010 §5 keeps
-/// `PUBLIC` on the refusing side for good either way.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
@@ -6432,6 +6447,14 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         format!("CREATE VIEW {s}.plain AS SELECT id FROM {s}.t"),
         format!("CREATE VIEW {s}.granted AS SELECT id FROM {s}.t"),
         format!("GRANT SELECT ON {s}.granted TO {reader}"),
+        // The three fixtures #248 exists to tell apart from `granted` above,
+        // once a `ChangeSet` carrying a declared `Grant` is in the picture.
+        format!("CREATE VIEW {s}.declared AS SELECT id FROM {s}.t"),
+        format!("GRANT SELECT ON {s}.declared TO {reader}"),
+        format!("CREATE VIEW {s}.declared_but_more AS SELECT id FROM {s}.t"),
+        format!("GRANT SELECT, INSERT ON {s}.declared_but_more TO {reader}"),
+        format!("CREATE VIEW {s}.declared_with_option AS SELECT id FROM {s}.t"),
+        format!("GRANT SELECT ON {s}.declared_with_option TO {reader} WITH GRANT OPTION"),
         // The grant that is not in the object's own ACL. Measured, `relacl`
         // stays NULL and the privilege lives in `pg_attribute.attacl`, so an
         // object-level check reports nothing carried and the rebuild removes
@@ -6515,7 +6538,11 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         // A revocation is not a row in the ACL — it is the absence of the
         // engine's default — so a rebuild restores the default and silently
         // reopens a function somebody deliberately closed.
-        (format!("{s}.closed(integer)"), Function, Some("=X/")),
+        (
+            format!("{s}.closed(integer)"),
+            Function,
+            Some("PUBLIC no longer holds `EXECUTE`"),
+        ),
         (format!("{s}.t.live"), Trigger, None),
         (format!("{s}.t.off"), Trigger, Some("disabled")),
         // A comment is carried state on every kind, and on a column of one.
@@ -6549,7 +6576,8 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     ];
     for (id, kind, expected) in &cases {
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
-        let rebuild = read_a_rebuild(&mut conn, &id, *kind).await;
+        let rebuild =
+            read_a_rebuild(&mut conn, &id, *kind, &pbps_model::ChangeSet::default()).await;
         match expected {
             None => assert_eq!(
                 rebuild.refusal(),
@@ -6565,6 +6593,76 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
             }
         }
     }
+
+    // The heart of #248: a `ChangeSet` carrying the declared `Grant` this
+    // rebuild would produce turns the same `GRANT SELECT` that `granted`
+    // above still refuses into one the plan is about to restate — so it must
+    // not refuse at all.
+    let grant_of = |name: &str, permissions: &[pbps_model::Permission]| {
+        pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+            role: reader.clone(),
+            target: pbps_model::GrantTarget::Object(
+                format!("{s}.{name}").parse().expect("an object name"),
+            ),
+            permissions: permissions.iter().copied().collect(),
+        })
+    };
+    let declaring = |name: &str, permissions: &[pbps_model::Permission]| pbps_model::ChangeSet {
+        changes: vec![grant_of(name, permissions)],
+    };
+
+    let id: pbps_model::ModuleId = format!("{s}.declared").parse().expect("a module id");
+    let rebuild = read_a_rebuild(
+        &mut conn,
+        &id,
+        View,
+        &declaring("declared", &[pbps_model::Permission::Select]),
+    )
+    .await;
+    assert_eq!(
+        rebuild.refusal(),
+        None,
+        "a grant this plan is about to restate must not refuse: {:?}",
+        rebuild.carries
+    );
+
+    // The live ACL holds more than the plan declares — `INSERT` alongside the
+    // `SELECT` the `ChangeSet` above would restate — and the extra permission
+    // is not one this plan is about to grant again, so it still refuses.
+    let id: pbps_model::ModuleId = format!("{s}.declared_but_more")
+        .parse()
+        .expect("a module id");
+    let rebuild = read_a_rebuild(
+        &mut conn,
+        &id,
+        View,
+        &declaring("declared_but_more", &[pbps_model::Permission::Select]),
+    )
+    .await;
+    let refusal = rebuild
+        .refusal()
+        .expect("a permission beyond the declared set must still refuse");
+    assert!(
+        refusal.contains("insert") || refusal.contains("INSERT"),
+        "{refusal}"
+    );
+
+    // `WITH GRANT OPTION` has no flag in the model, so it refuses even on a
+    // role the plan is about to grant the same permission to plainly.
+    let id: pbps_model::ModuleId = format!("{s}.declared_with_option")
+        .parse()
+        .expect("a module id");
+    let rebuild = read_a_rebuild(
+        &mut conn,
+        &id,
+        View,
+        &declaring("declared_with_option", &[pbps_model::Permission::Select]),
+    )
+    .await;
+    let refusal = rebuild
+        .refusal()
+        .expect("WITH GRANT OPTION must refuse even for a declared role");
+    assert!(refusal.contains("GRANT OPTION"), "{refusal}");
 
     // And the guard that makes the case above the one it says it is: the
     // object's own ACL is empty, so a reader that only looked there would have
@@ -6593,7 +6691,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     .await
     .expect("default privileges");
     let plain: pbps_model::ModuleId = format!("{s}.plain").parse().expect("a module id");
-    let arriving = read_a_rebuild(&mut conn, &plain, View).await;
+    let arriving = read_a_rebuild(&mut conn, &plain, View, &pbps_model::ChangeSet::default()).await;
     let refusal = arriving
         .refusal()
         .expect("a view that would arrive granted must refuse");
@@ -6611,7 +6709,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         .await
         .expect("a view created while the default privilege is in force");
     let arrived: pbps_model::ModuleId = format!("{s}.arrived").parse().expect("a module id");
-    let after = read_a_rebuild(&mut conn, &arrived, View).await;
+    let after = read_a_rebuild(&mut conn, &arrived, View, &pbps_model::ChangeSet::default()).await;
     let landed = after
         .refusal()
         .expect("the object the CREATE made carries a grant nothing declared");
@@ -6668,7 +6766,7 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
         (format!("{s}.f(integer)"), Function, "pg_proc"),
     ] {
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
-        let rebuild = read_a_rebuild(&mut conn, &id, kind).await;
+        let rebuild = read_a_rebuild(&mut conn, &id, kind, &pbps_model::ChangeSet::default()).await;
         match &rebuild.serialized {
             pbps_pg::modules::Serialized::By(what) => {
                 assert!(what.contains(expected), "{id}: {what}");
@@ -6684,9 +6782,14 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
     // and a read that matched no row says exactly that.
     let absent: pbps_model::ModuleId = format!("{s}.gone").parse().expect("a module id");
     in_a_transaction(&mut conn).await;
-    let missing = pbps_pg::modules::before_a_rebuild(&mut conn, &absent, View)
-        .await
-        .expect_err("a module that is not in the catalog");
+    let missing = pbps_pg::modules::before_a_rebuild(
+        &mut conn,
+        &absent,
+        View,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await
+    .expect_err("a module that is not in the catalog");
     rollback(&mut conn).await;
     assert!(
         format!("{missing}").contains("not in this database's catalog"),
@@ -6706,9 +6809,10 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
     // the read refuses rather than answering something that is true only while
     // it is being said.
     let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
-    let refused = pbps_pg::modules::before_a_rebuild(&mut conn, &id, View)
-        .await
-        .expect_err("a read with no transaction to hold the lock");
+    let refused =
+        pbps_pg::modules::before_a_rebuild(&mut conn, &id, View, &pbps_model::ChangeSet::default())
+            .await
+            .expect_err("a read with no transaction to hold the lock");
     assert!(
         format!("{refused}").contains("inside the transaction"),
         "{refused}"
@@ -6767,7 +6871,13 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
 
     let id: pbps_model::ModuleId = format!("{s}.f(integer)").parse().expect("a module id");
     // The read must survive an attempt that could not take the lock.
-    let rebuild = read_a_rebuild(&mut conn, &id, pbps_model::ModuleKind::Function).await;
+    let rebuild = read_a_rebuild(
+        &mut conn,
+        &id,
+        pbps_model::ModuleKind::Function,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await;
 
     match &rebuild.serialized {
         pbps_pg::modules::Serialized::Not(why) => {
@@ -7328,11 +7438,14 @@ async fn a_session_setting_left_behind_cannot_answer_the_transaction_probe() {
     // No transaction is open, so both of these must still refuse.
     for what in ["rebuild", "dependents"] {
         let refused = match what {
-            "rebuild" => {
-                pbps_pg::modules::before_a_rebuild(&mut conn, &v, pbps_model::ModuleKind::View)
-                    .await
-                    .err()
-            }
+            "rebuild" => pbps_pg::modules::before_a_rebuild(
+                &mut conn,
+                &v,
+                pbps_model::ModuleKind::View,
+                &pbps_model::ChangeSet::default(),
+            )
+            .await
+            .err(),
             _ => pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
                 .await
                 .err(),
@@ -7365,9 +7478,14 @@ async fn a_session_setting_left_behind_cannot_answer_the_transaction_probe() {
     // Inside a real transaction it still says yes, which is the half a broken
     // probe would also get right and this pins anyway.
     in_a_transaction(&mut conn).await;
-    let rebuild = pbps_pg::modules::before_a_rebuild(&mut conn, &v, pbps_model::ModuleKind::View)
-        .await
-        .expect("a real transaction is a transaction");
+    let rebuild = pbps_pg::modules::before_a_rebuild(
+        &mut conn,
+        &v,
+        pbps_model::ModuleKind::View,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await
+    .expect("a real transaction is a transaction");
     rollback(&mut conn).await;
     assert_eq!(rebuild.refusal(), None, "{:?}", rebuild.carries);
 
