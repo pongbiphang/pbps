@@ -1047,7 +1047,8 @@ mod tests {
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
     fn the_postgres_arms_answer_engine_only_questions_by_name() {
         block_on(async {
-            let mut conn = pg().await;
+            let database = crate::test_pg::TestDb::create("engine").await;
+            let mut conn = database.connect().await;
             assert_eq!(conn.driver(), Driver::Postgres);
 
             let version = server_version(&mut conn).await.expect("version");
@@ -1080,6 +1081,8 @@ mod tests {
             assert_eq!(spelled["no_such_schema_here"], None);
 
             assert_eq!(truncate_reason(conn.driver(), "abc"), "abc");
+            drop(conn);
+            database.drop().await;
         });
     }
 

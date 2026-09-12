@@ -5428,10 +5428,8 @@ mod tests {
     async fn a_probe_is_answered_under_the_pins() {
         use pbps_model::{Change, ChangeSet, CheckConstraint, PlannedChange};
 
-        let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
-        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &url)
-            .await
-            .expect("connect");
+        let database = crate::test_pg::TestDb::create("pins").await;
+        let mut conn = database.connect().await;
 
         let schema = format!("pbps_pins_{}", std::process::id());
         conn.execute(&format!(
@@ -5490,6 +5488,8 @@ mod tests {
             "the probe refused a plan this engine takes: {probed:?}"
         );
         cleanup.expect("drop");
+        drop(conn);
+        database.drop().await;
     }
 
     #[test]
@@ -5503,13 +5503,51 @@ mod tests {
     }
 
     async fn read_back_under_concurrent_ddl() {
-        let connection = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
-        let mut reader = Conn::connect(pbps_db::Driver::Postgres, &connection)
+        let database = crate::test_pg::TestDb::create("capture").await;
+        let mut reader = database.connect().await;
+        let mut writer = database.connect().await;
+        let mut sibling = crate::test_pg::shared().await;
+        let own = reader
+            .query("SELECT current_database() AS name")
             .await
             .unwrap();
-        let mut writer = Conn::connect(pbps_db::Driver::Postgres, &connection)
+        let shared = sibling
+            .query("SELECT current_database() AS name")
             .await
             .unwrap();
+        // Timing alone cannot prove isolation: without this assertion a quiet
+        // scheduler can make the old shared fixture pass the churn test.
+        assert_ne!(
+            own[0].try_get::<&str>("name").unwrap(),
+            shared[0].try_get::<&str>("name").unwrap()
+        );
+        let churn_schema = format!("pbps_sibling_{}", std::process::id());
+        sibling
+            .execute(&format!("CREATE SCHEMA {churn_schema}"))
+            .await
+            .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let churn = tokio::spawn(async move {
+            let mut rounds = 0;
+            loop {
+                sibling
+                    .execute(&format!(
+                        "CREATE TABLE {churn_schema}.t (id integer); DROP TABLE {churn_schema}.t"
+                    ))
+                    .await
+                    .unwrap();
+                rounds += 1;
+                if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            sibling
+                .execute(&format!("DROP SCHEMA {churn_schema}"))
+                .await
+                .unwrap();
+            rounds
+        });
         let schema = format!("pbps_capture_{}", std::process::id());
         writer.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; CREATE TABLE {schema}.untouched (id integer)")).await.unwrap();
         reader.execute("BEGIN").await.unwrap();
@@ -5562,6 +5600,11 @@ mod tests {
             .execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await
             .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            churn.await.unwrap() > 0,
+            "the sibling must actually issue DDL"
+        );
         assert!(
             result
                 .as_ref()
@@ -5592,6 +5635,9 @@ mod tests {
                 .tables
                 .contains_key(&TableName::new(&schema, "own_write"))
         );
+        drop(reader);
+        drop(writer);
+        database.drop().await;
     }
 
     /// `scope` drops a managed role's *plain* grant on an object nobody
