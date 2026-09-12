@@ -9524,6 +9524,86 @@ async fn a_retyped_column_gives_up_its_old_default_before_the_type_moves() {
     assert_eq!(state.schema, normalized(&b));
 }
 
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn trailing_default_comments_preserve_row_default_answers() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("commented_row_default").await;
+    db.conn.execute("CREATE TABLE dbo.t (id int PRIMARY KEY, n int DEFAULT (1 -- why\n)); INSERT dbo.t(id,n) VALUES (1,1),(2,2),(3,NULL);").await.unwrap();
+    let name = TableName::new("dbo", "t");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new(ty("int")).not_null());
+    let mut column = Column::new(ty("int"));
+    // Use declaration text: catalog normalization discards the comment.
+    column.default = Some("1 -- why".into());
+    table.columns.insert("n".into(), column);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    for (key, at_default) in [("1", true), ("2", false), ("3", false)] {
+        let query = pbps_mssql::rows::query(
+            &name,
+            &table,
+            &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+        )
+        .unwrap()
+        .unwrap();
+        let rows = db
+            .conn
+            .query(&query.sql)
+            .await
+            .expect("comment must not consume CASE syntax");
+        let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+        assert_eq!(observed.at_default.contains("n"), at_default, "row {key}");
+        assert!(!observed.unknown.contains("n"), "row {key}");
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn trailing_default_comments_preserve_insert_guards() {
+    let mut db = TestDb::create("commented_insert_default").await;
+    db.conn
+        .execute("CREATE TABLE dbo.t (id int PRIMARY KEY, n int DEFAULT (1));")
+        .await
+        .unwrap();
+    let change = pbps_model::Change::InsertRow {
+        table: TableName::new("dbo", "t"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: pbps_model::RowKey::from("1"),
+        row: Default::default(),
+        defaults: [("n".into(), "1 -- why".into())].into_iter().collect(),
+        types: [("n".into(), ty("int"))].into_iter().collect(),
+    };
+    let sql = Mssql.emit(&change, Default::default()).unwrap();
+    db.conn
+        .execute(&sql[0].sql)
+        .await
+        .expect("a valid defaulted insert must apply");
+    db.conn.execute("DELETE dbo.t;").await.unwrap();
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.rewrite_default ON dbo.t AFTER INSERT AS UPDATE dbo.t SET n = 2;",
+        )
+        .await
+        .unwrap();
+    let error = db
+        .conn
+        .execute(&sql[0].sql)
+        .await
+        .expect_err("rewriting the default must still be refused");
+    assert!(
+        error.to_string().contains("is not what this plan wrote"),
+        "{error}"
+    );
+    db.drop().await;
+}
+
 /// A declared expression ending in a line comment reaches the engine with the
 /// emitter's own syntax intact.
 ///

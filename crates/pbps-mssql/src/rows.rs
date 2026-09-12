@@ -204,6 +204,9 @@ pub fn query(
                 // defaulted_cell does. Type precedence must not convert a
                 // text cell to the numeric type of its default expression.
                 let ty = crate::types::normalize(&spec.ty)?;
+                // A trailing line comment must end before our CASE syntax
+                // at every interpolation, just as in the emitter (DECISIONS 281).
+                let default = crate::emit::verbatim(default);
                 select.push(format!(
                     // A failed assignment is unknown, not a NULL default.
                     // Keep that third answer local to this query/decode wire
@@ -1112,7 +1115,7 @@ mod tests {
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         assert!(
             q.sql.contains(
-                "WHEN [label] = TRY_CONVERT(nvarchar(50), 'Unlabelled') OR ([label] IS NULL AND ('Unlabelled') IS NULL)"
+                "WHEN [label] = TRY_CONVERT(nvarchar(50), 'Unlabelled'\n) OR ([label] IS NULL AND ('Unlabelled'\n) IS NULL)"
             ),
             "{}",
             q.sql
@@ -1146,13 +1149,13 @@ mod tests {
             .unwrap();
             assert!(
                 q.sql.contains(&format!(
-                    "[n]]ame] = TRY_CONVERT({expected}, -CAST('1' AS int))"
+                    "[n]]ame] = TRY_CONVERT({expected}, -CAST('1' AS int)\n)"
                 )),
                 "{}",
                 q.sql
             );
             assert!(q.sql.contains(&format!(
-                "(-CAST('1' AS int)) IS NOT NULL AND TRY_CONVERT({expected}, -CAST('1' AS int)) IS NULL THEN -1"
+                "(-CAST('1' AS int)\n) IS NOT NULL AND TRY_CONVERT({expected}, -CAST('1' AS int)\n) IS NULL THEN -1"
             )), "{}", q.sql);
         }
         for (ty, default) in [
@@ -1176,6 +1179,27 @@ mod tests {
             assert!(!q.sql.contains("CASE WHEN"), "{}", q.sql);
             assert!(q.columns[0].assume_default);
         }
+    }
+
+    #[test]
+    fn trailing_default_comments_leave_every_case_branch_intact() {
+        let t = table(
+            Some(vec!["id"]),
+            &[("id", "int", None), ("n", "int", Some("1 -- why"))],
+        );
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(q.columns[0].default_at, Some(2));
+        assert_eq!(q.sql.matches("1 -- why\n").count(), 4, "{}", q.sql);
+        assert!(!q.sql.contains("1 -- why)"), "{}", q.sql);
+        assert!(q.sql.contains("THEN 1 ELSE 0 END AS c2"), "{}", q.sql);
     }
 
     /// The engine's column, not the declaration's: never selected, so it never

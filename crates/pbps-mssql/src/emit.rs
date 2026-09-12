@@ -1093,6 +1093,7 @@ fn defaulted_cell(
         return Ok(None);
     }
     let (read, now) = (ty.read(), ty.now());
+    let default = verbatim(default);
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(
@@ -1257,7 +1258,7 @@ fn null_clause(nullable: bool) -> &'static str {
 /// in one helper rather than at each site so that the next site has somewhere
 /// to reach for (DECISIONS 281). A carriage return would end the comment too,
 /// but that direction needs no thought here: the newline is the emitter's own.
-fn verbatim(expression: &str) -> String {
+pub(crate) fn verbatim(expression: &str) -> String {
     format!("{expression}\n")
 }
 
@@ -2112,6 +2113,21 @@ mod tests {
     }
 
     #[test]
+    fn trailing_default_comments_leave_both_guard_interpolations_intact() {
+        let ty: ColumnType = "int".parse().unwrap();
+        let sql = defaulted_cell("n", "1 -- why", Some(Held::same(&ty)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sql.matches("1 -- why\n").count(), 2, "{sql}");
+        assert!(!sql.contains("1 -- why)"), "{sql}");
+        assert!(
+            defaulted_cell("n", "NEWID() -- why", Some(Held::same(&ty)))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn check_constraints_render_their_expression_verbatim() {
         let sql = sql_of(&Change::AddCheck {
             table: tname("dbo.t"),
@@ -2453,7 +2469,7 @@ mod tests {
             .map(|(c, t)| (c.to_owned(), ty(t)))
             .collect(),
         });
-        let sql = &sql[0];
+        let sql = sql[0].replace("\n)", ")");
         for held in [
             "CONVERT(nvarchar(max), [label]) = N'New' COLLATE Latin1_General_BIN2",
             // A constant default: both sides rendered as the read-back
@@ -2663,7 +2679,7 @@ mod tests {
             .collect(),
             after_types: Default::default(),
         });
-        let sql = &sql[0];
+        let sql = sql[0].replace("\n)", ")");
         let body = sql
             .strip_prefix("BEGIN TRANSACTION;\nBEGIN TRY\n")
             .expect("the write and its checks are one transaction");
@@ -2746,7 +2762,7 @@ mod tests {
             .collect(),
             after_types: Default::default(),
         });
-        let sql = &sql[0];
+        let sql = sql[0].replace("\n)", ")");
         let update = sql
             .lines()
             .find(|l| l.starts_with("UPDATE "))
