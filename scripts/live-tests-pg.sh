@@ -78,7 +78,7 @@ cargo test -p pbps-pg --test live -- --ignored "$@"
 # private, and the thing under test is that the second pins the session before
 # it asks anything (DECISIONS 415). Run here rather than left to
 # `cargo test --workspace`, which does not pass `--ignored`.
-cargo test -p pbps-cli --bin pbps -- --ignored "$@"
+cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 "$@"
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.
 cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 "$@"
