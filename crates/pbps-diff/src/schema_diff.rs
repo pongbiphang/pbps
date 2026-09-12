@@ -532,10 +532,71 @@ pub fn diff_partial(
     // target in this plan — an `ALTER TABLE <table> ...` drop on it needs
     // that rename to have already run (measured above).
     let needs_its_own_rename_first = |table: &TableName| renamed_to.contains(table);
+    // A cross-schema rename (`s1.old` -> `s2.target`) is `emit.rs`'s
+    // `rename_table` running two statements, not one: `ALTER TABLE s1.old
+    // SET SCHEMA s2;` lands the table at the *intermediate* name `s2.old`
+    // first, and only `ALTER TABLE s2.old RENAME TO target;` after that gives
+    // it its declared name. `renamed_to` above only knows the second name;
+    // measured on `pbps-test-pg-cw`, an index named `old` elsewhere in `s2`
+    // is a real, distinct collision the first statement hits with `relation
+    // "old" already exists in schema "s2"`, and dropping that index first is
+    // exactly what turns the plan valid. So the intermediate name is claimed
+    // too, and needs to free the same way the final one does — both are
+    // claimed by the very same `RenameTable`, so this changes what
+    // `frees_a_renamed_name` checks against, not the sort itself.
+    //
+    // Only when *both* the schema and the name change: a same-schema rename
+    // never runs `SET SCHEMA` at all (`at` starts and stays at `from`'s
+    // schema), and a schema-only move (`from.name == to.name`) lands on its
+    // declared name in that one statement, so `renamed_to` already has it.
+    let claimed_by_a_rename: BTreeSet<TableName> = planned
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, to, .. }
+                if from.schema != to.schema && from.name != to.name =>
+            {
+                Some(TableName::new(to.schema.clone(), from.name.clone()))
+            }
+            Change::RenameTable { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .chain(renamed_to.iter().cloned())
+        .collect();
     // Whether dropping `freed_name` from `table`'s schema frees a name some
-    // `RenameTable` in this plan is waiting to claim.
+    // `RenameTable` in this plan is waiting to claim — either its final
+    // declared name, or the intermediate one a cross-schema rename passes
+    // through first (above).
     let frees_a_renamed_name = |table: &TableName, freed_name: &str| -> bool {
-        renamed_to.contains(&TableName::new(table.schema.clone(), freed_name.to_owned()))
+        claimed_by_a_rename.contains(&TableName::new(table.schema.clone(), freed_name.to_owned()))
     };
     let is_a_freeing_drop = |c: &Change| -> bool {
         match c {
@@ -4853,6 +4914,57 @@ mod tests {
             ["DropIndex", "RenameTable"],
             "dropping an index never needs the table's current name, so it \
              can free even its own table's name: {cs:?}"
+        );
+    }
+
+    /// Round-3 review finding: `pbps-pg`'s `emit.rs::rename_table` runs a
+    /// cross-schema rename as two statements, not one — `ALTER TABLE s1.old
+    /// SET SCHEMA s2;` lands the table at the *intermediate* name `s2.old`
+    /// first, and only `ALTER TABLE s2.old RENAME TO target;` after that
+    /// gives it its declared name `s2.target`. The name set the guard used
+    /// to check only ever held the second name. Measured on
+    /// `pbps-test-pg-cw`: `s2.sibling`, an unrelated table, owns a plain
+    /// index literally named `old`; the first statement collides with it —
+    /// `relation "old" already exists in schema "s2"` — even though the
+    /// plan's *final* declared schema has no collision at all, and dropping
+    /// that index first is what the engine actually needs.
+    #[test]
+    fn a_cross_schema_rename_also_frees_the_schema_it_passes_through() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let mut sibling_base = table(&[("n", Column::new(ty("int")))]);
+        sibling_base.indexes.insert(
+            "old".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "n".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        let base = two_tables(("s1.old", old_t.clone()), ("s2.sibling", sibling_base));
+
+        let declared = two_tables(
+            ("s2.target", old_t),
+            ("s2.sibling", table(&[("n", Column::new(ty("int")))])),
+        );
+
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "s1.old".parse().unwrap(),
+                to: "s2.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropIndex", "RenameTable"],
+            "the index has to be gone before the cross-schema rename's first \
+             statement claims the intermediate name it collides with: {cs:?}"
         );
     }
 
