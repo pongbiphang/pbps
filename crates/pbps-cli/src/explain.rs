@@ -370,6 +370,7 @@ fn explain(
         plan_path: (plan_arg == placeholder("plan path")).then_some(literal),
         probes: dialect
             .preflight(cs)
+            .probes
             .into_iter()
             .map(|p| p.description)
             .collect(),
