@@ -1281,6 +1281,63 @@ fn a_narrowing_change_is_flagged_in_the_plan() {
 }
 
 #[test]
+fn value_changing_conversions_explain_narrowing_in_every_review_format() {
+    for (from, to, gated) in [
+        ("binary(8)", "binary(16)", true),
+        ("varbinary(8)", "binary(16)", true),
+        ("nvarchar(100)", "nvarchar(50)", true),
+        ("nvarchar(100)", "int", true),
+        ("varbinary(8)", "varbinary(16)", false),
+        ("binary(8)", "varbinary(16)", false),
+    ] {
+        let d = Demo::new("conversion-rationale");
+        d.table(&format!(
+            "table: dbo.t\ncolumns:\n  payload: {{type: '{from}'}}\n"
+        ));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        d.table(&format!(
+            "table: dbo.t\ncolumns:\n  payload: {{type: '{to}'}}\n"
+        ));
+        let path = d.dir.join("plan.json");
+        let plan = d.run(&["plan", "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&plan), 0, "{}", stderr(&plan));
+        let mut outputs = vec![stdout(&plan)];
+        for format in ["text", "json"] {
+            let explained = d.run(&[
+                "explain",
+                "--plan",
+                path.to_str().unwrap(),
+                "--format",
+                format,
+            ]);
+            assert_eq!(code(&explained), 0, "{}", stderr(&explained));
+            outputs.push(stdout(&explained));
+        }
+        for output in outputs {
+            if gated {
+                for detail in [
+                    "narrowing",
+                    "values",
+                    "changed",
+                    "padding",
+                    "truncated",
+                    "rejected",
+                ] {
+                    assert!(
+                        output.contains(detail),
+                        "{from} -> {to} missing {detail}: {output}"
+                    );
+                }
+            } else {
+                assert!(!output.contains("padding"), "{from} -> {to}: {output}");
+                assert!(!output.contains("narrowing"), "{from} -> {to}: {output}");
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn source_default_collation_notice_is_only_printed_once_during_onboarding() {
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");

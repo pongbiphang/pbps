@@ -30,7 +30,7 @@ use crate::uid::Uid;
 
 /// A risk class that must be explicitly allowed at the command level (SPEC §7.2).
 ///
-/// The criterion is **whether this kind of change can fail at all**, not whether
+/// The criterion is **whether this kind of change can fail or change stored values**, not whether
 /// today's data happens to be safe — inspecting data is a runtime concern and has
 /// no place in the declarative layer.
 #[derive(
@@ -44,7 +44,8 @@ pub enum RiskClass {
     /// Data loss or loss of a uniqueness guarantee: DROP COLUMN / TABLE /
     /// INDEX / UNIQUE constraint.
     Destructive,
-    /// Type narrowing or an incompatible conversion: may truncate or fail.
+    /// Type narrowing or a value-changing or incompatible conversion: may pad,
+    /// truncate or fail.
     Narrowing,
     /// nullable → NOT NULL with no DEFAULT: existing NULLs will violate it.
     NotNull,
@@ -108,7 +109,7 @@ impl RiskClass {
             }
             RiskClass::Destructive => "data is lost, and no plan brings it back",
             RiskClass::Narrowing => {
-                "the new type may not hold what is already stored: values can be truncated or the statement rejected"
+                "converting to the new type can change stored values: values may be changed by padding, truncated, or the statement rejected if conversion fails"
             }
             RiskClass::NotNull => {
                 "existing NULLs, or rows with no value for a newly required column, make the statement fail"

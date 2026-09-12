@@ -640,7 +640,7 @@ exists when prod deploys the rename five versions later.
 |---|---|---|
 | `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX / DROP UNIQUE constraint | Data loss or loss of a uniqueness guarantee |
-| `narrowing` | Type narrowing or an incompatible conversion | Truncation, failed conversion |
+| `narrowing` | Type narrowing or a value-changing or incompatible conversion | Changed values (including binary padding), truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
 | `constraint` | Adding UNIQUE / FK / CHECK, or a **unique index** | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |
@@ -648,7 +648,7 @@ exists when prod deploys the rename five versions later.
 | `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
 
-The criterion is **whether this kind of change can fail at all**; data is not read
+The criterion is **whether this kind of change can fail or change stored values**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is
 a runtime concern and outside the declarative layer's responsibility.
 
