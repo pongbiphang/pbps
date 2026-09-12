@@ -34,19 +34,17 @@ fn invalid(message: impl Into<String>) -> DialectError {
 /// Structural declaration errors, measured on PostgreSQL 18.6. Unlike SQL
 /// Server, repeated index keys, repeated INCLUDE columns, a key in INCLUDE,
 /// and repeated local FK columns are legal here. Only PK/UNIQUE lists reject
-/// duplicates. INCLUDE contributes to the 32-column limit. Key-type eligibility
-/// depends on installed operator classes and is left to the server, not guessed
-/// from the stock catalogue by an offline validator (DECISIONS 452).
+/// duplicates. Index width depends on the server build and key-type eligibility
+/// on installed operator classes. Both stay with the server, not guessed from
+/// the stock catalogue by an offline validator (DECISIONS 452).
 pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     let mut found = Vec::new();
     if let Some(pk) = &table.primary_key {
         found.extend(key_columns("primary key", &pk.columns, table, true));
-        index_width("primary key", pk.columns.len(), &mut found);
     }
     for (name, unique) in &table.unique {
         let what = format!("unique constraint `{name}`");
         found.extend(key_columns(&what, &unique.columns, table, true));
-        index_width(&what, unique.columns.len(), &mut found);
     }
     for (name, fk) in &table.foreign_keys {
         let what = format!("foreign key `{name}`");
@@ -77,7 +75,6 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         let what = format!("index `{name}`");
         let keys: Vec<_> = index.columns.iter().map(|c| c.name.clone()).collect();
         found.extend(key_columns(&what, &keys, table, false));
-        index_width(&what, keys.len() + index.include.len(), &mut found);
         for column in &index.include {
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
@@ -94,14 +91,6 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         }
     }
     found
-}
-
-fn index_width(what: &str, columns: usize, found: &mut Vec<DialectError>) {
-    if columns > 32 {
-        found.push(invalid(format!(
-            "{what} has {columns} columns; PostgreSQL allows at most 32 columns in an index, including INCLUDE columns"
-        )));
-    }
 }
 
 fn key_columns(what: &str, columns: &[String], table: &Table, distinct: bool) -> Vec<DialectError> {

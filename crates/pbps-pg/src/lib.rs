@@ -1846,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn the_index_limit_counts_key_and_include_columns_together() {
+    fn the_server_build_decides_the_index_limit_not_offline_validation() {
         for count in [32, 33] {
             for kind in ["primary", "unique", "index", "include"] {
                 let mut table = structural_table();
@@ -1893,14 +1893,7 @@ mod tests {
                     }
                 }
                 let errors = structural_errors(&table);
-                assert_eq!(
-                    errors.len(),
-                    usize::from(count > 32),
-                    "{kind} {count}: {errors:?}"
-                );
-                if count > 32 {
-                    assert!(errors[0].contains("at most 32"), "{errors:?}");
-                }
+                assert!(errors.is_empty(), "{kind} {count}: {errors:?}");
             }
         }
     }

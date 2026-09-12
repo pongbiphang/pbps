@@ -3528,6 +3528,11 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
 async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repetitions() {
     let s = emit_schema("structure");
     let mut conn = connect().await;
+    assert_eq!(
+        text(&mut conn, "SHOW max_index_keys").await,
+        "32",
+        "the boundary cases below measure the pinned stock build, not an offline dialect invariant"
+    );
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
         "CREATE TABLE {s}.parent (a integer PRIMARY KEY, b integer, UNIQUE(a,b))"
@@ -3798,7 +3803,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             // Operator classes and FK type compatibility belong to this
             // server, not to the offline declaration's structure. Stock json
             // is refused here; the custom-opclass test pins the legal case.
-            expected.is_none() || matches!(expected, Some("42704" | "42804")),
+            expected.is_none() || matches!(expected, Some("42704" | "42804" | "54011")),
             "{label}: {problems:?}"
         );
         let statements = pg
