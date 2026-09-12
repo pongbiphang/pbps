@@ -504,6 +504,23 @@ indexes:
         assert!(render(&e).contains("duplicate"), "{}", render(&e));
     }
 
+    /// A column name is a YAML mapping key, never parsed as a `.`-joined
+    /// string the way `table:` is, so nothing stopped a `.` from reaching
+    /// `ColumnRef`'s own serialized form — `dbo.t.a.b`, which reads back as
+    /// four segments, the same shape a mistyped five-part name produces. The
+    /// error must name the column and the file, not surface far away as an
+    /// unreadable ids file or plan (issue #108).
+    #[test]
+    fn column_name_containing_the_separator_is_rejected_at_load() {
+        let e = errors("table: dbo.t\ncolumns:\n  \"a.b\": {type: int}\n");
+        assert!(render(&e).contains("a.b"), "{}", render(&e));
+        assert_eq!(
+            e[0].path(),
+            Some(p()),
+            "the error must point at the file the column was declared in"
+        );
+    }
+
     #[test]
     fn malformed_foreign_key_target_is_rejected() {
         let e = errors(

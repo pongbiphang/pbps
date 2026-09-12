@@ -85,6 +85,60 @@ mod tests {
         r.ids.validate().unwrap();
     }
 
+    /// A column name that never passed through the loader's own check
+    /// (`pbps-load::convert`) — exactly what a dialect's introspection hands
+    /// `resolve` on `pull`, since `[a.b]` is a legal bracket-quoted SQL Server
+    /// identifier — must not be minted an identity: `ColumnRef` would
+    /// serialize it as `dbo.customer.a.b`, indistinguishable from a mistyped
+    /// five-part name once written to the ids file (issue #108).
+    #[test]
+    fn a_column_name_containing_the_separator_is_not_minted() {
+        let s = schema(&[("dbo.customer", &["id", "a.b"])]);
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: Some(table) }
+                    if *what == "column" && part == "a.b" && table == &t("dbo.customer")
+            )),
+            "{errs:?}"
+        );
+        // All-or-nothing, like every other blocker here: nothing is minted
+        // for this call, including the table itself or its other, valid
+        // column — `pull` writes no file at all until every name resolves.
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::AmbiguousColumns { .. }))
+        );
+    }
+
+    /// The same refusal for a table (or schema) name, reached the same way a
+    /// pulled column is: a dialect's introspection builds `TableName` from
+    /// the catalog's separate schema and name columns directly, never through
+    /// `TableName::from_str` (issue #108).
+    #[test]
+    fn a_table_name_containing_the_separator_is_not_minted() {
+        let mut s = Schema::default();
+        s.tables.insert(
+            TableName::new("dbo", "a.b"),
+            Table {
+                columns: IndexMap::new(),
+                ..Default::default()
+            },
+        );
+        let errs = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap_err();
+
+        assert!(
+            errs.iter().any(|b| matches!(
+                b,
+                Blocker::UnrepresentableName { what, part, table: None }
+                    if *what == "table" && part == "a.b"
+            )),
+            "{errs:?}"
+        );
+    }
+
     /// No change must produce no identity-level action at all, or every run would
     /// show phantom changes.
     #[test]

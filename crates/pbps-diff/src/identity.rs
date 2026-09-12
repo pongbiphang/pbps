@@ -78,6 +78,33 @@ pub enum Blocker {
     /// declarations. The source is left available so a companion drop intent
     /// can still account for it, instead of making the rename look absorbed.
     RenameTargetExists { target: String },
+    /// A schema, table, or column name pbps's own `.`-joined format cannot
+    /// carry: it contains the separator that format reserves, and minting an
+    /// identity for it would write something the next load cannot read back
+    /// (issue #108, `pbps_model::check_segment`).
+    ///
+    /// Reached from both directions: the loader already refuses this shape
+    /// for a declared column at the point it is read (`pbps-load::convert`),
+    /// but a *table* or *schema* part is never split apart from a single
+    /// string there — `table:` is one YAML scalar, parsed whole — so it
+    /// cannot carry an embedded `.` by construction. A live database has no
+    /// such restriction: `[a.b]` is a legal bracket-quoted SQL Server
+    /// identifier, and a dialect's introspection builds `TableName` from the
+    /// catalog's separate schema and name columns directly, bypassing that
+    /// parse. This is where every fresh identity — declared or pulled alike —
+    /// is actually minted, so it is where an introspected name meets the same
+    /// refusal a declared one already got earlier.
+    UnrepresentableName {
+        /// `"schema"`, `"table"`, or `"column"` — which part contained the
+        /// separator.
+        what: &'static str,
+        /// The offending part itself, not a joined name: joining it is
+        /// exactly the operation that made it ambiguous in the first place.
+        part: String,
+        /// The table this part belongs to. `None` for a table's own schema or
+        /// name; `Some` for a column.
+        table: Option<TableName>,
+    },
 }
 
 /// The half of a rename that two intents fought over.
@@ -720,6 +747,30 @@ fn resolve_tables(
     }
 
     for name in appeared {
+        // The loader already refuses this shape for a table written as one
+        // `schema.table` scalar (`pbps-load::convert`), so a declared table
+        // never reaches here with an embedded `.`. A pulled one can: a
+        // dialect's introspection builds `TableName` straight from the
+        // catalog's separate schema and name columns, and `[a.b]` is a legal
+        // bracket-quoted identifier on the live database this name came from
+        // (issue #108). Caught here rather than minted: an identity for it
+        // would write a name the next load could not read back.
+        if pbps_model::check_segment(&name.schema).is_err() {
+            blockers.push(Blocker::UnrepresentableName {
+                what: "schema",
+                part: name.schema.clone(),
+                table: None,
+            });
+            continue;
+        }
+        if pbps_model::check_segment(&name.name).is_err() {
+            blockers.push(Blocker::UnrepresentableName {
+                what: "table",
+                part: name.name.clone(),
+                table: None,
+            });
+            continue;
+        }
         let uid = fresh_uid(&r.ids, UidKind::Table);
         r.ids.tables.insert(uid.clone(), name.clone());
         r.created_tables.push((uid, name));
@@ -875,6 +926,23 @@ fn resolve_columns(
         }
 
         for name in appeared {
+            // Same refusal as the loader's, reached from the other
+            // direction: a column pulled from a live database never went
+            // through `pbps-load::convert`'s check on the way in — a
+            // dialect's introspection reads the catalog's column name
+            // straight into `Table::columns`, and a double-quoted or
+            // bracket-quoted `a.b` is a legal identifier there too (issue
+            // #108). This is the one place a fresh column identity is
+            // minted, declared or pulled alike, so it is where that check
+            // has to live for pull.
+            if pbps_model::check_segment(&name).is_err() {
+                blockers.push(Blocker::UnrepresentableName {
+                    what: "column",
+                    part: name,
+                    table: Some(table_name.clone()),
+                });
+                continue;
+            }
             let uid = fresh_uid(&r.ids, UidKind::Column);
             let col = table_name.column(name);
             r.ids.columns.insert(uid.clone(), col.clone());

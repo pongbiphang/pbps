@@ -59,7 +59,7 @@ pub use module::{
     Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, RoutineArg,
     RoutineArgError, RoutineId,
 };
-pub use name::{ColumnRef, NameError, TableName};
+pub use name::{ColumnRef, NameError, TableName, check_segment};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
