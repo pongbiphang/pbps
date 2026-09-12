@@ -10487,7 +10487,15 @@ SPEC is in sync with all of these.
      write never reaches. The allowance is `prepare`'s alone: `check` reads the
      catalog immediately before the write, where what the plan promised to
      remove has to actually be absent, exactly as 445 requires of a dropped
-     trigger. **An action whose own trigger does not fire** writes nothing
+     trigger. The same allowance covers the two predicates that *widen* a write
+     rather than follow one: the BEFORE ROW UPDATE trigger that makes
+     PostgreSQL touch every generated column, and the one that can rewrite a
+     referenced key the statement does not set. A plan that drops the only such
+     trigger and updates another column of that table would otherwise be
+     refused for a table its write cannot reach once the drop has run —
+     `DropModule` is `order_key` 0, so the widening is asked of the catalog as
+     the plan leaves it, not as it stands when the guard looks.
+     **An action whose own trigger does not fire** writes nothing
      either; measured on 18.6, neither a disabled parent-side constraint
      trigger nor an origin trigger under `session_replication_role = replica`
      cascades at all, and the child row is left untouched. The closure applies
@@ -10535,7 +10543,9 @@ SPEC is in sync with all of these.
      unreached event, untouched column and unreachable descendant with the
      writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
      cascade-reached table blocked until the write commits; the cannot-lock
-     refusal naming its table; and the removals and the two not-firing actions,
+     refusal naming its table; and the removals — of a foreign key, of the table
+     carrying one, and of each of the two triggers that widen a write — and the
+     two not-firing actions,
      each paired with the state in which the same closure does follow it, and
      each again with the referencing side partitioned, where the action trigger
      belongs to the declared constraint and not to the copy the walk matched; the

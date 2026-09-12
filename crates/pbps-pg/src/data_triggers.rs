@@ -218,7 +218,7 @@ async fn walk(
         }
         refuse_rules(conn, &statement).await?;
         triggers.extend(
-            read_triggers(conn, &statement)
+            read_triggers(conn, &statement, dropped)
                 .await?
                 .into_iter()
                 .map(|mut trigger| {
@@ -236,7 +236,10 @@ async fn walk(
         // An UPDATE that can change a partition key moves the row instead of
         // updating it, and a movement is a DELETE on the partition it leaves
         // and an INSERT on the one it lands in (DECISIONS 451).
-        if statement.event == UPDATE && !statement.rows_only && can_move(conn, &statement).await? {
+        if statement.event == UPDATE
+            && !statement.rows_only
+            && can_move(conn, &statement, dropped).await?
+        {
             queue.extend([DELETE, INSERT].map(|event| Statement {
                 relation: statement.relation,
                 event,
@@ -312,7 +315,7 @@ async fn lock_by_oid(conn: &mut Conn, relation: i64) -> Result<(), DbError> {
 
 /// The relations one statement reaches, and the columns an UPDATE touches on
 /// each of them. Both queries below start from these.
-fn reached(statement: &Statement) -> String {
+fn reached(statement: &Statement, dropped: &Dropped) -> String {
     let columns = statement
         .columns
         .iter()
@@ -323,6 +326,12 @@ fn reached(statement: &Statement) -> String {
     // UPDATE OF follows the SET list, including generated columns that depend
     // on it. A BEFORE ROW UPDATE trigger makes PostgreSQL include all generated
     // columns, even if that trigger is disabled; measured on PostgreSQL 18.
+    //
+    // A trigger this plan drops widens nothing, for the reason the dropped
+    // foreign keys are left out: `DropModule` is `order_key` 0, so by the time
+    // the row statement runs it is gone, and a closure that widened for it
+    // would refuse a plan for a column the write does not touch. `check`
+    // passes no removals and so asks the catalog as it stands.
     format!(
         "WITH RECURSIVE relations(oid) AS (
              SELECT {relation}::pg_catalog.oid
@@ -339,8 +348,11 @@ fn reached(statement: &Statement) -> String {
              WHERE a.attname::text = ANY(ARRAY[{columns}]::text[])
                 OR (a.attgenerated <> '' AND (EXISTS (
                        SELECT 1 FROM pg_catalog.pg_trigger before_update
+                       JOIN pg_catalog.pg_class widener ON widener.oid = before_update.tgrelid
+                       JOIN pg_catalog.pg_namespace widenerns ON widenerns.oid = widener.relnamespace
                        WHERE before_update.tgrelid = a.attrelid
                          AND (before_update.tgtype & 19) = 19
+                         AND NOT ({widening_gone})
                    ) OR EXISTS (
                        SELECT 1 FROM pg_catalog.pg_attrdef ad
                        JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = ad.oid
@@ -351,7 +363,39 @@ fn reached(statement: &Statement) -> String {
                    )))
          )",
         relation = statement.relation,
+        widening_gone = gone_triggers(dropped, "widenerns", "widener", "before_update"),
     )
+}
+
+/// The trigger modules this plan drops before the row statement, as a filter on
+/// a `pg_trigger` row joined to its relation and that relation's namespace.
+/// `false` when there are none: an empty `OR` list is not valid SQL, and every
+/// caller negates this.
+fn gone_triggers(dropped: &Dropped, namespace: &str, relation: &str, trigger: &str) -> String {
+    let clauses: Vec<String> = dropped
+        .modules
+        .iter()
+        .filter_map(|id| match id {
+            ModuleId::Trigger { on, name } => Some((on, name)),
+            // A view or a routine is not a trigger, and neither widens a
+            // write; naming the two kinds keeps a third from arriving here
+            // silently matched.
+            ModuleId::Named(_) | ModuleId::Routine(_) => None,
+        })
+        .map(|(on, name)| {
+            format!(
+                "({namespace}.nspname = {} AND {relation}.relname = {} AND {trigger}.tgname = {})",
+                literal(&on.schema),
+                literal(&on.name),
+                literal(name)
+            )
+        })
+        .collect();
+    if clauses.is_empty() {
+        "false".to_owned()
+    } else {
+        clauses.join(" OR ")
+    }
 }
 
 /// Refuse a relation this write reaches that carries a rewrite rule.
@@ -413,7 +457,11 @@ async fn refuse_rules(conn: &mut Conn, statement: &Statement) -> Result<(), DbEr
     })
 }
 
-async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Trigger>, DbError> {
+async fn read_triggers(
+    conn: &mut Conn,
+    statement: &Statement,
+    dropped: &Dropped,
+) -> Result<Vec<Trigger>, DbError> {
     // Statement-level triggers fire on the relation the statement names, not on
     // each descendant it reaches; row-level ones fire wherever the row lands.
     let rows = conn
@@ -442,7 +490,7 @@ async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Tri
                     CASE WHEN pg_catalog.current_setting('session_replication_role') = 'replica'
                          THEN 'R' ELSE 'O' END)
              ORDER BY t.oid",
-            ctes = reached(statement),
+            ctes = reached(statement, dropped),
             events = statement.event,
             update = UPDATE,
             named = if statement.rows_only {
@@ -486,7 +534,11 @@ async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Tri
 /// triggers of the one it lands in, and no UPDATE trigger at all. A partition
 /// key written as an expression is taken as always movable: which columns feed
 /// it is a question this tool does not parse (DECISIONS 174).
-async fn can_move(conn: &mut Conn, statement: &Statement) -> Result<bool, DbError> {
+async fn can_move(
+    conn: &mut Conn,
+    statement: &Statement,
+    dropped: &Dropped,
+) -> Result<bool, DbError> {
     let rows = conn
         .query(&format!(
             "{ctes}
@@ -499,7 +551,7 @@ async fn can_move(conn: &mut Conn, statement: &Statement) -> Result<bool, DbErro
                        AND touched.attnum = ANY(part.partattrs)
                  )
              ) AS movable",
-            ctes = reached(statement),
+            ctes = reached(statement, dropped),
         ))
         .await?;
     rows.first()
@@ -587,8 +639,14 @@ async fn read_actions(
                    -- nothing either.
                    ) OR EXISTS (
                        SELECT 1 FROM pg_catalog.pg_trigger rewriter
+                       JOIN pg_catalog.pg_class rw ON rw.oid = rewriter.tgrelid
+                       JOIN pg_catalog.pg_namespace rwns ON rwns.oid = rw.relnamespace
                        WHERE rewriter.tgrelid = con.confrelid
                          AND (rewriter.tgtype & 19) = 19
+                         -- A rewriter this plan drops rewrites nothing when the
+                         -- row statement runs, exactly as a removed foreign key
+                         -- writes nothing: `DropModule` is `order_key` 0.
+                         AND NOT ({rewriter_gone})
                          AND (rewriter.tgattr = ''::pg_catalog.int2vector OR EXISTS (
                              SELECT 1 FROM touched
                              WHERE touched.attrelid = rewriter.tgrelid
@@ -637,11 +695,12 @@ async fn read_actions(
              LEFT JOIN pg_catalog.pg_attribute a
                     ON NOT e.cascades AND a.attrelid = e.referencing AND a.attnum = ANY(e.written)
              ORDER BY constraint_oid, relation, event",
-            ctes = reached(statement),
+            ctes = reached(statement, dropped),
             events = statement.event,
             delete = DELETE,
             update = UPDATE,
             gone = gone(dropped),
+            rewriter_gone = gone_triggers(dropped, "rwns", "rw", "rewriter"),
         ))
         .await?;
     // One statement per constraint: merging two constraints' column sets would

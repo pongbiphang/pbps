@@ -3673,6 +3673,24 @@ fn update_of_generated_columns_follows_their_source_columns() {
         let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &Default::default()).await;
         assert!(checked.is_err(), "a disabled BEFORE ROW trigger still widens generated-column updates");
         conn.rollback(dialect.transaction_framing()).await.unwrap();
+        // Unless the plan drops it first: `DropModule` is `order_key` 0, so by
+        // the row statement the widener is gone and `size` is not touched.
+        let write = RowWrite {
+            table: pbps_model::TableName::new("app", "t"),
+            operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
+        };
+        let removed = pbps_pg::data_triggers::Dropped {
+            modules: [pbps_model::ModuleId::Trigger {
+                on: pbps_model::TableName::new("app", "t"),
+                name: "before_update".to_owned(),
+            }]
+            .into(),
+            ..Default::default()
+        };
+        conn.begin(dialect.transaction_framing()).await.unwrap();
+        let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &removed).await;
+        assert!(checked.is_ok(), "a widener the plan drops widens nothing: {:?}", checked.err().map(|e| e.to_string()));
+        conn.rollback(dialect.transaction_framing()).await.unwrap();
     });
 }
 
@@ -5294,12 +5312,38 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                 .await
                 .unwrap();
             assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(0));
-            for (label, form, baseline, refused) in [
-                ("the rewriter this statement fires", "BEFORE UPDATE", &wide, true),
+            // A rewriter the plan drops rewrites nothing when the row
+            // statement runs: `DropModule` is `order_key` 0, and a closure
+            // that widened for it would refuse a plan whose write never
+            // reaches `app.c`.
+            let removed = pbps_pg::data_triggers::Dropped {
+                modules: [pbps_model::ModuleId::Trigger {
+                    on: pbps_model::TableName::new("app", "p"),
+                    name: "rewrite".to_owned(),
+                }]
+                .into(),
+                ..Default::default()
+            };
+            for (label, form, baseline, dropped, refused) in [
+                (
+                    "the rewriter this statement fires",
+                    "BEFORE UPDATE",
+                    &wide,
+                    &Default::default(),
+                    true,
+                ),
                 (
                     "a rewriter this statement cannot fire",
                     "BEFORE UPDATE OF code",
                     &narrow,
+                    &Default::default(),
+                    false,
+                ),
+                (
+                    "a rewriter the plan drops first",
+                    "BEFORE UPDATE",
+                    &wide,
+                    &removed,
                     false,
                 ),
             ] {
@@ -5314,7 +5358,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                     &mut conn,
                     std::slice::from_ref(&write),
                     baseline,
-                    &Default::default(),
+                    dropped,
                 )
                 .await;
                 assert_eq!(
