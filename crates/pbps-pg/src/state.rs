@@ -347,6 +347,13 @@ const PROBE_STATE: &str = "SELECT 1 AS present FROM public.__pbps_state LIMIT 0"
 /// with it (DECISIONS 288): that one asks whether *this caller* has a ledger to
 /// read, which only a statement can answer, and answering it from the catalog
 /// would report a table this role cannot touch as one it can.
+///
+/// Nor is it where a view or another relation occupying the ledger's name gets
+/// caught (issue #217): narrowing this probe to `relkind = 'r'` would only make
+/// it predict `CREATE TABLE IF NOT EXISTS` wrong, since that statement skips a
+/// same-named view exactly the way an unfiltered probe does. See
+/// [`confirm_ledger_relations`], which asks that question after the DDL
+/// instead (DECISIONS 442).
 fn ledger_is_there() -> String {
     format!(
         "SELECT count(*)::int8 AS present
@@ -491,11 +498,104 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
             }
         }
     }
+    // A relation of each name exists by this point — freshly created, already
+    // there, or (issue #217) a decoy the DDL above skipped rather than
+    // replaced. Only the last of those is not yet ruled out.
+    confirm_ledger_relations(conn).await?;
     // Both tables exist by this point, freshly created or already there —
     // either way a `__pbps_state` from before issue #103 still needs its
     // five timeline columns, and one just created by [`CREATE_STATE`] above
     // already has them, so this is cheap in the common case (DECISIONS 435).
     migrate_timeline_columns(conn).await
+}
+
+/// After the block above — whether it sent the DDL or skipped it because a
+/// relation of the name was already there — confirms both ledger names
+/// resolve to ordinary tables, and refuses by name when either does not
+/// (issue #217).
+///
+/// This is a **different** question from [`ledger_is_there`]'s, asked
+/// **after** the DDL rather than by narrowing that probe (DECISIONS 442):
+/// `ledger_is_there` predicts whether `CREATE TABLE IF NOT EXISTS` would do
+/// anything, and measured on 18.6 that statement silently skips a view of the
+/// ledger's name — `NOTICE: relation "__pbps_state" already exists,
+/// skipping` — exactly the way an unfiltered probe would predict it should.
+/// A probe narrowed to `relkind = 'r'` would report 0 relations present, the
+/// DDL would still skip the view, and `ensure_tables` would still return
+/// `Ok(())` over a database with no ledger table at all; the wrong prediction
+/// moves, it does not go away. Only a question asked once the DDL has already
+/// run or been skipped can tell the two apart.
+///
+/// What this buys is bounded, and issue #217 measured the bound: an ordinary
+/// table of the ledger's name, holding the ledger's columns, passes
+/// `relkind = 'r'` and can still absorb every insert unnoticed — so can an
+/// auto-updatable view, which does not even fail this check's own catalog
+/// question until it is asked. Nothing here makes an occupant of the right
+/// *kind* a trustworthy ledger; what it does is turn the case that already
+/// failed — loudly for the view (`must be owner of table t` from
+/// [`migrate_timeline_columns`]'s `ALTER`, or a confusing insert failure from
+/// [`record`]) or not at all for the matching decoy table — into a clear,
+/// named refusal for the loud case, rather than a reported success.
+async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
+    let rows = conn.query(&ledger_occupants()).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let occupants: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let relname = text(row, "relname")?;
+            let relkind = text(row, "relkind")?;
+            Ok::<String, DbError>(format!(
+                "{LEDGER_SCHEMA}.{relname} is {}, not an ordinary table",
+                relkind_name(&relkind)
+            ))
+        })
+        .collect::<Result<_, DbError>>()?;
+    Err(DbError::Driver {
+        code: None,
+        message: format!(
+            "{}.\n\
+             A ledger name is occupied by a relation pbps did not create and will not write to. \
+             Rename or drop the existing relation, or point pbps at a database where \
+             {STATE_TABLE} and {LOCK_TABLE} are free.",
+            occupants.join("; ")
+        ),
+    })
+}
+
+/// The relations, if any, that keep either ledger name from naming an ordinary
+/// table. World-readable like [`ledger_is_there`], for the same reason: this
+/// runs on every [`ensure_tables`] call, including the least-privileged
+/// deployment role SPEC §8.1 asks for.
+fn ledger_occupants() -> String {
+    format!(
+        "SELECT c.relname, c.relkind::text AS relkind
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = '{LEDGER_SCHEMA}'
+            AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}')
+            AND c.relkind <> 'r'"
+    )
+}
+
+/// A `pg_class.relkind` letter, in the words [`confirm_ledger_relations`]'s
+/// error uses. PostgreSQL's own vocabulary (`\d` in `psql` names the same
+/// things), spelled out for a reader who does not carry the catalog's
+/// single-letter alphabet.
+fn relkind_name(relkind: &str) -> &'static str {
+    match relkind {
+        "v" => "a view",
+        "m" => "a materialized view",
+        "i" => "an index",
+        "I" => "a partitioned index",
+        "S" => "a sequence",
+        "c" => "a composite type",
+        "t" => "a TOAST table",
+        "f" => "a foreign table",
+        "p" => "a partitioned table",
+        _ => "a relation of a kind pbps does not expect there",
+    }
 }
 
 /// Whether the ledger's timeline-projection columns (issue #103) are already
@@ -1376,5 +1476,55 @@ mod tests {
             // `TM` is what makes `to_char` read `lc_time`; nothing here may.
             assert!(!sql.contains("TM"), "{sql}");
         }
+    }
+
+    /// The regression this pins: filtering `relkind` here would make the probe
+    /// predict `CREATE TABLE IF NOT EXISTS` wrong (issue #217), because that
+    /// statement skips a same-named relation of *any* kind. The check that
+    /// belongs to `relkind` lives in [`ledger_occupants`] instead, asked after
+    /// the DDL rather than by narrowing this probe (DECISIONS 442).
+    #[test]
+    fn the_presence_probe_does_not_filter_by_relkind() {
+        assert!(
+            !ledger_is_there().contains("relkind"),
+            "{}",
+            ledger_is_there()
+        );
+    }
+
+    /// [`ledger_occupants`] asks the opposite of [`ledger_is_there`]: both
+    /// table names, but only the kinds that are not an ordinary table.
+    #[test]
+    fn the_occupant_query_names_both_tables_and_excludes_ordinary_ones() {
+        let sql = ledger_occupants();
+        assert!(sql.contains(STATE_TABLE_NAME), "{sql}");
+        assert!(sql.contains(LOCK_TABLE_NAME), "{sql}");
+        assert!(sql.contains("relkind <> 'r'"), "{sql}");
+        assert!(!sql.contains("'{"), "a pasted value in ledger SQL: {sql}");
+    }
+
+    /// Every letter [`relkind_name`] is written to answer for, plus the
+    /// catch-all a letter this module has not met yet falls through to — a
+    /// wildcard on an enum PostgreSQL can extend without notice is the
+    /// deliberate exception, not an oversight.
+    #[test]
+    fn every_relkind_this_module_expects_to_meet_has_a_name() {
+        for (letter, expected) in [
+            ("v", "a view"),
+            ("m", "a materialized view"),
+            ("i", "an index"),
+            ("I", "a partitioned index"),
+            ("S", "a sequence"),
+            ("c", "a composite type"),
+            ("t", "a TOAST table"),
+            ("f", "a foreign table"),
+            ("p", "a partitioned table"),
+        ] {
+            assert_eq!(relkind_name(letter), expected, "relkind `{letter}`");
+        }
+        assert_eq!(
+            relkind_name("?"),
+            "a relation of a kind pbps does not expect there"
+        );
     }
 }
