@@ -915,6 +915,93 @@ impl Dialect for Postgres {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn planned_required_add_uses_postgres_default_identifier_boundaries() {
+        use pbps_model::{Column, Hints, IdsFile, RiskClass, Schema, Table, TableName};
+
+        let table = TableName::new("app", "t");
+        let mut base = Schema::default();
+        base.tables.insert(table.clone(), Table::default());
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-09-12".into(),
+        };
+        let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &context)
+            .unwrap()
+            .ids;
+        for (default, risky) in [
+            (Some("zz.null\u{301}x()"), false),
+            (None, true),
+            (Some("NULL"), true),
+        ] {
+            let mut declared = base.clone();
+            let mut column = Column::new("integer".parse().unwrap()).not_null();
+            column.default = default.map(str::to_owned);
+            declared
+                .tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .insert("added".into(), column);
+            let ids = pbps_diff::resolve(&declared, &base_ids, &[], &context)
+                .unwrap()
+                .ids;
+            let changes = pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                pbps_diff::Side {
+                    schema: &declared,
+                    ids: &ids,
+                },
+                &super::Postgres::new(),
+                &Hints::default(),
+            )
+            .unwrap();
+            assert_eq!(changes.changes.len(), 1);
+            assert_eq!(
+                changes.changes[0].risks.contains(&RiskClass::NotNull),
+                risky,
+                "{default:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_add_risks_follow_the_dialects_identifier_boundary() {
+        use pbps_dialect::{Dialect, MinimalDialect};
+        use pbps_model::{Change, Column, RiskClass, Uid, UidKind};
+
+        for (default, pg_risky) in [
+            (Some("zz.null\u{301}x()"), false),
+            (None, true),
+            (Some("NULL"), true),
+        ] {
+            let mut column = Column::new("integer".parse().unwrap()).not_null();
+            column.default = default.map(str::to_owned);
+            let change = Change::AddColumn {
+                uid: Uid::generate(UidKind::Column),
+                table: "app.t".parse().unwrap(),
+                name: "added".into(),
+                column: Box::new(column),
+            };
+            assert_eq!(
+                super::Postgres::new()
+                    .change_risks(&change)
+                    .contains(&RiskClass::NotNull),
+                pg_risky,
+                "{default:?}"
+            );
+            assert!(
+                MinimalDialect
+                    .change_risks(&change)
+                    .contains(&RiskClass::NotNull),
+                "{default:?}"
+            );
+            assert!(change.intrinsic_risks().contains(&RiskClass::NotNull));
+        }
+    }
     use super::*;
 
     #[test]
