@@ -1592,6 +1592,79 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+/// DECISIONS 444 moved the refusal to shared identity adoption. The catalog
+/// must preserve the engine's separate parts until that boundary; splitting
+/// them early would make a different, apparently representable name.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn pull_refuses_dotted_engine_names_before_writing_declarations_or_ids() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    for (kind, schema, table, column) in [
+        ("schema", "schema.dot", "parent", "id"),
+        ("table", "dbo", "table.dot", "id"),
+        ("column", "dbo", "parent", "column.dot"),
+    ] {
+        let own = OwnDatabase::new(&server, &format!("dotted_{kind}"));
+        if schema != "dbo" {
+            on_server(own.connection(), &format!("CREATE SCHEMA [{schema}];"));
+        }
+        // Exercise the same names as key/index members and as the referenced
+        // end of a foreign key, not only as a standalone catalog table.
+        on_server(
+            own.connection(),
+            &format!(
+                "CREATE TABLE [{schema}].[{table}] ([{column}] int NOT NULL PRIMARY KEY);
+                 CREATE INDEX ix_parent ON [{schema}].[{table}] ([{column}]);
+                 CREATE TABLE dbo.child (id int REFERENCES [{schema}].[{table}] ([{column}]));"
+            ),
+        );
+        let d = Demo::new(&format!("dotted-pull-{kind}"));
+        let config_before = std::fs::read(d.dir.join("pbps.yml")).unwrap();
+        let output = d.run(&["pull", "--db", own.connection()]);
+        assert_eq!(code(&output), 1, "{}", stderr(&output));
+        let error = stderr(&output);
+        assert!(error.contains(&format!("{kind} `{kind}.dot`")), "{error}");
+        assert!(error.contains("cannot mint an identity"), "{error}");
+        assert!(error.contains(&format!("rename the {kind}")), "{error}");
+        assert!(error.contains("pull could not mint identities"), "{error}");
+        assert_eq!(std::fs::read_dir(d.dir.join("schema")).unwrap().count(), 0);
+        assert!(!d.ids_path().exists());
+        assert_eq!(
+            std::fs::read(d.dir.join("pbps.yml")).unwrap(),
+            config_before
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn pull_round_trips_ordinary_engine_names_without_a_name_warning() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "ordinary_names");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.parent (id int NOT NULL PRIMARY KEY);
+         CREATE INDEX [ix.parent] ON dbo.parent (id);
+         CREATE TABLE dbo.child (id int, CONSTRAINT [fk.parent] FOREIGN KEY (id) REFERENCES dbo.parent (id));",
+    );
+    let d = Demo::new("ordinary-names-pull");
+    let output = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    // Constraint/index names are plain mapping keys, not dot-joined identity
+    // segments; refusing their dots would reject a format that already works.
+    let parent = std::fs::read_to_string(d.dir.join("schema/dbo.parent.yml")).unwrap();
+    let child = std::fs::read_to_string(d.dir.join("schema/dbo.child.yml")).unwrap();
+    assert!(parent.contains("ix.parent"), "{parent}");
+    assert!(child.contains("fk.parent"), "{child}");
+    let ids: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(d.ids_path()).unwrap()).unwrap();
+    assert_eq!(ids.tables.len(), 2);
+    assert_eq!(ids.columns.len(), 2);
+    let validate = d.run(&["validate"]);
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
+}
+
 // ---- pull (the paths that need no database) ----
 
 /// pull must never clobber an existing project by accident: the connection is
