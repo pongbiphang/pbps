@@ -235,7 +235,7 @@ async fn walk(
         }
         // An UPDATE that can change a partition key moves the row instead of
         // updating it, and a movement is a DELETE on the partition it leaves
-        // and an INSERT on the one it lands in (DECISIONS 449).
+        // and an INSERT on the one it lands in (DECISIONS 451).
         if statement.event == UPDATE && !statement.rows_only && can_move(conn, &statement).await? {
             queue.extend([DELETE, INSERT].map(|event| Statement {
                 relation: statement.relation,

@@ -907,7 +907,7 @@ pub async fn prepare_data_writes(
                 }
                 // Both are ordered ahead of every row change, so the
                 // referential action they carry cannot write when the row
-                // statement runs (DECISIONS 449).
+                // statement runs (DECISIONS 451).
                 if let Change::DropForeignKey { table, name } = &planned.change
                     && let Some(old) = stored(table)
                 {
