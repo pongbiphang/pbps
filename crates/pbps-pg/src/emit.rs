@@ -4950,6 +4950,15 @@ mod tests {
             key_column: "code".to_owned(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            dropped: [
+                (
+                    "label".to_owned(),
+                    Cell::Value(Value::Text("Dropped baseline".into())),
+                ),
+                ("dropped_only".to_owned(), Cell::Value(Value::Null)),
+            ]
+            .into_iter()
+            .collect(),
             row: [
                 ("label".to_owned(), Cell::Value(Value::Text("Old".into()))),
                 ("rank".to_owned(), Cell::Value(Value::Null)),
@@ -4967,7 +4976,16 @@ mod tests {
             .collect(),
             after_types: BTreeMap::new(),
         };
+        let json = serde_json::to_value(&change).unwrap();
+        assert_eq!(
+            json["dropped"]["label"]["value"]["text"],
+            "Dropped baseline"
+        );
+        assert_eq!(json["row"]["label"]["value"]["text"], "Old");
+        assert_eq!(serde_json::from_value::<Change>(json).unwrap(), change);
         let sql = sql_of(&Postgres::new(), &change).join("\n");
+        assert!(!sql.contains("Dropped baseline"), "{sql}");
+        assert!(!sql.contains("dropped_only"), "{sql}");
         assert!(sql.contains("FOR UPDATE;"), "{sql}");
         assert!(sql.contains("DELETE FROM \"app\".\"status\""), "{sql}");
         assert!(sql.contains("\"code\" = E'old'"), "{sql}");

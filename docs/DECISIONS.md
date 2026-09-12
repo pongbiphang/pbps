@@ -9824,3 +9824,27 @@ SPEC is in sync with all of these.
     `CREATE TABLE dbo.__pbps_state`, which then fails loudly — measured,
     `Msg 2714: There is already an object named '__pbps_state' in the
     database.` — rather than skip. No corresponding change was made there.
+
+442. **Deleted rows carry dropped baseline cells in a separate review map.**
+    The UID intersection used to compare rows contains surviving columns only,
+    so it cannot supply the cells of columns this plan drops (#126). Adding
+    those cells to `DeleteRow::row` under their baseline names is ambiguous:
+    an environment can skip a revision that drops `note`, then deploy a later
+    revision that renames surviving `label` to `note`. The deleted row has two
+    different baseline values that would occupy the same map key. A new column
+    reusing a dropped name likewise has no claim to the old column's cell.
+
+    `DeleteRow::dropped` therefore carries dropped cells under their baseline
+    names for review only; `row`, `types` and `after_types` keep their existing
+    surviving-column names and predicate semantics (143, 149). Both values can
+    be serialized without a decorated name or an overwritten predicate cell.
+    Emitters never inspect `dropped`. Primary keys remain separate and non-key
+    identity values remain engine-owned, as in the existing row guards.
+
+    The saved-plan version moves from 7 to 8 because older `Change` readers
+    deny unknown fields. The new field defaults to an empty map, so changes
+    with no dropped cells remain compact. The state and ids formats do not
+    change. Regressions resolve the intermediate declaration revisions before
+    diffing the original baseline against the final state, pin both name-reuse
+    cases, and require both dialects to ignore dropped cells even when their
+    names coincide with surviving predicate cells.

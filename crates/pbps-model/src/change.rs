@@ -429,6 +429,12 @@ pub enum Change {
         /// (DECISIONS 143). Absent from older plans, which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         row: BTreeMap<String, Cell>,
+        /// Baseline cells of columns this plan drops, keyed by their baseline
+        /// names for review only. These names can also belong to surviving
+        /// renamed columns in `row`, so the maps must remain separate. No
+        /// emitter may build a predicate from this map (DECISIONS 442).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        dropped: BTreeMap<String, Cell>,
         /// The type each recorded cell was read by, so the predicate compares
         /// it the way the read-back rendered it (122). A cell whose type has
         /// no comparison — `xml`, `text`, the spatial types — is carried but

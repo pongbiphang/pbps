@@ -1005,13 +1005,8 @@ fn diff_data(
                     // the engine can turn the first into the second
                     // (DECISIONS 149, where 146 held nothing at all).
                     //
-                    // Only for a column the declaration still has.
-                    // `base_name_of` is keyed by the ids file, which still
-                    // names a column this plan drops: that column is gone by
-                    // the time the `DELETE` runs, so it gets no type and the
-                    // emitter builds no predicate on it. The cell stays in
-                    // `row`, where the reviewer can still read what the
-                    // baseline held.
+                    // Only surviving identities have predicate types. Dropped
+                    // columns are carried separately under their base names.
                     let Some(declared_ty) = declared.columns.get(declared_column).map(|d| &d.ty)
                     else {
                         continue;
@@ -1021,12 +1016,28 @@ fn diff_data(
                         after_types.insert(declared_column.clone(), declared_ty.clone());
                     }
                 }
+                // The UID intersection above deliberately has no name for a
+                // dropped column. Keep its baseline cell for review under the
+                // only name it had, without inventing a declared identity or
+                // a predicate on a column that is already gone. A historical
+                // rename may reuse this base name for a surviving column, so
+                // reviewer-only cells need their own map (DECISIONS 442).
+                let mut dropped = BTreeMap::new();
+                for (base_column, spec) in &base.columns {
+                    if spec.identity.is_some()
+                        || base_name_of.values().any(|name| name == base_column)
+                    {
+                        continue;
+                    }
+                    dropped.insert(base_column.clone(), cell(before, base_column, Some(spec)));
+                }
                 changes.push(Change::DeleteRow {
                     table: name.clone(),
                     key_column: key_column.clone(),
                     key: key.clone(),
                     cause: DeleteCause::Undeclared,
                     row,
+                    dropped,
                     types,
                     after_types,
                 });
@@ -2814,11 +2825,16 @@ mod tests {
             },
         ];
         let cs = run(&base, &declared, &intents);
-        let (row, _) = cs
+        let (row, types, dropped) = cs
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow { row, types, .. } => Some((row, types)),
+                Change::DeleteRow {
+                    row,
+                    types,
+                    dropped,
+                    ..
+                } => Some((row, types, dropped)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
@@ -2829,6 +2845,220 @@ mod tests {
         );
         assert!(!row.contains_key("label"), "{row:?}");
         assert!(!row.contains_key("note"), "{row:?}");
+        assert_eq!(
+            dropped.get("note"),
+            Some(&pbps_model::Cell::Value(Value::Text("dropped".to_owned()))),
+            "the dropped cell remains visible to the reviewer: {row:?}"
+        );
+        assert!(
+            !types.contains_key("note"),
+            "a dropped column cannot be held: {types:?}"
+        );
+        assert!(
+            types.contains_key("caption"),
+            "the renamed survivor is still held: {types:?}"
+        );
+        assert!(
+            !row.contains_key("code"),
+            "the primary key is carried separately: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_replaced_column_keeps_its_deleted_rows_baseline_cell() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut intermediate = declared.clone();
+        intermediate
+            .tables
+            .get_mut(&"dbo.s".parse().unwrap())
+            .unwrap()
+            .columns
+            .shift_remove("label");
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.label".parse().unwrap(),
+                reason: "replace".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(&declared, &intermediate_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(cs.changes.iter().any(
+            |p| matches!(&p.change, Change::DropColumn { column, .. } if column.name == "label")
+        ));
+        assert!(
+            cs.changes
+                .iter()
+                .any(|p| matches!(&p.change, Change::AddColumn { name, .. } if name == "label"))
+        );
+        let (row, types, dropped) = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow {
+                    row,
+                    types,
+                    dropped,
+                    ..
+                } => Some((row, types, dropped)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            dropped.get("label"),
+            Some(&pbps_model::Cell::Value(Value::Text("Old".into())))
+        );
+        assert!(!types.contains_key("label"));
+        assert!(!row.contains_key("label"));
+    }
+
+    #[test]
+    fn a_historical_drop_then_rename_can_reuse_a_baseline_cell_name() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "note".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let (row, types, dropped) = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow {
+                    row,
+                    types,
+                    dropped,
+                    ..
+                } => Some((row, types, dropped)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            row.get("note"),
+            Some(&pbps_model::Cell::Value(Value::Text("surviving".into())))
+        );
+        assert!(types.contains_key("note"));
+        assert_eq!(
+            dropped.get("note"),
+            Some(&pbps_model::Cell::Value(Value::Text("dropped".into())))
+        );
+    }
+
+    #[test]
+    fn a_single_revision_cannot_rename_into_an_occupied_baseline_name() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let errors = crate::resolve(
+            &declared,
+            &base_ids,
+            &[
+                Intent::DropColumn {
+                    column: "dbo.s.note".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+                Intent::RenameColumn {
+                    table: "dbo.s".parse().unwrap(),
+                    from: "label".into(),
+                    to: "note".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| matches!(error, crate::Blocker::RenameTargetExists { target } if target == "dbo.s.note")), "{errors:?}");
     }
 
     /// And the same for a delete: `AlterColumnType` sorts before the row

@@ -2923,6 +2923,15 @@ mod tests {
             key_column: "code".to_owned(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            dropped: [
+                (
+                    "label".to_owned(),
+                    Cell::Value(Value::Text("Dropped baseline".into())),
+                ),
+                ("dropped_only".to_owned(), Cell::Value(Value::Null)),
+            ]
+            .into_iter()
+            .collect(),
             row: [
                 (
                     "label".to_owned(),
@@ -2946,6 +2955,8 @@ mod tests {
             after_types: Default::default(),
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(!sql[0].contains("Dropped baseline"), "{sql:?}");
+        assert!(!sql[0].contains("dropped_only"), "{sql:?}");
         let sql = &sql[0];
         assert!(
             sql.contains("DELETE FROM [dbo].[order_status] WHERE [code] = N'old' AND "),
@@ -2967,6 +2978,7 @@ mod tests {
             key_column: "code".to_owned(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            dropped: Default::default(),
             row: BTreeMap::new(),
             types: BTreeMap::new(),
             after_types: Default::default(),
@@ -3231,6 +3243,7 @@ mod tests {
                 key_column: "code".to_owned(),
                 key: RowKey::from("a"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: Default::default(),
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
                 after_types: Default::default(),
