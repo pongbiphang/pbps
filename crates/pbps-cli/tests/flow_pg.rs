@@ -4679,6 +4679,63 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
             false,
         ),
         (
+            "a_partition_the_action_moves_a_row_out_of",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY LIST (ukey); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES IN ('k1'); \
+                    CREATE TABLE {{s}}.there PARTITION OF {{s}}.c FOR VALUES IN ('k2'); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.here FOR EACH ROW EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "a_partition_the_action_moves_a_row_into",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY LIST (ukey); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES IN ('k1'); \
+                    CREATE TABLE {{s}}.there PARTITION OF {{s}}.c FOR VALUES IN ('k2'); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook BEFORE INSERT ON {{s}}.there FOR EACH ROW EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "a_statement_level_delete_trigger_no_movement_fires",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY LIST (ukey); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES IN ('k1'); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.c FOR EACH STATEMENT EXECUTE FUNCTION public.hook(); \
+                    CREATE TRIGGER also AFTER DELETE ON {{s}}.here FOR EACH STATEMENT EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "a_partition_key_the_action_does_not_write",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text, note text) PARTITION BY LIST (note); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES IN ('a'); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER DELETE ON {{s}}.here FOR EACH ROW EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            false,
+        ),
+        (
+            "the_named_table_moves_its_own_row",
+            "CREATE TABLE {s}.p(code text, ukey text, other text, label text) PARTITION BY LIST (ukey); \
+             CREATE TABLE {s}.here PARTITION OF {s}.p FOR VALUES IN ('k1'); \
+             CREATE TRIGGER hook AFTER DELETE ON {s}.here FOR EACH ROW EXECUTE FUNCTION public.hook()"
+                .to_owned(),
+            update(&["ukey"]),
+            true,
+        ),
+        (
+            "the_named_table_stays_where_it_is",
+            "CREATE TABLE {s}.p(code text, ukey text, other text, label text) PARTITION BY LIST (label); \
+             CREATE TABLE {s}.here PARTITION OF {s}.p FOR VALUES IN ('a'); \
+             CREATE TRIGGER hook AFTER DELETE ON {s}.here FOR EACH ROW EXECUTE FUNCTION public.hook()"
+                .to_owned(),
+            update(&["ukey"]),
+            false,
+        ),
+        (
             "a_generated_referenced_column_of_a_set_column",
             "CREATE TABLE {s}.p(code text PRIMARY KEY, label text, ukey text GENERATED ALWAYS AS (upper(label)) STORED UNIQUE); \
                     CREATE TABLE {s}.c(id int PRIMARY KEY, ukey text REFERENCES {s}.p(ukey) ON UPDATE CASCADE); \

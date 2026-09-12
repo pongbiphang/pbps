@@ -130,6 +130,9 @@ struct Statement {
     /// and deletes partitions of the referencing table but never a plain
     /// inheritance descendant, while the emitted row statement reaches both.
     partitions_only: bool,
+    /// The DELETE and INSERT halves of a cross-partition row movement, which
+    /// are row-level events of an UPDATE and not statements of their own.
+    rows_only: bool,
 }
 
 /// Every trigger the write can fire, with the tables holding them locked.
@@ -201,6 +204,7 @@ async fn walk(
             RowOperation::Insert | RowOperation::Delete => BTreeSet::new(),
         },
         partitions_only: false,
+        rows_only: false,
     }]);
     let mut done = BTreeSet::new();
     let mut locked = BTreeSet::from([named]);
@@ -222,9 +226,23 @@ async fn walk(
                 }),
         );
         // An INSERT fires no referential action: the row it adds is the one a
-        // foreign key checks, never one another row already refers to.
-        if statement.event != INSERT {
+        // foreign key checks, never one another row already refers to. Neither
+        // half of a row movement fires one either: measured on 18.6, a moved
+        // row's referencing rows are cascaded as an UPDATE, not deleted.
+        if statement.event != INSERT && !statement.rows_only {
             queue.extend(read_actions(conn, &statement, dropped).await?);
+        }
+        // An UPDATE that can change a partition key moves the row instead of
+        // updating it, and a movement is a DELETE on the partition it leaves
+        // and an INSERT on the one it lands in (DECISIONS 449).
+        if statement.event == UPDATE && !statement.rows_only && can_move(conn, &statement).await? {
+            queue.extend([DELETE, INSERT].map(|event| Statement {
+                relation: statement.relation,
+                event,
+                columns: BTreeSet::new(),
+                partitions_only: statement.partitions_only,
+                rows_only: true,
+            }));
         }
     }
     Ok(triggers)
@@ -359,7 +377,7 @@ async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Tri
                    SELECT 1 FROM touched
                    WHERE touched.attrelid = t.tgrelid AND touched.attnum = ANY(t.tgattr)
                ))
-               AND (t.tgrelid = {relation}::pg_catalog.oid OR (t.tgtype & 1) <> 0)
+               AND {named}
                AND (t.tgenabled = 'A' OR t.tgenabled =
                     CASE WHEN pg_catalog.current_setting('session_replication_role') = 'replica'
                          THEN 'R' ELSE 'O' END)
@@ -367,7 +385,17 @@ async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Tri
             ctes = reached(statement),
             events = statement.event,
             update = UPDATE,
-            relation = statement.relation,
+            named = if statement.rows_only {
+                // Measured on 18.6: a movement fires the partitions' row
+                // triggers and no statement-level DELETE or INSERT trigger at
+                // all, on the partition or on the table the statement names.
+                "(t.tgtype & 1) <> 0".to_owned()
+            } else {
+                format!(
+                    "(t.tgrelid = {}::pg_catalog.oid OR (t.tgtype & 1) <> 0)",
+                    statement.relation
+                )
+            },
         ))
         .await?;
     rows.iter()
@@ -389,6 +417,35 @@ async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Tri
             })
         })
         .collect()
+}
+
+/// Whether this UPDATE can move a row from one partition to another.
+///
+/// Measured on PostgreSQL 18.6, a move fires the row-level BEFORE and AFTER
+/// DELETE triggers of the partition the row leaves and the row-level INSERT
+/// triggers of the one it lands in, and no UPDATE trigger at all. A partition
+/// key written as an expression is taken as always movable: which columns feed
+/// it is a question this tool does not parse (DECISIONS 174).
+async fn can_move(conn: &mut Conn, statement: &Statement) -> Result<bool, DbError> {
+    let rows = conn
+        .query(&format!(
+            "{ctes}
+             SELECT EXISTS (
+                 SELECT 1 FROM relations r
+                 JOIN pg_catalog.pg_partitioned_table part ON part.partrelid = r.oid
+                 WHERE 0 = ANY(part.partattrs) OR EXISTS (
+                     SELECT 1 FROM touched
+                     WHERE touched.attrelid = part.partrelid
+                       AND touched.attnum = ANY(part.partattrs)
+                 )
+             ) AS movable",
+            ctes = reached(statement),
+        ))
+        .await?;
+    rows.first()
+        .and_then(|row| row.try_get::<bool>("movable").transpose())
+        .transpose()?
+        .ok_or_else(missing)
 }
 
 /// The statements PostgreSQL runs itself for this one's referential actions.
@@ -544,6 +601,7 @@ async fn read_actions(
             event,
             columns,
             partitions_only: true,
+            rows_only: false,
         })
         .collect())
 }

@@ -10393,6 +10393,20 @@ SPEC is in sync with all of these.
        is read exactly as the trigger scan reads one: a `BEFORE UPDATE OF code`
        trigger does not run for a statement that sets `ukey`, so it rewrites
        nothing and widens nothing.
+     - An UPDATE that can change a partition key does not update the row: it
+       moves it. Measured on 18.6, the move fires the row-level BEFORE and
+       AFTER **DELETE** triggers of the partition the row leaves and the
+       row-level **INSERT** triggers of the one it lands in, no UPDATE trigger
+       at all, and no statement-level DELETE or INSERT trigger anywhere. So an
+       update statement whose columns reach a partition key carries two more
+       events, row-level only, over the partitions it reaches — and that is
+       true of the emitted row statement as much as of an action's, which is
+       how 445's own guard turned out to have this gap for a declared
+       partitioned table. The halves produce no referential actions of their
+       own: measured, a moved row's children are cascaded as an UPDATE and not
+       deleted. A partition key written as an expression counts as always
+       movable, because which columns feed it is a question this tool does not
+       parse (174).
      - The action's statement runs even when it matches no row, so a
        statement-level trigger on the referencing table fires with zero
        referencing rows. This is why the delete side is guarded at all: the
@@ -10473,7 +10487,10 @@ SPEC is in sync with all of these.
      writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
      cascade-reached table blocked until the write commits; the cannot-lock
      refusal naming its table; and the removals and the two not-firing actions,
-     each paired with the state in which the same closure does follow it; and
+     each paired with the state in which the same closure does follow it; the
+     partitions a row movement leaves and lands in, against the partition key
+     the write does not touch and the statement-level trigger no movement
+     fires, on an action's target and on the named table alike; and
      the key a BEFORE trigger rewrites, with the engine's own behaviour
      asserted first and the trigger doing the rewriting recorded and approved,
      so the refusal can only be the table its cascade reaches. They
