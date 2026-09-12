@@ -9017,6 +9017,115 @@ fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
 
 // ---- SPEC safety invariant repairs ----
 
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn deliberately_unbuilt_constraint_is_reported_as_unchecked() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("unbuilt-probe");
+    let declaration = "table: dbo.pbps_unbuilt_probe\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_unbuilt_probe, columns: [code]}\n";
+    d.table(&format!(
+        "{declaration}data:\n  mode: ensure\n  rows: {{}}\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    rt.block_on(async {
+        let mut conn = connect_live(&connection).await.unwrap();
+        conn.execute(
+            "DROP TABLE IF EXISTS dbo.__pbps_lock; DROP TABLE IF EXISTS dbo.__pbps_state; \
+             DROP TABLE IF EXISTS dbo.pbps_unbuilt_probe; \
+             CREATE TABLE dbo.pbps_unbuilt_probe (code varchar(20) NOT NULL CONSTRAINT pk_unbuilt_probe PRIMARY KEY);"
+        ).await.unwrap();
+    });
+    let baseline = d.run(&["baseline", "--db", &connection, "--reason", "test"]);
+    assert_eq!(code(&baseline), 0, "{}", stderr(&baseline));
+
+    for skipped in [false, true] {
+        let indexes = if skipped {
+            "indexes:\n  ix_ordinary: {columns: [code], unique: true}\n  ix_unchecked: {columns: [code], unique: true, where: 'code IS NOT NULL'}\n"
+        } else {
+            "indexes:\n  ix_ordinary: {columns: [code], unique: true}\n"
+        };
+        let rows = if skipped {
+            "    next: {}\n"
+        } else {
+            "    {}\n"
+        };
+        d.table(&format!(
+            "{declaration}{indexes}data:\n  mode: ensure\n  rows:\n{rows}"
+        ));
+        let preview = d.run(&["plan"]);
+        assert_eq!(
+            code(&preview),
+            0,
+            "{}{}",
+            stdout(&preview),
+            stderr(&preview)
+        );
+        let path = d.dir.join("apply.json");
+        let made = d.run(&["plan", "--db", &connection, "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&made), 0, "{}", stderr(&made));
+        let applied = d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "constraint",
+        ]);
+        assert_eq!(
+            code(&applied),
+            0,
+            "{}{}",
+            stdout(&applied),
+            stderr(&applied)
+        );
+        if skipped {
+            assert!(
+                stderr(&applied).contains("could not check new unique index ix_unchecked"),
+                "{}",
+                stderr(&applied)
+            );
+            assert!(
+                stdout(&applied).contains("1 probe(s) could not be checked here"),
+                "{}",
+                stdout(&applied)
+            );
+            assert!(
+                !stdout(&applied).contains("probe(s) passed"),
+                "{}",
+                stdout(&applied)
+            );
+        } else {
+            assert!(
+                stdout(&applied).contains("1 probe(s) passed"),
+                "{}",
+                stdout(&applied)
+            );
+            assert!(
+                !stdout(&applied).contains("could not be checked"),
+                "{}",
+                stdout(&applied)
+            );
+            assert!(
+                !stderr(&applied).contains("could not check"),
+                "{}",
+                stderr(&applied)
+            );
+        }
+    }
+    rt.block_on(async {
+        let mut conn = connect_live(&connection).await.unwrap();
+        conn.execute("DROP TABLE dbo.pbps_unbuilt_probe; DROP TABLE dbo.__pbps_state; DROP TABLE dbo.__pbps_lock;").await.unwrap();
+    });
+}
+
 /// Recording a baseline or snapshot changes the authoritative state every
 /// later plan compares against, so it must respect the deployment lock just as
 /// apply does. Otherwise a snapshot can bless the half-built schema between two
