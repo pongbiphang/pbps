@@ -200,7 +200,7 @@ jobs:
       # is that the probes are answered under the settings the statements they
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
-      - run: cargo test -p pbps-cli --bin pbps -- --ignored
+      - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
       # The CLI end to end on this engine (issue #85): `bootstrap`, `verify`,
       # `plan --db`, `apply`, `state list`, `pull`, `doctor`, each through the
       # seam in `engine.rs`. Serial, because each test creates and drops a
