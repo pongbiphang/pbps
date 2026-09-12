@@ -12140,11 +12140,9 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
 /// stored value cannot make the trip and the rest can.
 ///
 /// `numeric(20,0)` into `integer`, so that the `AlterColumnType` change's own
-/// conversion probe (387) exists to name the offending row — this is one of
-/// the pairs `types::cannot_become` names, unlike a plain `bigint` into
-/// `integer`, which this catalogue leaves to the "narrows without a row to
-/// point at" default (a gap of its own, tracked separately, and not this
-/// issue's). **Measured**, an explicit `CAST` does not save an out-of-range
+/// conversion probe (387) exists to name the offending row. The integer
+/// source pairs are covered by the sibling regression for issue #429.
+/// **Measured**, an explicit `CAST` does not save an out-of-range
 /// value here either — `CAST(5000000000::numeric(20,0) AS integer)` raises
 /// `22003`, the same `SQLSTATE` the `ALTER` itself refuses with. A probe built
 /// by projecting the stored value straight through `converted`'s `CAST` would
@@ -12165,14 +12163,35 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_through_a_raising_cast()
 {
-    let mut conn = TestDb::create("pull_data_narrowedkey").await;
+    narrowed_integer_key("numeric(20,0)", "integer", 5000000000).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn integer_narrowing_key_probes_exclude_overflow_but_keep_fitting_orphans() {
+    for (from, to, overflow) in [
+        ("bigint", "integer", 2147483648_i64),
+        ("bigint", "smallint", 32768),
+        ("integer", "smallint", 32768),
+    ] {
+        narrowed_integer_key(from, to, overflow).await;
+    }
+}
+
+async fn narrowed_integer_key(from: &str, to: &str, overflow: i64) {
+    let tag = if from == "numeric(20,0)" {
+        "pull_data_narrowedkey"
+    } else {
+        "pull_data_narrowedintegerkey"
+    };
+    let mut conn = TestDb::create(tag).await;
     let s = data_schema("narrowedkey");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
         "CREATE TABLE {s}.parent (code bigint PRIMARY KEY, label text);
-         CREATE TABLE {s}.child (code text PRIMARY KEY, parent numeric(20,0));
-         INSERT INTO {s}.parent VALUES (5000000000, 'Old'), (2, 'Keep');
-         INSERT INTO {s}.child VALUES ('c1', 5000000000);"
+         CREATE TABLE {s}.child (code text PRIMARY KEY, parent {from});
+         INSERT INTO {s}.parent VALUES ({overflow}, 'Old'), (2, 'Keep');
+         INSERT INTO {s}.child VALUES ('c1', {overflow});"
     ))
     .await
     .expect("the fixture");
@@ -12182,13 +12201,13 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
     // (387) — takes it.
     let narrowing = conn
         .execute(&format!(
-            "ALTER TABLE {s}.child ALTER COLUMN parent TYPE integer"
+            "ALTER TABLE {s}.child ALTER COLUMN parent TYPE {to}"
         ))
         .await
         .expect_err("the stored value does not fit the narrower type");
     assert_eq!(sqlstate(&narrowing), "22003", "{narrowing:?}");
     let cast = conn
-        .execute("SELECT CAST(5000000000::numeric(20,0) AS integer)")
+        .execute(&format!("SELECT CAST({overflow}::{from} AS {to})"))
         .await
         .expect_err("an explicit CAST does not save an out-of-range integer either");
     assert_eq!(sqlstate(&cast), "22003", "{cast:?}");
@@ -12215,9 +12234,7 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
     child
         .columns
         .insert("code".into(), Column::new(ty("text")).not_null());
-    child
-        .columns
-        .insert("parent".into(), Column::new(ty("integer")));
+    child.columns.insert("parent".into(), Column::new(ty(to)));
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
@@ -12237,7 +12254,7 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
     // `c1` is not declared reference data — it stays an ordinary stored row
     // this plan does not itself write, exactly as the protected sibling test
     // above leaves its child table. Declaring it would ask the plan to
-    // rewrite the literal `5000000000` as an `integer`, which cannot hold it
+    // rewrite the overflowing literal as the target type, which cannot hold it
     // either — a different, real hazard, and not the one this test is about.
     let mut declared = Schema::default();
     declared.tables.insert(parent_name, parent);
@@ -12276,8 +12293,8 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
         probes
             .iter()
             .any(|p| p.description.contains(has_its_own_probe)
-                && p.sql.contains("CAST(ch.\"parent\" AS integer)")
-                && p.sql.contains("AND NOT (round(")),
+                && p.sql.contains(&format!("CAST(ch.\"parent\" AS {to})"))
+                && p.sql.contains("AND NOT (")),
         "a narrowing key still gets its own probe, carrying a plain CAST \
          and an exclusion for the row it would raise on: {probes:#?}"
     );
@@ -12306,6 +12323,25 @@ async fn a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_thro
         "the row the delete would have orphaned is exactly the one the \
          narrower type cannot hold: {named:#?}"
     );
+
+    // A fitting orphan must still be counted beside the overflowing row.
+    conn.execute(&format!(
+        "INSERT INTO {s}.parent VALUES (3, 'Also removed');
+         INSERT INTO {s}.child VALUES ('c2', 3), ('c3', NULL);"
+    ))
+    .await
+    .expect("a fitting orphan and a nullable key");
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let named = counts(&mut conn, &cs).await;
+    assert_eq!(one(&named, "cannot become"), 1, "{from} -> {to}");
+    let key_counts: Vec<_> = named
+        .iter()
+        .filter(|(description, _)| description.contains(has_its_own_probe))
+        .map(|(_, count)| *count)
+        .collect();
+    assert_eq!(key_counts.len(), 2, "one key probe per deleted parent");
+    assert_eq!(key_counts.iter().sum::<i64>(), 1, "{from} -> {to}");
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
@@ -18155,6 +18191,65 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
         }
     }
 
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// Integer target endpoints convert exactly; their immediate neighbors fail.
+/// NULL must never inflate the conversion count (SPEC 7.5).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("integerbounds");
+    fresh(&mut conn, &s).await;
+    for (from, to, min, max) in [
+        ("bigint", "integer", -2147483648_i64, 2147483647_i64),
+        ("bigint", "smallint", -32768, 32767),
+        ("integer", "smallint", -32768, 32767),
+    ] {
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: TableName::new(&s, "t").column("v"),
+                from: ty(from),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+            })],
+        };
+        for (value, rejected) in [(min - 1, true), (min, false), (max, false), (max + 1, true)] {
+            conn.execute(&format!(
+                "CREATE TABLE {s}.t (v {from}); INSERT INTO {s}.t VALUES ({value}), (NULL);"
+            ))
+            .await
+            .expect("boundary and NULL fixture");
+            assert_eq!(
+                one(&counts(&mut conn, &cs).await, "cannot become"),
+                i64::from(rejected),
+                "{from} -> {to}: {value}"
+            );
+            let altered = conn
+                .execute(&format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE {to}"))
+                .await;
+            if rejected {
+                let error = altered.expect_err("the adjacent value is out of range");
+                assert_eq!(
+                    sqlstate(&error),
+                    "22003",
+                    "{from} -> {to}: {value}: {error:?}"
+                );
+            } else {
+                altered.expect("the target endpoint is accepted");
+            }
+            conn.execute(&format!("DROP TABLE {s}.t"))
+                .await
+                .expect("drop boundary fixture");
+        }
+    }
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");

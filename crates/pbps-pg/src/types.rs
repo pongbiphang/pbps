@@ -1298,6 +1298,14 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
             Some(format!("length(rtrim(({value})::text, ' ')) > {n}"))
         }
 
+        // Integer assignment keeps the value exactly: measured on 18.6,
+        // both target endpoints fit and the adjacent integers raise 22003.
+        // Compare in the source domain so the probe cannot itself overflow.
+        (Family::Exact(Exact::Integer { .. }), Family::Exact(Exact::Integer { max })) => {
+            let min = -max - 1;
+            Some(format!("{value} > {max} OR {value} < {min}"))
+        }
+
         // An integer target. The engine tests the value it would *store*, so
         // the test is on the rounded one: measured, `2147483647.4` into
         // `integer` is accepted and `2147483647.6` is `integer out of range`.
@@ -2374,6 +2382,23 @@ mod tests {
         normalize(&ty(s))
             .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
             .to_string()
+    }
+
+    #[test]
+    fn integer_narrowing_probes_use_target_bounds_and_widening_needs_none() {
+        for (from, to, min, max) in [
+            ("bigint", "integer", -2147483648_i64, 2147483647_i64),
+            ("bigint", "smallint", -32768, 32767),
+            ("integer", "smallint", -32768, 32767),
+        ] {
+            assert_eq!(
+                cannot_become(&ty(from), &ty(to), "\"v\""),
+                Some(format!("\"v\" > {max} OR \"v\" < {min}")),
+                "{from} -> {to}"
+            );
+            assert_eq!(cannot_become(&ty(to), &ty(from), "\"v\""), None);
+            assert_eq!(cannot_become(&ty(from), &ty(from), "\"v\""), None);
+        }
     }
 
     /// DECISIONS 411: a float's boundary is tested as a float.
