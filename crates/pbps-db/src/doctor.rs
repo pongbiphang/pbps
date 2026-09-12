@@ -29,11 +29,28 @@ pub struct Ask<'a> {
     pub managed_tables: &'a [ObjectName],
     /// Foreign-key targets outside the managed schemas.
     pub referenced: &'a [ObjectName],
+    /// The columns a declared key names on each of `referenced`'s targets —
+    /// the union across every key that points there.
+    ///
+    /// PostgreSQL grants `SELECT` and `REFERENCES` per column (issue #215),
+    /// and a key needs them only on the columns it names; asking about the
+    /// whole table demanded a wider grant than the key the account holds
+    /// exactly needs. SQL Server has no counterpart yet — its own
+    /// `Needed::Referenced` asks the catalog's full column list instead
+    /// (`pbps_mssql::doctor::Columns::Catalog`) — so this field is read by the
+    /// PostgreSQL engine alone; the other is free to leave it unused rather
+    /// than plumb a demand it does not act on.
+    pub referenced_columns: &'a ReferencedColumns,
     /// What the managed roles are granted on (ADR-0005).
     pub granted: &'a GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
     pub data: &'a DataTables,
 }
+
+/// A foreign-key target outside the managed schemas, mapped to the columns a
+/// declared key names on it — the union across every key that points there.
+/// See [`Ask::referenced_columns`].
+pub type ReferencedColumns = BTreeMap<ObjectName, BTreeSet<String>>;
 
 /// What the managed roles are granted on, as `doctor` has to ask about it
 /// (ADR-0005). Empty from the project files is not yet "no role": the

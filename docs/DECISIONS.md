@@ -9703,3 +9703,62 @@ SPEC is in sync with all of these.
     resolution preferring the environment's recorded name over the declared
     one and falling back to the declared name when it cannot resolve, for
     each of the three reasons above.
+
+440. **`pbps_pg::doctor`'s `Needed::Referenced` falls back to the *declared*
+    columns a key names, not the target's whole catalog.** 294 asked
+    PostgreSQL for `REFERENCES` and `SELECT` on the whole of a foreign key's
+    referenced table, outside the managed schemas. PostgreSQL grants both of
+    those **per column**, and a key needs them only on the columns it names.
+    Measured on 18.6, with `GRANT SELECT (id), REFERENCES (id) ON
+    shared.parent` and nothing wider:
+
+    ```text
+    has_table_privilege ('shared.parent',      'REFERENCES') -> f    has_table_privilege(..., 'SELECT') -> f
+    has_column_privilege('shared.parent','id', 'REFERENCES') -> t    has_column_privilege(...,  'SELECT') -> t
+    CREATE TABLE app.child (id integer PRIMARY KEY, pid integer REFERENCES shared.parent(id))  -> CREATE TABLE
+    ```
+
+    So a role granted exactly what the key uses deployed, and `doctor`
+    reported two gaps against it and exited 2 — the over-demand `Needed`
+    exists to remove, one securable further out, and in the direction that
+    pushes an operator towards a wider grant on somebody else's table (issue
+    #215).
+
+    The fallback asks after the *declared* columns — `references_columns` on
+    each foreign key, unioned per target across every key that points there
+    (`pbps-cli::doctor::referenced_targets`) — not the catalog's full column
+    list. `pbps_mssql::doctor::Columns::Declared` is the same choice for
+    `Needed::DataUpdate`, and for the same reason: `doctor` never sees a plan,
+    so the catalog's list would include columns the key never names, and an
+    account granted exactly the key's own columns would still see a gap
+    against a column no statement will ever touch. The one case this fallback
+    does not reach is `Needed::ManagedTable`'s `SELECT` on a table this
+    project *does* manage: `doctor` has no declared column list for it either
+    — the pre-flight probes it is asked for run against a *plan*, which
+    `doctor` never sees — so covering it would mean reading the catalog's
+    whole column list the way `pbps_mssql::doctor::Columns::Catalog` does for
+    its own `Needed::Referenced`, and that plumbing is not built here. Left as
+    a known gap rather than invented unmeasured (tracked in #215's own
+    discussion, step 9, #84).
+
+    A column the fallback asks about is looked up by **attribute number**, not
+    by name: `has_column_privilege(oid, name, priv)` raises `column "x" of
+    relation "y" does not exist` for a name the table does not actually carry,
+    and a referenced table's declared columns are not validated against
+    reality the way a managed table's are. Joined through `pg_attribute` and
+    called as `has_column_privilege(oid, attnum, priv)` instead (measured on
+    18.6): a `LEFT JOIN` miss leaves the attribute `NULL`, and the attnum
+    overload answers `NULL` rather than raising for `NULL` in either
+    argument — read as "not held", the same rule this module already applies
+    to every other NULL the server returns, rather than failing the whole
+    readiness read over one stale reference.
+
+    The rescue is "every named column, or the object-scope gap stands": each
+    column a key names must confirm the permission before the object-scope
+    report is dropped, so a grant covering only part of a composite key still
+    reports the gap. Unit tests pin a `TableRights` holding no table privilege
+    but covering every named column at no gap, and one column short of that
+    at the gap standing; a live test reproduces the measurement above as the
+    least-privilege role itself, asserts `doctor` reports nothing, and then
+    creates the key as that role — the check and the engine pinned to the
+    same answer.
