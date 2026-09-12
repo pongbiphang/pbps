@@ -67,16 +67,34 @@ impl From<tokio_postgres::Error> for DbError {
 /// line `Display` on `tokio_postgres::error::DbError` gives.
 ///
 /// `message()` alone is what the fix in issue #167 asks for and would already
-/// beat `db error`. `detail()` and `hint()` are folded in on the next lines
-/// because several diagnostics this workspace builds today reconstruct by
-/// hand exactly what these carry — `pbps-pg`'s own `schema_changed_underneath`
-/// used to guess a whole sentence from a bare SQLSTATE because the sentence
-/// the server sent was unreachable through this seam. The object identifiers
-/// PostgreSQL tags on for some errors — schema, table, column, data type,
-/// constraint — are appended the same way for the same reason: a unique
-/// violation's `detail` already names the columns, but a NOT NULL violation
-/// carries no `detail` at all and the column name is only reachable through
-/// `column()` (measured on 18.6, DECISIONS 453).
+/// beat `db error`. `detail()` and `hint()` are folded in under the same
+/// labels `psql` prints them under, because several diagnostics this
+/// workspace builds today reconstruct by hand exactly what these carry —
+/// `pbps-pg`'s own `schema_changed_underneath` used to guess a whole sentence
+/// from a bare SQLSTATE because the sentence the server sent was unreachable
+/// through this seam. **Measured** on 18.6: a unique violation's `detail`
+/// names the conflicting key (`"Key (id)=(1) already exists."`) and a NOT
+/// NULL violation's names the failing row (`"Failing row contains (null)."`)
+/// — neither is redundant with `message()`.
+///
+/// `where_()` is `CONTEXT:` in `psql`'s own vocabulary — the call stack of
+/// PL/pgSQL functions and internally generated queries active when the error
+/// was raised (one frame per line, most recent first) — and is kept under
+/// that label rather than folded in with the object identifiers below: it is
+/// execution context, not object metadata, and a reviewer conflating the two
+/// is exactly the failure this comment exists to head off. **Measured**, an
+/// exception raised inside a PL/pgSQL function carries `where_()` and no
+/// `schema()`/`table()`/`column()` at all; the two fields are populated by
+/// disjoint shapes of error, never both at once, in every case this crate has
+/// measured.
+///
+/// The object identifiers PostgreSQL tags on for some errors — schema, table,
+/// column, data type, constraint — go under their own `OBJECT:` label,
+/// because they are not context and not detail: **measured**, a NOT NULL
+/// violation's `schema()` names the schema even though `message()` never
+/// does (it names only the unqualified relation), so this is the only way a
+/// reader learns which of two same-named tables in different schemas this
+/// was about.
 fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
     let mut message = db.message().to_owned();
     if let Some(detail) = db.detail() {
@@ -98,8 +116,12 @@ fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
     .flatten()
     .collect();
     if !identifiers.is_empty() {
-        message.push_str("\nWHERE: ");
+        message.push_str("\nOBJECT: ");
         message.push_str(&identifiers.join(", "));
+    }
+    if let Some(where_) = db.where_() {
+        message.push_str("\nCONTEXT: ");
+        message.push_str(where_);
     }
     message
 }

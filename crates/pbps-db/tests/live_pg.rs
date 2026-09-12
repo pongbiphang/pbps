@@ -57,39 +57,134 @@ async fn a_server_refusal_carries_the_servers_own_sentence() {
     assert_eq!(error.server_error_code().as_deref(), Some("42P01"));
 }
 
-/// The same seam, exercised for `detail()`, `hint()` and the column identifier
-/// `as_db_error()` carries beside the message — the enrichment issue #167
-/// asks for beyond the bare fix, and easy to lose in a future refactor that
-/// keeps `db.message()` but drops the rest.
+/// `detail()` and the object identifiers `as_db_error()` carries, each
+/// exercised where it says something the sentence above it does not — one
+/// fixture and one error, so a run under the default parallel test harness
+/// cannot race two tests over the same fixture schema.
 ///
-/// A `NOT NULL` violation is the shape PostgreSQL answers with no `detail` at
-/// all (measured on 18.6) — a unique violation's `detail` already names the
-/// column, so it cannot tell a working `column()` apart from a `column()` that
-/// silently started returning `None`. This one can.
+/// A `NOT NULL` violation's `detail` is `"Failing row contains (null)."`
+/// (measured on 18.6), which has no overlap with `message()`, so the first
+/// assertion fails if `detail()` is dropped. **Measured**, the same
+/// violation's `message()` names only the unqualified relation (`"of
+/// relation \"nn\""`) — never the schema it lives in — while `schema()`
+/// answers the fixture's own schema name; asserting on that name is an
+/// assertion the identifiers block must actually have run to satisfy, where
+/// `column()`'s `"required"` would not be, since `message()` already
+/// contains it. The fixture uses a **named, non-temporary** schema rather
+/// than the session's temporary one so there is a schema name worth pinning
+/// at all: `pg_temp_NNN`'s number is assigned per backend.
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
-async fn a_not_null_violation_names_its_column_and_a_hint_if_any() {
+async fn a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not() {
     let mut conn = connect().await;
-    conn.execute("CREATE TEMPORARY TABLE issue_167_not_null (id int, required int NOT NULL)")
+    conn.execute("DROP SCHEMA IF EXISTS issue167_enrichment CASCADE")
+        .await
+        .expect("clean up any previous run's schema");
+    conn.execute("CREATE SCHEMA issue167_enrichment")
+        .await
+        .expect("create the fixture schema");
+    conn.execute("CREATE TABLE issue167_enrichment.nn (required int NOT NULL)")
         .await
         .expect("create the fixture table");
     let error = match conn
-        .execute("INSERT INTO issue_167_not_null (id) VALUES (1)")
+        .execute("INSERT INTO issue167_enrichment.nn DEFAULT VALUES")
         .await
     {
-        Ok(()) => panic!("a NOT NULL column left out of the insert list must fail"),
+        Ok(()) => panic!("a NOT NULL column left to its default of NULL must fail"),
+        Err(e) => e,
+    };
+    conn.execute("DROP SCHEMA issue167_enrichment CASCADE")
+        .await
+        .expect("drop the fixture schema");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("violates not-null constraint"),
+        "expected the server's own sentence, got: {message}"
+    );
+    let primary_sentence = message
+        .split("\nOBJECT:")
+        .next()
+        .expect("splitting on a literal always yields at least one piece");
+    assert!(
+        !primary_sentence.contains("issue167_enrichment"),
+        "the fixture is broken: the schema must not already be in the message \
+         or the detail, or the identifier assertion below would pass without \
+         the identifiers block ever running: {message}"
+    );
+    assert!(
+        message.contains("DETAIL: Failing row contains (null)."),
+        "expected the detail folded in under its own label, got: {message}"
+    );
+    assert!(
+        message.contains("OBJECT: schema \"issue167_enrichment\""),
+        "expected the schema identifier folded in under its own label, got: {message}"
+    );
+    assert_eq!(error.server_error_code().as_deref(), Some("23502"));
+}
+
+/// `hint()`, exercised where the server actually sends one: a column name
+/// that does not exist but closely matches one that does. **Measured** on
+/// 18.6, this is also a shape with no `detail()` and no object identifiers at
+/// all, so it isolates `hint()` from every other branch.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn a_misspelled_column_carries_the_servers_own_hint() {
+    let mut conn = connect().await;
+    conn.execute("CREATE TEMPORARY TABLE issue167_hint (namee text)")
+        .await
+        .expect("create the fixture table");
+    let error = match conn.query("SELECT name FROM issue167_hint").await {
+        Ok(_) => panic!("a column that does not exist must fail"),
         Err(e) => e,
     };
     let message = error.to_string();
     assert!(
-        message.contains("null value in column \"required\""),
+        message.contains(r#"column "name" does not exist"#),
         "expected the server's own sentence, got: {message}"
     );
     assert!(
-        message.contains("column \"required\""),
-        "expected the column identifier folded in, got: {message}"
+        message
+            .contains(r#"HINT: Perhaps you meant to reference the column "issue167_hint.namee"."#),
+        "expected the hint folded in under its own label, got: {message}"
     );
-    assert_eq!(error.server_error_code().as_deref(), Some("23502"));
+    assert_eq!(error.server_error_code().as_deref(), Some("42703"));
+}
+
+/// `where_()` — `CONTEXT:` in `psql`'s own vocabulary — exercised for an
+/// error raised inside a PL/pgSQL function. **Measured** on 18.6, this shape
+/// carries `where_()` and none of `detail()`, `hint()`, or an object
+/// identifier, isolating it the same way the hint case isolates `hint()`.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn an_exception_inside_a_function_carries_its_call_stack_as_context() {
+    let mut conn = connect().await;
+    conn.execute(
+        "CREATE OR REPLACE FUNCTION issue167_ctx() RETURNS void LANGUAGE plpgsql AS $$
+         BEGIN
+           RAISE EXCEPTION 'boom from function';
+         END;
+         $$",
+    )
+    .await
+    .expect("create the fixture function");
+    let error = match conn.query("SELECT issue167_ctx()").await {
+        Ok(_) => panic!("a function that raises must fail"),
+        Err(e) => e,
+    };
+    conn.execute("DROP FUNCTION issue167_ctx()")
+        .await
+        .expect("drop the fixture function");
+    let message = error.to_string();
+    assert!(
+        message.contains("boom from function"),
+        "expected the server's own sentence, got: {message}"
+    );
+    assert!(
+        message.contains("CONTEXT: PL/pgSQL function issue167_ctx() line 3 at RAISE"),
+        "expected the call stack folded in under its own label, got: {message}"
+    );
+    assert_eq!(error.server_error_code().as_deref(), Some("P0001"));
 }
 
 /// The negative case: a failure that never reached the server — so
