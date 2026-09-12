@@ -12,16 +12,17 @@ use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 
 /// One intent in the user's own vocabulary.
 ///
-/// `Debug` would do at a pinch, but this string is shown to someone who has never
-/// seen the `Intent` type — they wrote `renamed_from:` in a YAML file, or typed a
-/// `pbps rename`, and that is what they should be shown.
+/// An intent retains its meaning, not where it was supplied (SPEC §6). Describe
+/// the operation without inventing an annotation for a command or prompt answer.
 pub fn intent(i: &Intent) -> String {
     match i {
-        Intent::RenameTable { from, to } => format!("{to} renamed_from {from}"),
-        Intent::RenameColumn { table, from, to } => format!("{table}.{to} renamed_from {from}"),
+        Intent::RenameTable { from, to } => format!("rename table {from} -> {to}"),
+        Intent::RenameColumn { table, from, to } => {
+            format!("rename column {table}.{from} -> {table}.{to}")
+        }
         Intent::DropTable { table, reason } => format!("drop table {table} (reason: {reason})"),
         Intent::DropColumn { column, reason } => format!("drop column {column} (reason: {reason})"),
-        Intent::RenameRole { from, to } => format!("role {to} renamed_from {from}"),
+        Intent::RenameRole { from, to } => format!("rename role {from} -> {to}"),
         Intent::DropRole { role, reason } => format!("drop role {role} (reason: {reason})"),
     }
 }
@@ -151,12 +152,12 @@ fn one_blocker(b: &Blocker) -> String {
         ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
-                "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n",
+                "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n\n    correct the names where this intent was supplied: edit its declaration annotation, fix and rerun the command, or retry with a corrected prompt answer\n",
                 intent(i)
             )
         }
         // The opposite complaint to the one above: these match too much. Every
-        // one of them is well formed, and the file does not say which the
+        // one of them is well formed, and nothing says which the
         // author meant — so they are listed and none is performed.
         Blocker::ConflictingRenameIntents {
             side,
@@ -187,7 +188,7 @@ fn one_blocker(b: &Blocker) -> String {
             s.push_str(
                 "\n    keep one and drop the rest, each where it was written: a \
                  `renamed_from:` line in the declarations, or the `pbps rename` you \
-                 have just run\n",
+                 have just run, or a prompt answer; correct the input and retry\n",
             );
             s
         }
@@ -852,6 +853,91 @@ pub fn env_arg(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn intent_reports_describe_the_operation_without_inventing_its_source() {
+        use pbps_model::Intent;
+        let cases = [
+            (
+                Intent::RenameTable {
+                    from: "dbo.old".parse().unwrap(),
+                    to: "dbo.new".parse().unwrap(),
+                },
+                "rename table dbo.old -> dbo.new",
+            ),
+            (
+                Intent::RenameColumn {
+                    table: "dbo.t".parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                "rename column dbo.t.old -> dbo.t.new",
+            ),
+            (
+                Intent::RenameRole {
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                "rename role old -> new",
+            ),
+            (
+                Intent::DropTable {
+                    table: "dbo.t".parse().unwrap(),
+                    reason: "retired".into(),
+                },
+                "drop table dbo.t (reason: retired)",
+            ),
+            (
+                Intent::DropColumn {
+                    column: "dbo.t.old".parse().unwrap(),
+                    reason: "retired".into(),
+                },
+                "drop column dbo.t.old (reason: retired)",
+            ),
+            (
+                Intent::DropRole {
+                    role: "old".into(),
+                    reason: "retired".into(),
+                },
+                "drop role old (reason: retired)",
+            ),
+        ];
+        for (intent, expected) in cases {
+            assert_eq!(super::intent(&intent), expected);
+            let blocker = pbps_diff::Blocker::UnusedIntent { intent };
+            let text = super::blockers(std::slice::from_ref(&blocker));
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("renamed_from"), "{text}");
+            for source in ["annotation", "command", "prompt answer"] {
+                assert!(text.contains(source), "{text}");
+            }
+            let finding = super::blocker_finding(&blocker);
+            assert_eq!(finding.id, "identity.unused-intent");
+            assert!(finding.remedy.unwrap().contains("retry"));
+        }
+    }
+
+    #[test]
+    fn a_prompt_answer_is_reported_as_an_operation_and_can_be_corrected() {
+        let answers = crate::prompt::ask_from(
+            &[pbps_diff::Blocker::AmbiguousColumns {
+                table: "dbo.t".parse().unwrap(),
+                disappeared: vec!["old".into()],
+                appeared: vec!["new".into()],
+            }],
+            std::io::Cursor::new("1\n"),
+        )
+        .unwrap();
+        assert_eq!(answers.len(), 1);
+        let text = super::blockers(&[pbps_diff::Blocker::UnusedIntent {
+            intent: answers[0].clone(),
+        }]);
+        assert!(
+            text.contains("rename column dbo.t.old -> dbo.t.new"),
+            "{text}"
+        );
+        assert!(!text.contains("renamed_from"), "{text}");
+        assert!(text.contains("prompt answer"), "{text}");
+    }
     use super::*;
     use pbps_model::change::PlannedChange;
     use pbps_model::{GrantTarget, Permission, Uid, UidKind};
@@ -1002,8 +1088,14 @@ mod tests {
             name: "dbo.t.old".into(),
             intents: vec![claim("aaa"), claim("zzz")],
         });
-        assert!(text.contains("dbo.t.aaa renamed_from old"), "{text}");
-        assert!(text.contains("dbo.t.zzz renamed_from old"), "{text}");
+        assert!(
+            text.contains("rename column dbo.t.old -> dbo.t.aaa"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rename column dbo.t.old -> dbo.t.zzz"),
+            "{text}"
+        );
 
         // And the finding splits into a message and a remedy, like every other
         // blocker: a caller reading JSON gets the same two halves the human

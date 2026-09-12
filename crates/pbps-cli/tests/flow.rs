@@ -957,7 +957,8 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
     );
     let text = format!("{}{}", stdout(&o), stderr(&o));
     assert!(
-        text.contains("dbo.t.aaa renamed_from old") && text.contains("dbo.t.zzz renamed_from old"),
+        text.contains("rename column dbo.t.old -> dbo.t.aaa")
+            && text.contains("rename column dbo.t.old -> dbo.t.zzz"),
         "the message must name both annotations, or there is nothing to go and \
          delete: {text}"
     );
@@ -971,6 +972,25 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
     );
     assert!(!ids.contains("aaa") && !ids.contains("zzz"), "{ids}");
 
+    let json = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&json), FINDING, "{}", stderr(&json));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(value["command"], "plan");
+    let finding = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "identity.conflicting-rename-intents")
+        .unwrap();
+    assert_eq!(finding["severity"], "error");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains("rename column dbo.t.old -> dbo.t.aaa")
+    );
+    assert!(finding["remedy"].as_str().unwrap().contains("renamed_from"));
+
     // Deleting one of them is the whole remedy.
     d.table(
         "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
@@ -978,6 +998,63 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
     );
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
+#[test]
+fn a_command_typo_reports_the_rename_without_inventing_an_annotation() {
+    let d = Demo::new("intent-source-command");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  old: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read(d.ids_path()).unwrap();
+    for (args, expected) in [
+        (
+            vec!["rename", "dbo.t.nosuch", "zzz"],
+            "rename column dbo.t.nosuch -> dbo.t.zzz",
+        ),
+        (
+            vec!["rename-table", "dbo.nosuch", "dbo.zzz"],
+            "rename table dbo.nosuch -> dbo.zzz",
+        ),
+        (
+            vec!["rename-role", "nosuch", "zzz"],
+            "rename role nosuch -> zzz",
+        ),
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+        let text = stderr(&o);
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("renamed_from"), "{text}");
+        assert!(text.contains("command") && text.contains("retry"), "{text}");
+        assert_eq!(std::fs::read(d.ids_path()).unwrap(), before);
+    }
+}
+
+#[test]
+fn annotation_and_command_conflicts_name_operations_without_claiming_two_annotations() {
+    let d = Demo::new("intent-source-conflict");
+    d.table("table: dbo.t\ncolumns:\n  old: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read(d.ids_path()).unwrap();
+    d.table("table: dbo.t\ncolumns:\n  aaa: {type: int, renamed_from: old}\n  zzz: {type: int}\n");
+    let o = d.run(&["rename", "dbo.t.old", "zzz"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let text = stderr(&o);
+    assert!(
+        text.contains("rename column dbo.t.old -> dbo.t.aaa"),
+        "{text}"
+    );
+    assert!(
+        text.contains("rename column dbo.t.old -> dbo.t.zzz"),
+        "{text}"
+    );
+    assert!(!text.contains("zzz renamed_from"), "{text}");
+    assert_eq!(std::fs::read(d.ids_path()).unwrap(), before);
+    // Correcting the command to agree with the annotation is a valid intent.
+    let o = d.run(&["rename", "dbo.t.old", "aaa"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
 
 /// The split of side effects in SPEC §6.2: plan absorbs the annotation into the
