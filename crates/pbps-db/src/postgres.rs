@@ -63,48 +63,52 @@ impl From<tokio_postgres::Error> for DbError {
     }
 }
 
-/// Renders a server-side PostgreSQL error the way `psql` does, not the one
-/// line `Display` on `tokio_postgres::error::DbError` gives.
+/// Renders a server-side PostgreSQL error's message and object identifiers —
+/// never `detail()`, `hint()` or `where_()`, which is not the one-line
+/// `Display` on `tokio_postgres::error::DbError` that `psql` imitates, and
+/// deliberately less than it.
 ///
-/// `message()` alone is what the fix in issue #167 asks for and would already
-/// beat `db error`. `detail()` and `hint()` are folded in under the same
-/// labels `psql` prints them under, because several diagnostics this
-/// workspace builds today reconstruct by hand exactly what these carry —
-/// `pbps-pg`'s own `schema_changed_underneath` used to guess a whole sentence
-/// from a bare SQLSTATE because the sentence the server sent was unreachable
-/// through this seam. **Measured** on 18.6: a unique violation's `detail`
-/// names the conflicting key (`"Key (id)=(1) already exists."`) and a NOT
-/// NULL violation's names the failing row (`"Failing row contains (null)."`)
-/// — neither is redundant with `message()`.
+/// A first draft of this fix folded `detail()`, `hint()` and `where_()` in
+/// too, each under its own label, on the reasoning that they are diagnostic
+/// text the server already composed. Ready-phase review of PR #464 caught
+/// what that reasoning missed: these three are not the server's *sentence* —
+/// they are one of the ways the server hands back **data**, and this
+/// function's caller writes its return value to two places that are supposed
+/// to hold nothing but the tool's own diagnosis: `crates/pbps-cli/src/
+/// main.rs` prints it to stderr, which reaches CI logs, and
+/// `failed_apply_snapshot` in `crates/pbps-cli/src/deploy.rs` records it in
+/// the ledger's `reason` column — durably, in the audited history this
+/// project exists to keep trustworthy.
 ///
-/// `where_()` is `CONTEXT:` in `psql`'s own vocabulary — the call stack of
-/// PL/pgSQL functions and internally generated queries active when the error
-/// was raised (one frame per line, most recent first) — and is kept under
-/// that label rather than folded in with the object identifiers below: it is
-/// execution context, not object metadata, and a reviewer conflating the two
-/// is exactly the failure this comment exists to head off. **Measured**, an
-/// exception raised inside a PL/pgSQL function carries `where_()` and no
-/// `schema()`/`table()`/`column()` at all; the two fields are populated by
-/// disjoint shapes of error, never both at once, in every case this crate has
-/// measured.
+/// **Measured** on 18.6, each of the three can carry values a deployer
+/// declared nowhere and this tool has no license to persist:
 ///
-/// The object identifiers PostgreSQL tags on for some errors — schema, table,
-/// column, data type, constraint — go under their own `OBJECT:` label,
-/// because they are not context and not detail: **measured**, a NOT NULL
-/// violation's `schema()` names the schema even though `message()` never
-/// does (it names only the unqualified relation), so this is the only way a
-/// reader learns which of two same-named tables in different schemas this
-/// was about.
+/// - `detail()` is *for* data — `"Key (email)=(alice@example.com) already
+///   exists."`, `"Failing row contains (null)."` — that is its entire
+///   purpose, not an edge case of it.
+/// - `hint()` is free text a user's own PL/pgSQL can set to anything:
+///   `RAISE EXCEPTION '...' USING HINT = format('the offending value was
+///   %s', v)` renders as `HINT:  the offending value was
+///   alice@example.com`, and nothing server-side stops a data trigger this
+///   tool's own guard exists to police (`crates/pbps-pg/src/
+///   data_triggers.rs`) from doing exactly that.
+/// - `where_()` is not only the safe-looking call stack the [`Conn`]-level
+///   test suite first measured (`"PL/pgSQL function f() line 3 at
+///   RAISE"`): a statement that fails *inside* a function carries the
+///   statement's own text with its literals in it —
+///   `CONTEXT:  SQL statement "INSERT INTO t VALUES ('secret')"` — and this
+///   seam holds no SQL grammar to tell that line apart from a bare call-stack
+///   frame (constraint 9; the same reason `data_triggers.rs` parses no SQL
+///   either). A field this crate cannot classify is not one it can partially
+///   trust.
+///
+/// The object identifiers below stay: schema, table, column, data type and
+/// constraint are names PostgreSQL itself declared as identifiers, never
+/// values, and `message()`'s own quoting already treats them the same way —
+/// asserting `column "email"` is not a step more dangerous than the message
+/// that already said `null value in column "email"` (DECISIONS 453).
 fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
     let mut message = db.message().to_owned();
-    if let Some(detail) = db.detail() {
-        message.push_str("\nDETAIL: ");
-        message.push_str(detail);
-    }
-    if let Some(hint) = db.hint() {
-        message.push_str("\nHINT: ");
-        message.push_str(hint);
-    }
     let identifiers: Vec<String> = [
         db.schema().map(|v| format!("schema \"{v}\"")),
         db.table().map(|v| format!("table \"{v}\"")),
@@ -118,10 +122,6 @@ fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
     if !identifiers.is_empty() {
         message.push_str("\nOBJECT: ");
         message.push_str(&identifiers.join(", "));
-    }
-    if let Some(where_) = db.where_() {
-        message.push_str("\nCONTEXT: ");
-        message.push_str(where_);
     }
     message
 }
