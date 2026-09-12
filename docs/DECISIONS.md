@@ -10576,3 +10576,87 @@ SPEC is in sync with all of these.
      so the refusal can only be the table its cascade reaches. They
      pass on 16.15 as well as 18.6: the one catalogue column the closure needs
      that is not ancient, `confdelsetcols`, arrived in 15.
+
+453. **`From<tokio_postgres::Error> for DbError` reads the server's own
+     sentence off `as_db_error()`, not `Display`, and only `message()` plus the
+     object identifiers — never `detail()`, `hint()` or `where_()`.** Measured:
+     `tokio_postgres` keeps a server-side failure's message in the error's
+     *source* (`DbError`, the driver's own type of that name) and renders
+     `Kind::Db` as the literal five-character string `db error` on `Display` —
+     `e.code()` still answered the right SQLSTATE, so the bug passed every test
+     that only checked the code. `message()` alone closes issue #167; the
+     object identifiers (`schema()`, `table()`, `column()`, `datatype()`,
+     `constraint()`) are folded in beside it under an `OBJECT:` label, because
+     several diagnostics this workspace builds today reconstruct by hand
+     exactly what these carry, and each is a name PostgreSQL itself declared as
+     an identifier, never a value — `message()`'s own quoting already treats
+     them the same way.
+
+     A first draft of this fix folded `detail()`, `hint()` and `where_()` in
+     too, each under its own label (`DETAIL:`, `HINT:`, `CONTEXT:`), on the
+     reasoning that they are diagnostic text the server already composed.
+     Ready-phase review of PR #464 caught what that reasoning missed: these
+     three are not the server's *sentence* — they are one of the ways the
+     server hands back **data**, and this function's return value reaches
+     stderr (`crates/pbps-cli/src/main.rs`, which CI logs) and the deployment
+     ledger's `reason` column (`failed_apply_snapshot` in
+     `crates/pbps-cli/src/deploy.rs`), durably, in the audited history this
+     project exists to keep trustworthy. **Measured** on 18.6, each of the
+     three can carry values a deployer declared nowhere: `detail()` is *for*
+     data (`"Key (email)=(alice@example.com) already exists."`,
+     `"Failing row contains (null)."`); `hint()` is free text a user's own
+     PL/pgSQL can set to anything (`RAISE EXCEPTION '...' USING HINT =
+     format('the offending value was %s', v)`), and nothing server-side stops
+     a data trigger this tool's own guard exists to police
+     (`crates/pbps-pg/src/data_triggers.rs`) from doing exactly that; and
+     `where_()` — `CONTEXT:` in `psql`'s own vocabulary — is not only the
+     safe-looking call stack of PL/pgSQL functions and internally generated
+     queries active when the error was raised, but also, for a statement that
+     fails *inside* a function, that statement's own text with its literals in
+     it (`CONTEXT:  SQL statement "INSERT INTO t VALUES ('secret')"`), and this
+     seam holds no SQL grammar to tell that line apart from a bare call-stack
+     frame (constraint 9; the same reason `data_triggers.rs` parses no SQL
+     either). A field this crate cannot classify is not one it can partially
+     trust, so all three are dropped unconditionally rather than filtered by
+     shape.
+
+     (An intermediate draft of this same fix folded the object identifiers
+     under a `WHERE:` label, mislabeling object metadata as execution context
+     and dropping the actual traceback `where_()` carries — round-1 review of
+     PR #464 caught it, before the ready-phase review above found the larger
+     problem with keeping `where_()` at all.) The live suite pins the
+     redaction directly: each of `detail()`, `hint()` and `where_()` (in both
+     its safe-looking and its literal-bearing shape) gets its own fixture
+     proving the field is *absent* from the rendered message while the
+     server's sentence and the object identifiers survive — not a test that
+     merely stopped asserting presence, which a regression could pass by doing
+     nothing. The fallback to `e.to_string()` is unchanged for a failure
+     `as_db_error()` answers `None` for: those never reached the server, and
+     the driver's own text for them (`"connection closed"`, and so on) was
+     never `db error` to begin with.
+
+     `pbps-pg`'s `schema_changed_underneath` and `the_engine_broke_a_tie` each
+     wrap this seam's `DbError::Driver` in a sentence of their own for a
+     SQLSTATE it recognizes (`XX000`, `40P01`) — written when the wrapped
+     message was unconditionally `db error` and the wrapping was reconstructing
+     by SQLSTATE alone what the server had already said. Both stay: what they
+     add is domain framing an `as_db_error()` fix cannot supply on its own —
+     that a `REPEATABLE READ` snapshot cannot see a concurrent `DROP`, that a
+     deadlock here is a tie the engine already broke — not a restatement of
+     the server's sentence, which the wrapped `{e}` now carries for the first
+     time instead of `db error`. Only the doc comments explaining *why* they
+     existed needed correcting, not the wrapping itself.
+
+     The SQL Server side does not have this defect: measured on 17.0.4075.5,
+     `tiberius::error::Error::Server`'s `Display` is `TokenError`'s own, which
+     interpolates its `message` field directly — there is no `Kind::Db`
+     standing in for the server's sentence the way `tokio_postgres::Error` has
+     one. `crates/pbps-db/src/mssql.rs` carries this measurement as a comment
+     and `crates/pbps-db/tests/live_mssql.rs` pins it as a regression guard,
+     not a fix.
+
+     The new live tests live in `crates/pbps-db/tests/`, not in `pbps-pg`'s or
+     `pbps-mssql`'s own live suites: the seam's `From` impls are what changed,
+     and `pbps-db` had no live suite of its own to reach them, so
+     `scripts/live-tests-pg.sh` and `scripts/live-tests.sh` each gained one
+     line invoking it.

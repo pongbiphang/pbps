@@ -40,12 +40,90 @@ impl From<tokio_postgres::Error> for DbError {
     /// `42P01` has a letter in it, which is why the seam carries the code as
     /// text: an `Option<u32>` here was a T-SQL shape under a neutral name
     /// (ADR-0014 §1, DECISIONS 193).
+    ///
+    /// The text is not `e.to_string()`. **Measured**: `tokio_postgres::Error`'s
+    /// `Display` keeps the server's own sentence in the error's *source*, not
+    /// in its message — for a server-side failure it renders the literal `db
+    /// error`, five characters wearing the clothes of a real answer while the
+    /// SQLSTATE beside it is the only thing still true (issue #167). What the
+    /// server actually said is behind [`tokio_postgres::Error::as_db_error`],
+    /// which is `None` exactly when the failure never reached the server — a
+    /// closed connection, a broken handshake — and `e.to_string()` already
+    /// carries its own text for those (`"connection closed"`, and so on), so
+    /// the fallback is unchanged (DECISIONS 453).
     fn from(e: tokio_postgres::Error) -> Self {
+        let message = e
+            .as_db_error()
+            .map(server_error_message)
+            .unwrap_or_else(|| e.to_string());
         DbError::Driver {
             code: e.code().map(|c| c.code().to_owned()),
-            message: e.to_string(),
+            message,
         }
     }
+}
+
+/// Renders a server-side PostgreSQL error's message and object identifiers —
+/// never `detail()`, `hint()` or `where_()`, which is not the one-line
+/// `Display` on `tokio_postgres::error::DbError` that `psql` imitates, and
+/// deliberately less than it.
+///
+/// A first draft of this fix folded `detail()`, `hint()` and `where_()` in
+/// too, each under its own label, on the reasoning that they are diagnostic
+/// text the server already composed. Ready-phase review of PR #464 caught
+/// what that reasoning missed: these three are not the server's *sentence* —
+/// they are one of the ways the server hands back **data**, and this
+/// function's caller writes its return value to two places that are supposed
+/// to hold nothing but the tool's own diagnosis: `crates/pbps-cli/src/
+/// main.rs` prints it to stderr, which reaches CI logs, and
+/// `failed_apply_snapshot` in `crates/pbps-cli/src/deploy.rs` records it in
+/// the ledger's `reason` column — durably, in the audited history this
+/// project exists to keep trustworthy.
+///
+/// **Measured** on 18.6, each of the three can carry values a deployer
+/// declared nowhere and this tool has no license to persist:
+///
+/// - `detail()` is *for* data — `"Key (email)=(alice@example.com) already
+///   exists."`, `"Failing row contains (null)."` — that is its entire
+///   purpose, not an edge case of it.
+/// - `hint()` is free text a user's own PL/pgSQL can set to anything:
+///   `RAISE EXCEPTION '...' USING HINT = format('the offending value was
+///   %s', v)` renders as `HINT:  the offending value was
+///   alice@example.com`, and nothing server-side stops a data trigger this
+///   tool's own guard exists to police (`crates/pbps-pg/src/
+///   data_triggers.rs`) from doing exactly that.
+/// - `where_()` is not only the safe-looking call stack the [`Conn`]-level
+///   test suite first measured (`"PL/pgSQL function f() line 3 at
+///   RAISE"`): a statement that fails *inside* a function carries the
+///   statement's own text with its literals in it —
+///   `CONTEXT:  SQL statement "INSERT INTO t VALUES ('secret')"` — and this
+///   seam holds no SQL grammar to tell that line apart from a bare call-stack
+///   frame (constraint 9; the same reason `data_triggers.rs` parses no SQL
+///   either). A field this crate cannot classify is not one it can partially
+///   trust.
+///
+/// The object identifiers below stay: schema, table, column, data type and
+/// constraint are names PostgreSQL itself declared as identifiers, never
+/// values, and `message()`'s own quoting already treats them the same way —
+/// asserting `column "email"` is not a step more dangerous than the message
+/// that already said `null value in column "email"` (DECISIONS 453).
+fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
+    let mut message = db.message().to_owned();
+    let identifiers: Vec<String> = [
+        db.schema().map(|v| format!("schema \"{v}\"")),
+        db.table().map(|v| format!("table \"{v}\"")),
+        db.column().map(|v| format!("column \"{v}\"")),
+        db.datatype().map(|v| format!("type \"{v}\"")),
+        db.constraint().map(|v| format!("constraint \"{v}\"")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !identifiers.is_empty() {
+        message.push_str("\nOBJECT: ");
+        message.push_str(&identifiers.join(", "));
+    }
+    message
 }
 
 impl Conn {

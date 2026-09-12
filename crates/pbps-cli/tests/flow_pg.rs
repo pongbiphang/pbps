@@ -1518,8 +1518,11 @@ fn ledger_migration_guidance_keeps_the_explicit_or_configured_target() {
             message.contains("needs ownership of public.__pbps_state"),
             "{message}"
         );
+        // Before issue #167 this seam rendered the ownership refusal as the
+        // literal `db error`; the server's own sentence is what a reader
+        // needs beside the guidance the assertion above already checks.
         assert!(
-            message.contains("this role could not add them: db error"),
+            message.contains("this role could not add them: must be owner of table __pbps_state"),
             "{message}"
         );
         assert!(

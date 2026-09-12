@@ -4320,8 +4320,12 @@ async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() 
         message.contains("timeline-column migration failed"),
         "{message}"
     );
+    // Before issue #167 this seam rendered the event trigger's own refusal as
+    // the literal `db error`; the server's own sentence is what makes this
+    // distinguishable from the ownership refusal `!message.contains("needs
+    // ownership")` below rules out.
     assert!(
-        message.contains("this role could not add them: db error"),
+        message.contains("this role could not add them: migration denied by event trigger"),
         "{message}"
     );
     assert!(!message.contains("needs ownership"), "{message}");
@@ -4350,7 +4354,13 @@ async fn an_authorized_migration_connection_failure_does_not_claim_missing_right
     );
     assert!(!message.contains("right it reports"), "{message}");
     assert!(!message.contains("needs ownership"), "{message}");
-    assert!(message.contains("db error"), "{message}");
+    // Before issue #167 this seam rendered the killed connection's own error as
+    // the literal `db error`; the server's actual sentence is what a reader
+    // needs to tell this apart from the ownership refusal above it.
+    assert!(
+        message.contains("terminating connection due to administrator command"),
+        "{message}"
+    );
     assert_eq!(error.server_error_code().as_deref(), Some("57P01"));
     db.drop().await;
 }
@@ -16658,11 +16668,13 @@ async fn connect_as(role: &str, database: &str) -> Conn {
 
 /// The SQLSTATE of a statement that must fail.
 ///
-/// The **code**, not the text: `tokio_postgres::Error` renders as `db error`
-/// and keeps the server's message in a source the seam deliberately does not
-/// carry (ADR-0014 §1) — so a test that matched on prose would pass on any
-/// failure at all, including the wrong one. A SQLSTATE is the engine's own
-/// identifier for *which* refusal this is.
+/// The **code**, not the text. `pbps_db::DbError`'s message carries the
+/// server's own sentence (issue #167), but matching this helper's callers on
+/// it would pin exact prose — locale-dependent, and free to change between
+/// engine versions — for the one property every caller here actually needs:
+/// *which* refusal this is. A SQLSTATE is the engine's own stable identifier
+/// for that, and a test that matched on prose instead would pass on any
+/// failure at all, including the wrong one.
 async fn refused(conn: &mut Conn, sql: &str) -> String {
     match conn.execute(sql).await {
         Ok(()) => panic!("the engine accepted `{sql}`, and this test needs it not to"),
@@ -21119,8 +21131,11 @@ async fn a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger()
         !message.contains("until that is fixed") && !message.contains("asks for today"),
         "the error must not describe doctor as incomplete: {message}"
     );
+    // Before issue #167 this seam rendered the underlying refusal as the
+    // literal `db error`; the server's own sentence is what makes this
+    // distinguishable from any other 42501 this migration could hit.
     assert!(
-        message.contains("this role could not add them: db error")
+        message.contains("this role could not add them: must be owner of table __pbps_state")
             && err.server_error_code().as_deref() == Some("42501"),
         "the original engine error must survive: {message}"
     );
