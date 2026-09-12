@@ -895,15 +895,21 @@ pub async fn prepare_data_writes(
                 if let Change::DropModule { id, .. } = &planned.change {
                     dropped.insert(id.clone());
                 }
-                let (table, operation) = if let Change::InsertRow { table, .. } = &planned.change {
-                    (table, RowOperation::Insert)
-                } else if let Change::UpdateRow { table, .. } = &planned.change {
-                    (table, RowOperation::Update)
-                } else if let Change::DeleteRow { table, .. } = &planned.change {
-                    (table, RowOperation::Delete)
-                } else {
-                    continue;
-                };
+                let (table, mut operation) =
+                    if let Change::InsertRow { table, .. } = &planned.change {
+                        (table, RowOperation::Insert)
+                    } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
+                        (
+                            table,
+                            RowOperation::Update {
+                                columns: columns.keys().cloned().collect(),
+                            },
+                        )
+                    } else if let Change::DeleteRow { table, .. } = &planned.change {
+                        (table, RowOperation::Delete)
+                    } else {
+                        continue;
+                    };
                 // The logical target has the plan's final spelling; locks are
                 // acquired before any rename, through the stable table uid.
                 // New tables receive no existing-trigger allowance.
@@ -912,6 +918,24 @@ pub async fn prepare_data_writes(
                     .or_else(|| baseline.ids.table_uid(table))
                     .and_then(|uid| baseline.ids.tables.get(uid))
                 {
+                    // Like the table, an updated column may still carry its
+                    // pre-plan name while the guard authenticates triggers.
+                    if let RowOperation::Update { columns } = &mut operation {
+                        *columns = columns
+                            .iter()
+                            .map(|name| {
+                                let column = pbps_model::ColumnRef {
+                                    table: table.clone(),
+                                    name: name.clone(),
+                                };
+                                planned_ids
+                                    .column_uid(&column)
+                                    .or_else(|| baseline.ids.column_uid(&column))
+                                    .and_then(|uid| baseline.ids.columns.get(uid))
+                                    .map_or_else(|| name.clone(), |old| old.name.clone())
+                            })
+                            .collect();
+                    }
                     writes.push(RowWrite {
                         table: old.clone(),
                         operation,

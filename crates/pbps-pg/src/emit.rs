@@ -2411,7 +2411,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         } => row_statement(
             pg,
             table,
-            pbps_dialect::RowOperation::Update,
+            pbps_dialect::RowOperation::Update {
+                columns: columns.keys().cloned().collect(),
+            },
             atomically(&update_row(
                 table,
                 key_column,
@@ -3167,7 +3169,7 @@ fn row_statement(
 ) -> Result<Vec<Statement>, DialectError> {
     Ok(one(pg, table, sql)?
         .into_iter()
-        .map(|s| s.writing_rows(table.clone(), operation))
+        .map(|s| s.writing_rows(table.clone(), operation.clone()))
         .collect())
 }
 

@@ -27,16 +27,11 @@ pub async fn prepare(
     dropped: &BTreeSet<ModuleId>,
 ) -> Result<Guard, DbError> {
     let mut writes = writes.to_vec();
-    writes.sort_by(|a, b| {
-        a.table
-            .cmp(&b.table)
-            .then(event(a.operation).cmp(&event(b.operation)))
-    });
+    writes.sort_by(|a, b| a.table.cmp(&b.table).then(a.operation.cmp(&b.operation)));
     writes.dedup();
     let mut guard = Guard::default();
     for write in writes {
-        let table = &write.table;
-        for trigger in read_locked(conn, table, event(write.operation)).await? {
+        for trigger in read_locked(conn, &write).await? {
             let id = ModuleId::Trigger {
                 on: trigger.table.clone(),
                 name: trigger.name.clone(),
@@ -61,7 +56,7 @@ pub async fn prepare(
 /// Recheck immediately before each row statement, including on a newly created
 /// or renamed table. The lock stays held through that statement's transaction.
 pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(), DbError> {
-    for trigger in read_locked(conn, &write.table, event(write.operation)).await? {
+    for trigger in read_locked(conn, write).await? {
         if guard.approved.get(&trigger.oid) != Some(&trigger.function_oid) || !trigger.trusted_owner
         {
             return Err(refused(&trigger.table, &trigger.name));
@@ -70,10 +65,10 @@ pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(
     Ok(())
 }
 
-fn event(operation: RowOperation) -> i16 {
+fn event(operation: &RowOperation) -> i16 {
     match operation {
         RowOperation::Insert => 4,
-        RowOperation::Update => 16,
+        RowOperation::Update { .. } => 16,
         RowOperation::Delete => 8,
     }
 }
@@ -87,11 +82,20 @@ struct Trigger {
     trusted_owner: bool,
 }
 
-async fn read_locked(
-    conn: &mut Conn,
-    table: &TableName,
-    events: i16,
-) -> Result<Vec<Trigger>, DbError> {
+async fn read_locked(conn: &mut Conn, write: &RowWrite) -> Result<Vec<Trigger>, DbError> {
+    let table = &write.table;
+    let events = event(&write.operation);
+    // UPDATE OF follows the SET list, including generated columns that depend
+    // on it. A BEFORE ROW UPDATE trigger makes PostgreSQL include all generated
+    // columns, even if that trigger is disabled; measured on PostgreSQL 18.
+    let columns = match &write.operation {
+        RowOperation::Update { columns } => columns
+            .iter()
+            .map(|name| literal(name))
+            .collect::<Vec<_>>()
+            .join(", "),
+        RowOperation::Insert | RowOperation::Delete => String::new(),
+    };
     // No ONLY: PostgreSQL DML can reach inheritance descendants. Lock and
     // inspect only descendants that this operation can reach. Statement-level
     // triggers fire on the named target, not each inheritance descendant.
@@ -131,6 +135,22 @@ async fn read_locked(
              JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE NOT t.tgisinternal AND (t.tgtype & {events}) <> 0
+               AND ({events} <> 16 OR t.tgattr = ''::pg_catalog.int2vector OR EXISTS (
+                   SELECT 1 FROM pg_catalog.pg_attribute a
+                   WHERE a.attrelid = t.tgrelid AND a.attnum = ANY(t.tgattr)
+                     AND (a.attname::text = ANY(ARRAY[{columns}]::text[]) OR
+                          (a.attgenerated <> '' AND (EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_trigger before_update
+                              WHERE before_update.tgrelid = t.tgrelid AND (before_update.tgtype & 19) = 19
+                          ) OR EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_attrdef ad
+                              JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.objid = ad.oid
+                              JOIN pg_catalog.pg_attribute source ON source.attrelid = d.refobjid AND source.attnum = d.refobjsubid
+                              WHERE ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+                                AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = a.attrelid
+                                AND source.attname::text = ANY(ARRAY[{columns}]::text[])
+                          ))))
+               ))
                AND ((n.nspname = {schema} AND c.relname = {name}) OR (t.tgtype & 1) <> 0)
                AND (t.tgenabled = 'A' OR t.tgenabled =
                     CASE WHEN pg_catalog.current_setting('session_replication_role') = 'replica'

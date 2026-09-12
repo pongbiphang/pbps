@@ -189,10 +189,13 @@ pub struct Statement {
 }
 
 /// The reference-data operation performed by a guarded statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowOperation {
     Insert,
-    Update,
+    /// Exactly the columns named in the emitted SET list.
+    Update {
+        columns: std::collections::BTreeSet<String>,
+    },
     Delete,
 }
 

@@ -9948,6 +9948,14 @@ SPEC is in sync with all of these.
      and must actually be absent at the write. Internal constraint triggers are
      engine machinery; disabled triggers and other events do not run that write.
 
+     UPDATE OF uses the emitted SET columns, resolved through column uids before
+     planned renames, rather than the UPDATE event bit alone. A trigger naming
+     only untouched columns must not refuse a valid write. Generated columns
+     also count when they depend on a SET column; measured on PostgreSQL 18,
+     the presence of any BEFORE ROW UPDATE trigger makes PostgreSQL include all
+     generated columns, even when that BEFORE trigger is disabled. The guard
+     follows both rules, with positive/negative live controls on 16 and 18.
+
      An ordinary apply holds its locks through the enclosing transaction and
      ledger record. A staged row gets a transaction only around its guard and
      one already-atomic row statement, committing before the existing checkpoint;
