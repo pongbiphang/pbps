@@ -2249,6 +2249,115 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
 
+/// Issue #142: `sysname` carries no argument, so a narrowing into it used to
+/// fall through to the generic `TRY_CONVERT` probe — which truncates into a
+/// `sysname` target instead of returning NULL. Measured on this image:
+/// `TRY_CONVERT(sysname, REPLICATE(N'x', 129))` returns 128 `x` characters,
+/// not NULL, so the old probe reported zero blockers for a value the engine's
+/// own `ALTER` refuses with error 2628. The fix reads `sysname`'s real
+/// `nvarchar(128)` capacity instead of falling through, and this pins that
+/// against the same server: 129 plain characters must be counted and
+/// refused, 128 must pass both the probe and the `ALTER`.
+///
+/// A trailing space and a non-BMP character are included because a Rust
+/// character count disagrees with the engine here, and the fix has to ask
+/// the server rather than guess: `LEN` ignores a trailing blank the same way
+/// `ALTER` does when it shortens a character column (measured: a 128-`x`
+/// value plus one trailing space still converts), and it counts a surrogate
+/// pair as two units, exactly how `nvarchar(128)` — and so `sysname` —
+/// measures its own capacity. A probe built from `.chars().count()` would
+/// call 65 non-BMP characters (130 UTF-16 units, over capacity) the same as
+/// 64 (exactly 128 units, the boundary).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut db = TestDb::create("sysname_probe").await;
+
+    let plan = || ChangeSet {
+        changes: vec![PlannedChange::new(Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: "dbo.t.v".parse().unwrap(),
+            from: ty("nvarchar(200)"),
+            to: ty("sysname"),
+            from_nullable: true,
+            to_nullable: true,
+        })],
+    };
+
+    let emoji = "\u{1F600}"; // one astral character: two UTF-16 code units.
+    for (label, value, alter_succeeds) in [
+        ("129 plain characters", "x".repeat(129), false),
+        ("128 plain characters", "x".repeat(128), true),
+        (
+            "128 characters plus a trailing space",
+            format!("{}{}", "x".repeat(128), " "),
+            true,
+        ),
+        (
+            "64 non-BMP characters (128 UTF-16 units)",
+            emoji.repeat(64),
+            true,
+        ),
+        (
+            "65 non-BMP characters (130 UTF-16 units)",
+            emoji.repeat(65),
+            false,
+        ),
+    ] {
+        db.conn
+            .execute("DROP TABLE IF EXISTS dbo.t; CREATE TABLE dbo.t (v nvarchar(200) NULL);")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: fixture: {e}"));
+        db.conn
+            .execute_with(
+                "INSERT INTO dbo.t (v) VALUES (@P1);",
+                &[pbps_db::Param::from(value.as_str())],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: insert: {e}"));
+
+        let mut counts = Vec::new();
+        for probe in Mssql.preflight(&plan()) {
+            let rows = db.conn.query(&probe.sql).await.unwrap_or_else(|e| {
+                panic!("{label}: the engine rejected a probe:\n{}\n{e}", probe.sql)
+            });
+            let n: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+            counts.push((probe.description, n));
+        }
+        let blocked = counts
+            .iter()
+            .find(|(d, _)| d.contains("too long"))
+            .unwrap_or_else(|| panic!("{label}: no `too long` probe in {counts:?}"))
+            .1;
+        assert_eq!(blocked, i32::from(!alter_succeeds), "{label}: {counts:?}");
+        assert!(
+            !counts.iter().any(|(d, _)| d.contains("cannot become")),
+            "{label}: fell through to the truncating TRY_CONVERT probe: {counts:?}"
+        );
+
+        let result = db
+            .conn
+            .execute("ALTER TABLE dbo.t ALTER COLUMN v sysname NULL;")
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            alter_succeeds,
+            "{label}: the ALTER's own verdict was {result:?}"
+        );
+        if let Err(error) = result {
+            assert_eq!(
+                error.server_error_code().as_deref(),
+                Some("2628"),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    db.drop().await;
+}
+
 /// A default this engine fills every row from is not counted as a missing
 /// value.
 ///

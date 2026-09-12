@@ -1881,16 +1881,28 @@ fn conversion_probe(
     // A bounded string or binary target truncates silently under CONVERT, so
     // `TRY_CONVERT` would return a value and report nothing. Count the values
     // beyond its declared capacity before asking any code-page question.
-    let bound = match to.args.first() {
+    //
+    // `sysname` carries no argument at all — `to.args` is empty — but it is
+    // not unbounded: it is `nvarchar(128)` under the hood, and `TRY_CONVERT`
+    // truncates into it exactly as it does into `nvarchar(128)` rather than
+    // returning NULL. Reading its capacity from `fixed_alias_capacity`
+    // instead of `to.args.first()` is what lets it take the length branch
+    // below instead of falling through to the truncating `TRY_CONVERT` probe
+    // (issue #142).
+    let bound = types::fixed_alias_capacity(to.base.as_str()).or_else(|| match to.args.first() {
         Some(TypeArg::Int(n)) => Some(*n),
         Some(TypeArg::Max) | Some(TypeArg::Ident(_)) | None => None,
-    };
+    });
     if let Some(n) = bound.filter(|_| probes_capacity) {
         match to.base.as_str() {
             // LEN ignores trailing blanks, and so does the engine when it
             // shortens a character column — counting them would report rows
-            // that convert perfectly well.
-            "char" | "nchar" | "varchar" | "nvarchar" => {
+            // that convert perfectly well. `sysname` shares this arm because
+            // it stores like `nvarchar`: `LEN` already counts UTF-16 code
+            // units, which is how `nvarchar(128)` — and so `sysname` —
+            // measures its own capacity, so no separate Unicode-length logic
+            // is needed here.
+            "char" | "nchar" | "varchar" | "nvarchar" | "sysname" => {
                 let len = match from.base.as_str() {
                     "text" => format!("LEN(CONVERT(varchar(max), {col}))"),
                     "ntext" => format!("LEN(CONVERT(nvarchar(max), {col}))"),
@@ -2132,6 +2144,48 @@ mod tests {
         assert_eq!(sql.len(), 1);
         assert!(sql[0].contains("LEN([email]) > 50"), "{sql:?}");
         assert!(!sql[0].contains("TRY_CONVERT"), "{sql:?}");
+    }
+
+    /// `sysname` carries no argument at all, so it used to fall through to
+    /// the generic `TRY_CONVERT` probe below — which truncates a `sysname`
+    /// target instead of returning NULL, reporting zero blockers for a value
+    /// the ALTER refuses with error 2628 (measured on the pinned image; see
+    /// the live preflight test in `crates/pbps-mssql/tests`). It shares
+    /// `nvarchar`'s real capacity, 128, so this must take the length branch
+    /// exactly as a narrowing `nvarchar` target does (issue #142).
+    #[test]
+    fn narrowing_to_sysname_is_probed_by_its_real_length_not_a_truncating_conversion() {
+        let sql = sql_of(&Change::AlterColumnType {
+            uid: uid("c_aaaaaa"),
+            column: cref("dbo.customer.label"),
+            from: ty("nvarchar(129)"),
+            to: ty("sysname"),
+            from_nullable: true,
+            to_nullable: true,
+        });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].contains("LEN([label]) > 128"), "{sql:?}");
+        assert!(!sql[0].contains("TRY_CONVERT"), "{sql:?}");
+    }
+
+    /// Negative case for the fix above: `nvarchar(128) -> sysname` is not a
+    /// narrowing at all (both hold 128 UTF-16 code units), so it must stay
+    /// unprobed — pinning that the length probe answers only the capacities
+    /// that actually differ, rather than firing for every conversion into
+    /// `sysname`.
+    #[test]
+    fn narrowing_to_sysname_at_its_own_capacity_needs_no_probe() {
+        assert!(
+            sql_of(&Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.label"),
+                from: ty("nvarchar(128)"),
+                to: ty("sysname"),
+                from_nullable: true,
+                to_nullable: true,
+            })
+            .is_empty()
+        );
     }
 
     #[test]

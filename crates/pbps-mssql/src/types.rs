@@ -378,6 +378,25 @@ impl Len {
     }
 }
 
+/// The capacity of a type this dialect declares with `ArgShape::None` but
+/// whose real storage is a bounded, argument-taking type underneath —
+/// currently only `sysname`, which the catalog reports as `nvarchar(128)`.
+///
+/// `family` (classification, SPEC §7.2) and
+/// `preflight::conversion_probe` (SPEC §7.5) both read the bound through this
+/// function instead of each hard-coding it, so a probe that used to fall
+/// through to `TRY_CONVERT` — which truncates a `sysname` target instead of
+/// failing — cannot happen again by the two paths drifting apart (issue
+/// #142). `None` means the type either takes its own arguments or has no
+/// length at all; callers that already special-case a `TypeArg` bound treat
+/// that the same way they treat "no argument".
+pub(crate) fn fixed_alias_capacity(base: &str) -> Option<i64> {
+    match base {
+        "sysname" => Some(128),
+        _ => None,
+    }
+}
+
 fn family(t: &ColumnType) -> Family {
     let arg0 = t.args.first();
     let int_arg = |i: usize| match t.args.get(i) {
@@ -429,9 +448,14 @@ fn family(t: &ColumnType) -> Family {
         "nchar" => text(true, true),
         "nvarchar" => text(true, false),
         // sysname takes no arguments, but its capacity is nvarchar(128), not
-        // the default length of an unparameterized string declaration.
+        // the default length of an unparameterized string declaration. Read
+        // from `fixed_alias_capacity` rather than repeating the literal `128`
+        // here, so this and `preflight::conversion_probe` cannot drift on
+        // what the alias actually holds (issue #142).
         "sysname" => Family::Text {
-            len: Len::Bounded(128),
+            len: Len::Bounded(
+                fixed_alias_capacity("sysname").expect("sysname has a fixed capacity"),
+            ),
             unicode: true,
             fixed: false,
         },
