@@ -423,6 +423,24 @@ async fn read_actions(
                    AND ({events} <> {update} OR EXISTS (
                        SELECT 1 FROM touched
                        WHERE touched.attrelid = con.confrelid AND touched.attnum = ANY(con.confkey)
+                   -- The action fires on the row the write leaves, not on the
+                   -- statement's SET list. Measured on 18.6, the referenced
+                   -- side's own constraint trigger carries no column list
+                   -- (`tgattr` is empty) and compares values, so a BEFORE ROW
+                   -- UPDATE trigger that rewrites a key nothing set makes the
+                   -- action fire on it. Every key of a relation that can be
+                   -- rewritten that way is therefore in the closure. Unlike
+                   -- the generated-column rule above, a *disabled* trigger is
+                   -- no hazard here: that rule is the planner's column list,
+                   -- and this one is a value written while the row is being
+                   -- built, which a trigger that does not run cannot write.
+                   ) OR EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_trigger rewriter
+                       WHERE rewriter.tgrelid = con.confrelid
+                         AND (rewriter.tgtype & 19) = 19
+                         AND (rewriter.tgenabled = 'A'
+                             OR (rewriter.tgenabled = 'O' AND pg_catalog.current_setting('session_replication_role') <> 'replica')
+                             OR (rewriter.tgenabled = 'R' AND pg_catalog.current_setting('session_replication_role') = 'replica'))
                    ))
                    -- The action is the constraint's own trigger on the
                    -- referenced side, and a trigger that does not fire writes

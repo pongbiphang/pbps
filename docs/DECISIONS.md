@@ -10375,6 +10375,21 @@ SPEC is in sync with all of these.
        derives from does, so the closure's key test reuses the same touched-
        column rule 445 defined for `UPDATE OF` rather than matching the SET list
        alone.
+     - An action fires on the row the write *leaves*, not on the statement's
+       `SET` list. The referenced side's own constraint trigger carries no
+       column list — `tgattr` is empty, measured — and compares the old and new
+       key values, so a `BEFORE ROW UPDATE` trigger that rewrites a key nothing
+       set makes it cascade: measured, `UPDATE p SET ukey = ...` with a BEFORE
+       trigger assigning `NEW.other` moved the child's `other` and fired the
+       child's trigger. Every key of a relation such a trigger can rewrite is
+       therefore in the closure. Two asymmetries, both measured and both the
+       other way round from the rule beside them: a *disabled* BEFORE trigger
+       rewrites nothing (that rule is a value written at run time, while the
+       generated-column one is the planner's column list, which a disabled
+       trigger still widens), and a user trigger's own `UPDATE OF` list is not
+       widened by a rewrite at all — `UPDATE OF ukey` stayed silent when only
+       the BEFORE trigger touched `ukey` — so the rule belongs to the
+       foreign-key edge and nowhere else.
      - The action's statement runs even when it matches no row, so a
        statement-level trigger on the referencing table fires with zero
        referencing rows. This is why the delete side is guarded at all: the
@@ -10444,6 +10459,9 @@ SPEC is in sync with all of these.
      writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
      cascade-reached table blocked until the write commits; the cannot-lock
      refusal naming its table; and the removals and the two not-firing actions,
-     each paired with the state in which the same closure does follow it. They
+     each paired with the state in which the same closure does follow it; and
+     the key a BEFORE trigger rewrites, with the engine's own behaviour
+     asserted first and the trigger doing the rewriting recorded and approved,
+     so the refusal can only be the table its cascade reaches. They
      pass on 16.15 as well as 18.6: the one catalogue column the closure needs
      that is not ancient, `confdelsetcols`, arrived in 15.

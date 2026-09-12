@@ -4990,3 +4990,117 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             }
         });
 }
+
+/// A referential action fires on the row the write leaves behind, not on the
+/// statement's SET list: an approved BEFORE ROW UPDATE trigger can rewrite a
+/// referenced key nothing set, and the action then cascades through it. The
+/// table that cascade reaches is part of the closure or the boundary has a
+/// hole in it — the trigger doing the rewriting is trusted, the one waiting on
+/// the other side of the key need not be.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "fk_rewrite");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+        CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE, other text UNIQUE); \
+        CREATE TABLE app.c(id integer PRIMARY KEY, other text REFERENCES app.p(other) ON UPDATE CASCADE); \
+        CREATE TABLE public.reached(value integer); \
+        CREATE FUNCTION app.rewrite() RETURNS trigger LANGUAGE plpgsql AS \
+        $$BEGIN NEW.other := 'rewritten'; RETURN NEW; END$$; \
+        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS \
+        $$BEGIN INSERT INTO public.reached VALUES (1); RETURN NULL; END$$; \
+        CREATE TRIGGER rewrite BEFORE UPDATE ON app.p FOR EACH ROW EXECUTE FUNCTION app.rewrite(); \
+        INSERT INTO app.p VALUES ('first', 'k1', 'o1'); INSERT INTO app.c VALUES (1, 'o1')",
+    );
+    // The engine's own behaviour first, so the guard is answering a question
+    // this server actually asks: an UPDATE of `ukey` alone reaches `app.c`.
+    on_server(
+        connection,
+        "CREATE TRIGGER hook AFTER UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION public.hook()",
+    );
+    on_server(
+        connection,
+        "UPDATE app.p SET ukey = 'k2' WHERE code = 'first'",
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM public.reached"), 1);
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.c WHERE other = 'rewritten'"
+        ),
+        1
+    );
+    on_server(connection, "DROP TRIGGER hook ON app.c");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            // Recorded while `rewrite` is the only trigger there is, so the
+            // rewriting trigger is approved and the one that arrives next is
+            // the only thing the guard can be refusing.
+            let baseline = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
+            let write = RowWrite {
+                table: pbps_model::TableName::new("app", "p"),
+                operation: RowOperation::Update {
+                    columns: ["ukey".to_owned()].into(),
+                },
+            };
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            pbps_pg::data_triggers::prepare(
+                &mut conn,
+                std::slice::from_ref(&write),
+                &baseline,
+                &Default::default(),
+            )
+            .await
+            .expect("the approved rewriting trigger is not itself a refusal");
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.execute("CREATE TRIGGER hook AFTER UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION public.hook()")
+                .await
+                .unwrap();
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let refused = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                std::slice::from_ref(&write),
+                &baseline,
+                &Default::default(),
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            assert!(
+                refused.contains("app.c"),
+                "a key the BEFORE trigger rewrites must carry its action into the closure: {refused}"
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            // Disabled, it rewrites nothing — measured — and the same
+            // unapproved trigger on `app.c` is out of reach again.
+            conn.execute("ALTER TABLE app.p DISABLE TRIGGER rewrite")
+                .await
+                .unwrap();
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let checked = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                &[write],
+                &baseline,
+                &Default::default(),
+            )
+            .await;
+            assert!(
+                checked.is_ok(),
+                "a disabled trigger writes nothing: {:?}",
+                checked.err().map(|e| e.to_string())
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+        });
+}
