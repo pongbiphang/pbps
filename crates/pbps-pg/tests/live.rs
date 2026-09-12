@@ -4304,6 +4304,31 @@ struct TestDb {
     conn: Conn,
 }
 
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {
+    let mut db = TestDb::create("migration_disconnect445").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    db.conn
+        .execute("ALTER TABLE public.__pbps_state DROP COLUMN state_version;")
+        .await
+        .unwrap();
+    // The owner reaches ALTER successfully; this fixture terminates its session
+    // at execution, after the catalog probe and savepoint handling succeeded.
+    db.conn.execute("CREATE FUNCTION disconnect_migration() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); END $$; CREATE EVENT TRIGGER disconnect_migration ON ddl_command_start WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION disconnect_migration();").await.unwrap();
+    let error = state::ensure_tables(&mut db.conn).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("timeline-column migration failed"),
+        "{message}"
+    );
+    assert!(!message.contains("right it reports"), "{message}");
+    assert!(!message.contains("needs ownership"), "{message}");
+    assert!(message.contains("db error"), "{message}");
+    assert_eq!(error.server_error_code().as_deref(), Some("57P01"));
+    db.drop().await;
+}
+
 // Pull helpers require the owning fixture, so a shared connection cannot
 // accidentally reintroduce another test's catalog churn. Dereferencing keeps
 // the ordinary SQL helpers usable without opening an extra connection.

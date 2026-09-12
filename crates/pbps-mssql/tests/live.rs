@@ -32,6 +32,37 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {
+    let mut db = TestDb::create("migration_disconnect445").await;
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .unwrap();
+    db.conn
+        .execute("ALTER TABLE dbo.__pbps_state DROP COLUMN state_version, tables_count, modules_count, staged_completed, staged_total;")
+        .await
+        .unwrap();
+    // Severity 20 closes the authorized session while its migration executes.
+    db.conn.execute("CREATE TRIGGER disconnect_migration ON DATABASE FOR ALTER_TABLE AS RAISERROR ('migration connection failure fixture', 20, 1) WITH LOG;").await.unwrap();
+    let error = pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("timeline-column migration failed"),
+        "{message}"
+    );
+    assert!(!message.contains("right it reports"), "{message}");
+    assert!(!message.contains("needs ALTER"), "{message}");
+    assert!(
+        message.contains("migration connection failure fixture"),
+        "{message}"
+    );
+    db.conn = connect_live(&conn_str()).await.unwrap();
+    db.drop().await;
+}
+
 /// Opens a connection to the live SQL Server this suite runs against.
 ///
 /// The driver is named here, once, rather than at each call site below: every

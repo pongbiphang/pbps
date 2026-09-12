@@ -655,20 +655,32 @@ async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
         }
         Err(e) => {
             guard.rewind_quietly(conn).await;
-            let code = e.server_error_code();
-            Err(DbError::Driver {
-                message: format!(
-                    "public.__pbps_state is missing the timeline columns (state_version, \
+            Err(migration_error(e))
+        }
+    }
+}
+
+fn migration_error(e: DbError) -> DbError {
+    let code = e.server_error_code();
+    // Ownership refusals carry 42501 (DECISIONS 435); connection failures
+    // cannot establish that the role lacks a migration right.
+    let guidance = if code.as_deref() == Some(INSUFFICIENT_PRIVILEGE) {
+        "This is a one-time migration that needs ownership of \
+         public.__pbps_state — PostgreSQL authorizes ALTER TABLE by ownership, \
+         not by a grantable privilege. Run `pbps doctor` and obtain the \
+         ownership right it reports before retrying."
+    } else {
+        "The timeline-column migration failed. Investigate the original database \
+         or connection error above before retrying."
+    };
+    DbError::Driver {
+        message: format!(
+            "public.__pbps_state is missing the timeline columns (state_version, \
                      tables_count, modules_count, staged_completed, staged_total) issue \
                      #103 added, and this role could not add them: {e}\n\
-                     This is a one-time migration that needs ownership of \
-                     public.__pbps_state — PostgreSQL authorizes ALTER TABLE by ownership, \
-                     not by a grantable privilege. Run `pbps doctor` and obtain the \
-                     ownership right it reports before retrying."
-                ),
-                code,
-            })
-        }
+                     {guidance}"
+        ),
+        code,
     }
 }
 
@@ -1288,6 +1300,25 @@ fn number(row: &Row, column: &str) -> Result<i64, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_permission_migration_failures_recommend_obtaining_rights() {
+        for code in [Some("42501"), Some("40P01"), None] {
+            let original = "original driver failure";
+            let error = migration_error(DbError::Driver {
+                message: original.into(),
+                code: code.map(str::to_owned),
+            });
+            assert_eq!(error.server_error_code().as_deref(), code);
+            let message = error.to_string();
+            assert!(message.contains(original));
+            assert_eq!(message.contains("right it reports"), code == Some("42501"));
+            assert_eq!(
+                message.contains("Investigate the original"),
+                code != Some("42501")
+            );
+        }
+    }
 
     /// Every statement this module can send, in one list, so that a rule
     /// asserted about "the SQL here" cannot quietly stop covering a statement
