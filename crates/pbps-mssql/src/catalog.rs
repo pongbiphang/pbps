@@ -72,7 +72,10 @@ SELECT c.object_id, c.name, ty.name AS type_name,
        CONVERT(bigint, ic.increment_value) AS increment,
        dc.definition AS default_definition,
        dc.object_id AS default_constraint_object_id,
-       dc.name AS default_constraint_name
+       dc.name AS default_constraint_name,
+       -- NULL for every type but the character ones; compared in `assemble`
+       -- against the database's own default collation (issue #94).
+       c.collation_name
   FROM sys.columns c
   JOIN sys.types ty ON ty.user_type_id = c.user_type_id
   LEFT JOIN sys.identity_columns ic
@@ -241,13 +244,15 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     let versions = conn
         .query(
             "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
-                CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition;",
+                CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition,
+                CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation;",
         )
         .await?;
     let version = versions
         .first()
         .ok_or_else(|| DbError::BadRow("the server version query returned no row".into()))?;
     let tables = tables_query(get(version, "version")?, get(version, "edition")?);
+    raw.database_collation = get::<&str>(version, "db_collation")?.to_owned();
     for row in conn.query(&tables).await? {
         raw.tables.push(RawTable {
             object_id: get(&row, "object_id")?,
@@ -275,6 +280,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             default: opt::<&str>(&row, "default_definition")?.map(str::to_owned),
             default_constraint: opt::<i32>(&row, "default_constraint_object_id")?
                 .zip(opt::<&str>(&row, "default_constraint_name")?.map(str::to_owned)),
+            collation: opt::<&str>(&row, "collation_name")?.map(str::to_owned),
         });
     }
 

@@ -12,10 +12,13 @@
 //! # What cannot be expressed
 //!
 //! The model does not cover everything a database can hold (computed columns,
-//! clustered-ness, collations). Those are **reported, never silently dropped**:
-//! a `pull` that quietly loses a computed column would produce declarations that
-//! plan the column's destruction on the next run. The caller decides whether the
-//! warnings are acceptable.
+//! clustered-ness, a column's non-default collation). Those are **reported,
+//! never silently dropped**: a `pull` that quietly loses a computed column
+//! would produce declarations that plan the column's destruction on the next
+//! run, and one that quietly loses a `COLLATE` would produce a declaration
+//! that reads as complete while a bootstrap onto a fresh database silently
+//! changes what every comparison and index seek on that column means. The
+//! caller decides whether the warnings are acceptable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,6 +68,12 @@ pub struct RawColumn {
     pub default: Option<String>,
     /// The backing `sys.default_constraints` row, when a default exists.
     pub default_constraint: Option<(i32, String)>,
+    /// `sys.columns.collation_name`: `None` for a type with no collation at
+    /// all (everything but the character types); `Some` names the collation a
+    /// character column actually has, whether that is the database's default
+    /// (inherited, or the same name spelled explicitly) or an explicit
+    /// `COLLATE` that overrides it.
+    pub collation: Option<String>,
 }
 
 /// One column of a PRIMARY KEY or UNIQUE constraint, in key order.
@@ -286,6 +295,14 @@ pub struct RawCatalog {
     pub object_dependencies: Vec<RawObjectDependency>,
     pub roles: Vec<RawRole>,
     pub permissions: Vec<RawPermission>,
+    /// `DATABASEPROPERTYEX(DB_NAME(), 'Collation')` of the connected database,
+    /// read once. The baseline [`RawColumn::collation`] is measured against:
+    /// a character column with no explicit `COLLATE` inherits exactly this
+    /// name, so a column whose collation differs from it is the one case that
+    /// needs a word — a matching collation, explicit or inherited, is
+    /// indistinguishable in the catalog and would be reproduced for free by
+    /// emitting no `COLLATE` clause at all.
+    pub database_collation: String,
 }
 
 fn push_limitation(
@@ -718,6 +735,31 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 continue;
             }
         };
+
+        // A collation matching the database default — whether inherited or
+        // spelled out explicitly — round-trips for free: the emitter writes
+        // no `COLLATE`, and a bootstrap column gets exactly this collation
+        // from the database itself. Anything else is a difference the
+        // declaration cannot hold; reported here rather than dropped, the way
+        // a clustered index is (`index_type_name` above), so an operator can
+        // find it instead of a bootstrap changing what `=` and a unique
+        // constraint on the column mean without a word (issue #94).
+        if let Some(collation) = c.collation.as_deref()
+            && collation != raw.database_collation
+        {
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: column collation `{collation}` is not the database's \
+                     default (`{}`); collations are not modelled yet, so the declaration omits \
+                     it and a bootstrap would create the column under the database default \
+                     instead",
+                    c.name, raw.database_collation
+                ),
+            );
+        }
 
         let mut column = Column::new(ty);
         column.nullable = c.is_nullable;
@@ -1329,6 +1371,7 @@ mod tests {
             identity: None,
             default: None,
             default_constraint: None,
+            collation: None,
         }
     }
 
@@ -1363,6 +1406,71 @@ mod tests {
         // Peeling this one would change its meaning.
         assert_eq!(strip_stored_parens("(a) AND (b)"), "(a) AND (b)");
         assert_eq!(strip_stored_parens("plain"), "plain");
+    }
+
+    /// A column `COLLATE`d away from the database's default is not modelled —
+    /// the emitter has nowhere to write it — so it is kept in the
+    /// declarations under its plain type, with a limitation naming the column
+    /// and both collations, matching the SPEC's rule that an unmodelled fact
+    /// is reported rather than silently dropped (issue #94).
+    #[test]
+    fn a_column_collation_that_differs_from_the_database_default_is_a_limitation() {
+        let mut column = raw_column(10, "code", "varchar");
+        column.collation = Some("Latin1_General_BIN2".into());
+        let raw = RawCatalog {
+            tables: vec![raw_table(10, "dbo", "customer")],
+            columns: vec![column],
+            database_collation: "Latin1_General_CI_AS".into(),
+            ..Default::default()
+        };
+
+        let pulled = assemble(&raw);
+
+        let table = &pulled.schema.tables[&TableName::new("dbo", "customer")];
+        assert!(
+            table.columns.contains_key("code"),
+            "only the collation is unmodelled; the column itself stays declared"
+        );
+        assert_eq!(pulled.limitations.len(), 1, "{:?}", pulled.limitations);
+        assert_eq!(
+            pulled.limitations[0].target.object_name(),
+            TableName::new("dbo", "customer")
+        );
+        assert!(
+            pulled.limitations[0].detail.contains("customer.code")
+                && pulled.limitations[0].detail.contains("Latin1_General_BIN2")
+                && pulled.limitations[0]
+                    .detail
+                    .contains("Latin1_General_CI_AS"),
+            "{:?}",
+            pulled.limitations
+        );
+    }
+
+    /// The common case — no explicit `COLLATE`, or one that only repeats the
+    /// database's own default — must not be reported: every character column
+    /// in an ordinary database would otherwise carry a limitation, drowning
+    /// the one that matters.
+    #[test]
+    fn a_column_collation_matching_the_database_default_is_not_reported() {
+        let mut inherited = raw_column(10, "code", "varchar");
+        inherited.collation = Some("Latin1_General_CI_AS".into());
+        let mut explicit = raw_column(10, "code2", "varchar");
+        explicit.collation = Some("Latin1_General_CI_AS".into());
+        // A non-character column carries no collation at all; it must not be
+        // compared against the baseline either.
+        let numeric = raw_column(10, "amount", "int");
+        let raw = RawCatalog {
+            tables: vec![raw_table(10, "dbo", "customer")],
+            columns: vec![inherited, explicit, numeric],
+            database_collation: "Latin1_General_CI_AS".into(),
+            ..Default::default()
+        };
+
+        let pulled = assemble(&raw);
+
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
     }
 
     fn one_table_catalog() -> RawCatalog {
@@ -2034,6 +2142,7 @@ mod module_tests {
                 identity: None,
                 default: None,
                 default_constraint: None,
+                collation: None,
             }],
             ..Default::default()
         }

@@ -27,6 +27,7 @@ fn full_catalog() -> RawCatalog {
         identity: None,
         default: None,
         default_constraint: None,
+        collation: None,
     };
 
     let mut id = col(1, "id", "bigint");
@@ -139,6 +140,11 @@ fn full_catalog() -> RawCatalog {
             },
         ],
         object_dependencies: Vec::new(),
+        // None of this fixture's columns carry a collation, so this baseline
+        // is never compared against; it is a real collation name rather than
+        // an empty string only so the fixture reads like the catalog it
+        // stands in for.
+        database_collation: "SQL_Latin1_General_CP1_CI_AS".into(),
     }
 }
 
