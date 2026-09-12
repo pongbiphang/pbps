@@ -200,6 +200,8 @@ jobs:
       # is that the probes are answered under the settings the statements they
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
+      # Keep --test-threads=1: issue #437 measured a test-to-test race between DDL
+      # and catalog reads in the shared database; parallel tests trip the catalog guard.
       - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
       # The CLI end to end on this engine (issue #85): `bootstrap`, `verify`,
       # `plan --db`, `apply`, `state list`, `pull`, `doctor`, each through the
