@@ -4320,8 +4320,12 @@ async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() 
         message.contains("timeline-column migration failed"),
         "{message}"
     );
+    // Before issue #167 this seam rendered the event trigger's own refusal as
+    // the literal `db error`; the server's own sentence is what makes this
+    // distinguishable from the ownership refusal `!message.contains("needs
+    // ownership")` below rules out.
     assert!(
-        message.contains("this role could not add them: db error"),
+        message.contains("this role could not add them: migration denied by event trigger"),
         "{message}"
     );
     assert!(!message.contains("needs ownership"), "{message}");
