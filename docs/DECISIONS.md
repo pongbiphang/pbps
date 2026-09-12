@@ -10389,7 +10389,10 @@ SPEC is in sync with all of these.
        trigger still widens), and a user trigger's own `UPDATE OF` list is not
        widened by a rewrite at all — `UPDATE OF ukey` stayed silent when only
        the BEFORE trigger touched `ukey` — so the rule belongs to the
-       foreign-key edge and nowhere else.
+       foreign-key edge and nowhere else. A rewriter's *own* `UPDATE OF` list
+       is read exactly as the trigger scan reads one: a `BEFORE UPDATE OF code`
+       trigger does not run for a statement that sets `ukey`, so it rewrites
+       nothing and widens nothing.
      - The action's statement runs even when it matches no row, so a
        statement-level trigger on the referencing table fires with zero
        referencing rows. This is why the delete side is guarded at all: the
@@ -10442,6 +10445,17 @@ SPEC is in sync with all of these.
      cascades at all, and the child row is left untouched. The closure applies
      the same enabled test `preflight::DELETE_ACTION_FIRES` makes, by the event
      this write raises rather than by the delete event alone.
+
+     A partitioned side is catalogued as the declared foreign key plus a copy
+     per partition, and a copy can carry another name (`qc_a_id_fkey_1`,
+     measured). Only the declared one is a name the plan can write, so a
+     removal is matched against it and not against the copy the walk happened
+     to reach — otherwise the guard follows an action the plan has already
+     taken away, which is the refusal this allowance exists to prevent. The
+     copies are not skipped outright, which was the first thing tried: when the
+     write names a partition of the *referenced* side, the copy is the only row
+     that matches it at all, and dropping copies from the scan would lose that
+     edge entirely.
 
      The lock a reached table takes is `LOCK TABLE` without `ONLY`, which also
      locks descendants the action itself will not write. Measured, that costs

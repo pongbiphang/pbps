@@ -4944,6 +4944,59 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 "a foreign key the plan promised to remove must actually be gone by the write"
             );
             conn.rollback(dialect.transaction_framing()).await.unwrap();
+            // A partitioned referencing side is catalogued as the declared
+            // key plus a copy per partition. The plan can only name the
+            // declared one, so a removal has to be matched against it or the
+            // copy keeps the action alive after the plan took it away.
+            conn.execute(
+                "CREATE TABLE app.parted(id integer, ukey text) PARTITION BY RANGE (id); \
+                 CREATE TABLE app.parted1 PARTITION OF app.parted FOR VALUES FROM (0) TO (10); \
+                 ALTER TABLE app.parted ADD CONSTRAINT fk_parted FOREIGN KEY (ukey) \
+                     REFERENCES app.p(ukey) ON UPDATE CASCADE; \
+                 CREATE TRIGGER hook AFTER UPDATE ON app.parted1 FOR EACH ROW EXECUTE FUNCTION public.hook(); \
+                 DROP TABLE app.c",
+            )
+            .await
+            .unwrap();
+            for (label, dropped, refused) in [
+                ("nothing removed", Dropped::default(), true),
+                (
+                    "the declared key the plan drops first",
+                    Dropped {
+                        foreign_keys: [(
+                            pbps_model::TableName::new("app", "parted"),
+                            "fk_parted".to_owned(),
+                        )]
+                        .into(),
+                        ..Default::default()
+                    },
+                    false,
+                ),
+            ] {
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    &Default::default(),
+                    &dropped,
+                )
+                .await;
+                assert_eq!(
+                    checked.is_err(),
+                    refused,
+                    "partitioned, {label}: {:?}",
+                    checked.err().map(|e| e.to_string())
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+            }
+            conn.execute(
+                "DROP TABLE app.parted; \
+                 CREATE TABLE app.c(id integer PRIMARY KEY, ukey text, \
+                     CONSTRAINT fk_c FOREIGN KEY (ukey) REFERENCES app.p(ukey) ON UPDATE CASCADE); \
+                 CREATE TRIGGER hook AFTER UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION public.hook()",
+            )
+            .await
+            .unwrap();
             // An action whose own trigger does not fire writes nothing.
             // Measured on 18.6: neither of these cascades at all.
             for (label, sql, reset) in [
@@ -5044,58 +5097,93 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                 .await
                 .unwrap();
             let dialect = pbps_pg::Postgres::new();
-            // Recorded while `rewrite` is the only trigger there is, so the
-            // rewriting trigger is approved and the one that arrives next is
-            // the only thing the guard can be refusing.
-            let baseline = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
                     columns: ["ukey".to_owned()].into(),
                 },
             };
+            // Both baselines are recorded while `rewrite` is the only trigger
+            // there is, so the rewriting trigger is approved in each and the
+            // one that arrives next is the only thing the guard can refuse.
+            let wide = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
             conn.begin(dialect.transaction_framing()).await.unwrap();
             pbps_pg::data_triggers::prepare(
                 &mut conn,
                 std::slice::from_ref(&write),
-                &baseline,
+                &wide,
                 &Default::default(),
             )
             .await
             .expect("the approved rewriting trigger is not itself a refusal");
             conn.rollback(dialect.transaction_framing()).await.unwrap();
-            conn.execute("CREATE TRIGGER hook AFTER UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION public.hook()")
-                .await
-                .unwrap();
-            conn.begin(dialect.transaction_framing()).await.unwrap();
-            let refused = pbps_pg::data_triggers::prepare(
-                &mut conn,
-                std::slice::from_ref(&write),
-                &baseline,
-                &Default::default(),
+            conn.execute(
+                "CREATE OR REPLACE TRIGGER rewrite BEFORE UPDATE OF code ON app.p \
+                 FOR EACH ROW EXECUTE FUNCTION app.rewrite()",
             )
             .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-            assert!(
-                refused.contains("app.c"),
-                "a key the BEFORE trigger rewrites must carry its action into the closure: {refused}"
-            );
-            conn.rollback(dialect.transaction_framing()).await.unwrap();
-            // Disabled, it rewrites nothing — measured — and the same
-            // unapproved trigger on `app.c` is out of reach again.
-            conn.execute("ALTER TABLE app.p DISABLE TRIGGER rewrite")
+            .unwrap();
+            let narrow = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
+            // The unapproved trigger arrives, and the engine says what this
+            // narrowed rewriter does: an UPDATE of `ukey` does not fire a
+            // trigger that names `code`, so nothing rewrites the key and
+            // nothing cascades.
+            conn.execute(
+                "CREATE TRIGGER hook AFTER UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION public.hook(); \
+                 TRUNCATE public.reached; \
+                 UPDATE app.p SET ukey = 'k3' WHERE code = 'first'",
+            )
+            .await
+            .unwrap();
+            let rows = conn
+                .query("SELECT count(*)::int8 AS n FROM public.reached")
                 .await
                 .unwrap();
-            conn.begin(dialect.transaction_framing()).await.unwrap();
-            let checked = pbps_pg::data_triggers::prepare(
-                &mut conn,
-                &[write],
-                &baseline,
-                &Default::default(),
+            assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(0));
+            for (label, form, baseline, refused) in [
+                ("the rewriter this statement fires", "BEFORE UPDATE", &wide, true),
+                (
+                    "a rewriter this statement cannot fire",
+                    "BEFORE UPDATE OF code",
+                    &narrow,
+                    false,
+                ),
+            ] {
+                conn.execute(&format!(
+                    "CREATE OR REPLACE TRIGGER rewrite {form} ON app.p \
+                     FOR EACH ROW EXECUTE FUNCTION app.rewrite()"
+                ))
+                .await
+                .unwrap();
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let checked = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    std::slice::from_ref(&write),
+                    baseline,
+                    &Default::default(),
+                )
+                .await;
+                assert_eq!(
+                    checked.is_err(),
+                    refused,
+                    "{label}: {:?}",
+                    checked.err().map(|e| e.to_string())
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+            }
+            // Disabled, it rewrites nothing — measured — and the same
+            // unapproved trigger on `app.c` is out of reach again.
+            conn.execute(
+                "CREATE OR REPLACE TRIGGER rewrite BEFORE UPDATE ON app.p \
+                 FOR EACH ROW EXECUTE FUNCTION app.rewrite(); \
+                 ALTER TABLE app.p DISABLE TRIGGER rewrite",
             )
-            .await;
+            .await
+            .unwrap();
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let checked =
+                pbps_pg::data_triggers::prepare(&mut conn, &[write], &wide, &Default::default())
+                    .await;
             assert!(
                 checked.is_ok(),
                 "a disabled trigger writes nothing: {:?}",

@@ -407,6 +407,31 @@ async fn read_actions(
     let rows = conn
         .query(&format!(
             "{ctes},
+             -- A partitioned side catalogues the declared foreign key and a
+             -- copy of it per partition, and a copy can even carry another
+             -- name (`qc_a_id_fkey_1`, measured). The plan can only name the
+             -- declared one, so a removal is matched against that: matching
+             -- the copy would follow an action the plan has already taken
+             -- away. Copies are not skipped outright -- when the write names
+             -- a partition of the *referenced* side, the copy is the only row
+             -- that matches it at all.
+             ancestry(copy, above) AS (
+                 SELECT con.oid, con.oid
+                 FROM pg_catalog.pg_constraint con
+                 JOIN relations r ON r.oid = con.confrelid
+                 WHERE con.contype = 'f'
+                 UNION
+                 SELECT a.copy, above.conparentid
+                 FROM ancestry a
+                 JOIN pg_catalog.pg_constraint above ON above.oid = a.above
+                 WHERE above.conparentid <> 0
+             ),
+             tops(copy, declared) AS (
+                 SELECT a.copy, a.above
+                 FROM ancestry a
+                 JOIN pg_catalog.pg_constraint declared ON declared.oid = a.above
+                 WHERE declared.conparentid = 0
+             ),
              edges(constraint_oid, referencing, cascades, written) AS (
                  SELECT con.oid, con.conrelid,
                         {events} = {delete} AND con.confdeltype = 'c',
@@ -415,7 +440,9 @@ async fn read_actions(
                              THEN con.confdelsetcols ELSE con.conkey END
                  FROM pg_catalog.pg_constraint con
                  JOIN relations r ON r.oid = con.confrelid
-                 JOIN pg_catalog.pg_class child ON child.oid = con.conrelid
+                 JOIN tops ON tops.copy = con.oid
+                 JOIN pg_catalog.pg_constraint declared ON declared.oid = tops.declared
+                 JOIN pg_catalog.pg_class child ON child.oid = declared.conrelid
                  JOIN pg_catalog.pg_namespace childns ON childns.oid = child.relnamespace
                  WHERE con.contype = 'f'
                    AND (CASE WHEN {events} = {delete} THEN con.confdeltype ELSE con.confupdtype END)
@@ -434,10 +461,19 @@ async fn read_actions(
                    -- no hazard here: that rule is the planner's column list,
                    -- and this one is a value written while the row is being
                    -- built, which a trigger that does not run cannot write.
+                   -- A rewriter's own UPDATE OF list is read the same way the
+                   -- trigger read below reads one, and for the same reason: a
+                   -- trigger the statement's columns do not fire writes
+                   -- nothing either.
                    ) OR EXISTS (
                        SELECT 1 FROM pg_catalog.pg_trigger rewriter
                        WHERE rewriter.tgrelid = con.confrelid
                          AND (rewriter.tgtype & 19) = 19
+                         AND (rewriter.tgattr = ''::pg_catalog.int2vector OR EXISTS (
+                             SELECT 1 FROM touched
+                             WHERE touched.attrelid = rewriter.tgrelid
+                               AND touched.attnum = ANY(rewriter.tgattr)
+                         ))
                          AND (rewriter.tgenabled = 'A'
                              OR (rewriter.tgenabled = 'O' AND pg_catalog.current_setting('session_replication_role') <> 'replica')
                              OR (rewriter.tgenabled = 'R' AND pg_catalog.current_setting('session_replication_role') = 'replica'))
@@ -513,8 +549,10 @@ async fn read_actions(
 }
 
 /// The removals this plan performs before the row statement, as a filter on
-/// the constraint's own referencing table. `false` when there are none: an
-/// empty `OR` list is not valid SQL, and the caller negates this.
+/// the *declared* constraint's referencing table — `declared` and `child` in
+/// the query that uses this, never the partition copy the walk may have
+/// matched. `false` when there are none: an empty `OR` list is not valid SQL,
+/// and the caller negates this.
 fn gone(dropped: &Dropped) -> String {
     let of_table = |table: &TableName| {
         format!(
@@ -526,7 +564,13 @@ fn gone(dropped: &Dropped) -> String {
     let mut clauses: Vec<String> = dropped
         .foreign_keys
         .iter()
-        .map(|(table, name)| format!("({} AND con.conname = {})", of_table(table), literal(name)))
+        .map(|(table, name)| {
+            format!(
+                "({} AND declared.conname = {})",
+                of_table(table),
+                literal(name)
+            )
+        })
         .collect();
     clauses.extend(dropped.tables.iter().map(|t| format!("({})", of_table(t))));
     if clauses.is_empty() {
