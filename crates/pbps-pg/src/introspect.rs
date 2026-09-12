@@ -1447,7 +1447,7 @@ fn add_module(
 /// the deparser's job, not this reader's. `None` where the text is not this
 /// shape at all, so that the caller can say so rather than record an empty
 /// body (DECISIONS 304).
-fn after_the_name<'a>(deparsed: &'a str, prefix: &str) -> Option<&'a str> {
+pub(crate) fn after_the_name<'a>(deparsed: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = deparsed.trim_start().strip_prefix(prefix)?;
     Some(after_a_qualified_name(rest)?.trim())
 }

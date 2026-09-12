@@ -3553,6 +3553,7 @@ pub fn cmd_plan_db(
                 .await?.check;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
+            crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids).await?;
             Ok::<_, anyhow::Error>((rename_evidence, rebuilds, drops))
         }
         .await;
@@ -4264,7 +4265,10 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
         crate::engine::check_drop_blockers(conn, &plan.changes).await?;
-        execute_statements(conn, statements).await?;
+        let data_guard =
+            crate::engine::prepare_data_writes(conn, &plan.changes, &entry.snapshot, &plan.ids)
+                .await?;
+        execute_statements(conn, statements, &data_guard).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
 
@@ -4614,14 +4618,35 @@ async fn apply_staged_under_lock(
     // later read and finally into the closing ordinary snapshot, which is the
     // state `verify` measures against ever after (DECISIONS 159).
     println!(
-        "Applying {} statement(s) without a transaction...",
+        "Applying {} statement(s) with per-statement commits...",
         total - start
     );
     for (i, stmt) in statements.iter().enumerate().skip(start) {
-        if let Err(e) = conn.execute(&stmt.sql).await {
+        let executed = if stmt.row_write.is_some() {
+            // A staged row is still one atomic statement. Hold its trigger
+            // locks through the write, then commit before the checkpoint;
+            // non-transactional DDL retains the ordinary staged path.
+            conn.begin(dialect.transaction_framing()).await?;
+            let result = async {
+                let guard = crate::engine::prepare_data_writes(
+                    conn,
+                    &plan.changes,
+                    &entry.snapshot,
+                    &plan.ids,
+                )
+                .await?;
+                crate::engine::check_data_write(conn, stmt, &guard).await?;
+                conn.execute(&stmt.sql).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            finish_transaction(conn, dialect, result).await
+        } else {
+            conn.execute(&stmt.sql).await.map_err(anyhow::Error::from)
+        };
+        if let Err(e) = executed {
             return Err(anyhow::anyhow!(
-                "the database rejected statement {} of {total}, and nothing was rolled back \
-                 (a staged apply runs outside a transaction):\n{}\n\n{e}\n\n\
+                "the database rejected statement {} of {total}; earlier committed statements were not rolled back:\n{}\n\n{e}\n\n\
                  The ledger records everything that did complete. Fix the cause, then continue \
                  with `pbps apply --staged --resume`.",
                 i + 1,
@@ -5299,14 +5324,16 @@ async fn execute_transaction_body(
     conn.begin(dialect.transaction_framing())
         .await
         .context("cannot open a transaction")?;
-    execute_statements(conn, statements).await
+    execute_statements(conn, statements, &crate::engine::DataWriteGuard::default()).await
 }
 
 async fn execute_statements(
     conn: &mut Conn,
     statements: &[pbps_dialect::Statement],
+    data_guard: &crate::engine::DataWriteGuard,
 ) -> anyhow::Result<()> {
     for stmt in statements {
+        crate::engine::check_data_write(conn, stmt, data_guard).await?;
         if let Err(e) = conn.execute(&stmt.sql).await {
             return Err(anyhow::anyhow!(
                 "the database rejected this statement, and the whole plan was rolled back:\n\

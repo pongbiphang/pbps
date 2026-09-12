@@ -2386,9 +2386,10 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             row,
             defaults,
             types,
-        } => one(
+        } => row_statement(
             pg,
             table,
+            pbps_dialect::RowOperation::Insert,
             atomically(&insert_row(
                 table,
                 key_column,
@@ -2407,9 +2408,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             unchanged,
             types,
             after_types,
-        } => one(
+        } => row_statement(
             pg,
             table,
+            pbps_dialect::RowOperation::Update {
+                columns: columns.keys().cloned().collect(),
+            },
             atomically(&update_row(
                 table,
                 key_column,
@@ -2428,9 +2432,10 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             types,
             after_types,
             ..
-        } => one(
+        } => row_statement(
             pg,
             table,
+            pbps_dialect::RowOperation::Delete,
             atomically(&delete_row(
                 table,
                 key_column,
@@ -3154,6 +3159,18 @@ fn delete_row(
         // be read back and recorded as this plan's result.
         gone_row(table, key, key_column)?,
     ))
+}
+
+fn row_statement(
+    pg: &Postgres,
+    table: &TableName,
+    operation: pbps_dialect::RowOperation,
+    sql: String,
+) -> Result<Vec<Statement>, DialectError> {
+    Ok(one(pg, table, sql)?
+        .into_iter()
+        .map(|s| s.writing_rows(table.clone(), operation.clone()))
+        .collect())
 }
 
 #[cfg(test)]

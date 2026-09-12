@@ -3103,3 +3103,474 @@ fn a_staged_rename_refuses_a_recreated_intermediate_name_at_closing_and_resume()
     ));
     succeeds(d.run(&["verify", "--db", connection]));
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for role in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {role}"));
+            }
+        }
+    }
+    let admin = server();
+    let deployer = format!("pbps_trigger_deployer_{}", std::process::id());
+    let attacker = format!("pbps_trigger_attacker_{}", std::process::id());
+    let _roles = Roles(admin.clone(), vec![deployer.clone(), attacker.clone()]);
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'trigger-test'; \
+         CREATE ROLE {attacker} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'trigger-test'"
+        ),
+    );
+    for (operation, before, after, allow) in [
+        (
+            "INSERT",
+            "",
+            "data:\n  mode: exact\n  rows:\n    new: {label: New}\n",
+            "",
+        ),
+        (
+            "UPDATE",
+            "data:\n  mode: exact\n  rows:\n    old: {label: Old}\n",
+            "data:\n  mode: exact\n  rows:\n    old: {label: New}\n",
+            "data-update",
+        ),
+        (
+            "DELETE",
+            "data:\n  mode: exact\n  rows:\n    old: {label: Old}\n",
+            "data:\n  mode: exact\n  rows: {}\n",
+            "data-delete",
+        ),
+    ] {
+        for staged in [false, true] {
+            let slug = format!("trigger_{}_{}", operation.to_lowercase(), staged);
+            let own = OwnDatabase::new(&admin, &slug);
+            let connection = own.connection();
+            on_server(
+                connection,
+                &format!(
+                    "CREATE SCHEMA app AUTHORIZATION {deployer}; CREATE SCHEMA attacker AUTHORIZATION {attacker}; \
+                 GRANT USAGE ON SCHEMA app TO {attacker}; GRANT USAGE ON SCHEMA attacker TO {deployer}; \
+                 GRANT CREATE ON SCHEMA public TO {deployer}; \
+                 CREATE TABLE public.secret(value text); INSERT INTO public.secret VALUES ('test-only-secret'); \
+                 GRANT SELECT ON public.secret TO {deployer}; \
+                 CREATE TABLE attacker.leaked(value text); ALTER TABLE attacker.leaked OWNER TO {attacker}; \
+                 GRANT INSERT ON attacker.leaked TO {deployer}"
+                ),
+            );
+            let login = |role: &str| {
+                format!(
+                    "{} user={role} password=trigger-test",
+                    connection
+                        .split_whitespace()
+                        .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+            let deployment = login(&deployer);
+            let attack = login(&attacker);
+            assert_eq!(
+                scalar(
+                    &deployment,
+                    "SELECT count(*) FROM pg_roles WHERE rolname = current_user AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication)"
+                ),
+                0
+            );
+            assert!(try_on_server(&attack, "SELECT * FROM public.secret").is_err());
+            let d = Demo::new(&slug);
+            std::fs::write(
+                d.dir.join("pbps.yml"),
+                format!(
+                    "dialect: postgres\nunmanaged: {}\n",
+                    if staged { "warn" } else { "ignore" }
+                ),
+            )
+            .unwrap();
+            let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+            d.table(&format!("{declared}{before}"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", &deployment]));
+            d.table(&format!("{declared}{after}"));
+            let plan = connected_artifact(&d, &deployment, staged);
+            // Installed after approval by a role that cannot read the secret.
+            on_server(connection, &format!("GRANT TRIGGER ON app.t TO {attacker}"));
+            let level = if staged { "STATEMENT" } else { "ROW" };
+            on_server(
+                &attack,
+                &format!(
+                    "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
+                 $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
+                 IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$; \
+                 CREATE TRIGGER steal BEFORE {operation} ON app.t FOR EACH {level} EXECUTE FUNCTION attacker.steal()"
+                ),
+            );
+            if operation == "INSERT" && !staged {
+                use pbps_dialect::Dialect;
+                // Merely recording this trigger cannot make its independently
+                // replaceable invoker function safe to run as the deployer.
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &deployment).await.unwrap();
+                    let recorded = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
+                    let dialect = pbps_pg::Postgres::new();
+                    conn.begin(dialect.transaction_framing()).await.unwrap();
+                    let refused = pbps_pg::data_triggers::prepare(&mut conn, &[pbps_dialect::RowWrite {
+                        table: pbps_model::TableName::new("app", "t"), operation: pbps_dialect::RowOperation::Insert,
+                    }], &recorded, &Default::default()).await;
+                    assert!(refused.is_err(), "recording a lower-privileged owner's invoker trigger must not authorize it");
+                    conn.rollback(dialect.transaction_framing()).await.unwrap();
+                });
+            }
+            let blocked_plan = d.run(&["plan", "--db", &deployment]);
+            assert_eq!(code(&blocked_plan), 1);
+            assert!(
+                stderr(&blocked_plan).contains("unsafe data trigger"),
+                "{}",
+                stderr(&blocked_plan)
+            );
+            let mut extra = Vec::new();
+            if staged {
+                extra.push("--staged");
+            }
+            if !allow.is_empty() {
+                extra.extend(["--allow", allow]);
+            }
+            let refused = approved_apply(&d, &deployment, &plan, &extra);
+            assert_eq!(
+                scalar(connection, "SELECT count(*) FROM attacker.leaked"),
+                0,
+                "{operation} staged={staged} leaked despite approval boundary: {}{}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            assert_eq!(
+                code(&refused),
+                1,
+                "{}{}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            assert!(
+                stderr(&refused).contains("trigger") && stderr(&refused).contains("steal"),
+                "{}",
+                stderr(&refused)
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+                ),
+                0
+            );
+            on_server(&deployment, "DROP TRIGGER steal ON app.t");
+            let other_event = if operation == "INSERT" {
+                "UPDATE"
+            } else {
+                "INSERT"
+            };
+            on_server(
+                &deployment,
+                &format!(
+                    "CREATE TRIGGER disabled BEFORE {operation} ON app.t FOR EACH ROW EXECUTE FUNCTION attacker.steal();                  ALTER TABLE app.t DISABLE TRIGGER disabled;                  CREATE TRIGGER another_event BEFORE {other_event} ON app.t FOR EACH ROW EXECUTE FUNCTION attacker.steal();                  CREATE TABLE app.unrelated (id integer);                  CREATE TRIGGER unrelated BEFORE {operation} ON app.unrelated FOR EACH ROW EXECUTE FUNCTION attacker.steal()"
+                ),
+            );
+            succeeds(approved_apply(&d, &deployment, &plan, &extra));
+            assert_eq!(
+                scalar(connection, "SELECT count(*) FROM attacker.leaked"),
+                0
+            );
+            succeeds(d.run(&["verify", "--db", &deployment]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn recorded_triggers_run_but_their_names_cannot_authorize_replacements() {
+    let own = OwnDatabase::new(&server(), "recorded_triggers");
+    let connection = own.connection();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    let d = bootstrapped_demo(connection, "recorded-triggers", declared);
+    on_server(
+        connection,
+        "CREATE TABLE app.calls (value integer); \
+        CREATE FUNCTION app.record_call() RETURNS trigger LANGUAGE plpgsql AS \
+        $$BEGIN INSERT INTO app.calls VALUES (1); RETURN NEW; END$$; \
+        CREATE TRIGGER record_call BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.record_call()",
+    );
+    succeeds(d.run(&["pull", "--db", connection, "--force"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopt the intended trigger",
+    ]));
+    d.table(&format!(
+        "{declared}data:\n  mode: exact\n  rows:\n    first: {{label: First}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.calls"), 1);
+    succeeds(d.run(&["verify", "--db", connection]));
+    d.table(&format!("{declared}data:\n  mode: exact\n  rows:\n    first: {{label: First}}\n    second: {{label: Second}}\n"));
+    let plan = connected_artifact(&d, connection, false);
+    on_server(
+        connection,
+        "CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE OR REPLACE TRIGGER record_call BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.replacement()",
+    );
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE code = 'second'"
+        ),
+        0
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.calls"), 1);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "trigger_lock");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer); \
+        CREATE FUNCTION app.trusted() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE TRIGGER guarded BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trusted()",
+    );
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut writer = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection).await.unwrap();
+        let mut other = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection).await.unwrap();
+        let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
+        let dialect = pbps_pg::Postgres::new();
+        let mut write = RowWrite { table: pbps_model::TableName::new("app", "t"), operation: RowOperation::Insert };
+        writer.begin(dialect.transaction_framing()).await.unwrap();
+        let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
+        other.execute("SET lock_timeout = '100ms'").await.unwrap();
+        let replace = "CREATE OR REPLACE TRIGGER guarded BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.replacement()";
+        let blocked = other.execute(replace).await.unwrap_err();
+        assert!(matches!(blocked, pbps_db::DbError::Driver { ref code, .. } if code.as_deref() == Some("55P03")), "{blocked}");
+            writer.execute("ALTER TABLE app.t RENAME TO renamed").await.unwrap();
+            write.table = pbps_model::TableName::new("app", "renamed");
+        pbps_pg::data_triggers::check(&mut writer, &write, &guard).await.unwrap();
+        writer.execute("INSERT INTO app.renamed VALUES (1)").await.unwrap();
+        writer.commit(dialect.transaction_framing()).await.unwrap();
+        // After release the same replacement succeeds, proving the first
+        // failure came from the guard's lock, not invalid DDL or permissions.
+        let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
+            other.execute(&replace.replace("ON app.t", "ON app.renamed")).await.unwrap();
+        writer.begin(dialect.transaction_framing()).await.unwrap();
+        let refused = pbps_pg::data_triggers::prepare(&mut writer, &[write], &baseline, &Default::default()).await;
+        assert!(refused.is_err());
+        writer.rollback(dialect.transaction_framing()).await.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn bootstrap_checks_triggers_that_arrive_with_a_created_table() {
+    let own = OwnDatabase::new(&server(), "bootstrap_trigger");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE public.marker (value integer); \
+        CREATE FUNCTION public.row_hook() RETURNS trigger LANGUAGE plpgsql AS \
+        $$BEGIN INSERT INTO public.marker VALUES (1); RETURN NEW; END$$; \
+        CREATE FUNCTION public.attach_hook() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+        BEGIN \
+          IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() d JOIN pg_class c ON c.oid = d.objid \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'app' AND c.relname = 't') THEN \
+            EXECUTE 'CREATE TRIGGER unexpected BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION public.row_hook()'; \
+          END IF; \
+        END$$; \
+        CREATE EVENT TRIGGER attach_hook ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.attach_hook()",
+    );
+    let d = Demo::new("bootstrap-trigger");
+    d.table("table: app.t\ncolumns:\n  code: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    first: {}\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("unexpected"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM public.marker"), 0);
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.t')"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM public.__pbps_state WHERE kind = 'bootstrap'"
+        ),
+        0
+    );
+    on_server(connection, "DROP EVENT TRIGGER attach_hook");
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn update_of_triggers_only_guard_columns_the_statement_can_fire() {
+    for staged in [false, true] {
+        for level in ["ROW", "STATEMENT"] {
+            let own = OwnDatabase::new(&server(), &format!("update_of_{staged}_{level}"));
+            let connection = own.connection();
+            let declared = "table: app.t\ncolumns:\n  code: {type: text, nullable: false}\n  label: {type: text, nullable: false}\n  audit: {type: text, nullable: true}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n";
+            let d = bootstrapped_demo(
+                connection,
+                "update-of",
+                &format!("{declared}    first: {{label: Old}}\n"),
+            );
+            on_server(
+                connection,
+                &format!(
+                    "CREATE TABLE public.fired (value integer); \
+                 CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NEW; END$$; \
+                 CREATE TRIGGER untouched BEFORE UPDATE OF audit ON app.t FOR EACH {level} EXECUTE FUNCTION public.mark(); \
+                 BEGIN; UPDATE app.t SET label = 'Measured'; SELECT 1; COMMIT;"
+                ),
+            );
+            assert_eq!(scalar(connection, "SELECT count(*) FROM public.fired"), 0);
+            on_server(
+                connection,
+                "UPDATE app.t SET label = 'Old'; UPDATE app.t SET audit = NULL",
+            );
+            assert_eq!(scalar(connection, "SELECT count(*) FROM public.fired"), 1);
+            on_server(connection, "TRUNCATE public.fired");
+            d.table(&format!("{declared}    first: {{label: New}}\n"));
+            let plan = connected_artifact(&d, connection, staged);
+            let extra = if staged {
+                vec!["--staged", "--allow", "data-update"]
+            } else {
+                vec!["--allow", "data-update"]
+            };
+            succeeds(approved_apply(&d, connection, &plan, &extra));
+            assert_eq!(scalar(connection, "SELECT count(*) FROM public.fired"), 0);
+            succeeds(d.run(&["verify", "--db", connection]));
+            d.table(&format!("{declared}    first: {{label: Next}}\n"));
+            let plan = connected_artifact(&d, connection, staged);
+            on_server(
+                connection,
+                &format!(
+                    "CREATE OR REPLACE TRIGGER untouched BEFORE UPDATE OF audit, label ON app.t FOR EACH {level} EXECUTE FUNCTION public.mark()"
+                ),
+            );
+            let refused = approved_apply(&d, connection, &plan, &extra);
+            assert_eq!(
+                code(&refused),
+                1,
+                "{}{}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            assert!(
+                stderr(&refused).contains("unsafe data trigger"),
+                "{}",
+                stderr(&refused)
+            );
+            assert_eq!(scalar(connection, "SELECT count(*) FROM public.fired"), 0);
+            assert_eq!(
+                scalar(connection, "SELECT count(*) FROM app.t WHERE label = 'New'"),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn update_of_generated_columns_follows_their_source_columns() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "update_of_generated");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (label text, audit text, size integer GENERATED ALWAYS AS (length(label)) STORED); \
+         INSERT INTO app.t (label) VALUES ('Old'); CREATE TABLE public.fired (value integer); \
+         CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NEW; END$$; \
+         CREATE TRIGGER derived AFTER UPDATE OF size ON app.t FOR EACH ROW EXECUTE FUNCTION public.mark(); \
+         UPDATE app.t SET audit = 'untouched'",
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM public.fired"), 0);
+    on_server(connection, "UPDATE app.t SET label = 'Measured'");
+    assert_eq!(scalar(connection, "SELECT count(*) FROM public.fired"), 1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let dialect = pbps_pg::Postgres::new();
+        for (column, allowed) in [("audit", true), ("label", false)] {
+            let write = RowWrite {
+                table: pbps_model::TableName::new("app", "t"),
+                operation: RowOperation::Update {
+                    columns: [column.to_owned()].into(),
+                },
+            };
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let checked = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                &[write],
+                &Default::default(),
+                &Default::default(),
+            )
+            .await;
+            assert_eq!(
+                checked.is_ok(),
+                allowed,
+                "column {column}: {:?}",
+                checked.err()
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+        }
+        conn.execute("CREATE FUNCTION public.noop() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; CREATE TRIGGER before_update BEFORE UPDATE ON app.t FOR EACH ROW EXECUTE FUNCTION public.noop(); ALTER TABLE app.t DISABLE TRIGGER before_update; TRUNCATE public.fired; UPDATE app.t SET audit = 'again'").await.unwrap();
+        let rows = conn.query("SELECT count(*)::int8 AS n FROM public.fired").await.unwrap();
+        assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(1));
+        let write = RowWrite {
+            table: pbps_model::TableName::new("app", "t"),
+            operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
+        };
+        conn.begin(dialect.transaction_framing()).await.unwrap();
+        let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &Default::default()).await;
+        assert!(checked.is_err(), "a disabled BEFORE ROW trigger still widens generated-column updates");
+        conn.rollback(dialect.transaction_framing()).await.unwrap();
+    });
+}

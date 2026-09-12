@@ -891,6 +891,15 @@ gradual adoption. Teams that want whole-database control tune it with
 `unmanaged: ignore | warn | error` in `pbps.yml`, and scope can also be drawn at
 the schema level (manage `dbo` only).
 
+**Unmanaged scope is not permission to execute trigger code.** PostgreSQL
+reference-data writes refuse active, matching non-internal triggers unless the
+trigger matches its recorded managed definition and its function owner can act
+as the deploying role (DECISIONS 445). The check holds a table lock through the
+write, including a staged row statement, and is repeated at apply time after
+planning. A planned trigger drop must have happened before the row write; newly
+created tables get no pre-existing trigger allowance. This boundary does not
+sandbox transitive routine calls, defaults, CHECK expressions or event triggers.
+
 Declared rows (ADR-0004) are part of the managed set: `exact` tables compare
 every row, `ensure` tables compare the declared keys only, and a table without a
 `data:` block has no rows compared at all.
