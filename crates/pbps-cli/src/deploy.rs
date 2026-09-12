@@ -5621,6 +5621,7 @@ mod tests {
         let object = |t: &TableName| Some(pbps_model::GrantTarget::Object(t.clone()));
         let pulled = Pulled {
             schema: Schema::default(),
+            onboarding_notices: Vec::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -8629,6 +8630,7 @@ mod tests {
     fn pulled() -> Pulled {
         Pulled {
             schema: Schema::default(),
+            onboarding_notices: Vec::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![

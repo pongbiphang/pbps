@@ -1282,6 +1282,76 @@ fn a_narrowing_change_is_flagged_in_the_plan() {
 
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn source_default_collation_notice_is_only_printed_once_during_onboarding() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "collation_notice");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.characters (code varchar(20) NULL, label nvarchar(20) NULL);",
+    );
+    let d = Demo::new("collation-notice");
+    let notice = "source database default collation `";
+    let pull = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&pull), 0, "{}", stderr(&pull));
+    assert_eq!(
+        stderr(&pull).matches(notice).count(),
+        1,
+        "{}",
+        stderr(&pull)
+    );
+    d.commit();
+
+    for args in [
+        vec!["snapshot", "--db", own.connection(), "--force"],
+        vec!["verify", "--db", own.connection()],
+        vec!["plan", "--db", own.connection()],
+    ] {
+        let output = d.run(&args);
+        assert_eq!(code(&output), 0, "{args:?}: {}", stderr(&output));
+        assert!(
+            !stderr(&output).contains(notice),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    let init_project = Demo::new("collation-notice-init");
+    std::fs::remove_file(init_project.dir.join("pbps.yml")).unwrap();
+    let init_dir = &init_project.dir;
+    let init = Command::new(BIN)
+        .env("PBPS_COLLATION_NOTICE_SOURCE", own.connection())
+        .arg("--project")
+        .arg(init_dir)
+        .args([
+            "init",
+            "--from",
+            "source",
+            "--url-env",
+            "PBPS_COLLATION_NOTICE_SOURCE",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&init), 0, "{}", stderr(&init));
+    assert_eq!(
+        stderr(&init).matches(notice).count(),
+        1,
+        "{}",
+        stderr(&init)
+    );
+
+    // An unrelated catalog warning must still survive the shared connected read.
+    on_server(
+        own.connection(),
+        "ALTER TABLE dbo.characters ADD derived AS (LEN(code));",
+    );
+    let verify = d.run(&["verify", "--db", own.connection()]);
+    assert_eq!(code(&verify), 2, "{}", stderr(&verify));
+    assert!(stderr(&verify).contains("computed"), "{}", stderr(&verify));
+    assert!(!stderr(&verify).contains(notice), "{}", stderr(&verify));
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
     let own = OwnDatabase::new(&server, "temporal_pull");
