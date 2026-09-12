@@ -1893,7 +1893,23 @@ fn conversion_probe(
         Some(TypeArg::Int(n)) => Some(*n),
         Some(TypeArg::Max) | Some(TypeArg::Ident(_)) | None => None,
     });
-    if let Some(n) = bound.filter(|_| probes_capacity) {
+    // `sysname`'s capacity is fixed regardless of what the source is, but
+    // `LEN` is only a capacity measure for a source that is already
+    // character data. A `varbinary` source's `LEN` counts bytes — measured,
+    // 200 bytes that `CONVERT(sysname, ...)` reinterprets as 100 UTF-16
+    // characters (comfortably inside `sysname`'s 128) still read `LEN = 200`,
+    // over the bound, and the old-shaped probe refused a plan the engine
+    // accepts. `char`/`nchar`/`varchar`/`nvarchar` targets need no such guard
+    // here: their `bound` only ever comes from their own declared length
+    // (`to.args.first()`), never from this `sysname`-only fallback, so this
+    // is unchanged for them (round 2 of #460's review, issue #142).
+    let from_is_character = matches!(
+        from.base.as_str(),
+        "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
+    );
+    if let Some(n) =
+        bound.filter(|_| probes_capacity && (to.base != "sysname" || from_is_character))
+    {
         match to.base.as_str() {
             // LEN ignores trailing blanks, and so does the engine when it
             // shortens a character column — counting them would report rows
@@ -1901,7 +1917,10 @@ fn conversion_probe(
             // it stores like `nvarchar`: `LEN` already counts UTF-16 code
             // units, which is how `nvarchar(128)` — and so `sysname` —
             // measures its own capacity, so no separate Unicode-length logic
-            // is needed here.
+            // is needed here — reached only when the source is character
+            // data in the first place (see `from_is_character` above); a
+            // non-character source targeting `sysname` falls through to the
+            // generic `TRY_CONVERT` probe below instead.
             "char" | "nchar" | "varchar" | "nvarchar" | "sysname" => {
                 let len = match from.base.as_str() {
                     "text" => format!("LEN(CONVERT(varchar(max), {col}))"),
@@ -2186,6 +2205,34 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    /// Round 2 of the review on PR #460 (issue #142): `sysname`'s fixed
+    /// bound was routed through the `LEN`-based length arm for *any* source,
+    /// not only a character one. `LEN` on a `varbinary` column counts bytes,
+    /// not the UTF-16 units `sysname`'s capacity is measured in — measured,
+    /// a 200-byte `varbinary` value that `CONVERT(sysname, ...)` turns into
+    /// exactly 100 characters (well under `sysname`'s 128) still reads
+    /// `LEN = 200`, so the broken shape reported a blocker for a plan the
+    /// engine actually accepts. This is "a valid plan is refused" — one of
+    /// the three review-loop cases that must always be fixed, unlike the
+    /// `_SC`-collation finding deferred to issue #461.
+    #[test]
+    fn narrowing_a_non_character_source_to_sysname_is_not_probed_by_len() {
+        let sql = sql_of(&Change::AlterColumnType {
+            uid: uid("c_aaaaaa"),
+            column: cref("dbo.customer.label"),
+            from: ty("varbinary(200)"),
+            to: ty("sysname"),
+            from_nullable: true,
+            to_nullable: true,
+        });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains("TRY_CONVERT(sysname, [label]) IS NULL"),
+            "{sql:?}"
+        );
+        assert!(!sql[0].contains("LEN("), "{sql:?}");
     }
 
     #[test]

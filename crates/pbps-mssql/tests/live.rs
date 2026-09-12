@@ -2358,6 +2358,71 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
     db.drop().await;
 }
 
+/// Round 2 of the review on PR #460 (issue #142): the fixed `sysname` bound
+/// was routed through the `LEN`-based length arm regardless of the source
+/// type. `LEN` on a `varbinary` source counts bytes, not the UTF-16 units
+/// `sysname`'s capacity is measured in, so a value that comfortably fits
+/// `sysname` once converted still read as too long. This is "a valid plan is
+/// refused" (one of the three cases the review loop always fixes), not the
+/// `_SC`-collation false-clean deferred to issue #461.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut db = TestDb::create("sysname_varbin").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t (v varbinary(200) NULL); \
+             INSERT INTO dbo.t (v) VALUES \
+             (CAST(REPLICATE(CAST(N'x' AS nvarchar(1)), 100) AS varbinary(200)));",
+        )
+        .await
+        .expect("fixture");
+
+    // Measured: this 200-byte value is exactly 100 UTF-16 characters once
+    // `CONVERT` reinterprets the bytes, well inside `sysname`'s 128 — but the
+    // broken shape asked `LEN` of the *binary* column, which reports 200.
+    let rows = db
+        .conn
+        .query("SELECT LEN(v), DATALENGTH(v) FROM dbo.t;")
+        .await
+        .unwrap();
+    let len_of_varbinary: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+    let bytes: i32 = rows[0].try_get_at(1).unwrap().unwrap();
+    assert_eq!((len_of_varbinary, bytes), (200, 200));
+
+    let cs = ChangeSet {
+        changes: vec![PlannedChange::new(Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: "dbo.t.v".parse().unwrap(),
+            from: ty("varbinary(200)"),
+            to: ty("sysname"),
+            from_nullable: true,
+            to_nullable: true,
+        })],
+    };
+    for probe in Mssql.preflight(&cs) {
+        let rows = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probe.sql));
+        let n: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+        assert_eq!(n, 0, "{}: reported a blocker: {n}", probe.description);
+    }
+
+    db.conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN v sysname NULL;")
+        .await
+        .unwrap_or_else(|e| panic!("the ALTER a clean probe promised was refused: {e}"));
+    let rows = db.conn.query("SELECT LEN(v) FROM dbo.t;").await.unwrap();
+    let len_after: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(len_after, 100);
+
+    db.drop().await;
+}
+
 /// A default this engine fills every row from is not counted as a missing
 /// value.
 ///
