@@ -57,22 +57,22 @@ async fn a_server_refusal_carries_the_servers_own_sentence() {
     assert_eq!(error.server_error_code().as_deref(), Some("42P01"));
 }
 
-/// `detail()` and the object identifiers `as_db_error()` carries, each
-/// exercised where it says something the sentence above it does not — one
-/// fixture and one error, so a run under the default parallel test harness
-/// cannot race two tests over the same fixture schema.
+/// `detail()` and `hint()` never reach the message, even though the object
+/// identifiers `as_db_error()` carries beside them do.
 ///
-/// A `NOT NULL` violation's `detail` is `"Failing row contains (null)."`
-/// (measured on 18.6), which has no overlap with `message()`, so the first
-/// assertion fails if `detail()` is dropped. **Measured**, the same
-/// violation's `message()` names only the unqualified relation (`"of
-/// relation \"nn\""`) — never the schema it lives in — while `schema()`
-/// answers the fixture's own schema name; asserting on that name is an
-/// assertion the identifiers block must actually have run to satisfy, where
-/// `column()`'s `"required"` would not be, since `message()` already
-/// contains it. The fixture uses a **named, non-temporary** schema rather
-/// than the session's temporary one so there is a schema name worth pinning
-/// at all: `pg_temp_NNN`'s number is assigned per backend.
+/// Ready-phase review of PR #464 found the fix's first draft folding
+/// `detail()` in unconditionally — and a `NOT NULL` violation's `detail`,
+/// `"Failing row contains (null)."`, is one measured shape; a unique
+/// violation's is `"Key (id)=(1) already exists."` (DECISIONS 453). Both are
+/// **data**, and this crate's caller writes what this function returns to
+/// stderr and to the deployment ledger's `reason` column — nowhere a
+/// deployer's row values belong. So this asserts the opposite of what an
+/// earlier draft of this test did: the detail must be *absent*, specifically
+/// (not merely "the test no longer checks for it" — a regression that put it
+/// back would still pass a test that only stopped looking), while the schema
+/// identifier `message()` never states on its own must still be *present*,
+/// proving the redaction removed the data-bearing field without silently
+/// disabling the safe one beside it.
 ///
 /// The schema name carries `std::process::id()`, the convention every
 /// non-temporary fixture in `crates/pbps-pg/tests/live.rs` already follows
@@ -84,7 +84,7 @@ async fn a_server_refusal_carries_the_servers_own_sentence() {
 /// process leave nothing behind.
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
-async fn a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not() {
+async fn a_not_null_violations_detail_never_reaches_the_message() {
     let mut conn = connect().await;
     let schema = format!("issue167_enrichment_{}", std::process::id());
     conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -112,34 +112,31 @@ async fn a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not
         message.contains("violates not-null constraint"),
         "expected the server's own sentence, got: {message}"
     );
-    let primary_sentence = message
-        .split("\nOBJECT:")
-        .next()
-        .expect("splitting on a literal always yields at least one piece");
     assert!(
-        !primary_sentence.contains(&schema),
-        "the fixture is broken: the schema must not already be in the message \
-         or the detail, or the identifier assertion below would pass without \
-         the identifiers block ever running: {message}"
-    );
-    assert!(
-        message.contains("DETAIL: Failing row contains (null)."),
-        "expected the detail folded in under its own label, got: {message}"
+        !message.contains("DETAIL") && !message.contains("Failing row"),
+        "the server's DETAIL carries a data-bearing row value and must not \
+         reach the message this tool logs and writes into the ledger: {message}"
     );
     assert!(
         message.contains(&format!("OBJECT: schema \"{schema}\"")),
-        "expected the schema identifier folded in under its own label, got: {message}"
+        "expected the schema identifier to survive the redaction, got: {message}"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("23502"));
 }
 
-/// `hint()`, exercised where the server actually sends one: a column name
-/// that does not exist but closely matches one that does. **Measured** on
-/// 18.6, this is also a shape with no `detail()` and no object identifiers at
-/// all, so it isolates `hint()` from every other branch.
+/// `hint()` never reaches the message either, measured against a case where
+/// the server's hint is ordinary advice — the risk is not that advice is
+/// itself sensitive, but that PostgreSQL sets no boundary on what a `hint`
+/// can say: `RAISE ... USING HINT = format(...)` in a data trigger this
+/// tool's own guard exists to police (`crates/pbps-pg/src/data_triggers.rs`)
+/// can interpolate anything, including a rejected row's own value, and this
+/// seam cannot tell that shape apart from `psql`'s example (**measured** on
+/// 18.6: `HINT:  the offending value was alice@example.com` from
+/// `RAISE EXCEPTION '...' USING HINT = format('the offending value was %s',
+/// v)`).
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
-async fn a_misspelled_column_carries_the_servers_own_hint() {
+async fn a_misspelled_columns_hint_never_reaches_the_message() {
     let mut conn = connect().await;
     conn.execute("CREATE TEMPORARY TABLE issue167_hint (namee text)")
         .await
@@ -154,27 +151,28 @@ async fn a_misspelled_column_carries_the_servers_own_hint() {
         "expected the server's own sentence, got: {message}"
     );
     assert!(
-        message
-            .contains(r#"HINT: Perhaps you meant to reference the column "issue167_hint.namee"."#),
-        "expected the hint folded in under its own label, got: {message}"
+        !message.contains("HINT") && !message.contains("Perhaps you meant"),
+        "a hint is free text a user's own PL/pgSQL controls and must not \
+         reach the message this tool logs and writes into the ledger: {message}"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("42703"));
 }
 
-/// `where_()` — `CONTEXT:` in `psql`'s own vocabulary — exercised for an
-/// error raised inside a PL/pgSQL function. **Measured** on 18.6, this shape
-/// carries `where_()` and none of `detail()`, `hint()`, or an object
-/// identifier, isolating it the same way the hint case isolates `hint()`.
+/// `where_()` never reaches the message, exercised first for the safe-looking
+/// shape — a bare call stack, `"PL/pgSQL function f() line N at RAISE"`, with
+/// no embedded statement text at all — to prove the redaction is
+/// unconditional and not a filter that happens to catch only the dangerous
+/// shape.
 ///
 /// The function name carries `std::process::id()` for the reason
-/// [`a_not_null_violation_carries_a_detail_and_a_schema_the_message_does_not`]'s
-/// schema does: `CREATE OR REPLACE FUNCTION` is not temporary — there is no
-/// `pg_temp` equivalent for functions this fixture uses — so a fixed name
-/// would let two runs against the same database race `CREATE OR REPLACE`
-/// against `DROP FUNCTION`.
+/// [`a_not_null_violations_detail_never_reaches_the_message`]'s schema does:
+/// `CREATE OR REPLACE FUNCTION` is not temporary — there is no `pg_temp`
+/// equivalent for functions this fixture uses — so a fixed name would let two
+/// runs against the same database race `CREATE OR REPLACE` against
+/// `DROP FUNCTION`.
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
-async fn an_exception_inside_a_function_carries_its_call_stack_as_context() {
+async fn an_exceptions_call_stack_never_reaches_the_message() {
     let mut conn = connect().await;
     let function = format!("issue167_ctx_{}", std::process::id());
     conn.execute(&format!(
@@ -199,12 +197,77 @@ async fn an_exception_inside_a_function_carries_its_call_stack_as_context() {
         "expected the server's own sentence, got: {message}"
     );
     assert!(
-        message.contains(&format!(
-            "CONTEXT: PL/pgSQL function {function}() line 3 at RAISE"
-        )),
-        "expected the call stack folded in under its own label, got: {message}"
+        !message.contains("CONTEXT") && !message.contains("PL/pgSQL function"),
+        "the call stack must not reach the message even in this shape, which \
+         carries no embedded statement text at all: {message}"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("P0001"));
+}
+
+/// `where_()`'s dangerous shape, measured directly: a statement that fails
+/// *inside* a function carries that statement's own text, literals and all
+/// (`CONTEXT:  SQL statement "INSERT INTO t VALUES ('secret')"`), and this
+/// seam holds no SQL grammar to strip the literal while keeping the frame —
+/// constraint 9, the same reason `data_triggers.rs` parses no SQL either.
+/// This is the shape the ready-phase review named; the fixture writes a
+/// distinctive value expressly so the assertion below cannot pass by
+/// accident of the value being short or common.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn a_statement_literal_inside_a_function_never_reaches_the_message() {
+    let mut conn = connect().await;
+    let schema = format!("issue167_leak_{}", std::process::id());
+    conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .expect("clean up any previous run's schema");
+    conn.execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("create the fixture schema");
+    conn.execute(&format!(
+        "CREATE TABLE {schema}.secrets (secret text PRIMARY KEY)"
+    ))
+    .await
+    .expect("create the fixture table");
+    conn.execute(&format!(
+        "CREATE FUNCTION {schema}.leak() RETURNS void LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO {schema}.secrets VALUES ('super-secret-value-167');
+           INSERT INTO {schema}.secrets VALUES ('super-secret-value-167');
+         END;
+         $$"
+    ))
+    .await
+    .expect("create the fixture function");
+    let error = match conn.query(&format!("SELECT {schema}.leak()")).await {
+        Ok(_) => panic!("a duplicate key inside the function must fail"),
+        Err(e) => e,
+    };
+    conn.execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .expect("drop the fixture schema");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("duplicate key value violates unique constraint"),
+        "expected the server's own sentence, got: {message}"
+    );
+    assert!(
+        !message.contains("super-secret-value-167"),
+        "the row's own value must never reach the message this tool logs \
+         and writes into the ledger: {message}"
+    );
+    assert!(
+        !message.contains("DETAIL") && !message.contains("CONTEXT"),
+        "neither of the two fields that could have carried the value above \
+         may reach the message at all: {message}"
+    );
+    assert!(
+        message.contains(&format!("OBJECT: schema \"{schema}\""))
+            && message.contains("table \"secrets\"")
+            && message.contains("constraint \"secrets_pkey\""),
+        "expected the identifiers to survive the redaction, got: {message}"
+    );
+    assert_eq!(error.server_error_code().as_deref(), Some("23505"));
 }
 
 /// The negative case: a failure that never reached the server — so
