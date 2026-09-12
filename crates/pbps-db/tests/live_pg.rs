@@ -228,9 +228,16 @@ async fn a_connection_failure_with_no_server_error_still_renders_its_own_text() 
         Err(e) => e,
     };
     let message = error.to_string();
-    assert!(
-        !message.is_empty(),
-        "a connection failure must not render as nothing"
+    // The exact string, not merely "non-empty": a non-empty check would pass
+    // for a generic placeholder, or for the very literal `db error` this fix
+    // exists to eliminate. **Measured**: `tokio_postgres::Error`'s own
+    // `Display` for `Kind::Closed` is exactly `"connection closed"` — the
+    // fallback branch renders that unmodified, so this is the one string
+    // that pins the fallback actually ran rather than something else
+    // entirely.
+    assert_eq!(
+        message, "connection closed",
+        "the fallback must render tokio_postgres's own text for this failure"
     );
     assert_eq!(
         error.server_error_code(),
