@@ -366,7 +366,8 @@ fn reached(statement: &Statement) -> String {
 ///
 /// Not asked of a row movement's halves: measured, rules on the partitions a
 /// row leaves and lands in do not fire, because the movement is one statement's
-/// doing and not a statement of its own.
+/// doing and not a statement of its own. Asked only of the relation the
+/// statement names, for the same reason a movement is not asked at all.
 async fn refuse_rules(conn: &mut Conn, statement: &Statement) -> Result<(), DbError> {
     if statement.rows_only {
         return Ok(());
@@ -376,20 +377,24 @@ async fn refuse_rules(conn: &mut Conn, statement: &Statement) -> Result<(), DbEr
         DELETE => '4',
         _ => '2',
     };
+    // Only the relation the statement names: measured on 18.6, the rewriter
+    // runs before partition routing and before inheritance expansion, so a
+    // rule on a partition or on an inheritance child does not fire for a
+    // statement naming their parent — and refusing for one would refuse a
+    // plan whose write cannot reach it.
     let rows = conn
         .query(&format!(
-            "{ctes}
-             SELECT n.nspname AS schema_name, c.relname AS table_name, w.rulename AS name
-             FROM relations r
-             JOIN pg_catalog.pg_rewrite w ON w.ev_class = r.oid
-             JOIN pg_catalog.pg_class c ON c.oid = r.oid
+            "SELECT n.nspname AS schema_name, c.relname AS table_name, w.rulename AS name
+             FROM pg_catalog.pg_rewrite w
+             JOIN pg_catalog.pg_class c ON c.oid = w.ev_class
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-             WHERE w.rulename <> '_RETURN' AND w.ev_type = '{event}'
+             WHERE w.ev_class = {relation}::pg_catalog.oid
+               AND w.rulename <> '_RETURN' AND w.ev_type = '{event}'
                AND (w.ev_enabled = 'A' OR w.ev_enabled =
                     CASE WHEN pg_catalog.current_setting('session_replication_role') = 'replica'
                          THEN 'R' ELSE 'O' END)
              ORDER BY w.oid",
-            ctes = reached(statement),
+            relation = statement.relation,
         ))
         .await?;
     let Some(row) = rows.first() else {

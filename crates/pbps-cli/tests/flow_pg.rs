@@ -5343,6 +5343,60 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 );
                 conn.rollback(dialect.transaction_framing()).await.unwrap();
             }
+            // A rule lives on the relation a statement names. Measured, the
+            // rewriter runs before partition routing, so a partition's rule
+            // does not fire for the action that names its root.
+            conn.execute(
+                "CREATE TABLE app.parted(id integer, ukey text) PARTITION BY RANGE (id); \
+                 CREATE TABLE app.parted1 PARTITION OF app.parted FOR VALUES FROM (0) TO (10); \
+                 ALTER TABLE app.parted ADD FOREIGN KEY (ukey) REFERENCES app.p(ukey) ON UPDATE CASCADE; \
+                 CREATE RULE also AS ON UPDATE TO app.parted1 DO ALSO INSERT INTO app.side VALUES ('leaf'); \
+                 DROP TABLE app.c",
+            )
+            .await
+            .unwrap();
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let checked = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                std::slice::from_ref(&updates),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await;
+            assert!(
+                checked.is_ok(),
+                "a partition's rule cannot rewrite the action that names its root: {:?}",
+                checked.err().map(|e| e.to_string())
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.execute(
+                "CREATE RULE also AS ON UPDATE TO app.parted DO ALSO INSERT INTO app.side VALUES ('root')",
+            )
+            .await
+            .unwrap();
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let message = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                std::slice::from_ref(&updates),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            assert!(
+                message.contains("unsafe rewrite rule") && message.contains("app.parted"),
+                "the rule on the relation the action names: {message}"
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+            conn.execute(
+                "DROP TABLE app.parted; \
+                 CREATE TABLE app.c(ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
+                 CREATE RULE also AS ON UPDATE TO app.c DO ALSO INSERT INTO app.side VALUES ('from the rule')",
+            )
+            .await
+            .unwrap();
             // Disabled, it rewrites nothing.
             conn.execute("ALTER TABLE app.c DISABLE RULE also")
                 .await

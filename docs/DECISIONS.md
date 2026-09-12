@@ -10437,10 +10437,15 @@ SPEC is in sync with all of these.
      is SQL this tool does not parse (174), so the boundary is drawn where the
      model already draws it: `ORDINARY_TABLE` holds no relation with rules, and
      now neither does a write's closure. The test is the rule's own event and
-     enabled state, so another event's rule and a disabled one refuse nothing.
-     A row movement's halves are not asked: measured, rules on the partitions a
-     row leaves and lands in do not fire, because the movement is one
-     statement's doing and not a statement of its own.
+     enabled state, so another event's rule and a disabled one refuse nothing,
+     and only the relation the statement *names*: measured, the rewriter runs
+     before partition routing and before inheritance expansion, so a rule on a
+     partition or on an inheritance child does not fire for a statement naming
+     their parent, and refusing for one would refuse a plan whose write cannot
+     reach it. A row movement's halves are not asked at all, for the same
+     reason: measured, rules on the partitions a row leaves and lands in do not
+     fire, because the movement is one statement's doing and not a statement of
+     its own.
 
      Each reached table is locked `ROW EXCLUSIVE` before its triggers are read
      and held for the write, as 445 requires of the named one; the same lock on
@@ -10520,7 +10525,8 @@ SPEC is in sync with all of these.
      declared on one partition, against a trigger on its sibling and a
      statement trigger on their root; the rewrite rule on a cascade's target,
      with the engine's own third-table write asserted first, against the same
-     rule on another event and disabled; and
+     rule on another event, on a partition of the relation the action names,
+     and disabled; and
      the key a BEFORE trigger rewrites, with the engine's own behaviour
      asserted first and the trigger doing the rewriting recorded and approved,
      so the refusal can only be the table its cascade reaches. They
