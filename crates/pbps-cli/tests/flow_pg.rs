@@ -1131,6 +1131,71 @@ fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// An index occupies the schema's relation namespace on PostgreSQL, alongside
+/// tables and views — not a per-table namespace as on SQL Server — so two
+/// tables in one schema declaring an index of the same name is refused before
+/// it ever reaches the engine, the same shape as
+/// `a_module_named_after_a_table_is_refused` in `flow.rs` but for
+/// `Dialect::indexes_share_namespace_with_tables` (issue #176). This needs no
+/// live server: `validate` is offline.
+#[test]
+fn two_tables_with_one_index_name_are_refused() {
+    let d = Demo::new("index-namespace");
+    d.table("table: app.t1\ncolumns:\n  n: {type: integer}\nindexes:\n  ix_n: {columns: [n]}\n");
+    std::fs::write(
+        d.dir.join("schema/app.t2.yml"),
+        "table: app.t2\ncolumns:\n  n: {type: integer}\nindexes:\n  ix_n: {columns: [n]}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("app.t1.ix_n"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("app.t2.ix_n"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("one namespace per schema"),
+        "{}",
+        stderr(&o)
+    );
+    let o = d.run(&["validate", "--format", "json"]);
+    assert!(
+        stdout(&o).contains("schema.name-collision"),
+        "{}",
+        stdout(&o)
+    );
+
+    // A named unique constraint is backed by an index, so it collides too —
+    // the review-widened half of issue #176 — while a check constraint of the
+    // same name is not backed by one and is not in this namespace at all.
+    std::fs::write(
+        d.dir.join("schema/app.t3.yml"),
+        "table: app.t3\ncolumns:\n  n: {type: integer}\nunique:\n  ix_n: [n]\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    let findings = json_output(o);
+    let collisions = findings["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "schema.name-collision")
+        .count();
+    assert!(collisions >= 2, "{findings}");
+
+    std::fs::remove_file(d.dir.join("schema/app.t2.yml")).unwrap();
+    std::fs::remove_file(d.dir.join("schema/app.t3.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.t2.yml"),
+        "table: app.t2\ncolumns:\n  n: {type: integer}\nchecks:\n  t1: n > 0\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert!(
+        !stdout(&o).contains("schema.name-collision"),
+        "a check constraint has no backing index and is not in this namespace: {}",
+        stdout(&o)
+    );
+}
+
 /// The principal belongs to the cluster; bootstrap creates its managed grants
 /// in this database, not the role itself (DECISIONS 211).
 #[test]
