@@ -2920,6 +2920,87 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
     assert_eq!(by("orphaned", "parent"), 3, "{counts:?}");
 }
 
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
+    use pbps_mssql::{doctor, state};
+    let mut db = TestDb::create("doctor_migration").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    db.conn.execute("ALTER TABLE dbo.__pbps_state DROP COLUMN state_version, tables_count, modules_count, staged_completed, staged_total;
+        CREATE USER migration_deployer WITHOUT LOGIN;
+        GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO migration_deployer;
+        GRANT SELECT, INSERT, DELETE ON dbo.__pbps_state TO migration_deployer;
+        GRANT SELECT, INSERT, DELETE ON dbo.__pbps_lock TO migration_deployer;").await.unwrap();
+    db.conn.execute("REVOKE SELECT, INSERT, DELETE ON dbo.__pbps_state FROM migration_deployer; EXECUTE AS USER = 'migration_deployer';").await.unwrap();
+    let hidden = doctor::permissions(
+        &mut db.conn,
+        &[],
+        &[],
+        &doctor::GrantTargets::default(),
+        &doctor::DataTables::new(),
+        &IdsFile::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !hidden
+            .ledger_objects
+            .contains_key(&doctor::ledger_tables()[0])
+    );
+    assert!(
+        !hidden.ledger_migration_needed,
+        "hidden metadata must not be interpreted as missing columns"
+    );
+    assert!(!doctor::missing(&hidden).is_empty(), "hidden is not ready");
+    db.conn
+        .execute("REVERT; GRANT SELECT, INSERT, DELETE ON dbo.__pbps_state TO migration_deployer;")
+        .await
+        .unwrap();
+    for (alter, migrated) in [(false, false), (true, false), (false, true)] {
+        if alter {
+            db.conn
+                .execute("GRANT ALTER ON dbo.__pbps_state TO migration_deployer;")
+                .await
+                .unwrap();
+        }
+        if migrated {
+            db.conn
+                .execute("REVOKE ALTER ON dbo.__pbps_state FROM migration_deployer;")
+                .await
+                .unwrap();
+        }
+        db.conn
+            .execute("EXECUTE AS USER = 'migration_deployer';")
+            .await
+            .unwrap();
+        let held = doctor::permissions(
+            &mut db.conn,
+            &[],
+            &[],
+            &doctor::GrantTargets::default(),
+            &doctor::DataTables::new(),
+            &IdsFile::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.ledger_migration_needed, !migrated);
+        let gaps = doctor::missing(&held);
+        if !alter && !migrated {
+            assert_eq!(gaps.len(), 1, "{gaps:?}");
+            assert_eq!(gaps[0].permission, "ALTER");
+            assert_eq!(gaps[0].securable(), "OBJECT::[dbo].[__pbps_state]");
+            assert!(state::ensure_tables(&mut db.conn).await.is_err());
+        } else {
+            assert!(gaps.is_empty(), "{gaps:?}");
+            state::ensure_tables(&mut db.conn)
+                .await
+                .expect("the reported right authorizes migration, and is spent afterwards");
+        }
+        db.conn.execute("REVERT;").await.unwrap();
+    }
+    db.drop().await;
+}
+
 /// The permission check against a real least-privilege login.
 ///
 /// This is the shape the check exists for and the shape no unit test can

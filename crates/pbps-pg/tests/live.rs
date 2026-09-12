@@ -5572,6 +5572,104 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() {
+    let mut db = TestDb::create("doctor_migration").await;
+    let role = least_privilege_role(&mut db, "migration").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    db.conn.execute(&format!("ALTER TABLE public.__pbps_state DROP COLUMN state_version, DROP COLUMN tables_count, DROP COLUMN modules_count, DROP COLUMN staged_completed, DROP COLUMN staged_total;
+        GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {role};")).await.unwrap();
+    let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+    };
+    for (owner, migrated) in [(false, false), (true, false), (false, true)] {
+        if !owner && !migrated {
+            db.conn
+                .execute(&format!("REVOKE ALL ON public.__pbps_state FROM {role}"))
+                .await
+                .unwrap();
+            let mut hidden =
+                Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+                    .await
+                    .unwrap();
+            let held = doctor::permissions(&mut hidden, &ask).await.unwrap();
+            assert!(
+                held.ledger_migration_needed,
+                "world-readable metadata still proves the columns are absent"
+            );
+            assert!(
+                doctor::missing(&held)
+                    .iter()
+                    .any(|gap| gap.permission == doctor::OWNERSHIP)
+            );
+            db.conn
+                .execute(&format!(
+                    "GRANT SELECT, INSERT, DELETE ON public.__pbps_state TO {role}"
+                ))
+                .await
+                .unwrap();
+        }
+        if owner {
+            db.conn
+                .execute(&format!("ALTER TABLE public.__pbps_state OWNER TO {role}"))
+                .await
+                .unwrap();
+        }
+        if migrated {
+            db.conn
+                .execute("ALTER TABLE public.__pbps_state OWNER TO postgres")
+                .await
+                .unwrap();
+            // Transferring ownership rewrites the old owner's ACL entry.
+            db.conn
+                .execute(&format!(
+                    "GRANT SELECT, INSERT, DELETE ON public.__pbps_state TO {role}"
+                ))
+                .await
+                .unwrap();
+        }
+        let mut theirs =
+            Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+                .await
+                .unwrap();
+        let held = doctor::permissions(&mut theirs, &ask).await.unwrap();
+        assert_eq!(held.ledger_migration_needed, !migrated);
+        let gaps = doctor::missing(&held);
+        if !owner && !migrated {
+            assert_eq!(gaps.len(), 1, "{gaps:?}");
+            assert_eq!(gaps[0].permission, doctor::OWNERSHIP);
+            assert_eq!(
+                gaps[0].securable,
+                doctor::Securable::Object(doctor::ledger_tables()[0].clone())
+            );
+            assert!(state::ensure_tables(&mut theirs).await.is_err());
+        } else {
+            assert!(gaps.is_empty(), "{gaps:?}");
+            state::ensure_tables(&mut theirs)
+                .await
+                .expect("ownership authorizes migration, and is spent afterwards");
+        }
+    }
+    // Catalog access is ordinarily public, but a DBA can revoke it. An
+    // unreadable shape must remain an error, never a readiness answer.
+    db.conn
+        .execute("REVOKE SELECT ON pg_catalog.pg_attribute FROM PUBLIC")
+        .await
+        .unwrap();
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .unwrap();
+    let error = doctor::permissions(&mut theirs, &ask).await.unwrap_err();
+    assert_eq!(sqlstate(&error), "42501", "{error:?}");
+    db.drop().await;
+}
+
 /// The least-privilege configuration SPEC §8.1 asks for, run end to end: a DBA
 /// creates the ledger, grants the deployment role the DML on those two tables
 /// and nothing else, and the role deploys.
