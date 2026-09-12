@@ -4699,6 +4699,22 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
             true,
         ),
         (
+            // A movable statement is not a statement whose every row moves:
+            // measured on 18.6, one that leaves a row where it is fires that
+            // partition's BEFORE *and* AFTER UPDATE row triggers, while the
+            // row that moves fires BEFORE UPDATE and the DELETE/INSERT halves.
+            // So the movement events are added to the UPDATE triggers, never
+            // swapped for them (DECISIONS 451).
+            "an_after_update_row_trigger_on_a_partition_a_row_can_leave",
+            format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY LIST (ukey); \
+                    CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES IN ('k1'); \
+                    CREATE TABLE {{s}}.there PARTITION OF {{s}}.c FOR VALUES IN ('k2'); \
+                    ALTER TABLE {{s}}.c ADD FOREIGN KEY (ukey) REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE; \
+                    CREATE TRIGGER hook AFTER UPDATE ON {{s}}.here FOR EACH ROW EXECUTE FUNCTION public.hook()"),
+            update(&["ukey"]),
+            true,
+        ),
+        (
             "a_statement_level_delete_trigger_no_movement_fires",
             format!("{head}CREATE TABLE {{s}}.c(id int, ukey text) PARTITION BY LIST (ukey); \
                     CREATE TABLE {{s}}.here PARTITION OF {{s}}.c FOR VALUES IN ('k1'); \

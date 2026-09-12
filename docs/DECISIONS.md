@@ -10396,8 +10396,16 @@ SPEC is in sync with all of these.
      - An UPDATE that can change a partition key does not update the row: it
        moves it. Measured on 18.6, the move fires the row-level BEFORE and
        AFTER **DELETE** triggers of the partition the row leaves and the
-       row-level **INSERT** triggers of the one it lands in, no UPDATE trigger
-       at all, and no statement-level DELETE or INSERT trigger anywhere. So an
+       row-level **INSERT** triggers of the one it lands in, and no
+       statement-level DELETE or INSERT trigger anywhere. Of the partition's
+       own UPDATE triggers only the row-level **BEFORE** one fires — it is
+       what picks the destination — and the row-level AFTER UPDATE one does
+       not. That takes nothing out of the closure: `can_move` says the
+       statement *can* move a row, never that every row it touches does, and
+       measured on the same table the same statement fires BEFORE **and**
+       AFTER UPDATE on a row it leaves where it is. Narrowing a movable
+       statement to its BEFORE UPDATE triggers would hand an attacker the one
+       trigger the guard no longer looks at, on rows that never move. So an
        update statement whose columns reach a partition key carries two more
        events, row-level only, over the partitions it reaches — and that is
        true of the emitted row statement as much as of an action's, which is
