@@ -800,7 +800,9 @@ async fn bootstrap_then_introspect_returns_the_declared_schema() {
         .expect("introspect");
     db.drop().await;
 
-    assert_eq!(pulled.warnings, Vec::<String>::new());
+    assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+    assert!(pulled.warnings[0].starts_with("source database default collation `"));
+    assert!(pulled.limitations.is_empty());
     assert_eq!(pulled.schema, normalized(&declared));
 }
 
@@ -891,7 +893,9 @@ async fn applying_a_planned_migration_converges_on_the_target() {
         .expect("introspect B");
     db.drop().await;
 
-    assert_eq!(state_b.warnings, Vec::<String>::new());
+    assert_eq!(state_b.warnings.len(), 1, "{:?}", state_b.warnings);
+    assert!(state_b.warnings[0].starts_with("source database default collation `"));
+    assert!(state_b.limitations.is_empty());
     assert_eq!(state_b.schema, normalized(&b));
 
     // And having converged, the next plan must be empty — the fixpoint check.
@@ -970,6 +974,64 @@ async fn pull_warns_about_what_it_cannot_express() {
          reported, the way issue #94 asked for: {:?}",
         pulled.warnings
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn pull_reports_the_source_default_once_when_character_columns_exist() {
+    for collation in ["Latin1_General_CI_AS", "Latin1_General_CS_AS"] {
+        let mut db = TestDb::create("default_collation").await;
+        db.conn
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];
+                 CREATE TABLE dbo.numeric_only (amount int NULL);",
+                db.name
+            ))
+            .await
+            .expect("create numeric control under the chosen default");
+        let numeric = pbps_mssql::catalog::introspect(&mut db.conn)
+            .await
+            .expect("introspect numeric control");
+        assert!(numeric.warnings.is_empty(), "{:?}", numeric.warnings);
+        assert!(numeric.limitations.is_empty());
+
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.characters (
+                     inherited varchar(20) NULL,
+                     explicit_default nvarchar(20) COLLATE {collation} NULL
+                 );"
+            ))
+            .await
+            .expect("create inherited and explicit matching collations");
+        let rows = db.conn
+            .query("SELECT collation_name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.characters')")
+            .await
+            .expect("measure stored column collations");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                row.try_get::<&str>("collation_name").unwrap(),
+                Some(collation)
+            );
+        }
+        let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+            .await
+            .expect("introspect matching character columns");
+        db.drop().await;
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0]
+                .contains(&format!("source database default collation `{collation}`"))
+        );
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("dbo", "characters")]
+                .columns
+                .len(),
+            2
+        );
+    }
 }
 
 #[tokio::test]
