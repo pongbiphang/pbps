@@ -14,8 +14,9 @@
 //!
 //! # Where a probe is deliberately absent
 //!
-//! An empty result means "nothing was checked", never "nothing is wrong", and
-//! the cases are named rather than left to be discovered:
+//! Deliberately unbuilt checks carry an unchecked description and reason in
+//! the report. Changes with no data question produce neither a query nor an
+//! unchecked check:
 //!
 //! - **Renames** carry a dependency risk, not a data one. They are answered by
 //!   [`crate::impact`], which asks the catalog instead.
@@ -27,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_dialect::{DialectError, Probe};
+use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Value,
 };
@@ -38,17 +39,25 @@ use crate::types;
 
 /// Every probe a plan implies.
 ///
-/// Errors in quoting are swallowed on purpose: an identifier this dialect
-/// cannot write has already stopped the plan in [`crate::emit`], and a probe
-/// list is not the place to report it a second time.
-pub fn probes(changes: &ChangeSet) -> Vec<Probe> {
+/// A question that cannot be built stays in the report as unchecked; it
+/// never becomes an executable query or a successful answer.
+pub fn probes(changes: &ChangeSet) -> Preflight {
     let names = AsStored::of(changes);
-    changes
-        .changes
-        .iter()
-        .filter_map(|p| build(&p.change, &names).ok())
-        .flatten()
-        .collect()
+    let mut report = Preflight::default();
+    for p in &changes.changes {
+        match build(&p.change, &names, &mut report.unchecked) {
+            Ok(probes) => report.probes.extend(probes),
+            Err(error) => report
+                .unchecked
+                .push(Unchecked::for_change(&p.change, error.to_string())),
+        }
+    }
+    report
+}
+
+fn skip(change: &Change, reason: &str, unchecked: &mut Vec<Unchecked>) -> Vec<Probe> {
+    unchecked.push(Unchecked::for_change(change, reason));
+    Vec::new()
 }
 
 /// What every row *already in the table* holds in a column this plan adds.
@@ -469,7 +478,11 @@ impl AsStored {
     }
 }
 
-fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> {
+fn build(
+    change: &Change,
+    names: &AsStored,
+    unchecked: &mut Vec<Unchecked>,
+) -> Result<Vec<Probe>, DialectError> {
     match change {
         Change::AddColumn {
             table,
@@ -493,10 +506,13 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // expression is the case DECISIONS 124 answers with no probe rather
             // than a guess; asking the engine `(expr) IS NULL` would run the
             // operator's expression before approval, the hazard in #274.
-            if let Some(default) = column.default.as_deref()
-                && (!crate::rows::is_constant(default) || !is_null_default(default))
-            {
-                return Ok(Vec::new());
+            if let Some(default) = column.default.as_deref() {
+                if !crate::rows::is_constant(default) {
+                    return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
+                }
+                if !is_null_default(default) {
+                    return Ok(Vec::new());
+                }
             }
             Ok(vec![Probe::new(
                 format!(
@@ -517,7 +533,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &qualified(&stored.table)?,
                 &quote(&stored.name)?,
             )?]),
-            None => Ok(Vec::new()),
+            None => Ok(skip(change, "the column does not exist before apply", unchecked)),
         },
 
         Change::AlterColumnType {
@@ -529,7 +545,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             ..
         } => {
             let Some(stored) = names.column(column) else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
             let mut out = Vec::new();
             // A type change folds a nullability change into itself (§12), so it
@@ -572,7 +588,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             constraint,
         } => {
             let Some(stored) = names.table(table) else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
             // The rows the statement will meet, not the rows standing now.
             // `order_key` runs every row change (11, 12) before every
@@ -585,7 +601,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // columns *are* the constraint, so `rows_after` can build them.
             // No answer, as everywhere else one cannot be given.
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty()) {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the check predicate cannot be evaluated over planned row writes", unchecked));
             }
             let mut sql = format!(
                 // A CHECK rejects a row only when its predicate is FALSE;
@@ -607,7 +623,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 && !m.deleted.is_empty()
             {
                 let Some(key_column) = names.column(&table.column(&m.key_column)) else {
-                    return Ok(Vec::new());
+                    return Ok(skip(change, "the deleted row key does not exist before apply", unchecked));
                 };
                 let gone: BTreeSet<String> =
                     m.deleted.iter().map(|k| literal(k.as_str())).collect();
@@ -638,7 +654,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &Applies::AllRows,
             )?
             else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned unique-key values cannot be evaluated before apply", unchecked));
             };
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
@@ -667,7 +683,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &Applies::AllRows,
             )?;
             let Some(rows) = rows else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned primary-key values cannot be evaluated before apply", unchecked));
             };
             let from = format!("(\n{rows}\n) AS r");
             let mut out = Vec::new();
@@ -705,7 +721,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &applies,
             )?;
             let Some(rows) = rows else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned index values or predicate cannot be evaluated before apply", unchecked));
             };
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
@@ -732,7 +748,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &Applies::AllRows,
             )?
             else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned child-key values cannot be evaluated before apply", unchecked));
             };
             let Some(parent) = rows_after(
                 names,
@@ -743,7 +759,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &Applies::AllRows,
             )?
             else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned parent-key values cannot be evaluated before apply", unchecked));
             };
 
             // A row with any NULL in the key is exempt from the constraint
@@ -843,7 +859,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 }
                 Ok(probes)
             }
-            None => Ok(Vec::new()),
+            None => Ok(skip(change, "the deleted row key does not exist before apply", unchecked)),
         },
     }
 }
@@ -1857,9 +1873,7 @@ fn conversion_probe(
     let table = qualified(&stored.table)?;
     let col = quote(&stored.name)?;
     let from = types::normalize(from)?;
-    let Ok(to) = types::normalize(to) else {
-        return Ok(Vec::new());
-    };
+    let to = types::normalize(to)?;
     let character_to_non_unicode = matches!(
         from.base.as_str(),
         "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
@@ -1982,6 +1996,9 @@ fn conversion_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn probes(changes: &ChangeSet) -> Vec<Probe> {
+        super::probes(changes).probes
+    }
     use pbps_model::{
         CheckConstraint, ForeignKey, PlannedChange, PrimaryKey, ReferentialAction, UniqueConstraint,
     };

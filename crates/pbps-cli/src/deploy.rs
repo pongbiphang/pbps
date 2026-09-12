@@ -5193,8 +5193,15 @@ async fn run_probes(
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
-    let probes = dialect.preflight(changes);
-    for probe in &probes {
+    let report = dialect.preflight(changes);
+    for skipped in &report.unchecked {
+        unchecked += 1;
+        eprintln!(
+            "warning: could not check {} ({}); the engine will enforce it during the apply",
+            skipped.description, skipped.reason
+        );
+    }
+    for probe in &report.probes {
         // A probe can still legitimately fail to run — a check whose expression
         // names a column this plan renames, say, since expression text is never
         // rewritten by substitution. That is not a violation and it is not
