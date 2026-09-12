@@ -1741,6 +1741,68 @@ fn a_postgres_project_is_validated_against_the_postgres_catalogue() {
     assert_eq!(v["data"]["dialect"], "postgres", "{v}");
 }
 
+#[test]
+fn offline_default_sql_requires_resolution_without_preventing_identity_minting() {
+    let d = Demo::new("pg-offline-default");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let schema = d.dir.join("schema/app.t.yml");
+    std::fs::write(
+        &schema,
+        "table: app.t\ncolumns:\n  d: {type: date, default: \"'01/02/2026'::date\"}\n",
+    )
+    .unwrap();
+    let minted = d.run(&["plan"]);
+    assert_eq!(code(&minted), 0, "{}", stderr(&minted));
+    let sql = d.dir.join("plan.sql");
+    let refused = d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("canonical engine resolution"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!sql.exists());
+    std::fs::write(
+        &schema,
+        "table: app.t\ncolumns:\n  d: {type: integer, default: '42'}\n",
+    )
+    .unwrap();
+    let allowed = d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]);
+    assert_eq!(code(&allowed), 0, "{}", stderr(&allowed));
+    assert!(std::fs::read_to_string(sql).unwrap().contains("DEFAULT 42"));
+}
+
+#[test]
+fn a_pre_resolution_plan_version_is_refused_before_connecting() {
+    let d = Demo::new("old-default-plan");
+    let mut plan = pbps_model::SavedPlan::new(
+        pbps_model::PlanOrigin::Database,
+        "mssql",
+        "2026-09-13T00:00:00Z",
+        pbps_model::PlanBaseline {
+            description: "test".into(),
+            checksum: "0".repeat(64),
+        },
+        pbps_model::ChangeSet::default(),
+        pbps_model::IdsFile::default(),
+    );
+    plan.version = 8;
+    let path = d.dir.join("old.json");
+    std::fs::write(&path, serde_json::to_string(&plan).unwrap()).unwrap();
+    let out = d.run(&[
+        "apply",
+        "--db",
+        "not a connection",
+        "--plan",
+        path.to_str().unwrap(),
+        "--checksum",
+        &plan.checksum(),
+    ]);
+    assert_ne!(code(&out), 0);
+    assert!(stderr(&out).contains("version 8 plan"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("version 9"), "{}", stderr(&out));
+}
+
 /// A connected command on a `postgres` project reaches the connection: what
 /// stops it is the target, reported in the envelope as an unreachable
 /// environment, and never the dialect.
@@ -2005,6 +2067,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
                 risks: Default::default(),
                 strategy: Default::default(),
                 findings: Default::default(),
+                defaults: Default::default(),
             }],
         },
         pbps_model::IdsFile::default(),

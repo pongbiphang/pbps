@@ -35,6 +35,85 @@ async fn connect() -> Conn {
         .expect("connect to the live server")
 }
 
+#[tokio::test]
+#[ignore = "needs PostgreSQL"]
+async fn canonical_default_plan_replays_under_hostile_settings_for_every_sensitive_type() {
+    let mut conn = connect().await;
+    let s = emit_schema("resolved_defaults");
+    fresh(&mut conn, &s).await;
+    let mut table = pbps_model::Table::default();
+    for (name, ty, source) in [
+        ("d", "date", "'01/02/2026'::date"),
+        ("d2", "date", "DATE '01/02/2026'"),
+        ("d3", "date", "CAST('01/02/2026' AS date)"),
+        ("t", "time", "'12:34:56.789'::time"),
+        ("tz", "timetz", "'12:00 CST'::timetz"),
+        ("ts", "timestamp", "TIMESTAMP '01/02/2026 03:04'"),
+        (
+            "tstz",
+            "timestamptz",
+            "CAST('01/02/2026 03:04 CST' AS timestamptz)",
+        ),
+        ("i", "interval", "'-1 2:00:00'::interval"),
+        ("r", "real", "'0.12345678'::real"),
+        (
+            "f",
+            "double precision",
+            "'0.12345678901234568'::double precision",
+        ),
+        ("n", "integer", "7"),
+        ("expr", "date", "CURRENT_DATE"),
+    ] {
+        let mut c = pbps_model::Column::new(ty.parse().unwrap());
+        c.default = Some(source.into());
+        table.columns.insert(name.into(), c);
+    }
+    let mut cs = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::CreateTable {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                name: pbps_model::TableName::new(&s, "t"),
+                table: Box::new(table),
+            },
+        )],
+    };
+    assert!(Postgres::new().emit_planned(&cs.changes[0]).is_err());
+    conn.execute("SET DateStyle = 'ISO, DMY'; SET TimeZone = 'America/New_York'; SET IntervalStyle = 'sql_standard'; SET timezone_abbreviations = 'Australia'").await.unwrap();
+    pbps_pg::defaults::resolve(&mut conn, &mut cs)
+        .await
+        .unwrap();
+    assert_eq!(text(&mut conn, "SHOW DateStyle").await, "ISO, DMY");
+    let json = serde_json::to_string(&cs).unwrap();
+    let replay: pbps_model::ChangeSet = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        replay.changes[0]
+            .defaults
+            .values()
+            .filter(|d| matches!(
+                d.resolution,
+                pbps_model::DefaultResolution::Canonical { .. }
+            ))
+            .count(),
+        10
+    );
+    let statements = Postgres::new().emit_planned(&replay.changes[0]).unwrap();
+    assert!(statements[0].sql.contains("'2026-01-02'::date"));
+    for style in ["ISO, MDY", "ISO, DMY"] {
+        conn.execute(&format!("SET DateStyle = '{style}'"))
+            .await
+            .unwrap();
+        for statement in &statements {
+            conn.execute(&statement.sql).await.unwrap();
+        }
+        conn.execute(&format!("INSERT INTO {s}.t DEFAULT VALUES"))
+            .await
+            .unwrap();
+        assert!(truth(&mut conn, &format!("SELECT d = DATE '2026-01-02' AND d2 = d AND d3 = d AND t = TIME '12:34:56.789' AND tz = TIMETZ '12:00:00-06' AND ts = TIMESTAMP '2026-01-02 03:04:00' AND tstz = TIMESTAMPTZ '2026-01-02 09:04:00+00' AND extract(epoch from i) = -79200 AND r = '0.12345678'::real AND f = '0.12345678901234568'::double precision AND n = 7 FROM {s}.t")).await);
+        conn.execute(&format!("DROP TABLE {s}.t")).await.unwrap();
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
 fn conn_str() -> String {
     std::env::var("PBPS_TEST_PG_DB")
         .expect("PBPS_TEST_PG_DB is not set; see scripts/live-tests-pg.sh")
@@ -3377,9 +3456,15 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
             "{spelling}: {message}"
         );
     }
+    let mut resolved = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(table("'2026-01-02'::date"))],
+    };
+    pbps_pg::defaults::resolve(&mut conn, &mut resolved)
+        .await
+        .unwrap();
     Postgres::new()
-        .emit(&table("'2026-01-02'::date"), Strategy::default())
-        .expect("the resolved typed spelling is emitted as written");
+        .emit_planned(&resolved.changes[0])
+        .expect("the engine-resolved typed spelling is emitted as written");
     // And a type whose input function reads no setting is never in question.
     let mut plain = Table::default();
     let mut n = Column::new(ty("integer"));

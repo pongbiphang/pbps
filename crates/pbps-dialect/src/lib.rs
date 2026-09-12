@@ -1529,6 +1529,25 @@ pub trait Dialect {
     /// either way and refusing would turn a performance hint into an outage.
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError>;
 
+    /// Emits the checksum-pinned plan facts alongside a change.
+    fn emit_planned(
+        &self,
+        planned: &pbps_model::PlannedChange,
+    ) -> Result<Vec<Statement>, DialectError> {
+        if planned.defaults.values().any(|d| {
+            matches!(
+                d.resolution,
+                pbps_model::DefaultResolution::Canonical { .. }
+            )
+        }) {
+            return Err(DialectError::Invalid {
+                dialect: self.name(),
+                message: "canonical defaults are unsupported by this dialect".into(),
+            });
+        }
+        self.emit(&planned.change, planned.strategy)
+    }
+
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///
     /// The unit is the plan and not one change, and that is not a convenience.

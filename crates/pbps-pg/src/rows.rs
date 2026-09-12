@@ -451,18 +451,22 @@ pub fn is_constant(default: &str) -> bool {
 /// stores. What follows the string may be words alone: `TEXT 'a' || 'b'` is
 /// an expression (DECISIONS 367).
 fn is_a_typed_literal(s: &str) -> bool {
+    typed_literal_parts(s).is_some()
+}
+
+pub(crate) fn typed_literal_parts(s: &str) -> Option<(String, &str)> {
     let bytes = s.as_bytes();
     // The first quote that opens a string, read past any comment before it.
     let mut i = 0;
     let start = loop {
         if i >= bytes.len() {
-            return false;
+            return None;
         }
         match bytes[i] {
             b'\'' | b'$' => break i,
             b'-' | b'/' => match comment_end(s, i) {
                 Some(end) => i = end,
-                None if s[i..].starts_with("/*") => return false,
+                None if s[i..].starts_with("/*") => return None,
                 None => i += 1,
             },
             _ => i += 1,
@@ -488,30 +492,27 @@ fn is_a_typed_literal(s: &str) -> bool {
             head_end = start - 2;
         }
     }
-    let Some(ty) = type_text(&s[..head_end]) else {
-        return false;
-    };
+    let ty = type_text(&s[..head_end])?;
     if ty.is_empty() || ty.contains('[') || !looks_like_a_type(&ty) {
-        return false;
+        return None;
     }
     let tail = &s[head_end..];
     if crate::emit::is_a_bare_literal(tail) {
-        return true;
+        return Some((ty, tail));
     }
     // The string, then an interval's field qualifier and nothing else: not
     // any words — `BOOLEAN 'false' OR flip()` is an expression, and one a
     // probe must not evaluate a second time (DECISIONS 368).
-    let Some(end) = string_end(tail, start - head_end) else {
-        return false;
-    };
-    crate::emit::is_a_bare_literal(&tail[..end]) && is_an_interval_qualifier(&tail[end..])
+    let end = string_end(tail, start - head_end)?;
+    (crate::emit::is_a_bare_literal(&tail[..end]) && is_an_interval_qualifier(&tail[end..]))
+        .then(|| (format!("{ty} {}", &tail[end..]), &tail[..end]))
 }
 
 /// Whether `s` is one of the field qualifiers the grammar lets follow an
 /// `INTERVAL` literal — `DAY`, `HOUR TO MINUTE`, `SECOND(3)`, `DAY TO
 /// SECOND (2)` — read past comments and case. **Measured** on 18.6: each of
 /// those is accepted; `DAYS` and `TO DAY` are syntax errors (DECISIONS 368).
-fn is_an_interval_qualifier(s: &str) -> bool {
+pub(crate) fn is_an_interval_qualifier(s: &str) -> bool {
     const FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
     let Some(text) = type_text(s) else {
         return false;
@@ -547,7 +548,7 @@ fn is_an_interval_qualifier(s: &str) -> bool {
 /// base-prefixed integer — `0xFF`, `0o17`, `0b101` — has no fraction and no
 /// exponent (`0xFF.5` is a syntax error); and `1.`, `.5` and `1e5` are the
 /// decimal shapes they always were (DECISIONS 360).
-fn is_a_number(s: &str) -> bool {
+pub(crate) fn is_a_number(s: &str) -> bool {
     // Digits of `radix` with single underscores between them; `leading`
     // admits one underscore before the first digit, for the base prefix.
     let digits = |part: &str, radix: u32, leading: bool| {
@@ -700,7 +701,7 @@ fn identifier_end(expr: &str, at: usize) -> Option<usize> {
 /// (DECISIONS 350). The `AS` has to be the last one at the top level outside
 /// a string literal, and what follows it a type name as [`without_a_cast`]
 /// admits one.
-fn without_a_cast_call_typed(expr: &str) -> Option<(&str, String)> {
+pub(crate) fn without_a_cast_call_typed(expr: &str) -> Option<(&str, String)> {
     let rest = expr.trim();
     let head = rest.get(..4)?;
     if !head.eq_ignore_ascii_case("cast") {
@@ -834,7 +835,7 @@ fn looks_like_a_type(name: &str) -> bool {
 /// `_`, `.`, spaces and quotes, with an optional `(5,2)` modifier or `[]`.
 /// That is what separates `'unnamed'::text` from `'a'::text || 'b'`, whose
 /// trailing `::text` is in the middle of an expression.
-fn without_a_cast_typed(expr: &str) -> Option<(&str, String)> {
+pub(crate) fn without_a_cast_typed(expr: &str) -> Option<(&str, String)> {
     let bytes = expr.as_bytes();
     let mut last = None;
     let mut i = 0;

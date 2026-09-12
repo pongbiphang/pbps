@@ -38,6 +38,13 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+pub async fn resolve_defaults(conn: &mut Conn, cs: &mut ChangeSet) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Mssql => Ok(()),
+        Driver::Postgres => Ok(pbps_pg::defaults::resolve(conn, cs).await?),
+    }
+}
+
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::CostReport {

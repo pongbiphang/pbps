@@ -96,7 +96,7 @@ fn column_list(columns: &[String]) -> Result<String, DialectError> {
 /// abbreviation dictionary and `12:00:00+09:30` under another — and narrowing a
 /// recorded list because today's probe did not reach one of its rows is how the
 /// list stops being the rule it was derived from.
-const SETTING_SENSITIVE: &[&str] = &[
+pub(crate) const SETTING_SENSITIVE: &[&str] = &[
     "date",
     "time without time zone",
     "time with time zone",
@@ -704,16 +704,16 @@ pub(crate) fn refuse_an_unresolved_default(
     ty: &ColumnType,
     default: &str,
 ) -> Option<DialectError> {
-    if !SETTING_SENSITIVE.contains(&ty.base.as_str()) || !is_a_bare_literal(default) {
+    if !SETTING_SENSITIVE.contains(&ty.base.as_str()) || !crate::rows::is_constant(default) {
         return None;
     }
     Some(invalid(format!(
-        "column `{column}` is `{ty}` and its default is the bare literal {default}. What that \
+        "column `{column}` is `{ty}` and its default is the unresolved literal {default}. What that \
          text means is decided by the session that runs the `CREATE`: measured, `'01/02/2026'` on \
          a `date` stores 2026-01-02 under `DateStyle` MDY and 2026-02-01 under DMY, with no error \
          either way — so this column would default to February in one environment and January in \
-         another. Write it the way the engine renders it, with the cast it welds on and a \
-         spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 §3, §4)."
+         another. Use `plan --db` or `bootstrap --db` to bake the canonical engine rendering \
+         (for example `'2026-01-02'::date`) into the plan (ADR-0013 §3, §4)."
     )))
 }
 
@@ -747,7 +747,7 @@ fn null_clause(nullable: bool) -> &'static str {
 }
 
 /// One line of a `CREATE TABLE` column list, or the body of an `ALTER TABLE ADD`.
-fn column_definition(name: &str, column: &Column) -> Result<String, DialectError> {
+fn column_definition(name: &str, column: &Column, resolved: bool) -> Result<String, DialectError> {
     let mut s = format!("{} {}", quote(name)?, types::normalize(&column.ty)?);
     if let Some(id) = column.identity {
         // `GENERATED ALWAYS`, never `BY DEFAULT`: the model holds a seed and an
@@ -765,7 +765,10 @@ fn column_definition(name: &str, column: &Column) -> Result<String, DialectError
     s.push(' ');
     s.push_str(null_clause(column.nullable));
     if let Some(expr) = &column.default {
-        if let Some(e) = refuse_an_unresolved_default(name, &types::normalize(&column.ty)?, expr) {
+        if !resolved
+            && let Some(e) =
+                refuse_an_unresolved_default(name, &types::normalize(&column.ty)?, expr)
+        {
             return Err(e);
         }
         s.push_str(&format!(" DEFAULT {}", verbatim(expr)));
@@ -1971,11 +1974,20 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
 }
 
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
+    emit_resolved(pg, change, strategy, false)
+}
+
+pub(crate) fn emit_resolved(
+    pg: &Postgres,
+    change: &Change,
+    strategy: Strategy,
+    resolved: bool,
+) -> Sql {
     match change {
         // The first statement is the one that brings the table into being; it
         // says so, and a staged checkpoint adopts the table from there.
         Change::CreateTable { name, table, .. } => {
-            let mut out = create_table(pg, name, table)?;
+            let mut out = create_table(pg, name, table, resolved)?;
             if let Some(first) = out.first_mut() {
                 first.creates.push(Created::Table(name.clone()));
             }
@@ -2013,7 +2025,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 &format!(
                     "ALTER TABLE {} ADD COLUMN {};",
                     qualified(table)?,
-                    column_definition(name, column)?
+                    column_definition(name, column, resolved)?
                 ),
             )?
             .creating(Created::Column(table.clone(), name.clone())),
@@ -2484,7 +2496,7 @@ fn rename_table(pg: &Postgres, from: &TableName, to: &TableName) -> Sql {
     Ok(out)
 }
 
-fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
+fn create_table(pg: &Postgres, name: &TableName, table: &Table, resolved: bool) -> Sql {
     if table.columns.is_empty() {
         return Err(invalid(format!("table `{name}` has no columns")));
     }
@@ -2492,7 +2504,7 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
 
     let mut body: Vec<String> = Vec::new();
     for (col_name, column) in &table.columns {
-        body.push(column_definition(col_name, column)?);
+        body.push(column_definition(col_name, column, resolved)?);
     }
     // The primary key goes inline; every other constraint is added afterwards,
     // so that creating a table and altering one take the same code path and

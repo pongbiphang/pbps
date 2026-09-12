@@ -42,9 +42,9 @@ pub mod types;
 pub mod uid;
 
 pub use change::{
-    CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, Dropped, ModuleAfter, Part,
-    PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange, Presence, RiskClass,
-    RowAfter,
+    CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, DefaultResolution, Dropped,
+    ModuleAfter, Part, PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange,
+    PlannedDefault, Presence, RiskClass, RowAfter,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,

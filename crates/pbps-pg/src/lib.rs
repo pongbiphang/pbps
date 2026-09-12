@@ -38,6 +38,7 @@ use pbps_model::{
 
 pub mod catalog;
 pub mod data_triggers;
+pub mod defaults;
 pub mod doctor;
 mod drop_impact;
 mod emit;
@@ -652,18 +653,8 @@ impl Dialect for Postgres {
                     continue;
                 }
             };
-            // A default whose value the applying session would decide
-            // (ADR-0013 §3). Asked here and not only in the emitter, because
-            // `AlterColumnDefault` carries no type and the emitter therefore
-            // cannot ask it on the one path that changes a default on a column
-            // that is already there. This is where a user is looking at the
-            // declaration, and every command that hands statements to a
-            // database runs these checks (DECISIONS 141).
-            if let Some(expr) = &column.default
-                && let Some(e) = emit::refuse_an_unresolved_default(column_name, &normalized, expr)
-            {
-                found.push(e);
-            }
+            // Literal defaults are resolved by connected planning. Refusing
+            // them here would prevent that caller from reaching the engine.
             // A default that is a NULL of the column's own type. **Measured**
             // on 18.6: `DEFAULT NULL`, `DEFAULT (NULL)` and `DEFAULT NULL::text`
             // on a `text` column leave the column with no `pg_attrdef` row at
@@ -916,6 +907,13 @@ impl Dialect for Postgres {
 
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(self, change, strategy)
+    }
+
+    fn emit_planned(
+        &self,
+        planned: &pbps_model::PlannedChange,
+    ) -> Result<Vec<Statement>, DialectError> {
+        defaults::emit(self, planned)
     }
 
     /// What this plan implies about the data, asked before its first
@@ -1321,14 +1319,11 @@ mod tests {
     /// The one rule the emitter cannot enforce on every path, enforced where it
     /// can be.
     ///
-    /// `AlterColumnDefault` carries a column reference and two expressions and
-    /// no type, so `emit` cannot tell a bare `'01/02/2026'` on a `date` from
-    /// one on a `text` — and it is only on a `date` that the applying session
-    /// decides the value. `validate_table` sees the declaration, and every
-    /// command that hands statements to a database runs it (DECISIONS 141), so
-    /// the change never gets planned in the first place.
+    /// Connected planning must reach the resolver. The plan carries the type
+    /// beside `AlterColumnDefault`; emission, not declaration validation,
+    /// refuses an unresolved literal.
     #[test]
-    fn validating_a_table_names_a_default_the_applying_session_would_decide() {
+    fn validating_a_table_allows_literals_to_reach_connected_resolution() {
         let mut table = Table::default();
         let mut d = pbps_model::Column::new("date".parse().expect("a type"));
         d.default = Some("'01/02/2026'".into());
@@ -1345,10 +1340,13 @@ mod tests {
 
         let problems =
             Postgres::new().validate_table(&"app.t".parse().expect("a table name parses"), &table);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        let message = problems[0].to_string();
-        assert!(message.contains("column `d`"), "{message}");
-        assert!(message.contains("DateStyle"), "{message}");
+        assert!(problems.is_empty(), "{problems:?}");
+        table.columns.get_mut("d").unwrap().ty = "not_a_type".parse().unwrap();
+        assert!(
+            !Postgres::new()
+                .validate_table(&"app.t".parse().unwrap(), &table)
+                .is_empty()
+        );
     }
 
     /// A table declared where the pull will not look is refused before

@@ -263,6 +263,57 @@ fn bootstrapped_demo(connection: &str, slug: &str, table: &str) -> Demo {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn canonical_defaults_survive_bootstrap_saved_apply_and_the_next_plan() {
+    let own = OwnDatabase::new(&server(), "canonical_defaults");
+    let connection = own.connection();
+    on_server(
+        &server(),
+        &format!("ALTER DATABASE \"{}\" SET DateStyle = 'ISO, DMY'", own.name),
+    );
+    let source = "table: app.t\ncolumns:\n  d: {type: date, default: \"'01/02/2026'::date\"}\n  n: {type: integer, default: '7'}\n";
+    let d = bootstrapped_demo(connection, "canonical_defaults", source);
+    on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE d = DATE '2026-01-02' AND n = 7"
+        ),
+        1
+    );
+    let snapshot = latest_snapshot(connection);
+    assert_eq!(
+        snapshot.declared.expressions.defaults[&"app.t".parse().unwrap()]["d"],
+        "'01/02/2026'::date"
+    );
+    d.table(&source.replace("01/02/2026", "03/04/2026"));
+    let path = connected_artifact(&d, connection, false);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let plan: pbps_model::SavedPlan = serde_json::from_str(&raw).unwrap();
+    assert!(raw.contains("'2026-03-04'::date"), "{raw}");
+    let changed: pbps_model::SavedPlan =
+        serde_json::from_str(&raw.replace("'2026-03-04'::date", "'2026-04-03'::date")).unwrap();
+    assert_ne!(plan.checksum(), changed.checksum());
+    succeeds(approved_apply(&d, connection, &path, &[]));
+    on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE d = DATE '2026-03-04'"
+        ),
+        1
+    );
+    assert_eq!(
+        latest_snapshot(connection).declared.expressions.defaults[&"app.t".parse().unwrap()]["d"],
+        "'03/04/2026'::date"
+    );
+    let next = connected_artifact(&d, connection, false);
+    let next: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(next).unwrap()).unwrap();
+    assert!(next.changes.is_empty(), "{:?}", next.changes);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
     let own = OwnDatabase::new(&server(), "cost");
     let connection = own.connection();

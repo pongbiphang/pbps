@@ -537,7 +537,7 @@ fn role_name_expectations(
     let mut at = 0usize;
     for p in &cs.changes {
         let n = dialect
-            .emit(&p.change, p.strategy)
+            .emit_planned(p)
             .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?
             .len();
         // A change is pending while any of its statements is: a half-done
@@ -3001,7 +3001,7 @@ pub fn cmd_bootstrap(
     }
 
     // Bootstrap is the plan from nothing: every declared table is created.
-    let cs = pbps_diff::diff(
+    let mut cs = pbps_diff::diff(
         pbps_diff::Side {
             schema: &Schema::default(),
             ids: &IdsFile::default(),
@@ -3029,7 +3029,7 @@ pub fn cmd_bootstrap(
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
 
-    if let Some(path) = sql_out {
+    if let Some(path) = sql_out.filter(|_| target.is_none()) {
         let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;
         std::fs::write(path, script)
             .with_context(|| format!("cannot write `{}`", path.display()))?;
@@ -3046,11 +3046,18 @@ pub fn cmd_bootstrap(
         return Ok(());
     };
 
-    let statements = crate::statements(&cs, dialect.as_ref())?;
     let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        crate::engine::resolve_defaults(&mut conn, &mut cs).await?;
+        let statements = crate::statements(&cs, dialect.as_ref())?;
+        if let Some(path) = sql_out {
+            let script = crate::render_sql(&cs, dialect.as_ref(), "an empty database")?;
+            std::fs::write(path, script)
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
+            println!("wrote {}", path.display());
+        }
         crate::engine::permission_support(&mut conn, &cs).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
@@ -3547,6 +3554,7 @@ pub fn cmd_plan_db(
         })?;
 
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
+        crate::engine::resolve_defaults(&mut conn, &mut cs).await?;
         conn.begin(dialect.transaction_framing()).await?;
         let checks = async {
             let rename_evidence = crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
@@ -4968,7 +4976,7 @@ fn role_drop_expectations(
     let mut at = 0usize;
     for p in &cs.changes {
         let n = dialect
-            .emit(&p.change, p.strategy)
+            .emit_planned(p)
             .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?
             .len();
         if let pbps_model::Change::DropRole { name, members, .. } = &p.change {

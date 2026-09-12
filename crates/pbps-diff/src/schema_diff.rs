@@ -367,6 +367,26 @@ pub fn diff_partial(
     // exactly as a plan would be.
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
+        if let Change::AlterColumnDefault {
+            column,
+            to: Some(source),
+            ..
+        } = &p.change
+            && let Some(declaration) = declared
+                .schema
+                .tables
+                .get(&column.table)
+                .and_then(|table| table.columns.get(&column.name))
+        {
+            p.defaults.insert(
+                column.clone(),
+                pbps_model::PlannedDefault {
+                    column_type: declaration.ty.clone(),
+                    source: source.clone(),
+                    resolution: pbps_model::DefaultResolution::Unresolved,
+                },
+            );
+        }
         p.risks = dialect.change_risks(&p.change);
         // Attached here, not looked up at emit time: the plan file is the
         // artifact the deployment gate reviews, and a hint resolved later
@@ -4143,6 +4163,40 @@ mod tests {
 
         assert_eq!(kinds(&cs), ["RenameColumn", "AlterColumnType"]);
         assert!(cs.risks().contains(&RiskClass::Narrowing));
+    }
+
+    #[test]
+    fn default_context_follows_renames_and_keeps_same_named_columns_distinct() {
+        let mut old = Column::new(ty("date"));
+        old.default = Some("'01/02/2026'::date".into());
+        let mut new = old.clone();
+        new.default = Some("'03/04/2026'::date".into());
+        let mut base = schema_of("dbo.t", table(&[("old", old.clone())]));
+        base.tables
+            .insert("other.t".parse().unwrap(), table(&[("new", old)]));
+        let mut want = schema_of("dbo.t", table(&[("new", new.clone())]));
+        want.tables
+            .insert("other.t".parse().unwrap(), table(&[("new", new)]));
+        let cs = run(
+            &base,
+            &want,
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            }],
+        );
+        let defaults: BTreeMap<_, _> = cs.changes.iter().flat_map(|p| p.defaults.iter()).collect();
+        assert_eq!(defaults.len(), 2);
+        for at in ["dbo.t.new", "other.t.new"] {
+            let d = defaults[&at.parse::<pbps_model::ColumnRef>().unwrap()];
+            assert_eq!(d.column_type, ty("date"));
+            assert_eq!(d.source, "'03/04/2026'::date");
+            assert_eq!(d.resolution, pbps_model::DefaultResolution::Unresolved);
+        }
+        assert!(!defaults.contains_key(&"dbo.t.old".parse::<pbps_model::ColumnRef>().unwrap()));
+        let unchanged = run(&want, &want, &[]);
+        assert!(unchanged.changes.iter().all(|p| p.defaults.is_empty()));
     }
 
     /// A new table's columns ride along in CreateTable; no per-column AddColumn
