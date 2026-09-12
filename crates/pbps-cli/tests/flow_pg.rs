@@ -1617,6 +1617,26 @@ fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let assert_omitted_modules = |result: &Output, present: bool| {
+        let message = stderr(result);
+        for object in ["aggregate app.t(bigint)", "view app.bad(int)"] {
+            assert_eq!(message.contains(object), present, "{message}");
+        }
+        assert!(!message.contains("function app.t(integer)"), "{message}");
+        // An unrelated cluster role may independently refuse the plan, but
+        // connection, snapshot, or planning errors must never count as clean.
+        if message.contains("`unmanaged: error`") {
+            assert_ne!(code(result), 0, "{message}");
+        } else {
+            assert_eq!(code(result), 0, "{message}");
+        }
+    };
     let own = OwnDatabase::new(&server(), "unmanaged-modules");
     let connection = own.connection();
     on_server(connection, "CREATE SCHEMA app");
@@ -1626,9 +1646,8 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["bootstrap", "--db", connection]));
-    // Roles are cluster-wide: this database still sees principals left by
-    // other live tests. Keep their refusal as a control rather than assuming
-    // an own database means an empty unmanaged inventory.
+    // Roles are cluster-wide, so compare only this test's objects rather than
+    // assuming an own database means a stable unmanaged inventory.
     std::fs::write(
         d.dir.join("pbps.yml"),
         "dialect: postgres\nunmanaged: error\n",
@@ -1636,6 +1655,12 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     .unwrap();
     d.commit();
     let control = d.run(&["plan", "--db", connection]);
+    assert_omitted_modules(&control, false);
+    let role = Role(
+        connection.to_owned(),
+        format!("pbps_unmanaged_churn_{}", std::process::id()),
+    );
+    on_server(connection, &format!("CREATE ROLE {}", role.1));
 
     on_server(
         connection,
@@ -1651,6 +1676,7 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
         d.commit();
         let result = d.run(&["plan", "--db", connection]);
         if policy == "error" {
+            assert_omitted_modules(&result, true);
             assert_ne!(code(&result), 0, "{}", stdout(&result));
             let message = stderr(&result);
             assert!(message.contains("`unmanaged: error`"), "{message}");
@@ -1690,8 +1716,17 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
         "DROP AGGREGATE app.t(bigint); DROP VIEW app.\"bad(int)\"",
     );
     let restored = d.run(&["plan", "--db", connection]);
-    assert_eq!(code(&restored), code(&control));
-    assert_eq!(stderr(&restored), stderr(&control));
+    assert!(stderr(&restored).contains(&role.1), "{}", stderr(&restored));
+    assert_omitted_modules(&restored, false);
+    let role_name = role.1.clone();
+    drop(role);
+    let after_role_drop = d.run(&["plan", "--db", connection]);
+    assert!(
+        !stderr(&after_role_drop).contains(&role_name),
+        "{}",
+        stderr(&after_role_drop)
+    );
+    assert_omitted_modules(&after_role_drop, false);
 }
 
 #[test]
