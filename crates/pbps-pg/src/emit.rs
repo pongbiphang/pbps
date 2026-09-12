@@ -738,7 +738,7 @@ pub(crate) fn refuse_an_unresolved_default(
 /// of the five places an expression is interpolated. One newline is the whole
 /// fix, and it goes here rather than at each site so that a sixth place has
 /// somewhere to reach for (DECISIONS 281).
-fn verbatim(expression: &str) -> String {
+pub(crate) fn verbatim(expression: &str) -> String {
     format!("{expression}\n")
 }
 

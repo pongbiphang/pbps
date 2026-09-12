@@ -221,14 +221,22 @@ pub fn query(
                 // DECISIONS 329: the write half was fixed there and this call
                 // site was not swept (DECISIONS 330).
                 let stored = crate::emit::binary(&read_expr(&quoted));
+                // The same rule as every other verbatim expression in this
+                // dialect (DECISIONS 281): the default is the user's text and
+                // the `AS`/`IS NULL` that follow it below are the emitter's
+                // own syntax on the same line, so a trailing line comment
+                // would swallow them. `emit::verbatim` is the sixth place
+                // DECISIONS 281 named as the reason the newline lives in a
+                // helper rather than at each site.
+                let default_expr = format!("({})", crate::emit::verbatim(default));
                 let declared = crate::emit::binary(&read_expr(&format!(
-                    "CAST(({default}) AS {})",
+                    "CAST({default_expr} AS {})",
                     crate::types::normalize(&spec.ty).unwrap_or_else(|_| spec.ty.clone())
                 )));
                 select.push(format!(
                     // Both halves, because `=` is UNKNOWN for a NULL on either
                     // side and `DEFAULT NULL` is a real declaration.
-                    "CASE WHEN {stored} = {declared} OR ({quoted} IS NULL AND ({default}) IS NULL) \
+                    "CASE WHEN {stored} = {declared} OR ({quoted} IS NULL AND {default_expr} IS NULL) \
                      THEN true ELSE false END"
                 ));
                 Some(select.len() - 1)
@@ -1554,16 +1562,51 @@ mod tests {
         assert!(q.sql.contains("FROM \"app\".\"status\""), "{}", q.sql);
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         // Byte for byte, and through the column's type — the same comparison
-        // the write path makes (DECISIONS 330), not the column's own `=`.
+        // the write path makes (DECISIONS 330), not the column's own `=`. The
+        // default is followed by a newline before the closing paren
+        // (DECISIONS 281, via `emit::verbatim`), which is why the literal
+        // below breaks there rather than reading as one uninterrupted run.
         assert!(
             q.sql.contains(
                 "CASE WHEN (CAST(\"label\" AS text)) COLLATE \"C\" = \
-                 (CAST(CAST(('Unlabelled'::text) AS text) AS text)) COLLATE \"C\""
+                 (CAST(CAST(('Unlabelled'::text\n) AS text) AS text)) COLLATE \"C\""
             ),
             "{}",
             q.sql
         );
         assert!(q.sql.trim_end().ends_with(';'), "{}", q.sql);
+    }
+
+    /// `rows::query` is the sixth site DECISIONS 281 named: it interpolates
+    /// the column's default twice, in the comparison's `CAST` and in the
+    /// `IS NULL` half, and the emitter's own syntax follows each on the same
+    /// line. A trailing line comment in the default swallows it — measured on
+    /// 18.6 (issue #216) — unless the newline `emit::verbatim` supplies goes
+    /// in first, exactly as `emit::defaulted_cell` already does for the write
+    /// path.
+    #[test]
+    fn a_defaults_trailing_comment_does_not_swallow_the_comparison_or_the_is_null_half() {
+        let t = table(
+            Some(vec!["code"]),
+            &[
+                ("code", "varchar(20)", None),
+                ("label", "text", Some("'x' -- why")),
+            ],
+        );
+        let q = query(&name(), &t, &every())
+            .expect("the table is readable")
+            .expect("the scope names rows");
+        assert_eq!(q.columns[0].default_at, Some(2), "{}", q.sql);
+        assert!(
+            q.sql.contains("CAST(('x' -- why\n) AS text)"),
+            "the comparison's CAST must not be commented out: {}",
+            q.sql
+        );
+        assert!(
+            q.sql.contains("AND ('x' -- why\n) IS NULL)"),
+            "the IS NULL half must not be commented out: {}",
+            q.sql
+        );
     }
 
     /// The engine's column, not the declaration's: never selected, so it never
