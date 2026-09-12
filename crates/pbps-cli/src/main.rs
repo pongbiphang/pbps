@@ -59,8 +59,8 @@ use clap::{Args, Parser, Subcommand};
 
 use pbps_config::{DialectName, Project};
 use pbps_dialect::Dialect;
-use pbps_diff::{Context, Side};
-use pbps_model::{ColumnRef, IdsFile, Intent, TableName};
+use pbps_diff::{Context, RenameSource, Side};
+use pbps_model::{ColumnRef, IdsFile, Intent, Schema, TableName};
 
 #[derive(Parser)]
 #[command(
@@ -1968,22 +1968,30 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                 Vec::new(),
             ),
             pbps_load::LoadedFile::Table(t) => {
-                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = t
-                    .intents
-                    .iter()
-                    .cloned()
-                    .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
+                // Judged against the names this file declares, because a
+                // `renamed_from` whose source column is declared again records
+                // a rename that happened and a new column that has since taken
+                // the vacated name -- not a rename still waiting. One file is
+                // all fmt reads, so a table-level source, which lives in
+                // another file, stays unknown and its annotation is kept.
+                let mut declared = Schema::default();
+                declared.tables.insert(t.name.clone(), t.table.clone());
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
+                    t.intents.iter().cloned().partition(|i| {
+                        !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
+                    });
                 (
                     pbps_load::render(&t.name, &t.table, &pending, t.strategy.as_ref()),
                     absorbed,
                 )
             }
             pbps_load::LoadedFile::Role(r) => {
-                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = r
-                    .intents
-                    .iter()
-                    .cloned()
-                    .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
+                let mut declared = Schema::default();
+                declared.roles.insert(r.name.clone(), r.role.clone());
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
+                    r.intents.iter().cloned().partition(|i| {
+                        !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
+                    });
                 (pbps_load::render_role(&r.name, &r.role, &pending), absorbed)
             }
         };
@@ -2398,7 +2406,7 @@ fn cmd_plan(
     if loaded
         .intents
         .iter()
-        .any(|i| pbps_diff::intent_is_absorbed(i, &res.ids))
+        .any(|i| pbps_diff::intent_is_absorbed(i, &res.ids, RenameSource::of(i, &loaded.schema)))
     {
         findings.push(
             output::Finding::note(

@@ -12,7 +12,8 @@ pub mod managed;
 pub mod schema_diff;
 
 pub use identity::{
-    Blocker, Context, RenameSide, Resolution, intent_is_absorbed, resolve, resolve_with_annotations,
+    Blocker, Context, RenameSide, RenameSource, Resolution, intent_is_absorbed, resolve,
+    resolve_with_annotations,
 };
 pub use managed::{Scoped, observed_ids, scope};
 pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial, order_role_drops};
@@ -673,17 +674,21 @@ mod tests {
             from: "customer_name".into(),
             to: "full_name".into(),
         };
+        // The declarations `fmt` reads are the new ones, which is what makes
+        // the source name vacated rather than reused.
+        let s = schema(&[("dbo.customer", &["id", "full_name"])]);
+        let source = RenameSource::of(&intent, &s);
+        assert_eq!(source, RenameSource::Vacated);
         assert!(
-            !intent_is_absorbed(&intent, &ids),
+            !intent_is_absorbed(&intent, &ids, source),
             "a pending rename must not count as absorbed, or fmt would strip it early"
         );
 
-        let s = schema(&[("dbo.customer", &["id", "full_name"])]);
         let after = resolve(&s, &ids, std::slice::from_ref(&intent), &ctx())
             .unwrap()
             .ids;
         assert!(
-            intent_is_absorbed(&intent, &after),
+            intent_is_absorbed(&intent, &after, source),
             "once the ids file has the fact, the annotation is redundant"
         );
     }
@@ -1402,12 +1407,14 @@ mod tests {
         assert_eq!(r.ids.role_uid("app_reader"), Some(&before));
         assert_eq!(r.ids.role_uid("reader"), None);
         // Absorbed: the same annotation left in the file is not a typo.
+        let annotation = Intent::RenameRole {
+            from: "reader".into(),
+            to: "app_reader".into(),
+        };
         assert!(intent_is_absorbed(
-            &Intent::RenameRole {
-                from: "reader".into(),
-                to: "app_reader".into()
-            },
-            &r.ids
+            &annotation,
+            &r.ids,
+            RenameSource::of(&annotation, &s)
         ));
     }
 
@@ -1439,12 +1446,14 @@ mod tests {
         assert_eq!(r.ids.tombstones[&uid].reason, "SEC-7: retired");
         r.ids.validate().unwrap();
         // And a stale annotation for it is absorbed, not a blocker.
+        let stale = Intent::DropRole {
+            role: "legacy".into(),
+            reason: "x".into(),
+        };
         assert!(intent_is_absorbed(
-            &Intent::DropRole {
-                role: "legacy".into(),
-                reason: "x".into()
-            },
-            &r.ids
+            &stale,
+            &r.ids,
+            RenameSource::of(&stale, &s)
         ));
     }
 
