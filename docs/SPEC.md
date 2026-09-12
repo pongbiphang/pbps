@@ -898,8 +898,23 @@ function ownership rights can act as the deploying role (DECISIONS 445, 450).
 The check holds a table lock through the write, including a staged row
 statement, and is repeated at apply time after planning. A planned trigger drop
 must have happened before the row write; newly created tables get no
-pre-existing trigger allowance. This boundary does not sandbox transitive
-routine calls, defaults, CHECK expressions or event triggers.
+pre-existing trigger allowance.
+
+The tables checked are every table the row operation makes the engine write,
+not only the one it names: a foreign key whose `ON UPDATE` or `ON DELETE`
+action is `CASCADE`, `SET NULL` or `SET DEFAULT` writes the referencing side,
+and that write is followed recursively, with the columns and events each action
+produces — including the DELETE and INSERT a row moving between partitions
+fires in place of an UPDATE (DECISIONS 451). A foreign key the plan removes before the row
+statement, and one whose action cannot fire in this session, are left out of
+that set; at apply time the removal has to have happened, as a planned trigger
+drop does. A reached table carrying a rewrite rule is refused: a rule adds
+statements that are not in the plan, and their triggers are nobody's to
+authenticate. Holding a reached table needs `INSERT`, `UPDATE`, `DELETE` or
+`TRUNCATE` on it, which the action itself does not, so a plan whose cascade
+reaches a table the deployment role may not write is refused by name.
+This boundary does not sandbox transitive routine calls, defaults, CHECK
+expressions or event triggers.
 
 Declared rows (ADR-0004) are part of the managed set: `exact` tables compare
 every row, `ensure` tables compare the declared keys only, and a table without a

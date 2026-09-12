@@ -2015,6 +2015,39 @@ over: `pull`'s guard against a failed listing on a real directory, and the
 `plan` / `fmt` write failures. All need permission bits or an immutable flag;
 the suite may run as root **and** runs on Windows.
 
+## The table a statement names, standing in for the tables it writes
+
+The PostgreSQL data-trigger guard (DECISIONS 445) authenticated the triggers of
+the table the row statement names, plus its inheritance descendants, and held
+them under a lock. Every part of that was right, and the set was still the wrong
+set: a foreign key with `ON UPDATE CASCADE` makes the engine write the
+*referencing* table too, and the trigger it fires there runs with the deployment
+role's privileges exactly like one on the named table. `unmanaged: ignore` does
+not authorize it, which is the sentence the original guard exists to enforce.
+
+The shape is shape 5 — a sweep that asked one of the two questions. "Which
+triggers can this statement fire?" was answered thoroughly for one table, and
+"which tables does this statement write?" was never asked. A guard is a claim
+about a boundary, and the boundary is what the engine does, not what the
+statement mentions.
+
+Three traps sat inside the fix, and each of them is a measurement:
+
+- **A referential action is not the statement that caused it.** It carries
+  `ONLY`, so it reaches partitions of the referencing table but never a plain
+  inheritance descendant — the opposite of the emitted row statement, which
+  reaches both. Reusing the one expansion for both would have refused for a
+  child the engine leaves alone, or missed a partition it writes.
+- **An action writes whether or not there is a row to write.** With no
+  referencing row at all, the action's statement still runs and still fires the
+  referencing table's statement-level triggers. A guard reasoning from "there
+  are no children, so nothing cascades" would have been wrong on exactly the
+  plans the row-delete preflight lets through.
+- **A cascade writes every column of the key**, not the column that changed,
+  and an `ON DELETE SET NULL (cols)` writes just that list. `UPDATE OF` on the
+  referencing side has to follow those columns by name: a partition can number
+  its columns differently from the root it inherits them from.
+
 ## YAML and file-format traps
 
 - **`null` cannot be a YAML key** (it is the null literal); the field is

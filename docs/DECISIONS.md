@@ -10344,3 +10344,235 @@ SPEC is in sync with all of these.
      inheritors that can already act as the deployer remain trusted. This
      narrows the execution policy without granting any additional privileges
      or extending the guard to transitive routine calls and indirect writes.
+
+451. **The named table is not the write set: a row operation is guarded over the
+     foreign keys whose actions write for it.** 445 authenticated the triggers
+     of the table the plan names and its inheritance descendants. That is not
+     where the write ends. **Measured on PostgreSQL 18.6**, with the same
+     separate non-superuser roles as 445 and reproduced end to end through the
+     CLI (#412): a deployer's `UPDATE` of a referenced UNIQUE value makes the
+     engine write the referencing table for it, and an invoker trigger the
+     attacker attached there with nothing but `TRIGGER` on it copies a secret
+     the attacker cannot read — `current_user` inside that trigger is the
+     deployer. PostgreSQL runs a referential action as the *referencing* table's
+     owner, so the escalation is exactly the ordinary case where the deployment
+     role owns the table the action writes. `unmanaged: ignore` and `warn` do
+     not authorize it, for the reason 445 already gave: scope is comparison,
+     not execution.
+
+     The guard therefore walks the write-producing closure of each row
+     operation: `CASCADE`, `SET NULL` and `SET DEFAULT` produce a write,
+     `NO ACTION` and `RESTRICT` only refuse, and every statement the walk finds
+     is itself walked, so a cascade two foreign keys away is authenticated by
+     the same rule as the first. What the engine actually writes, measured:
+
+     - An `ON UPDATE` action sets **every** column of the foreign key, even when
+       only one referenced column changed; an `ON DELETE SET NULL`/`SET DEFAULT`
+       with a column list sets that list (`confdelsetcols`, PostgreSQL 15 and
+       later). `UPDATE OF` on the referencing side follows those columns, by
+       name: a partition may number its columns differently from its root.
+     - A referenced column that is generated changes when a `SET` column it
+       derives from does, so the closure's key test reuses the same touched-
+       column rule 445 defined for `UPDATE OF` rather than matching the SET list
+       alone.
+     - An action fires on the row the write *leaves*, not on the statement's
+       `SET` list. The referenced side's own constraint trigger carries no
+       column list — `tgattr` is empty, measured — and compares the old and new
+       key values, so a `BEFORE ROW UPDATE` trigger that rewrites a key nothing
+       set makes it cascade: measured, `UPDATE p SET ukey = ...` with a BEFORE
+       trigger assigning `NEW.other` moved the child's `other` and fired the
+       child's trigger. Every key of a relation such a trigger can rewrite is
+       therefore in the closure. Two asymmetries, both measured and both the
+       other way round from the rule beside them: a *disabled* BEFORE trigger
+       rewrites nothing (that rule is a value written at run time, while the
+       generated-column one is the planner's column list, which a disabled
+       trigger still widens), and a user trigger's own `UPDATE OF` list is not
+       widened by a rewrite at all — `UPDATE OF ukey` stayed silent when only
+       the BEFORE trigger touched `ukey` — so the rule belongs to the
+       foreign-key edge and nowhere else. A rewriter's *own* `UPDATE OF` list
+       is read exactly as the trigger scan reads one: a `BEFORE UPDATE OF code`
+       trigger does not run for a statement that sets `ukey`, so it rewrites
+       nothing and widens nothing.
+     - An UPDATE that can change a partition key does not update the row: it
+       moves it. Measured on 18.6, the move fires the row-level BEFORE and
+       AFTER **DELETE** triggers of the partition the row leaves and the
+       row-level **INSERT** triggers of the one it lands in, and no
+       statement-level DELETE or INSERT trigger anywhere. Of the partition's
+       own UPDATE triggers only the row-level **BEFORE** one fires — it is
+       what picks the destination — and the row-level AFTER UPDATE one does
+       not. That takes nothing out of the closure: `can_move` says the
+       statement *can* move a row, never that every row it touches does, and
+       measured on the same table the same statement fires BEFORE **and**
+       AFTER UPDATE on a row it leaves where it is. Narrowing a movable
+       statement to its BEFORE UPDATE triggers would hand an attacker the one
+       trigger the guard no longer looks at, on rows that never move. So an
+       update statement whose columns reach a partition key carries two more
+       events, row-level only, over the partitions it reaches — and that is
+       true of the emitted row statement as much as of an action's, which is
+       how 445's own guard turned out to have this gap for a declared
+       partitioned table. The halves produce no referential actions of their
+       own: measured, a moved row's children are cascaded as an UPDATE and not
+       deleted. A partition key written as an expression counts as always
+       movable, because which columns feed it is a question this tool does not
+       parse (174). A BEFORE ROW UPDATE trigger picks the destination partition
+       too — measured, one assigning the key moved a row whose statement
+       touched nothing near it — and the closure deliberately does *not* carry
+       that rule: such a trigger is on a partitioned relation or a partition,
+       and `ORDINARY_TABLE` holds no relation that appears in `pg_inherits` at
+       all, so it can never be a recorded managed trigger and the guard has
+       already refused it by the time the question could arise. A filter that
+       cannot change an answer is one nobody re-reads.
+     - The action's statement runs even when it matches no row, so a
+       statement-level trigger on the referencing table fires with zero
+       referencing rows. That is the *least* a delete reaches, not the most,
+       and the delete side keeps its row-level triggers and its recursion for
+       the concurrent case. The row-delete preflight and the statement guard
+       that matches it (333) refuse a plan whose declared row still has
+       children — with one deployer and nobody else writing, the action's
+       statement therefore matches nothing and only the statement trigger
+       fires, measured. **Measured on 18.6**, a second session that inserts a
+       child and a grandchild and commits while that guarded `DELETE` waits on
+       the parent's row lock defeats both: the `NOT EXISTS` guard still admits
+       the delete, the cascade removes the rows the other session committed,
+       and the child's row trigger, the grandchild's row trigger and both
+       statement triggers all fire. (The other order is safe on its own —
+       an insert that starts *after* the delete has the parent row blocks and
+       then fails the foreign key.) Narrowing the delete side to statement
+       triggers, or refusing to walk past the first action because its
+       statement "must" be empty, would hand an attacker exactly the trigger
+       the guard had stopped looking at.
+     - Referential actions carry `ONLY`. They reach partitions of the
+       referencing side and name the root of its partition tree — a statement
+       trigger on a partition does not fire, one on the root does — but they
+       never reach a plain inheritance descendant, which the emitted row
+       statement, carrying no `ONLY`, does. The two expansions are therefore
+       kept apart rather than shared: one rule for both would either miss a
+       partition or refuse for an inheritance child the engine leaves alone.
+
+     A reached relation carrying a **rewrite rule** is refused outright rather
+     than followed. Measured on 18.6, an `ON UPDATE … DO ALSO` rule on the
+     table a cascade writes inserted into a third table and fired its
+     statement trigger — a write the closure had neither locked nor
+     authenticated, and one an attacker with `TRIGGER` on that third table
+     could wait for. Following it would mean reading the rule's action, which
+     is SQL this tool does not parse (174), so the boundary is drawn where the
+     model already draws it: `ORDINARY_TABLE` holds no relation with rules, and
+     now neither does a write's closure. The test is the rule's own event and
+     enabled state, so another event's rule and a disabled one refuse nothing,
+     and only the relation the statement *names*: measured, the rewriter runs
+     before partition routing and before inheritance expansion, so a rule on a
+     partition or on an inheritance child does not fire for a statement naming
+     their parent, and refusing for one would refuse a plan whose write cannot
+     reach it. A row movement's halves are not asked at all, for the same
+     reason: measured, rules on the partitions a row leaves and lands in do not
+     fire, because the movement is one statement's doing and not a statement of
+     its own.
+
+     Each reached table is locked `ROW EXCLUSIVE` before its triggers are read
+     and held for the write, as 445 requires of the named one; the same lock on
+     the referenced side is what keeps a new foreign key from being added to it
+     mid-walk, since `ALTER TABLE ... ADD FOREIGN KEY` takes
+     `SHARE ROW EXCLUSIVE` on both sides. Reached tables are followed by oid,
+     never by name: a name is needed only to write `LOCK TABLE`, and a rename
+     between reading that name and locking it would otherwise hand the guard a
+     lock on some other relation, so the lock is proved to have landed on the
+     intended oid before its triggers count for anything.
+
+     The cost is one refusal that is not about a trigger: `ROW EXCLUSIVE` needs
+     `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on the table, and measured,
+     `SELECT` alone is `permission denied`. Because the action runs as the
+     referencing table's owner, a deployment role can have a valid plan whose
+     cascade reaches a table it may not write. Refusing is the safe direction —
+     there is no weaker lock that conflicts with `CREATE TRIGGER` — and the
+     refusal names the table and the privilege rather than surfacing the
+     engine's bare `permission denied`. Narrowing the closure to tables whose
+     owner can act as the deployer would avoid it and was not taken: the
+     effective-role rule is the thing an attacker would have to fool, and a
+     guard that is right about who may write beats one that is clever about
+     when it need not look.
+
+     Two things take a constraint back out of the closure, and both are the
+     shape 128 and `DELETE_ACTION_FIRES` already established one crate over.
+     **A foreign key the plan removes before the row statement** — a
+     `DropForeignKey`, or a `DropTable` carrying one, both ordered at
+     `order_key` 2 and 6 against the row classes 11 and 12 — cannot write when
+     that statement runs, and following it would refuse a plan for a table the
+     write never reaches. The allowance is `prepare`'s alone: `check` reads the
+     catalog immediately before the write, where what the plan promised to
+     remove has to actually be absent, exactly as 445 requires of a dropped
+     trigger. The same allowance covers the two predicates that *widen* a write
+     rather than follow one: the BEFORE ROW UPDATE trigger that makes
+     PostgreSQL touch every generated column, and the one that can rewrite a
+     referenced key the statement does not set. A plan that drops the only such
+     trigger and updates another column of that table would otherwise be
+     refused for a table its write cannot reach once the drop has run —
+     `DropModule` is `order_key` 0, so the widening is asked of the catalog as
+     the plan leaves it, not as it stands when the guard looks.
+     **An action whose own trigger does not fire** writes nothing
+     either; measured on 18.6, neither a disabled parent-side constraint
+     trigger nor an origin trigger under `session_replication_role = replica`
+     cascades at all, and the child row is left untouched. The closure applies
+     the same enabled test `preflight::DELETE_ACTION_FIRES` makes, by the event
+     this write raises rather than by the delete event alone — but asks it of
+     the constraint that *owns* the trigger, which the probe one crate over
+     never has to: every probe there filters `con.conparentid = 0` and so only
+     ever holds a declared row. Measured on 18.6, a partitioned referencing
+     side puts one pair of action triggers on the referenced table for the
+     declared constraint and none at all for the copies, so asking a copy for
+     its own trigger finds nothing and reads a disabled action as a firing one;
+     a partitioned *referenced* side is the other way about, each level owning
+     its pair on its own relation. The test is therefore the constraint's
+     ancestry chain narrowed by the relation the trigger is on, which is right
+     in both shapes and in the one where both sides are partitioned.
+
+     A partitioned side is catalogued as the declared foreign key plus a copy
+     per partition, and a copy can carry another name (`qc_a_id_fkey_1`,
+     measured). The declared row answers both questions asked of a constraint:
+     it is the only name the plan can remove, so a removal is matched against
+     it rather than against the copy the walk happened to reach, and its
+     `conrelid` is the relation the action's own statement names — measured,
+     the cascade into a partitioned referencing table ran against the
+     partitioned parent and fired its statement trigger, not the partition's.
+     Following `pg_inherits` upward instead was the first shape and is wrong
+     the other way: a foreign key somebody declared on a single partition is
+     its own declared row, and promoting it to the root drags in the root's
+     statement triggers and every sibling partition, refusing a plan for
+     tables that action cannot touch. The copies are not skipped outright
+     either: when the write names a partition of the *referenced* side, the
+     copy is the only row that matches it at all.
+
+     The lock a reached table takes is `LOCK TABLE` without `ONLY`, which also
+     locks descendants the action itself will not write. Measured, that costs
+     no privilege — PostgreSQL checks the named table's and takes the
+     descendants' locks regardless — and it is atomic over the descendant set,
+     which enumerate-then-lock is not.
+
+     Live regressions: the escalation through `ON UPDATE CASCADE`, `SET NULL`
+     and `SET DEFAULT` and through `ON DELETE CASCADE` and `SET NULL`, at row
+     and statement level, two foreign keys deep, under both apply modes and
+     both `unmanaged` settings, each with a control proving the action really
+     reaches the table and that the same plan applies once the trigger is gone;
+     a table of closure membership cases pairing every non-writing action,
+     unreached event, untouched column and unreachable descendant with the
+     writing case next to it; a concurrent `CREATE OR REPLACE TRIGGER` on a
+     cascade-reached table blocked until the write commits; the cannot-lock
+     refusal naming its table; and the removals — of a foreign key, of the table
+     carrying one, and of each of the two triggers that widen a write — and the
+     two not-firing actions, the row-level and grandchild triggers a delete
+     action reaches,
+     each paired with the state in which the same closure does follow it, and
+     each again with the referencing side partitioned, where the action trigger
+     belongs to the declared constraint and not to the copy the walk matched; the
+     partitions a row movement leaves and lands in, against the partition key
+     the write does not touch and the statement-level trigger no movement
+     fires, on an action's target and on the named table alike; a foreign key
+     declared on one partition, against a trigger on its sibling and a
+     statement trigger on their root; the rewrite rule on a cascade's target,
+     with the engine's own third-table write asserted first, against the same
+     rule on another event, on a partition of the relation the action names,
+     and disabled; and
+     the key a BEFORE trigger rewrites, with the engine's own behaviour
+     asserted first and the trigger doing the rewriting recorded and approved,
+     so the refusal can only be the table its cascade reaches. They
+     pass on 16.15 as well as 18.6: the one catalogue column the closure needs
+     that is not ancient, `confdelsetcols`, arrived in 15.
