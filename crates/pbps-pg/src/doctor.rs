@@ -54,6 +54,7 @@ use crate::state::{LEDGER_SCHEMA, LOCK_TABLE, STATE_TABLE};
 
 mod data;
 mod grants;
+mod referenced;
 
 pub use pbps_db::doctor::Ask;
 
@@ -279,6 +280,26 @@ pub struct TableRights {
 
     /// The privileges effective on it, of the ones [`REQUIRED`] asks about.
     pub privileges: BTreeSet<String>,
+
+    /// Privileges confirmed at **column** scope, keyed by the columns a
+    /// fallback question actually asked about — a subset of the table's
+    /// columns, never the whole catalog.
+    ///
+    /// PostgreSQL grants `SELECT` and `REFERENCES` per column, and an account
+    /// granted exactly the columns a declared foreign key names holds nothing
+    /// at object scope on the far side of it (issue #215). Measured on 18.6,
+    /// with `GRANT SELECT (id), REFERENCES (id) ON shared.parent`:
+    /// `has_table_privilege` answers `false` for both, `has_column_privilege`
+    /// on `id` answers `true` for both, and the key really does create. So the
+    /// object answer alone reports a gap the account does not have.
+    ///
+    /// Populated only for [`Held::referenced_objects`], and only for the
+    /// columns a declared key actually names there (this module's own
+    /// `referenced` submodule) — never for [`Held::tables`] or
+    /// [`Held::ledger_objects`], which stay empty. A permission this map was
+    /// never asked about for a column [`missing`] reads the same as any other
+    /// NULL from the server: not held.
+    pub columns: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// What the connected role effectively holds, per securable.
@@ -613,6 +634,10 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
             held.referenced_objects.insert(object, rights);
         }
     }
+    // A key needs `SELECT`/`REFERENCES` only on the columns it names, not on
+    // the whole of somebody else's table (issue #215, DECISIONS 440) — asked
+    // only where the object-scope answer above did not already cover it.
+    referenced::fill(conn, &mut held.referenced_objects, ask.referenced_columns).await?;
 
     held.declaration_gaps
         .extend(data::missing(conn, ask.data).await?);
@@ -691,6 +716,10 @@ async fn read_tables(
                 TableRights {
                     owned: optional_flag(row, "owned")?.unwrap_or(false),
                     privileges,
+                    // Filled in afterwards, only for `referenced_objects` and
+                    // only where the object answer above did not already
+                    // cover a permission (`referenced::fill`).
+                    columns: BTreeMap::new(),
                 },
             ))
         })
@@ -788,7 +817,20 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             }
             Needed::Referenced => {
                 for (object, rights) in &held.referenced_objects {
-                    if !rights.privileges.contains(r.name) {
+                    if rights.privileges.contains(r.name) {
+                        continue;
+                    }
+                    // A gap the object answer alone would report, rescued
+                    // exactly as far as the key's own columns cover it: every
+                    // column a declared key names on this target must confirm
+                    // the permission, or the rescue does not apply and the
+                    // object-scope gap stands (issue #215, DECISIONS 440).
+                    let column_covered = !rights.columns.is_empty()
+                        && rights
+                            .columns
+                            .values()
+                            .all(|granted| granted.contains(r.name));
+                    if !column_covered {
                         out.push(Gap {
                             permission: r.name,
                             why: r.why,
@@ -858,6 +900,27 @@ mod tests {
         TableRights {
             owned,
             privileges: privileges.iter().map(|p| (*p).to_owned()).collect(),
+            columns: BTreeMap::new(),
+        }
+    }
+
+    /// A referenced target's column-scope answer: no privilege at object
+    /// scope, and exactly the given columns confirmed for exactly the given
+    /// permissions — the shape this module's `referenced::fill` leaves
+    /// behind.
+    fn column_rights(columns: &[(&str, &[&str])]) -> TableRights {
+        TableRights {
+            owned: false,
+            privileges: BTreeSet::new(),
+            columns: columns
+                .iter()
+                .map(|(column, perms)| {
+                    (
+                        (*column).to_owned(),
+                        perms.iter().map(|p| (*p).to_owned()).collect(),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -1027,6 +1090,37 @@ mod tests {
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "USAGE");
         assert_eq!(gaps[0].securable(), "SCHEMA \"shared\"");
+    }
+
+    /// The measurement issue #215 exists for: no table-level privilege at
+    /// all, and every column a declared key names on the target confirmed for
+    /// both permissions the key needs. The object-scope answer alone would
+    /// report two gaps here, and neither is real.
+    #[test]
+    fn a_referenced_target_with_every_named_column_covered_has_no_gap() {
+        let mut held = Held::default();
+        held.referenced_objects.insert(
+            object("shared", "parent"),
+            column_rights(&[("id", &["SELECT", "REFERENCES"])]),
+        );
+        assert_eq!(missing(&held), Vec::new(), "{held:?}");
+    }
+
+    /// The converse, and the reason the rescue is "every column", not "some
+    /// column": a key that names two columns needs the permission on both,
+    /// and a grant that covers only one of them must not read as covering the
+    /// key.
+    #[test]
+    fn a_referenced_target_missing_one_named_columns_grant_is_still_a_gap() {
+        let mut held = Held::default();
+        held.referenced_objects.insert(
+            object("shared", "parent"),
+            column_rights(&[("id", &["SELECT", "REFERENCES"]), ("code", &["SELECT"])]),
+        );
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "REFERENCES");
+        assert_eq!(gaps[0].securable(), "TABLE \"shared\".\"parent\"");
     }
 
     /// A schema that is not there produces no `GRANT` advice, because there is

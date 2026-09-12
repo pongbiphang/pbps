@@ -4882,6 +4882,7 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         managed_schemas: &["app".to_owned()],
         managed_tables: std::slice::from_ref(&customer),
         referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask)
         .await
@@ -5139,6 +5140,7 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         managed_schemas: &[],
         managed_tables: &[],
         referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
         granted: &granted,
         data: &Default::default(),
     };
@@ -5296,6 +5298,7 @@ async fn a_role_that_may_write_the_ledger_and_not_create_it_deploys() {
         managed_schemas: &[],
         managed_tables: &[],
         referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask)
         .await
@@ -5340,6 +5343,7 @@ async fn a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted
         managed_schemas: &[],
         managed_tables: &[],
         referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask)
         .await
@@ -5411,6 +5415,7 @@ async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_nee
         managed_schemas: &["app".to_owned()],
         managed_tables: &[],
         referenced: std::slice::from_ref(&parent),
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask)
         .await
@@ -5461,6 +5466,101 @@ async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_nee
     db.drop().await;
 }
 
+/// The measurement issue #215 exists for: PostgreSQL grants `SELECT` and
+/// `REFERENCES` per column, and a role granted exactly the columns a key
+/// names deploys — so demanding them on the whole referenced table reported
+/// two gaps against an account that could already create the key.
+///
+/// Measured on 18.6, with `GRANT SELECT (id), REFERENCES (id) ON
+/// shared.parent` and nothing wider:
+///
+/// ```text
+/// has_table_privilege ('shared.parent',      'REFERENCES') -> f    has_table_privilege(..., 'SELECT') -> f
+/// has_column_privilege('shared.parent','id', 'REFERENCES') -> t    has_column_privilege(...,  'SELECT') -> t
+/// CREATE TABLE app.child (id integer PRIMARY KEY, pid integer REFERENCES shared.parent(id))  -> CREATE TABLE
+/// ```
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_column_grant_covering_exactly_the_keys_columns_reports_no_gap() {
+    let mut db = TestDb::create("referenced_column_grant").await;
+    let role = least_privilege_role(&mut db, "col_fk").await;
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA shared; \
+             CREATE TABLE shared.parent (id integer PRIMARY KEY, extra text); \
+             CREATE SCHEMA app; ALTER SCHEMA app OWNER TO {role}; \
+             GRANT USAGE ON SCHEMA shared TO {role}; \
+             GRANT USAGE, CREATE ON SCHEMA app TO {role}; \
+             GRANT SELECT (id), REFERENCES (id) ON shared.parent TO {role}"
+        ))
+        .await
+        .expect("a table where only the key's own column is granted");
+
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the least-privilege role");
+
+    // The premise, asserted rather than assumed: table scope really answers
+    // no, and column scope on the key's own column really answers yes.
+    for (permission, expected) in [("REFERENCES", false), ("SELECT", false)] {
+        assert_eq!(
+            truth(
+                &mut theirs,
+                &format!("SELECT has_table_privilege('shared.parent', '{permission}')")
+            )
+            .await,
+            expected,
+            "table-scope {permission}"
+        );
+    }
+    for permission in ["REFERENCES", "SELECT"] {
+        assert!(
+            truth(
+                &mut theirs,
+                &format!("SELECT has_column_privilege('shared.parent', 'id', '{permission}')")
+            )
+            .await,
+            "column-scope {permission} on the granted column"
+        );
+    }
+
+    let parent = ObjectName {
+        schema: "shared".to_owned(),
+        name: "parent".to_owned(),
+    };
+    let referenced_columns: pbps_db::doctor::ReferencedColumns =
+        [(parent.clone(), ["id".to_owned()].into_iter().collect())]
+            .into_iter()
+            .collect();
+    let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
+        managed_schemas: &["app".to_owned()],
+        managed_tables: &[],
+        referenced: std::slice::from_ref(&parent),
+        referenced_columns: &referenced_columns,
+    };
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read permissions");
+    let gaps = doctor::missing(&held);
+    assert!(
+        !gaps.iter().any(|g| g.securable().contains("parent")),
+        "a role granted exactly the key's own column must read as ready: {gaps:?}"
+    );
+
+    // And the engine agrees: the key the report said was possible really is,
+    // run as the very role the report described.
+    theirs
+        .execute(
+            "CREATE TABLE app.child (id integer PRIMARY KEY, pid integer REFERENCES shared.parent(id))",
+        )
+        .await
+        .expect("the key a column grant covering its own columns should permit");
+
+    db.drop().await;
+}
+
 /// A managed schema that is not there is not a permission problem, and not
 /// nothing either: the emitter never writes `CREATE SCHEMA`, so the first
 /// statement of the plan would fail.
@@ -5475,6 +5575,7 @@ async fn a_managed_schema_that_is_absent_is_reported_as_absent_and_not_as_a_gap(
         managed_schemas: &["not_here".to_owned()],
         managed_tables: &[],
         referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
     let held = doctor::permissions(&mut db.conn, &ask)
         .await

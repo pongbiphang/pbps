@@ -189,8 +189,10 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // environment's own recorded state, read where the permission question is
     // actually asked (DECISIONS 439).
     let ids = crate::read_ids(project).unwrap_or_default();
+    let (referenced, referenced_columns) = referenced_targets(project, &managed_schemas);
     let declared = Declared {
-        referenced: referenced_tables(project, &managed_schemas),
+        referenced,
+        referenced_columns,
         tables: managed_tables(project),
         granted: grant_targets(project, &ids),
         data: data_tables(project),
@@ -424,22 +426,48 @@ fn managed_tables(project: &Project) -> Vec<pbps_model::ObjectName> {
         .collect()
 }
 
-fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::ObjectName> {
+/// Tables a declared foreign key points at that lie **outside** the managed
+/// schemas — see the note above `managed_tables` for why they are asked
+/// about at all — together with the columns a declared key actually names on
+/// each one, unioned across every key that points there.
+///
+/// PostgreSQL grants `SELECT` and `REFERENCES` per column, and a key needs
+/// them only on the columns it names (issue #215): asking `doctor` to hold
+/// them on the whole table pushed towards a wider grant than the key the
+/// account already has actually needs. SQL Server has no per-column
+/// counterpart in this list yet, so `pbps_mssql::doctor` reads the target
+/// list alone and leaves this map unread (DECISIONS 440).
+///
+/// Declarations that do not load give an empty target list and an empty map,
+/// for the reason [`managed_schemas`] gives.
+fn referenced_targets(
+    project: &Project,
+    managed: &[String],
+) -> (
+    Vec<pbps_model::ObjectName>,
+    pbps_db::doctor::ReferencedColumns,
+) {
     let Ok(loaded) = crate::load_quiet(project) else {
-        return Vec::new();
+        return (Vec::new(), pbps_db::doctor::ReferencedColumns::new());
     };
     let managed: std::collections::BTreeSet<&str> = managed.iter().map(String::as_str).collect();
-    let mut out: std::collections::BTreeSet<pbps_model::ObjectName> =
+    let mut targets: std::collections::BTreeSet<pbps_model::ObjectName> =
         std::collections::BTreeSet::new();
+    let mut columns = pbps_db::doctor::ReferencedColumns::new();
     for table in loaded.schema.tables.values() {
         for fk in table.foreign_keys.values() {
             let target = &fk.references_table;
-            if !managed.contains(target.schema.as_str()) {
-                out.insert(target.clone());
+            if managed.contains(target.schema.as_str()) {
+                continue;
             }
+            targets.insert(target.clone());
+            columns
+                .entry(target.clone())
+                .or_default()
+                .extend(fk.references_columns.iter().cloned());
         }
     }
-    out.into_iter().collect()
+    (targets.into_iter().collect(), columns)
 }
 
 /// The tables whose declarations carry rows, and what each would have written
@@ -563,6 +591,9 @@ struct Declared {
     tables: Vec<pbps_model::ObjectName>,
     /// Foreign-key targets outside them.
     referenced: Vec<pbps_model::ObjectName>,
+    /// The columns a declared key names on each of `referenced`'s targets
+    /// (issue #215, DECISIONS 440).
+    referenced_columns: pbps_db::doctor::ReferencedColumns,
     /// What the managed roles are granted on (ADR-0005).
     granted: pbps_db::doctor::GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
@@ -630,6 +661,7 @@ async fn examine(
         managed_schemas: &declared.schemas,
         managed_tables: &declared.tables,
         referenced: &declared.referenced,
+        referenced_columns: &declared.referenced_columns,
         granted: &declared.granted,
         data: &declared.data,
     };
