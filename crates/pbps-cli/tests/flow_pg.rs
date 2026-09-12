@@ -2546,7 +2546,7 @@ fn the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate() {
 /// tool keeps that value on the operator's own screen and off the ledger.
 ///
 /// The ready-phase finding on PR #464 named two shapes that can put row data
-/// into `db.message()` rather than the enrichment fields DECISIONS 453
+/// into `db.message()` rather than the enrichment fields DECISIONS 454
 /// already strips: an engine conversion error, and a "PL/pgSQL/check/trigger
 /// exception whose primary MESSAGE contains row data." The first was tried
 /// here first and **measured** not to be reachable through this tool's own
@@ -2569,7 +2569,7 @@ fn the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate() {
 /// what was declared, so a secret placed there also appears in this tool's
 /// own `.context()` framing around the statement, which is not the driver
 /// frame and is not supposed to be redacted (it is the plan's own checksummed
-/// text, already in git — DECISIONS 454). Reading a genuinely undeclared
+/// text, already in git — DECISIONS 455). Reading a genuinely undeclared
 /// value out of a side table, the way `unapproved_data_triggers_
 /// cannot_use_the_deployers_privileges` above already reads `public.secret`,
 /// isolates the one frame this test means to pin: the driver's.
@@ -2659,6 +2659,70 @@ fn a_triggers_own_exception_keeps_the_row_value_off_the_ledger_but_not_off_the_o
         reason.contains("New"),
         "the plan's own declared value is not the driver's data and must \
          survive in this tool's own emitted-statement text: {reason}"
+    );
+}
+
+/// A tool-composed refusal — this tool's own guard naming an unapproved
+/// trigger, never a server value — keeps naming the trigger in the durable
+/// ledger, unlike the driver's own sentence the test above pins.
+///
+/// A second ready-phase round on PR #464 found `ledger_safe_reason` treating
+/// this refusal the same way as a real driver frame: `data_triggers.rs`'s
+/// `refused()` used to build a `DbError::Driver` with no code, exactly the
+/// shape `ledger_safe_reason` could not tell apart from a server's, and it
+/// redacted the one thing an operator reading the ledger later needs — which
+/// trigger to remove. `DbError::Refused` (DECISIONS 455) makes this
+/// unrepresentable as `Driver`: this test pins that the redaction can never
+/// happen again, whatever call site builds the refusal.
+///
+/// The trigger is created live *after* the plan is computed against the
+/// clean baseline, so `plan` never sees it and only `apply`'s own re-check
+/// (`crate::engine::prepare_data_writes`, run fresh inside the transaction)
+/// catches it — the same shape a trigger installed between approval and
+/// deployment would take outside a test.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_unapproved_triggers_own_refusal_keeps_naming_it_on_the_ledger() {
+    let own = OwnDatabase::new(&server(), "invariant_refused_trigger");
+    let connection = own.connection();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+         label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    let d = bootstrapped_demo(connection, "invariant-refused-trigger", declared);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nunmanaged: ignore\n",
+    )
+    .unwrap();
+    d.table(&format!(
+        "{declared}data:\n  mode: exact\n  rows:\n    x: {{label: New}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    on_server(
+        connection,
+        "CREATE FUNCTION app.audit() RETURNS trigger LANGUAGE plpgsql AS \
+         $$BEGIN RETURN NEW; END$$; \
+         CREATE TRIGGER audit BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.audit()",
+    );
+    let failed = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+    assert!(
+        stderr(&failed).contains("unsafe data trigger") && stderr(&failed).contains("audit"),
+        "{}",
+        stderr(&failed)
+    );
+
+    let after = latest_snapshot(connection);
+    assert_eq!(after.kind, pbps_model::StateKind::Failed);
+    let reason = after.reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("unsafe data trigger") && reason.contains("audit"),
+        "a tool-composed refusal names its own trigger, and must survive on \
+         the ledger unredacted: {reason}"
+    );
+    assert!(
+        !reason.contains("its message is not recorded here"),
+        "this is not a driver frame, and must never be run through the \
+         driver-only redaction marker: {reason}"
     );
 }
 

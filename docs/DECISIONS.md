@@ -10736,9 +10736,9 @@ SPEC is in sync with all of these.
      `scripts/live-tests-pg.sh` and `scripts/live-tests.sh` each gained one
      line invoking it.
 
-454. **What the operator's own terminal sees and what `pbps` writes down are
+455. **What the operator's own terminal sees and what `pbps` writes down are
      deliberately different, from PR #464's apply failure path onward.**
-     DECISIONS 453 redacts `detail()`, `hint()` and `where_()` at the seam
+     DECISIONS 454 redacts `detail()`, `hint()` and `where_()` at the seam
      because those three are optional enrichment this crate can drop without
      losing anything issue #167 asked for. `message()` cannot be dropped the
      same way — it is the sentence #167 exists to surface — and ready-phase
@@ -10755,7 +10755,7 @@ SPEC is in sync with all of these.
      conversion error names the value" when that parse fails.
 
      A first reflex here would be to redact `message()` at the seam too,
-     matching 453's answer for the other three fields. That would silence
+     matching 454's answer for the other three fields. That would silence
      issue #167's own deliverable: an operator running `apply` against a
      database they already hold credentials for would be back to a message
      with nothing in it, for every failure, not only the rare one that names a
@@ -10777,12 +10777,12 @@ SPEC is in sync with all of these.
      both sinks now go through, in place of `error.to_string()`. It walks the
      failing `anyhow::Error`'s `.chain()` and rewrites only a `DbError::Driver`
      frame — the one shape a driver's own server-supplied sentence can reach
-     this chain through — to its SQLSTATE and a fixed marker; every other
+     this chain through — to its code and a fixed marker; every other
      frame, `DbError` or not, is this tool's own composed text (a malformed
      connection string, an unreachable host, a catalog row the introspection
      SQL got wrong, or a `.context()` sentence naming the statement that
      failed) and passes through unchanged. Object identifiers stay redacted
-     the way 453 already decided; SQLSTATE is not a value either, and is kept
+     the way 454 already decided; the code is not a value either, and is kept
      because it is the one thing a reader of a *redacted* ledger row can still
      act on.
 
@@ -10808,7 +10808,7 @@ SPEC is in sync with all of these.
      decision withholds.
 
      `crates/pbps-cli/src/engine.rs`'s four unit tests pin `ledger_safe_reason`
-     directly: a `DbError::Driver` frame with a SQLSTATE redacts to it and
+     directly: a `DbError::Driver` frame with a code redacts to it and
      nothing else; one with none is redacted without inventing a code; a
      non-`Driver` `DbError` frame passes through unchanged; and a
      `.context()`-wrapped driver frame keeps the context and redacts only the
@@ -10818,7 +10818,7 @@ SPEC is in sync with all of these.
      already treats as approved (`crates/pbps-pg/src/data_triggers.rs`) reads
      an undeclared value from a side table and names it in its own
      `RAISE EXCEPTION`, and the resulting apply's ledger `reason` carries the
-     SQLSTATE and this tool's own framing but not the value, while the
+     code and this tool's own framing but not the value, while the
      operator's stderr carries all of it. A first draft of that fixture put
      the secret in the *declared* row instead of a side table, and its
      failure was itself a useful measurement: pbps's own emitted `INSERT`
@@ -10847,3 +10847,50 @@ SPEC is in sync with all of these.
      holds — `pbps-model`'s own `StateKind::Failed` doc comment says only
      "`reason` records the failure," which stays true; nothing there needed
      correcting.
+
+     A second ready-phase round on PR #464 found two more defects in this same
+     function, both from treating `DbError::Driver` as if every caller who
+     built one meant "the server said this." **`DbError::Refused(String)`**
+     (a new variant, `crates/pbps-db/src/lib.rs`) is the fix for the first:
+     several `pbps-pg` guards — an unsafe data trigger
+     (`crates/pbps-pg/src/data_triggers.rs`), a catalog read outside the
+     transaction it needs (`crates/pbps-pg/src/catalog.rs`), others in
+     `drop_impact.rs`, `modules.rs` and `state.rs` — were building their own
+     refusal text as a `DbError::Driver` with no code, because that was the
+     only variant here with a free-text message and no server type behind it.
+     `ledger_safe_reason` could not tell that shape apart from a genuine driver
+     frame and redacted it the same way, hiding the one thing an operator
+     reading the ledger later needs: which trigger or rule to fix. Rather than
+     add a flag or a heuristic to `ledger_safe_reason` to tell the two apart,
+     the type itself now cannot hold the ambiguity: a tool-composed refusal is
+     `DbError::Refused`, never `Driver`, so it is no longer representable as
+     the one shape this function redacts, and falls to the unredacted arm like
+     any other of this tool's own text. Every call site that wraps an existing
+     `Driver`'s rendered text into a new message of its own — the SQLSTATE- and
+     deadlock-recognizing wraps in `catalog.rs` and `modules.rs`, and both
+     engines' `migration_error` — is unchanged, because what it carries really
+     did originate at the driver. `crates/pbps-cli/src/engine.rs`'s
+     `a_refused_frame_names_its_own_rule_and_is_never_redacted` pins the unit
+     shape; `crates/pbps-cli/tests/flow_pg.rs`'s
+     `an_unapproved_triggers_own_refusal_keeps_naming_it_on_the_ledger` pins it
+     live: a trigger installed after a plan is computed against a clean
+     baseline is caught by `apply`'s own re-check, and the ledger's `reason`
+     still names the trigger.
+
+     The second defect is this decision's and this function's own wording, not
+     a caller's: every marker above called the code a SQLSTATE regardless of
+     which engine produced it, and **measured** on 17.0.4075.5,
+     `tiberius::Error::code()` returns SQL Server's own numeric message number
+     (`208`, `2627`, an ad hoc `THROW`'s `50000`, …), which is not a SQLSTATE —
+     that word names PostgreSQL's own five-character scheme and nothing on the
+     SQL Server side. `ledger_safe_reason`'s marker text is now engine-neutral
+     ("the driver reported code …"), true of both without needing to know
+     which one is asking. `crates/pbps-cli/src/engine.rs`'s
+     `a_mssql_driver_frame_is_redacted_without_being_called_a_sqlstate` pins
+     the unit shape; `crates/pbps-cli/tests/flow.rs`'s
+     `a_triggers_own_throw_is_redacted_without_being_called_a_sqlstate` pins it
+     live against a real SQL Server, the same way the PostgreSQL trigger test
+     above pins the first fix: a trigger's `THROW` names a value nobody
+     declared to this tool, the operator's stderr still gets the full
+     sentence, and the ledger keeps `50000` without calling it something SQL
+     Server never sent.

@@ -3228,7 +3228,7 @@ pub fn cmd_bootstrap(
 ///
 /// `reason` goes through [`crate::engine::ledger_safe_reason`] for the same
 /// reason `failed_apply_snapshot`'s does: bootstrap fails the same way apply
-/// does, through the same `execute_statements` (DECISIONS 454).
+/// does, through the same `execute_statements` (DECISIONS 455).
 async fn record_failed_bootstrap(
     conn: &mut Conn,
     root: &std::path::Path,
@@ -3922,7 +3922,7 @@ pub fn cmd_apply(
         // comment calls this payload "stable input" a `pbps.yml` author wires
         // to an arbitrary shell command, which can relay it anywhere — a
         // wider and less accountable audience than the operator's own
-        // terminal, and exactly the "emitted outward" case DECISIONS 454
+        // terminal, and exactly the "emitted outward" case DECISIONS 455
         // exists for, beside the ledger it names directly.
         let message = crate::engine::ledger_safe_reason(&error);
         crate::hooks::run_apply_attempt(
@@ -4156,7 +4156,7 @@ async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow
 ///
 /// `reason` is [`crate::engine::ledger_safe_reason`], not `error.to_string()`:
 /// this row is durable — SPEC's own audit trail — and a driver's own sentence
-/// can name a value nobody declared to this tool (DECISIONS 454). The
+/// can name a value nobody declared to this tool (DECISIONS 455). The
 /// operator still sees the whole thing; only what gets written down is cut.
 fn failed_apply_snapshot(
     driver: pbps_db::Driver,
@@ -4669,7 +4669,7 @@ async fn apply_staged_under_lock(
             // opaque string with nothing left to downcast. This keeps
             // whatever `e` already carries (a `DbError::Driver`, most often)
             // as the source, so `crate::engine::ledger_safe_reason` can find
-            // and redact just that frame later (DECISIONS 454).
+            // and redact just that frame later (DECISIONS 455).
             return Err(e.context(format!(
                 "the database rejected statement {} of {total}; earlier committed statements were not rolled back:\n{}\n\n\
                  The ledger records everything that did complete. Fix the cause, then continue \
@@ -5375,7 +5375,7 @@ async fn execute_statements(
             // downcast to `DbError::Driver` and redact only that frame later —
             // the server's sentence still reaches the operator through the
             // top-level context here plus `{:#}` at the CLI's own top level
-            // (DECISIONS 454).
+            // (DECISIONS 455).
             return Err(anyhow::Error::new(e).context(format!(
                 "the database rejected this statement, and the whole plan was rolled back:\n{}",
                 stmt.sql

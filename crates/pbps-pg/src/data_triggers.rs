@@ -449,12 +449,9 @@ async fn refuse_rules(conn: &mut Conn, statement: &Statement) -> Result<(), DbEr
         row.try_get::<&str>("table_name")?.ok_or_else(missing)?,
     );
     let name = row.try_get::<&str>("name")?.ok_or_else(missing)?;
-    Err(DbError::Driver {
-        code: None,
-        message: format!(
-            "unsafe rewrite rule `{name}` on `{table}`: a rule decides what a write does, and this row operation reaches that table. The statements a rule adds are not part of the plan and their triggers cannot be authenticated, so the write is refused rather than executed as the deployment role. Remove the rule before planning again."
-        ),
-    })
+    Err(DbError::Refused(format!(
+        "unsafe rewrite rule `{name}` on `{table}`: a rule decides what a write does, and this row operation reaches that table. The statements a rule adds are not part of the plan and their triggers cannot be authenticated, so the write is refused rather than executed as the deployment role. Remove the rule before planning again."
+    )))
 }
 
 async fn read_triggers(
@@ -779,26 +776,17 @@ fn refused(trigger: &Trigger, written: &TableName) -> DbError {
     } else {
         String::new()
     };
-    DbError::Driver {
-        code: None,
-        message: format!(
-            "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role.{reached} Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
-        ),
-    }
+    DbError::Refused(format!(
+        "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role.{reached} Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
+    ))
 }
 
 fn moved(relation: i64) -> DbError {
-    DbError::Driver {
-        code: None,
-        message: format!(
-            "a table reached through a foreign-key action (oid {relation}) was renamed or dropped while the data-trigger guard was locking it; nothing was written. Re-run the command."
-        ),
-    }
+    DbError::Refused(format!(
+        "a table reached through a foreign-key action (oid {relation}) was renamed or dropped while the data-trigger guard was locking it; nothing was written. Re-run the command."
+    ))
 }
 
 fn missing() -> DbError {
-    DbError::Driver {
-        code: None,
-        message: "data trigger catalog read returned a missing value".to_owned(),
-    }
+    DbError::Refused("data trigger catalog read returned a missing value".to_owned())
 }

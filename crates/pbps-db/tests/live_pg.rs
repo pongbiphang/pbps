@@ -63,7 +63,7 @@ async fn a_server_refusal_carries_the_servers_own_sentence() {
 /// Ready-phase review of PR #464 found the fix's first draft folding
 /// `detail()` in unconditionally — and a `NOT NULL` violation's `detail`,
 /// `"Failing row contains (null)."`, is one measured shape; a unique
-/// violation's is `"Key (id)=(1) already exists."` (DECISIONS 453). Both are
+/// violation's is `"Key (id)=(1) already exists."` (DECISIONS 454). Both are
 /// **data**, and this crate's caller writes what this function returns to
 /// stderr and to the deployment ledger's `reason` column — nowhere a
 /// deployer's row values belong. So this asserts the opposite of what an

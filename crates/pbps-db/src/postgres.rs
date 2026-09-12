@@ -50,7 +50,7 @@ impl From<tokio_postgres::Error> for DbError {
     /// which is `None` exactly when the failure never reached the server — a
     /// closed connection, a broken handshake — and `e.to_string()` already
     /// carries its own text for those (`"connection closed"`, and so on), so
-    /// the fallback is unchanged (DECISIONS 453).
+    /// the fallback is unchanged (DECISIONS 454).
     fn from(e: tokio_postgres::Error) -> Self {
         let message = e
             .as_db_error()
@@ -106,7 +106,7 @@ impl From<tokio_postgres::Error> for DbError {
 /// constraint are names PostgreSQL itself declared as identifiers, never
 /// values, and `message()`'s own quoting already treats them the same way —
 /// asserting `column "email"` is not a step more dangerous than the message
-/// that already said `null value in column "email"` (DECISIONS 453).
+/// that already said `null value in column "email"` (DECISIONS 454).
 fn server_error_message(db: &tokio_postgres::error::DbError) -> String {
     let mut message = db.message().to_owned();
     let identifiers: Vec<String> = [

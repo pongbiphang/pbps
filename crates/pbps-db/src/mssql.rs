@@ -36,7 +36,7 @@ impl From<tiberius::error::Error> for DbError {
     /// interpolates its `message` field straight in — there is no `Kind::Db`
     /// standing in for it the way `tokio_postgres::Error` has one. Pinned by
     /// the live suite alongside the PostgreSQL fix, as a regression guard
-    /// rather than a second fix (DECISIONS 453).
+    /// rather than a second fix (DECISIONS 454).
     fn from(e: tiberius::error::Error) -> Self {
         DbError::Driver {
             code: e.code().map(|c| c.to_string()),

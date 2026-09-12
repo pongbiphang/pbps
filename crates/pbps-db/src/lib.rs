@@ -76,11 +76,47 @@ pub enum DbError {
     /// A variant holding one driver's type would put that driver's name into
     /// every signature that mentions `DbError`, which is exactly what the seam
     /// exists to prevent, and with two drivers it could only hold one of them.
+    ///
+    /// **Built only by this crate's own `From<tokio_postgres::Error>` and
+    /// `From<tiberius::error::Error>`, or by a caller wrapping an existing
+    /// `Driver`'s rendered text into a new message of its own** (`pbps-pg`'s
+    /// `schema_changed_underneath` and `state::migration_error`, `pbps-mssql`'s
+    /// `state::migration_error` — each interpolates the wrapped error, so
+    /// whatever it carried is still in there). Ready-phase review of PR #464
+    /// found several other `pbps-pg` guards reaching for this variant to
+    /// carry their *own* composed refusal text — an unsafe data trigger, a
+    /// catalog read outside the transaction it needs — because it was the
+    /// only variant here with a free-text message and an optional
+    /// pass-through code. That made the variant mean two things depending on
+    /// which call built it, and `pbps-cli`'s `engine::ledger_safe_reason`
+    /// — which exists because `message()` can name a row's own value
+    /// (DECISIONS 455) and redacts every `Driver` frame's message to its
+    /// code — could not tell them apart and redacted a tool-composed
+    /// diagnosis along with a server one, hiding the one thing that told an
+    /// operator which trigger or rule to fix. [`DbError::Refused`] is the
+    /// fix: a tool-authored refusal is a value this type cannot hold as
+    /// `Driver` any more, so nothing downstream has to guess.
     #[error("{message}")]
     Driver {
         message: String,
         code: Option<String>,
     },
+
+    /// This workspace's own refusal, composed of its own text — never a
+    /// server's. `pbps-pg` and `pbps-mssql` reach for this instead of
+    /// [`DbError::Driver`] for a check they ran themselves and are reporting
+    /// in their own words: a catalog read outside the transaction it needs,
+    /// an unsafe data trigger, a vanished catalog row. None of these carry a
+    /// server error code — a real one belongs on the `Driver` it was read
+    /// from, not invented here — so there is no field for one.
+    ///
+    /// The split exists for `pbps-cli`'s `engine::ledger_safe_reason`
+    /// (DECISIONS 455): it redacts a `Driver`'s message to its code because
+    /// that message can be, or embed, a server-supplied sentence naming a row
+    /// value nobody declared to this tool; a `Refused` message never can be,
+    /// by construction, so it always passes through unchanged.
+    #[error("{0}")]
+    Refused(String),
 
     /// The server was reached and is not the session the connection string
     /// requires (`target_session_attrs`).
@@ -130,7 +166,11 @@ impl DbError {
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
             | DbError::WrongSession { .. }
-            | DbError::BadRow(_) => None,
+            | DbError::BadRow(_)
+            // A tool-composed refusal never carries a server code — a real
+            // one belongs on the `Driver` it was read from, never invented
+            // here (see `Refused`'s own doc comment).
+            | DbError::Refused(_) => None,
         }
     }
 }
@@ -235,6 +275,7 @@ pub(crate) async fn open_socket(
             error @ (DbError::BadConnectionString(_)
             | DbError::Connect { .. }
             | DbError::Driver { .. }
+            | DbError::Refused(_)
             | DbError::WrongSession { .. }
             | DbError::BadRow(_)) => error,
         })

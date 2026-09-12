@@ -194,7 +194,7 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 /// **durably** (the ledger) or **outward** (the `on_apply_attempt` hook) is
 /// allowed to: every frame this tool itself composed, kept verbatim, and
 /// every `DbError::Driver` frame — the one place a server's own sentence
-/// enters this chain — replaced by its SQLSTATE alone.
+/// enters this chain — replaced by its code alone.
 ///
 /// Ready-phase review of PR #464 measured that `db.message()` is not always
 /// safe the way `pbps-db`'s object identifiers are: a failed type conversion
@@ -206,10 +206,27 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 /// reads), and `crates/pbps-pg/src/emit.rs`'s own comment on `as_stored`
 /// confirms this tool's own column-retype apply reaches that path with a real
 /// cell's value. Unlike the enrichment fields the seam itself dropped
-/// (DECISIONS 453), `message()` cannot be dropped at the seam without
+/// (DECISIONS 454), `message()` cannot be dropped at the seam without
 /// silencing the diagnosis issue #167 exists to give the operator — so the
 /// split is here, between what stays on the operator's own terminal and what
-/// this tool writes down or sends elsewhere (DECISIONS 454).
+/// this tool writes down or sends elsewhere (DECISIONS 455).
+///
+/// A second ready-phase round on that fix found this function redacting more
+/// than the server ever said. `DbError::Driver` used to be built by any
+/// caller with a message and an optional code — including several `pbps-pg`
+/// guards refusing something *this tool* decided on its own (an unsafe data
+/// trigger, a catalog read outside the transaction it needs), never a server.
+/// Redacting those the same way as a real driver frame hid the one thing that
+/// told an operator which trigger or rule to fix. [`DbError::Refused`]
+/// (DECISIONS 455) is the fix at the type: a tool-composed refusal is no
+/// longer representable as `Driver`, so it falls to the `_` arm below and
+/// passes through unchanged — this function needs no case for it.
+///
+/// The same round measured that "SQLSTATE" is a PostgreSQL word.
+/// `tiberius::Error::code()` returns SQL Server's own numeric message number
+/// (`208`, `2627`, …), not a SQLSTATE, so naming every `Driver.code` a
+/// SQLSTATE was simply wrong on that engine. The wording below is the engine's
+/// own code, unnamed by convention, rather than a borrowed one.
 ///
 /// Walking `error.chain()` rather than reading only the top frame is what
 /// makes this work regardless of *where* the driver frame sits: most of this
@@ -233,18 +250,20 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
         .map(|frame| match frame.downcast_ref::<DbError>() {
             Some(DbError::Driver { code, .. }) => match code {
                 Some(code) => {
-                    format!("the driver reported SQLSTATE {code}; its message is not recorded here")
+                    format!("the driver reported code {code}; its message is not recorded here")
                 }
-                None => "the driver reported a failure with no SQLSTATE; its message is not \
+                None => "the driver reported a failure with no code; its message is not \
                           recorded here"
                     .to_owned(),
             },
-            // Every other `DbError` variant, and every frame that is not a
-            // `DbError` at all, is this tool's own composed text — a
+            // Every other `DbError` variant — including `Refused`, this
+            // tool's own composed refusal, which can never carry a server
+            // value by construction — and every frame that is not a
+            // `DbError` at all, is this tool's own composed text: a
             // malformed connection string, an `io::Error` naming a host that
             // refused a socket, a catalog row the introspection SQL got
-            // wrong, or a `.context()` sentence this crate wrote — none of
-            // which echoes a server-supplied value back.
+            // wrong, or a `.context()` sentence this crate wrote. None of it
+            // echoes a server-supplied value back.
             _ => frame.to_string(),
         })
         .collect::<Vec<_>>()
@@ -1058,10 +1077,13 @@ mod tests {
     /// The one frame the ready-phase review named: a `DbError::Driver`'s
     /// `message` is exactly what a driver's `db.message()` can carry — a
     /// value nobody declared to this tool, measured on both engines
-    /// (DECISIONS 454) — and this is the only frame `ledger_safe_reason` may
-    /// not repeat verbatim.
+    /// (DECISIONS 455) — and this is the only frame `ledger_safe_reason` may
+    /// not repeat verbatim. The code is PostgreSQL's SQLSTATE here, but the
+    /// marker names it neutrally: SQL Server's own `Driver` frame carries a
+    /// numeric message number instead, not a SQLSTATE (see the MSSQL test
+    /// below), and this function has one wording for both.
     #[test]
-    fn a_driver_frame_is_redacted_to_its_sqlstate_and_nothing_else() {
+    fn a_driver_frame_is_redacted_to_its_code_and_nothing_else() {
         let db = anyhow::Error::new(DbError::Driver {
             message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
             code: Some("22P02".to_owned()),
@@ -1073,16 +1095,21 @@ mod tests {
         );
         assert!(
             rendered.contains("22P02"),
-            "the SQLSTATE must survive: {rendered}"
+            "the code must survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SQLSTATE"),
+            "SQLSTATE is a PostgreSQL word; SQL Server's own code is not one \
+             (this same wording renders both): {rendered}"
         );
     }
 
-    /// A driver failure with no SQLSTATE at all (a broken protocol, not a
+    /// A driver failure with no code at all (a broken protocol, not a
     /// refused statement) is still redacted — the marker just says so, rather
     /// than rendering an empty code or falling back to the message it exists
     /// to withhold.
     #[test]
-    fn a_driver_frame_with_no_sqlstate_is_redacted_without_inventing_one() {
+    fn a_driver_frame_with_no_code_is_redacted_without_inventing_one() {
         let db = anyhow::Error::new(DbError::Driver {
             message: "super-secret-protocol-detail".to_owned(),
             code: None,
@@ -1094,7 +1121,36 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            "the driver reported a failure with no SQLSTATE; its message is not recorded here"
+            "the driver reported a failure with no code; its message is not recorded here"
+        );
+    }
+
+    /// SQL Server's own `Driver` frame: `tiberius::Error::code()` is a numeric
+    /// message number (`208`, "cannot drop the object because..."; `2627`,
+    /// a constraint violation), never a SQLSTATE — ready-phase review found
+    /// this function calling every engine's code a SQLSTATE regardless, which
+    /// is simply wrong on this one. The marker must still redact the message
+    /// and keep the code, without calling it something it is not.
+    #[test]
+    fn a_mssql_driver_frame_is_redacted_without_being_called_a_sqlstate() {
+        let db = anyhow::Error::new(DbError::Driver {
+            message: "Conversion failed when converting the varchar value \
+                      'super-secret-abc' to data type int."
+                .to_owned(),
+            code: Some("245".to_owned()),
+        });
+        let rendered = ledger_safe_reason(&db);
+        assert!(
+            !rendered.contains("super-secret-abc"),
+            "the driver's own text must not survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("245"),
+            "the code must survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SQLSTATE"),
+            "245 is a SQL Server message number, not a SQLSTATE: {rendered}"
         );
     }
 
@@ -1109,6 +1165,28 @@ mod tests {
         assert_eq!(
             ledger_safe_reason(&bad_row),
             "unexpected row shape: column `n` was read as an unsigned byte"
+        );
+    }
+
+    /// A tool-composed refusal — an unsafe data trigger, a catalog read
+    /// outside the transaction it needs — names its own rule or trigger in
+    /// its message, never a server value, and `DbError::Refused` makes that
+    /// unrepresentable as `Driver` by construction (DECISIONS 455). Ready-phase
+    /// review found this function redacting exactly this shape before the
+    /// split existed; this pins that it cannot happen again even if a new
+    /// call site is added, since `Refused` falls to the same `_` arm as any
+    /// other non-`Driver` frame rather than a case naming it specially.
+    #[test]
+    fn a_refused_frame_names_its_own_rule_and_is_never_redacted() {
+        let refused = anyhow::Error::new(DbError::Refused(
+            "unsafe data trigger `audit.enforce_price` on `sales.orders`: this trigger is not \
+             part of the recorded baseline"
+                .to_owned(),
+        ));
+        assert_eq!(
+            ledger_safe_reason(&refused),
+            "unsafe data trigger `audit.enforce_price` on `sales.orders`: this trigger is not \
+             part of the recorded baseline"
         );
     }
 

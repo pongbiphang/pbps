@@ -1473,15 +1473,14 @@ async fn open(conn: &mut Conn, scope: Scope) -> Result<(), DbError> {
         }
         Scope::CallersTransaction => {
             if !in_transaction(conn).await? {
-                return Err(DbError::Driver {
-                    code: None,
-                    message: "this connection has no open transaction, and a read-back of one \
-                              cannot run outside it.\nThe read exists to see what the \
-                              caller's transaction has written and not yet committed; outside \
-                              a transaction there is nothing of the kind, and the plain read \
-                              takes its own snapshot instead."
+                return Err(DbError::Refused(
+                    "this connection has no open transaction, and a read-back of one \
+                     cannot run outside it.\nThe read exists to see what the \
+                     caller's transaction has written and not yet committed; outside \
+                     a transaction there is nothing of the kind, and the plain read \
+                     takes its own snapshot instead."
                         .to_owned(),
-                });
+                ));
             }
             conn.execute(SAVEPOINT).await
         }
@@ -1561,16 +1560,15 @@ async fn close<T>(
 /// "what the database looks like" means.
 async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
     if in_transaction(conn).await? {
-        return Err(DbError::Driver {
-            code: None,
-            message: "this connection already has an open transaction, and a pull cannot run \
-                      inside one.\nThe read takes its own `REPEATABLE READ READ ONLY` \
-                      transaction to own its snapshot and restore its local settings. \
-                      PostgreSQL does not nest transactions, so running here would neither get \
-                      that snapshot nor be able to end without committing yours. Commit or roll \
-                      back first."
+        return Err(DbError::Refused(
+            "this connection already has an open transaction, and a pull cannot run \
+             inside one.\nThe read takes its own `REPEATABLE READ READ ONLY` \
+             transaction to own its snapshot and restore its local settings. \
+             PostgreSQL does not nest transactions, so running here would neither get \
+             that snapshot nor be able to end without committing yours. Commit or roll \
+             back first."
                 .to_owned(),
-        });
+        ));
     }
     Ok(())
 }
@@ -1617,6 +1615,7 @@ fn schema_changed_underneath(e: DbError) -> DbError {
             ),
         },
         DbError::Driver { .. }
+        | DbError::Refused(_)
         | DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
@@ -1648,16 +1647,13 @@ fn schema_changed_underneath(e: DbError) -> DbError {
 /// that is not wrong here. **Absent, empty and unreadable are three different
 /// things**, and a vanished object is the third.
 fn deparsed_away(kind: char, schema: &str, name: &str) -> DbError {
-    DbError::Driver {
-        code: None,
-        message: format!(
-            "the catalog changed while it was being read: `{schema}.{name}` (kind `{kind}`) was \
-             there when the catalog was scanned and gone when its definition was deparsed.\n\
-             Something applied DDL to this database during the pull. The read is taken in one \
-             snapshot so that it cannot report half of a change as a whole schema, and this is \
-             that guard firing. Run it again when the other change has finished."
-        ),
-    }
+    DbError::Refused(format!(
+        "the catalog changed while it was being read: `{schema}.{name}` (kind `{kind}`) was \
+         there when the catalog was scanned and gone when its definition was deparsed.\n\
+         Something applied DDL to this database during the pull. The read is taken in one \
+         snapshot so that it cannot report half of a change as a whole schema, and this is \
+         that guard firing. Run it again when the other change has finished."
+    ))
 }
 
 fn missing(column: &str) -> DbError {
