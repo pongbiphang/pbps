@@ -908,7 +908,9 @@ produces — including the DELETE and INSERT a row moving between partitions
 fires in place of an UPDATE (DECISIONS 451). A foreign key the plan removes before the row
 statement, and one whose action cannot fire in this session, are left out of
 that set; at apply time the removal has to have happened, as a planned trigger
-drop does. Holding a reached table needs `INSERT`, `UPDATE`, `DELETE` or
+drop does. A reached table carrying a rewrite rule is refused: a rule adds
+statements that are not in the plan, and their triggers are nobody's to
+authenticate. Holding a reached table needs `INSERT`, `UPDATE`, `DELETE` or
 `TRUNCATE` on it, which the action itself does not, so a plan whose cascade
 reaches a table the deployment role may not write is refused by name.
 This boundary does not sandbox transitive routine calls, defaults, CHECK

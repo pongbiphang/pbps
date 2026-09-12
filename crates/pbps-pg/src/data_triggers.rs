@@ -216,6 +216,7 @@ async fn walk(
         if locked.insert(statement.relation) {
             lock_by_oid(conn, statement.relation).await?;
         }
+        refuse_rules(conn, &statement).await?;
         triggers.extend(
             read_triggers(conn, &statement)
                 .await?
@@ -351,6 +352,60 @@ fn reached(statement: &Statement) -> String {
          )",
         relation = statement.relation,
     )
+}
+
+/// Refuse a relation this write reaches that carries a rewrite rule.
+///
+/// A rule decides what a statement does: measured on 18.6, an `ON UPDATE … DO
+/// ALSO` rule on the table a cascade writes inserted into a third table and
+/// fired its triggers, none of which the closure had locked or authenticated.
+/// Following a rule would mean reading its action, and this tool parses no SQL
+/// (DECISIONS 174) — so a reached relation carrying one is refused instead,
+/// which is also what the model does with such a table: `ORDINARY_TABLE` holds
+/// no relation with rules at all.
+///
+/// Not asked of a row movement's halves: measured, rules on the partitions a
+/// row leaves and lands in do not fire, because the movement is one statement's
+/// doing and not a statement of its own.
+async fn refuse_rules(conn: &mut Conn, statement: &Statement) -> Result<(), DbError> {
+    if statement.rows_only {
+        return Ok(());
+    }
+    let event = match statement.event {
+        INSERT => '3',
+        DELETE => '4',
+        _ => '2',
+    };
+    let rows = conn
+        .query(&format!(
+            "{ctes}
+             SELECT n.nspname AS schema_name, c.relname AS table_name, w.rulename AS name
+             FROM relations r
+             JOIN pg_catalog.pg_rewrite w ON w.ev_class = r.oid
+             JOIN pg_catalog.pg_class c ON c.oid = r.oid
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE w.rulename <> '_RETURN' AND w.ev_type = '{event}'
+               AND (w.ev_enabled = 'A' OR w.ev_enabled =
+                    CASE WHEN pg_catalog.current_setting('session_replication_role') = 'replica'
+                         THEN 'R' ELSE 'O' END)
+             ORDER BY w.oid",
+            ctes = reached(statement),
+        ))
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let table = TableName::new(
+        row.try_get::<&str>("schema_name")?.ok_or_else(missing)?,
+        row.try_get::<&str>("table_name")?.ok_or_else(missing)?,
+    );
+    let name = row.try_get::<&str>("name")?.ok_or_else(missing)?;
+    Err(DbError::Driver {
+        code: None,
+        message: format!(
+            "unsafe rewrite rule `{name}` on `{table}`: a rule decides what a write does, and this row operation reaches that table. The statements a rule adds are not part of the plan and their triggers cannot be authenticated, so the write is refused rather than executed as the deployment role. Remove the rule before planning again."
+        ),
+    })
 }
 
 async fn read_triggers(conn: &mut Conn, statement: &Statement) -> Result<Vec<Trigger>, DbError> {

@@ -10428,6 +10428,20 @@ SPEC is in sync with all of these.
        kept apart rather than shared: one rule for both would either miss a
        partition or refuse for an inheritance child the engine leaves alone.
 
+     A reached relation carrying a **rewrite rule** is refused outright rather
+     than followed. Measured on 18.6, an `ON UPDATE … DO ALSO` rule on the
+     table a cascade writes inserted into a third table and fired its
+     statement trigger — a write the closure had neither locked nor
+     authenticated, and one an attacker with `TRIGGER` on that third table
+     could wait for. Following it would mean reading the rule's action, which
+     is SQL this tool does not parse (174), so the boundary is drawn where the
+     model already draws it: `ORDINARY_TABLE` holds no relation with rules, and
+     now neither does a write's closure. The test is the rule's own event and
+     enabled state, so another event's rule and a disabled one refuse nothing.
+     A row movement's halves are not asked: measured, rules on the partitions a
+     row leaves and lands in do not fire, because the movement is one
+     statement's doing and not a statement of its own.
+
      Each reached table is locked `ROW EXCLUSIVE` before its triggers are read
      and held for the write, as 445 requires of the named one; the same lock on
      the referenced side is what keeps a new foreign key from being added to it
@@ -10504,7 +10518,9 @@ SPEC is in sync with all of these.
      the write does not touch and the statement-level trigger no movement
      fires, on an action's target and on the named table alike; a foreign key
      declared on one partition, against a trigger on its sibling and a
-     statement trigger on their root; and
+     statement trigger on their root; the rewrite rule on a cascade's target,
+     with the engine's own third-table write asserted first, against the same
+     rule on another event and disabled; and
      the key a BEFORE trigger rewrites, with the engine's own behaviour
      asserted first and the trigger doing the rewriting recorded and approved,
      so the refusal can only be the table its cascade reaches. They

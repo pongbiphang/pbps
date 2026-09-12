@@ -5270,3 +5270,96 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             conn.rollback(dialect.transaction_framing()).await.unwrap();
         });
 }
+
+/// A rewrite rule decides what a write does, so a table the closure reaches
+/// carrying one is refused: the statements the rule adds are not in the plan,
+/// and the triggers they fire are nobody's to authenticate.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_rewrite_rule_on_a_reached_table_is_refused() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "fk_rules");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE public.reached(value integer); \
+        CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE); \
+        CREATE TABLE app.c(ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
+        CREATE TABLE app.side(value text); \
+        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS \
+        $$BEGIN INSERT INTO public.reached VALUES (1); RETURN NULL; END$$; \
+        CREATE TRIGGER hook AFTER INSERT ON app.side FOR EACH STATEMENT EXECUTE FUNCTION public.hook(); \
+        INSERT INTO app.p VALUES ('first', 'k1'); INSERT INTO app.c VALUES ('k1')",
+    );
+    // The engine first: the rule really does carry the cascade into a third
+    // table and fire its trigger, which is the write nobody authenticated.
+    on_server(
+        connection,
+        "CREATE RULE also AS ON UPDATE TO app.c DO ALSO INSERT INTO app.side VALUES ('from the rule'); \
+        UPDATE app.p SET ukey = 'k2' WHERE code = 'first'",
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM public.reached"), 1);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            let write = |operation| RowWrite {
+                table: pbps_model::TableName::new("app", "p"),
+                operation,
+            };
+            let updates = write(RowOperation::Update {
+                columns: ["ukey".to_owned()].into(),
+            });
+            for (label, write, refused) in [
+                ("the event the rule is on", updates.clone(), true),
+                // The rule is an ON UPDATE rule; the delete's own cascade
+                // reaches the same table and that rule cannot rewrite it.
+                (
+                    "another event on the same table",
+                    write(RowOperation::Delete),
+                    false,
+                ),
+            ] {
+                conn.begin(dialect.transaction_framing()).await.unwrap();
+                let message = pbps_pg::data_triggers::prepare(
+                    &mut conn,
+                    &[write],
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+                assert_eq!(
+                    message.contains("unsafe rewrite rule") && message.contains("app.c"),
+                    refused,
+                    "{label}: {message}"
+                );
+                conn.rollback(dialect.transaction_framing()).await.unwrap();
+            }
+            // Disabled, it rewrites nothing.
+            conn.execute("ALTER TABLE app.c DISABLE RULE also")
+                .await
+                .unwrap();
+            conn.begin(dialect.transaction_framing()).await.unwrap();
+            let checked = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                &[updates],
+                &Default::default(),
+                &Default::default(),
+            )
+            .await;
+            assert!(
+                checked.is_ok(),
+                "a disabled rule rewrites nothing: {:?}",
+                checked.err().map(|e| e.to_string())
+            );
+            conn.rollback(dialect.transaction_framing()).await.unwrap();
+        });
+}
