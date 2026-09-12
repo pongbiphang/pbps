@@ -1334,15 +1334,34 @@ impl AsStored {
         }
     }
 
-    /// `expr`, converted to the type this plan gives `column` — or as it is,
-    /// where the plan leaves the type alone.
-    fn converted(&self, column: &ColumnRef, expr: String) -> String {
-        match self.retyped.get(column) {
-            Some(to) => format!(
-                "CAST({expr} AS {})",
-                crate::types::normalize(to).unwrap_or_else(|_| to.clone())
-            ),
-            None => expr,
+    /// `expr`, converted to the type this plan gives `column` — as it is
+    /// where the plan leaves the type alone, and `None` where the `CAST` this
+    /// would build can raise.
+    ///
+    /// **Not `TypeChangeRisk::Safe` alone** — DECISIONS 448, found by two live
+    /// tests this crate already had: `TypeChangeRisk::Narrowing` is set
+    /// whenever a change can lose precision by rounding, which is not the
+    /// same question as whether an explicit `CAST` can *raise*, and DECISIONS
+    /// 392's exception — no probe is built, because the row that would raise
+    /// cannot survive the `AlterColumnType` change's own conversion probe (387)
+    /// either — only holds for the second. A narrowing that only rounds keeps
+    /// its `CAST`, because rounding is exactly what the engine's own `ALTER`
+    /// does to the same value, and the key comparison has to see it (DECISIONS
+    /// 340) — `types::narrowing_cast_cannot_overflow` names the one such shape
+    /// these two tests demand. Anything else that is not `Safe` gets no `CAST`
+    /// and this key gets no probe of its own, matching the rule `rows_after`'s
+    /// `projected` applies at the sibling site (392).
+    fn converted(&self, column: &ColumnRef, expr: String) -> Option<String> {
+        match (self.retyped_from.get(column), self.retyped.get(column)) {
+            (Some(from), Some(to)) => {
+                let from = crate::types::normalize(from).ok()?;
+                let to = crate::types::normalize(to).ok()?;
+                let cannot_raise = crate::types::change_risk(&from, &to)
+                    == pbps_dialect::TypeChangeRisk::Safe
+                    || crate::types::narrowing_cast_cannot_overflow(&from, &to);
+                cannot_raise.then(|| format!("CAST({expr} AS {to})"))
+            }
+            _ => Some(expr),
         }
     }
 
@@ -1790,6 +1809,22 @@ fn planned_key_probes(
         // that stands for it in a body the engine assembles (DECISIONS 353).
         let mut clauses: Vec<String> = Vec::new();
         let mut collated: BTreeMap<String, usize> = BTreeMap::new();
+        // Set where a column of this key is one whose `CAST` to the plan's new
+        // type can raise — not merely narrow, since a narrowing that only
+        // rounds keeps its `CAST` (DECISIONS 448). Where it is set, `converted`
+        // has no `CAST` it can safely build, and this key gets no probe of its
+        // own at all (DECISIONS 392) — the `AlterColumnType` change's own
+        // conversion probe already counts the row and names the column.
+        //
+        // That skip carries no description anywhere a reader can find — there
+        // is no probe here to hold one, and the two probes this key would
+        // otherwise share (`delete_probe`, `hidden_children_probe`) answer a
+        // different question and are not this key's to annotate. This is
+        // exactly the shape #270 names ("a probe that is never built is
+        // invisible to the runner"): its own fix is a change to the dialect
+        // seam, touching both drivers, and is deliberately not duplicated
+        // here.
+        let mut narrows_unsafely = false;
         for (c, r) in a.columns.iter().zip(&a.referenced) {
             let Some(stored_r) = names.column(&a.parent.column(r)) else {
                 continue;
@@ -1818,8 +1853,15 @@ fn planned_key_probes(
                     // closure owns what it needs.
                     let column = a.parent.column(r);
                     let quoted = quote(&stored_r.name)?;
-                    let p = names.converted(&column, format!("p.{quoted}"));
-                    let q = names.converted(&column, format!("q.{quoted}"));
+                    // A narrowing here would need a `CAST` that can raise; see
+                    // `converted` and DECISIONS 392.
+                    let (Some(p), Some(q)) = (
+                        names.converted(&column, format!("p.{quoted}")),
+                        names.converted(&column, format!("q.{quoted}")),
+                    ) else {
+                        narrows_unsafely = true;
+                        break;
+                    };
                     // A column this plan retypes carries its collation into
                     // the new type only where that type has one.
                     let still_collatable = match names.retyped.get(&column) {
@@ -1857,13 +1899,24 @@ fn planned_key_probes(
                     held
                 }
                 None => {
-                    let side = names
-                        .converted(&a.child.column(c), format!("ch.{}", quote(&stored_c.name)?));
+                    // Same rule, on the child side of the key.
+                    let Some(side) = names
+                        .converted(&a.child.column(c), format!("ch.{}", quote(&stored_c.name)?))
+                    else {
+                        narrows_unsafely = true;
+                        break;
+                    };
                     stored_sides.push(side.clone());
                     Some(side)
                 }
             };
             columns.push((c.clone(), r.clone(), parent_side, held));
+        }
+        // No probe for this key at all where a column of it cannot be
+        // safely converted — see the field comment on `narrows_unsafely`,
+        // and #270 for why the skip itself goes unrecorded.
+        if narrows_unsafely {
+            continue;
         }
         // A NULL on either side of any column: the tuple references nothing,
         // whatever the other columns hold. Through `unwrapped`, because a
@@ -3390,6 +3443,89 @@ mod tests {
             asked[0].sql.contains("r.k0 IS NOT NULL"),
             "{}",
             asked[0].sql
+        );
+    }
+
+    /// DECISIONS 392's rule, applied at `AsStored::converted`'s own site: a
+    /// key this plan adds over a column it *narrows* gets no probe of its
+    /// own. The `CAST` `converted` would otherwise build can raise on the
+    /// first stored row that cannot make the trip, and a probe built from one
+    /// is a probe that raises — reported as unchecked, while `apply` proceeds
+    /// regardless, silently losing the very count that gates the delete
+    /// (issue #253). That row cannot survive the `AlterColumnType` change's
+    /// own conversion probe either, and that probe is what counts it and
+    /// names the column instead.
+    ///
+    /// The positive half matters as much: a key over a column this plan
+    /// *widens* still gets its own probe, carrying the CAST — so the skip
+    /// above is the narrowing rule, and not a rule that silences every added
+    /// key spanning a retyped column.
+    #[test]
+    fn a_key_this_plan_adds_on_a_column_it_narrows_gets_no_probe_of_its_own() {
+        let child: TableName = "app.child".parse().expect("a table name");
+        let parent: TableName = "app.status".parse().expect("a table name");
+        let key = pbps_model::ForeignKey {
+            columns: vec!["status".to_owned()],
+            references_table: parent.clone(),
+            references_columns: vec!["code".to_owned()],
+            on_delete: pbps_model::ReferentialAction::NoAction,
+            on_update: pbps_model::ReferentialAction::NoAction,
+        };
+        let retype = |from: &str, to: &str| Change::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: child.column("status"),
+            from: from.parse().expect("a type"),
+            to: to.parse().expect("a type"),
+            from_nullable: true,
+            to_nullable: true,
+        };
+        let plan = |retype_change: Change| {
+            set(vec![
+                retype_change,
+                Change::AddForeignKey {
+                    table: child.clone(),
+                    name: "child_status_fkey".to_owned(),
+                    constraint: Box::new(key.clone()),
+                },
+                deleting("app.status", "old"),
+            ])
+        };
+        // The unique tail of the description `planned_key_probes` gives the
+        // count over this key — present only where that count is built.
+        let has_its_own_probe = "the key cannot be added once the row is gone";
+
+        // `text` into `varchar(3)` is a narrowing (measured, DECISIONS 387):
+        // a value over three characters raises rather than truncating.
+        let narrowed = probes(&plan(retype("text", "varchar(3)")));
+        assert!(
+            narrowed.iter().any(|p| p.sql.contains("length(rtrim")),
+            "the ALTER's own conversion probe still runs and still counts \
+             the offending rows: {narrowed:#?}"
+        );
+        assert!(
+            narrowed
+                .iter()
+                .all(|p| !p.description.contains(has_its_own_probe)),
+            "a narrowing CAST here can raise and take the whole probe with \
+             it, so none is built: {narrowed:#?}"
+        );
+        assert!(
+            narrowed
+                .iter()
+                .all(|p| !p.sql.contains("CAST(ch.\"status\" AS")),
+            "{narrowed:#?}"
+        );
+
+        // `varchar(3)` into `text` is the reverse and safe — nothing a
+        // `varchar(3)` can hold is too wide for `text`.
+        let widened = probes(&plan(retype("varchar(3)", "text")));
+        assert!(
+            widened
+                .iter()
+                .any(|p| p.description.contains(has_its_own_probe)
+                    && p.sql.contains("CAST(ch.\"status\" AS text)")),
+            "a widening still gets its own probe, carrying the CAST: \
+             {widened:#?}"
         );
     }
 

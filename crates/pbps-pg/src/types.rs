@@ -1425,6 +1425,70 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
     }
 }
 
+/// Whether a `CAST` from `from` to `to` can raise for some value `from` can
+/// hold, where `TypeChangeRisk::Narrowing` alone says only that the change can
+/// lose precision — true of every reduced `numeric` scale, whether or not the
+/// `CAST` can ever fail (DECISIONS 448).
+///
+/// Built for exactly one caller — `preflight::AsStored::converted`, which
+/// embeds the `CAST` directly in a generated comparison and needs to know
+/// whether it is safe to, not whether the change is risky in the sense the
+/// offline classifier means. `types::cannot_become` is the wrong predicate to
+/// borrow for it: its bounded-numeric-target arm returns a real predicate for
+/// *every* narrowing into a bounded `numeric`, whether or not overflow is
+/// reachable for that particular precision and scale.
+///
+/// Only `numeric -> numeric`, and only on the property this site's own
+/// failing tests demand: the integer-digit capacity does not shrink. Where
+/// the scale also shrinks — `s2 < s`, the only case that rounds — the
+/// requirement is **strict**: `p2 - s2 > p - s`. Where the scale does not
+/// shrink, `p2 - s2 >= p - s` is enough (and `change_risk` already calls
+/// that combination `Safe`, so this arm is only ever consulted for the
+/// shrinking-scale case in practice).
+///
+/// The strict form is not a stylistic choice — the non-strict form is
+/// **unsafe**. Rounding can carry a value into an extra integer digit, and
+/// at the equality boundary the target has no room for it. **Measured** on
+/// 18.6: `CAST(999.99::numeric(5,2) AS numeric(5,1))` (`int_digits` `3 -> 4`,
+/// strictly greater) is `1000.0`, no error. But
+/// `CAST(999.99::numeric(5,2) AS numeric(4,1))` (`int_digits` `3 -> 3`, equal
+/// — admitted by the non-strict rule, refused by the strict one) is `22003
+/// numeric field overflow`, detail "A field with precision 4, scale 1 must
+/// round to an absolute value less than 10^3" — while the same cast applied
+/// to `12.34` succeeds as `12.3`. A predicate that admits this pair is the
+/// worst kind of wrong: it passes any fixture whose rows happen to be small
+/// and raises only for the rows large enough to round into the extra digit.
+/// The wide-margin boundary `CAST(999.99::numeric(5,2) AS numeric(3,1))`
+/// (`3 -> 2`) is also `22003`, unchanged by either form of the rule.
+///
+/// An unbounded side on either end already reads as `Safe` or stays excluded
+/// through the caller's own `TypeChangeRisk::Safe` check, so this asks only
+/// about two bounded ends. No other family is admitted: nothing here has
+/// evidence for one, and DECISIONS 448 records why widening this beyond
+/// `numeric` is a choice for whoever has the next failing test, not this
+/// one.
+pub(crate) fn narrowing_cast_cannot_overflow(from: &ColumnType, to: &ColumnType) -> bool {
+    match (family(from), family(to)) {
+        (
+            Family::Exact(Exact::Numeric {
+                int_digits: Some(a),
+                scale: from_scale,
+            }),
+            Family::Exact(Exact::Numeric {
+                int_digits: Some(b),
+                scale: to_scale,
+            }),
+        ) => {
+            if to_scale.unwrap_or(0) < from_scale.unwrap_or(0) {
+                b > a
+            } else {
+                b >= a
+            }
+        }
+        _ => false,
+    }
+}
+
 /// The spelling this engine puts in a routine's identity, from a declared one
 /// (ADR-0009 §1, DECISIONS 301 and 303).
 ///
@@ -2943,6 +3007,88 @@ mod tests {
             ("jsonb", "json"),
         ] {
             assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
+        }
+    }
+
+    /// DECISIONS 448: a `numeric` narrowing that only reduces scale, holding
+    /// or growing the integer-digit capacity, is one `preflight::AsStored::
+    /// converted` still admits — `types::narrowing_cast_cannot_overflow`
+    /// names it — because the `CAST` it builds cannot overflow, while the
+    /// boundary one column narrower does.
+    ///
+    /// **Measured** on 18.6, three edges of the same value: `SELECT
+    /// CAST(999.99::numeric(5,2) AS numeric(5,1))` (`int_digits` `3 -> 4`,
+    /// strictly greater) is `1000.0`, no error; `SELECT
+    /// CAST(999.99::numeric(5,2) AS numeric(4,1))` (`3 -> 3`, equal — the
+    /// boundary the non-strict form of this rule would have wrongly
+    /// admitted) is `22003 numeric field overflow`, detail "A field with
+    /// precision 4, scale 1 must round to an absolute value less than
+    /// 10^3"; the same cast applied to `12.34` instead succeeds as `12.3`,
+    /// so the equal-`int_digits` boundary is not even reliably wrong — it
+    /// raises only for values large enough to round into the extra digit.
+    /// `SELECT CAST(999.99::numeric(5,2) AS numeric(3,1))` (`3 -> 2`, a wide
+    /// margin) is also `22003`, but passes under both the correct strict
+    /// rule and the wrong non-strict one, so it alone would not have caught
+    /// the bug. All three are `TypeChangeRisk::Narrowing` — `risk` alone
+    /// cannot tell them apart, which is the whole reason this predicate
+    /// exists beside it — and only the first is one this test's sibling,
+    /// `a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_
+    /// values` in `tests/live.rs`, needs admitted: over that live test's own
+    /// fixture, the `numeric(5,2) -> numeric(5,1)` shape it narrows both
+    /// sides to, the `AlterColumnType` conversion probe on each column
+    /// **measures zero** — nothing for it to count — while the key
+    /// comparison this predicate keeps alive is what catches two stored
+    /// values, `1.04` and `1.00`, rounding to the same `1.0`.
+    #[test]
+    fn a_numeric_narrowing_that_cannot_overflow_keeps_its_cast() {
+        let pair = |from: &str, to: &str| {
+            (
+                normalize(&ty(from)).expect("from normalizes"),
+                normalize(&ty(to)).expect("to normalizes"),
+            )
+        };
+        for (from, to) in [
+            ("numeric(5,2)", "numeric(5,1)"),
+            // Precision growing alongside a smaller scale only ever widens
+            // the integer part further.
+            ("numeric(5,2)", "numeric(6,1)"),
+            // Scale alone, precision fixed: `int_digits` cannot drop.
+            ("numeric(10,4)", "numeric(10,0)"),
+        ] {
+            assert_eq!(
+                risk(from, to),
+                TypeChangeRisk::Narrowing,
+                "`{from}` -> `{to}`"
+            );
+            let (from, to) = pair(from, to);
+            assert!(
+                narrowing_cast_cannot_overflow(&from, &to),
+                "`{from}` -> `{to}`"
+            );
+        }
+        for (from, to) in [
+            // The decisive boundary: `int_digits` holds equal (`3 -> 3`),
+            // which the non-strict form of this rule would wrongly admit.
+            // Measured: `CAST(999.99::numeric(5,2) AS numeric(4,1))` raises
+            // `22003 numeric field overflow`, detail "A field with
+            // precision 4, scale 1 must round to an absolute value less
+            // than 10^3" — while `CAST(12.34::numeric(5,2) AS numeric(4,1))`
+            // succeeds as `12.3`. A wide-margin drop (`3 -> 2`, below) also
+            // raises but passes under both the wrong rule and the right
+            // one, so it alone would not have caught the bug; this one does.
+            ("numeric(5,2)", "numeric(4,1)"),
+            ("numeric(5,2)", "numeric(3,1)"),
+            ("numeric(10,4)", "numeric(8,4)"),
+            // Not `numeric -> numeric` at all: this predicate answers for
+            // that family alone (DECISIONS 448).
+            ("numeric(20,0)", "integer"),
+            ("bigint", "integer"),
+        ] {
+            let (from, to) = pair(from, to);
+            assert!(
+                !narrowing_cast_cannot_overflow(&from, &to),
+                "`{from}` -> `{to}`"
+            );
         }
     }
 

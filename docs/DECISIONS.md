@@ -10132,3 +10132,51 @@ SPEC is in sync with all of these.
      The scan's character-width stepping (408) needed no change either way:
      ASCII-only folding never changes a string's byte length or its char
      boundaries, so the same stepping rule runs unchanged on the folded body.
+449. **A key this plan adds over a column it narrows is admitted by whether its
+    `CAST` can raise, not by `TypeChangeRisk`.** DECISIONS 392's rule for this
+    shape — no probe is built for a narrowing key, because the row that would
+    make the `CAST` raise cannot survive the `AlterColumnType` change's own
+    conversion probe either, and that probe is what counts it — assumes that
+    probe is the one that would have caught it. **Measured, it is not,** for
+    every narrowing that only rounds: `CAST(999.99::numeric(5,2) AS
+    numeric(5,1))` is `1000.0`, no error, and over the fixture
+    `a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_values`
+    pins — `child.amount` and `parent.amount` both narrowed from `numeric(5,2)`
+    to `numeric(5,1)` — the conversion probe on each column counts **zero**.
+    Nothing there catches the hazard that test exists for: two stored values,
+    `1.04` and `1.00`, that round to the same `1.0` and collide once the key is
+    validated. Deleting the key probe for this pair would have deleted the only
+    thing that sees it, and DECISIONS 340 — a key spanning a retyped column
+    compares the converted values — is still the right rule; 392's exception to
+    it does not reach here.
+
+    `TypeChangeRisk::Narrowing` conflates two different properties: it is set
+    whenever a change can lose precision by rounding, which is true of every
+    scale reduction, and 392's rule needs to ask only whether a `CAST` can
+    *raise*, which is not the same question. So `AsStored::converted` admits
+    `TypeChangeRisk::Safe` as before, plus one further case the failing tests
+    force: `numeric(p,s) -> numeric(p2,s2)` where the target's scale shrinks
+    (`s2 < s`, the only case that rounds) requires the integer-digit capacity
+    to **strictly** grow — `p2 - s2 > p - s` — and where the scale does not
+    shrink, `p2 - s2 >= p - s` is enough. The strict form is not a stylistic
+    choice: rounding can carry a value into an extra integer digit, and at
+    the equal-`int_digits` boundary the target has no room for it.
+    **Measured**, three edges of the same value: `CAST(999.99::numeric(5,2)
+    AS numeric(5,1))` (`int_digits` `3 -> 4`, strictly greater) is `1000.0`,
+    no error. `CAST(999.99::numeric(5,2) AS numeric(4,1))` (`3 -> 3`, equal —
+    what a non-strict `>=` rule would wrongly admit) is `22003 numeric field
+    overflow`, detail "A field with precision 4, scale 1 must round to an
+    absolute value less than 10^3" — while the same cast applied to `12.34`
+    instead succeeds as `12.3`. That is the worst shape a wrong predicate can
+    take: it passes any fixture whose rows happen to be small, and only
+    raises for the rows large enough to round into the extra digit. The
+    wide-margin boundary `CAST(999.99::numeric(5,2) AS numeric(3,1))`
+    (`3 -> 2`) also raises `22003`, but that pair is admitted by neither the
+    correct rule nor the wrong one, so it alone would not have caught this.
+    No other family is admitted here; nothing in this shape's evidence
+    reaches beyond `numeric`, and `types::cannot_become` is the wrong
+    predicate to reuse for it — its bounded-numeric-target arm returns a real
+    overflow check for *every* narrowing into a bounded `numeric`, whether or
+    not overflow is reachable for that particular precision and scale, which
+    is the same over-broad answer `TypeChangeRisk::Narrowing` gives (issue
+    #253).
