@@ -349,10 +349,10 @@ fn question(b: &Blocker) -> String {
         // Unreachable in practice (`ask_from` skips a blocker with no
         // choices before ever calling this), but the match still has to
         // cover it.
-        Blocker::UnrepresentableName { what, part, table } => match table {
-            Some(table) => format!("{table}: column `{part}` contains a `.`"),
-            None => format!("{what} `{part}` contains a `.`"),
-        },
+        Blocker::UnrepresentableName { what, part, table } => {
+            let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
+            format!("{prefix}{what} `{part}` contains a `.`")
+        }
     }
 }
 

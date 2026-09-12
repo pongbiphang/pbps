@@ -198,19 +198,19 @@ fn one_blocker(b: &Blocker) -> String {
         // missing a reason, the object itself has a name this tool's own
         // `.`-joined identity format cannot carry, so the remedy is renaming
         // the object, not resolving an ambiguity pbps can see both sides of.
-        Blocker::UnrepresentableName { what, part, table } => match table {
-            Some(table) => format!(
-                "  {table}: column `{part}` contains a `.`, which pbps uses to separate \
-                 schema, table and column; it cannot mint an identity for this column.\n\n    \
-                 rename the column so it no longer contains a `.`, then declare it (or pull) \
-                 again\n"
-            ),
-            None => format!(
-                "  {what} `{part}` contains a `.`, which pbps uses to separate schema, table \
-                 and column; it cannot mint an identity for this {what}.\n\n    rename the \
-                 {what} so it no longer contains a `.`, then declare it (or pull) again\n"
-            ),
-        },
+        // `what` already carries the right noun for every case (`"schema"`,
+        // `"table"`, `"column"`, `"view"`, `"routine"`, `"trigger"`), so one
+        // message covers them all; `table` only adds a `"dbo.t: "` prefix
+        // when there is a containing table worth naming (a column, or a
+        // trigger's own table).
+        Blocker::UnrepresentableName { what, part, table } => {
+            let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
+            format!(
+                "  {prefix}{what} `{part}` contains a `.`, which pbps uses to separate schema, \
+                 table and column; it cannot mint an identity for this {what}.\n\n    rename \
+                 the {what} so it no longer contains a `.`, then declare it (or pull) again\n"
+            )
+        }
     }
 }
 

@@ -36,7 +36,7 @@ pub enum NameError {
 /// column literally named `a.b` on table `dbo.customer` serializes as
 /// `dbo.customer.a.b`, which parses back as four segments: exactly the string
 /// a mistyped five-part name would also produce, with no way to tell the two
-/// apart after the fact (issue #108).
+/// apart after the fact (issue #108, DECISIONS 444).
 ///
 /// `FromStr` below never needs this: splitting on `.` cannot leave a `.`
 /// inside any one of its own parts, so every part it hands to
