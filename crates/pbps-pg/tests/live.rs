@@ -18275,6 +18275,53 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
         .expect("drop");
 }
 
+/// Issue #260: an unquoted identifier is folded to lower case by the engine
+/// before it is stored, so a text-bodied routine spelling `EMAIL` unquoted
+/// names the same column as `email`, and the advisory scan has to find it
+/// under that spelling.
+///
+/// The negative half is the trap the fix exists to avoid (DECISIONS 448): a
+/// *quoted* `"EMAIL"` is a different column, case preserved, and folding it
+/// too would report a routine that does not actually break.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_body_naming_an_unquoted_column_in_another_case_is_found() {
+    use pbps_pg::impact::{RenameTarget, rename_impact};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("impact_case_fold");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.customer (id integer PRIMARY KEY, email text);
+         CREATE FUNCTION {s}.f_bare_upper() RETURNS text LANGUAGE plpgsql AS
+             $f$ BEGIN RETURN (SELECT EMAIL FROM {s}.customer LIMIT 1); END $f$;
+         CREATE FUNCTION {s}.f_quoted_upper() RETURNS text LANGUAGE plpgsql AS
+             $f$ BEGIN RETURN (SELECT \"EMAIL\" FROM {s}.customer LIMIT 1); END $f$;"
+    ))
+    .await
+    .expect("the fixture");
+
+    let target = RenameTarget::Column(TableName::new(&s, "customer").column("email"));
+    let report = rename_impact(&mut conn, &target)
+        .await
+        .expect("the impact report");
+
+    let advisory: Vec<&str> = report.advisory.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        advisory.iter().any(|n| n.contains("f_bare_upper")),
+        "a bare `EMAIL` folds to the column `email` on this engine: {report:#?}"
+    );
+    assert!(
+        !advisory.iter().any(|n| n.contains("f_quoted_upper")),
+        "a quoted \"EMAIL\" is a different, case-preserved column and must not be folded: \
+         {report:#?}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// A column the report cannot find is a question that could not be asked, and
 /// never an empty report.
 ///

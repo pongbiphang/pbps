@@ -10034,3 +10034,101 @@ SPEC is in sync with all of these.
      plainly — the model has no flag for it), a column-level grant, an owner a
      rebuild would transfer, `reloptions`, a view column default and a
      trigger's `tgenabled`.
+
+448. **The rename-impact text-body scan folds an unquoted mention, never a
+     quoted one, and only when the target's own name could have come from an
+     unquoted spelling.** 230 and 313 already settle *which* fold this engine
+     uses on an unquoted identifier — ASCII, byte by byte, high bit untouched;
+     measured, `CREATE TABLE AÄ` makes the relation `aÄ`, not `aä`. They do not
+     settle *when* `impact::mentions` should fold at all, which is this entry.
+
+     A quoted identifier is stored exactly as written, so `"EMAIL"` and
+     `email` are two different columns; folding the quoted spelling too would
+     report a routine that does not actually break, which is the finding
+     #260 was opened over. So the fold runs on the bare scan only, and the
+     `"name"` exact-quoted check stays unfolded beside it.
+
+     A target whose own catalog name still carries an ASCII uppercase letter
+     — `Email`, not `email` — got that name from being created quoted: 230's
+     `aÄ` measurement shows an unquoted spelling can leave a *non-ASCII*
+     uppercase letter in place, but never an ASCII one, since the engine
+     downcases exactly that range. So no unquoted spelling in a body could
+     ever refer to such a target, and a bare mention that happens to match it
+     case-insensitively is always naming a different, lower-spelled column.
+     The scan skips the fold entirely for such a target rather than run it and
+     rely on the quoted check to save it — a filter whose reason has gone is
+     one nobody re-reads, and the next person to touch this code would have
+     no way to tell a defensive skip from a forgotten one.
+
+     **Amended: the SQL prefilter's fold has to be pinned to `COLLATE "C"`,
+     not left to the database's default.** `prosrc` is plain `text`, so an
+     unqualified `lower()` in `TEXT_BODIED_ROUTINES` ran under whatever
+     collation the database was created with — and on one with Turkish
+     casing rules that is measurably a different fold than the engine's own
+     identifier rule:
+
+     ```text
+     lower('I')                                                        -> i
+     lower('I' COLLATE "tr-TR-x-icu")                                  -> ı
+     lower('I' COLLATE "C")                                            -> i
+     strpos(lower('SELECT I FROM t' COLLATE "tr-TR-x-icu"),
+            lower('i' COLLATE "tr-TR-x-icu"))                          -> 0
+     strpos(lower('SELECT I FROM t' COLLATE "C"),
+            lower('i' COLLATE "C"))                                    -> 8
+     ```
+
+     A routine on such a database naming the target with a bare, differently
+     cased ASCII letter was excluded by the prefilter before the ASCII-correct
+     Rust scan ever saw it — the exact silence #260 exists to remove, produced
+     by the fix meant to remove it. The first cut of this entry called the
+     unqualified `lower()` a "safe superset" and reasoned that any fold is
+     wider than none; that assumed the fold was locale-independent, and
+     measured, it is not.
+
+     `COLLATE "C"` on both `strpos` arguments is what fixes it: `C` folds
+     ASCII only and never depends on the database's locale, which is *exactly*
+     the engine's own identifier fold (230, 313) rather than an approximation
+     of it. That makes the earlier "keep the exact quoted test beside the
+     folded one, in case the fold loses a real match" hedge pointless rather
+     than merely redundant: an ASCII, per-byte fold cannot turn a string that
+     contains `$1` into one that does not, for any `$1` or body, so the
+     folded test is now a superset by construction and not by hope, and there
+     is nothing left for a second test to catch. The exact-quoted `strpos`
+     test is removed rather than kept — a filter whose reason has gone is one
+     nobody re-reads, the same rule this entry already applied to the
+     mixed-case-target skip above, and keeping a now-pointless test beside a
+     provably sufficient one would only invite the next reader to wonder what
+     it was for. 245's Greek-final-sigma counterexample was never wrong; it
+     was the reason for pinning the collation, not for keeping a redundant
+     test beside an unpinned fold.
+
+     **Amended again: `"C"`, unqualified, is a name and not a fact — it
+     resolves through `search_path` like any other identifier, and a schema
+     earlier on the path can hold its own collation named `"C"`.** Measured:
+
+     ```text
+     CREATE SCHEMA shad;
+     CREATE COLLATION shad."C" (provider = icu, locale = 'tr-TR', deterministic = false);
+     SET search_path = shad, pg_catalog;
+     SELECT lower('I' COLLATE "C");               -- ı      <- hijacked
+     SELECT lower('I' COLLATE pg_catalog."C");    -- i      <- pinned
+     ```
+
+     With a shadow collation on the path, `COLLATE "C"` folds `I` to `ı`
+     again — the identical defect this entry exists to fix, one schema-lookup
+     away. The "superset by construction" claim two paragraphs up was true of
+     the *fold*, ASCII versus Unicode, and silently assumed the collation
+     named `"C"` was always `pg_catalog`'s; under a hostile or merely unusual
+     `search_path` it is not, and the claim was false until the name was
+     qualified. `pg_catalog."C"` cannot be shadowed by anything on the path,
+     and it matches every other name in this query, all of them already
+     schema-qualified (`pg_catalog.strpos`, `pg_catalog.lower`,
+     `pg_catalog.pg_proc`, `pg_catalog.pg_depend`) — the collation was the one
+     unqualified name in a query whose whole style is that nothing resolves
+     through the path, and it is now qualified the same way. The unit
+     assertion pinning this SQL literal was tightened to require the
+     qualified spelling: the unqualified one would have passed it.
+
+     The scan's character-width stepping (408) needed no change either way:
+     ASCII-only folding never changes a string's byte length or its char
+     boundaries, so the same stepping rule runs unchanged on the folded body.
