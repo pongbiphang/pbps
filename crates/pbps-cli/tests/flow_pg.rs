@@ -4916,6 +4916,146 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
     });
 }
 
+/// Pin the engine race measured in DECISIONS 451: a NOT EXISTS predicate sees
+/// no child while the foreign-key action can see a concurrently committed one.
+/// This is the measured statement, not the emitter's separate parent-lock and
+/// referencing-count block; the closure-membership cases above pin the policy.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_child_committed_while_a_guarded_delete_waits_fires_cascade_row_triggers() {
+    use pbps_dialect::Dialect;
+    use std::time::Duration;
+    let own = OwnDatabase::new(&server(), "fk_delete_race");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+        CREATE TABLE app.p(k text PRIMARY KEY); \
+        CREATE TABLE app.c(k text PRIMARY KEY REFERENCES app.p(k) ON DELETE CASCADE); \
+        CREATE TABLE app.g(k text PRIMARY KEY REFERENCES app.c(k) ON DELETE CASCADE); \
+        CREATE TABLE app.fired(relation text, level text); \
+        CREATE FUNCTION app.log_delete() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
+            INSERT INTO app.fired VALUES (TG_TABLE_NAME, TG_LEVEL); RETURN OLD; END$$; \
+        CREATE TRIGGER row_hook AFTER DELETE ON app.c FOR EACH ROW EXECUTE FUNCTION app.log_delete(); \
+        CREATE TRIGGER statement_hook AFTER DELETE ON app.c FOR EACH STATEMENT EXECUTE FUNCTION app.log_delete(); \
+        CREATE TRIGGER row_hook AFTER DELETE ON app.g FOR EACH ROW EXECUTE FUNCTION app.log_delete(); \
+        CREATE TRIGGER statement_hook AFTER DELETE ON app.g FOR EACH STATEMENT EXECUTE FUNCTION app.log_delete(); \
+        INSERT INTO app.p VALUES ('k1')",
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut writer = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let mut other = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            let pid = writer
+                .query("SELECT pg_backend_pid()::int8 AS pid")
+                .await
+                .unwrap()[0]
+                .try_get::<i64>("pid")
+                .unwrap()
+                .unwrap();
+            writer
+                .execute("SET statement_timeout = '10s'")
+                .await
+                .unwrap();
+            other.begin(dialect.transaction_framing()).await.unwrap();
+            other
+                .execute("INSERT INTO app.c VALUES ('k1'); INSERT INTO app.g VALUES ('k1')")
+                .await
+                .unwrap();
+            let delete = "DELETE FROM app.p AS p WHERE k = 'k1' \
+                AND NOT EXISTS (SELECT 1 FROM app.c AS c WHERE c.k = p.k)";
+            let deleting = tokio::spawn(async move {
+                let deleted = writer.execute(delete).await;
+                (writer, deleted)
+            });
+            let hand_off = async {
+                // pg_blocking_pids reads current lock state, unlike a sleep or
+                // a transaction-cached activity snapshot. Do not commit until
+                // the delete has taken its snapshot and is waiting on us.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let rows = other.query(&format!(
+                            "SELECT pg_backend_pid() = ANY(pg_blocking_pids({pid}::int)) AS blocked"
+                        )).await.unwrap();
+                        if rows[0].try_get::<bool>("blocked").unwrap() == Some(true) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("guarded delete never waited on the inserting session");
+                other.commit(dialect.transaction_framing()).await.unwrap();
+            };
+            hand_off.await;
+            let (mut writer, deleted) = deleting.await.unwrap();
+            deleted.unwrap();
+            let rows = writer
+                .query(
+                    "SELECT (SELECT count(*) FROM app.p) + \
+                (SELECT count(*) FROM app.c) + (SELECT count(*) FROM app.g) AS n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows[0].try_get::<i64>("n").unwrap(),
+                Some(0),
+                "the admitted delete must cascade through both committed rows"
+            );
+            let rows = writer
+                .query("SELECT relation, level FROM app.fired ORDER BY relation, level")
+                .await
+                .unwrap();
+            let fired: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.try_get::<&str>("relation").unwrap().unwrap(),
+                        row.try_get::<&str>("level").unwrap().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                fired,
+                [
+                    ("c", "ROW"),
+                    ("c", "STATEMENT"),
+                    ("g", "ROW"),
+                    ("g", "STATEMENT")
+                ]
+            );
+
+            // With the same rows committed before the statement snapshot,
+            // NOT EXISTS refuses the parent and neither cascade fires.
+            writer
+                .execute(
+                    "TRUNCATE app.fired; INSERT INTO app.p VALUES ('k1'); \
+                INSERT INTO app.c VALUES ('k1'); INSERT INTO app.g VALUES ('k1')",
+                )
+                .await
+                .unwrap();
+            writer.execute(delete).await.unwrap();
+            let rows = writer
+                .query(
+                    "SELECT (SELECT count(*) FROM app.p) + \
+                (SELECT count(*) FROM app.c) + (SELECT count(*) FROM app.g) AS n, \
+                (SELECT count(*) FROM app.fired) AS fired",
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(3));
+            assert_eq!(rows[0].try_get::<i64>("fired").unwrap(), Some(0));
+        });
+}
+
 /// The guard holds every table it authenticates, and a table it cannot hold is
 /// a refusal with a name in it rather than a bare `permission denied`.
 #[test]
