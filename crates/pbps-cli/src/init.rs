@@ -154,7 +154,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     };
     let config_text = render_config(&config);
 
-    let (schema, ids, warnings, unmanaged) = match (&args.from, &url_env) {
+    let (schema, ids, warnings, unmanaged, onboarding_notices) = match (&args.from, &url_env) {
         (Some(_), Some(var)) => {
             let connection = std::env::var(var).with_context(|| {
                 format!(
@@ -172,11 +172,13 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 ids,
                 pulled.warnings,
                 pulled.unmanaged_modules,
+                pulled.onboarding_notices,
             )
         }
         (None, _) => (
             Schema::default(),
             IdsFile::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ),
@@ -191,7 +193,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         warnings,
         unmanaged,
     };
-    for warning in &prepared.warnings {
+    for warning in onboarding_notices.iter().chain(&prepared.warnings) {
         eprintln!("warning: {warning}");
     }
     if !prepared.unmanaged.is_empty() {

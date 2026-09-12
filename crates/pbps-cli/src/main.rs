@@ -1077,7 +1077,7 @@ fn cmd_pull(
         Ok::<_, anyhow::Error>(pulled)
     })?;
 
-    for w in &pulled.warnings {
+    for w in pulled.onboarding_notices.iter().chain(&pulled.warnings) {
         eprintln!("warning: {w}");
     }
     // A role's permission the model cannot hold: for `pull` a warning like

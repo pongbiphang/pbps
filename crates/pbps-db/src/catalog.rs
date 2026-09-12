@@ -22,6 +22,10 @@ use crate::DbError;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pulled {
     pub schema: Schema,
+    /// Source context to show when adopting declarations through pull or init.
+    /// These reminders are not catalog defects or managed-object limitations,
+    /// so routine connected reads must not present them as warnings.
+    pub onboarding_notices: Vec<String>,
     /// Facts about the database the model cannot express, rendered, in the
     /// order a reader should see them. Never empty silence: the caller must
     /// show these, because each one is a difference that would otherwise

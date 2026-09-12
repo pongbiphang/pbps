@@ -800,8 +800,9 @@ async fn bootstrap_then_introspect_returns_the_declared_schema() {
         .expect("introspect");
     db.drop().await;
 
-    assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
-    assert!(pulled.warnings[0].starts_with("source database default collation `"));
+    assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    assert_eq!(pulled.onboarding_notices.len(), 1);
+    assert!(pulled.onboarding_notices[0].starts_with("source database default collation `"));
     assert!(pulled.limitations.is_empty());
     assert_eq!(pulled.schema, normalized(&declared));
 }
@@ -893,8 +894,9 @@ async fn applying_a_planned_migration_converges_on_the_target() {
         .expect("introspect B");
     db.drop().await;
 
-    assert_eq!(state_b.warnings.len(), 1, "{:?}", state_b.warnings);
-    assert!(state_b.warnings[0].starts_with("source database default collation `"));
+    assert!(state_b.warnings.is_empty(), "{:?}", state_b.warnings);
+    assert_eq!(state_b.onboarding_notices.len(), 1);
+    assert!(state_b.onboarding_notices[0].starts_with("source database default collation `"));
     assert!(state_b.limitations.is_empty());
     assert_eq!(state_b.schema, normalized(&b));
 
@@ -1019,9 +1021,10 @@ async fn pull_reports_the_source_default_once_when_character_columns_exist() {
             .await
             .expect("introspect matching character columns");
         db.drop().await;
-        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+        assert_eq!(pulled.onboarding_notices.len(), 1);
         assert!(
-            pulled.warnings[0]
+            pulled.onboarding_notices[0]
                 .contains(&format!("source database default collation `{collation}`"))
         );
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);

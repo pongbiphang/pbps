@@ -843,6 +843,7 @@ mod tests {
         );
         let pulled = pbps_db::catalog::Pulled {
             schema: live,
+            onboarding_notices: Vec::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: Vec::new(),

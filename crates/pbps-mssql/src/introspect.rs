@@ -636,6 +636,7 @@ fn action(code: u8) -> ReferentialAction {
 /// managed set.
 pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut warnings = Vec::new();
+    let mut onboarding_notices = Vec::new();
     let mut unexpressible: Vec<Unexpressible> = Vec::new();
     let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
@@ -653,18 +654,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .iter()
         .any(|column| column.collation.is_some() && user_table_ids.contains(&column.object_id))
     {
-        push_limitation(
-            &mut warnings,
-            &mut limitations,
-            None,
-            format!(
-                "source database default collation `{}` is not recorded in the declarations; \
-                 character columns bootstrapped onto a target with a different default \
-                 may have different comparison semantics; ensure the target database \
-                 uses this default before bootstrapping",
-                raw.database_collation
-            ),
-        );
+        onboarding_notices.push(format!(
+            "source database default collation `{}` is not recorded in the declarations; \
+             character columns bootstrapped onto a target with a different default \
+             may have different comparison semantics; ensure the target database \
+             uses this default before bootstrapping",
+            raw.database_collation
+        ));
     }
 
     for t in &raw.tables {
@@ -770,7 +766,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // explicitly — round-trips for free *onto a database whose own
         // default is the same*: the emitter writes no `COLLATE`, so the
         // column is created under whatever default the target has.
-        // The database-level warning above names that source default; nothing
+        // The onboarding notice above names that source default; nothing
         // compares it with the target's. Anything differing from the source default
         // is a difference the declaration cannot hold regardless of target;
         // reported here rather than dropped, the way a clustered index is
@@ -1319,6 +1315,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 
     Pulled {
         schema,
+        onboarding_notices,
         warnings,
         unexpressible,
         limitations,
@@ -1465,9 +1462,11 @@ mod tests {
             "only the collation is unmodelled; the column itself stays declared"
         );
         assert_eq!(pulled.limitations.len(), 1, "{:?}", pulled.limitations);
-        assert_eq!(pulled.warnings.len(), 2, "{:?}", pulled.warnings);
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert_eq!(pulled.warnings[0], pulled.limitations[0].detail);
         assert!(
-            pulled.warnings[0].contains("source database default collation `Latin1_General_CI_AS`")
+            pulled.onboarding_notices[0]
+                .contains("source database default collation `Latin1_General_CI_AS`")
         );
         assert_eq!(
             pulled.limitations[0].target.object_name(),
@@ -1505,11 +1504,13 @@ mod tests {
         let pulled = assemble(&raw);
 
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
-        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+        assert_eq!(pulled.onboarding_notices.len(), 1);
         assert!(
-            pulled.warnings[0].contains("source database default collation `Latin1_General_CI_AS`")
+            pulled.onboarding_notices[0]
+                .contains("source database default collation `Latin1_General_CI_AS`")
         );
-        assert!(pulled.warnings[0].contains("target"));
+        assert!(pulled.onboarding_notices[0].contains("target"));
         assert_eq!(
             pulled.schema.tables[&TableName::new("dbo", "customer")]
                 .columns
@@ -1534,6 +1535,7 @@ mod tests {
             let pulled = assemble(&raw);
             assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
             assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+            assert!(pulled.onboarding_notices.is_empty());
         }
     }
 
@@ -1549,6 +1551,7 @@ mod tests {
         };
         let pulled = assemble(&raw);
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+        assert!(pulled.onboarding_notices.is_empty());
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
     }
 
