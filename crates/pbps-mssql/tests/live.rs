@@ -10197,11 +10197,8 @@ async fn drop_login(login: &str) {
 
 /// Condition 4's ruling, pinned: a login that can read and write the ledger
 /// but cannot `ALTER` it meets a pre-#103 `__pbps_state` and is refused by
-/// name, not by a bare driver error. `doctor` does not yet ask for `ALTER` on
-/// an existing ledger (`Needed::LedgerCreation` is spent once the tables
-/// exist) — see `pbps_mssql::state::migrate_timeline_columns`'s own doc
-/// comment and the gap tracked beside this PR — so the only thing standing
-/// between this login and a confusing Msg 1088 is the wrapping under test.
+/// name, not by a bare driver error. The diagnostic points to `doctor`'s
+/// migration readiness check while retaining the engine's original refusal.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 async fn a_login_without_alter_is_refused_by_name_on_a_pre_migration_ledger() {
@@ -10250,6 +10247,20 @@ async fn a_login_without_alter_is_refused_by_name_on_a_pre_migration_ledger() {
     assert!(
         message.contains("needs ALTER on dbo.__pbps_state"),
         "the error must name the right needed: {message}"
+    );
+    assert!(
+        message.contains("Run `pbps doctor`")
+            && message.contains("obtain the ALTER right it reports"),
+        "the error must recommend the current readiness check: {message}"
+    );
+    assert!(
+        !message.contains("until that is fixed") && !message.contains("asks for today"),
+        "the error must not describe doctor as incomplete: {message}"
+    );
+    assert!(
+        message.contains("Cannot find the object")
+            && err.server_error_code().as_deref() == Some("1088"),
+        "the original engine error and code must survive: {err:?}"
     );
 
     drop(lp);

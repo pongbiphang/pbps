@@ -21009,12 +21009,8 @@ async fn role_without_ownership(db: &mut TestDb, role: &str, password: &str) -> 
 
 /// Condition 4's ruling, pinned: a role that can read and write the ledger
 /// but does not own it meets a pre-#103 `public.__pbps_state` and is refused
-/// by name, not by a bare "must be owner of table" driver error. `doctor`
-/// does not yet ask for ownership of an *existing* ledger
-/// (`Needed::LedgerCreation` is spent once the tables exist) — see
-/// `pbps_pg::state::migrate_timeline_columns`'s own doc comment and the gap
-/// tracked beside this PR — so the only thing standing between this role and
-/// that bare error is the wrapping under test.
+/// by name, not by a bare "must be owner of table" driver error. The diagnostic
+/// points to `doctor`'s migration readiness check while retaining that refusal.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger() {
@@ -21062,6 +21058,20 @@ async fn a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger()
     assert!(
         message.contains("needs ownership of public.__pbps_state"),
         "the error must name the right needed: {message}"
+    );
+    assert!(
+        message.contains("Run `pbps doctor`")
+            && message.contains("obtain the ownership right it reports"),
+        "the error must recommend the current readiness check: {message}"
+    );
+    assert!(
+        !message.contains("until that is fixed") && !message.contains("asks for today"),
+        "the error must not describe doctor as incomplete: {message}"
+    );
+    assert!(
+        message.contains("this role could not add them: db error")
+            && err.server_error_code().as_deref() == Some("42501"),
+        "the original engine error must survive: {message}"
     );
 
     drop(lp);

@@ -280,9 +280,8 @@ async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
                 "dbo.__pbps_state is missing the timeline columns (state_version, \
                  tables_count, modules_count, staged_completed, staged_total) issue #103 \
                  added, and this login could not add them: {e}\n\
-                 This is a one-time migration that needs ALTER on dbo.__pbps_state; it is \
-                 not part of the ordinary deployment grant, so a login holding only what \
-                 `doctor` asks for today will meet this until that is fixed."
+                 This is a one-time migration that needs ALTER on dbo.__pbps_state. \
+                 Run `pbps doctor` and obtain the ALTER right it reports before retrying."
             ),
             code,
         }

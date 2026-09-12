@@ -663,8 +663,8 @@ async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
                      #103 added, and this role could not add them: {e}\n\
                      This is a one-time migration that needs ownership of \
                      public.__pbps_state — PostgreSQL authorizes ALTER TABLE by ownership, \
-                     not by a grantable privilege — so a role holding only what `doctor` \
-                     asks for today will meet this until that is fixed."
+                     not by a grantable privilege. Run `pbps doctor` and obtain the \
+                     ownership right it reports before retrying."
                 ),
                 code,
             })
