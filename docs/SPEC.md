@@ -749,6 +749,12 @@ contradict 7.2's "data is not read to decide the class": classification stays
 static; the probes are the last line of defence at apply time, where a
 connection is guaranteed and reading data is exactly the job.
 
+A check that cannot be built before the plan runs is reported as **unchecked**,
+with the affected object and the reason, just like a query that fails or
+returns no readable count. It never contributes to the passed count. Changes
+that need no data probe (such as an ordinary index) do not contribute to the
+unchecked count either.
+
 **Nothing user-supplied runs between the approval and the statements.** The
 pre-flight is derived from the plan; the exec hooks of 13.5 run after an apply
 has finished. That gap is closed deliberately: anything executing inside it

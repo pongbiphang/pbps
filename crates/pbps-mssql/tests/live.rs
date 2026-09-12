@@ -508,7 +508,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                         PlannedChange::new(delete(deleted)),
                     ],
                 };
-                let probes = Mssql.preflight(&cs);
+                let probes = Mssql.preflight(&cs).probes;
                 assert_eq!(probes.len(), 1);
                 let rows = db.conn.query(&probes[0].sql).await.unwrap();
                 assert_eq!(
@@ -546,7 +546,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                         PlannedChange::new(delete(deleted)),
                     ],
                 };
-                let probes = Mssql.preflight(&cs);
+                let probes = Mssql.preflight(&cs).probes;
                 assert_eq!(probes.len(), 1);
                 let rows = db.conn.query(&probes[0].sql).await.unwrap();
                 assert_eq!(
@@ -588,7 +588,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                     }),
                 ],
             };
-            let probes = Mssql.preflight(&cs);
+            let probes = Mssql.preflight(&cs).probes;
             let probe = probes
                 .iter()
                 .find(|p| p.sql.contains("NOT EXISTS"))
@@ -2224,7 +2224,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     };
 
     let mut counts = Vec::new();
-    for probe in Mssql.preflight(&cs) {
+    for probe in Mssql.preflight(&cs).probes {
         let rows = db
             .conn
             .query(&probe.sql)
@@ -2319,7 +2319,7 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
             .unwrap_or_else(|e| panic!("{label}: insert: {e}"));
 
         let mut counts = Vec::new();
-        for probe in Mssql.preflight(&plan()) {
+        for probe in Mssql.preflight(&plan()).probes {
             let rows = db.conn.query(&probe.sql).await.unwrap_or_else(|e| {
                 panic!("{label}: the engine rejected a probe:\n{}\n{e}", probe.sql)
             });
@@ -2402,7 +2402,7 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
             to_nullable: true,
         })],
     };
-    for probe in Mssql.preflight(&cs) {
+    for probe in Mssql.preflight(&cs).probes {
         let rows = db
             .conn
             .query(&probe.sql)
@@ -2474,7 +2474,7 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
         let cs = plan(&base, &base_ids, &declared, &ids);
 
         let mut measured = Vec::new();
-        for probe in Mssql.preflight(&cs) {
+        for probe in Mssql.preflight(&cs).probes {
             let rows = db
                 .conn
                 .query(&probe.sql)
@@ -2533,7 +2533,7 @@ async fn unicode_to_varchar_probes_character_loss() {
     };
     async fn counts(conn: &mut Conn, plan: &ChangeSet) -> std::collections::BTreeMap<String, i32> {
         let mut counts = std::collections::BTreeMap::new();
-        for probe in Mssql.preflight(plan) {
+        for probe in Mssql.preflight(plan).probes {
             let rows = conn
                 .query(&probe.sql)
                 .await
@@ -2871,11 +2871,11 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
 
     // A plain index constrains nothing, so there is nothing to count.
     assert!(
-        Mssql.preflight(&one(index(false, None))).is_empty(),
+        Mssql.preflight(&one(index(false, None))).probes.is_empty(),
         "a plain index is not probed"
     );
 
-    let probes = Mssql.preflight(&one(index(true, None)));
+    let probes = Mssql.preflight(&one(index(true, None))).probes;
     assert_eq!(probes.len(), 1, "{probes:?}");
     let rows = db
         .conn
@@ -2886,7 +2886,9 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
     // Rows, not groups: the two rows sharing c@example.com.
     assert_eq!(n, 2, "{}", probes[0].sql);
 
-    let filtered = Mssql.preflight(&one(index(true, Some("[deleted_at] IS NULL"))));
+    let filtered = Mssql
+        .preflight(&one(index(true, Some("[deleted_at] IS NULL"))))
+        .probes;
     assert_eq!(filtered.len(), 1, "{filtered:?}");
     let rows = db
         .conn
@@ -2984,31 +2986,33 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
     // Which is why the probe is not taken at all when the plan retypes a
     // column of the table: the count it could produce here is 2, and 2 refuses
     // the plan the engine just accepted.
-    let probes = Mssql.preflight(&ChangeSet {
-        changes: vec![
-            PlannedChange::new(Change::AlterColumnType {
-                uid: "c_bbbbbb".parse().unwrap(),
-                column: TableName::new("dbo", "customer").column("flag"),
-                from: ColumnType::simple("int"),
-                to: ColumnType::new("varchar", vec![pbps_model::TypeArg::Int(2)]),
-                from_nullable: true,
-                to_nullable: true,
-            }),
-            PlannedChange::new(Change::AddIndex {
-                table: TableName::new("dbo", "customer"),
-                name: "ix_flagged".into(),
-                index: Box::new(Index {
-                    columns: vec![IndexColumn {
-                        name: "email".into(),
-                        descending: false,
-                    }],
-                    include: Vec::new(),
-                    unique: true,
-                    filter: Some("flag = '01'".into()),
+    let probes = Mssql
+        .preflight(&ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::AlterColumnType {
+                    uid: "c_bbbbbb".parse().unwrap(),
+                    column: TableName::new("dbo", "customer").column("flag"),
+                    from: ColumnType::simple("int"),
+                    to: ColumnType::new("varchar", vec![pbps_model::TypeArg::Int(2)]),
+                    from_nullable: true,
+                    to_nullable: true,
                 }),
-            }),
-        ],
-    });
+                PlannedChange::new(Change::AddIndex {
+                    table: TableName::new("dbo", "customer"),
+                    name: "ix_flagged".into(),
+                    index: Box::new(Index {
+                        columns: vec![IndexColumn {
+                            name: "email".into(),
+                            descending: false,
+                        }],
+                        include: Vec::new(),
+                        unique: true,
+                        filter: Some("flag = '01'".into()),
+                    }),
+                }),
+            ],
+        })
+        .probes;
     assert!(
         !probes.iter().any(|p| p.description.contains("collide")),
         "{probes:?}"
@@ -3063,6 +3067,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
         let cs = ChangeSet { changes };
         Mssql
             .preflight(&cs)
+            .probes
             .into_iter()
             .find(|p| p.description.contains("collide"))
             .map(|p| p.sql)
@@ -3162,7 +3167,7 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
         // The same, pointing at a parent row that is not there.
         ("orphaned", vec![add(false, Some("'us'")), unique, fk]),
     ] {
-        for probe in Mssql.preflight(&ChangeSet { changes }) {
+        for probe in Mssql.preflight(&ChangeSet { changes }).probes {
             let rows = db.conn.query(&probe.sql).await.unwrap_or_else(|e| {
                 panic!("the engine rejected a probe ({label}):\n{}\n{e}", probe.sql)
             });
@@ -5792,6 +5797,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let probe_for = |cs: &pbps_model::ChangeSet| {
         Mssql
             .preflight(cs)
+            .probes
             .into_iter()
             .find(|p| p.description.contains("row `old`"))
             .expect("the delete carries a probe")
@@ -6087,6 +6093,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let refusal_for = |cs: &pbps_model::ChangeSet| {
         Mssql
             .preflight(cs)
+            .probes
             .into_iter()
             .find(|p| p.description.contains("cannot evaluate"))
     };
@@ -6490,6 +6497,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
     // constraint that would take it.
     let probe = Mssql
         .preflight(&cs)
+        .probes
         .into_iter()
         .find(|p| p.description.contains("row `old`"))
         .expect("the delete carries a probe");
@@ -6674,6 +6682,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     // The probe, run where `apply` runs it: nothing references the row.
     let probe = Mssql
         .preflight(&cs)
+        .probes
         .into_iter()
         .find(|p| p.description.contains("row `old`"))
         .expect("the delete carries a probe");
@@ -7545,6 +7554,7 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
         let cs = grant(schema);
         let probe = Mssql
             .preflight(&cs)
+            .probes
             .into_iter()
             .find(|p| p.description.contains(schema))
             .unwrap_or_else(|| panic!("the grant on `{schema}` carries a probe"));
@@ -7570,7 +7580,7 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
         })],
     };
     assert!(
-        Mssql.preflight(&object).is_empty(),
+        Mssql.preflight(&object).probes.is_empty(),
         "an object target carries no probe"
     );
 
@@ -9113,7 +9123,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
     ];
 
     async fn count(conn: &mut Conn, cs: &ChangeSet) -> i32 {
-        let probes = Mssql.preflight(cs);
+        let probes = Mssql.preflight(cs).probes;
         let probe = probes
             .iter()
             .find(|p| p.description.contains("parent"))

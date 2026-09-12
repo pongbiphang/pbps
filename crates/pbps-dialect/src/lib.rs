@@ -293,6 +293,77 @@ impl Probe {
     }
 }
 
+/// Executable questions and deliberately unasked questions stay distinct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preflight {
+    pub probes: Vec<Probe>,
+    pub unchecked: Vec<Unchecked>,
+}
+
+/// A check whose answer cannot be obtained before the plan runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unchecked {
+    pub description: String,
+    pub reason: String,
+}
+
+impl Unchecked {
+    pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
+        let description = match change {
+            Change::AddCheck { table, name, .. } => format!("new check {name} on {table}"),
+            Change::AddUnique { table, name, .. } => {
+                format!("new unique constraint {name} on {table}")
+            }
+            Change::AddForeignKey { table, name, .. } => {
+                format!("new foreign key {name} on {table}")
+            }
+            Change::AddIndex { table, name, .. } => format!("new unique index {name} on {table}"),
+            Change::SetPrimaryKey { table, to, .. } => format!(
+                "new primary key {} on {table}",
+                to.as_ref()
+                    .and_then(|key| key.name.as_deref())
+                    .unwrap_or("(unnamed)")
+            ),
+            Change::AddColumn { table, name, .. } => {
+                format!("new NOT NULL column {}", table.column(name))
+            }
+            Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
+            Change::AlterColumnType { column, .. } => format!("type conversion of {column}"),
+            Change::DeleteRow { table, key, .. } => format!("references to row {key} in {table}"),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::DropUnique { .. }
+            | Change::DropForeignKey { .. }
+            | Change::DropCheck { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => change.subject(),
+        };
+        Self::new(description, reason)
+    }
+
+    pub fn new(description: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 /// What the shared definition scanner has to know about one engine's lexis.
 ///
 /// Not a table of delimiters. Two of the three failures ADR-0011 Amendment 2
@@ -1433,14 +1504,15 @@ pub trait Dialect {
     /// tightens it to NOT NULL describes that column by its *new* name.
     /// Building each probe in isolation would query a column that does not
     /// exist yet, and the check the pre-flight most needed to make is the one
-    /// it would skip. For the same reason a table this plan creates is not
-    /// probed at all: it is empty, and nothing in it can violate anything.
+    /// it would skip. A new table's key probes can instead ask about its
+    /// declared rows, including a typed empty relation where it has none.
     ///
     /// The default is "none", which is the honest answer for a dialect that has
-    /// not implemented them: an empty list means "nothing was checked", and the
-    /// caller reports it that way rather than as "nothing is wrong".
-    fn preflight(&self, _changes: &ChangeSet) -> Vec<Probe> {
-        Vec::new()
+    /// not implemented them. A deliberately unbuilt check belongs in
+    /// `unchecked`, with its object and reason; only executable queries belong
+    /// in `probes`.
+    fn preflight(&self, _changes: &ChangeSet) -> Preflight {
+        Preflight::default()
     }
 
     /// The line that separates batches in a script for this dialect, if the
@@ -2033,7 +2105,7 @@ mod tests {
                 name: "dbo.customer".parse().unwrap(),
             })],
         };
-        assert!(MinimalDialect.preflight(&changes).is_empty());
+        assert!(MinimalDialect.preflight(&changes).probes.is_empty());
     }
 
     // ---- module identity (ADR-0009 §1) ----

@@ -911,7 +911,7 @@ impl Dialect for Postgres {
     /// with no probe are named in [`preflight`]'s own documentation, and the
     /// caller reports how many could not be checked rather than counting them
     /// as passes.
-    fn preflight(&self, changes: &ChangeSet) -> Vec<pbps_dialect::Probe> {
+    fn preflight(&self, changes: &ChangeSet) -> pbps_dialect::Preflight {
         preflight::probes(changes)
     }
 

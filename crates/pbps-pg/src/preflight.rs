@@ -23,10 +23,9 @@
 //!
 //! # Where a probe is deliberately absent
 //!
-//! An empty result means "nothing was checked", never "nothing is wrong", so
-//! the cases are named here rather than left to be discovered. The caller
-//! reports how many probes could not be checked and does not count them as
-//! passes.
+//! Deliberately unbuilt checks carry an unchecked description and reason in
+//! the report. The caller reports how many could not be checked and never
+//! counts them as passes. Changes with no data question produce neither.
 //!
 //! - **A narrowing with no row to point at.** Reducing a `numeric`'s scale
 //!   rounds (measured, `1.55` into `numeric(10,1)` is `1.6`), a float into an
@@ -137,7 +136,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_dialect::{DialectError, Probe};
+use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 use pbps_model::{Cell, Change, ChangeSet, ColumnRef, RowKey, TableName, Value};
 
 use crate::emit::{qualified, value_literal};
@@ -2861,7 +2860,11 @@ fn duplicate_probe(from: &str, columns: &[String], description: &str) -> Probe {
 /// probes meet exactly the rows that are stored now. Every constraint this plan
 /// adds runs at rank 13, **after** them, so those probes meet the rows
 /// [`rows_after`] projects.
-fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> {
+fn build(
+    change: &Change,
+    names: &AsStored,
+    unchecked: &mut Vec<Unchecked>,
+) -> Result<Vec<Probe>, DialectError> {
     match change {
         // A new column the declarations require a value in, with nothing to
         // put there. Every existing row breaks it, so the count is the table's
@@ -2906,7 +2909,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // something no probe in this crate does.
             if let Some(default) = column.default.as_deref() {
                 let Some(literal) = constant_default(default) else {
-                    return Ok(Vec::new());
+                    return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
                 };
                 if !crate::rows::unwrapped(literal).eq_ignore_ascii_case("null") {
                     return Ok(Vec::new());
@@ -2931,7 +2934,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &qualified(&stored.table)?,
                 &quote(&stored.name)?,
             )]),
-            None => Ok(Vec::new()),
+            None => Ok(skip(change, "the column does not exist before apply", unchecked)),
         },
 
         Change::AlterColumnType {
@@ -2943,7 +2946,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             ..
         } => {
             let Some(stored) = names.column(column) else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
             let table = qualified(&stored.table)?;
             let quoted = quote(&stored.name)?;
@@ -2956,6 +2959,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             }
             let (Ok(from), Ok(to)) = (crate::types::normalize(from), crate::types::normalize(to))
             else {
+                unchecked.push(Unchecked::for_change(change, "the conversion types cannot be normalized"));
                 return Ok(out);
             };
             if let Some(fails) = crate::types::cannot_become(&from, &to, &quoted) {
@@ -2979,7 +2983,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             constraint,
         } => {
             let Some(stored) = names.table(table) else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
             let moved = names.moved.get(table);
             // A row this plan writes cannot be spelled against an arbitrary
@@ -3008,7 +3012,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
                 || names.retypes_in(table)
             {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the check predicate cannot be evaluated over planned row writes or retyped columns", unchecked));
             }
             let mut sql = format!(
                 // A CHECK rejects a row only when its predicate is FALSE;
@@ -3038,7 +3042,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 && !m.deleted.is_empty()
             {
                 let Some(key_column) = names.column(&table.column(&m.key_column)) else {
-                    return Ok(Vec::new());
+                    return Ok(skip(change, "the deleted row key does not exist before apply", unchecked));
                 };
                 let gone: BTreeSet<String> = m
                     .deleted
@@ -3065,7 +3069,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         } => {
             let Some(rows) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)?
             else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned unique-key values cannot be evaluated before apply", unchecked));
             };
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
@@ -3086,7 +3090,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 None => Applies::AllRows,
             };
             let Some(rows) = rows_after(names, table, &columns, "c", &applies)? else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned index values or predicate cannot be evaluated before apply", unchecked));
             };
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
@@ -3101,7 +3105,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             ..
         } => {
             let Some(rows) = rows_after(names, table, &pk.columns, "c", &Applies::AllRows)? else {
-                return Ok(Vec::new());
+                return Ok(skip(change, "the planned primary-key values cannot be evaluated before apply", unchecked));
             };
             let from = format!("(\n{rows}\n) AS r");
             // Both questions, because a primary key asks both: this engine
@@ -3126,7 +3130,13 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             table,
             name,
             constraint,
-        } => orphan_probe(names, table, name, constraint),
+        } => {
+            let probes = orphan_probe(names, table, name, constraint)?;
+            if probes.is_empty() {
+                return Ok(skip(change, "the planned foreign-key values cannot be evaluated before apply", unchecked));
+            }
+            Ok(probes)
+        },
 
         // Everything else either cannot fail on the data or cannot be counted.
         Change::CreateTable { .. }
@@ -3271,48 +3281,77 @@ fn orphan_probe(
 /// The delete's count comes first, so a reader meets the rows before the
 /// refusal.
 ///
-/// A probe that cannot be built is left out rather than reported as a failure:
-/// the caller is told how many probes ran and how many could not be checked,
-/// and a `DialectError` here would refuse the whole plan for a question nobody
-/// could ask.
-pub(crate) fn probes(changes: &ChangeSet) -> Vec<Probe> {
+/// A probe that cannot be built is reported as unchecked, keeping it distinct
+/// from a change that needs no data question at all.
+pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
     let names = AsStored::of(changes);
     let mut out = Vec::new();
+    let mut unchecked = Vec::new();
     for p in &changes.changes {
-        out.extend(build(&p.change, &names).unwrap_or_default());
+        match build(&p.change, &names, &mut unchecked) {
+            Ok(probes) => out.extend(probes),
+            Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
+        }
         if let Change::DeleteRow {
             table,
             key_column,
             key,
             ..
         } = &p.change
-            && let Some(stored) = names.column(&table.column(key_column))
-            && let Ok(probe) = delete_probe(table, key, &stored, &names)
         {
-            out.push(probe);
+            let Some(stored) = names.column(&table.column(key_column)) else {
+                skip(
+                    &p.change,
+                    "the deleted row key does not exist before apply",
+                    &mut unchecked,
+                );
+                continue;
+            };
+            match delete_probe(table, key, &stored, &names) {
+                Ok(probe) => out.push(probe),
+                Err(error) => {
+                    unchecked.push(Unchecked::for_change(&p.change, error.to_string()));
+                    continue;
+                }
+            }
             // Then whether that count could be complete at all, before the
             // refusals about what the plan itself writes.
-            if let Ok(hidden) = hidden_children_probe(table, key, &stored, &names) {
-                out.push(hidden);
+            match hidden_children_probe(table, key, &stored, &names) {
+                Ok(hidden) => out.push(hidden),
+                Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
             }
-            if let Ok(planned) = planned_key_probes(table, key, &stored, &names) {
-                out.extend(planned);
+            match planned_key_probes(table, key, &stored, &names) {
+                Ok(planned) => out.extend(planned),
+                Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
             }
             for (child, moved) in &names.moved {
-                if let Ok(Some(refusal)) =
-                    unprobeable_probe(table, key, &stored, child, moved, &names)
-                {
-                    out.push(refusal);
+                match unprobeable_probe(table, key, &stored, child, moved, &names) {
+                    Ok(Some(refusal)) => out.push(refusal),
+                    Ok(None) => {}
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                    }
                 }
             }
         }
     }
-    out
+    Preflight {
+        probes: out,
+        unchecked,
+    }
+}
+
+fn skip(change: &Change, reason: &str, unchecked: &mut Vec<Unchecked>) -> Vec<Probe> {
+    unchecked.push(Unchecked::for_change(change, reason));
+    Vec::new()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn probes(changes: &ChangeSet) -> Vec<Probe> {
+        super::probes(changes).probes
+    }
     use pbps_model::{Change, PlannedChange};
 
     fn planned(change: Change) -> PlannedChange {
