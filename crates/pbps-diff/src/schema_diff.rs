@@ -768,32 +768,38 @@ pub fn diff_partial(
             | Change::Revoke { .. } => false,
         }
     };
-    // The column names a `RenameColumn` in this plan is waiting to claim, on
-    // the table it will claim them on. Both sides carry `declared_table_name`
-    // (`diff_columns`), so the two spellings meet.
+    // The tables a `RenameColumn` in this plan claims a column name on. Both
+    // this and the drops below carry `declared_table_name` (`diff_columns`),
+    // so the two spellings meet.
     //
-    // Folded by the dialect, because "are these one name" is its question —
-    // and then lowercased on top, because on SQL Server the dialect cannot
-    // answer it. `Mssql::fold_ident` is the identity, correctly: what makes
-    // two spellings one name there is the *database's* collation, which a
-    // plan computed offline does not have (SPEC 7.3). **Measured** on the
-    // pinned image: in a `SQL_Latin1_General_CP1_CI_AS` database — the server
-    // default, and this suite's — `note` and `Note` cannot coexist and
-    // `sp_rename` to `Note` is `Msg 15335`; in a `Latin1_General_CS_AS` one
-    // they sit side by side and the rename succeeds.
+    // The *table*, and not the name, because the name is a question this
+    // cannot answer. On SQL Server what makes two spellings one column name is
+    // the database's collation, which a plan computed offline does not have
+    // (SPEC 7.3) — and `Mssql::fold_ident` returns the identity for exactly
+    // that reason. **Measured** on the pinned image, each in a database of the
+    // named collation:
     //
-    // So the match is deliberately wider than any one collation, because the
-    // two errors are not the same size. Missing a claim refuses a valid plan
-    // at the engine. Over-matching only moves a drop earlier than it had to
-    // go, and nothing between its old class and its new one can notice: a
-    // `Revoke` names no column, and a column this plan drops is never a
-    // rename's source, since the two come from different uids and no two
-    // baseline columns share a name.
-    let one_name = |ident: &str| dialect.fold_ident(ident).to_lowercase();
-    let claimed_by_a_column_rename: BTreeSet<(TableName, String)> = planned
+    //     SQL_Latin1_General_CP1_CI_AS   note  vs Note  ->  one name, Msg 15335
+    //     SQL_Latin1_General_CP1_CI_AI   café  vs cafe  ->  one name, Msg 15335
+    //     Latin1_General_CS_AS           note  vs Note  ->  two names, both kept
+    //
+    // Case, then accents; width and kana sensitivity are two more flags on the
+    // same collation name, and a binary collation is another answer again.
+    // Folding the name here would be guessing at which of those the target
+    // database chose, and each guess that comes up short refuses a valid plan
+    // at the engine — the defect this is here to fix, one collation further
+    // out. So the question asked is the one that is true under every
+    // collation: a rename can only collide with a column of its own table.
+    //
+    // The cost is that a drop of a column nothing claims moves too, and
+    // nothing between its old class and its new one can notice: a `Revoke`
+    // names no column, and a column this plan drops is never a rename's
+    // source, since the two come from different uids and no two baseline
+    // columns share a name.
+    let tables_claiming_a_column_name: BTreeSet<TableName> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::RenameColumn { table, to, .. } => Some((table.clone(), one_name(to))),
+            Change::RenameColumn { table, .. } => Some(table.clone()),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -826,13 +832,13 @@ pub fn diff_partial(
             | Change::Revoke { .. } => None,
         })
         .collect();
-    // Whether this drop is what frees a name a `RenameColumn` above is
+    // Whether this drop can be what frees a name a `RenameColumn` above is
     // waiting for. A column drop and nothing else: no other change gives up a
     // column name.
     let frees_a_renamed_column = |c: &Change| -> bool {
         match c {
             Change::DropColumn { column, .. } => {
-                claimed_by_a_column_rename.contains(&(column.table.clone(), one_name(&column.name)))
+                tables_claiming_a_column_name.contains(&column.table)
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
@@ -3898,16 +3904,25 @@ mod tests {
         );
     }
 
-    /// And where the two names differ only by case.
+    /// And where the two names are one name only to the database.
     ///
     /// `fold_ident` is the dialect's answer to "are these one name", and on
     /// SQL Server it is the identity — because the answer there belongs to the
     /// *database's* collation, which a plan computed offline does not have.
-    /// **Measured** on the pinned image: in a `SQL_Latin1_General_CP1_CI_AS`
-    /// database (the server default, and this container's) `note` and `Note`
-    /// cannot coexist and `sp_rename` to `Note` is `Msg 15335`; in a
-    /// `Latin1_General_CS_AS` one they sit side by side and the rename
-    /// succeeds. So the ordering takes the conservative side.
+    /// **Measured** on the pinned image, each in a database of the named
+    /// collation:
+    ///
+    /// ```text
+    /// SQL_Latin1_General_CP1_CI_AS   note vs Note  ->  one name, Msg 15335
+    /// SQL_Latin1_General_CP1_CI_AI   café vs cafe  ->  one name, Msg 15335
+    /// Latin1_General_CS_AS           note vs Note  ->  two names, both kept
+    /// ```
+    ///
+    /// Case here; the accent case is the same fixture with the same answer,
+    /// and width and kana sensitivity are two more flags on the same collation
+    /// name. The ordering does not fold at all — see
+    /// `every_column_drop_on_a_renamed_columns_table_runs_first` for the rule
+    /// that makes all of them one case.
     #[test]
     fn a_dropped_columns_name_is_free_before_a_rename_that_differs_only_by_case() {
         let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
@@ -3981,6 +3996,86 @@ mod tests {
             drop_at < rename_at,
             "the engine reads one name where the model reads two: {:?}",
             kinds(&cs)
+        );
+    }
+
+    /// The rule the two cases above are instances of, stated where it can be
+    /// broken: on a table this plan renames a column of, **every** column drop
+    /// runs first — including one whose name nothing claims.
+    ///
+    /// Narrowing it to a name comparison is what the two cases above each
+    /// refuted in turn, one collation further out every time. Which spellings
+    /// are one column name is the target database's to say, and a plan is
+    /// computed offline (SPEC 7.3), so the only question that is true under
+    /// every collation is "same table". The over-match is free: nothing
+    /// between the drop's old class and its new one can notice, because a
+    /// `Revoke` names no column and a column this plan drops is never a
+    /// rename's source.
+    #[test]
+    fn every_column_drop_on_a_renamed_columns_table_runs_first() {
+        let base = schema_of(
+            "dbo.t",
+            table(&[
+                ("old", Column::new(ty("int"))),
+                ("unrelated", Column::new(ty("int"))),
+            ]),
+        );
+        let declared = schema_of("dbo.t", table(&[("new", Column::new(ty("int")))]));
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameColumn {
+                    table: "dbo.t".parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                Intent::DropColumn {
+                    column: "dbo.t.unrelated".parse().unwrap(),
+                    reason: "no longer in use".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropColumn", "RenameColumn"],
+            "`unrelated` claims nothing `new` wants, and still goes first: {cs:?}"
+        );
+
+        // And a drop on *another* table stays where it was: the rename can
+        // collide with a column of its own table and no other.
+        let mut base = base;
+        base.tables.insert(
+            "dbo.other".parse().unwrap(),
+            table(&[("gone", Column::new(ty("int")))]),
+        );
+        let mut declared = declared;
+        declared
+            .tables
+            .insert("dbo.other".parse().unwrap(), table(&[]));
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameColumn {
+                    table: "dbo.t".parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                Intent::DropColumn {
+                    column: "dbo.t.unrelated".parse().unwrap(),
+                    reason: "no longer in use".into(),
+                },
+                Intent::DropColumn {
+                    column: "dbo.other.gone".parse().unwrap(),
+                    reason: "no longer in use".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropColumn", "RenameColumn", "DropColumn"],
+            "only the renamed table's own drops move: {cs:?}"
         );
     }
 
@@ -5947,11 +6042,12 @@ mod tests {
 
         assert_eq!(
             kinds(&cs),
-            ["DropIndex", "RenameColumn", "DropColumn"],
-            "an index must be dropped before the column it references, and the \
-             whole drop class now runs before the column renames — this index \
-             blocks neither, which is the point: the ordering is uniform, not \
-             conditional on what a constraint happens to name"
+            ["DropIndex", "DropColumn", "RenameColumn"],
+            "an index must be dropped before the column it references, and a \
+             column drop before the rename of a column of its own table — \
+             `doomed` claims nothing `new` wants here, and moves anyway, \
+             because which spellings are one name is the target database's \
+             collation to say and not this plan's (DECISIONS 472)"
         );
     }
 

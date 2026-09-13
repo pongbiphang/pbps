@@ -11886,22 +11886,35 @@ SPEC is in sync with all of these.
      drop ahead of a table rename (176, 467) becomes the first rank of class 1
      under the same scheme, unchanged in effect.
 
-     **Only the drop that frees a claimed name moves**, and the claim is the
-     dialect's own question — `Dialect::fold_ident` on both sides — lowercased
-     on top of it, because on SQL Server the dialect cannot answer. Its
-     `fold_ident` is the identity, correctly: what makes two spellings one name
-     there is the *database's* collation, which a plan computed offline does
-     not have (SPEC 7.3). **Measured** on the pinned image: in a
-     `SQL_Latin1_General_CP1_CI_AS` database — the server default, and this
-     suite's — `note` and `Note` cannot coexist and `sp_rename` to `Note` is
-     `Msg 15335`; in a `Latin1_General_CS_AS` one they sit side by side and the
-     rename succeeds. The match is therefore deliberately wider than any one
-     collation, because the two errors are not the same size: missing a claim
-     refuses a valid plan at the engine, while over-matching only moves a drop
-     earlier than it had to go, and nothing between its old class and its new
-     one can notice — a `Revoke` names no column, and a column this plan drops
-     is never a rename's source, since the two come from different uids and no
-     two baseline columns share a name. A rename into a
+     **The drops that move are a table's, not a name's**, and two review
+     rounds are why. The first version asked `Dialect::fold_ident` whether the
+     dropped name was the one the rename claims. On SQL Server that is the
+     identity function, and correctly so: what makes two spellings one column
+     name there is the *database's* collation, which a plan computed offline
+     does not have (SPEC 7.3). **Measured** on the pinned image, each in a
+     database of the named collation:
+
+     ```text
+     SQL_Latin1_General_CP1_CI_AS   note vs Note  ->  one name, Msg 15335
+     SQL_Latin1_General_CP1_CI_AI   café vs cafe  ->  one name, Msg 15335
+     Latin1_General_CS_AS           note vs Note  ->  two names, both kept
+     ```
+
+     Lowercasing on top of the fold answered the first line and the review
+     produced the second; width and kana sensitivity are two more flags on the
+     same collation name, and a binary collation is another answer again. Each
+     fold that comes up short refuses a valid plan at the engine, which is the
+     defect this entry exists to fix, one collation further out. So the
+     question asked is the one that is true under every collation: **a rename
+     can only collide with a column of its own table**, so on a table this plan
+     renames a column of, every column drop runs first.
+
+     The over-match is free, which is what makes the wide answer the right one
+     rather than the lazy one. Nothing between the drop's old class and its new
+     one can notice it: a `Revoke` names no column, and a column this plan
+     drops is never a rename's source, since the two come from different uids
+     and no two baseline columns share a name. A drop on another table does not
+     move at all. A rename into a
      name nothing in the plan gives up never reaches this sort at all —
      `resolve` refuses it as an occupied target, which is what keeps the
      reorder from reading as an implicit drop.

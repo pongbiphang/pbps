@@ -770,6 +770,19 @@ The validator and the sorter were each right on their own. The validator's
 answer was "this is fine, because another change fixes it", which is an
 *ordering obligation*, and it was recorded nowhere the sorter could read.
 
+And a second shape came out of fixing it. The ordering first asked *which
+name* the drop frees, through the dialect's identifier fold. Review answered
+with a case-insensitive collation; a lowercase on top of the fold answered
+that, and review answered with an accent-insensitive one — both measured, both
+`Msg 15335`. Width and kana sensitivity are two more flags on the same
+collation name. **A guess about the target database, made offline, can only be
+refuted one round at a time**: the question "are these one name" belongs to a
+collation this tool does not have, so the ordering stopped asking it and asked
+the one that holds under every collation instead — a rename can only collide
+with a column of its own table. Reach for the closed question when the open one
+is somebody else's to answer, and check what the wide answer costs: here,
+nothing.
+
 The shape: **when a check passes because of something else in the same plan,
 the ordering now owes that something a place.** Whenever a refusal is lifted by
 the presence of another change, go and look at where that change sorts — and
