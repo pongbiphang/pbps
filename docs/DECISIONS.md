@@ -1071,7 +1071,7 @@ SPEC is in sync with all of these.
     predicate ever proves too narrow; it reorganises every apply path, and
     the predicate is what the reviewed plan actually asserts.
 
-    **Amended by 470: the type is no longer one of the things that hold
+    **Amended by 471: the type is no longer one of the things that hold
     nothing.** The comparison became one of text on both sides, so the types
     without an `=` are held like every other; a default the engine would have
     to run, and a column the base does not have, are still the whole list.
@@ -1575,7 +1575,7 @@ SPEC is in sync with all of these.
     baseline checksum still covers it up to the moment `apply` reads the
     state.
 
-    **Amended by 470: "a type with no comparison at either end" is no longer a
+    **Amended by 471: "a type with no comparison at either end" is no longer a
     case.** That sentence kept 146's answer for `xml`, `text` and the spatial
     types; the comparison is of text now, so all of them are held. What is left
     of 146's answer is narrower, and is about the retype alone: a column this

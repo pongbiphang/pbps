@@ -334,7 +334,7 @@ pub enum Change {
         /// the column's own collation would call equal is still a rewrite
         /// (DECISIONS 137); a column left to a *constant* default is checked
         /// against that default the same way — which needs the type to render
-        /// both sides as the read-back rendered them (133, amended by 470) —
+        /// both sides as the read-back rendered them (133, amended by 471) —
         /// and a column left to nothing is held to NULL (136). Absent from older
         /// plans, which is an empty map: a spelled cell is then compared as
         /// the engine compares, and the rest holds nothing.
@@ -440,7 +440,7 @@ pub enum Change {
         /// it the way the read-back rendered it (122). A cell is carried but
         /// not held only where this plan retypes its column and the old type
         /// has no way back from its own rendering, exactly as in an update
-        /// (143, amended by 470); the type itself excludes nothing.
+        /// (143, amended by 471); the type itself excludes nothing.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         types: BTreeMap<String, ColumnType>,
         /// The type each of those columns has *when the `DELETE` runs*, where

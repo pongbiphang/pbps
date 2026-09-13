@@ -114,7 +114,7 @@ pub struct Slot {
     /// engine would have to run — so the cell is taken as at its default
     /// (module docs). The type is no longer part of that question: the
     /// comparison is of text, which every type this dialect holds renders as
-    /// (DECISIONS 470).
+    /// (DECISIONS 471).
     pub assume_default: bool,
 }
 

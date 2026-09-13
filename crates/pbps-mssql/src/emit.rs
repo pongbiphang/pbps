@@ -276,7 +276,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // carried unheld is narrower — a column this plan *retypes* whose
             // old type has no way back from its own rendering: `image`, which
             // has no conversion from text at all, and the two spatial types,
-            // whose text leaves out the SRID (DECISIONS 143 and 470).
+            // whose text leaves out the SRID (DECISIONS 143 and 471).
             let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
             for (column, cell) in row {
                 predicates.extend(recorded_cell(
@@ -904,7 +904,7 @@ fn recorded_cell(
             let recorded = literal(&recorded_text(v));
             // A retyped column whose old type has no way back from its own
             // rendering is carried and not held — `image`, `geometry` and
-            // `geography` (DECISIONS 470): there is no expression that puts
+            // `geography` (DECISIONS 471): there is no expression that puts
             // the recorded text back through that type, so there is nothing
             // to compare the converted column with.
             let Some(expected) = ty.as_stored(&recorded) else {
@@ -2667,7 +2667,7 @@ mod tests {
     /// column's type's — and a NULL as `IS NULL`; a literal default as the
     /// read-back compared it; a default the engine would have to run, and a
     /// column the base does not have, hold nothing. The type no longer
-    /// excludes anything: the comparison is of text (DECISIONS 470).
+    /// excludes anything: the comparison is of text (DECISIONS 471).
     #[test]
     fn an_update_holds_the_row_to_what_the_plan_recorded() {
         let cell = |from: Cell, to: Cell| (from, to);
