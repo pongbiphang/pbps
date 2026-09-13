@@ -11575,3 +11575,32 @@ SPEC is in sync with all of these.
      PostgreSQL malformed UUID and identity-text negative cases. Unit cases
      cover aliases, non-string scalar renderings, empty data and invalid key
      shapes; the live collation test retains the separate collision question.
+
+470. **SQL Server's delete guard excludes the doomed row from its own
+     self-reference.** Measured on SQL Server 17.0.4075.5, a row whose foreign
+     key points at itself can be deleted: the one statement removes both
+     sides of the reference. The preflight already excluded planned deletes,
+     but the execution guard counted that row before deleting it and refused
+     a valid plan. This is the SQL Server counterpart of decision 330.
+
+     `still_referenced` now supplies a per-child exclusion only where
+     `fk.parent_object_id = fk.referenced_object_id`. It excludes exactly
+     `ch.<plan key> = @key`, using the same native comparison and parameter as
+     the parent lookup. The plan's key identifies the row even when the FK
+     references another unique key, including a composite one. Identifier
+     quoting and SQL literal escaping remain separate because the exclusion
+     is text within the generated child-count statement.
+
+     A different row in the same table still counts, as does a row with equal
+     key spelling in another table. The complete metadata and row-filter
+     checks of 468 precede this count unchanged, and retained child ranges
+     still use `HOLDLOCK`. Plan-wide exclusions and arrivals remain the
+     preflight's responsibility.
+
+     Live regressions compare direct and emitted deletes, then add another
+     self-referencing child and an external CASCADE child with the same key.
+     They cover a primary-key reference, a composite unique-key reference,
+     and quoted identifiers and values. Both negative cases must raise the
+     pbps guard before the engine constraint or cascade, and effects are
+     read before rollback. Restoring the old guard makes both tests fail by
+     refusing the self-only delete.

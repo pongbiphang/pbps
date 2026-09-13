@@ -2124,3 +2124,16 @@ Three traps sat inside the fix, and each of them is a measurement:
   an expensive job with a label or a `draft` test opens the gate instead of
   closing it. If a condition must gate a merge, the job has to run and fail —
   or the gate has to be a separate report, as `ci-gate` is.
+
+## A pre-delete count includes the row its statement removes
+
+SQL Server's preflight excluded rows the plan deletes, but its execution
+check deliberately counted every remaining reference. That included the
+row about to be deleted when it referenced itself. The engine accepts that
+single-row delete because both sides disappear together; the guard refused
+it first (DECISIONS 470, the counterpart of PostgreSQL decision 330).
+
+Exclude exactly the current row on its own table, identified by the plan's
+key rather than the foreign key's referenced columns. A second row through
+the same foreign key survives and still counts. Equal key spelling in another
+table identifies another row and must never receive that exclusion.
