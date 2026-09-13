@@ -321,8 +321,8 @@ carrying one is refused at plan time rather than halfway through an apply
 Two rules came out of the emitter's own fixpoint rather than from the issue.
 A table the pull would never read is refused offline — a schema of
 `pg_catalog`, `information_schema` or any name beginning with `pg_`, or a table
-called `__pbps_state` or `__pbps_lock`, which the reader hides in every schema
-(DECISIONS 274) — and a schema named `$user`, which every `search_path` reads
+called `public.__pbps_state` or `public.__pbps_lock`, the two ledger tables
+(DECISIONS 274 and 284) — and a schema named `$user`, which every `search_path` reads
 as the deploying role's own schema however it is quoted, so the table would be
 created and its unqualified names would bind somewhere else (DECISIONS 275).
 The pull never reads the first group — and

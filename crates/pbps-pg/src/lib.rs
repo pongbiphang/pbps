@@ -585,26 +585,16 @@ impl Dialect for Postgres {
                 ),
             });
         }
-        // The two tables this tool owns, refused for the same reason and from
-        // the same list the reader hides them by (`catalog::OURS`). A
-        // declaration naming one is created and then invisible: the pull
-        // reports it absent and the next plan creates it again, which the
-        // engine refuses for already existing.
-        //
-        // By name and in every schema, because that is how the filter reads —
-        // `catalog.rs` narrowed it from a prefix on purpose, so that a
-        // project's own `app.__pbps_customers` stays a project's table
-        // (DECISIONS 274).
-        if catalog::OURS.contains(&name.name.as_str()) {
+        // The pull and validation share the ledger's qualified identity.
+        // Same-named tables elsewhere belong to the project (DECISIONS 284).
+        if catalog::is_ours(name) {
             found.push(DialectError::Invalid {
                 dialect: types::DIALECT,
                 message: format!(
-                    "table `{name}` uses the name `{}`, which is one of the two this tool owns \
-                     (SPEC §8.1) and which this dialect's pull hides in every schema. The engine \
-                     would create the table and no plan could ever see it again. Only these two \
-                     names are taken: a table of your own called `{}_customers`, or anything \
-                     else beginning with the same letters, is read back normally.",
-                    name.name, name.name
+                    "table `{name}` is one of the two this tool owns (SPEC §8.1). \
+                     Only those names in schema `{}` are reserved; the same table name in \
+                     another project schema is read back normally.",
+                    crate::state::LEDGER_SCHEMA
                 ),
             });
         }
@@ -1443,8 +1433,7 @@ mod tests {
         }
     }
 
-    /// A table named as one of the two this tool owns is refused, in any
-    /// schema, because the reader hides it in any schema.
+    /// Only the ledger's qualified table identities are reserved.
     ///
     /// The negative case is the whole reason the reader's filter names the two
     /// rather than matching a prefix: a project's own `__pbps_customers` is a
@@ -1460,7 +1449,7 @@ mod tests {
             );
             Postgres::new().validate_table(&name.parse().expect("a table name parses"), &table)
         };
-        for name in ["app.__pbps_state", "app.__pbps_lock", "public.__pbps_state"] {
+        for name in [crate::state::STATE_TABLE, crate::state::LOCK_TABLE] {
             let problems = one(name);
             assert_eq!(problems.len(), 1, "`{name}`: {problems:?}");
             assert!(
@@ -1470,6 +1459,10 @@ mod tests {
             );
         }
         for name in [
+            "app.__pbps_state",
+            "app.__pbps_lock",
+            "Public.__pbps_state",
+            "public.__pbps_customers",
             "app.__pbps_customers",
             "app.__pbps_statement",
             "app.pbps_state",
