@@ -12008,3 +12008,6 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
         "only the planned parent disappears and both children hold NULL"
     );
 }
+
+#[path = "live/row_security.rs"]
+mod row_security;
