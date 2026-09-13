@@ -11017,3 +11017,45 @@ SPEC is in sync with all of these.
      staged failures must record `42501`, the reached table and the required
      privileges, omit the raw server sentence, and leave the row unchanged.
      Restoring UPDATE lets the same saved plan complete.
+
+457. **The local viewer is a synchronous CLI consumer (issue #117).**
+     `pbps-ui` depends only on serde, serde_json and `tiny_http` 0.12.0, with
+     default features disabled. The HTTP crate adds ascii, chunked_transfer
+     and httpdate; log was already present. Its [documented synchronous
+     server](https://docs.rs/crate/tiny_http/0.12.0/source/src/lib.rs) supplies
+     HTTP/1.1 framing without TLS, a framework or another async runtime.
+     `cargo deny check` accepted the resulting tree. CLI uses the existing
+     rand and base64 dependencies to supply a 256-bit launch token and the
+     exact documentation stylesheet's SHA-256 CSP hash. The UI crate has no
+     workspace dependency; a test pins its complete dependency list.
+
+     Measured on Linux x86_64 with Rust 1.98.0, the default release profile
+     and `cargo build --release -p pbps-cli`: baseline master `2fe40e0` was
+     24,835,096 bytes, and the viewer build was 25,678,104 bytes, an increase
+     of 843,008 bytes (3.39%). Both builds used the same toolchain and target
+     directory, with the baseline binary copied before building the viewer.
+     This keeps ADR-0015 decision 6's single-binary placement.
+
+     Each read spawns the running executable with the project directory and
+     `--no-input`; environment selections use `--env`, never a browser-sent
+     connection string. Only status, verify, saved-plan explain, state list
+     and docs are representable. Ordinary CLI behavior includes verify's
+     configured on_drift hook; the viewer introduces no scheduler. Raw stderr
+     is not a browser data channel. Findings and absent data stay distinct.
+
+     The independently written consumer types refuse unknown envelope and
+     payload fields, wrong command/version and inconsistent exit outcomes.
+     Drift's changes field is intentionally opaque in the published schema:
+     the page displays its entire JSON as text and does not reinterpret
+     model variants. No other structured payload is opaque. Golden tests
+     feed real offline and live CLI output to this consumer.
+
+     Every request is checked before routing, including unknown routes:
+     loopback peer, exactly one bound Host, matching Origin when present
+     (required for methods other than GET/HEAD), and exactly one launch token
+     header. Only the three immutable shell resources omit the token check.
+     Authenticated non-read methods are refused too. The page renders data
+     as text and docs in a script-free sandboxed frame; no-store applies to
+     responses, and CSP permits only shipped assets plus the measured style
+     hash. These boundaries ship with the read views, before any compose or
+     deployment UI exists.

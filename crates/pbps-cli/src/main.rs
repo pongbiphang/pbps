@@ -90,6 +90,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Browse local read views of environments, drift, saved plans and history
+    Ui,
+
     /// Create a new project, optionally adopting an existing database
     Init(init::InitArgs),
 
@@ -402,6 +405,7 @@ impl Command {
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
             | Command::Docs { .. }
+            | Command::Ui
             | Command::Pull { .. }
             | Command::Apply { .. }
             | Command::Snapshot { .. }
@@ -628,6 +632,25 @@ fn run() -> anyhow::Result<()> {
     };
 
     match cli.command {
+        Command::Ui => {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            use std::io::Write as _;
+            let style_hash = base64::engine::general_purpose::STANDARD.encode(
+                sha2::Sha256::digest(pbps_docs::html::style_contents().as_bytes()),
+            );
+            let viewer = pbps_ui::Viewer::bind(pbps_ui::Config {
+                executable: std::env::current_exe()?,
+                project: project.root.clone(),
+                token: rand::random(),
+                docs_style_hash: style_hash,
+            })?;
+            println!("{}", viewer.url());
+            std::io::stdout().flush()?;
+            eprintln!("Read-only viewer. Press Ctrl-C to stop.");
+            viewer.serve()?;
+            Ok(())
+        }
         Command::Init(_)
         | Command::Schema { .. }
         | Command::Completions { .. }

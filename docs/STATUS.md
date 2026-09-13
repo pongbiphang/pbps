@@ -43,6 +43,13 @@ Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.
 
+Phase 6 step 3: `pbps ui` serves local read views for environments, drift,
+saved plans, the ledger timeline and schema documentation/ERD. Open the complete
+printed URL, including its fragment. The viewer requires a per-launch token,
+exact bound Host and matching Origin, and calls the same binary for every read.
+Its page works offline. Compose and deployment actions remain later steps of
+#64; this viewer accepts no writes. See [UI.md](UI.md).
+
 ## Live tests
 
 **Live tests**: the SPEC §11.5 invariants plus the Phase 3, 3.5 and 3.1 ones (the

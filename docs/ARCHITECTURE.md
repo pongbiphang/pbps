@@ -29,6 +29,9 @@ pbps-db        Connections plus transaction framing. Owns "there is a network";
                names one. Driver isolation: see constraint 9
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
+pbps-ui        Loopback read views over fixed CLI subprocess commands. Owns its
+               envelope consumer types and embedded page; depends on no other
+               workspace crate (ADR-0015 decision 6)
 pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
                output is the one typed findings envelope every read-only
                command speaks; prompt is the TTY intent channel of SPEC 6.3.
@@ -47,6 +50,9 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   crate names either. A third engine is a compile error in every `engine`
   function until it has an answer for each.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
+- The synchronous local UI's only project-data source is `current_exe()` run
+  with `--no-input`. CLI supplies its launch token and the documentation style
+  hash; the UI neither reads configuration nor links the renderer or model.
 - The dialect supplies transaction statements; `pbps-db` owns the transaction
   framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)
   for the boundary correction.
