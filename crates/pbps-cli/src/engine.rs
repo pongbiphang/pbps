@@ -631,46 +631,58 @@ pub struct ConnectedCheck {
     pub message: String,
 }
 
-/// Predict existing table/column DROP dependencies in the caller's transaction.
+/// Predict existing table/column/key DROP dependencies in the caller's transaction.
 /// The other engine's rename reader does not answer this question (issue 254).
 pub async fn check_drop_blockers(
     conn: &mut Conn,
     changes: &ChangeSet,
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
-        Driver::Mssql => Ok(ConnectedCheck {
-            name: "drop_blockers",
-            engine: "SQL Server",
-            status: "unavailable",
-            message: "The table/column drop dependency reader is not implemented for SQL Server"
-                .to_owned(),
-        }),
+        Driver::Mssql => {
+            let reports = pbps_mssql::impact::key_drop_blockers(conn, changes).await?;
+            refuse_drop_reports("SQL Server", &reports)?;
+            Ok(ConnectedCheck {
+                name: "drop_blockers",
+                engine: "SQL Server",
+                status: "unavailable",
+                message: format!(
+                    "{} primary/unique-key drop(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
+                    reports.len()
+                ),
+            })
+        }
         Driver::Postgres => {
             let reports = pbps_pg::impact::drop_blockers(conn, changes).await?;
-            let blocked: Vec<_> = reports
-                .iter()
-                .filter(|r| !r.blocking.is_empty())
-                .map(|r| format!("{}: {}", r.target, r.blocking.join("; ")))
-                .collect();
-            if !blocked.is_empty() {
-                anyhow::bail!(
-                    "drop_blockers (PostgreSQL): {}.\n\
-                    Remove these dependencies before the drop, through earlier declared changes \
-                    or a separately reviewed deployment, then recompute the plan.",
-                    blocked.join("\n")
-                );
-            }
+            refuse_drop_reports("PostgreSQL", &reports)?;
             Ok(ConnectedCheck {
                 name: "drop_blockers",
                 engine: "PostgreSQL",
                 status: "passed",
                 message: format!(
-                    "{} table/column drop(s) checked against current catalog dependencies",
+                    "{} table/column/key drop(s) checked against current catalog dependencies",
                     reports.len()
                 ),
             })
         }
     }
+}
+
+fn refuse_drop_reports(
+    engine: &str,
+    reports: &[pbps_db::impact::DropReport],
+) -> anyhow::Result<()> {
+    let blocked: Vec<_> = reports
+        .iter()
+        .filter(|r| !r.blocking.is_empty())
+        .map(|r| format!("{}: {}", r.target, r.blocking.join("; ")))
+        .collect();
+    if !blocked.is_empty() {
+        anyhow::bail!(
+            "drop_blockers ({engine}): {}.\nRemove these dependencies before the drop, through earlier declared changes or a separately reviewed deployment, then recompute the plan.",
+            blocked.join("\n")
+        );
+    }
+    Ok(())
 }
 
 /// Check the permissions this deployment will grant, not every permission in

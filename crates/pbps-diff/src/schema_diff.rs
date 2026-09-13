@@ -272,6 +272,8 @@ pub fn diff_partial(
         );
     }
 
+    recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
+
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
@@ -965,6 +967,111 @@ fn renames_of(base: Side, declared: Side) -> Renames {
         }
     }
     renames
+}
+
+/// A standing FK is bound to one backing index, not merely to columns that
+/// another surviving key also covers. Offline the binding is unknown, so make
+/// every affected managed FK explicit in the reviewed plan. Connected guards
+/// use actual catalog dependencies to refuse an unplanned or external removal.
+fn recreate_referenced_foreign_keys(
+    base: Side<'_>,
+    declared: Side<'_>,
+    renames: &Renames,
+    changes: &mut Vec<Change>,
+) {
+    if !changes.iter().any(|c| {
+        matches!(
+            c,
+            Change::SetPrimaryKey { from: Some(_), .. } | Change::DropUnique { .. }
+        )
+    }) {
+        return;
+    }
+    let aligned: BTreeMap<_, _> = base
+        .ids
+        .tables
+        .iter()
+        .filter_map(|(uid, old_name)| {
+            let new_name = declared.ids.tables.get(uid)?;
+            let table = base.schema.tables.get(old_name)?;
+            Some((new_name.clone(), renames.apply(table, old_name)))
+        })
+        .collect();
+    let mut removed = BTreeSet::new();
+    for change in changes.iter() {
+        let (table, columns) = match change {
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                ..
+            } => (table, &key.columns),
+            Change::DropUnique { table, name } => {
+                let Some(key) = aligned.get(table).and_then(|t| t.unique.get(name)) else {
+                    continue;
+                };
+                (table, &key.columns)
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => continue,
+        };
+        // PostgreSQL can bind a permutation of a composite candidate key.
+        // SQL Server requires its order; a set conservatively covers both.
+        removed.insert((
+            table.clone(),
+            columns.iter().cloned().collect::<BTreeSet<_>>(),
+        ));
+    }
+    for (table, before) in &aligned {
+        let Some(after) = declared.schema.tables.get(table) else {
+            continue;
+        };
+        for (name, fk) in &before.foreign_keys {
+            let Some(wanted) = after.foreign_keys.get(name) else {
+                continue;
+            };
+            if !removed.contains(&(fk.references_table.clone(), fk.references_columns.iter().cloned().collect()))
+                || changes.iter().any(|c| matches!(c, Change::DropForeignKey { table: on, name: n } if on == table && n == name)) {
+                continue;
+            }
+            changes.push(Change::DropForeignKey {
+                table: table.clone(),
+                name: name.clone(),
+            });
+            changes.push(Change::AddForeignKey {
+                table: table.clone(),
+                name: name.clone(),
+                constraint: Box::new(wanted.clone()),
+            });
+        }
+    }
 }
 
 /// Constraints and indexes are always matched by name and never modified in
@@ -4212,6 +4319,190 @@ mod tests {
             references_columns: to_columns.iter().map(|c| (*c).to_string()).collect(),
             on_delete: ReferentialAction::default(),
             on_update: ReferentialAction::default(),
+        }
+    }
+
+    #[test]
+    fn replacing_a_referenced_key_surrounds_it_with_visible_foreign_key_changes() {
+        for primary in [false, true] {
+            let mut parent = sku_table();
+            if primary {
+                parent.primary_key = Some(PrimaryKey {
+                    name: Some("old_key".into()),
+                    columns: vec!["id".into()],
+                });
+            } else {
+                parent.unique.insert("old_key".into(), unique(&["id"]));
+            }
+            parent.unique.insert("unrelated".into(), unique(&["sku"]));
+            let mut child = sku_table();
+            child
+                .foreign_keys
+                .insert("fk_kept".into(), fk(&["id"], "dbo.parent", &["id"]));
+            child
+                .foreign_keys
+                .insert("fk_other".into(), fk(&["sku"], "dbo.parent", &["sku"]));
+            let base = two_tables(("dbo.parent", parent), ("dbo.child", child));
+            assert!(run(&base, &base, &[]).is_empty());
+            let mut declared = base.clone();
+            let parent = declared
+                .tables
+                .get_mut(&"dbo.parent".parse().unwrap())
+                .unwrap();
+            if primary {
+                parent.primary_key.as_mut().unwrap().name = Some("new_key".into());
+            } else {
+                let key = parent.unique.remove("old_key").unwrap();
+                parent.unique.insert("new_key".into(), key);
+            }
+            let cs = run(&base, &declared, &[]);
+            assert_eq!(
+                kinds(&cs),
+                if primary {
+                    vec![
+                        "DropForeignKey",
+                        "SetPrimaryKey",
+                        "SetPrimaryKey",
+                        "AddForeignKey",
+                    ]
+                } else {
+                    vec!["DropForeignKey", "DropUnique", "AddUnique", "AddForeignKey"]
+                },
+                "{cs:?}"
+            );
+            assert!(
+                matches!(&cs.changes[0].change, Change::DropForeignKey {name, ..} if name == "fk_kept")
+            );
+            assert!(
+                matches!(&cs.changes[3].change, Change::AddForeignKey {name, constraint, ..}
+                if name == "fk_kept" && **constraint == base.tables[&"dbo.child".parse().unwrap()].foreign_keys["fk_kept"])
+            );
+            assert_eq!(cs.changes[0].risks, cs.changes[0].change.intrinsic_risks());
+            assert!(
+                cs.changes[3]
+                    .change
+                    .intrinsic_risks()
+                    .contains(&pbps_model::RiskClass::Constraint)
+            );
+
+            // An explicit FK removal must not be duplicated or recreated.
+            declared
+                .tables
+                .get_mut(&"dbo.child".parse().unwrap())
+                .unwrap()
+                .foreign_keys
+                .remove("fk_kept");
+            let removed = run(&base, &declared, &[]);
+            assert_eq!(
+                removed
+                    .changes
+                    .iter()
+                    .filter(|p| matches!(p.change, Change::DropForeignKey { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                !removed
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, Change::AddForeignKey { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn composite_and_self_references_follow_table_and_column_identity_during_key_replacement() {
+        let mut parent = sku_table();
+        parent
+            .unique
+            .insert("old_key".into(), unique(&["id", "sku"]));
+        parent.foreign_keys.insert(
+            "self_fk".into(),
+            fk(&["id", "sku"], "dbo.parent", &["id", "sku"]),
+        );
+        let mut child = sku_table();
+        child.foreign_keys.insert(
+            "child_fk".into(),
+            fk(&["id", "sku"], "dbo.parent", &["sku", "id"]),
+        );
+        let base = two_tables(("dbo.parent", parent), ("dbo.child", child));
+        let intents = [
+            Intent::RenameTable {
+                from: "dbo.parent".parse().unwrap(),
+                to: "dbo.parent_new".parse().unwrap(),
+            },
+            Intent::RenameTable {
+                from: "dbo.child".parse().unwrap(),
+                to: "dbo.child_new".parse().unwrap(),
+            },
+            Intent::RenameColumn {
+                table: "dbo.parent_new".parse().unwrap(),
+                from: "id".into(),
+                to: "code".into(),
+            },
+        ];
+        for replace in [false, true] {
+            let mut parent = base.tables[&"dbo.parent".parse().unwrap()].clone();
+            let column = parent.columns.shift_remove("id").unwrap();
+            parent.columns.insert("code".into(), column);
+            parent.unique.clear();
+            parent.unique.insert(
+                if replace { "new_key" } else { "old_key" }.into(),
+                unique(&["code", "sku"]),
+            );
+            parent.foreign_keys.insert(
+                "self_fk".into(),
+                fk(&["code", "sku"], "dbo.parent_new", &["code", "sku"]),
+            );
+            let mut child = base.tables[&"dbo.child".parse().unwrap()].clone();
+            child.foreign_keys.insert(
+                "child_fk".into(),
+                fk(&["id", "sku"], "dbo.parent_new", &["sku", "code"]),
+            );
+            let declared = two_tables(("dbo.parent_new", parent), ("dbo.child_new", child));
+            let cs = run(&base, &declared, &intents);
+            let drops: Vec<_> = cs
+                .changes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.change, Change::DropForeignKey { .. }))
+                .collect();
+            let adds: Vec<_> = cs
+                .changes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.change, Change::AddForeignKey { .. }))
+                .collect();
+            assert_eq!(drops.len(), if replace { 2 } else { 0 }, "{cs:?}");
+            assert_eq!(adds.len(), drops.len());
+            if replace {
+                let key_drop = cs
+                    .changes
+                    .iter()
+                    .position(|p| matches!(p.change, Change::DropUnique { .. }))
+                    .unwrap();
+                let key_add = cs
+                    .changes
+                    .iter()
+                    .position(|p| matches!(p.change, Change::AddUnique { .. }))
+                    .unwrap();
+                assert!(drops.iter().all(|(i, _)| *i < key_drop));
+                for (i, p) in adds {
+                    assert!(i > key_add);
+                    let Change::AddForeignKey {
+                        table,
+                        name,
+                        constraint,
+                    } = &p.change
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        constraint.as_ref(),
+                        &declared.tables[table].foreign_keys[name]
+                    );
+                }
+            }
         }
     }
 

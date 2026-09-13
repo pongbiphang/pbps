@@ -10938,3 +10938,141 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
     .unwrap();
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs a live database; run the engine's live-test script"]
+async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
+    use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
+    let db = TestDb::create("key_guard177").await;
+    let mut conn = connect_live(&format!(
+        "{};Database={}",
+        conn_str().trim_end_matches(';'),
+        db.name
+    ))
+    .await
+    .unwrap();
+    conn.begin(Mssql.transaction_framing()).await.unwrap();
+    conn.execute("CREATE TABLE dbo.parent (id integer NOT NULL, CONSTRAINT old_key UNIQUE(id)); CREATE TABLE dbo.child (id integer CONSTRAINT child_fk REFERENCES dbo.parent(id)); ALTER TABLE dbo.parent ADD CONSTRAINT other_key UNIQUE(id);").await.unwrap();
+    let parent = TableName::new("dbo", "parent");
+    let child = TableName::new("dbo", "child");
+    let drop_key = |name: &str| Change::DropUnique {
+        table: parent.clone(),
+        name: name.into(),
+    };
+    let plan = |changes: Vec<Change>| ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    };
+    let reports =
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("other_key")]))
+            .await
+            .unwrap();
+    assert!(
+        reports.iter().all(|r| r.blocking.is_empty()),
+        "the other key has the same columns but no binding: {reports:?}"
+    );
+    let reports =
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+            .await
+            .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].blocking.iter().any(|b| b.contains("child_fk")),
+        "{reports:?}"
+    );
+    let fk = Change::DropForeignKey {
+        table: child.clone(),
+        name: "child_fk".into(),
+    };
+    let reports = pbps_mssql::impact::key_drop_blockers(
+        &mut conn,
+        &plan(vec![fk.clone(), drop_key("old_key")]),
+    )
+    .await
+    .unwrap();
+    assert!(reports.iter().all(|r| r.blocking.is_empty()), "{reports:?}");
+    let reports =
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key"), fk]))
+            .await
+            .unwrap();
+    assert!(
+        !reports[0].blocking.is_empty(),
+        "a later FK removal does not clear an earlier key drop"
+    );
+    let renamed_parent = TableName::new("dbo", "renamed_parent");
+    let renamed_child = TableName::new("dbo", "renamed_child");
+    let renamed = plan(vec![
+        Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: parent.clone(),
+            to: renamed_parent.clone(),
+        },
+        Change::RenameTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            from: child.clone(),
+            to: renamed_child.clone(),
+        },
+        Change::DropForeignKey {
+            table: renamed_child,
+            name: "child_fk".into(),
+        },
+        Change::DropUnique {
+            table: renamed_parent,
+            name: "old_key".into(),
+        },
+    ]);
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &renamed)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.blocking.is_empty())
+    );
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("missing")]))
+            .await
+            .is_err(),
+        "an absent existing key is not a successful dependency read"
+    );
+    conn.execute("CREATE USER key_guard177_reader WITHOUT LOGIN; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.parent TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
+    let hidden = pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+        .await
+        .unwrap_err();
+    assert!(
+        hidden.to_string().contains("database VIEW DEFINITION"),
+        "{hidden}"
+    );
+    conn.execute("REVERT; GRANT VIEW DEFINITION TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
+    let visible =
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+            .await
+            .unwrap();
+    assert!(!visible[0].blocking.is_empty());
+    conn.execute("REVERT").await.unwrap();
+    conn.execute("CREATE ROLE key_guard177_denied; ALTER ROLE key_guard177_denied ADD MEMBER key_guard177_reader;").await.unwrap();
+    for principal in ["key_guard177_reader", "key_guard177_denied"] {
+        conn.execute(&format!("DENY VIEW DEFINITION ON OBJECT::dbo.child TO {principal}; EXECUTE AS USER='key_guard177_reader';")).await.unwrap();
+        let denied =
+            pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+                .await
+                .unwrap_err();
+        assert!(denied.to_string().contains("metadata DENY"), "{denied}");
+        conn.execute(&format!(
+            "REVERT; REVOKE VIEW DEFINITION ON OBJECT::dbo.child FROM {principal};"
+        ))
+        .await
+        .unwrap();
+    }
+    conn.execute("DENY VIEW DEFINITION ON OBJECT::dbo.child TO public")
+        .await
+        .unwrap();
+    let owner = pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+        .await
+        .unwrap();
+    assert!(
+        !owner[0].blocking.is_empty(),
+        "the owner still reads the actual FK despite a public denial"
+    );
+    conn.rollback(Mssql.transaction_framing()).await.unwrap();
+    drop(conn);
+    db.drop().await;
+}
