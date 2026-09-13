@@ -1413,9 +1413,12 @@ SPEC is in sync with all of these.
     A mismatch is `@@ROWCOUNT <> 1`, which already says "changed or deleted
     since the plan was made. Plan again."
 
-    **Amended by 471: nothing is carried unheld any more.** That limit was the
-    native `=`, and the comparison became one of text; a cell of a type without
-    an operator is held by the rendering that read it, like every other.
+    **Amended by 471: the type is no longer what leaves a cell unheld.** That
+    limit was the native `=`, and the comparison became one of text, so a cell
+    of a type without an operator is held by the rendering that read it like
+    every other. One case remains, and it is narrower: a column *this plan
+    retypes* whose old type cannot be spelled back from its own rendering —
+    `image` alone, measured. Unretyped, an `image` cell is held.
 
 144. **A disabled foreign key is not counted when a row is deleted.**
     `NOCHECK CONSTRAINT` leaves the constraint in `sys.foreign_keys` and stops

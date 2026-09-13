@@ -270,10 +270,12 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // key-only DELETE removes whatever an application session left
             // under that key in between, and `@@ROWCOUNT = 1` calls the loss
             // a success. Each recorded cell is compared the way the read-back
-            // rendered it, exactly as an update's precondition does. Every
-            // type is held now: the comparison is of text, so a cell that
-            // used to be carried unheld for want of a native `=` is held like
-            // any other (DECISIONS 143, and this dialect's port of 331).
+            // rendered it, exactly as an update's precondition does. The
+            // comparison is of text, so a cell that used to be carried unheld
+            // for want of a native `=` is held like any other; what is still
+            // carried unheld is narrower — a column this plan *retypes* whose
+            // old type has no way back from its own rendering, which is
+            // `image` alone (DECISIONS 143 and 470).
             let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
             for (column, cell) in row {
                 predicates.extend(recorded_cell(
