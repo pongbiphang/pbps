@@ -112,8 +112,8 @@ enum Token {
     /// non-ASCII byte. A `$` continues it.
     Identifier,
     /// Opened with an ASCII digit, and a numeric constant it stays: the
-    /// letters of an exponent or a base prefix are part of the number, not the
-    /// start of a name. **Measured**, `SELECT 1e2$$;` and `SELECT 0x1$$;` are
+    /// letters of an exponent or a base prefix, and the decimal point between
+    /// them, are part of the number and not the start of a name. **Measured**, `SELECT 1e2$$;` and `SELECT 0x1$$;` are
     /// `trailing junk after numeric literal` on 18.6 and 16.15 — so there the
     /// engine refuses them itself — while `SELECT 10$$;` is `unterminated
     /// dollar-quoted string`. The junk check arrived in PostgreSQL 15 and this
@@ -251,6 +251,13 @@ impl FromStr for RoutineArg {
                     Token::Closed | Token::Numeric => Token::Numeric,
                     Token::Identifier => Token::Identifier,
                 },
+                // A decimal point does not end a number, and it does end a
+                // name: **measured**, `1.e2` is one numeric constant — `SELECT
+                // 1.e2$$;` is `trailing junk after numeric literal` — while
+                // `a.b` is two tokens and the `$` in `a.b$c` belongs to `b$c`.
+                // Closing the token here unconditionally let the `e` of an
+                // exponent open an identifier.
+                '.' if token == Token::Numeric => Token::Numeric,
                 _ => Token::Closed,
             };
             // A space between two words is part of the name — `timestamp with
@@ -2698,6 +2705,23 @@ mod tests {
             "0x1$$",
             "numeric(1e2$$)",
             "1e2$a",
+            // And the decimal point does not end the number either. This one
+            // is not a pre-15 question: **measured on 18.6 and 16.15**,
+            // `SELECT 1.5$$;` is `unterminated dollar-quoted string at or near
+            // "$$;"` — no junk check catches it, because `1.5$$` is a number
+            // followed by a quote and nothing else. `1.e2$$` is the spelling
+            // that reached an identifier through the exponent's letter.
+            "1.5$$",
+            "1.e2$$",
+            "a[1.e2$$]",
+            "numeric(1.5$$)",
+            // The rest of what the engine's lexer counts as part of a number,
+            // swept rather than waited for: a digit separator and the other
+            // base prefixes. Every one of them is a character this whitelist
+            // admits, and none of them opens a name.
+            "1_0$$",
+            "0b1$$",
+            "0o7$$",
         ] {
             assert!(
                 bad.parse::<RoutineArg>().is_err(),
@@ -2720,6 +2744,9 @@ mod tests {
             // is not.
             "a1$b",
             "a(b1$c)",
+            // And the dot still ends a *name*, so the `$` in `a1.b$c` belongs
+            // to `b$c` and is one byte of it.
+            "a1.b$c",
         ] {
             assert_eq!(
                 good.parse::<RoutineArg>()

@@ -6523,6 +6523,19 @@ SPEC is in sync with all of these.
     inside a name is still a name (`a1$b`), which is the case the two-state
     parser got right and this one keeps.
 
+    **And the decimal point does not end the number, though it does end a
+    name.** Round 3 found `1.e2$$`, where the dot closed the token and the
+    exponent's `e` opened an identifier. Measured on 18.6 and 16.15, that
+    spelling is junk like the others — but `SELECT 1.5$$;` is `unterminated
+    dollar-quoted string` on both, with no junk check to catch it, because a
+    number followed by a quote is exactly what it is. So the dot is carried
+    through a numeric token and closes an identifier one, which is the lexer's
+    own asymmetry: `1.e2` is one constant and `a.b` is two names. With that,
+    every character the engine counts as part of a number — digits, the point,
+    an exponent's letter, the `0x`/`0o`/`0b` prefixes and the `_` separator —
+    is inside the numeric state, and the family is closed rather than patched
+    one round at a time.
+
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
     edges to it:
