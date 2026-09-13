@@ -9555,6 +9555,203 @@ fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
     );
 }
 
+/// CHECK and filtered-index probes must actually count through the CLI apply
+/// path. An emitter-only test never reaches the unchecked-probe fallback.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn commented_constraint_probes_count_violations_and_accept_nonviolating_rows() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    for (slug, constraint, failure, repair) in [
+        (
+            "check203",
+            "checks:\n  ck_amount: 'amount >= 0 -- reason'\n",
+            "2 rows that violate the new check ck_amount",
+            "UPDATE dbo.t SET amount = ABS(amount);",
+        ),
+        (
+            "filter203",
+            "indexes:\n  ix_email: {columns: [email], unique: true, where: 'amount < 0 -- reason'}\n",
+            "2 rows that would collide under the new unique index ix_email",
+            "UPDATE dbo.t SET email = 'b' WHERE id = 2;",
+        ),
+    ] {
+        let db = OwnDatabase::new(&server, slug);
+        let connection = db.connection();
+        let d = Demo::new(slug);
+        let declaration = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  amount: {type: int}\n  email: {type: varchar(20)}\nprimary_key: {name: pk_t, columns: [id]}\n";
+        d.table(declaration);
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        on_server(
+            connection,
+            "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, amount int, email varchar(20)); \
+             INSERT dbo.t VALUES (1, -1, 'a'), (2, -2, 'a'), (3, NULL, 'a'), (4, 5, 'b');",
+        );
+        let baseline = d.run(&["baseline", "--db", connection, "--reason", "test"]);
+        assert_eq!(code(&baseline), 0, "{}", stderr(&baseline));
+        d.table(&format!("{declaration}{constraint}"));
+        let preview = d.run(&["plan"]);
+        assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+        let path = d.dir.join("apply.json");
+        let apply = || {
+            let made = d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]);
+            assert_eq!(code(&made), 0, "{}", stderr(&made));
+            d.run(&[
+                "apply",
+                "--db",
+                connection,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&path),
+                "--allow",
+                "constraint",
+            ])
+        };
+        let refused = apply();
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains(failure),
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("nothing has been changed"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(
+            !stderr(&refused).contains("could not check"),
+            "{}",
+            stderr(&refused)
+        );
+        on_server(connection, repair);
+        let accepted = apply();
+        assert_eq!(
+            code(&accepted),
+            0,
+            "{}{}",
+            stdout(&accepted),
+            stderr(&accepted)
+        );
+        assert!(
+            stdout(&accepted).contains("1 probe(s) passed"),
+            "{}",
+            stdout(&accepted)
+        );
+        assert!(
+            !stderr(&accepted).contains("could not check"),
+            "{}",
+            stderr(&accepted)
+        );
+        // NULL passes a CHECK; duplicates outside the index's filter remain
+        // legal. Both survive the successful apply, rather than widening it.
+        let verified = d.run(&["verify", "--db", connection]);
+        assert_eq!(
+            code(&verified),
+            0,
+            "{}{}",
+            stdout(&verified),
+            stderr(&verified)
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn commented_default_arrivals_are_counted_before_constraints_are_applied() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let db = OwnDatabase::new(&server, "defaultprobe203");
+    let connection = db.connection();
+    let d = Demo::new("default-probe203");
+    let declaration = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n";
+    let key = "primary_key: {name: pk_t, columns: [id]}\n";
+    d.table(&format!("{declaration}{key}"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    on_server(
+        connection,
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY); INSERT dbo.t VALUES (1), (2);",
+    );
+    let baseline = d.run(&["baseline", "--db", connection, "--reason", "test"]);
+    assert_eq!(code(&baseline), 0, "{}", stderr(&baseline));
+    d.table(&format!("{declaration}  value: {{type: int, nullable: false, default: '7 -- reason'}}\n{key}unique:\n  uq_value: [value]\n"));
+    let preview = d.run(&["plan"]);
+    assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+    let path = d.dir.join("apply.json");
+    let apply = || {
+        let made = d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&made), 0, "{}", stderr(&made));
+        d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "constraint",
+        ])
+    };
+    let refused = apply();
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused)
+            .contains("2 rows that would collide under the new unique constraint uq_value"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        !stderr(&refused).contains("could not check"),
+        "{}",
+        stderr(&refused)
+    );
+    // One backfilled value is legal: the same commented default must not make
+    // a successful query invent a duplicate or disable the probe.
+    on_server(connection, "DELETE dbo.t WHERE id = 2;");
+    let accepted = apply();
+    assert_eq!(
+        code(&accepted),
+        0,
+        "{}{}",
+        stdout(&accepted),
+        stderr(&accepted)
+    );
+    assert!(
+        stdout(&accepted).contains("1 probe(s) passed"),
+        "{}",
+        stdout(&accepted)
+    );
+    assert!(
+        !stderr(&accepted).contains("could not check"),
+        "{}",
+        stderr(&accepted)
+    );
+    let verified = d.run(&["verify", "--db", connection]);
+    assert_eq!(
+        code(&verified),
+        0,
+        "{}{}",
+        stdout(&verified),
+        stderr(&verified)
+    );
+}
+
 // ---- SPEC safety invariant repairs ----
 
 #[test]
