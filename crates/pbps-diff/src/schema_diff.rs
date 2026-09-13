@@ -768,14 +768,128 @@ pub fn diff_partial(
             | Change::Revoke { .. } => false,
         }
     };
+    // The column names a `RenameColumn` in this plan is waiting to claim, on
+    // the table it will claim them on. Both sides carry `declared_table_name`
+    // (`diff_columns`), so the two spellings meet.
+    //
+    // Folded by the dialect, because "are these one name" is its question and
+    // the two dialects answer differently: SQL Server folds nothing, while
+    // PostgreSQL lowercases, so a declaration renaming to `Note` is claiming
+    // the name a baseline `note` holds.
+    let claimed_by_a_column_rename: BTreeSet<(TableName, String)> = planned
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameColumn { table, to, .. } => {
+                Some((table.clone(), dialect.fold_ident(to).into_owned()))
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect();
+    // Whether this drop is what frees a name a `RenameColumn` above is
+    // waiting for. A column drop and nothing else: no other change gives up a
+    // column name.
+    let frees_a_renamed_column = |c: &Change| -> bool {
+        match c {
+            Change::DropColumn { column, .. } => claimed_by_a_column_rename.contains(&(
+                column.table.clone(),
+                dialect.fold_ident(&column.name).into_owned(),
+            )),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => false,
+        }
+    };
+    // The class, and a rank inside it, so a change can sit between two
+    // classes without a new ordinal shifting every one below it — the cost
+    // `order_key`'s own doc names.
+    let sort_class = |c: &Change| -> (u8, u8) {
+        if moves_ahead_of_the_rename(c) {
+            // Ahead of the table rename whose name it frees, and ahead of
+            // everything else that class holds.
+            (1, 0)
+        } else if frees_a_renamed_column(c) {
+            // Between the constraint and index drops of class 2 — a column a
+            // check or an index names cannot be dropped while they stand —
+            // and the `RenameColumn` of class 3 that is waiting for its name.
+            //
+            // Measured on the pinned images, this is the difference between a
+            // reviewed plan and one the engine refuses: SQL Server answers
+            // `sp_rename` with `Msg 15335, The new name 'note' is already in
+            // use as a COLUMN name and would cause a duplicate that is not
+            // permitted`, PostgreSQL with `column "note" of relation "s"
+            // already exists` (DECISIONS 472, issue #398).
+            //
+            // Only the drop that frees a claimed name moves. A rename into a
+            // name nothing here gives up is refused by `resolve` as an
+            // occupied target and never reaches this sort, which is the
+            // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
+            // holds.
+            (2, 2)
+        } else {
+            (order_key(c), 1)
+        }
+    };
     planned.sort_by_key(|p| {
+        let (class, within) = sort_class(&p.change);
         (
-            if moves_ahead_of_the_rename(&p.change) {
-                1
-            } else {
-                order_key(&p.change)
-            },
-            u8::from(!moves_ahead_of_the_rename(&p.change)),
+            class,
+            within,
             dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank),
             p.change.subject(),
             format!("{:?}", p.change),
@@ -3679,6 +3793,97 @@ mod tests {
         assert_eq!(
             dropped.get("note"),
             Some(&pbps_model::Cell::Value(Value::Text("dropped".into())))
+        );
+    }
+
+    /// The same two revisions, and the order the engine needs.
+    ///
+    /// `order_key` puts `RenameColumn` at 3 and `DropColumn` at 5, so the plan
+    /// reached the engine with the rename first — into a name the doomed
+    /// column still held. **Measured** on the pinned images: SQL Server 2025
+    /// answers `sp_rename` with `Msg 15335, The new name 'note' is already in
+    /// use as a COLUMN name and would cause a duplicate that is not
+    /// permitted`, and PostgreSQL 18.6 answers `ALTER TABLE s RENAME COLUMN
+    /// label TO note` with `column "note" of relation "s" already exists`.
+    /// Both take the two statements in the other order.
+    ///
+    /// The drop that frees the name moves, and only that one: a rename into a
+    /// name nothing in this plan gives up is still refused outright rather
+    /// than implicitly dropped, which is
+    /// `a_single_revision_cannot_rename_into_an_occupied_baseline_name`.
+    #[test]
+    fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "note".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
+        };
+        let drop_at =
+            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note"));
+        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to == "note"));
+        assert!(
+            drop_at < rename_at,
+            "the drop must free the name first: {:?}",
+            kinds(&cs)
         );
     }
 

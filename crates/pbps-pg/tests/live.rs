@@ -4922,6 +4922,130 @@ use pbps_pg::{doctor, state};
 /// boundary to exclude incidental DDL from other tests (issue #358). Creating
 /// these fixtures requires CREATEDB, already supplied by the script's postgres
 /// role; callers close them explicitly with `drop().await`.
+/// A deploy that skips a revision: `note` was dropped in one, and the next
+/// renamed `label` into the name it gave up. The differ has to hand the engine
+/// the drop first, and the engine is what says so (issue #398).
+///
+/// The SQL Server counterpart of this test lives beside it in `pbps-mssql`;
+/// this emitter takes the same plan shape, and this engine refuses the same
+/// reversed order with `42P07`. Both orders are run on one table — the
+/// reversed one inside a transaction that rolls back, so its refusal is
+/// evidence rather than debris.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
+    let pg = Postgres::new();
+    let table = |columns: &[(&str, &str)]| {
+        let mut t = Table::default();
+        for (name, spec) in columns {
+            let column = Column::new(ty(spec));
+            t.columns.insert(
+                (*name).to_owned(),
+                if *name == "code" {
+                    column.not_null()
+                } else {
+                    column
+                },
+            );
+        }
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_s".to_owned()),
+            columns: vec!["code".to_owned()],
+        });
+        t
+    };
+    let named = TableName::new("public", "s");
+    let schema_of = |t: Table| {
+        let mut s = Schema::default();
+        s.tables.insert(named.clone(), t);
+        s
+    };
+    // The three declarations of the history: the deployed one, the revision
+    // nobody deployed, and the one this plan is for.
+    let base = schema_of(table(&[
+        ("code", "varchar(20)"),
+        ("label", "text"),
+        ("note", "text"),
+    ]));
+    let intermediate = schema_of(table(&[("code", "varchar(20)"), ("label", "text")]));
+    let declared = schema_of(table(&[("code", "varchar(20)"), ("note", "text")]));
+
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let intermediate_ids = mint_ids(
+        &intermediate,
+        &base_ids,
+        &[Intent::DropColumn {
+            column: named.column("note"),
+            reason: "gone".into(),
+        }],
+    );
+    let declared_ids = mint_ids(
+        &declared,
+        &intermediate_ids,
+        &[Intent::RenameColumn {
+            table: named.clone(),
+            from: "label".into(),
+            to: "note".into(),
+        }],
+    );
+
+    let mut db = TestDb::create("reused_column_name398").await;
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &base, &base_ids),
+    )
+    .await;
+    let state = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the baseline");
+
+    let migration = plan(&state.schema, &base_ids, &declared, &declared_ids);
+    let at = |f: fn(&pbps_model::Change) -> bool| {
+        migration
+            .changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{migration:?}"))
+    };
+    let drop_at =
+        at(|c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note"));
+    let rename_at =
+        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to == "note"));
+    assert!(
+        drop_at < rename_at,
+        "the drop must free the name first: {migration:?}"
+    );
+
+    // The order the differ used to emit, refused by the engine and rolled
+    // back: `42P07`, measured here rather than quoted.
+    db.conn.execute("BEGIN").await.expect("begin");
+    let mut refused = None;
+    for p in migration.changes.iter().rev() {
+        for stmt in pg.emit(&p.change, p.strategy).expect("emit") {
+            if let Err(e) = db.conn.execute(&stmt.sql).await {
+                refused = Some(e.to_string());
+                break;
+            }
+        }
+        if refused.is_some() {
+            break;
+        }
+    }
+    db.conn.execute("ROLLBACK").await.expect("rollback");
+    let refused =
+        refused.expect("the engine must refuse the rename while the old column holds the name");
+    assert!(refused.contains("already exists"), "{refused}");
+
+    apply(&mut db.conn, &pg, &migration).await;
+    let after = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the result");
+    let ours = ours_only(&after, "public");
+    db.drop().await;
+    assert_eq!(ours, normalized(&declared));
+}
+
 struct TestDb {
     name: String,
     conn: Conn,

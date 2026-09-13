@@ -11853,3 +11853,59 @@ SPEC is in sync with all of these.
      makes verify report drift and baseline refuse to erase the distinction;
      restoring ordinary mode makes the original record verify clean again.
      ADR-0009's rebuild guard still checks carried enable state under its lock.
+474. **The column drop that frees a name sorts before the rename that claims
+     it.** A deploy can skip a revision: `note` dropped in one, `label` renamed
+     into the name it gave up in the next, and the plan is the difference
+     between the deployed baseline and the last of them. `resolve` accepts both
+     revisions and the differ accepts the diff — correctly, because the
+     occupant is going — and then `order_key` handed the engine the rename
+     first, at class 3, with the drop behind it at class 5. **Measured** on
+     both pinned images, with the doomed column still in place:
+
+     ```text
+     EXEC sp_rename N'[dbo].[s].[label]', N'note', 'COLUMN'
+       ->  Msg 15335: The new name 'note' is already in use as a COLUMN name
+           and would cause a duplicate that is not permitted
+     ALTER TABLE s RENAME COLUMN label TO note
+       ->  ERROR: column "note" of relation "s" already exists
+     ```
+
+     Both take the two statements in the other order. So this was a valid,
+     reviewed plan neither engine would perform, with no declaration the user
+     could write to fix it — the shape 174 records for a check constraint
+     blocking `sp_rename`, one namespace down.
+
+     **The drop moves, not the class.** `order_key`'s own doc says why a new
+     ordinal is expensive: the numbers are quoted in prose that justifies
+     behaviour, and inserting one means renumbering all of it in the same
+     commit. The sort key carries a rank *inside* the class instead, so the
+     freeing drop sits between class 2 and class 3 without moving anything
+     else: after the constraint and index drops, because a column a check or
+     an index names cannot be dropped while they stand, and before the rename
+     that is waiting for its name. The existing reorder of a freeing index
+     drop ahead of a table rename (176, 467) becomes the first rank of class 1
+     under the same scheme, unchanged in effect.
+
+     **Only the drop that frees a claimed name moves**, and the claim is the
+     dialect's own question: `Dialect::fold_ident` on both sides, because
+     PostgreSQL lowercases and SQL Server does not, so a declaration renaming
+     to `Note` is claiming the name a baseline `note` holds. A rename into a
+     name nothing in the plan gives up never reaches this sort at all —
+     `resolve` refuses it as an occupied target, which is what keeps the
+     reorder from reading as an implicit drop.
+
+     **The sweep this closes, and the one it does not.** Every other pair
+     where one change gives up a name another claims already ran in the right
+     order: a column drop before an add (5 before 8), an index or constraint
+     drop before its re-add (2 before 13), a role drop before a role rename (0
+     before 1), a module drop before a module create (0 before 14), a table
+     drop before a table create (6 before 7). One pair is wrong the same way
+     and is **not** fixed here: `DropTable` at 6 against `RenameTable` at 1,
+     where a table dropped in one revision gives its name to a table renamed
+     in the next. Measured, both engines refuse that too (`Msg 15335`,
+     `42P07`), but the drop cannot take the same trip: it has to run after the
+     `DropForeignKey` of every child still referencing it, and those are class
+     2, already behind the rename — so freeing the name means moving the
+     foreign-key drops as well, which is the reordering 467 records as unsafe
+     while a pinned one is present. Filed as issue #536 rather than widened into
+     this one.
