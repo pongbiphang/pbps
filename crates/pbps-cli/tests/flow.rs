@@ -3143,6 +3143,151 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
     );
 }
 
+/// The managed-table list must reach the SQL Server readiness query, including
+/// for a declaration with no data block. Schema grants cannot answer whether
+/// a narrower object/column grant or denial authorizes the actual probe.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn doctor_accepts_complete_managed_column_select_and_names_the_missing_scope() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let db = OwnDatabase::new(&server, "doctorcol194");
+    let login = format!("pbps_flow_col194_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!("CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"),
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA app;');
+             CREATE USER [{login}] FOR LOGIN [{login}];
+             GRANT VIEW DEFINITION, ALTER, REFERENCES ON SCHEMA::app TO [{login}];
+             GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}];
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+        ),
+    );
+    let base = db
+        .connection()
+        .split(';')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("").trim();
+            !["user id", "uid", "password", "pwd"]
+                .iter()
+                .any(|credential| key.eq_ignore_ascii_case(credential))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = with_key(&base, "User Id", &login);
+    let as_login = with_key(&as_login, "Password", password);
+    let project = Demo::new("doctorcol194");
+    project.table(
+        "table: app.t\ncolumns:\n  code: {type: int, nullable: false}\n  label: {type: int}\n",
+    );
+    let var = format!("PBPS_DOCTOR_COL194_{}", std::process::id());
+    std::fs::write(
+        project.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    project.commit();
+    let diagnose = || {
+        let output = Command::new(BIN)
+            .arg("--project")
+            .arg(&project.dir)
+            .args(["doctor", "--format", "json"])
+            .env(&var, &as_login)
+            .output()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        let gaps: Vec<String> = value["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no permission list: {value}"))
+            .iter()
+            .map(|gap| {
+                gap.as_str()
+                    .unwrap()
+                    .split(" — ")
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        (gaps, code(&output), value)
+    };
+    let absent = diagnose();
+    on_server(
+        db.connection(),
+        &format!("GRANT SELECT ON SCHEMA::app TO [{login}];"),
+    );
+    let future_grant = diagnose();
+    on_server(
+        db.connection(),
+        &format!(
+            "REVOKE SELECT ON SCHEMA::app FROM [{login}];
+             CREATE TABLE app.t (code int NOT NULL, label int NULL);
+             CREATE TABLE app.unmanaged (id int);
+             GRANT SELECT ON app.t(code) TO [{login}];
+             GRANT SELECT ON app.t(label) TO [{login}];"
+        ),
+    );
+    // Measure both premises under the actual deployment login. The unmanaged
+    // table shares the schema but must not become an extra SELECT demand.
+    on_server(
+        &as_login,
+        "IF HAS_PERMS_BY_NAME('[app]', 'SCHEMA', 'SELECT') <> 0
+             THROW 51940, 'the fixture unexpectedly grants schema SELECT', 1;
+         IF HAS_PERMS_BY_NAME('[app].[t]', 'OBJECT', 'SELECT') <> 0
+             THROW 51941, 'the fixture unexpectedly grants object SELECT', 1;
+         SELECT code, label FROM app.t;",
+    );
+    let complete_columns = diagnose();
+    on_server(
+        db.connection(),
+        &format!("REVOKE SELECT ON app.t(label) FROM [{login}];"),
+    );
+    let one_short = diagnose();
+    let missing_column_probe = try_on_server(&as_login, "SELECT code, label FROM app.t;");
+    on_server(
+        db.connection(),
+        &format!("GRANT SELECT ON OBJECT::app.t TO [{login}];"),
+    );
+    let object_grant = diagnose();
+    on_server(
+        db.connection(),
+        &format!(
+            "REVOKE SELECT ON app.t(code) FROM [{login}];
+             GRANT SELECT ON SCHEMA::app TO [{login}];
+             DENY SELECT ON OBJECT::app.t TO [{login}];"
+        ),
+    );
+    let object_deny = diagnose();
+    let denied_probe = try_on_server(&as_login, "SELECT code, label FROM app.t;");
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop(db);
+
+    assert!(
+        missing_column_probe.is_err(),
+        "an ungranted column cannot be read"
+    );
+    assert!(
+        denied_probe.is_err(),
+        "an object DENY defeats the schema grant"
+    );
+    for result in [&future_grant, &complete_columns, &object_grant] {
+        assert!(result.0.is_empty(), "{}", result.2);
+        assert_eq!(result.1, 0, "{}", result.2);
+    }
+    for (result, scope) in [
+        (&absent, "SCHEMA::[app]"),
+        (&one_short, "OBJECT::[app].[t]"),
+        (&object_deny, "OBJECT::[app].[t]"),
+    ] {
+        assert_eq!(result.0, [format!("SELECT on {scope}")], "{}", result.2);
+        assert_eq!(result.1, FINDING, "{}", result.2);
+    }
+}
+
 /// The wiring, end to end: `doctor` reads each table's `data:` block out of
 /// the declarations and asks for the DML that block can actually emit, at the
 /// securable the engine authorizes it on.

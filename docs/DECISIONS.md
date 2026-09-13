@@ -11416,3 +11416,32 @@ SPEC is in sync with all of these.
      hostile column names, absent targets and empty subsets. The CLI regression
      checks both members of the union and repeated references to one column;
      the packing test covers a union too wide for one statement.
+
+467. **SQL Server doctor asks managed probe reads on each table (issue #194).**
+     Measured on SQL Server 17.0.4075.5, complete column-level `SELECT` grants
+     answer zero at both schema and object scope while the probe's column
+     reads succeed. The schema question therefore overstates the required
+     grant. The opposite scope mismatch matters too: an object-level `DENY`
+     defeats a schema grant and the read fails despite a positive schema
+     answer. Readiness now uses the existing object-or-all-catalog-columns
+     permission question for the managed tables already carried by `Ask`.
+
+     The shared input and PostgreSQL behavior do not change. SQL Server uses
+     the supplied table names and resolves them against the environment's
+     recorded identities before querying; recorded tables awaiting removal
+     are also asked about under their existing names. A new declaration reusing
+     a departing table's name retains its own creation-schema fallback, so it
+     cannot inherit the old identity's object grant. Existing tables use their
+     object answer even when a schema grant would give a different answer.
+     Absent tables use the schema's answer, deduplicated per securable; absent
+     schemas remain separately diagnosed. No catalog table outside the managed
+     declarations or recorded state is added merely for sharing a schema.
+
+     `doctor` sees declarations, not a plan. This checks every catalog column
+     of a managed table, as the existing object-scope reader does, rather than
+     inventing a plan-specific subset. Foreign-key targets retain the declared-column union
+     from decision 466. The CLI live regression checks complete and
+     incomplete column grants, object grants and denials, the absent-table
+     schema fallback, and actual permitted/refused reads under the deployment
+     login. Unit cases preserve distinct rename/reuse demands and recorded
+     tables without turning an absent schema into an invented grant target.

@@ -1204,8 +1204,12 @@ organization say no to the tool.
 
 **Each is asked for at the securable where it is actually needed**, and the
 report names that securable. The four `CREATE` permissions cannot be granted
-below the database, so they are asked for there; `ALTER`, `VIEW DEFINITION` and
-the probes' `SELECT` are asked for on each **managed** schema, and `INSERT`,
+below the database, so they are asked for there; `ALTER` and `VIEW DEFINITION`
+are asked for on each **managed** schema. The probes' `SELECT` is asked for on
+each **managed table**, accepting an object grant or grants on every catalog
+column. Its schema is the fallback only while the table does not exist yet.
+Declared tables are resolved to their current names in each environment, and
+recorded tables remain managed until their removal is applied. `INSERT`,
 `DELETE` and the ledger's own `SELECT` on the ledger and lock **objects**
 themselves, falling back to their schema only while those tables do not exist
 yet — plus `ALTER` on that schema while the ledger has still to be created,
