@@ -11321,3 +11321,30 @@ SPEC is in sync with all of these.
      Reverting the recovery dispatch, no-checkpoint guidance and pre-existing
      object guard independently makes the respective live regression fail;
      restoring them passes both suites.
+
+464. **The PostgreSQL write path names `pg_temp` once, after every project
+     schema (issue #190).** Measured on PostgreSQL 18.6, an omitted temporary
+     schema is searched before even the implicit `pg_catalog` for relation and
+     type names. A session holding temporary `t` and domain `d` therefore binds
+     a declared default `'t'::regclass::oid::bigint + 1::d` to those objects even
+     when the explicit path names the project's schema containing its own
+     `t` and `d`. Naming `pg_temp` last makes both bindings use the project.
+     Deployment connections create no temporary objects themselves, but an
+     operator running a rendered script can already have them in that session.
+
+     The common statement scope appends the alias after the object's schema
+     and the configured extras. An exact `pg_temp` already among those entries
+     moves to the final position rather than being refused or left earlier:
+     appending a duplicate would leave the earlier occurrence ahead of later
+     project schemas. Ordinary identifiers retain their spelling and order.
+     `pg_catalog` remains implicit and first under decisions 276/277; the
+     `$user` refusal remains unchanged. Canonical read paths and the existing
+     unscoped concurrent-index boundary are unchanged. No model or saved-plan
+     fields are added, and the configured extras remain recorded as supplied.
+
+     The live regression inspects both stored default dependencies rather than
+     equal result values, tests the object's own schema and an extra schema,
+     and includes an early/repeated `pg_temp` configuration. The same emitted
+     statement with the final alias removed binds both temporary objects,
+     pinning the negative case. Unit cases keep ordinary names, quoting and
+     extra ordering intact.

@@ -7,8 +7,8 @@
 //!
 //! Every statement here is wrapped in a `search_path` of its own — the object's
 //! own schema first, then the project's configured extras
-//! ([`Postgres::with_write_path_extras`]) — because PostgreSQL binds an
-//! unqualified name in a *verbatim expression* when the object is created, and
+//! ([`Postgres::with_write_path_extras`]), then `pg_temp` — because PostgreSQL
+//! binds an unqualified name in a *verbatim expression* when the object is created, and
 //! this model holds three of those: a column's default, a check's expression
 //! and an index's filter (ADR-0013 §3, and the same section's correction that
 //! the rule is scoped to what the model can represent).
@@ -22,6 +22,9 @@
 //! would let a project type shadow a built-in one, and the emitter cannot
 //! defend against that — `character varying` and `timestamp with time zone`
 //! have no schema-qualified spelling to write instead.
+//! Naming `pg_temp` last has the opposite purpose: omitting it searches the
+//! session's temporary relations and types before the project. An explicitly
+//! configured `pg_temp` is moved to that final position too (DECISIONS 464).
 //!
 //! It is per statement and not per session for the reason ADR-0013 measured: a
 //! scope held over a statement is also a scope over everything that statement
@@ -1056,8 +1059,14 @@ fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectError> {
                  check, a filter or a default against whatever that role owns (ADR-0013 §3)."
             )));
         }
-        parts.push(quote(part)?);
+        // An omitted temporary schema is implicitly searched first. Keeping
+        // an earlier explicit entry would also beat later project extras;
+        // normalize the alias to one final entry (DECISIONS 464).
+        if part != "pg_temp" {
+            parts.push(quote(part)?);
+        }
     }
+    parts.push(quote("pg_temp")?);
     Ok(parts.join(", "))
 }
 
@@ -3274,7 +3283,7 @@ mod tests {
             // Under the write path like every other statement this emitter
             // produces: a routine's argument type can be a project's own.
             assert!(
-                sql[0].starts_with("SET search_path = \"app\";"),
+                sql[0].starts_with("SET search_path = \"app\", \"pg_temp\";"),
                 "{spelled}: {}",
                 sql[0]
             );
@@ -3816,7 +3825,7 @@ mod tests {
             assert_eq!(
                 sql,
                 vec![format!(
-                    "SET search_path = \"app\";\n{expected}\n;\nRESET search_path;"
+                    "SET search_path = \"app\", \"pg_temp\";\n{expected}\n;\nRESET search_path;"
                 )],
                 "{id}"
             );
@@ -4099,15 +4108,46 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "SET search_path = \"app\", \"shared\", \"public\";\n\
+                "SET search_path = \"app\", \"shared\", \"public\", \"pg_temp\";\n\
                  DROP TABLE \"app\".\"t\";\n\
                  RESET search_path;"
             ]
         );
     }
 
-    /// With nothing configured the path is the object's own schema alone, which
-    /// is the value every project has until there is a key to set.
+    #[test]
+    fn the_temporary_schema_is_named_once_after_all_project_schemas() {
+        for extras in [
+            vec!["shared".into(), "public".into()],
+            vec![
+                "pg_temp".into(),
+                "shared".into(),
+                "pg_temp".into(),
+                "public".into(),
+            ],
+        ] {
+            assert_eq!(
+                write_path(&Postgres::with_write_path_extras(extras), "app").unwrap(),
+                "\"app\", \"shared\", \"public\", \"pg_temp\""
+            );
+        }
+        // Only the exact alias is moved; ordinary quoted identifiers retain
+        // both their spelling and their configured order.
+        assert_eq!(
+            write_path(
+                &Postgres::with_write_path_extras(vec![
+                    "PG_TEMP".into(),
+                    "pg_temp_extra".into(),
+                    "odd\"schema".into(),
+                ]),
+                "own schema",
+            )
+            .unwrap(),
+            "\"own schema\", \"PG_TEMP\", \"pg_temp_extra\", \"odd\"\"schema\", \"pg_temp\""
+        );
+    }
+
+    /// With nothing configured the object's schema still precedes pg_temp.
     #[test]
     fn the_path_of_an_unconfigured_project_is_the_objects_own_schema() {
         let sql = sql_of(
@@ -4119,7 +4159,9 @@ mod tests {
         );
         assert_eq!(
             sql,
-            vec!["SET search_path = \"app\";\nDROP INDEX \"app\".\"ix\";\nRESET search_path;"]
+            vec![
+                "SET search_path = \"app\", \"pg_temp\";\nDROP INDEX \"app\".\"ix\";\nRESET search_path;"
+            ]
         );
     }
 
@@ -4272,7 +4314,7 @@ mod tests {
                 &retype("character varying(10)", "character varying(20)")
             ),
             vec![
-                "SET search_path = \"app\";\n\
+                "SET search_path = \"app\", \"pg_temp\";\n\
                  ALTER TABLE \"app\".\"t\" ALTER COLUMN \"at\" TYPE character varying(20);\n\
                  RESET search_path;"
             ]
@@ -4305,7 +4347,7 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "SET search_path = \"app\";\n\
+                "SET search_path = \"app\", \"pg_temp\";\n\
                  CREATE TABLE \"app\".\"t\" (\n\
                  \x20   \"id\" integer NOT NULL\n\
                  ) USING heap;\n\
@@ -4609,7 +4651,7 @@ mod tests {
         );
         let block = &sql[0];
         assert!(
-            block.contains("SET search_path = \"odd schema\";"),
+            block.contains("SET search_path = \"odd schema\", \"pg_temp\";"),
             "{block}"
         );
         // Code position: doubled quotes. Literal position: doubled apostrophe —
@@ -4630,7 +4672,7 @@ mod tests {
         // doubling and not two — and the tag is chosen so the body cannot end
         // it early.
         assert!(
-            block.starts_with("SET search_path = \"odd schema\";\nDO $pbps$\n"),
+            block.starts_with("SET search_path = \"odd schema\", \"pg_temp\";\nDO $pbps$\n"),
             "{block}"
         );
     }
@@ -4677,7 +4719,7 @@ mod tests {
         };
         let offline = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
-            offline.starts_with("SET search_path = \"app\";"),
+            offline.starts_with("SET search_path = \"app\", \"pg_temp\";"),
             "{offline}"
         );
         assert!(
