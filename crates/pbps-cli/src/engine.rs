@@ -275,24 +275,43 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(|frame| match frame.downcast_ref::<DbError>() {
-            Some(DbError::Driver { code, .. }) => match code {
-                Some(code) => {
-                    format!("the driver reported code {code}; its message is not recorded here")
-                }
-                None => "the driver reported a failure with no code; its message is not \
-                          recorded here"
-                    .to_owned(),
-            },
-            // Every other `DbError` variant — including `Refused`, this
-            // tool's own composed refusal, which can never carry a server
-            // value by construction — and every frame that is not a
-            // `DbError` at all, is this tool's own composed text: a
-            // malformed connection string, an `io::Error` naming a host that
-            // refused a socket, a catalog row the introspection SQL got
-            // wrong, or a `.context()` sentence this crate wrote. None of it
-            // echoes a server-supplied value back.
-            _ => frame.to_string(),
+        .map(|frame| {
+            // `RowsError::Read` boxes its `#[source]` (`Box<DbError>`, kept
+            // small beside every `Ok` it travels next to) — and a boxed
+            // `#[source]` is not merely a `DbError` behind one more layer of
+            // indirection: `thiserror` stores the trait object over `Box<T>`
+            // itself, so `downcast_ref::<DbError>()` on that frame **fails**
+            // (measured: a `Box<T>` field downcasts to `Box<T>`, never to
+            // `T`, because `Box<T>`'s own blanket `Error` impl is what is
+            // actually in the vtable). A first version of this fix missed
+            // that and fell through to the frame's own `Display` — which
+            // still renders the driver's message, since `Box`'s `Display`
+            // forwards to what it holds — silently un-redacting exactly the
+            // frame this match exists to catch. Trying both shapes is what a
+            // boxed `#[source]` costs a redaction that has to survive being
+            // downcast through it.
+            let as_driver = frame
+                .downcast_ref::<DbError>()
+                .or_else(|| frame.downcast_ref::<Box<DbError>>().map(AsRef::as_ref));
+            match as_driver {
+                Some(DbError::Driver { code, .. }) => match code {
+                    Some(code) => {
+                        format!("the driver reported code {code}; its message is not recorded here")
+                    }
+                    None => "the driver reported a failure with no code; its message is not \
+                              recorded here"
+                        .to_owned(),
+                },
+                // Every other `DbError` variant — including `Refused`, this
+                // tool's own composed refusal, which can never carry a server
+                // value by construction — and every frame that is not a
+                // `DbError` at all, is this tool's own composed text: a
+                // malformed connection string, an `io::Error` naming a host
+                // that refused a socket, a catalog row the introspection SQL
+                // got wrong, or a `.context()` sentence this crate wrote.
+                // None of it echoes a server-supplied value back.
+                _ => frame.to_string(),
+            }
         })
         .collect::<Vec<_>>()
         .join(": ")
@@ -1284,6 +1303,45 @@ mod tests {
                 "{driver:?}: redaction must still hold after reordering: {cut}"
             );
         }
+    }
+
+    /// A ready-phase round on the truncation fix found this shape: a wrapper
+    /// whose own `Display` interpolates `{source}` — `RowsError::Read`, for
+    /// an apply whose managed-row read hits a data-bearing server error —
+    /// reproduces the driver's full, unredacted text as part of *its own*
+    /// rendered frame, before `error.chain()` ever reaches the `DbError`
+    /// separately to redact it. Redacting that later frame changes nothing;
+    /// the leak already happened one frame up. Fixed by dropping `{source}`
+    /// from `RowsError::Read`'s format string (`crates/pbps-db/src/
+    /// catalog.rs`) rather than special-casing `RowsError` here: `#[source]`
+    /// alone still lets `.chain()` walk into the `DbError`, so this function
+    /// needs no new arm, the same way it needed none for `DbError::Refused`.
+    #[test]
+    fn a_wrapper_that_names_its_source_does_not_repeat_the_drivers_text() {
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-xyz\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(RowsError::Read {
+            table: TableName::new("app", "t"),
+            source: Box::new(db),
+        });
+        let rendered = ledger_safe_reason(&wrapped);
+        assert!(
+            !rendered.contains("super-secret-xyz"),
+            "a wrapper frame's own Display must not smuggle the driver's text \
+             past the redaction that runs on the frame beneath it: {rendered}"
+        );
+        assert!(
+            rendered.contains("22P02"),
+            "the code must still survive, from the DbError frame beneath the \
+             wrapper: {rendered}"
+        );
+        assert!(
+            rendered.contains("reading its rows back failed"),
+            "the wrapper's own text, which names no server value, must still \
+             survive: {rendered}"
+        );
     }
 
     #[test]

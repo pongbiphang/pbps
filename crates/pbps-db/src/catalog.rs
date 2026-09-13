@@ -162,7 +162,20 @@ pub enum RowsError {
     #[error("{table}: its rows cannot be read back — {why}")]
     Unreadable { table: TableName, why: String },
 
-    #[error("{table}: reading its rows back failed: {source}")]
+    /// `{source}` is deliberately not in this format string. `pbps-cli`'s
+    /// `engine::ledger_safe_reason` (DECISIONS 455) redacts a `DbError::Driver`
+    /// frame wherever `error.chain()` reaches it on its own — but a wrapper
+    /// whose own `Display` interpolates `{source}` renders that frame's full,
+    /// unredacted text as part of *this* frame's text, before `chain()` ever
+    /// gets to visit the source separately. Ready-phase review of PR #464
+    /// measured exactly that: an apply whose managed-row read hit a
+    /// data-bearing server error put `Read`'s own rendered string — server
+    /// message included — into the ledger and the `on_apply_attempt` hook,
+    /// with the later, correctly-redacted `Driver` frame changing nothing,
+    /// since the leak had already happened one frame up. `#[source]` alone
+    /// (below) is enough for `.chain()` and `.source()` to keep walking into
+    /// it; only the *text* has to stop repeating it.
+    #[error("{table}: reading its rows back failed")]
     Read {
         table: TableName,
         // Boxed so the error is not larger than every `Ok` it travels beside.

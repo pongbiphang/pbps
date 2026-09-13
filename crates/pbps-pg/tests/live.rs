@@ -20978,6 +20978,7 @@ async fn the_read_back_savepoint_is_read_only_and_gives_the_transaction_back_wri
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_read_back_outside_a_transaction_is_refused_not_answered() {
+    use std::error::Error as _;
     let mut conn = connect().await;
     let e = pbps_pg::catalog::introspect_within_transaction(&mut conn)
         .await
@@ -20990,7 +20991,15 @@ async fn a_read_back_outside_a_transaction_is_refused_not_answered() {
     )
     .await
     .expect_err("refused outside a transaction");
-    assert!(e.to_string().contains("no open transaction"), "{e}");
+    // `RowsError::Read`'s own text names no server value and does not repeat
+    // its source's (issue #167 P1 round 4): the refusal itself is on the
+    // wrapped `DbError`, reached through `source()`, not through `e`'s own
+    // `Display`.
+    let source = e.source().expect("a Read variant carries its DbError");
+    assert!(
+        source.to_string().contains("no open transaction"),
+        "{source}"
+    );
     // And the connection is usable afterwards.
     assert_eq!(number(&mut conn, "SELECT 1").await, 1);
     assert!(

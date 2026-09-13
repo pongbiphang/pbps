@@ -10928,3 +10928,39 @@ SPEC is in sync with all of these.
      pins the boundary directly: a context frame built to outgrow both
      engines' column widths, run through each engine's own `truncate_reason`,
      with the code still present in the result for both.
+
+     A fourth ready-phase round, on the pushed reordering fix, found a
+     wrapper whose own `Display` interpolates `{source}`: `RowsError::Read`
+     (`crates/pbps-db/src/catalog.rs`), for an apply whose managed-row read
+     hits a data-bearing server error, rendered the driver's full message as
+     part of *its own* text — before `error.chain()` ever reached the
+     `DbError` separately to redact it. Redacting that later frame changed
+     nothing; the leak already happened one frame up. Fixed by dropping
+     `{source}` from `Read`'s format string: `#[source]` alone is enough for
+     `.chain()` to keep walking into it, so nothing downstream needed to
+     change to keep seeing it.
+
+     Fixing that surfaced a second, independent defect this crate's own
+     review missed: `Read`'s `#[source]` is `Box<DbError>` (boxed so the
+     error is not larger than every `Ok` it travels beside), and **measured**,
+     a boxed `#[source]` field downcasts through `error.chain()` to
+     `Box<DbError>`, never to `DbError` — `thiserror` stores the trait object
+     over the `Box` itself, so `downcast_ref::<DbError>()` on that frame fails
+     even though `Box`'s own `Display` still forwards to what it holds.
+     `ledger_safe_reason`'s match on that frame therefore fell to its
+     catch-all, which called `frame.to_string()` and got the driver's raw
+     message back regardless of the format-string fix above — the two defects
+     compounded, and fixing only the one review found would still have leaked
+     the message through the other. `ledger_safe_reason` now tries
+     `downcast_ref::<DbError>()` and, failing that,
+     `downcast_ref::<Box<DbError>>().map(AsRef::as_ref)`, so a boxed source
+     redacts the same as a bare one.
+
+     `crates/pbps-cli/src/engine.rs`'s
+     `a_wrapper_that_names_its_source_does_not_repeat_the_drivers_text` pins
+     both: a `RowsError::Read` built directly around a `DbError::Driver`
+     carrying a value nobody declared, checked against `ledger_safe_reason`
+     for the value's absence, the code's presence, and the wrapper's own
+     (now source-free) text surviving. Reverted and watched fail for each
+     defect independently — the format string alone, then the downcast alone
+     — before both were restored together.
