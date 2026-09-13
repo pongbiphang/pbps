@@ -11736,3 +11736,31 @@ SPEC is in sync with all of these.
      not asked about at all before — and fixing it means changing what
      `read_expr` writes for them, which is the recorded text of every spatial
      cell. Filed rather than done here.
+
+471. **SQL Server row-write postconditions also hold the key's text spelling
+     (issue #218).** The native key comparison identifies a row under its
+     column's collation; it can accept a trigger changing `New` to `new`.
+     `wrote_the_row` keeps that comparison and adds a binary-collated text
+     comparison for both inserts and updates. Row selection and the delete
+     postcondition still ask about native identity (132), not spelling.
+
+     A saved row change carries types for non-key cells only. Rather than
+     add a model field or require catalog visibility, compare the key's
+     generic `nvarchar(max)` rendering with the rendering of
+     `CASE WHEN 1 = 0 THEN <key column> ELSE <declared literal> END`. SQL Server
+     infers the non-text column's type for that expression; a text literal
+     retains its spelling. Measured on SQL Server 17.0.4075.5, the pair agrees
+     for canonical decimal, money, float, date, datetime, hierarchyid and UUID
+     keys, and SQL equality still accepts fixed-width text padding. Comparing
+     a generic rendering directly to the raw declaration would reject money,
+     float and datetime keys that the canonical reader accepts.
+
+     Native equality remains necessary as well: generic text conversion can
+     round two distinct money or float values to the same text. The two
+     predicates jointly hold the stored value and its text spelling. The
+     live regressions accept the same emitted INSERT/UPDATE without a trigger,
+     then refuse and atomically undo a trigger that lowercases a quoted key.
+     Canonical non-text and padded text keys still accept both writes; a money
+     trigger changing only precision lost by generic rendering is refused.
+     Removing the spelling predicate makes the first two tests fail; removing
+     native equality makes the money negative case fail.

@@ -1149,7 +1149,17 @@ fn wrote_the_row(
     key_column: &str,
     cells: &[String],
 ) -> Result<String, DialectError> {
-    let mut predicate = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    let quoted = quote(key_column)?;
+    let expected = row_key(key);
+    // Keep the native comparison for the full value (money/float text may
+    // round). CASE lets SQL Server type the expected non-text key before
+    // rendering both sides alike; a text key keeps the declared spelling.
+    // The plan carries no key type, unlike its other cells (DECISIONS 471).
+    let mut predicate = vec![format!(
+        "{quoted} = {expected} AND CONVERT(nvarchar(max), {quoted}) = \
+         CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN {quoted} ELSE {expected} END) \
+         COLLATE Latin1_General_BIN2"
+    )];
     predicate.extend(cells.iter().cloned());
     Ok(format!(
         "IF NOT EXISTS (SELECT 1 FROM {} WHERE {})\n  THROW 50000, {}, 1;",
@@ -2464,7 +2474,9 @@ mod tests {
         assert!(
             sql[0].contains(
                 "IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] \
-                 WHERE [code] = N'new' AND [label] = N'New')"
+                 WHERE [code] = N'new' AND CONVERT(nvarchar(max), [code]) = \
+                 CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) \
+                 COLLATE Latin1_General_BIN2 AND [label] = N'New')"
             ),
             "{}",
             sql[0]
@@ -2643,7 +2655,9 @@ mod tests {
             sql,
             [atomically(&format!(
                 "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
-                 IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new')\n  \
+                 IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new' \
+                 AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), \
+                 CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) COLLATE Latin1_General_BIN2)\n  \
                  THROW 50000, N'dbo.order_status row `new` is not what this plan wrote once the \
                  statement had run — a trigger on the table, another writer inside it, or a \
                  value the engine stores differently from the way it is declared. Nothing was \
@@ -3342,6 +3356,8 @@ mod tests {
                 "INSERT INTO [dbo].[t] ([code], [label]) ",
                 r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');",
                 "\nIF NOT EXISTS (SELECT 1 FROM [dbo].[t] WHERE [code] = N'o''brien' ",
+                "AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), ",
+                "CASE WHEN 1 = 0 THEN [code] ELSE N'o''brien' END) COLLATE Latin1_General_BIN2 ",
                 r"AND [label] = N'''); DROP TABLE [dbo].[t]; --')",
                 "\n  THROW 50000, N'dbo.t row `o''brien` is not what this plan wrote once ",
                 "the statement had run — a trigger on the table, another writer inside it, ",
