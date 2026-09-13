@@ -11399,6 +11399,11 @@ fn envelope_matches_schema(validator: &jsonschema::Validator, label: &str, out: 
     if let Err(e) = validator.validate(&value) {
         panic!("{label}: the envelope does not match the published schema: {e}\n{text}");
     }
+    if matches!(label, "status" | "verify" | "explain" | "state list") {
+        pbps_ui::contract::parse(label, &out.stdout, code(out)).unwrap_or_else(|e| {
+            panic!("{label}: the independent UI consumer refused the CLI output: {e}\n{text}")
+        });
+    }
     // `oneOf` is satisfied by exactly one branch, and the branch is chosen by
     // `command`. Checking the field as well is what says the *right* branch
     // matched: a payload that happened to fit another command's shape would

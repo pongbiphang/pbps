@@ -12,6 +12,7 @@ members = [
     "crates/pbps-db",
     "crates/pbps-policy",
     "crates/pbps-cli",
+    "crates/pbps-ui",
 ]
 
 # Historical experiments stay available for reproducing the ADR evidence,
@@ -39,6 +40,11 @@ pbps-pg      = { path = "crates/pbps-pg" }
 pbps-docs    = { path = "crates/pbps-docs" }
 pbps-db      = { path = "crates/pbps-db" }
 pbps-policy  = { path = "crates/pbps-policy" }
+pbps-ui      = { path = "crates/pbps-ui" }
+
+# ADR-0015: synchronous HTTP with no TLS or additional async runtime.
+tiny_http = { version = "0.12", default-features = false }
+base64 = "0.22"
 
 serde      = { version = "1", features = ["derive"] }
 

@@ -32,6 +32,13 @@ pre { background: #8881; padding: 1em; overflow-x: auto; border-radius: 4px; }
 .dep { text-decoration: line-through; opacity: .7; }
 .muted { opacity: .65; }";
 
+/// Exact stylesheet text, including whitespace, for the viewer's CSP hash.
+pub fn style_contents() -> String {
+    // CSP hashes the text between the tags, including both newlines. Keep the
+    // same bytes available to the CLI without giving pbps-ui a renderer edge.
+    format!("\n{STYLE}\n")
+}
+
 /// Escapes the five characters that can change the structure of the document.
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

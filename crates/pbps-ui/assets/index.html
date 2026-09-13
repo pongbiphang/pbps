@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pbps · Schema workspace</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside>
+    <a class="brand" href="/" aria-label="pbps home">pbps<span>Schema workspace</span></a>
+    <div class="section-label">EXPLORE</div>
+    <nav aria-label="Read views">
+      <button type="button" data-view="status" aria-current="page">Environments</button>
+      <button type="button" data-view="drift">Drift</button>
+      <button type="button" data-view="plan">Saved plan</button>
+      <button type="button" data-view="timeline">Timeline</button>
+      <button type="button" data-view="docs">Schema &amp; ERD</button>
+    </nav>
+    <div class="local"><span class="dot"></span> Local workspace<p>Read views · Nothing stored in this viewer</p></div>
+  </aside>
+  <main>
+    <header><div><div class="eyebrow">PONGBIPHANG SCHEMA</div><h1 id="title">Environments</h1><p id="description">See the recorded state and readiness of your environments.</p></div><button type="button" id="refresh">Refresh</button></header>
+    <form id="selection" hidden>
+      <label id="input-label" for="selection-value">Environment name</label>
+      <div class="input-row"><input id="selection-value" type="text" autocomplete="off" spellcheck="false" required><button type="submit" id="read">Read environment</button></div>
+      <p id="input-help"></p>
+    </form>
+    <div id="activity" role="status" aria-live="polite"></div>
+    <section id="findings" aria-label="Findings"></section>
+    <section id="content" aria-label="Report"></section>
+    <footer>Declarations in git. Recorded state in your database.</footer>
+  </main>
+</body>
+</html>

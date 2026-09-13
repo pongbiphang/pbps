@@ -160,6 +160,13 @@ between them are the product. The full reasoning is in
 | Reading the schema from your ORM's models | The second source wins every disagreement silently, and identity, drop reasons and execution strategy have nowhere to live in a model class. Generate declarations once with `pull`, then own them |
 | Editing `plan.sql` by hand | It is an artifact, not a source file; the checksum exists so that what was reviewed is what runs |
 
+## Local viewer
+
+Run `pbps ui` and open the complete URL it prints to browse environments, drift,
+saved plans, the ledger timeline and schema documentation. It uses the CLI
+environment variables and serves on loopback. See [docs/UI.md](docs/UI.md) for
+usage and the read-only boundary.
+
 ## Development
 
 Linux is the primary development and release target; Windows coverage comes from
