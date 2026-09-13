@@ -290,9 +290,31 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
             // frame this match exists to catch. Trying both shapes is what a
             // boxed `#[source]` costs a redaction that has to survive being
             // downcast through it.
+            // `LedgerError::Db` and `ImpactError::Query` are
+            // `#[error(transparent)]`: not merely a `DbError` behind a
+            // named wrapper, but thiserror's specific instruction to forward
+            // `Display` to the wrapped value and — the part that matters
+            // here — forward `source()` to *its* `source()`, skipping the
+            // wrapped value itself. **Measured**: `error.chain()` on such a
+            // value is one frame long, and that one frame downcasts to the
+            // wrapper type (`LedgerError`), never to what it wraps
+            // (`DbError`) — the opposite failure from the boxed case above,
+            // for the opposite reason: there a real chain link downcast to
+            // the wrong type, here `.chain()` never produces a second link
+            // to downcast at all. Both still leave `frame.to_string()`
+            // rendering the driver's raw message, since `Display` forwards
+            // regardless of whether `source()` does.
             let as_driver = frame
                 .downcast_ref::<DbError>()
-                .or_else(|| frame.downcast_ref::<Box<DbError>>().map(AsRef::as_ref));
+                .or_else(|| frame.downcast_ref::<Box<DbError>>().map(AsRef::as_ref))
+                .or_else(|| match frame.downcast_ref::<LedgerError>() {
+                    Some(LedgerError::Db(inner)) => Some(inner),
+                    _ => None,
+                })
+                .or_else(|| match frame.downcast_ref::<ImpactError>() {
+                    Some(ImpactError::Query(inner)) => Some(inner),
+                    _ => None,
+                });
             match as_driver {
                 Some(DbError::Driver { code, .. }) => match code {
                     Some(code) => {
@@ -1342,6 +1364,46 @@ mod tests {
             "the wrapper's own text, which names no server value, must still \
              survive: {rendered}"
         );
+    }
+
+    /// A ready-phase round on the previous fix found a third shape:
+    /// `LedgerError::Db` and `ImpactError::Query` are `#[error(transparent)]`,
+    /// which is not a boxed `#[source]` either — thiserror forwards
+    /// `Display` to the wrapped `DbError` but forwards `source()` to *its*
+    /// `source()`, so `error.chain()` never produces a second link to
+    /// downcast at all: the one frame it does produce downcasts to
+    /// `LedgerError`, never to `DbError`, and its `Display` still renders
+    /// the driver's raw message regardless. `ledger_safe_reason` now also
+    /// tries `downcast_ref::<LedgerError>()` (and `ImpactError`) and unwraps
+    /// their transparent `DbError` directly, rather than relying on `.chain()`
+    /// to have produced it as its own link.
+    #[test]
+    fn a_transparent_wrapper_does_not_repeat_the_drivers_text() {
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-def\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(LedgerError::Db(db));
+        let rendered = ledger_safe_reason(&wrapped);
+        assert!(
+            !rendered.contains("super-secret-def"),
+            "a transparent wrapper's forwarded Display must not smuggle the \
+             driver's text past redaction: {rendered}"
+        );
+        assert!(
+            rendered.contains("22P02"),
+            "the code must still survive, from the DbError a transparent \
+             wrapper hides from .chain(): {rendered}"
+        );
+
+        let db2 = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-ghi\"".to_owned(),
+            code: Some("22P03".to_owned()),
+        };
+        let wrapped2 = anyhow::Error::new(ImpactError::Query(db2));
+        let rendered2 = ledger_safe_reason(&wrapped2);
+        assert!(!rendered2.contains("super-secret-ghi"), "{rendered2}");
+        assert!(rendered2.contains("22P03"), "{rendered2}");
     }
 
     #[test]

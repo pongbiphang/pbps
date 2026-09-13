@@ -10964,3 +10964,28 @@ SPEC is in sync with all of these.
      (now source-free) text surviving. Reverted and watched fail for each
      defect independently — the format string alone, then the downcast alone
      — before both were restored together.
+
+     A fifth ready-phase round found a third shape of the same family:
+     `LedgerError::Db` and `ImpactError::Query` (`crates/pbps-db/src/
+     ledger.rs`, `crates/pbps-db/src/impact.rs`) are `#[error(transparent)]`
+     — not a boxed `#[source]` either, but thiserror's instruction to forward
+     `Display` to the wrapped `DbError` *and* forward `source()` to the
+     wrapped value's own `source()`, skipping the wrapped value itself.
+     **Measured**: `error.chain()` on such a value is one frame long, and
+     that frame downcasts to the wrapper (`LedgerError`), never to what it
+     wraps — the opposite failure from the boxed case above (there a real
+     second link downcast to the wrong type; here `.chain()` never produces
+     a second link to downcast at all) — and `frame.to_string()` still
+     renders the driver's raw message regardless, since `Display` forwards
+     independently of whether `source()` does. Reachable through
+     `crate::engine::record`, `latest` and `lock`, which return
+     `Result<_, LedgerError>`. `ledger_safe_reason` now also tries
+     `downcast_ref::<LedgerError>()` and `downcast_ref::<ImpactError>()`,
+     unwrapping their transparent `DbError` directly rather than depending on
+     `.chain()` to have produced it as its own link.
+
+     `crates/pbps-cli/src/engine.rs`'s
+     `a_transparent_wrapper_does_not_repeat_the_drivers_text` pins both
+     wrappers directly, the same way the boxed-source test above pins
+     `RowsError::Read`. Reverted and watched fail for the expected reason
+     (the driver's raw message, unredacted) before being restored.
