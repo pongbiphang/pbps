@@ -1944,7 +1944,20 @@ fn refuse_unplanned_movement(
                 // what `columns_after` holds this plan to, and the plan is in
                 // `order_key` order, so the rename's `Present` is the net
                 // promise about the name (DECISIONS 280).
-                let given_up = from.is_some()
+                //
+                // Only while the earlier read still holds the source, which is
+                // what says it was taken before the rename ran. A staged run's
+                // closing read is compared against the checkpoint the last
+                // statement left: both sides already hold the survivor under
+                // the claimed name and neither holds the source, so there is
+                // nothing to fall back *to* — and falling through anyway
+                // returned `None`, which the rename's `Whole` then excused as
+                // a one-sided column. A concurrent retype between that
+                // checkpoint and the closing read would have been recorded as
+                // this plan's own result, which is exactly what SPEC 7.6
+                // promises to catch. Once both reads have the target, they are
+                // compared directly.
+                let given_up = from.is_some_and(|from| was.columns.contains_key(from))
                     && dropped_columns
                         .get(now_name)
                         .is_some_and(|d| d.contains(column.as_str()));
@@ -6666,6 +6679,24 @@ mod tests {
         )
         .expect_err("a column the plan never names is answerable for itself");
         assert!(format!("{e:#}").contains("`code`"), "{e:#}");
+
+        // A staged run's closing read: the checkpoint it is compared against
+        // is the one the last statement left, so both sides already hold the
+        // survivor under the claimed name and neither holds the source. The
+        // fallback must not fire there — with nothing to fall back to it
+        // returns `None`, the rename's `Whole` excuses the one-sided entry,
+        // and a concurrent retype between the last checkpoint and the closing
+        // read is recorded as this plan's own result (SPEC 7.6).
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]),
+            &table(&[("code", "varchar(20)"), ("note", "int")]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("once both reads hold the survivor, they are compared directly");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
     }
 
     /// A touched table is exempt down to the columns and constraints the plan

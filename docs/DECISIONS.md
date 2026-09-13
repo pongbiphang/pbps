@@ -11912,6 +11912,20 @@ SPEC is in sync with all of these.
      and in `order_key` order the rename's `Present` is the net promise about
      the name (280) — which is the ordering above, once more, doing the work.
 
+     **And the fall-through only while there is something to fall back to.**
+     Round two of the same review. A staged run's closing check compares two
+     checkpoints, and by then the earlier one already holds the survivor under
+     the claimed name and holds the source under no name at all. Falling
+     through regardless returned `None`, and the rename's own `Whole` then
+     excused that as a one-sided column — so a concurrent retype between the
+     last checkpoint and the closing read would have been recorded as this
+     plan's result, which is the case SPEC 7.6 exists to catch. The condition
+     is therefore "the earlier read still holds the source", which is what says
+     it was taken before the rename ran; once both reads have the target they
+     are compared directly, like any other column. A fix for a false refusal
+     that opens a false acceptance is the worse trade, and only the second
+     review round said so.
+
      **The sweep this closes, and the one it does not.** Every other pair
      where one change gives up a name another claims already ran in the right
      order: a column drop before an add (5 before 8), an index or constraint
