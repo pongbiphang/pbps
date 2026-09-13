@@ -270,9 +270,13 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // key-only DELETE removes whatever an application session left
             // under that key in between, and `@@ROWCOUNT = 1` calls the loss
             // a success. Each recorded cell is compared the way the read-back
-            // rendered it, exactly as an update's precondition does; a cell
-            // whose type has no comparison is carried and not held
-            // (DECISIONS 143).
+            // rendered it, exactly as an update's precondition does. The
+            // comparison is of text, so a cell that used to be carried unheld
+            // for want of a native `=` is held like any other; what is still
+            // carried unheld is narrower — a column this plan *retypes* whose
+            // old type has no way back from its own rendering: `image`, which
+            // has no conversion from text at all, and the two spatial types,
+            // whose text leaves out the SRID (DECISIONS 143 and 471).
             let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
             for (column, cell) in row {
                 predicates.extend(recorded_cell(
@@ -898,6 +902,11 @@ fn recorded_cell(
         Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
         Cell::Value(v) => {
             let recorded = literal(&recorded_text(v));
+            // A retyped column whose old type has no way back from its own
+            // rendering is carried and not held — `image`, `geometry` and
+            // `geography` (DECISIONS 471): there is no expression that puts
+            // the recorded text back through that type, so there is nothing
+            // to compare the converted column with.
             let Some(expected) = ty.as_stored(&recorded) else {
                 return Ok(None);
             };
@@ -961,15 +970,6 @@ impl<'a> Held<'a> {
         normalized(self.now.unwrap_or(self.read))
     }
 
-    /// Whether a retyped column can be held at all: `xml`, `text` and the
-    /// spatial types have no comparison to give, so asking either end for one
-    /// would be an error rather than a false answer — the same reason
-    /// [`defaulted_cell`] asks first. An unretyped column needs nothing of
-    /// its type but the rendering, and never comes here.
-    fn comparable(self) -> bool {
-        crate::rows::comparable(&self.read().base) && crate::rows::comparable(&self.now().base)
-    }
-
     /// `value`, an expression of the type the cell was recorded in, as the
     /// column holds it now.
     ///
@@ -999,16 +999,19 @@ impl<'a> Held<'a> {
     /// conversion erases. Measured — a cell moved from `1.50` to `1.99`
     /// before a `decimal(5,2)` becomes `int` reads back as `1` either way,
     /// and the column no longer holds what would tell them apart.
+    ///
+    /// `None` only where this plan retypes the column *and* the type that
+    /// rendered the text has no way back from it — `image`, `geometry` and
+    /// `geography` ([`crate::rows::from_text`], which measures why for each).
+    /// A column this plan leaves alone never converts anything, so it is
+    /// always held, whatever its type.
     fn as_stored(self, recorded: &str) -> Option<String> {
         if !self.retyped() {
             return Some(recorded.to_owned());
         }
-        if !self.comparable() {
-            return None;
-        }
         let now = self.now();
         Some(crate::rows::read_expr(
-            &self.converted(&crate::rows::from_text(recorded, &self.read())),
+            &self.converted(&crate::rows::from_text(recorded, &self.read())?),
             &now.base,
         ))
     }
@@ -1078,10 +1081,13 @@ fn atomically(body: &str) -> String {
 /// or nothing, where there is no answer the engine can give without running
 /// something.
 ///
-/// The type decides whether the comparison exists at all: `xml`, `text` and
-/// the spatial types have no `=`, and asking for one is an error rather than
-/// a false answer. A plan made before the types travelled carries none, and
-/// checks nothing here — the same as an older plan's `UpdateRow`.
+/// What decides that is the *default*, not the type: a default the engine
+/// would have to run is not asked about at all. The type used to decide too,
+/// because `xml`, `text` and the spatial types have no native `=` — but this
+/// comparison has never been a native one, and the guard outlived its reason
+/// while costing those six types their whole read-back. A plan made before
+/// the types travelled carries none, and checks nothing here — the same as an
+/// older plan's `UpdateRow`.
 ///
 /// Both sides are rendered as the read-back renders the column, and compared
 /// under a binary collation: the default is first converted to the column's
@@ -1097,23 +1103,20 @@ fn defaulted_cell(
     let Some(ty) = ty else {
         return Ok(None);
     };
-    if !ty.comparable() || !crate::rows::is_constant(default) {
+    if !crate::rows::is_constant(default) {
         return Ok(None);
     }
     let (read, now) = (ty.read(), ty.now());
     let default = verbatim(default);
+    // The default converted to the type the column had when the row was
+    // written, and then — where this plan retypes it — the way the `ALTER`
+    // converted the column itself.
+    let at_default = ty.converted(&format!("CONVERT({read}, {default})"));
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(
-        "({} = {} COLLATE Latin1_General_BIN2 OR ({quoted} IS NULL AND ({default}) IS NULL))",
-        crate::rows::read_expr(&quoted, &now.base),
-        // The default converted to the type the column had when the row was
-        // written, and then — where this plan retypes it — the way the
-        // `ALTER` converted the column itself.
-        crate::rows::read_expr(
-            &ty.converted(&format!("CONVERT({read}, {default})")),
-            &now.base
-        ),
+        "({} OR ({quoted} IS NULL AND ({default}) IS NULL))",
+        crate::rows::same_value(&quoted, &at_default, &now.base),
     )))
 }
 
@@ -2486,7 +2489,8 @@ mod tests {
                 // value before it runs, and a sequence would be consumed.
                 ("seq".to_owned(), "(NEXT VALUE FOR dbo.s)".to_owned()),
                 ("stamp".to_owned(), "(getdate())".to_owned()),
-                // No `=` exists for the type, so no comparison does either.
+                // A type with no native `=` is held like any other: the
+                // comparison is of the text the read-back renders.
                 ("doc".to_owned(), "('<a/>')".to_owned()),
                 // A plan made before the types travelled carries none.
                 ("old".to_owned(), "((1))".to_owned()),
@@ -2520,6 +2524,9 @@ mod tests {
             // renders the column, the default converted to its type first.
             "(CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
             "(CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), CONVERT(nvarchar(50), (NULL))) COLLATE Latin1_General_BIN2 OR ([note] IS NULL AND ((NULL)) IS NULL))",
+            // `xml` has no `=`, and it is held anyway, because the two sides
+            // are text by the time they meet.
+            "(CONVERT(nvarchar(max), [doc]) = CONVERT(nvarchar(max), CONVERT(xml, ('<a/>'))) COLLATE Latin1_General_BIN2 OR ([doc] IS NULL AND (('<a/>')) IS NULL))",
             " AND [rank] IS NULL",
             " AND [body] IS NULL",
         ] {
@@ -2530,7 +2537,6 @@ mod tests {
         for absent in [
             "[seq]",
             "[stamp]",
-            "[doc]",
             "[old]",
             "[label] = N'New'",
             "[label] IS NULL",
@@ -2659,8 +2665,9 @@ mod tests {
     /// it only up to the moment `apply` reads it. Each recorded cell goes
     /// into the predicate, compared by the rendering that read it — the
     /// column's type's — and a NULL as `IS NULL`; a literal default as the
-    /// read-back compared it; a default the engine would have to run, a
-    /// type without `=`, and a column the base does not have hold nothing.
+    /// read-back compared it; a default the engine would have to run, and a
+    /// column the base does not have, hold nothing. The type no longer
+    /// excludes anything: the comparison is of text (DECISIONS 471).
     #[test]
     fn an_update_holds_the_row_to_what_the_plan_recorded() {
         let cell = |from: Cell, to: Cell| (from, to);
@@ -2832,6 +2839,107 @@ mod tests {
             assert!(!update.contains(not_held), "{not_held}\n{update}");
             assert!(!wrote.contains(not_held), "{not_held}\n{wrote}");
         }
+    }
+
+    /// The types with no way back from their own rendering. Removing
+    /// `rows::comparable` made every cell held, and a *retyped* column of one
+    /// of these is where that is one step too far, each for its own measured
+    /// reason: `TRY_CONVERT(image, N'0x02')` is `Msg 529: Explicit conversion
+    /// from data type nvarchar to image is not allowed` — with or without
+    /// style 1 — so the statement raises instead of refusing; and a spatial
+    /// value's `ToString()` leaves out its SRID, so a `geometry` built at 4326
+    /// reads back at 0 and the predicate refuses a row nobody changed.
+    ///
+    /// Carried and not held, then, and *only* there: the same column with no
+    /// retype is held like any other, because nothing is converted.
+    #[test]
+    fn a_retyped_column_whose_text_has_no_way_back_is_carried_not_held() {
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        for (before, after, recorded) in [
+            ("image", "varbinary(max)", "0x02"),
+            ("geometry", "geography", "POINT (1 2)"),
+            ("geography", "geometry", "POINT (1 2)"),
+        ] {
+            let retyped = sql_of(&Change::UpdateRow {
+                table: tname("dbo.t"),
+                key_column: "code".to_owned(),
+                key: RowKey::from("a"),
+                columns: [("label".to_owned(), (text("Old"), text("New")))]
+                    .into_iter()
+                    .collect(),
+                unchanged: [("blob".to_owned(), text(recorded))].into_iter().collect(),
+                types: [("label", "nvarchar(50)"), ("blob", before)]
+                    .into_iter()
+                    .map(|(c, t)| (c.to_owned(), ty(t)))
+                    .collect(),
+                after_types: [("blob", after)]
+                    .into_iter()
+                    .map(|(c, t)| (c.to_owned(), ty(t)))
+                    .collect(),
+            });
+            assert!(
+                !retyped[0].contains(&format!("TRY_CONVERT({before}")),
+                "no statement may rebuild a {before} from its own rendering:\n{}",
+                retyped[0]
+            );
+            let precondition = retyped[0]
+                .lines()
+                .find(|l| l.starts_with("UPDATE "))
+                .and_then(|l| l.split_once(" WHERE "))
+                .expect("the key predicate")
+                .1;
+            assert!(!precondition.contains("[blob]"), "{before}: {precondition}");
+        }
+        let retyped = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [("label".to_owned(), (text("Old"), text("New")))]
+                .into_iter()
+                .collect(),
+            unchanged: [("blob".to_owned(), text("0x02"))].into_iter().collect(),
+            types: [("label", "nvarchar(50)"), ("blob", "image")]
+                .into_iter()
+                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .collect(),
+            after_types: [("blob", "varbinary(max)")]
+                .into_iter()
+                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .collect(),
+        });
+        // The postcondition still names it, and needs no inverse — it reads
+        // the column as the type the `ALTER` left and compares the recorded
+        // text, which is the same `0x02` either type renders.
+        assert!(
+            retyped[0].contains("CONVERT(nvarchar(max), [blob], 1) = N'0x02'"),
+            "{}",
+            retyped[0]
+        );
+
+        // Unretyped, the same cell is held: the recorded text *is* what the
+        // read-back rendered, and no conversion stands between them.
+        let held = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [("label".to_owned(), (text("Old"), text("New")))]
+                .into_iter()
+                .collect(),
+            unchanged: [("blob".to_owned(), text("0x02"))].into_iter().collect(),
+            types: [("label", "nvarchar(50)"), ("blob", "image")]
+                .into_iter()
+                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .collect(),
+            after_types: Default::default(),
+        });
+        assert!(
+            held[0].contains(
+                "CONVERT(nvarchar(max), CONVERT(varbinary(max), [blob]), 1) = N'0x02' \
+                 COLLATE Latin1_General_BIN2"
+            ),
+            "{}",
+            held[0]
+        );
     }
 
     /// A column this plan adds and populates in the same revision has no

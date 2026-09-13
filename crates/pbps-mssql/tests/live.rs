@@ -341,6 +341,261 @@ async fn signed_defaults_are_compared_as_the_column_stores_them() {
     db.drop().await;
 }
 
+/// The read-back asks the question the write path asks. `emit::defaulted_cell`
+/// holds a cell to its default as text under `COLLATE Latin1_General_BIN2` and
+/// through the column's type; `rows::query` asked the same question with a
+/// native `=` on the raw column, and a collation makes those two different
+/// questions.
+///
+/// **On this engine it needs no unusual collation at all**, which is what makes
+/// it worse here than on PostgreSQL, where the counterpart test has to
+/// `CREATE COLLATION`: the server's *default* collation is case-insensitive,
+/// and this suite's container runs on it. The first assertion measures that
+/// rather than assuming it, so the test says why it is a test on a server
+/// where the default ever changes.
+///
+/// What the old answer cost: the cell was marked at its default, so
+/// `ObservedRow::as_seen_by` left it out of the read-back, the drift was not in
+/// the observed state at all, and neither a connected plan nor `verify`
+/// proposed to put the value back. A hand edit that changes only the case of a
+/// defaulted cell was silently permanent.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_cell_the_columns_collation_calls_equal_to_its_default_is_still_drift() {
+    use pbps_model::{RowKey, RowScope, Value};
+    let mut db = TestDb::create("ci_default").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.status (code varchar(10) PRIMARY KEY, label varchar(20) DEFAULT \
+             ('new')); INSERT dbo.status(code,label) VALUES('a','New'),('b','new');",
+        )
+        .await
+        .unwrap();
+    // The column's own comparison, which is the one the read-back used to
+    // take. Measured here rather than assumed: it is true only because this
+    // server's collation is case-insensitive.
+    let native = db
+        .conn
+        .query(
+            "SELECT CASE WHEN label = ('new') THEN 1 ELSE 0 END AS same, \
+             CONVERT(nvarchar(200), SERVERPROPERTY('Collation')) AS collation \
+             FROM dbo.status WHERE code = 'a'",
+        )
+        .await
+        .unwrap();
+    let collation = native[0]
+        .try_get::<&str>("collation")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        native[0].try_get::<i32>("same").unwrap().unwrap(),
+        1,
+        "this server's collation ({collation}) must call the two spellings equal, \
+         or the test proves nothing"
+    );
+
+    let name = TableName::new("dbo", "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
+    let mut label = Column::new(ty("varchar(20)"));
+    // The engine's own rendering of the default, which is what `pull` writes.
+    label.default = Some("('new')".into());
+    table.columns.insert("label".into(), label);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+
+    for (key, at_default, stored) in [("a", false, "New"), ("b", true, "new")] {
+        let query = pbps_mssql::rows::query(
+            &name,
+            &table,
+            &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+        )
+        .unwrap()
+        .unwrap();
+        let rows = db.conn.query(&query.sql).await.unwrap();
+        let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+        assert_eq!(
+            observed.at_default.contains("label"),
+            at_default,
+            "row {key}"
+        );
+        assert!(!observed.unknown.contains("label"), "row {key}");
+        assert_eq!(
+            observed.cells.get("label"),
+            Some(&Value::Text(stored.to_owned())),
+            "row {key}"
+        );
+    }
+    db.drop().await;
+}
+
+/// A `sql_variant` cell is the one where comparing rendered text alone would
+/// hide a difference the engine keeps: the rendering writes the value and not
+/// its base type. **Measured**, a variant holding `nvarchar` `N'1'` beside a
+/// default of `int` `1` — the engine calls them different values and
+/// `CONVERT(nvarchar(max), …)` calls them the same string.
+///
+/// The regression this pins is a wrong recording: read as at its default, the
+/// cell leaves the read-back, and an application that replaced the number with
+/// the string is drift no plan proposes to settle.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_variant_that_renders_like_its_default_is_still_drift() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("variant_default").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t (id int PRIMARY KEY, v sql_variant DEFAULT (1)); \
+             INSERT dbo.t(id) VALUES(1); \
+             INSERT dbo.t(id,v) VALUES(2, CONVERT(nvarchar(10), N'1'));",
+        )
+        .await
+        .unwrap();
+    // Both rows render the same text, and the engine calls only one of them
+    // the default. Measured here rather than assumed.
+    let rendered = db
+        .conn
+        .query(
+            "SELECT CASE WHEN (SELECT CONVERT(nvarchar(max), v) FROM dbo.t WHERE id = 1) \
+             = (SELECT CONVERT(nvarchar(max), v) FROM dbo.t WHERE id = 2) THEN 1 ELSE 0 END \
+             AS same_text, \
+             CASE WHEN (SELECT v FROM dbo.t WHERE id = 1) = (SELECT v FROM dbo.t WHERE id = 2) \
+             THEN 1 ELSE 0 END AS same_value",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rendered[0].try_get::<i32>("same_text").unwrap().unwrap(), 1);
+    assert_eq!(
+        rendered[0].try_get::<i32>("same_value").unwrap().unwrap(),
+        0
+    );
+
+    let name = TableName::new("dbo", "t");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new(ty("int")).not_null());
+    let mut column = Column::new(ty("sql_variant"));
+    column.default = Some("(1)".into());
+    table.columns.insert("v".into(), column);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    for (key, at_default) in [("1", true), ("2", false)] {
+        let query = pbps_mssql::rows::query(
+            &name,
+            &table,
+            &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+        )
+        .unwrap()
+        .unwrap();
+        let rows = db.conn.query(&query.sql).await.unwrap();
+        let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+        assert_eq!(observed.at_default.contains("v"), at_default, "row {key}");
+        assert!(!observed.unknown.contains("v"), "row {key}");
+    }
+    db.drop().await;
+}
+
+/// The guard that asked "does this type have `=`?" outlived every native `=`
+/// it guarded, and took six types with it: a cell of one was never asked about
+/// its default, so it read back as one nobody can tell from its default and a
+/// hand edit was drift no plan proposed to settle.
+///
+/// Every one of them renders as text, which is all the comparison needs. The
+/// sweep that makes removing the guard safe is the other half: **measured**,
+/// each of the six is `Msg 1919 … invalid for use as a key column in an index`
+/// as a `PRIMARY KEY` and as a `UNIQUE`, so none can carry the native `=` this
+/// dialect still writes on a key, and nothing can reference one either.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_type_with_no_native_equality_is_read_back_against_its_default() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("no_equality_default").await;
+    for (i, (sql_ty, default, drifted)) in [
+        ("xml", "('<a/>')", "'<b/>'"),
+        ("text", "('new')", "'New'"),
+        ("ntext", "(N'new')", "N'New'"),
+        ("image", "(0x01)", "0x02"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // None of the six may be a key column, so the key is a separate one.
+        for (kind, statement) in [
+            (
+                "PRIMARY KEY",
+                format!("CREATE TABLE dbo.k{i} (c {sql_ty} PRIMARY KEY)"),
+            ),
+            (
+                "UNIQUE",
+                format!("CREATE TABLE dbo.u{i} (c {sql_ty} UNIQUE)"),
+            ),
+        ] {
+            let refused = db.conn.execute(&statement).await.expect_err(
+                "a type with no comparison cannot be a key, which is what makes \
+                 removing the guard safe",
+            );
+            assert!(
+                refused.to_string().contains("1919")
+                    || refused
+                        .to_string()
+                        .contains("invalid for use as a key column"),
+                "{sql_ty} as {kind}: {refused}"
+            );
+        }
+
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.t{i} (id int PRIMARY KEY, n {sql_ty} DEFAULT {default}); \
+                 INSERT dbo.t{i}(id) VALUES(1); \
+                 INSERT dbo.t{i}(id,n) VALUES(2,{drifted});"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{sql_ty}: {e}"));
+        let name = TableName::new("dbo", format!("t{i}"));
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        let mut column = Column::new(ty(sql_ty));
+        column.default = Some(default.to_owned());
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for (key, at_default) in [("1", true), ("2", false)] {
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db
+                .conn
+                .query(&query.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql_ty} row {key}: {e}"));
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert_eq!(
+                observed.at_default.contains("n"),
+                at_default,
+                "{sql_ty} row {key}"
+            );
+            assert!(!observed.unknown.contains("n"), "{sql_ty} row {key}");
+        }
+    }
+    db.drop().await;
+}
+
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn an_unassignable_signed_default_is_unknown_not_null() {

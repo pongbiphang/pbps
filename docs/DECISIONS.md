@@ -1070,6 +1070,11 @@ SPEC is in sync with all of these.
     window for structure too, and is the shape to reach for if the row
     predicate ever proves too narrow; it reorganises every apply path, and
     the predicate is what the reviewed plan actually asserts.
+
+    **Amended by 471: the type is no longer one of the things that hold
+    nothing.** The comparison became one of text on both sides, so the types
+    without an `=` are held like every other; a default the engine would have
+    to run, and a column the base does not have, are still the whole list.
 123. **The names a plan's remaining statements need free are compared with
     one another, not only with the catalog.** 119 asked the engine which
     existing principal holds each wanted name; two declared roles the
@@ -1228,6 +1233,10 @@ SPEC is in sync with all of these.
     spatial types have no `=`, and asking for one is an error rather than a
     false answer. An older plan carries no types and checks nothing here,
     exactly as an older `UpdateRow` holds the row to its key alone.
+
+    **Amended by 471: the type no longer says anything.** The comparison is of
+    text on both sides and has been for some time, so the six types without an
+    `=` are held like every other. Only the *default* decides now.
 134. **A permission on a schema is probed before the plan runs.** `validate`
     accepts a schema target it cannot see inside — an external schema has no
     declared objects — and this tool never creates a schema, so a grant on
@@ -1409,6 +1418,15 @@ SPEC is in sync with all of these.
     A mismatch is `@@ROWCOUNT <> 1`, which already says "changed or deleted
     since the plan was made. Plan again."
 
+    **Amended by 471: the type is no longer what leaves a cell unheld.** That
+    limit was the native `=`, and the comparison became one of text, so a cell
+    of a type without an operator is held by the rendering that read it like
+    every other. One case remains, and it is narrower: a column *this plan
+    retypes* whose old type cannot be spelled back from its own rendering —
+    `image`, which has no conversion from text at all, and `geometry` and
+    `geography`, whose text leaves out the SRID. All three measured. Unretyped,
+    a cell of any of them is held.
+
 144. **A disabled foreign key is not counted when a row is deleted.**
     `NOCHECK CONSTRAINT` leaves the constraint in `sys.foreign_keys` and stops
     the engine enforcing it, so the delete probe and the delete's own
@@ -1556,6 +1574,13 @@ SPEC is in sync with all of these.
     invisible — the column no longer holds what would tell them apart. The
     baseline checksum still covers it up to the moment `apply` reads the
     state.
+
+    **Amended by 471: "a type with no comparison at either end" is no longer a
+    case.** That sentence kept 146's answer for `xml`, `text` and the spatial
+    types; the comparison is of text now, so all of them are held. What is left
+    of 146's answer is narrower, and is about the retype alone: a column this
+    plan retypes whose old type cannot be spelled back from its own rendering
+    — `image`, `geometry`, `geography` — is carried and held by nothing.
 
 150. **What `apply` records has to be the baseline plus the plan, and the
     part of that the tool can check exactly is everything the plan does not
@@ -11604,3 +11629,110 @@ SPEC is in sync with all of these.
      pbps guard before the engine constraint or cascade, and effects are
      read before rollback. Restoring the old guard makes both tests fail by
      refusing the self-only delete.
+471. **This dialect's read of a defaulted cell asks the same question the write
+     does, and the guard that asked about the type had nothing left to guard.**
+     The port of 330 and 331 to `pbps-mssql`, and worse here than there because
+     it needs no unusual collation at all.
+
+     **The read-back's `at_default` was the column's comparison, not pbps's.**
+     `emit::defaulted_cell` holds a cell to its default as text under
+     `COLLATE Latin1_General_BIN2` and through the column's type; `rows::query`
+     asked the same question with a native `=` on the raw column. **Measured on
+     `SQL_Latin1_General_CP1_CI_AS`** — the server's default collation, and the
+     one this suite's container runs on — with `label varchar(20) DEFAULT 'new'`
+     holding `New`:
+
+     ```text
+     label = ('new')                                  ->  at_default
+     the same, as text under Latin1_General_BIN2      ->  drift
+     ```
+
+     The first answer marks the cell at its default, so `ObservedRow::as_seen_by`
+     leaves it out of the read-back, the drift is not in the observed state at
+     all, and neither a connected plan nor `verify` proposes to put the value
+     back. On PostgreSQL the same defect needs a `CREATE COLLATION`; here the
+     default server collation is case-insensitive, so every installation that
+     never chose one is exposed.
+
+     **And `rows::comparable` went with it.** It answered "does this type have
+     `=`?" for `xml`, `geometry`, `geography`, `text`, `ntext` and `image`, and
+     was asked in three places because the comparisons there were native. Every
+     one of them is a comparison of text now — `read_expr` on both sides, under
+     the binary collation — so the guard cost those six types their read-back
+     and bought nothing: a cell of one was never asked about, was read as
+     indistinguishable from its default, and a hand edit to it was drift no plan
+     would settle.
+
+     **Measured**, both halves of why removing it is safe:
+
+     ```text
+     CONVERT(nvarchar(max), doc) = CONVERT(nvarchar(max), TRY_CONVERT(xml, '<a/>'))
+                                                    ->  at_default for the default,
+                                                        drift for an edit
+     CREATE TABLE k (c xml PRIMARY KEY)             ->  Msg 1919 … invalid for use
+                                                        as a key column in an index
+     CREATE TABLE u (c xml UNIQUE)                  ->  Msg 1919, the same
+     ```
+
+     The last two lines are what make the sweep complete rather than hopeful,
+     and they were run for all six types, not for `xml` alone. The native `=`
+     this dialect still writes is on key columns — `WHERE [key] = N'…'` — and
+     none of the six can be one: refused as a `PRIMARY KEY` and as a `UNIQUE`,
+     so no foreign key can reference one either. There is no type left for the
+     guard to protect.
+
+     What a plan holds therefore widens: an `INSERT` that leaves an `xml`
+     column to a literal default now carries a predicate holding it to that
+     default, where before it carried none.
+
+     **One case the widening must not reach, found in review: a retyped
+     `image` column.** Holding a cell across a retype means putting the
+     recorded text back through the type that rendered it, and `image` has no
+     way back. **Measured**, and not a conversion that merely fails:
+
+     ```text
+     TRY_CONVERT(image, N'0x02')      ->  Msg 529: Explicit conversion from data
+     TRY_CONVERT(image, N'0x02', 1)       type nvarchar to image is not allowed
+     ```
+
+     So the expression does not run at all rather than answering NULL, and a
+     statement built from it raises where it should refuse — which is the one
+     thing `TRY_CONVERT` is in that predicate to avoid. `rows::from_text`
+     returns an `Option` now. `Held::as_stored` keeps its `Option` for that one
+     reason — a retype it cannot invert — rather than the old one, a type
+     without an operator, and an `image` column this plan leaves alone is held
+     like any other, because nothing is converted.
+
+     **Two more renderings are not inverses, and the review found both.**
+     `geometry` and `geography` convert back and come back *different*:
+     `ToString()` is the well-known text and the SRID is not in it. Measured, a
+     `geometry` built at SRID 4326 renders `POINT (1 2)` and reads back at SRID
+     0; `geography` round-trips only because 4326 is its own default. Both join
+     `image` in returning `None`. `text`, `ntext`, `xml`, `hierarchyid`
+     (`/1/2/` returns `/1/2/`), `timestamp` and `sql_variant` were each measured
+     converting back and stay invertible.
+
+     **And one rendering is lossy where it is compared, not only where it is
+     rebuilt.** A `sql_variant` writes its value and not its base type, so
+     measured, a variant holding `nvarchar` `N'1'` and one holding `int` `1`
+     render the same string while the engine calls them different values:
+
+     ```text
+     @stored = @default                            ->  different
+     the same, as text under Latin1_General_BIN2   ->  equal
+     ```
+
+     Moving that column from the native `=` to a comparison of text alone would
+     have hidden exactly the drift this entry is about, on the one type where
+     the old comparison was the better one. So the default question carries the
+     engine's `=` beside the text for `sql_variant` — and for no other type,
+     because adding it everywhere would refuse matches no measurement says are
+     wrong. It is one function, `rows::same_value`, asked by the read path and
+     the write path alike, so the two cannot drift apart again.
+
+     What this does **not** reach: a spatial value whose SRID alone differs from
+     its default still compares equal, because the comparison is of a rendering
+     that never carried the SRID. That is not a regression — those types were
+     not asked about at all before — and fixing it means changing what
+     `read_expr` writes for them, which is the recorded text of every spatial
+     cell. Filed rather than done here.

@@ -111,8 +111,10 @@ pub struct Slot {
     /// means (see the module docs).
     pub has_default: bool,
     /// The column has a default that is *not* asked about — an expression the
-    /// engine would have to run, or a type without `=` — so the cell is taken
-    /// as at its default (module docs).
+    /// engine would have to run — so the cell is taken as at its default
+    /// (module docs). The type is no longer part of that question: the
+    /// comparison is of text, which every type this dialect holds renders as
+    /// (DECISIONS 471).
     pub assume_default: bool,
 }
 
@@ -207,12 +209,22 @@ pub fn query(
                 // A trailing line comment must end before our CASE syntax
                 // at every interpolation, just as in the emitter (DECISIONS 281).
                 let default = crate::emit::verbatim(default);
+                // Both sides as text under a binary collation, which is the
+                // question `emit::defaulted_cell` asks — not the column's own
+                // `=`. On a case-insensitive collation, and this engine's
+                // default one is, those are two different questions: a cell
+                // the column calls equal to its default is left out of the
+                // read-back entirely, so the drift is not in the observed
+                // state and no plan proposes to settle it.
+                let at_default =
+                    same_value(&quoted, &format!("TRY_CONVERT({ty}, {default})"), &ty.base);
                 select.push(format!(
                     // A failed assignment is unknown, not a NULL default.
                     // Keep that third answer local to this query/decode wire
                     // format; TRY_CONVERT preserves the engine's rounding.
                     "CASE WHEN ({default}) IS NOT NULL AND TRY_CONVERT({ty}, {default}) IS NULL THEN -1 \
-                     WHEN {quoted} = TRY_CONVERT({ty}, {default}) OR ({quoted} IS NULL AND ({default}) IS NULL) \
+                     WHEN {at_default} \
+                       OR ({quoted} IS NULL AND ({default}) IS NULL) \
                      THEN 1 ELSE 0 END"
                 ));
                 Some(select.len() - 1)
@@ -569,26 +581,82 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
 /// means the cell is not what the plan recorded, and the caller's own
 /// "the row is not as the plan recorded it" is a better answer than the
 /// engine's conversion error (Msg 245).
-pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> String {
-    match ty.base.as_str() {
+///
+/// `None` where [`read_expr`]'s rendering is not something the value can be
+/// rebuilt from, which is three types and each for its own measured reason.
+///
+/// `image` has no conversion at all — and not one that merely fails:
+/// `TRY_CONVERT(image, N'0x02')` is `Msg 529: Explicit conversion from data
+/// type nvarchar to image is not allowed`, with or without style 1, so the
+/// expression does not run rather than answering NULL. A statement built from
+/// it raises instead of refusing, which is the one thing `TRY_CONVERT` is here
+/// to avoid.
+///
+/// `geometry` and `geography` convert back, and come back a different value:
+/// `ToString()` is the well-known text and the **SRID is not in it**. Measured,
+/// a `geometry` built at SRID 4326 renders `POINT (1 2)` and reads back at SRID
+/// 0 — the spatial reference the value was in, gone. `geography` round-trips
+/// only because 4326 is its default; another geographic SRID is lost the same
+/// way. A predicate built from that text refuses a row nobody changed.
+///
+/// Everything else was measured converting back: `text`, `ntext`, `xml`,
+/// `hierarchyid` (`/1/2/` returns `/1/2/`), `timestamp` and `sql_variant`.
+///
+/// An `Option` rather than a check beside the call, so the type that cannot be
+/// spelled back has no expression to spell it with.
+pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> Option<String> {
+    Some(match ty.base.as_str() {
         "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => {
             format!("TRY_CONVERT({ty}, {literal}, 126)")
         }
         "binary" | "varbinary" | "timestamp" => format!("TRY_CONVERT({ty}, {literal}, 1)"),
+        "image" | "geometry" | "geography" => return None,
         _ => format!("TRY_CONVERT({ty}, {literal})"),
+    })
+}
+
+/// Whether a cell of this column stands at the value `other` gives, as one
+/// predicate — the question `rows::query` asks of a stored cell and
+/// `emit::defaulted_cell` holds a written one to, in one place so that the two
+/// cannot drift apart again (PITFALLS, "The write path was fixed and the read
+/// path asks the same question").
+///
+/// Both sides through [`read_expr`], compared under a binary collation, so a
+/// column whose own collation calls two spellings equal cannot hide an edit.
+///
+/// **And the engine's own `=` as well, for `sql_variant`.** That rendering is
+/// lossy in a way the others are not: it writes the value and not its base
+/// type, so **measured**, a variant holding `nvarchar` `N'1'` and one holding
+/// `int` `1` render the same text while the engine calls them different
+/// values. The conjunct is only added where the type has an `=` *and* the
+/// rendering loses something it keeps; adding it everywhere would refuse
+/// matches no measurement says are wrong.
+pub(crate) fn same_value(stored: &str, other: &str, base: &str) -> String {
+    let text = format!(
+        "{} = {} COLLATE Latin1_General_BIN2",
+        read_expr(stored, base),
+        read_expr(other, base)
+    );
+    match base {
+        "sql_variant" => format!("({text} AND {stored} = {other})"),
+        _ => text,
     }
 }
 
 /// Whether the engine is asked to confirm a cell of this column at its
-/// default: the default is a literal it can compare without running anything,
-/// and the type has `=`. One function because two callers ask it — the row
-/// reader, to decide what to put in the query, and the apply guard, to know
-/// whether an omitted cell in the read-back *means* at-default (DECISIONS
-/// 191) — and two spellings of it would drift.
+/// default: the default is a literal it can compare without running anything.
+/// One function because two callers ask it — the row reader, to decide what to
+/// put in the query, and the apply guard, to know whether an omitted cell in
+/// the read-back *means* at-default (DECISIONS 191) — and two spellings of it
+/// would drift.
+///
+/// The type used to be asked about as well, because the comparison was the
+/// column's native `=` and six types do not have one. It is a comparison of
+/// text now, which every type this dialect holds can be rendered as, so there
+/// is no type left to exclude — and excluding one cost the read-back the whole
+/// column (DECISIONS 331's shape, on this dialect).
 pub fn confirms_default(spec: &pbps_model::Column) -> bool {
-    spec.default
-        .as_deref()
-        .is_some_and(|d| comparable(&spec.ty.base) && is_constant(d))
+    spec.default.as_deref().is_some_and(is_constant)
 }
 
 /// Whether a default expression is a literal — a number, a string, `NULL`, a
@@ -954,15 +1022,6 @@ fn constant_operand(default: &str, depth: usize) -> bool {
     mantissa_ok && exponent.is_none_or(|e| digits(e.strip_prefix(['-', '+']).unwrap_or(e)))
 }
 
-/// Whether `=` is defined on the type. Where it is not, the default is not
-/// asked about and the cell is taken as at its default (module docs).
-pub(crate) fn comparable(base: &str) -> bool {
-    !matches!(
-        base,
-        "xml" | "geometry" | "geography" | "text" | "ntext" | "image"
-    )
-}
-
 /// One cell's text as a model value.
 pub fn value_of(kind: ValueKind, text: &str) -> Option<Value> {
     Some(match kind {
@@ -1153,7 +1212,7 @@ mod tests {
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         assert!(
             q.sql.contains(
-                "WHEN [label] = TRY_CONVERT(nvarchar(50), 'Unlabelled'\n) OR ([label] IS NULL AND ('Unlabelled'\n) IS NULL)"
+                "WHEN CONVERT(nvarchar(max), [label]) = CONVERT(nvarchar(max), TRY_CONVERT(nvarchar(50), 'Unlabelled'\n)) COLLATE Latin1_General_BIN2 OR ([label] IS NULL AND ('Unlabelled'\n) IS NULL)"
             ),
             "{}",
             q.sql
@@ -1168,6 +1227,9 @@ mod tests {
             ("nvarchar(max)", "nvarchar(max)"),
             ("numeric(8,2)", "decimal(8, 2)"),
             ("integer", "int"),
+            // A type with no native `=` is asked about like any other: the
+            // comparison is of the text the read-back renders.
+            ("text", "text"),
         ] {
             let t = table(
                 Some(vec!["id"]),
@@ -1187,7 +1249,7 @@ mod tests {
             .unwrap();
             assert!(
                 q.sql.contains(&format!(
-                    "[n]]ame] = TRY_CONVERT({expected}, -CAST('1' AS int)\n)"
+                    "CONVERT(nvarchar(max), [n]]ame]) = CONVERT(nvarchar(max), TRY_CONVERT({expected}, -CAST('1' AS int)\n)) COLLATE Latin1_General_BIN2"
                 )),
                 "{}",
                 q.sql
@@ -1196,11 +1258,10 @@ mod tests {
                 "(-CAST('1' AS int)\n) IS NOT NULL AND TRY_CONVERT({expected}, -CAST('1' AS int)\n) IS NULL THEN -1"
             )), "{}", q.sql);
         }
-        for (ty, default) in [
-            ("text", "-CAST('1' AS int)"),
-            ("varchar(10)", "NEWID()"),
-            ("int", "-CAST('abc' AS int)"),
-        ] {
+        // What is still never asked: a default the engine would have to run,
+        // and one whose evaluation can throw. The type is not on this list any
+        // more.
+        for (ty, default) in [("varchar(10)", "NEWID()"), ("int", "-CAST('abc' AS int)")] {
             let t = table(
                 Some(vec!["id"]),
                 &[("id", "int", None), ("n", ty, Some(default))],
@@ -1415,14 +1476,23 @@ mod tests {
         assert!(e.to_string().contains("2 columns"), "{e}");
     }
 
+    /// A `sql_variant`'s rendering writes its value and not its base type, so
+    /// two variants the engine calls different values render the same text.
+    /// **Measured**: a variant holding `nvarchar` `N'1'` and one holding `int`
+    /// `1` are `different` to the engine and the same string to
+    /// `CONVERT(nvarchar(max), …)`.
+    ///
+    /// So this one type carries the engine's own `=` beside the text
+    /// comparison — and only this one, because adding it everywhere would
+    /// refuse matches no measurement says are wrong.
     #[test]
-    fn types_without_equality_get_no_default_flag() {
+    fn a_variants_base_type_is_compared_and_no_other_types_is() {
         let t = table(
             Some(vec!["id"]),
             &[
                 ("id", "int", None),
-                ("doc", "xml", Some("''")),
-                ("blob", "image", Some("0x")),
+                ("v", "sql_variant", Some("(1)")),
+                ("n", "varchar(10)", Some("('new')")),
             ],
         );
         let q = query(
@@ -1434,10 +1504,65 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(q.columns.iter().all(|s| s.default_at.is_none()), "{q:?}");
+        assert!(
+            q.sql.contains("AND [v] = TRY_CONVERT(sql_variant, (1)"),
+            "{}",
+            q.sql
+        );
+        // The ordinary column keeps the text comparison alone.
+        assert!(
+            q.sql.contains(
+                "CONVERT(nvarchar(max), [n]) = CONVERT(nvarchar(max), TRY_CONVERT(varchar(10), ('new'"
+            ),
+            "{}",
+            q.sql
+        );
+        assert!(!q.sql.contains("AND [n] ="), "{}", q.sql);
+    }
+
+    /// The six types with no native `=` — `xml`, `geometry`, `geography`,
+    /// `text`, `ntext`, `image` — used to be left out of the default question
+    /// for want of one. The comparison is of text now, and text is what every
+    /// one of them renders as, so each is asked about like any other column.
+    ///
+    /// The regression this pins is silence: a cell not asked about is taken at
+    /// the declaration's word, so a hand edit to one of these columns was
+    /// drift nothing proposed to settle.
+    #[test]
+    fn a_type_with_no_native_equality_is_still_asked_about_its_default() {
+        let t = table(
+            Some(vec!["id"]),
+            &[
+                ("id", "int", None),
+                ("doc", "xml", Some("''")),
+                ("blob", "image", Some("0x")),
+                ("note", "text", Some("'new'")),
+                ("wide", "ntext", Some("N'new'")),
+            ],
+        );
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(q.columns.iter().all(|s| s.default_at.is_some()), "{q:?}");
         assert!(q.columns.iter().all(|s| s.has_default), "{q:?}");
-        // Not asked about is taken at the declaration's word.
-        assert!(q.columns.iter().all(|s| s.assume_default), "{q:?}");
+        // Asked about is not taken at the declaration's word.
+        assert!(q.columns.iter().all(|s| !s.assume_default), "{q:?}");
+        // Each rendered the way the read-back renders that type, both sides,
+        // under the binary collation.
+        for held in [
+            "CONVERT(nvarchar(max), [doc]) = CONVERT(nvarchar(max), TRY_CONVERT(xml, ''",
+            "CONVERT(nvarchar(max), CONVERT(varbinary(max), [blob]), 1) = CONVERT(nvarchar(max), CONVERT(varbinary(max), TRY_CONVERT(image, 0x",
+            "CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), TRY_CONVERT(text, 'new'",
+            "CONVERT(nvarchar(max), [wide]) = CONVERT(nvarchar(max), TRY_CONVERT(ntext, N'new'",
+        ] {
+            assert!(q.sql.contains(held), "{held}\n{}", q.sql);
+        }
     }
 
     /// A default the engine would have to *run* is never put in the query: a
