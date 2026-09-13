@@ -323,7 +323,20 @@ async fn one(
         crate::engine::Read::Snapshot,
     )
     .await
-    .map_err(|e| format!("the declared rows could not be read back: {e}"));
+    // `{:#}` on a fresh `anyhow::Error`, not `{e}` on the bare `RowsError`:
+    // `status` is operator-facing output, the same audience `main.rs`'s own
+    // `{e:#}` serves, not the ledger `ledger_safe_reason` guards — nothing
+    // here is redacted. `RowsError::Read`'s own `Display` deliberately no
+    // longer repeats its wrapped `DbError` (DECISIONS 455), so reading it
+    // through only `{e}` now shows less than before; `{:#}` walks the chain
+    // itself and joins every frame, the way this crate's other operator-
+    // facing prints already do, so the driver's own sentence is unaffected.
+    .map_err(|e| {
+        format!(
+            "the declared rows could not be read back: {:#}",
+            anyhow::Error::new(e)
+        )
+    });
     record_catalog_findings(&mut row, &entry, &pulled, &scoped, rows, unmanaged);
     row
 }
@@ -715,6 +728,35 @@ fn status_finding(environment: &str, state: &'static str, detail: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ready-phase review of PR #464 found this operator-facing path relying
+    /// on `RowsError::Read`'s own `Display` to repeat the driver's sentence —
+    /// exactly the shape DECISIONS 455's fourth addendum stopped that type
+    /// from doing, on purpose, so `ledger_safe_reason` cannot be tricked into
+    /// un-redacting it. `status` is not the ledger; it needs the sentence
+    /// back a different way: `{:#}` on a fresh `anyhow::Error` walks the
+    /// chain itself, the way `main.rs`'s own operator-facing print already
+    /// does, so this is the same pattern rather than a new one.
+    #[test]
+    fn read_back_status_still_names_the_drivers_sentence() {
+        let db = pbps_db::DbError::Driver {
+            message: "permission denied for table t".to_owned(),
+            code: Some("42501".to_owned()),
+        };
+        let err = pbps_db::catalog::RowsError::Read {
+            table: pbps_model::TableName::new("app", "t"),
+            source: Box::new(db),
+        };
+        let rendered = format!(
+            "the declared rows could not be read back: {:#}",
+            anyhow::Error::new(err)
+        );
+        assert!(
+            rendered.contains("permission denied for table t"),
+            "an operator running `status` is not the redaction `ledger_safe_reason` \
+             guards against, and still needs the driver's own sentence: {rendered}"
+        );
+    }
 
     fn row(environment: &str, state: &'static str) -> EnvStatus {
         EnvStatus {
