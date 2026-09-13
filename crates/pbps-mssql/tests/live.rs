@@ -434,6 +434,75 @@ async fn a_cell_the_columns_collation_calls_equal_to_its_default_is_still_drift(
     db.drop().await;
 }
 
+/// A `sql_variant` cell is the one where comparing rendered text alone would
+/// hide a difference the engine keeps: the rendering writes the value and not
+/// its base type. **Measured**, a variant holding `nvarchar` `N'1'` beside a
+/// default of `int` `1` — the engine calls them different values and
+/// `CONVERT(nvarchar(max), …)` calls them the same string.
+///
+/// The regression this pins is a wrong recording: read as at its default, the
+/// cell leaves the read-back, and an application that replaced the number with
+/// the string is drift no plan proposes to settle.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_variant_that_renders_like_its_default_is_still_drift() {
+    use pbps_model::{RowKey, RowScope};
+    let mut db = TestDb::create("variant_default").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t (id int PRIMARY KEY, v sql_variant DEFAULT (1)); \
+             INSERT dbo.t(id) VALUES(1); \
+             INSERT dbo.t(id,v) VALUES(2, CONVERT(nvarchar(10), N'1'));",
+        )
+        .await
+        .unwrap();
+    // Both rows render the same text, and the engine calls only one of them
+    // the default. Measured here rather than assumed.
+    let rendered = db
+        .conn
+        .query(
+            "SELECT CASE WHEN (SELECT CONVERT(nvarchar(max), v) FROM dbo.t WHERE id = 1) \
+             = (SELECT CONVERT(nvarchar(max), v) FROM dbo.t WHERE id = 2) THEN 1 ELSE 0 END \
+             AS same_text, \
+             CASE WHEN (SELECT v FROM dbo.t WHERE id = 1) = (SELECT v FROM dbo.t WHERE id = 2) \
+             THEN 1 ELSE 0 END AS same_value",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rendered[0].try_get::<i32>("same_text").unwrap().unwrap(), 1);
+    assert_eq!(
+        rendered[0].try_get::<i32>("same_value").unwrap().unwrap(),
+        0
+    );
+
+    let name = TableName::new("dbo", "t");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new(ty("int")).not_null());
+    let mut column = Column::new(ty("sql_variant"));
+    column.default = Some("(1)".into());
+    table.columns.insert("v".into(), column);
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    for (key, at_default) in [("1", true), ("2", false)] {
+        let query = pbps_mssql::rows::query(
+            &name,
+            &table,
+            &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+        )
+        .unwrap()
+        .unwrap();
+        let rows = db.conn.query(&query.sql).await.unwrap();
+        let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+        assert_eq!(observed.at_default.contains("v"), at_default, "row {key}");
+        assert!(!observed.unknown.contains("v"), "row {key}");
+    }
+    db.drop().await;
+}
+
 /// The guard that asked "does this type have `=`?" outlived every native `=`
 /// it guarded, and took six types with it: a cell of one was never asked about
 /// its default, so it read back as one nobody can tell from its default and a

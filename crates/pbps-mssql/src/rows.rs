@@ -214,14 +214,14 @@ pub fn query(
                 // the column calls equal to its default is left out of the
                 // read-back entirely, so the drift is not in the observed
                 // state and no plan proposes to settle it.
-                let stored = read_expr(&quoted, &ty.base);
-                let at_default = read_expr(&format!("TRY_CONVERT({ty}, {default})"), &ty.base);
+                let at_default =
+                    same_value(&quoted, &format!("TRY_CONVERT({ty}, {default})"), &ty.base);
                 select.push(format!(
                     // A failed assignment is unknown, not a NULL default.
                     // Keep that third answer local to this query/decode wire
                     // format; TRY_CONVERT preserves the engine's rounding.
                     "CASE WHEN ({default}) IS NOT NULL AND TRY_CONVERT({ty}, {default}) IS NULL THEN -1 \
-                     WHEN {stored} = {at_default} COLLATE Latin1_General_BIN2 \
+                     WHEN {at_default} \
                        OR ({quoted} IS NULL AND ({default}) IS NULL) \
                      THEN 1 ELSE 0 END"
                 ));
@@ -580,15 +580,25 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
 /// "the row is not as the plan recorded it" is a better answer than the
 /// engine's conversion error (Msg 245).
 ///
-/// `None` for `image`, which has no inverse to give. **Measured**, and not a
-/// conversion that merely fails — `TRY_CONVERT(image, N'0x02')` is
-/// `Msg 529: Explicit conversion from data type nvarchar to image is not
-/// allowed`, with or without style 1, so the expression does not run at all
-/// rather than answering NULL. A statement built from it raises instead of
-/// refusing, which is the one thing `TRY_CONVERT` is here to avoid. It is the
-/// only type in this dialect's catalogue with that answer: `text`, `ntext`,
-/// `xml`, `geometry`, `geography`, `hierarchyid`, `timestamp` and
-/// `sql_variant` all convert back.
+/// `None` where [`read_expr`]'s rendering is not something the value can be
+/// rebuilt from, which is three types and each for its own measured reason.
+///
+/// `image` has no conversion at all — and not one that merely fails:
+/// `TRY_CONVERT(image, N'0x02')` is `Msg 529: Explicit conversion from data
+/// type nvarchar to image is not allowed`, with or without style 1, so the
+/// expression does not run rather than answering NULL. A statement built from
+/// it raises instead of refusing, which is the one thing `TRY_CONVERT` is here
+/// to avoid.
+///
+/// `geometry` and `geography` convert back, and come back a different value:
+/// `ToString()` is the well-known text and the **SRID is not in it**. Measured,
+/// a `geometry` built at SRID 4326 renders `POINT (1 2)` and reads back at SRID
+/// 0 — the spatial reference the value was in, gone. `geography` round-trips
+/// only because 4326 is its default; another geographic SRID is lost the same
+/// way. A predicate built from that text refuses a row nobody changed.
+///
+/// Everything else was measured converting back: `text`, `ntext`, `xml`,
+/// `hierarchyid` (`/1/2/` returns `/1/2/`), `timestamp` and `sql_variant`.
 ///
 /// An `Option` rather than a check beside the call, so the type that cannot be
 /// spelled back has no expression to spell it with.
@@ -598,9 +608,37 @@ pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> Option<String> {
             format!("TRY_CONVERT({ty}, {literal}, 126)")
         }
         "binary" | "varbinary" | "timestamp" => format!("TRY_CONVERT({ty}, {literal}, 1)"),
-        "image" => return None,
+        "image" | "geometry" | "geography" => return None,
         _ => format!("TRY_CONVERT({ty}, {literal})"),
     })
+}
+
+/// Whether a cell of this column stands at the value `other` gives, as one
+/// predicate — the question `rows::query` asks of a stored cell and
+/// `emit::defaulted_cell` holds a written one to, in one place so that the two
+/// cannot drift apart again (PITFALLS, "The write path was fixed and the read
+/// path asks the same question").
+///
+/// Both sides through [`read_expr`], compared under a binary collation, so a
+/// column whose own collation calls two spellings equal cannot hide an edit.
+///
+/// **And the engine's own `=` as well, for `sql_variant`.** That rendering is
+/// lossy in a way the others are not: it writes the value and not its base
+/// type, so **measured**, a variant holding `nvarchar` `N'1'` and one holding
+/// `int` `1` render the same text while the engine calls them different
+/// values. The conjunct is only added where the type has an `=` *and* the
+/// rendering loses something it keeps; adding it everywhere would refuse
+/// matches no measurement says are wrong.
+pub(crate) fn same_value(stored: &str, other: &str, base: &str) -> String {
+    let text = format!(
+        "{} = {} COLLATE Latin1_General_BIN2",
+        read_expr(stored, base),
+        read_expr(other, base)
+    );
+    match base {
+        "sql_variant" => format!("({text} AND {stored} = {other})"),
+        _ => text,
+    }
 }
 
 /// Whether the engine is asked to confirm a cell of this column at its
@@ -1434,6 +1472,50 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("2 columns"), "{e}");
+    }
+
+    /// A `sql_variant`'s rendering writes its value and not its base type, so
+    /// two variants the engine calls different values render the same text.
+    /// **Measured**: a variant holding `nvarchar` `N'1'` and one holding `int`
+    /// `1` are `different` to the engine and the same string to
+    /// `CONVERT(nvarchar(max), …)`.
+    ///
+    /// So this one type carries the engine's own `=` beside the text
+    /// comparison — and only this one, because adding it everywhere would
+    /// refuse matches no measurement says are wrong.
+    #[test]
+    fn a_variants_base_type_is_compared_and_no_other_types_is() {
+        let t = table(
+            Some(vec!["id"]),
+            &[
+                ("id", "int", None),
+                ("v", "sql_variant", Some("(1)")),
+                ("n", "varchar(10)", Some("('new')")),
+            ],
+        );
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            q.sql.contains("AND [v] = TRY_CONVERT(sql_variant, (1)"),
+            "{}",
+            q.sql
+        );
+        // The ordinary column keeps the text comparison alone.
+        assert!(
+            q.sql.contains(
+                "CONVERT(nvarchar(max), [n]) = CONVERT(nvarchar(max), TRY_CONVERT(varchar(10), ('new'"
+            ),
+            "{}",
+            q.sql
+        );
+        assert!(!q.sql.contains("AND [n] ="), "{}", q.sql);
     }
 
     /// The six types with no native `=` — `xml`, `geometry`, `geography`,

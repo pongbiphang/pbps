@@ -11684,9 +11684,41 @@ SPEC is in sync with all of these.
      So the expression does not run at all rather than answering NULL, and a
      statement built from it raises where it should refuse — which is the one
      thing `TRY_CONVERT` is in that predicate to avoid. `rows::from_text`
-     returns an `Option` now, `None` for `image` alone: `text`, `ntext`, `xml`,
-     `geometry`, `geography`, `hierarchyid`, `timestamp` and `sql_variant` were
-     each measured converting back. `Held::as_stored` keeps its `Option` for
-     that one reason — a retype it cannot invert — rather than the old one, a
-     type without an operator, and an `image` column this plan leaves alone is
-     held like any other, because nothing is converted.
+     returns an `Option` now. `Held::as_stored` keeps its `Option` for that one
+     reason — a retype it cannot invert — rather than the old one, a type
+     without an operator, and an `image` column this plan leaves alone is held
+     like any other, because nothing is converted.
+
+     **Two more renderings are not inverses, and the review found both.**
+     `geometry` and `geography` convert back and come back *different*:
+     `ToString()` is the well-known text and the SRID is not in it. Measured, a
+     `geometry` built at SRID 4326 renders `POINT (1 2)` and reads back at SRID
+     0; `geography` round-trips only because 4326 is its own default. Both join
+     `image` in returning `None`. `text`, `ntext`, `xml`, `hierarchyid`
+     (`/1/2/` returns `/1/2/`), `timestamp` and `sql_variant` were each measured
+     converting back and stay invertible.
+
+     **And one rendering is lossy where it is compared, not only where it is
+     rebuilt.** A `sql_variant` writes its value and not its base type, so
+     measured, a variant holding `nvarchar` `N'1'` and one holding `int` `1`
+     render the same string while the engine calls them different values:
+
+     ```text
+     @stored = @default                            ->  different
+     the same, as text under Latin1_General_BIN2   ->  equal
+     ```
+
+     Moving that column from the native `=` to a comparison of text alone would
+     have hidden exactly the drift this entry is about, on the one type where
+     the old comparison was the better one. So the default question carries the
+     engine's `=` beside the text for `sql_variant` — and for no other type,
+     because adding it everywhere would refuse matches no measurement says are
+     wrong. It is one function, `rows::same_value`, asked by the read path and
+     the write path alike, so the two cannot drift apart again.
+
+     What this does **not** reach: a spatial value whose SRID alone differs from
+     its default still compares equal, because the comparison is of a rendering
+     that never carried the SRID. That is not a regression — those types were
+     not asked about at all before — and fixing it means changing what
+     `read_expr` writes for them, which is the recorded text of every spatial
+     cell. Filed rather than done here.
