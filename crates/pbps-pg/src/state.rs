@@ -410,7 +410,9 @@ impl Recoverable {
         if self.inside_a_transaction {
             conn.execute(ROLLBACK_TO_SAVEPOINT).await?;
         }
-        Ok(())
+        // ROLLBACK TO keeps the marker; release it to restore the caller's
+        // original depth and expose any older savepoint of the same name.
+        self.release(conn).await
     }
 
     /// The same, for a failure that is **not** being handled: the caller is

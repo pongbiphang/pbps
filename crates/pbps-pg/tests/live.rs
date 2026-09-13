@@ -5746,6 +5746,90 @@ async fn an_expected_failure_leaves_the_callers_transaction_where_it_found_it() 
     db.drop().await;
 }
 
+/// ROLLBACK TO makes a failed transaction usable but leaves its savepoint
+/// established. Probe the marker itself, not just a subsequent SELECT (#214).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn handled_ledger_failures_release_their_savepoint() {
+    let mut db = TestDb::create("released_recovery214").await;
+    db.conn
+        .execute("CREATE TABLE public.caller_rows (id integer); BEGIN")
+        .await
+        .unwrap();
+    for operation in 0..3 {
+        db.conn
+            .execute("INSERT INTO public.caller_rows VALUES (1); SAVEPOINT caller_checkpoint")
+            .await
+            .unwrap();
+        match operation {
+            0 => assert!(!state::is_initialized(&mut db.conn).await.unwrap()),
+            1 => assert!(state::lock_holder(&mut db.conn).await.unwrap().is_none()),
+            2 => assert!(!state::unlock(&mut db.conn).await.unwrap()),
+            _ => unreachable!(),
+        }
+        assert_eq!(number(&mut db.conn, "SELECT 1").await, 1);
+        let error = db
+            .conn
+            .execute("ROLLBACK TO SAVEPOINT pbps_ensure_tables")
+            .await
+            .expect_err("a handled ledger failure must release its marker");
+        assert_eq!(sqlstate(&error), "3B001", "{error:?}");
+        // The deliberately failed probe aborts the transaction. Our own
+        // checkpoint restores it without hiding a leaked tool savepoint.
+        db.conn
+            .execute("ROLLBACK TO SAVEPOINT caller_checkpoint; RELEASE SAVEPOINT caller_checkpoint")
+            .await
+            .unwrap();
+    }
+    db.conn.execute("COMMIT").await.unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.caller_rows").await,
+        3
+    );
+    db.drop().await;
+}
+
+/// The quiet rewind must preserve both the original error and a caller's
+/// older savepoint of the same name, which PostgreSQL shadows rather than replaces.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn quiet_ledger_rewinds_restore_the_callers_same_named_savepoint() {
+    let mut db = TestDb::create("quiet_recovery214").await;
+    db.conn
+        .execute(
+            "CREATE TABLE public.__pbps_lock (wrong_column integer);
+                  CREATE TABLE public.caller_rows (id integer);
+                  BEGIN;
+                  INSERT INTO public.caller_rows VALUES (1);
+                  SAVEPOINT pbps_ensure_tables;
+                  INSERT INTO public.caller_rows VALUES (2)",
+        )
+        .await
+        .unwrap();
+    let error = state::unlock(&mut db.conn)
+        .await
+        .expect_err("an unreadable lock table remains an error");
+    assert_eq!(sqlstate(&error), "42703", "{error:?}");
+    db.conn
+        .execute("ROLLBACK TO SAVEPOINT pbps_ensure_tables")
+        .await
+        .expect("the caller's older savepoint survives the quiet rewind");
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.caller_rows").await,
+        1,
+        "rollback must reach the caller's checkpoint, not the tool's leaked marker"
+    );
+    db.conn
+        .execute("RELEASE SAVEPOINT pbps_ensure_tables; COMMIT")
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.caller_rows").await,
+        1
+    );
+    db.drop().await;
+}
+
 /// `42P07` names *a* relation the DDL would create, not the ledger, so the
 /// answer is not taken from the error.
 ///
