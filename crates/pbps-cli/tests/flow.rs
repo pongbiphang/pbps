@@ -3325,6 +3325,125 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
     );
 }
 
+/// The CLI must union every foreign key's target columns and pass the result
+/// to SQL Server. A correct engine check alone cannot catch a dropped demand.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_unions_only_the_columns_external_foreign_keys_reference() {
+    struct Login(String, String);
+    impl Drop for Login {
+        fn drop(&mut self) {
+            after_test_on_server(&self.0, &format!("DROP LOGIN [{}]", self.1));
+        }
+    }
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let login = Login(
+        server.clone(),
+        format!("pbps_refcols195_{}", std::process::id()),
+    );
+    let password = "pbpsReferenced195!1";
+    let db = OwnDatabase::new(&server, "doctorrefcols195");
+    on_server(
+        &server,
+        &format!(
+            "CREATE LOGIN [{}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;",
+            login.1
+        ),
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA app;'); EXEC(N'CREATE SCHEMA shared;'); \
+         CREATE TABLE shared.parent (code int PRIMARY KEY, alt int UNIQUE, label nvarchar(50)); \
+         CREATE USER [{0}] FOR LOGIN [{0}]; \
+         GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{0}]; \
+         GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{0}]; \
+         GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{0}]; \
+         GRANT SELECT, REFERENCES ON OBJECT::shared.parent(code) TO [{0}];",
+            login.1
+        ),
+    );
+    let connection = with_key(
+        &with_key(db.connection(), "User Id", &login.1),
+        "Password",
+        password,
+    );
+    let d = Demo::new("doctor-refcols195");
+    let declaration = "table: app.child\ncolumns:\n  code: {type: int}\n  alt: {type: int}\nforeign_keys:\n  fk_code:\n    columns: [code]\n    references: shared.parent(code)\n  fk_alt:\n    columns: [alt]\n    references: shared.parent(alt)\n";
+    d.table(declaration);
+    d.commit();
+    let gaps = || {
+        let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("invalid doctor JSON: {e}: {} {}", stdout(&o), stderr(&o)));
+        let mut named: Vec<String> = v["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no permission list: {v}"))
+            .iter()
+            .map(|g| g.as_str().unwrap().split(" — ").next().unwrap().to_owned())
+            .collect();
+        named.sort();
+        named
+    };
+    let both = [
+        "REFERENCES on OBJECT::[shared].[parent]",
+        "SELECT on OBJECT::[shared].[parent]",
+    ];
+    assert_eq!(
+        gaps(),
+        both,
+        "the second foreign key's ungranted column must remain in the union"
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "GRANT SELECT, REFERENCES ON OBJECT::shared.parent(alt) TO [{}];",
+            login.1
+        ),
+    );
+    assert!(
+        gaps().is_empty(),
+        "the unrelated label column needs no grant"
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "REVOKE SELECT ON OBJECT::shared.parent(code) FROM [{}];",
+            login.1
+        ),
+    );
+    assert_eq!(
+        gaps(),
+        [both[1]],
+        "the first foreign key's column must remain in the union too"
+    );
+    on_server(
+        db.connection(),
+        &format!(
+            "GRANT SELECT ON OBJECT::shared.parent(code) TO [{0}]; \
+         REVOKE SELECT, REFERENCES ON OBJECT::shared.parent(alt) FROM [{0}];",
+            login.1
+        ),
+    );
+    d.table(&declaration.replace(
+        "references: shared.parent(alt)",
+        "references: shared.parent(code)",
+    ));
+    assert!(
+        gaps().is_empty(),
+        "repeated references to code do not demand alt"
+    );
+    d.table(&declaration.replace(
+        "references: shared.parent(alt)",
+        "references: shared.parent(missing)",
+    ));
+    assert_eq!(
+        gaps(),
+        both,
+        "an unknown target column cannot read as ready"
+    );
+}
+
 // ---- Phase 3.1: the interactive prompt (SPEC 6.3) ----
 
 /// The conversation itself is unit-tested in `prompt`; what only the real binary

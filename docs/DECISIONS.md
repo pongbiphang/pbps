@@ -11376,3 +11376,28 @@ SPEC is in sync with all of these.
      from `9a01bfa` pins the old acceptance of `state list` with `limit: 0`;
      the current document refuses it under a distinct schema-set version,
      while both accept a positive limit and reject a future envelope version.
+
+466. **SQL Server foreign-key readiness uses the declared target-column union
+     (issue #195).** The shared doctor request already carries this union for
+     PostgreSQL (440). SQL Server now consumes the same map rather than asking
+     `sys.columns` for every column of each external target. `REFERENCES` covers
+     the emitted key and `SELECT` its preflight probe; neither names an
+     unrelated target column. Targets within managed schemas retain their
+     existing classification, and managed-table, ledger, role and row-DML
+     permission demands retain their respective column policies.
+
+     An object-level grant remains sufficient. Otherwise each named column
+     must answer 1 for the requested permission: 0 or NULL is a gap, and an
+     empty subset supplies no column-level evidence. Target and column names
+     remain bound values. The statement packer counts one parameter per named
+     column as well as the target's two name parts, so unions across many keys
+     remain within the existing RPC budget without dropping a target.
+
+     Measured on SQL Server, a least-privilege account granted only the two
+     referenced columns can execute both emitted foreign keys and their
+     preflight probes while an unrelated column remains unreadable. Revoking
+     one required REFERENCES or SELECT grant produces the corresponding gap
+     and makes the real statement fail. Live cases also cover unknown and
+     hostile column names, absent targets and empty subsets. The CLI regression
+     checks both members of the union and repeated references to one column;
+     the packing test covers a union too wide for one statement.

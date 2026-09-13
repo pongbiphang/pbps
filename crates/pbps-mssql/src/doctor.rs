@@ -23,7 +23,7 @@ use crate::catalog::get;
 
 // What `doctor` asks about is read off the declarations and is `pbps-db`'s;
 // what this engine answers, and how, is below (DECISIONS 417).
-pub use pbps_db::doctor::{DataDemand, DataTables, GrantTargets};
+pub use pbps_db::doctor::{DataDemand, DataTables, GrantTargets, ReferencedColumns};
 
 /// Where a permission has to be held for a deployment to succeed.
 ///
@@ -637,17 +637,15 @@ fn column_scoped(permission: &str) -> bool {
 /// added after the grant, so `object OR every-column` is never narrower than
 /// what the account has.
 ///
-/// That last sentence is the safety of the whole thing: the column question
-/// can only turn a 0 into a 1, never a 1 into a 0. Whatever the column list
-/// gets wrong, no gap this check used to report is lost — the worst a wrong
-/// list can do is leave the over-demand that was there before.
+/// The object answer remains sufficient; otherwise the complete required
+/// column set must be known and granted. An empty or unreadable set cannot
+/// stand in for permission evidence.
 #[derive(Debug, Clone, Copy)]
 enum Columns<'a> {
     /// The columns the catalog shows, asked in the server — no parameters, and
-    /// right for the objects pbps does not declare: the ledger tables, the
-    /// foreign-key targets, the securables a role is granted on. Nothing this
-    /// tool does adds a column to one of them, so what the catalog holds is
-    /// the whole set a statement could name.
+    /// right for the ledger tables and securables a role is granted on.
+    /// Foreign-key targets instead use their named subset; these callers
+    /// retain the whole visible set as their column-level fallback.
     ///
     /// An object with no visible column keeps the object answer: metadata
     /// visibility hides every column from a principal with no permission on
@@ -673,9 +671,12 @@ enum Columns<'a> {
     /// ADD extra`, a column-only grantee answers 0 on `extra` and its `UPDATE`
     /// is denied; an object-level grantee answers 1 and its `UPDATE` runs.
     Declared(&'a BTreeMap<ObjectName, Vec<String>>),
+    /// Only the union of columns named by external foreign keys. This is not
+    /// a complete declaration of the target; unrelated columns need no grant.
+    Referenced(&'a ReferencedColumns),
 }
 
-impl Columns<'_> {
+impl<'a> Columns<'a> {
     /// How many parameters one object costs beyond its own two slots.
     fn parameters_for(self, object: &ObjectName) -> usize {
         match self {
@@ -689,6 +690,25 @@ impl Columns<'_> {
             // `MAX_PARAMETERS` — a table SQL Server takes without complaint,
             // and `doctor` would have failed the whole permission read on it.
             Self::Declared(declared) => declared.get(object).map_or(0, Vec::len),
+            Self::Referenced(referenced) => referenced.get(object).map_or(0, BTreeSet::len),
+        }
+    }
+
+    fn named(self, object: &ObjectName) -> Vec<&'a str> {
+        match self {
+            Self::Declared(declared) => declared
+                .get(object)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            Self::Referenced(referenced) => referenced
+                .get(object)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            Self::Catalog => Vec::new(),
         }
     }
 }
@@ -740,11 +760,11 @@ fn object_permissions_sql<'a>(
              AND HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.name, 'COLUMN') = 0)"
                 .to_owned(),
         ),
-        Columns::Declared(declared) => {
+        Columns::Declared(_) | Columns::Referenced(_) => {
             let mut column_slots = Vec::new();
             for (i, o) in objects.iter().enumerate() {
-                for column in declared.get(o).map_or(&[][..], Vec::as_slice) {
-                    params.push(Param::from(column.as_str()));
+                for column in columns.named(o) {
+                    params.push(Param::from(column));
                     // The object is named by its position in this statement,
                     // a literal on both sides. Binding its two parts again
                     // per column is what a table of a few hundred columns
@@ -754,7 +774,7 @@ fn object_permissions_sql<'a>(
                 }
             }
             // `VALUES ()` is not T-SQL, and a chunk whose objects declare no
-            // row column has nothing to fall back to: the object answer
+            // required column has nothing to fall back to: the object answer
             // stands, which is what an always-false predicate leaves.
             if column_slots.is_empty() {
                 ("1 = 0".to_owned(), "1 = 0".to_owned())
@@ -764,11 +784,18 @@ fn object_permissions_sql<'a>(
                 // twice costs no second binding — which is what keeps a wide
                 // table at one slot per column rather than two.
                 let list = format!("(VALUES {}) AS c(i, col)", column_slots.join(", "));
+                let ungranted = if matches!(columns, Columns::Referenced(_)) {
+                    // A named external column can be absent or invisible.
+                    // NULL is not evidence that its permission is held.
+                    "COALESCE(HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN'), 0) <> 1"
+                } else {
+                    "HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN') = 0"
+                };
                 (
                     format!("EXISTS (SELECT 1 FROM {list} WHERE c.i = o.i)"),
                     format!(
                         "EXISTS (SELECT 1 FROM {list} WHERE c.i = o.i \
-                         AND HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN') = 0)"
+                         AND {ungranted})"
                     ),
                 )
             }
@@ -819,16 +846,14 @@ pub(crate) const MAX_PARAMETERS: usize = 2098;
 /// and `doctor` reported an estate it could have checked as unreadable.
 ///
 /// Packed rather than divided, because an object no longer costs a fixed two
-/// slots — under [`Columns::Declared`] it costs one more per declared row
+/// slots — a named column set costs one more per required
 /// column, so one wide table can be worth a hundred narrow ones and a fixed
 /// chunk size would be sized for either the widest table or none of them.
 ///
-/// No single object can exceed the budget on its own, and that is a property
-/// of the slot cost rather than of this loop: SQL Server takes 1,024 columns
-/// in a table, so the widest one it can hold costs 1,025 slots against 2,095.
-/// The "asked alone" branch below is what happens if that ever stops being
-/// true — a statement the server refuses, loudly, rather than an object
-/// dropped from the answer, which would read as ready.
+/// Ordinary table widths fit on their own, but a supplied column set can be
+/// wider than a real table. An oversized object is asked alone: the server
+/// refuses that statement loudly rather than losing the object's demand,
+/// which would read as ready.
 fn object_statements<'a>(
     objects: &'a [ObjectName],
     perms: usize,
@@ -1052,7 +1077,7 @@ fn resolve_for_query<'a>(
 pub async fn permissions(
     conn: &mut Conn,
     schemas: &[String],
-    referenced: &[ObjectName],
+    referenced: &ReferencedColumns,
     granted: &GrantTargets,
     data: &DataTables,
     project_ids: &pbps_model::IdsFile,
@@ -1252,12 +1277,13 @@ pub async fn permissions(
         .filter(|r| matches!(r.needed, Needed::Referenced))
         .map(|r| r.name)
         .collect();
+    let referenced_names: Vec<ObjectName> = referenced.keys().cloned().collect();
     let referenced_objects = object_permissions(
         conn,
-        referenced,
+        &referenced_names,
         &referenced_perms,
         Existing::OrNot,
-        Columns::Catalog,
+        Columns::Referenced(referenced),
     )
     .await?;
 
@@ -2048,6 +2074,38 @@ mod tests {
         let chunks = object_statements(&objects[..1], perms.len(), Columns::Declared(&huge));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1);
+    }
+
+    #[test]
+    fn referenced_column_unions_fit_the_rpc_parameter_budget_without_losing_targets() {
+        let objects: Vec<_> = (0..40)
+            .map(|i| ObjectName::new("shared", format!("parent{i}")))
+            .collect();
+        let referenced: ReferencedColumns = objects
+            .iter()
+            .map(|o| (o.clone(), (0..100).map(|i| format!("c{i}")).collect()))
+            .collect();
+        let columns = Columns::Referenced(&referenced);
+        let perms = ["SELECT", "REFERENCES"];
+        let chunks = object_statements(&objects, perms.len(), columns);
+        assert!(
+            chunks.len() > 1,
+            "one statement would exceed the RPC budget"
+        );
+        let mut seen = Vec::new();
+        for chunk in chunks {
+            let (_, params) = object_permissions_sql(chunk, &perms, Existing::OrNot, columns);
+            assert!(params.len() <= MAX_PARAMETERS, "{} params", params.len());
+            seen.extend_from_slice(chunk);
+        }
+        assert_eq!(
+            seen, objects,
+            "every target is asked once, including the final chunk"
+        );
+        // Missing subset entries still carry their object-level demand.
+        let empty = ReferencedColumns::new();
+        let chunks = object_statements(&objects, perms.len(), Columns::Referenced(&empty));
+        assert_eq!(chunks, vec![objects.as_slice()]);
     }
 
     /// The role permissions are asked for only of a project that declares a

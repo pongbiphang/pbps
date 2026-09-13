@@ -3215,7 +3215,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
     let hidden = doctor::permissions(
         &mut db.conn,
         &[],
-        &[],
+        &Default::default(),
         &doctor::GrantTargets::default(),
         &doctor::DataTables::new(),
         &IdsFile::default(),
@@ -3256,7 +3256,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
         let held = doctor::permissions(
             &mut db.conn,
             &[],
-            &[],
+            &Default::default(),
             &doctor::GrantTargets::default(),
             &doctor::DataTables::new(),
             &IdsFile::default(),
@@ -3349,7 +3349,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3384,7 +3384,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3417,7 +3417,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3455,7 +3455,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3486,7 +3486,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3547,7 +3547,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3578,7 +3578,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["App".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3602,7 +3602,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["nowhere".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -3675,7 +3675,7 @@ async fn data_permissions(
     pbps_mssql::doctor::permissions(
         conn,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         data,
         &pbps_model::IdsFile::default(),
@@ -3684,11 +3684,20 @@ async fn data_permissions(
     .expect("read permissions")
 }
 
+// Object-level controls need target identities but no column fallback.
+fn reference_names(objects: &[pbps_model::ObjectName]) -> pbps_db::doctor::ReferencedColumns {
+    objects
+        .iter()
+        .cloned()
+        .map(|object| (object, Default::default()))
+        .collect()
+}
+
 /// The readiness question for one project's foreign-key targets outside the
 /// managed schemas, asked the way `doctor` asks it.
 async fn referenced_permissions(
     conn: &mut Conn,
-    referenced: &[pbps_model::ObjectName],
+    referenced: &pbps_db::doctor::ReferencedColumns,
 ) -> pbps_mssql::doctor::Held {
     pbps_mssql::doctor::permissions(
         conn,
@@ -4029,7 +4038,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
         &project_ids,
@@ -4066,7 +4075,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
         &project_ids,
@@ -4206,7 +4215,7 @@ async fn a_renamed_and_a_reused_name_keep_their_own_distinct_demands() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
         &project_ids,
@@ -4337,7 +4346,7 @@ async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
         &project_ids,
@@ -4461,7 +4470,7 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
         &project_ids,
@@ -4739,17 +4748,176 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    let mut db = TestDb::create("refsubset195").await;
+    let login = format!("pbps_refsubset195_{}", std::process::id());
+    let as_login = least_privilege_login(&mut db, &login, "pbpsLeastPrivilege!1").await;
+    db.conn.execute(&format!(
+        "EXEC(N'CREATE SCHEMA shared');
+         CREATE TABLE shared.parent (code int NOT NULL PRIMARY KEY, alt int NOT NULL UNIQUE, label nvarchar(50));
+         CREATE TABLE app.child (code int, alt int);
+         INSERT shared.parent VALUES (1, 2, N'private');
+         INSERT app.child VALUES (1, 2);
+         GRANT SELECT, REFERENCES ON shared.parent(code, alt) TO [{login}];"
+    )).await.unwrap();
+    let target: pbps_model::ObjectName = "shared.parent".parse().unwrap();
+    let referenced: pbps_db::doctor::ReferencedColumns = [(
+        target.clone(),
+        ["code".to_owned(), "alt".to_owned()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+    let changes = ChangeSet {
+        changes: ["code", "alt"]
+            .into_iter()
+            .map(|column| {
+                PlannedChange::new(Change::AddForeignKey {
+                    table: "app.child".parse().unwrap(),
+                    name: format!("fk_{column}"),
+                    constraint: Box::new(ForeignKey {
+                        columns: vec![column.into()],
+                        references_table: target.clone(),
+                        references_columns: vec![column.into()],
+                        on_delete: ReferentialAction::NoAction,
+                        on_update: ReferentialAction::NoAction,
+                    }),
+                })
+            })
+            .collect(),
+    };
+    let mut lp = connect_live(&as_login).await.unwrap();
+    let object_select = holds_at_object_scope(&mut lp, "shared.parent", "SELECT").await;
+    let unrelated = lp.query("SELECT label FROM shared.parent").await;
+    let ready = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
+    let probes = Mssql.preflight(&changes).probes;
+    let mut counts = Vec::new();
+    for probe in &probes {
+        let rows = lp.query(&probe.sql).await.unwrap();
+        counts.push(rows[0].try_get_at::<i32>(0).unwrap().unwrap());
+    }
+    apply(&mut lp, &changes).await;
+    lp.execute("ALTER TABLE app.child DROP CONSTRAINT fk_code, fk_alt;")
+        .await
+        .unwrap();
+
+    db.conn
+        .execute(&format!(
+            "REVOKE REFERENCES ON shared.parent(alt) FROM [{login}];"
+        ))
+        .await
+        .unwrap();
+    let missing_references = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
+    let alt_statement = &Mssql
+        .emit(&changes.changes[1].change, Default::default())
+        .unwrap()[0]
+        .sql;
+    let refused_key = lp.execute(alt_statement).await;
+    db.conn.execute(&format!("GRANT REFERENCES ON shared.parent(alt) TO [{login}]; REVOKE SELECT ON shared.parent(alt) FROM [{login}];")).await.unwrap();
+    let missing_select = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
+    let refused_probe = lp.query(&probes[1].sql).await;
+    db.conn
+        .execute(&format!("GRANT SELECT ON shared.parent(alt) TO [{login}];"))
+        .await
+        .unwrap();
+
+    // A malformed target name returns NULL, unlike an ordinary absent name's 0.
+    // The public permission request must fail closed for either answer.
+    let invalid_column = "x".repeat(129);
+    let rows = lp
+        .query_with(
+            "SELECT HAS_PERMS_BY_NAME('shared.parent', 'OBJECT', 'SELECT', @P1, 'COLUMN') AS held",
+            &[pbps_db::Param::from(invalid_column.as_str())],
+        )
+        .await
+        .unwrap();
+    let invalid_answer = rows[0].try_get::<i32>("held").unwrap();
+    let mut invalid = referenced.clone();
+    invalid.get_mut(&target).unwrap().insert(invalid_column);
+    let invalid_gaps = named_gaps(&referenced_permissions(&mut lp, &invalid).await);
+    let mut unknown = referenced.clone();
+    unknown
+        .get_mut(&target)
+        .unwrap()
+        .insert("missing'; --".into());
+    let unknown_gaps = named_gaps(&referenced_permissions(&mut lp, &unknown).await);
+    let empty = reference_names(std::slice::from_ref(&target));
+    let empty_gaps = named_gaps(&referenced_permissions(&mut lp, &empty).await);
+    let absent = [(
+        "shared.absent".parse().unwrap(),
+        ["code".to_owned()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+    let absent_gaps = named_gaps(&referenced_permissions(&mut lp, &absent).await);
+    let restored = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
+
+    // Assertions after cleanup also leave no login/database on counterfactual failure.
+    drop(lp);
+    db.conn
+        .execute(&format!("USE master; DROP LOGIN [{login}];"))
+        .await
+        .unwrap();
+    db.drop().await;
+    assert!(!object_select);
+    assert!(
+        unrelated.is_err(),
+        "the unrelated label must really be ungranted"
+    );
+    assert!(ready.is_empty(), "{ready:?}");
+    assert_eq!(
+        counts,
+        [0, 0],
+        "both emitted probes must run with only their named columns"
+    );
+    assert_eq!(
+        missing_references,
+        ["REFERENCES on OBJECT::[shared].[parent]"]
+    );
+    assert!(
+        refused_key.is_err(),
+        "a missing required REFERENCES grant must block the emitted key"
+    );
+    assert_eq!(missing_select, ["SELECT on OBJECT::[shared].[parent]"]);
+    assert!(
+        refused_probe.is_err(),
+        "a missing required SELECT grant must block the emitted probe"
+    );
+    let both = [
+        "REFERENCES on OBJECT::[shared].[parent]",
+        "SELECT on OBJECT::[shared].[parent]",
+    ];
+    assert_eq!(
+        unknown_gaps, both,
+        "an unreadable named column cannot become a grant"
+    );
+    assert_eq!(
+        invalid_answer, None,
+        "the malformed column must really answer NULL"
+    );
+    assert_eq!(invalid_gaps, both, "NULL cannot become a grant");
+    assert_eq!(empty_gaps, both, "an empty subset cannot prove readiness");
+    assert_eq!(
+        absent_gaps,
+        [
+            "REFERENCES on OBJECT::[shared].[absent]",
+            "SELECT on OBJECT::[shared].[absent]"
+        ]
+    );
+    assert!(restored.is_empty(), "{restored:?}");
+}
+
 /// The same grant, on a securable whose columns pbps does not declare: a
 /// foreign-key target outside the managed schemas.
 ///
-/// There the column list is the catalog's own, which is the whole set a
-/// statement could name — nothing this tool does adds a column to someone
-/// else's table. `SELECT` and `REFERENCES` are both taken at column scope, so
-/// an account granted them column by column on the parent is ready, and one
-/// column short of it is not.
+/// Both columns are explicitly referenced here. `SELECT` and `REFERENCES`
+/// granted column by column cover that demand; one required column short
+/// remains a gap.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
-async fn a_column_level_grant_on_a_referenced_table_is_read_from_the_catalog() {
+async fn every_explicitly_referenced_column_needs_its_grant() {
     let mut db = TestDb::create("doctorrefcol").await;
     let login = format!("pbps_refcol_{}", std::process::id());
     let password = "pbpsLeastPrivilege!1";
@@ -4763,7 +4931,14 @@ async fn a_column_level_grant_on_a_referenced_table_is_read_from_the_catalog() {
         .await
         .expect("create the referenced table");
 
-    let referenced: Vec<pbps_model::ObjectName> = vec!["shared.parent".parse().unwrap()];
+    let referenced = [(
+        "shared.parent".parse().unwrap(),
+        ["code".to_owned(), "label".to_owned()]
+            .into_iter()
+            .collect(),
+    )]
+    .into_iter()
+    .collect();
 
     // Every column of the parent, and nothing at object scope.
     db.conn
@@ -4786,8 +4961,8 @@ async fn a_column_level_grant_on_a_referenced_table_is_read_from_the_catalog() {
     let gaps = pbps_mssql::doctor::missing(&referenced_permissions(&mut lp, &referenced).await);
     assert!(gaps.is_empty(), "{gaps:?}");
 
-    // One column short: the probe reads the whole row, so a column it cannot
-    // read is a gap — and it is reported on the object, where the `GRANT`
+    // One requested column short: the probe needs that column, so an absent
+    // grant is a gap — and it is reported on the object, where the `GRANT`
     // goes.
     db.conn
         .execute(&format!(
@@ -4885,7 +5060,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -4910,7 +5085,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -5273,7 +5448,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -5290,7 +5465,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &["shared.parent".parse().unwrap()],
+        &reference_names(&["shared.parent".parse().unwrap()]),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -5318,7 +5493,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &["shared.parent".parse().unwrap()],
+        &reference_names(&["shared.parent".parse().unwrap()]),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -8549,7 +8724,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
         &[],
-        &[],
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &pbps_model::IdsFile::default(),
@@ -8596,7 +8771,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
         &[],
-        &[],
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &pbps_model::IdsFile::default(),
@@ -8671,7 +8846,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -8695,7 +8870,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -8779,7 +8954,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &managed,
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -8815,7 +8990,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &nowhere,
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -8843,7 +9018,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
-        &[],
+        &Default::default(),
         &managed,
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -9370,7 +9545,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
         &["dbo".to_owned()],
-        std::slice::from_ref(&bracket),
+        &reference_names(std::slice::from_ref(&bracket)),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
@@ -9444,7 +9619,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
         &["dbo".to_owned()],
-        &objects,
+        &reference_names(&objects),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
         &pbps_model::IdsFile::default(),
