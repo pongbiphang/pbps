@@ -37,10 +37,11 @@ pub enum SchemaKind {
 
 /// The version of the *published schemas*, independent of the tool's.
 ///
-/// It moves when a schema changes in a way an editor would notice, which the
-/// tool version does — for reasons no editor cares about (SPEC §14.2,
-/// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 9;
+/// Advance once per merged change to the published JSON content of any kind,
+/// excluding only whitespace, object-key order and the tool-version stamp.
+/// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
+/// acceptance criterion 6, DECISIONS 465).
+pub const SCHEMA_VERSION: u32 = 10;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.
@@ -69,6 +70,9 @@ pub const SCHEMA_VERSION: u32 = 9;
 //    keying on it can now ask this binary for a schema a version-8 one would
 //    have refused, and "which kinds does this binary publish" is exactly what
 //    the stamp is for.
+// 10: all accumulated schema changes after 9, including envelope constraints
+//     and payloads. Versioned archives now pin each set independently of the
+//     current checked-in copies (DECISIONS 465).
 
 /// Every command that emits an envelope, with the payload its `data` carries.
 ///
@@ -298,6 +302,88 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Current output and the mutable copies may drift together. An archived
+    /// document selected by the version does not drift with either of them.
+    #[test]
+    fn a_published_version_keeps_its_archived_schema_contract() {
+        for (kind, file) in [
+            (SchemaKind::Declaration, "declaration.schema.json"),
+            (SchemaKind::Config, "pbps.yml.schema.json"),
+            (SchemaKind::Envelope, "envelope.schema.json"),
+        ] {
+            let mut current = schema(kind);
+            let mut published = archived_schema(SCHEMA_VERSION, file);
+            // This annotation identifies a build, not the schema contract.
+            current
+                .as_object_mut()
+                .unwrap()
+                .remove("x-pbps-tool-version");
+            published
+                .as_object_mut()
+                .unwrap()
+                .remove("x-pbps-tool-version");
+            assert!(
+                current == published,
+                "{file} changed under published schema version {SCHEMA_VERSION}; \
+                 bump the schema-set version and add its archive, keeping existing archives"
+            );
+        }
+    }
+
+    fn archived_schema(version: u32, file: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/published-schemas")
+            .join(version.to_string())
+            .join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing published schema archive {}: {e}", path.display()));
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            document["x-pbps-schema-version"],
+            version,
+            "{}",
+            path.display()
+        );
+        document
+    }
+
+    /// Version 9 was already reused for incompatible documents. Keep one real
+    /// legacy publication to prove why the current contract needs a new key.
+    #[test]
+    fn a_changed_envelope_contract_has_a_distinct_published_version() {
+        let legacy = archived_schema(9, "envelope.schema.json");
+        let current = schema(SchemaKind::Envelope);
+        let old_validator = jsonschema::validator_for(&legacy).unwrap();
+        let new_validator = jsonschema::validator_for(&current).unwrap();
+        let mut envelope = serde_json::json!({
+            "schema_version": 1,
+            "tool_version": "0.0.0",
+            "command": "state list",
+            "result": "ok",
+            "findings": [],
+            "data": {
+                "environment": "test",
+                "initialized": true,
+                "limit": 1,
+                "entries": []
+            }
+        });
+        assert!(old_validator.is_valid(&envelope));
+        assert!(new_validator.is_valid(&envelope));
+        envelope["data"]["limit"] = 0.into();
+        assert!(old_validator.is_valid(&envelope));
+        assert!(!new_validator.is_valid(&envelope));
+        assert_ne!(
+            legacy["x-pbps-schema-version"],
+            current["x-pbps-schema-version"]
+        );
+        // The envelope's own wire version is independent of the schema set.
+        envelope["data"]["limit"] = 1.into();
+        envelope["schema_version"] = 2.into();
+        assert!(!old_validator.is_valid(&envelope));
+        assert!(!new_validator.is_valid(&envelope));
     }
 
     /// `deny_unknown_fields` is what turns a typo into an error rather than a
@@ -597,11 +683,15 @@ mod tests {
         assert_eq!(v["required"], serde_json::json!(["dialect"]), "{v}");
     }
 
-    /// Both schemas carry their own version, so a copy found on disk can say
+    /// Every schema carries its version, so a copy found on disk can say
     /// whether it is the one this binary would produce.
     #[test]
     fn every_schema_is_stamped_with_its_version() {
-        for kind in [SchemaKind::Config, SchemaKind::Declaration] {
+        for kind in [
+            SchemaKind::Config,
+            SchemaKind::Declaration,
+            SchemaKind::Envelope,
+        ] {
             let v = schema(kind);
             assert_eq!(v["x-pbps-schema-version"], SCHEMA_VERSION);
             assert_eq!(v["x-pbps-tool-version"], env!("CARGO_PKG_VERSION"));
