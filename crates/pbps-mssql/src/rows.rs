@@ -579,14 +579,28 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
 /// means the cell is not what the plan recorded, and the caller's own
 /// "the row is not as the plan recorded it" is a better answer than the
 /// engine's conversion error (Msg 245).
-pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> String {
-    match ty.base.as_str() {
+///
+/// `None` for `image`, which has no inverse to give. **Measured**, and not a
+/// conversion that merely fails — `TRY_CONVERT(image, N'0x02')` is
+/// `Msg 529: Explicit conversion from data type nvarchar to image is not
+/// allowed`, with or without style 1, so the expression does not run at all
+/// rather than answering NULL. A statement built from it raises instead of
+/// refusing, which is the one thing `TRY_CONVERT` is here to avoid. It is the
+/// only type in this dialect's catalogue with that answer: `text`, `ntext`,
+/// `xml`, `geometry`, `geography`, `hierarchyid`, `timestamp` and
+/// `sql_variant` all convert back.
+///
+/// An `Option` rather than a check beside the call, so the type that cannot be
+/// spelled back has no expression to spell it with.
+pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> Option<String> {
+    Some(match ty.base.as_str() {
         "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => {
             format!("TRY_CONVERT({ty}, {literal}, 126)")
         }
         "binary" | "varbinary" | "timestamp" => format!("TRY_CONVERT({ty}, {literal}, 1)"),
+        "image" => return None,
         _ => format!("TRY_CONVERT({ty}, {literal})"),
-    }
+    })
 }
 
 /// Whether the engine is asked to confirm a cell of this column at its

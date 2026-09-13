@@ -11662,8 +11662,28 @@ SPEC is in sync with all of these.
      this dialect still writes is on key columns — `WHERE [key] = N'…'` — and
      none of the six can be one: refused as a `PRIMARY KEY` and as a `UNIQUE`,
      so no foreign key can reference one either. There is no type left for the
-     guard to protect, and `Held::as_stored` no longer returns an `Option`.
+     guard to protect.
 
      What a plan holds therefore widens: an `INSERT` that leaves an `xml`
      column to a literal default now carries a predicate holding it to that
      default, where before it carried none.
+
+     **One case the widening must not reach, found in review: a retyped
+     `image` column.** Holding a cell across a retype means putting the
+     recorded text back through the type that rendered it, and `image` has no
+     way back. **Measured**, and not a conversion that merely fails:
+
+     ```text
+     TRY_CONVERT(image, N'0x02')      ->  Msg 529: Explicit conversion from data
+     TRY_CONVERT(image, N'0x02', 1)       type nvarchar to image is not allowed
+     ```
+
+     So the expression does not run at all rather than answering NULL, and a
+     statement built from it raises where it should refuse — which is the one
+     thing `TRY_CONVERT` is in that predicate to avoid. `rows::from_text`
+     returns an `Option` now, `None` for `image` alone: `text`, `ntext`, `xml`,
+     `geometry`, `geography`, `hierarchyid`, `timestamp` and `sql_variant` were
+     each measured converting back. `Held::as_stored` keeps its `Option` for
+     that one reason — a retype it cannot invert — rather than the old one, a
+     type without an operator, and an `image` column this plan leaves alone is
+     held like any other, because nothing is converted.
