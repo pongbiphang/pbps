@@ -8655,6 +8655,119 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
     conn.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn views_with_nondefault_options_are_named_and_default_options_stay_plain() {
+    let mut db = TestDb::create("view_options227").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE TABLE app.t (id int primary key)")
+        .await
+        .unwrap();
+    let defaults = [
+        ("plain", ""),
+        ("invoker_false", "WITH (security_invoker=false)"),
+        ("invoker_off", "WITH (security_invoker=off)"),
+        ("invoker_no", "WITH (security_invoker=no)"),
+        ("invoker_zero", "WITH (security_invoker=0)"),
+        ("barrier_false", "WITH (security_barrier=false)"),
+        (
+            "both_false",
+            "WITH (security_invoker=off, security_barrier=no)",
+        ),
+    ];
+    let unsupported = [
+        ("invoker", "security_invoker=true"),
+        ("barrier", "security_barrier=on"),
+        ("local_check", "check_option=local"),
+        ("cascaded_check", "check_option=cascaded"),
+        ("mixed", "security_invoker=false, security_barrier=true"),
+    ];
+    for (name, options) in defaults {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.{name} {options} AS SELECT id FROM app.t"
+            ))
+            .await
+            .unwrap();
+    }
+    for (name, options) in unsupported {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.{name} WITH ({options}) AS SELECT id FROM app.t WHERE id > 0"
+            ))
+            .await
+            .unwrap();
+    }
+    db.conn
+        .execute(
+            "CREATE FUNCTION app.ignore_write() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN NEW; END $$;
+             CREATE TRIGGER held INSTEAD OF INSERT ON app.invoker_off
+                 FOR EACH ROW EXECUTE FUNCTION app.ignore_write();
+             CREATE TRIGGER omitted INSTEAD OF INSERT ON app.invoker
+                 FOR EACH ROW EXECUTE FUNCTION app.ignore_write();
+             CREATE VIEW app.extension_view WITH (security_invoker=true) AS SELECT id FROM app.t;
+             ALTER EXTENSION plpgsql ADD VIEW app.extension_view;",
+        )
+        .await
+        .unwrap();
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn).await.unwrap();
+    db.drop().await;
+
+    for (name, _) in defaults {
+        let id = format!("app.{name}").parse().unwrap();
+        assert!(pulled.schema.modules.contains_key(&id), "{id}");
+        assert!(
+            !pulled
+                .limitations
+                .iter()
+                .any(|l| l.target.matches_module(&id)),
+            "{id}"
+        );
+    }
+    for (name, options) in unsupported {
+        let id = format!("app.{name}").parse().unwrap();
+        assert!(!pulled.schema.modules.contains_key(&id), "{id}");
+        let limitation = pulled
+            .limitations
+            .iter()
+            .find(|l| l.target.matches_module(&id))
+            .unwrap();
+        for option in options.split(", ") {
+            assert!(limitation.detail.contains(option), "{}", limitation.detail);
+        }
+        assert!(
+            pulled
+                .unmanaged_modules
+                .iter()
+                .any(|m| m.kind == "view" && m.target.matches_module(&id))
+        );
+    }
+    assert!(
+        pulled
+            .schema
+            .modules
+            .contains_key(&"app.invoker_off.held".parse().unwrap())
+    );
+    let omitted = "app.invoker.omitted".parse().unwrap();
+    assert!(!pulled.schema.modules.contains_key(&omitted));
+    assert!(
+        pulled
+            .limitations
+            .iter()
+            .any(|l| l.target.matches_module(&omitted))
+    );
+    let extension = "app.extension_view".parse().unwrap();
+    assert!(!pulled.schema.modules.contains_key(&extension));
+    assert!(
+        !pulled
+            .limitations
+            .iter()
+            .any(|l| l.target.matches_module(&extension))
+    );
+    assert!(pbps_model::module::check_names(&pulled.schema).is_empty());
+}
+
 /// A module the catalog scan saw and the deparse could not: the third of
 /// "absent, empty and unreadable", and the one the pull used to report as its
 /// own bug.
