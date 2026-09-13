@@ -6468,12 +6468,12 @@ SPEC is in sync with all of these.
     with the identity `dl.h(dl."money$type")`, and the argument was refused
     before it reached the engine.
 
-    **Amended again: `$` is a continuation and never a first character**
-    (issue #204). The character was admitted at any position, which gave back
-    the property the whitelist exists for. The whitelist is not about which
-    types exist — it is what makes the identity safe to interpolate verbatim
-    into `DROP FUNCTION` and `GRANT` by construction rather than by review,
-    and a leading `$` is the one position where the interpolated text stops
+    **Amended again: `$` is admitted only where an unquoted identifier is
+    already open** (issue #204). The character was admitted at any position,
+    which gave back the property the whitelist exists for. The whitelist is not
+    about which types exist — it is what makes the identity safe to interpolate
+    verbatim into `DROP FUNCTION` and `GRANT` by construction rather than by
+    review, and a `$` that opens a token is where the interpolated text stops
     being a name. Measured on 18.6:
 
     ```text
@@ -6487,6 +6487,26 @@ SPEC is in sync with all of these.
     match, so `a$$b` is one name and not a quote opening — and that spelling
     stays accepted. A token that *opens* with one names no type in any case, so
     refusing it costs nothing and takes the swallowed statement with it.
+
+    **And "an identifier is open" is state, not the last character emitted.**
+    The first rule read back one character and asked whether a name may contain
+    it, which a digit may — so `1$$` passed, and review round 1 on #520 was
+    right that it should not. An ASCII digit continues an identifier and cannot
+    begin one, so a token that starts with one is a numeric constant and the
+    `$$` after it opens a quote like any other. Measured:
+
+    ```text
+    SELECT 1$$;                              ->  unterminated dollar-quoted
+                                                 string at or near "$$;"
+    DROP FUNCTION app.f(numeric(10$$)); …    ->  unterminated dollar-quoted
+                                                 string at or near
+                                                 "$$)); SELECT 1;"
+    ```
+
+    The second is the one that matters: the parse is still live inside the
+    modifier, so nothing refuses the statement before the quote swallows its
+    suffix. The parser now carries whether a token opened with `ident_start`,
+    updated in one place so no arm of the whitelist can forget it.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three

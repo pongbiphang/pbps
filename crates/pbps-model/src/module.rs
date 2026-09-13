@@ -97,15 +97,17 @@ impl RoutineArg {
     }
 }
 
-/// Whether a character can continue an unquoted name, which is what a `$` has
-/// to follow to be one byte of a type name rather than the start of a token.
+/// Whether a character can *begin* an unquoted identifier, which is the
+/// engine's `ident_start` as this whitelist can see it: a letter, `_`, or any
+/// non-ASCII byte.
 ///
-/// The engine's `ident_cont` as this whitelist can see it: what `FromStr`
-/// already admits outside quotes, minus the punctuation that separates one
-/// name from the next. `.` is not here — a name does not resume after a
-/// qualifying dot with a `$`, because `a.$b` names nothing (measured).
-fn continues_a_name(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii()
+/// An ASCII digit is the one character that continues an identifier without
+/// being able to start one, and the difference is the whole of the `$` rule:
+/// **measured**, `SELECT 1$$;` is `unterminated dollar-quoted string at or
+/// near "$$;"`, because `1` is a numeric token and the `$$` after it opens a
+/// quote rather than continuing a name.
+fn begins_an_identifier(c: char) -> bool {
+    (c.is_alphabetic() && c.is_ascii()) || c == '_' || !c.is_ascii()
 }
 
 /// What a routine argument's text may not be.
@@ -153,6 +155,12 @@ impl FromStr for RoutineArg {
         let mut brackets = 0usize;
         let mut quoted = false;
         let mut pending_space = false;
+        // Whether the character about to be read continues an unquoted
+        // *identifier* — a token that began with `ident_start`. Tracked rather
+        // than inferred from the last character emitted, because a digit
+        // continues an identifier and also begins a numeric token, and only
+        // one of those may be followed by a `$`.
+        let mut in_identifier = false;
         let mut chars = t.char_indices();
         while let Some((i, c)) = chars.next() {
             if quoted {
@@ -171,6 +179,8 @@ impl FromStr for RoutineArg {
             }
             if c.is_ascii_whitespace() {
                 pending_space = !out.is_empty();
+                // A space ends the token, so the next word starts one.
+                in_identifier = false;
                 continue;
             }
             match c {
@@ -180,19 +190,23 @@ impl FromStr for RoutineArg {
                 ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
                 ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
                 ',' | '"' | '.' | '_' => {}
-                // `$` continues a name and cannot begin one, which is the
-                // engine's own rule and the one position where this whitelist
-                // would stop making the statement safe. **Measured**:
-                // `dl.money$type` and `dl.a$$b` are types, identified as
-                // `dl."money$type"` and `dl."a$$b"` — the doubled `$` inside a
-                // word is two bytes of the name, because the identifier is the
-                // longer match. Opening a token with one is not a name at all:
-                // `CREATE DOMAIN dl.$x` is `syntax error at or near "$"`, and
+                // `$` only where an unquoted **identifier** is already open —
+                // not merely after a character a name may contain. That is the
+                // one position where this whitelist would otherwise stop
+                // making the statement safe. **Measured**: `dl.money$type` and
+                // `dl.a$$b` are types, identified as `dl."money$type"` and
+                // `dl."a$$b"` — the doubled `$` inside a word is two bytes of
+                // the name, because the identifier is the longer match. Where
+                // no identifier is open the `$` opens a quote instead:
+                // `CREATE DOMAIN dl.$x` is `syntax error at or near "$"`,
                 // `DROP FUNCTION dl.f($$)` is `unterminated dollar-quoted
-                // string at or near "$$); …"` — the rest of the statement
-                // swallowed, which is what this whitelist exists to make
-                // impossible by construction.
-                '$' if !pending_space && out.chars().next_back().is_some_and(continues_a_name) => {}
+                // string at or near "$$); …"`, and — the case a test of the
+                // last character alone let through —
+                // `DROP FUNCTION app.f(numeric(10$$)); SELECT 1;` is
+                // `unterminated dollar-quoted string at or near
+                // "$$)); SELECT 1;"`. The statement suffix swallowed is what
+                // this whitelist exists to make impossible by construction.
+                '$' if in_identifier => {}
                 // Any non-ASCII byte is a name byte, which is the engine's own
                 // rule (`continues_ident`): a letter, a symbol, a space that is
                 // not the ASCII one.
@@ -207,6 +221,19 @@ impl FromStr for RoutineArg {
                 // one.
                 _ => return Err(shape(t)),
             }
+            // Where the token the next character belongs to stands, updated in
+            // one place so that no arm above can forget it. Punctuation and a
+            // quoted region end the token; a letter, `_` or a non-ASCII byte
+            // opens one; a digit continues an identifier without opening one —
+            // `10` in `numeric(10,2)` is a numeric token, and that is the whole
+            // difference the `$` rule turns on.
+            in_identifier = match c {
+                '$' => true,
+                c if c.is_alphanumeric() || c == '_' || !c.is_ascii() => {
+                    in_identifier || begins_an_identifier(c)
+                }
+                _ => false,
+            };
             // A space between two words is part of the name — `timestamp with
             // time zone` — and a space beside punctuation is layout.
             //
@@ -2628,6 +2655,20 @@ mod tests {
             "a.$b",
             "a $b",
             "\"a\"$b",
+            // And a `$` after a token that is not an identifier at all. A
+            // digit continues a name but cannot begin one, so `10` is a
+            // numeric token and the quote opens after it: **measured**,
+            // `SELECT 1$$;` is `unterminated dollar-quoted string at or near
+            // "$$;"`, and inside a modifier, where the parse is still live,
+            // `DROP FUNCTION app.f(numeric(10$$)); SELECT 1;` is
+            // `unterminated dollar-quoted string at or near "$$)); SELECT 1;"`
+            // — the statement suffix swallowed. Inferring the token from the
+            // last character emitted admitted every one of these.
+            "1$$",
+            "1$a",
+            "numeric(10$$)",
+            "a(1$$)",
+            "a[1$$]",
         ] {
             assert!(
                 bad.parse::<RoutineArg>().is_err(),
@@ -2639,7 +2680,18 @@ mod tests {
         // A `$` is a name byte where a name may continue: measured,
         // `dl.money$type` and `dl.a$$b` are types, identified as
         // `dl."money$type"` and `dl."a$$b"`.
-        for good in ["dl.money$type", "dl.a$$b", "a$", "_$x", "r8.a\u{a0}$b"] {
+        for good in [
+            "dl.money$type",
+            "dl.a$$b",
+            "a$",
+            "_$x",
+            "r8.a\u{a0}$b",
+            // A digit *inside* an identifier is a name byte, and the token it
+            // is in was opened by a letter — so this one is a name and `1$$`
+            // is not.
+            "a1$b",
+            "a(b1$c)",
+        ] {
             assert_eq!(
                 good.parse::<RoutineArg>()
                     .unwrap_or_else(|e| panic!("{good}: {e}"))
