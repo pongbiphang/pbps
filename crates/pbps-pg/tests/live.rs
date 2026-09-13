@@ -2067,6 +2067,14 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE AGGREGATE {s}.theirs_agg(integer) (sfunc = int4pl, stype = integer);
              ALTER EXTENSION btree_gist ADD MATERIALIZED VIEW {s}.theirs_mv;
              ALTER EXTENSION btree_gist ADD AGGREGATE {s}.theirs_agg(integer);
+             -- And two tables, which `ALTER EXTENSION … ADD TABLE` hands over
+             -- the same way. One is a table this model holds and one is not,
+             -- because the table reader and the limitation reader are two
+             -- readers and each had to be told: neither is this project's.
+             CREATE TABLE {s}.theirs_table (id integer PRIMARY KEY);
+             CREATE UNLOGGED TABLE {s}.theirs_unlogged (id integer);
+             ALTER EXTENSION btree_gist ADD TABLE {s}.theirs_table;
+             ALTER EXTENSION btree_gist ADD TABLE {s}.theirs_unlogged;
              CREATE TABLE {s}.temporal (
                  id integer, valid daterange,
                  CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
@@ -2248,8 +2256,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     // refuses every command for a limitation whose name is in the managed set,
     // so an extension object colliding with a declared name would refuse a
     // plan that is correct. A materialized view and an aggregate are the two
-    // kinds the unheld reader reports, so they are the two this checks.
-    for theirs in ["theirs_mv", "theirs_agg"] {
+    // kinds the unheld reader reports; `theirs_unlogged` is the fourth thing
+    // that reader names — a table of a kind the model does not hold — and it
+    // is an extension's before it is unheld.
+    for theirs in ["theirs_mv", "theirs_agg", "theirs_unlogged"] {
         assert!(
             !all.contains(theirs),
             "`{s}.{theirs}` belongs to an extension and is nobody's declaration:\n{all}"
@@ -2265,6 +2275,20 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             .any(|id| id.schema() == s && id.name().starts_with("theirs")),
         "{:?}",
         pulled.schema.modules.keys().collect::<Vec<_>>()
+    );
+    // `theirs_table` is an ordinary heap table with a primary key: everything
+    // the table reader holds, owned by somebody else. Pulled, it is an
+    // undeclared table a `unmanaged: error` run refuses over and no
+    // declaration can claim — its definition lives in a `.sql` file the
+    // extension owns.
+    assert!(
+        !pulled
+            .schema
+            .tables
+            .keys()
+            .any(|name| name.schema == s && name.name.starts_with("theirs")),
+        "{:?}",
+        pulled.schema.tables.keys().collect::<Vec<_>>()
     );
 
     // The two that must be left out rather than read back wrong.
@@ -9505,6 +9529,16 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
             "CREATE TRIGGER user_tg INSTEAD OF INSERT ON {s}.pg_buffercache FOR EACH ROW EXECUTE \
              FUNCTION {s}.tg()"
         ),
+        // A *table* an extension owns is left out of the pull for the same
+        // reason the view is, and a user's trigger on one is as much the
+        // user's. `ALTER EXTENSION … ADD TABLE` makes the `pg_depend` edge the
+        // reader keys on without an extension that ships a table.
+        format!("CREATE TABLE {s}.theirs (id int primary key)"),
+        format!("ALTER EXTENSION pg_buffercache ADD TABLE {s}.theirs"),
+        format!(
+            "CREATE TRIGGER user_tg BEFORE INSERT ON {s}.theirs FOR EACH ROW EXECUTE FUNCTION \
+             {s}.tg()"
+        ),
     ] {
         conn.execute(&sql)
             .await
@@ -9535,7 +9569,8 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         [
             format!("{s}.part.audit"),
             format!("{s}.pg_buffercache.user_tg"),
-            format!("{s}.scratch.audit")
+            format!("{s}.scratch.audit"),
+            format!("{s}.theirs.user_tg")
         ]
     );
 
@@ -9576,6 +9611,7 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         "scratch",
         "scratch.audit",
         "pg_buffercache.user_tg",
+        "theirs.user_tg",
     ] {
         assert!(
             named.contains(&left_out.to_owned()),
@@ -9584,9 +9620,19 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     }
     assert!(!named.contains(&"t.audit".to_owned()), "{named:?}");
     assert!(
-        !named.contains(&"pg_buffercache".to_owned()),
-        "the extension's view is left out silently, and only the user's trigger on it is named: \
-         {named:?}"
+        !named.contains(&"pg_buffercache".to_owned()) && !named.contains(&"theirs".to_owned()),
+        "the extension's view and table are left out silently, and only the user's triggers on \
+         them are named: {named:?}"
+    );
+    // Left out, not read back: without the table reader's filter `theirs` was
+    // an ordinary undeclared table, and its trigger was held rather than named.
+    assert!(
+        !pulled
+            .schema
+            .tables
+            .contains_key(&pbps_model::TableName::new(&s, "theirs")),
+        "{:?}",
+        pulled.schema.tables.keys().collect::<Vec<_>>()
     );
     let detail = &ours_limitations(&pulled, &s)
         .iter()

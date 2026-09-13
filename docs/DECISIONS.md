@@ -6051,6 +6051,21 @@ SPEC is in sync with all of these.
     rule the ordinary reader applies and the reader beside it does not is a
     rule with a hole in it, and the hole is on the path that refuses.
 
+    **Amended again: the table readers are readers too** (issue #201). The
+    filter reached the module queries and the unheld-module query and stopped
+    there, so `CREATE EXTENSION … SCHEMA app` and `ALTER EXTENSION … ADD TABLE`
+    — measured, both put an extension's table in a project's schema — left it
+    pulled as an ordinary undeclared table. Under `unmanaged: error` the next
+    command refuses a database nothing is wrong with, and no declaration can
+    claim it back: its definition lives in the extension's own `.sql` file. The
+    filter is now on the ordinary table reader, on the limitation reader beside
+    it, and on the predicate that decides which relation a trigger is read
+    with — a user's trigger on an extension's table is the user's, and it is
+    named as unheld rather than pulled naming a table the schema does not have.
+    The grants reader is deliberately not among them: a grant on an extension's
+    object is a grant a role really holds, and hiding it would be *absent*
+    reading as *empty*.
+
 306. **On this dialect every carried attribute refuses the rebuild today,
     because there is no declared grant for one to come back from.**
     ADR-0009 §3 decides that a grant to a **declared** role survives a module

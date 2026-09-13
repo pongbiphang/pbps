@@ -125,6 +125,7 @@ fn not_one_of_our_tables() -> String {
 /// It is reported by [`PARTITIONED`] instead.
 fn tables_query() -> String {
     let not_one_of_ours = not_one_of_ours();
+    let not_an_extensions = not_an_extensions("c.oid", "pg_class");
     format!(
         "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name
        FROM pg_catalog.pg_class c
@@ -132,6 +133,7 @@ fn tables_query() -> String {
       WHERE {ORDINARY_TABLE}
         AND {NOT_A_PROJECTS_SCHEMA}
         AND {not_one_of_ours}
+        AND {not_an_extensions}
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -165,23 +167,28 @@ const ORDINARY_TABLE: &str = "c.relkind = 'r'
 /// by [`unheld_modules_query`] rather than silently gone.
 fn on_a_relation_the_pull_holds() -> String {
     let not_one_of_ours = not_one_of_ours();
-    // The view reader's own filter too: measured, a user's `INSTEAD OF`
-    // trigger on a view an extension owns is not extension-owned itself, and
-    // read back it named a view the pull had left out.
-    let view_not_extension = not_an_extensions("c.oid", "pg_class");
+    // The relation readers' own filter too, over both arms: measured, a user's
+    // `INSTEAD OF` trigger on a view an extension owns is not extension-owned
+    // itself, and read back it named a view the pull had left out. A table an
+    // extension owns leaves the pull for the same reason (DECISIONS 305), so a
+    // user's trigger on one would name a table the schema does not have.
+    let not_an_extensions = not_an_extensions("c.oid", "pg_class");
     format!(
-        "((c.relkind = 'v' AND {view_not_extension}) OR ({ORDINARY_TABLE} AND {not_one_of_ours}))"
+        "({not_an_extensions}
+          AND (c.relkind = 'v' OR ({ORDINARY_TABLE} AND {not_one_of_ours})))"
     )
 }
 
 /// Objects owned by an extension, which are nobody's declarations.
 ///
-/// `CREATE EXTENSION` installs functions, views and types that belong to the
-/// extension and are dropped with it. `CREATE EXTENSION … SCHEMA app` puts them
-/// in a project's schema, where a reader without this filter reports every one
-/// as an undeclared module and the next plan offers to drop them — objects
-/// whose declaration lives in a `.sql` file the extension owns and this project
-/// does not have.
+/// `CREATE EXTENSION` installs functions, views, types — and **tables**, which
+/// `ALTER EXTENSION … ADD TABLE` also hands over — that belong to the extension
+/// and are dropped with it. `CREATE EXTENSION … SCHEMA app` puts them in a
+/// project's schema, where a reader without this filter reports every one as an
+/// undeclared object and the next plan offers to drop them — objects whose
+/// declaration lives in a `.sql` file the extension owns and this project does
+/// not have. There is no way to declare one back: under `unmanaged: error` the
+/// next command refuses a database nothing is wrong with.
 ///
 /// Left out rather than reported: they are not a limitation of the model, they
 /// are somebody else's objects. `DROP EXTENSION` is how one goes away
@@ -344,8 +351,14 @@ fn unheld_modules_query() -> String {
 /// gives the column to every child. A managed parent would therefore compare
 /// clean while a plan against it silently changed tables nobody declared. Both
 /// ends of `pg_inherits` are excluded, and each is named for its own reason.
+///
+/// An extension's table is not here either, for the reason
+/// [`unheld_modules_query`] leaves an extension's materialized view out: it is
+/// nobody's declaration, and `managed_limitations` refuses every command for a
+/// limitation whose name is in the managed set (DECISIONS 305).
 fn partitioned_query() -> String {
     let not_one_of_ours = not_one_of_ours();
+    let not_an_extensions = not_an_extensions("c.oid", "pg_class");
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
             c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
@@ -362,6 +375,7 @@ fn partitioned_query() -> String {
        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
       WHERE {NOT_A_PROJECTS_SCHEMA}
         AND {not_one_of_ours}
+        AND {not_an_extensions}
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
@@ -2333,6 +2347,46 @@ mod tests {
             // time, and the pull would report it absent.
             assert!(!sql.contains("pbps\\_%"), "{name}: {sql}");
         }
+    }
+
+    /// An extension's objects are nobody's declarations (DECISIONS 305), and
+    /// that holds for a table as much as for a module: `CREATE EXTENSION …
+    /// SCHEMA app` installs one into a project's schema and `ALTER EXTENSION …
+    /// ADD TABLE` hands an existing one over. A reader with the filter beside
+    /// one without it is the shape this catches — the modules left out
+    /// silently, the table beside them pulled as undeclared, and no way to
+    /// declare it back. Pinned live by
+    /// `what_the_model_cannot_hold_is_named_and_never_silently_dropped`.
+    #[test]
+    fn an_extensions_table_is_neither_held_nor_named_by_any_reader_that_reads_tables() {
+        let not_an_extensions = not_an_extensions("c.oid", "pg_class");
+        for (name, sql) in [
+            ("TABLES", tables_query()),
+            ("PARTITIONED", partitioned_query()),
+            ("HELD", on_a_relation_the_pull_holds()),
+            ("UNHELD_MODULES", unheld_modules_query()),
+        ] {
+            assert!(sql.contains(&not_an_extensions), "{name}: {sql}");
+        }
+        // Over *both* arms of the held predicate, not the view's alone: the
+        // filter that keeps an extension's table out of `tables_query` leaves
+        // a user's trigger on one with no relation to be read with, and a
+        // trigger read without its relation is a pull `check_names` refuses.
+        // One filter, ahead of both arms.
+        let held = on_a_relation_the_pull_holds();
+        let filter = held.find(&not_an_extensions).expect("the filter");
+        let view_arm = held.find("c.relkind = 'v'").expect("the view arm");
+        let table_arm = held.find(ORDINARY_TABLE).expect("the table arm");
+        assert!(filter < view_arm && filter < table_arm, "{held}");
+        // And deliberately not the grants reader: a grant on an extension's
+        // object is a grant a role really holds, so hiding it would be absent
+        // reading as empty. Its own filters are `not_one_of_our_tables` and
+        // `NOT_AN_INDEX_OR_TOAST`.
+        assert!(
+            !grants_query().contains(&not_an_extensions),
+            "{}",
+            grants_query()
+        );
     }
 
     /// A backslash in an ordinary string literal is only a backslash while
