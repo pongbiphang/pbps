@@ -29,11 +29,10 @@
 //!
 //! # Why these two tables are not part of the managed set
 //!
-//! [`crate::catalog`]'s table query excludes them by name, so the tool never
-//! introspects its own bookkeeping and never plans a change to it. Qualifying
-//! that filter with [`LEDGER_SCHEMA`] — so that a project's own
-//! `app.__pbps_state` stays visible — is #185, which was waiting on this module
-//! to say where the ledger lives.
+//! [`crate::catalog`]'s table query excludes the two qualified ledger names,
+//! using [`LEDGER_SCHEMA`] and the shared ledger names. The tool never plans a
+//! change to its bookkeeping, while a project's own `app.__pbps_state` remains
+//! visible to both the catalog and validation.
 
 use pbps_db::ledger::{
     LOCK_TABLE_NAME, LedgerEntry, LedgerError, LockInfo, STATE_TABLE_NAME, TimelineEntry,

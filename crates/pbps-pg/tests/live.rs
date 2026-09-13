@@ -25,6 +25,93 @@ use pbps_dialect::{Dialect, TypeChangeRisk};
 use pbps_model::ColumnType;
 use pbps_pg::Postgres;
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
+    let mut db = TestDb::create("qualified_ledger185").await;
+    pbps_pg::state::ensure_tables(&mut db.conn).await.unwrap();
+    let role = least_privilege_role(&mut db, "qualified185").await;
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA app;
+         CREATE SCHEMA limited;
+         CREATE TABLE app.__pbps_state (id integer PRIMARY KEY);
+         CREATE TABLE app.__pbps_lock (id integer REFERENCES app.__pbps_state(id));
+         CREATE TABLE app.__pbps_customers (id integer);
+         CREATE TABLE limited.__pbps_state (id integer) PARTITION BY RANGE (id);
+         CREATE FUNCTION app.ledger185_fn() RETURNS trigger LANGUAGE plpgsql
+             AS $$ BEGIN RETURN NEW; END $$;
+         CREATE TRIGGER ledger185_trigger BEFORE INSERT ON app.__pbps_state
+             FOR EACH ROW EXECUTE FUNCTION app.ledger185_fn();
+         GRANT USAGE ON SCHEMA app TO {role};
+         GRANT SELECT ON app.__pbps_state, app.__pbps_lock TO {role};
+         GRANT SELECT ON public.__pbps_state, public.__pbps_lock TO {role};"
+        ))
+        .await
+        .unwrap();
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn).await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    let pulled = pulled.unwrap();
+    for name in [
+        "app.__pbps_state",
+        "app.__pbps_lock",
+        "app.__pbps_customers",
+    ] {
+        let name = name.parse().unwrap();
+        let table = pulled
+            .schema
+            .tables
+            .get(&name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(table.columns.contains_key("id"), "{name}");
+        assert!(
+            Postgres::new().validate_table(&name, table).is_empty(),
+            "{name}"
+        );
+    }
+    for name in [
+        pbps_pg::state::STATE_TABLE,
+        pbps_pg::state::LOCK_TABLE,
+        "limited.__pbps_state",
+    ] {
+        assert!(
+            !pulled.schema.tables.contains_key(&name.parse().unwrap()),
+            "{name}"
+        );
+    }
+    assert!(
+        pulled
+            .limitations
+            .iter()
+            .any(|l| l.detail.contains("limited.__pbps_state")),
+        "{:?}",
+        pulled.limitations
+    );
+    assert!(
+        pulled
+            .schema
+            .modules
+            .keys()
+            .any(|id| id.to_string().contains("ledger185_trigger")),
+        "{:?}",
+        pulled.schema.modules
+    );
+    let grants = &pulled.schema.roles[&role].grants;
+    for name in ["app.__pbps_state", "app.__pbps_lock"] {
+        assert!(
+            grants.keys().any(|target| target.to_string() == name),
+            "{name}: {grants:?}"
+        );
+    }
+    for name in [pbps_pg::state::STATE_TABLE, pbps_pg::state::LOCK_TABLE] {
+        assert!(
+            !grants.keys().any(|target| target.to_string() == name),
+            "{name}: {grants:?}"
+        );
+    }
+}
+
 /// Opens a connection to the live server this suite runs against.
 ///
 /// The driver is named here once, as it is on the SQL Server side: every test
@@ -2350,7 +2437,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
 
     // The partitioned table is not in the pull at all — and this is why the
     // warning above matters, because otherwise it reads as a table to create.
-    // This tool's own tables are not in it either.
+    // Same-named project tables outside the ledger schema remain visible.
     assert_eq!(
         ours(&pulled, &s),
         [
@@ -2358,6 +2445,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             // `__pbps_lock` out names them, and a prefix would have reported a
             // project's own table as absent.
             pbps_model::TableName::new(&s, "__pbps_customers"),
+            pbps_model::TableName::new(&s, "__pbps_lock"),
+            pbps_model::TableName::new(&s, "__pbps_state"),
             pbps_model::TableName::new(&s, "borrowing"),
             pbps_model::TableName::new(&s, "bounded"),
             pbps_model::TableName::new(&s, "cached"),
@@ -17377,28 +17466,27 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
 }
 
 /// The ledger is two **tables**, so the grants query hides those two names only
-/// where they are a table.
+/// where they are a table in its schema.
 ///
 /// `modules_query` keeps a view whatever it is called, so a project may declare
-/// `app.__pbps_state` as a view; measured here, the grant on it is pulled while
+/// `public.__pbps_state` as a view; measured here, the grant on it is pulled while
 /// the grant on a *table* of that name is not. Hidden by name alone, the view
 /// came back without its grant, the apply's own read-back would refuse the plan
 /// for not having achieved its postcondition, and every plan after it would
 /// propose the same `GRANT` again.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-async fn the_ledger_names_are_hidden_where_they_are_a_table_and_not_where_they_are_a_view() {
+async fn the_ledger_names_are_hidden_only_for_tables_in_its_schema() {
     let mut db = TestDb::create("ledgername").await;
     let role = least_privilege_role(&mut db, "ledgername").await;
     for sql in [
-        "CREATE SCHEMA app".to_owned(),
         // A view of the ledger's name, which the module reader keeps.
-        "CREATE VIEW app.__pbps_state AS SELECT 1 AS id".to_owned(),
+        "CREATE VIEW public.__pbps_state AS SELECT 1 AS id".to_owned(),
         // And a table of it, which it does not.
-        "CREATE TABLE app.__pbps_lock (id integer)".to_owned(),
-        format!("GRANT USAGE ON SCHEMA app TO {role}"),
-        format!("GRANT SELECT ON app.__pbps_state TO {role}"),
-        format!("GRANT SELECT ON app.__pbps_lock TO {role}"),
+        "CREATE TABLE public.__pbps_lock (id integer)".to_owned(),
+        format!("GRANT USAGE ON SCHEMA public TO {role}"),
+        format!("GRANT SELECT ON public.__pbps_state TO {role}"),
+        format!("GRANT SELECT ON public.__pbps_lock TO {role}"),
     ] {
         db.conn.execute(&sql).await.expect(&sql);
     }
@@ -17410,7 +17498,7 @@ async fn the_ledger_names_are_hidden_where_they_are_a_table_and_not_where_they_a
         pulled
             .schema
             .modules
-            .contains_key(&"app.__pbps_state".parse().expect("a module id")),
+            .contains_key(&"public.__pbps_state".parse().expect("a module id")),
         "the view is pulled: {:?}",
         pulled.schema.modules.keys().collect::<Vec<_>>()
     );
@@ -17418,7 +17506,7 @@ async fn the_ledger_names_are_hidden_where_they_are_a_table_and_not_where_they_a
         !pulled
             .schema
             .tables
-            .contains_key(&"app.__pbps_lock".parse().expect("a table name")),
+            .contains_key(&"public.__pbps_lock".parse().expect("a table name")),
         "a table of the ledger's name is not"
     );
     assert_eq!(
@@ -17431,7 +17519,7 @@ async fn the_ledger_names_are_hidden_where_they_are_a_table_and_not_where_they_a
             .keys()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        ["app.__pbps_state", "schema::app"],
+        ["public.__pbps_state", "schema::public"],
         "the view's grant is read and the table's is not"
     );
 

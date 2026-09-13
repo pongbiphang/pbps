@@ -86,38 +86,34 @@ pub(crate) fn a_projects_schema(name: &str) -> bool {
     !matches!(name, "pg_catalog" | "information_schema") && !name.starts_with("pg_")
 }
 
-/// This tool's own tables, which arrive at Phase 5 step 8. They must never
-/// enter the managed set, or the tool would plan changes to itself.
-///
-/// **By name, not by prefix.** `NOT LIKE '\_\_pbps\_%'` also hides a
-/// project's own `app.__pbps_customers`, and nothing refuses that declaration —
-/// so the pull reported the table absent and the next plan tried to create one
-/// that was already there. The two names SPEC §8.1 defines are the two tables
-/// this tool owns; a step that adds a third adds it here, where a reader can
-/// see what the list is for. The SQL Server pull qualifies the two with the
-/// schema SPEC §8.1 puts them in; this one cannot until step 8 says where its
-/// own ledger lives, so `app.__pbps_state` is still hidden here (#185).
-const NOT_ONE_OF_OURS: &str = "c.relname NOT IN ('__pbps_state', '__pbps_lock')";
+/// The ledger names and schema come from the ledger implementation, so the
+/// catalog and validation reserve exactly the same identities (DECISIONS 284).
+/// A project's same-named tables in another schema remain ordinary tables.
+pub(crate) const OURS: [&str; 2] = [
+    pbps_db::ledger::STATE_TABLE_NAME,
+    pbps_db::ledger::LOCK_TABLE_NAME,
+];
 
-/// [`NOT_ONE_OF_OURS`], asked only of the kind this tool's own objects are.
-///
-/// The ledger is two **tables** (SPEC §8.1), and `modules_query` already reads
-/// that way: a view is kept whatever it is called, and only an ordinary table
-/// is filtered by name. The grants query has to agree, or a declared view named
-/// `app.__pbps_state` is pulled as a module while its `relacl` row is thrown
-/// away — the grant on it then reads back as absent, the apply's own read-back
-/// refuses the plan for not having achieved its postcondition, and every plan
-/// after it proposes the same `GRANT` again (DECISIONS 386).
-const NOT_ONE_OF_OUR_TABLES: &str = "(c.relkind <> 'r' OR c.relname NOT IN ('__pbps_state',                                      '__pbps_lock'))";
+pub(crate) fn is_ours(name: &TableName) -> bool {
+    name.schema == crate::state::LEDGER_SCHEMA && OURS.contains(&name.name.as_str())
+}
 
-/// The same two names, for the one other place that has to know them:
-/// `validate_table` refuses a declaration that uses one, because a table the
-/// reader always hides is one the pull reports absent and the next plan tries
-/// to create again (DECISIONS 274). Kept beside the filter, and tied to it by
-/// `the_filter_hides_exactly_the_names_the_validation_refuses`, so the two
-/// cannot drift apart — this rule has already been spelled in two places once
-/// (PITFALLS, "one rule, spelled in three places").
-pub(crate) const OURS: [&str; 2] = ["__pbps_state", "__pbps_lock"];
+/// Catalog predicates use the relation `c` and its namespace `n`. This also
+/// scopes the unsupported-table and trigger readers: visibility must agree
+/// across every projection of the same table.
+fn not_one_of_ours() -> String {
+    format!(
+        "NOT (n.nspname = {} AND c.relname IN ({}))",
+        crate::emit::value_literal(crate::state::LEDGER_SCHEMA),
+        OURS.map(crate::emit::value_literal).join(", ")
+    )
+}
+
+/// The grants reader also sees views and sequences. A view in the ledger's
+/// schema is still a module, so its ACL must remain visible (DECISIONS 386).
+fn not_one_of_our_tables() -> String {
+    format!("(c.relkind <> 'r' OR {})", not_one_of_ours())
+}
 
 /// `relkind = 'r'`, and the filter is the whole point: `pg_attribute` holds a
 /// row for every index and sequence column too, so a reader without it reports
@@ -128,13 +124,14 @@ pub(crate) const OURS: [&str; 2] = ["__pbps_state", "__pbps_lock"];
 /// ordinary one would produce a plan that recreates it without its partitions.
 /// It is reported by [`PARTITIONED`] instead.
 fn tables_query() -> String {
+    let not_one_of_ours = not_one_of_ours();
     format!(
         "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE {ORDINARY_TABLE}
         AND {NOT_A_PROJECTS_SCHEMA}
-        AND {NOT_ONE_OF_OURS}
+        AND {not_one_of_ours}
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -167,12 +164,13 @@ const ORDINARY_TABLE: &str = "c.relkind = 'r'
 /// as a limitation by [`partitioned_query`]; the trigger is named beside it
 /// by [`unheld_modules_query`] rather than silently gone.
 fn on_a_relation_the_pull_holds() -> String {
+    let not_one_of_ours = not_one_of_ours();
     // The view reader's own filter too: measured, a user's `INSTEAD OF`
     // trigger on a view an extension owns is not extension-owned itself, and
     // read back it named a view the pull had left out.
     let view_not_extension = not_an_extensions("c.oid", "pg_class");
     format!(
-        "((c.relkind = 'v' AND {view_not_extension}) OR ({ORDINARY_TABLE} AND {NOT_ONE_OF_OURS}))"
+        "((c.relkind = 'v' AND {view_not_extension}) OR ({ORDINARY_TABLE} AND {not_one_of_ours}))"
     )
 }
 
@@ -347,6 +345,7 @@ fn unheld_modules_query() -> String {
 /// clean while a plan against it silently changed tables nobody declared. Both
 /// ends of `pg_inherits` are excluded, and each is named for its own reason.
 fn partitioned_query() -> String {
+    let not_one_of_ours = not_one_of_ours();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
             c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
@@ -362,7 +361,7 @@ fn partitioned_query() -> String {
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
       WHERE {NOT_A_PROJECTS_SCHEMA}
-        AND {NOT_ONE_OF_OURS}
+        AND {not_one_of_ours}
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
@@ -1192,6 +1191,7 @@ SELECT r.rolname AS name, r.rolsuper AS superuser
 /// `relacl` is NULL — and a reader that only asked the object would report a
 /// role as holding nothing on a table it can read a column of.
 fn grants_query() -> String {
+    let not_one_of_our_tables = not_one_of_our_tables();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS object_name,
                 'rel' AS source, c.relkind::text AS kind,
@@ -1208,7 +1208,7 @@ fn grants_query() -> String {
                     (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))) AS a
           WHERE {NOT_AN_INDEX_OR_TOAST}
             AND {NOT_A_PROJECTS_SCHEMA}
-            AND {NOT_ONE_OF_OUR_TABLES}
+            AND {not_one_of_our_tables}
          UNION ALL
          SELECT n.nspname, c.relname, 'rel', c.relkind::text,
                 NULL::int8, at.attname,
@@ -1222,7 +1222,7 @@ fn grants_query() -> String {
            CROSS JOIN LATERAL pg_catalog.aclexplode(at.attacl) AS a
           WHERE at.attacl IS NOT NULL
             AND {NOT_A_PROJECTS_SCHEMA}
-            AND {NOT_ONE_OF_OUR_TABLES}
+            AND {not_one_of_our_tables}
          UNION ALL
          SELECT n.nspname, p.proname, 'pro', p.prokind::text,
                 p.oid::int8, NULL::text,
@@ -2310,6 +2310,7 @@ mod tests {
     /// trusted to review.
     #[test]
     fn the_filters_that_keep_a_phantom_out_are_in_the_queries_that_need_them() {
+        let not_one_of_ours = not_one_of_ours();
         assert!(
             columns_query().contains("NOT a.attisdropped"),
             "ADR-0012 §6"
@@ -2326,7 +2327,7 @@ mod tests {
             ("TABLES", tables_query()),
             ("PARTITIONED", partitioned_query()),
         ] {
-            assert!(sql.contains(NOT_ONE_OF_OURS), "{name}: {sql}");
+            assert!(sql.contains(&not_one_of_ours), "{name}: {sql}");
             // By name: a prefix would also hide a project's own table
             // (`app.__pbps_customers`), which nothing refuses at declaration
             // time, and the pull would report it absent.
@@ -2403,19 +2404,35 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_hides_exactly_the_names_the_validation_refuses() {
+    fn the_filter_hides_exactly_the_qualified_names_the_validation_refuses() {
+        let not_one_of_ours = not_one_of_ours();
+        assert!(not_one_of_ours.contains(&format!(
+            "n.nspname = {}",
+            crate::emit::value_literal(crate::state::LEDGER_SCHEMA)
+        )));
+        for qualified in [crate::state::STATE_TABLE, crate::state::LOCK_TABLE] {
+            assert!(is_ours(&qualified.parse().unwrap()), "{qualified}");
+        }
+        for qualified in [
+            "app.__pbps_state",
+            "app.__pbps_lock",
+            "Public.__pbps_state",
+            "public.__pbps_customers",
+        ] {
+            assert!(!is_ours(&qualified.parse().unwrap()), "{qualified}");
+        }
         for name in OURS {
             assert!(
-                NOT_ONE_OF_OURS.contains(&format!("'{name}'")),
+                not_one_of_ours.contains(&format!("'{name}'")),
                 "`{name}` is refused by the validation and not hidden by the filter"
             );
         }
         // And nothing else: a third name in the filter that the validation does
         // not know is the same drift from the other side.
         assert_eq!(
-            NOT_ONE_OF_OURS.matches('\'').count(),
-            OURS.len() * 2,
-            "the filter names something `OURS` does not: {NOT_ONE_OF_OURS}"
+            not_one_of_ours.matches('\'').count(),
+            OURS.len() * 2 + 2,
+            "the filter names only the ledger schema and table names: {not_one_of_ours}"
         );
     }
 
@@ -2424,24 +2441,26 @@ mod tests {
     /// called. Hiding a view's ACL row instead pulls the view and drops the
     /// grant on it, which no plan can then reach.
     #[test]
-    fn the_grants_query_hides_the_ledger_by_kind_as_well_as_by_name() {
+    fn the_grants_query_hides_the_ledger_by_kind_schema_and_name() {
+        let not_one_of_ours = not_one_of_ours();
+        let not_one_of_our_tables = not_one_of_our_tables();
         let sql = grants_query();
-        assert!(sql.contains(NOT_ONE_OF_OUR_TABLES), "{sql}");
+        assert!(sql.contains(&not_one_of_our_tables), "{sql}");
         // And not the kindless filter, which is what over-applied it.
         assert!(
-            !sql.contains(&format!("AND {NOT_ONE_OF_OURS}")),
+            !sql.contains(&format!("AND {not_one_of_ours}")),
             "the grants query still filters every relkind by name: {sql}"
         );
         for name in OURS {
             assert!(
-                NOT_ONE_OF_OUR_TABLES.contains(&format!("'{name}'")),
+                not_one_of_our_tables.contains(&format!("'{name}'")),
                 "`{name}` is hidden from the inventory and not from the grants"
             );
         }
         assert_eq!(
-            NOT_ONE_OF_OUR_TABLES.matches('\'').count(),
-            OURS.len() * 2 + 2,
-            "the two names, and the `r` that says which kind: {NOT_ONE_OF_OUR_TABLES}"
+            not_one_of_our_tables.matches('\'').count(),
+            OURS.len() * 2 + 4,
+            "the schema, two names, and the `r` that says which kind: {not_one_of_our_tables}"
         );
     }
 }
