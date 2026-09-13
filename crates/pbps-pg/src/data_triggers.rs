@@ -284,13 +284,10 @@ async fn lock_by_oid(conn: &mut Conn, relation: i64) -> Result<(), DbError> {
     ))
     .await
     .map_err(|e| {
-        if matches!(&e, DbError::Driver { code, .. } if code.as_deref() == Some(DENIED)) {
-            return DbError::Driver {
-                code: Some(DENIED.to_owned()),
-                message: format!(
-                    "the data-trigger guard cannot lock `{table}`, which this row operation writes through a foreign-key referential action ({e}). The deployment role needs INSERT, UPDATE, DELETE or TRUNCATE on it to hold its triggers still through the write."
-                ),
-            };
+        if e.server_error_code().as_deref() == Some(DENIED) {
+            return e.context(format!(
+                "the data-trigger guard cannot lock `{table}`, which this row operation writes through a foreign-key referential action. The deployment role needs INSERT, UPDATE, DELETE or TRUNCATE on it to hold its triggers still through the write."
+            ));
         }
         e
     })?;

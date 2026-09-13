@@ -1723,24 +1723,15 @@ const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
 /// exactly one thing: run it again. Nothing was half-done; the engine rolled
 /// the victim back whole before either side wrote.
 fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
-    match &e {
-        DbError::Driver { code, .. } if code.as_deref() == Some("40P01") => DbError::Driver {
-            code: code.clone(),
-            message: format!(
-                "another session held what this rebuild of `{id}` needed, and needed what this \
-                 held: the engine broke the tie and rolled this side back whole ({e}).\n\
+    match e.server_error_code().as_deref() {
+        Some("40P01") => e.context(format!(
+            "another session held what this rebuild of `{id}` needed, and needed what this \
+                 held: the engine broke the tie and rolled this side back whole.\n\
                  Nothing was changed. Run the deploy again once the other session has \
                  finished — most often it is a `pull` or a `status`, which opens every view in \
                  the database to read its definition back."
-            ),
-        },
-        DbError::Driver { .. }
-        | DbError::Refused(_)
-        | DbError::BadConnectionString(_)
-        | DbError::Connect { .. }
-        | DbError::ConnectTimeout { .. }
-        | DbError::WrongSession { .. }
-        | DbError::BadRow(_) => e,
+        )),
+        _ => e,
     }
 }
 
@@ -1984,6 +1975,32 @@ mod tests {
 
     fn id(s: &str) -> ModuleId {
         s.parse().expect("a module id parses")
+    }
+
+    #[test]
+    fn rebuild_guidance_preserves_a_separate_source_only_for_deadlocks() {
+        for code in [Some("40P01"), Some("57014"), None] {
+            let error = the_engine_broke_a_tie(
+                &id("app.v"),
+                DbError::Driver {
+                    message: "original server sentence".into(),
+                    code: code.map(str::to_owned),
+                },
+            );
+            assert_eq!(error.server_error_code().as_deref(), code);
+            if code == Some("40P01") {
+                assert!(error.to_string().contains("app.v"));
+                assert!(error.to_string().contains("Run the deploy again"));
+                assert!(!error.to_string().contains("original server sentence"));
+                assert_eq!(
+                    std::error::Error::source(&error).unwrap().to_string(),
+                    "original server sentence"
+                );
+            } else {
+                assert!(matches!(error, DbError::Driver { .. }));
+                assert_eq!(error.to_string(), "original server sentence");
+            }
+        }
     }
 
     fn module(definition: &str) -> Module {

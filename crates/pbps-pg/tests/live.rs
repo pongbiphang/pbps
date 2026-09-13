@@ -200,6 +200,7 @@ async fn a_refused_socket_names_the_address_it_could_not_reach() {
         DbError::BadConnectionString(_)
         | DbError::ConnectTimeout { .. }
         | DbError::Driver { .. }
+        | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a refused socket is not {error:?}"),
@@ -292,6 +293,7 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
         DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::Driver { .. }
+        | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
@@ -332,6 +334,7 @@ async fn a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling() {
         DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::Driver { .. }
+        | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
@@ -585,6 +588,7 @@ async fn a_session_the_connection_string_excludes_is_refused() {
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
             | DbError::Driver { .. }
+            | DbError::Context { .. }
             | DbError::Refused(_)
             | DbError::BadRow(_) => panic!("a session mismatch is not {error:?}"),
         }
@@ -2453,6 +2457,7 @@ async fn fresh(conn: &mut Conn, schema: &str) {
 fn sqlstate(e: &DbError) -> &str {
     match e {
         DbError::Driver { code, .. } => code.as_deref().unwrap_or("no code"),
+        DbError::Context { source, .. } => sqlstate(source),
         // Named rather than wildcarded, for the reason the connection-failure
         // test names them: a variant added later has to be looked at here.
         other @ (DbError::BadConnectionString(_)
@@ -4740,8 +4745,12 @@ async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() 
     // distinguishable from the ownership refusal `!message.contains("needs
     // ownership")` below rules out.
     assert!(
-        message.contains("this role could not add them: migration denied by event trigger"),
+        !message.contains("migration denied by event trigger"),
         "{message}"
+    );
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().to_string(),
+        "migration denied by event trigger"
     );
     assert!(!message.contains("needs ownership"), "{message}");
     assert!(!message.contains("right it reports"), "{message}");
@@ -4772,9 +4781,10 @@ async fn an_authorized_migration_connection_failure_does_not_claim_missing_right
     // Before issue #167 this seam rendered the killed connection's own error as
     // the literal `db error`; the server's actual sentence is what a reader
     // needs to tell this apart from the ownership refusal above it.
-    assert!(
-        message.contains("terminating connection due to administrator command"),
-        "{message}"
+    assert!(!message.contains("terminating connection"), "{message}");
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().to_string(),
+        "terminating connection due to administrator command"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("57P01"));
     db.drop().await;
@@ -5020,6 +5030,7 @@ async fn a_ledger_never_initialized_an_empty_one_and_an_unreachable_database_sta
         other @ (DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
+        | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_)) => {
@@ -6845,7 +6856,25 @@ async fn read_a_rebuild(
 
 /// Whether the engine broke a lock cycle and this side lost.
 fn deadlocked(e: &DbError) -> bool {
-    matches!(e, DbError::Driver { code, .. } if code.as_deref() == Some("40P01"))
+    e.server_error_code().as_deref() == Some("40P01")
+}
+
+#[test]
+fn a_wrapped_deadlock_is_retriable_but_other_failures_are_not() {
+    for code in [Some("40P01"), Some("42501"), None] {
+        let error = DbError::Driver {
+            message: "driver diagnosis".into(),
+            code: code.map(str::to_owned),
+        };
+        assert_eq!(deadlocked(&error), code == Some("40P01"));
+        assert_eq!(
+            deadlocked(&error.context("rebuild guidance")),
+            code == Some("40P01")
+        );
+    }
+    assert!(!deadlocked(
+        &DbError::Refused("own guard".into()).context("rebuild guidance")
+    ));
 }
 
 /// `DROP SCHEMA … CASCADE`, retried for the same reason.
@@ -21563,11 +21592,12 @@ async fn a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger()
     // Before issue #167 this seam rendered the underlying refusal as the
     // literal `db error`; the server's own sentence is what makes this
     // distinguishable from any other 42501 this migration could hit.
-    assert!(
-        message.contains("this role could not add them: must be owner of table __pbps_state")
-            && err.server_error_code().as_deref() == Some("42501"),
-        "the original engine error must survive: {message}"
+    assert!(!message.contains("must be owner of table"), "{message}");
+    assert_eq!(
+        std::error::Error::source(&err).unwrap().to_string(),
+        "must be owner of table __pbps_state"
     );
+    assert_eq!(err.server_error_code().as_deref(), Some("42501"));
 
     drop(lp);
     db.drop().await;

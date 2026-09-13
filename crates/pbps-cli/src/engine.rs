@@ -221,6 +221,9 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 /// (DECISIONS 455) is the fix at the type: a tool-composed refusal is no
 /// longer representable as `Driver`, so it falls to the `_` arm below and
 /// passes through unchanged — this function needs no case for it.
+/// Wrapping diagnostics use `DbError::Context` (DECISIONS 456): its source
+/// remains a separate chain frame, so the same redaction preserves the
+/// context without accepting any part of the server's sentence as safe.
 ///
 /// The same round measured that "SQLSTATE" is a PostgreSQL word.
 /// `tiberius::Error::code()` returns SQL Server's own numeric message number
@@ -304,7 +307,7 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
             // to downcast at all. Both still leave `frame.to_string()`
             // rendering the driver's raw message, since `Display` forwards
             // regardless of whether `source()` does.
-            let as_driver = frame
+            let as_db = frame
                 .downcast_ref::<DbError>()
                 .or_else(|| frame.downcast_ref::<Box<DbError>>().map(AsRef::as_ref))
                 .or_else(|| match frame.downcast_ref::<LedgerError>() {
@@ -315,7 +318,7 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
                     Some(ImpactError::Query(inner)) => Some(inner),
                     _ => None,
                 });
-            match as_driver {
+            match as_db {
                 Some(DbError::Driver { code, .. }) => match code {
                     Some(code) => {
                         format!("the driver reported code {code}; its message is not recorded here")
@@ -324,6 +327,7 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
                               recorded here"
                         .to_owned(),
                 },
+                Some(DbError::Context { message, .. }) => message.clone(),
                 // Every other `DbError` variant — including `Refused`, this
                 // tool's own composed refusal, which can never carry a server
                 // value by construction — and every frame that is not a
@@ -1404,6 +1408,49 @@ mod tests {
         let rendered2 = ledger_safe_reason(&wrapped2);
         assert!(!rendered2.contains("super-secret-ghi"), "{rendered2}");
         assert!(rendered2.contains("22P03"), "{rendered2}");
+    }
+
+    #[test]
+    fn nested_database_context_survives_redaction_through_every_wrapper() {
+        for code in [Some("42501"), Some("1088"), None] {
+            for wrapper in 0..4 {
+                let db = DbError::Driver {
+                    message: "undeclared-secret-488".into(),
+                    code: code.map(str::to_owned),
+                }
+                .context("the data-trigger guard cannot lock `public.c`")
+                .context("The deployment role needs INSERT, UPDATE, DELETE or TRUNCATE");
+                let error = match wrapper {
+                    0 => anyhow::Error::new(db),
+                    1 => anyhow::Error::new(RowsError::Read {
+                        table: TableName::new("app", "p"),
+                        source: Box::new(db),
+                    }),
+                    2 => anyhow::Error::new(LedgerError::Db(db)),
+                    _ => anyhow::Error::new(ImpactError::Query(db)),
+                }
+                .context("x".repeat(pbps_pg::state::REASON_CHARS * 2));
+                assert!(format!("{error:#}").contains("undeclared-secret-488"));
+                let rendered = ledger_safe_reason(&error);
+                for text in ["public.c", "INSERT, UPDATE, DELETE or TRUNCATE"] {
+                    assert_eq!(rendered.matches(text).count(), 1, "{rendered}");
+                }
+                assert_eq!(
+                    rendered.matches("its message is not recorded here").count(),
+                    1
+                );
+                assert!(!rendered.contains("undeclared-secret-488"), "{rendered}");
+                for driver in [Driver::Postgres, Driver::Mssql] {
+                    let cut = truncate_reason(driver, &rendered);
+                    assert!(cut.contains(code.unwrap_or("no code")), "{cut}");
+                    assert!(cut.contains("public.c"), "{cut}");
+                    assert!(cut.contains("INSERT, UPDATE, DELETE or TRUNCATE"), "{cut}");
+                }
+            }
+        }
+        let error =
+            anyhow::Error::new(DbError::Refused("own refusal".into()).context("own context"));
+        assert_eq!(ledger_safe_reason(&error), "own refusal: own context");
     }
 
     #[test]

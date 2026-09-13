@@ -77,29 +77,27 @@ pub enum DbError {
     /// every signature that mentions `DbError`, which is exactly what the seam
     /// exists to prevent, and with two drivers it could only hold one of them.
     ///
-    /// **Built only by this crate's own `From<tokio_postgres::Error>` and
-    /// `From<tiberius::error::Error>`, or by a caller wrapping an existing
-    /// `Driver`'s rendered text into a new message of its own** (`pbps-pg`'s
-    /// `schema_changed_underneath` and `state::migration_error`, `pbps-mssql`'s
-    /// `state::migration_error` — each interpolates the wrapped error, so
-    /// whatever it carried is still in there). Ready-phase review of PR #464
-    /// found several other `pbps-pg` guards reaching for this variant to
-    /// carry their *own* composed refusal text — an unsafe data trigger, a
-    /// catalog read outside the transaction it needs — because it was the
-    /// only variant here with a free-text message and an optional
-    /// pass-through code. That made the variant mean two things depending on
-    /// which call built it, and `pbps-cli`'s `engine::ledger_safe_reason`
-    /// — which exists because `message()` can name a row's own value
-    /// (DECISIONS 455) and redacts every `Driver` frame's message to its
-    /// code — could not tell them apart and redacted a tool-composed
-    /// diagnosis along with a server one, hiding the one thing that told an
-    /// operator which trigger or rule to fix. [`DbError::Refused`] is the
-    /// fix: a tool-authored refusal is a value this type cannot hold as
-    /// `Driver` any more, so nothing downstream has to guess.
+    /// Built by the driver conversions only. Tool-authored refusals use
+    /// [`DbError::Refused`]; additional context uses [`DbError::context`]
+    /// instead of interpolating an error into another `Driver` message.
+    /// Keeping the server's text separate lets durable diagnostics redact it
+    /// without losing this tool's remediation (DECISIONS 455, 456).
     #[error("{message}")]
     Driver {
         message: String,
         code: Option<String>,
+    },
+
+    /// Tool-authored context around an existing failure. `message` must never
+    /// interpolate the source: its text may name undeclared row values.
+    /// `Display` deliberately prints only this frame; the error chain carries
+    /// the original diagnosis to the operator and lets ledger redaction treat
+    /// each frame separately (DECISIONS 456).
+    #[error("{message}")]
+    Context {
+        message: String,
+        #[source]
+        source: Box<DbError>,
     },
 
     /// This workspace's own refusal, composed of its own text — never a
@@ -140,6 +138,14 @@ pub enum DbError {
 }
 
 impl DbError {
+    /// Adds this tool's own explanation without flattening the source into it.
+    pub fn context(self, message: impl Into<String>) -> Self {
+        Self::Context {
+            message: message.into(),
+            source: Box::new(self),
+        }
+    }
+
     /// The server's own error code, when the failure came from the server
     /// rather than from the connection.
     ///
@@ -162,6 +168,7 @@ impl DbError {
         // asking about" and would silently apply to it.
         match self {
             DbError::Driver { code, .. } => code.clone(),
+            DbError::Context { source, .. } => source.server_error_code(),
             DbError::BadConnectionString(_)
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
@@ -275,6 +282,7 @@ pub(crate) async fn open_socket(
             error @ (DbError::BadConnectionString(_)
             | DbError::Connect { .. }
             | DbError::Driver { .. }
+            | DbError::Context { .. }
             | DbError::Refused(_)
             | DbError::WrongSession { .. }
             | DbError::BadRow(_)) => error,
@@ -688,6 +696,29 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_keeps_the_original_code_and_source_separate_from_its_message() {
+        for code in [Some("42501"), Some("1088"), None] {
+            let error = DbError::Driver {
+                message: "server-only text".into(),
+                code: code.map(str::to_owned),
+            }
+            .context("inner guidance")
+            .context("outer guidance");
+            assert_eq!(error.server_error_code().as_deref(), code);
+            assert_eq!(error.to_string(), "outer guidance");
+            let inner = std::error::Error::source(&error).unwrap();
+            assert_eq!(inner.to_string(), "inner guidance");
+            assert_eq!(inner.source().unwrap().to_string(), "server-only text");
+        }
+        let error = DbError::Refused("own refusal".into()).context("own context");
+        assert_eq!(error.server_error_code(), None);
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "own refusal"
+        );
+    }
 
     /// The conversions are what call sites rely on to stay readable
     /// (`snapshot.reason.as_deref().into()`), so each shape has to land in its

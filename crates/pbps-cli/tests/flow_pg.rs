@@ -1587,7 +1587,8 @@ fn ledger_migration_guidance_keeps_the_explicit_or_configured_target() {
         // literal `db error`; the server's own sentence is what a reader
         // needs beside the guidance the assertion above already checks.
         assert!(
-            message.contains("this role could not add them: must be owner of table __pbps_state"),
+            message.contains("this role could not add them.")
+                && message.contains("must be owner of table __pbps_state"),
             "{message}"
         );
         assert!(
@@ -5475,6 +5476,109 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
             );
             conn.rollback(dialect.transaction_framing()).await.unwrap();
         });
+}
+
+/// A guard failure must retain its table and remedy after driver redaction,
+/// on both the ordinary and staged failed-attempt recording paths.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_cascade_lock_denial_keeps_its_remedy_on_the_failed_ledger() {
+    let admin = server();
+    let deployer = format!("pbps_context488_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![deployer.clone()],
+    };
+    on_server(
+        &admin,
+        &format!("CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'"),
+    );
+    for staged in [false, true] {
+        let own = OwnDatabase::new(&admin, &format!("lock_context_{staged}"));
+        let connection = own.connection();
+        let deployment = as_role(connection, &deployer);
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app AUTHORIZATION {deployer}; GRANT CREATE ON SCHEMA public TO {deployer}"
+            ),
+        );
+        let d = Demo::new("lock-context");
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            "dialect: postgres\nunmanaged: ignore\n",
+        )
+        .unwrap();
+        let declared = "table: app.p\ncolumns:\n  code: {type: text, nullable: false}\n  ukey: {type: text, nullable: false}\nprimary_key: {name: pk_p, columns: [code]}\nunique:\n  uq_p_ukey: [ukey]\ndata:\n  mode: exact\n  rows:\n    first: {ukey: old}\n";
+        d.table(declared);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", &deployment]));
+        on_server(
+            connection,
+            &format!(
+                "CREATE TABLE public.c(id integer PRIMARY KEY, ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE); \
+             GRANT SELECT, TRIGGER, UPDATE ON public.c TO {deployer}"
+            ),
+        );
+        d.table(&declared.replace("ukey: old", "ukey: new"));
+        let plan = connected_artifact(&d, &deployment, staged);
+        // Plan with the lock right, then remove it so the failure is apply's
+        // own guard and reaches the durable failed-attempt recording path.
+        on_server(
+            connection,
+            &format!("REVOKE UPDATE ON public.c FROM {deployer}"),
+        );
+        assert_eq!(
+            scalar(
+                &deployment,
+                "SELECT (has_table_privilege('public.c', 'TRIGGER') AND NOT \
+             has_table_privilege('public.c', 'INSERT,UPDATE,DELETE,TRUNCATE'))::int::int8"
+            ),
+            1
+        );
+        let extra = if staged {
+            vec!["--staged", "--allow", "data-update"]
+        } else {
+            vec!["--allow", "data-update"]
+        };
+        let failed = approved_apply(&d, &deployment, &plan, &extra);
+        assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+        assert!(
+            stderr(&failed).contains("permission denied for table c"),
+            "{}",
+            stderr(&failed)
+        );
+        let after = latest_snapshot(connection);
+        assert_eq!(after.kind, pbps_model::StateKind::Failed);
+        let reason = after.reason.unwrap_or_default();
+        for text in [
+            "42501",
+            "cannot lock `public.c`",
+            "INSERT, UPDATE, DELETE or TRUNCATE",
+        ] {
+            assert!(reason.contains(text), "missing {text}: {reason}");
+        }
+        assert!(
+            !reason.contains("permission denied for table c"),
+            "{reason}"
+        );
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.p WHERE ukey = 'old'"),
+            1
+        );
+        // Restoring a listed privilege lets the very same plan complete.
+        on_server(
+            connection,
+            &format!("GRANT UPDATE ON public.c TO {deployer}"),
+        );
+        succeeds(approved_apply(&d, &deployment, &plan, &extra));
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.p WHERE ukey = 'new'"),
+            1
+        );
+        succeeds(d.run(&["verify", "--db", &deployment]));
+    }
 }
 
 /// A referential action that the plan removes, or that this session cannot

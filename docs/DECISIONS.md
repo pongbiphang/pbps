@@ -10989,3 +10989,31 @@ SPEC is in sync with all of these.
      wrappers directly, the same way the boxed-source test above pins
      `RowsError::Read`. Reverted and watched fail for the expected reason
      (the driver's raw message, unredacted) before being restored.
+
+456. **Database error context is a separate frame, never part of the driver's
+     message (issue #488).** `DbError::Context` holds tool-authored text and a
+     boxed `DbError` source. Its `Display` renders only that text; its source
+     remains in the error chain, and `server_error_code()` delegates to it.
+     A second copy of a server sentence in a wrapper would evade the
+     per-frame redaction of DECISIONS 455. Flattening both texts into `Driver`
+     instead loses the tool's remediation along with the server sentence.
+     `DbError::context` keeps both facts separately without guessing whether
+     a particular server error can contain row data.
+
+     The PostgreSQL data-trigger lock denial, catalog-change and module
+     deadlock diagnoses, and both engines' timeline-migration diagnoses use
+     this frame. Raw driver messages originate only at the driver seam;
+     standalone tool refusals remain `Refused`. The operator's full error
+     chain retains the original message. Durable reasons and outbound hook
+     diagnostics retain the context and redact the driver frame, with the
+     code first so a long statement cannot crowd it out of the ledger.
+
+     Unit regressions cover the wrapping sites, code propagation, nested
+     context, boxed sources, transparent ledger/impact wrappers, absent codes
+     and both engines' truncation. The PostgreSQL CLI regression
+     `a_cascade_lock_denial_keeps_its_remedy_on_the_failed_ledger` plans a
+     reference-data update with the reached table's lock privilege, revokes
+     it while retaining TRIGGER and SELECT, then applies. Both ordinary and
+     staged failures must record `42501`, the reached table and the required
+     privileges, omit the raw server sentence, and leave the row unchanged.
+     Restoring UPDATE lets the same saved plan complete.
