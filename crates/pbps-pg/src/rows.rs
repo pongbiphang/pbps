@@ -1442,7 +1442,8 @@ fn not_a_bytea(text: &str) -> Option<&'static str> {
 /// What `validate` could not answer about a schema's declared rows, offline.
 ///
 /// **Whether two declared keys are one row is the engine's question**
-/// (ADR-0013 §5), and it has two halves this command cannot ask. The
+/// (ADR-0013 §5). A single key can also fail to convert or read back with
+/// its original spelling (DECISIONS 469). This command cannot ask either. The
 /// conversion half: `1` and `01` are one `integer` row, and `New` and `new`
 /// are two rows or one depending on the key column's collation — which lives
 /// on the live column and which ADR-0013 keeps out of `pbps-model`. **Measured
@@ -1466,8 +1467,7 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
     let mut out = Vec::new();
     for (name, table) in &schema.tables {
         let Some(data) = &table.data else { continue };
-        // One key cannot collide with itself.
-        if data.rows.len() < 2 {
+        if data.rows.is_empty() {
             continue;
         }
         let Some(key) = table
@@ -1478,14 +1478,35 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
         else {
             continue;
         };
+        // Collisions and spelling are separate questions: even an identity
+        // text conversion can compare distinct keys as equal under a collation.
+        if data.rows.len() > 1 {
+            out.push(format!(
+                "`{name}`: whether two of its {} declared row keys are one row is decided by the \
+                 live `{key}` column — by the type's conversion, and, for a character type, by that \
+                 column's collation, which is not in the declarations. A case-insensitive or \
+                 nondeterministic collation makes `New` and `new` one key and the second insert \
+                 fails on the primary key. `pbps plan --db` asks the engine; this run did not \
+                 (ADR-0013 §5).",
+                data.rows.len()
+            ));
+        }
+        let Some(column) = table.columns.get(&key) else {
+            continue;
+        };
+        let Ok(ty) = crate::types::normalize(&column.ty) else {
+            continue;
+        };
+        // ValueKind::Text also holds UUIDs, dates and numeric renderings. Only
+        // unbounded text conversions preserve the key itself (DECISIONS 469).
+        if ty.base == "text" || (ty.base == "character varying" && ty.args.is_empty()) {
+            continue;
+        }
         out.push(format!(
-            "`{name}`: whether two of its {} declared row keys are one row is decided by the \
-             live `{key}` column — by the type's conversion, and, for a character type, by that \
-             column's collation, which is not in the declarations. A case-insensitive or \
-             nondeterministic collation makes `New` and `new` one key and the second insert \
-             fails on the primary key. `pbps plan --db` asks the engine; this run did not \
-             (ADR-0013 §5).",
-            data.rows.len()
+            "`{name}`: this run did not check whether each declared row key converts to \
+             `{ty}`, the type of `{key}`, and reads back with the same spelling. Even one \
+             key can be refused or respelled by the engine. `pbps plan --db` checks the \
+             key conversion and spelling against the live column."
         ));
     }
     out
@@ -2158,10 +2179,10 @@ mod tests {
         let mut two = table(Some(vec!["code"]), &[("code", "varchar(10)", None)]);
         with_rows(&mut two, &[("New", &[]), ("new", &[])]);
         schema.tables.insert(name(), two);
-        // One key cannot collide with itself, and a table with no `data:`
-        // block declares no keys at all: neither earns a note, because a note
-        // about nothing is noise that teaches a reader to skip them.
-        let mut one = table(Some(vec!["code"]), &[("code", "varchar(10)", None)]);
+        // One unbounded text key cannot collide or change spelling, and a
+        // table with no `data:` block declares no keys at all. Neither
+        // earns a note about a question it does not pose.
+        let mut one = table(Some(vec!["code"]), &[("code", "text", None)]);
         with_rows(&mut one, &[("only", &[])]);
         schema.tables.insert(TableName::new("app", "one"), one);
         schema.tables.insert(
@@ -2170,9 +2191,96 @@ mod tests {
         );
 
         let notes = not_checked_offline(&schema);
-        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes.len(), 2, "{notes:#?}");
         assert!(notes[0].contains("app.status"), "{}", notes[0]);
         assert!(notes[0].contains("collation"), "{}", notes[0]);
         assert!(notes[0].contains("plan --db"), "{}", notes[0]);
+        assert!(notes[1].contains("spelling"), "{}", notes[1]);
+        schema
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut("code")
+            .unwrap()
+            .ty = ColumnType::from_str("text").unwrap();
+        assert_eq!(
+            not_checked_offline(&schema),
+            vec![notes[0].clone()],
+            "identity text still needs the unchanged collision note for multiple keys"
+        );
+    }
+
+    #[test]
+    fn offline_spelling_notes_follow_conversion_not_the_row_value_kind() {
+        for (ty, expected) in [
+            ("integer", true),
+            ("int4", true),
+            ("bool", true),
+            ("uuid", true),
+            ("date", true),
+            ("numeric(6,2)", true),
+            ("varchar(3)", true),
+            ("char(5)", true),
+            ("text", false),
+            ("varchar", false),
+            ("character varying", false),
+        ] {
+            let mut t = table(Some(vec!["code"]), &[("code", ty, None)]);
+            t.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: [(RowKey::from("01"), Row::default())].into(),
+            });
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(name(), t);
+            let notes = not_checked_offline(&schema);
+            assert_eq!(notes.len(), usize::from(expected), "{ty}: {notes:?}");
+            if expected {
+                assert!(notes[0].contains("spelling"), "{ty}: {notes:?}");
+                assert!(!notes[0].contains("collation"), "{ty}: {notes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_keys_and_invalid_key_shapes_do_not_get_spelling_notes() {
+        let declared = table(Some(vec!["code"]), &[("code", "integer", None)]);
+        let mut empty = declared.clone();
+        empty.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: Default::default(),
+        });
+        let mut rows = empty.clone();
+        rows.data
+            .as_mut()
+            .unwrap()
+            .rows
+            .insert(RowKey::from("01"), Row::default());
+        let mut no_pk = rows.clone();
+        no_pk.primary_key = None;
+        let mut composite = rows.clone();
+        composite
+            .primary_key
+            .as_mut()
+            .unwrap()
+            .columns
+            .push("other".into());
+        let mut missing_column = rows.clone();
+        missing_column.columns.clear();
+        let mut unknown_type = rows;
+        unknown_type.columns.get_mut("code").unwrap().ty =
+            ColumnType::from_str("unknown_type").unwrap();
+        for t in [
+            declared,
+            empty,
+            no_pk,
+            composite,
+            missing_column,
+            unknown_type,
+        ] {
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(name(), t);
+            assert!(not_checked_offline(&schema).is_empty(), "{schema:?}");
+        }
     }
 }

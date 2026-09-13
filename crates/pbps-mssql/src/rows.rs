@@ -1058,6 +1058,44 @@ pub fn decode(
     ))
 }
 
+/// What offline validation cannot establish about a declared key's conversion.
+/// The engine's spelling is needed even when there is no second key to collide.
+pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, table) in &schema.tables {
+        let Some(data) = &table.data else { continue };
+        if data.rows.is_empty() {
+            continue;
+        }
+        let Some(key) = table
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.columns.len() == 1)
+            .map(|pk| &pk.columns[0])
+        else {
+            continue;
+        };
+        let Some(column) = table.columns.get(key) else {
+            continue;
+        };
+        let Ok(ty) = crate::types::normalize(&column.ty) else {
+            continue;
+        };
+        // Bounded Unicode text can truncate or pad; varchar additionally uses
+        // the live code page. ValueKind::Text is not identity (DECISIONS 469).
+        if ty.base == "nvarchar" && ty.args == [pbps_model::TypeArg::Max] {
+            continue;
+        }
+        out.push(format!(
+            "`{name}`: this run did not check whether each declared row key converts to \
+             `{ty}`, the type of `{key}`, and reads back with the same spelling. Even one \
+             key can be refused or respelled by the engine. `pbps plan --db` checks the \
+             key conversion and spelling against the live column."
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,5 +1665,79 @@ mod tests {
             ..without
         };
         assert_eq!(canonical(&int, Some("x")), Err("integer"));
+    }
+
+    #[test]
+    fn offline_spelling_notes_follow_conversion_not_the_row_value_kind() {
+        for (ty, expected) in [
+            ("integer", true),
+            ("bit", true),
+            ("uniqueidentifier", true),
+            ("date", true),
+            ("decimal(6,2)", true),
+            ("sysname", true),
+            ("varchar(max)", true),
+            ("nvarchar(3)", true),
+            ("nchar(5)", true),
+            ("nvarchar", true),
+            ("nvarchar(max)", false),
+            ("national character varying(max)", false),
+        ] {
+            let mut t = table(Some(vec!["code"]), &[("code", ty, None)]);
+            t.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: [(RowKey::from("01"), Row::default())].into(),
+            });
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(name(), t);
+            let notes = not_checked_offline(&schema);
+            assert_eq!(notes.len(), usize::from(expected), "{ty}: {notes:?}");
+            if expected {
+                assert!(notes[0].contains("spelling"), "{ty}: {notes:?}");
+                assert!(!notes[0].contains("collation"), "{ty}: {notes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_keys_and_invalid_key_shapes_do_not_get_spelling_notes() {
+        let declared = table(Some(vec!["code"]), &[("code", "integer", None)]);
+        let mut empty = declared.clone();
+        empty.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: Default::default(),
+        });
+        let mut rows = empty.clone();
+        rows.data
+            .as_mut()
+            .unwrap()
+            .rows
+            .insert(RowKey::from("01"), Row::default());
+        let mut no_pk = rows.clone();
+        no_pk.primary_key = None;
+        let mut composite = rows.clone();
+        composite
+            .primary_key
+            .as_mut()
+            .unwrap()
+            .columns
+            .push("other".into());
+        let mut missing_column = rows.clone();
+        missing_column.columns.clear();
+        let mut unknown_type = rows;
+        unknown_type.columns.get_mut("code").unwrap().ty =
+            ColumnType::from_str("unknown_type").unwrap();
+        for t in [
+            declared,
+            empty,
+            no_pk,
+            composite,
+            missing_column,
+            unknown_type,
+        ] {
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(name(), t);
+            assert!(not_checked_offline(&schema).is_empty(), "{schema:?}");
+        }
     }
 }
