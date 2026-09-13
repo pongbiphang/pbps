@@ -1248,9 +1248,10 @@ fn counting_statement(r: &Referencing<'_>) -> String {
 /// cannot be cascaded away unseen (DECISIONS 129).
 ///
 /// It is not the probe: by the time this runs, every insert, update and child
-/// delete of the plan has run (`order_key`), so *any* row still referencing
-/// the parent is one the probe did not account for. The probe stays where it
-/// is — it reports the number before anything runs, which is what a human
+/// delete of the plan has run (`order_key`), so a surviving row referencing
+/// the parent is one the probe did not account for. The row being deleted
+/// does not survive, even if it references itself (DECISIONS 470).
+/// The probe reports the number before anything runs, which is what a human
 /// approves; this refuses what changed underneath it.
 pub(crate) fn still_referenced(
     table: &TableName,
@@ -1273,11 +1274,16 @@ pub(crate) fn still_referenced(
             // an update moving a row into the range waits for the delete
             // instead of racing it.
             hint: " WITH (HOLDLOCK)",
-            // Both belong to a plan the probe reads whole; here the plan has
-            // already run, and a row referencing the parent now is a row
-            // nobody accounted for.
+            // Plan-wide removals and arrivals belong to the probe; this
+            // statement sees the rows left by the preceding changes.
             gone: "",
-            exclusion: "N\'\'",
+            // SQL Server removes both sides of a row's self-reference in
+            // one DELETE. Only that row is excluded, using the plan's key
+            // even when the FK references another unique key (470).
+            exclusion: &format!(
+                "CASE WHEN fk.parent_object_id = fk.referenced_object_id THEN {} ELSE N'' END",
+                literal(&format!(" AND ch.{} <> @key", quote(key_column)?))
+            ),
             arrival: "N\'\'",
         }),
         literal(&format!(

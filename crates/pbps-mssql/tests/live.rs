@@ -12011,3 +12011,6 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
 
 #[path = "live/row_security.rs"]
 mod row_security;
+
+#[path = "live/self_reference.rs"]
+mod self_reference;
