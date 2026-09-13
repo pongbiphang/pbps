@@ -485,6 +485,110 @@ CREATE EVENT TRIGGER stop_after_first ON ddl_command_end WHEN TAG IN ('ALTER TAB
     }
 }
 
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_create_never_closes_over_a_replaced_pending_part() {
+    for index in [false, true] {
+        let slug = if index {
+            "pending_index"
+        } else {
+            "pending_unique"
+        };
+        let own = OwnDatabase::new(&server(), slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, slug, ONE_COLUMN);
+        let part = if index {
+            "indexes:\n  ix: {columns: [id]}\n"
+        } else {
+            "unique:\n  uq: [id]\n"
+        };
+        std::fs::write(d.dir.join("schema/app.u.yml"), format!("table: app.u\ncolumns:\n  id: {{type: integer}}\n  other: {{type: integer}}\n{part}")).unwrap();
+        let plan = connected_artifact(&d, connection, true);
+        let (tag, present, replace) = if index {
+            (
+                "CREATE INDEX",
+                "to_regclass('app.ix') IS NOT NULL",
+                "DROP INDEX app.ix; CREATE INDEX ix ON app.u(other);",
+            )
+        } else {
+            (
+                "ALTER TABLE",
+                "EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('app.u') AND conname='uq')",
+                "ALTER TABLE app.u DROP CONSTRAINT uq; ALTER TABLE app.u ADD CONSTRAINT uq UNIQUE(other);",
+            )
+        };
+        on_server(
+            connection,
+            &format!(
+                r#"
+CREATE SCHEMA witness;
+CREATE TABLE witness.fired (id integer PRIMARY KEY);
+CREATE FUNCTION witness.replace_part() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM witness.fired) AND {present} THEN
+    INSERT INTO witness.fired VALUES (1);
+    {replace}
+  END IF;
+END $$;
+CREATE EVENT TRIGGER replace_part ON ddl_command_end WHEN TAG IN ('{tag}') EXECUTE FUNCTION witness.replace_part();
+"#
+            ),
+        );
+        let refused = approved_apply(&d, connection, &plan, &["--staged"]);
+        assert_eq!(
+            code(&refused),
+            1,
+            "a replaced pending part was accepted: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("not the one this plan's `CREATE TABLE` declares"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(scalar(connection, "SELECT count(*) FROM witness.fired"), 1);
+        let checkpoint = latest_snapshot(connection);
+        assert!(
+            checkpoint.staged.is_some(),
+            "the bad definition must not close as an apply"
+        );
+        assert_ne!(checkpoint.kind, pbps_model::StateKind::Apply);
+        let recorded = &checkpoint.schema.tables[&"app.u".parse().unwrap()];
+        if index {
+            assert_eq!(recorded.indexes["ix"].columns[0].name, "other");
+        } else {
+            assert_eq!(recorded.unique["uq"].columns, ["other"]);
+        }
+        // An unchanged bad checkpoint is still not the CREATE's declaration.
+        let still_bad = approved_apply(&d, connection, &plan, &["--staged", "--resume"]);
+        assert_eq!(
+            code(&still_bad),
+            1,
+            "{}{}",
+            stdout(&still_bad),
+            stderr(&still_bad)
+        );
+        assert!(latest_snapshot(connection).staged.is_some());
+        let clean_slug = format!("{slug}_clean");
+        let clean = OwnDatabase::new(&server(), &clean_slug);
+        let control = bootstrapped_demo(clean.connection(), &clean_slug, ONE_COLUMN);
+        std::fs::write(
+            control.dir.join("schema/app.u.yml"),
+            std::fs::read(d.dir.join("schema/app.u.yml")).unwrap(),
+        )
+        .unwrap();
+        let clean_plan = connected_artifact(&control, clean.connection(), true);
+        succeeds(approved_apply(
+            &control,
+            clean.connection(),
+            &clean_plan,
+            &["--staged"],
+        ));
+        succeeds(control.run(&["verify", "--db", clean.connection()]));
+    }
+}
+
 fn bootstrapped_demo(connection: &str, slug: &str, table: &str) -> Demo {
     on_server(connection, "CREATE SCHEMA app");
     let d = Demo::new(slug);

@@ -11102,3 +11102,17 @@ SPEC is in sync with all of these.
      the closing read, where no statement ran. Negative unit cases pin those
      boundaries for all four kinds. This is the valid-plan-refusal case of
      the review rule, needed to exercise the issue's staged/resume path.
+
+     A pending part's first observed definition must also answer to the
+     CREATE payload. Review found that a ddl_command_end trigger could
+     replace a newly added UNIQUE/index before its checkpoint, after which
+     comparing that checkpoint against itself let the run close. The created
+     table's existing structure validation now runs at every read, including
+     resumed and closing reads, even when the previous checkpoint already
+     holds the table. Foreign keys carried in the payload receive the same
+     structural comparison as separately added foreign keys. Checks and
+     filters still follow SPEC 7.6's expression-text exclusion. Live trigger
+     regressions replace UNIQUE and index columns, require a retained staged
+     failure and a refused resume, and keep successful clean deployments as
+     controls. Restoring the reviewed guard makes the new test accept the
+     replaced UNIQUE and fail its refusal assertion.

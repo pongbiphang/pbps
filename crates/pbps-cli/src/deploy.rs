@@ -1715,15 +1715,13 @@ fn refuse_unplanned_movement(
         // such a table a synthetic baseline of *no rows* for the same reason;
         // this is the other half of it (DECISIONS 181).
         //
-        // By name, never by value. What a created column *is* comes back in
-        // the engine's spelling, and holding it to the declaration would
-        // refuse valid applies — which is why the whole table was exempt
-        // before 166. A name nobody declared is not ambiguous that way.
-        if let (None, Some(declared), Some(now)) = (
-            before.tables.get(name),
-            created.get(now_name),
-            after.tables.get(now_name),
-        ) {
+        // Keep asking after the table enters the checkpoint: its constraints
+        // and indexes can be separate later statements, replaced by a trigger
+        // before their first read. Comparing only with that checkpoint would
+        // certify the replacement against itself (decision 458). Comparable
+        // structure is held to the declaration; engine-rewritten expressions
+        // still use presence, as SPEC 7.6 requires.
+        if let (Some(declared), Some(now)) = (created.get(now_name), after.tables.get(now_name)) {
             let no_parts = BTreeSet::new();
             let planned = added_parts.get(now_name).unwrap_or(&no_parts);
             let mut named = |kind: &str,
@@ -1820,11 +1818,15 @@ fn refuse_unplanned_movement(
             }
             // A foreign key is nothing but structure — the columns, the
             // parent and the two referential actions — so all of it is
-            // comparable, and its definition is on the change rather than in
-            // the payload (182).
+            // comparable. The differ normally splits its definition into an
+            // AddForeignKey change (182); a carried CREATE payload must answer
+            // for the same structure instead of relying on that split.
             for (n, now) in &now.foreign_keys {
-                if let Some(was) = added_fks.get(&(now_name, n.as_str()))
-                    && *was != now
+                if let Some(was) = added_fks
+                    .get(&(now_name, n.as_str()))
+                    .copied()
+                    .or_else(|| declared.foreign_keys.get(n))
+                    && was != now
                 {
                     moved.push(format!(
                         "{now_name} foreign key `{n}` is not the one this plan adds"
@@ -7282,6 +7284,28 @@ mod tests {
                 _ => unreachable!(),
             }
             let changed = schema(changed);
+            if matches!(part, "unique" | "foreign key" | "index") {
+                for settled in [Settled::SoFar, Settled::Whole, Settled::Closing] {
+                    refuse_unplanned_movement(
+                        &pbps_mssql::Mssql,
+                        &changes,
+                        &before,
+                        &changed,
+                        "test",
+                        settled,
+                    )
+                    .expect_err("the first observed part must match the CREATE payload");
+                    refuse_unplanned_movement(
+                        &pbps_mssql::Mssql,
+                        &changes,
+                        &changed,
+                        &changed,
+                        "test",
+                        settled,
+                    )
+                    .expect_err("a bad checkpoint cannot certify its own structure");
+                }
+            }
             for settled in [Settled::SoFar, Settled::Whole, Settled::Closing] {
                 refuse_unplanned_movement(
                     &pbps_mssql::Mssql,
