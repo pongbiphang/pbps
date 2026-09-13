@@ -744,7 +744,7 @@ fn insert_row(
             None => Some(format!("{} IS NULL", quote(column)?)),
         });
     }
-    let wrote = wrote_the_row(table, key, key_column, &cells)?;
+    let wrote = wrote_the_row(table, key, key_column, KeySpelling::Inserted, &cells)?;
     let table = qualified(table)?;
     let insert = format!(
         "INSERT INTO {table} ({}) VALUES ({});",
@@ -842,11 +842,16 @@ fn update_row(
             message: format!("{table}: a row update with no changed column"),
         });
     }
+    // The key locates this row through the engine's aliases; UPDATE does
+    // not assign it. Capture its stored spelling in the same statement,
+    // before AFTER triggers, without a separate read that could race (472).
+    let quoted_key = quote(key_column)?;
     let mut sql = format!(
-        "UPDATE {} SET {} WHERE {} = {}",
+        "DECLARE @pbps_key_before nvarchar(max);\n\
+         UPDATE {} SET @pbps_key_before = CONVERT(nvarchar(max), {quoted_key}), {} \
+         WHERE {quoted_key} = {}",
         qualified(table)?,
         sets.join(", "),
-        quote(key_column)?,
         row_key(key)
     );
     for r in &recorded {
@@ -870,8 +875,15 @@ fn update_row(
         cells.extend(recorded_cell(column, held, after_ty(column))?);
     }
     sql.push('\n');
-    sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
-    one(atomically(&sql))
+    sql.push_str(&wrote_the_row(
+        table,
+        key,
+        key_column,
+        KeySpelling::BeforeUpdate,
+        &cells,
+    )?);
+    // Variables have batch scope, so exported consecutive updates need GO.
+    Ok(vec![Statement::new(atomically(&sql)).own_batch()])
 }
 
 /// One cell as a predicate holding the row to it, by the rendering that read
@@ -1120,6 +1132,12 @@ fn defaulted_cell(
     )))
 }
 
+/// INSERT assigns the declaration; UPDATE preserves the existing alias.
+enum KeySpelling {
+    Inserted,
+    BeforeUpdate,
+}
+
 /// What a row write holds itself to once it has run: the row is there, and
 /// it holds what the plan wrote.
 ///
@@ -1137,19 +1155,45 @@ fn defaulted_cell(
 /// row to, and a column the plan never names is the application's business,
 /// not this statement's.
 ///
-/// A *connected* plan cannot fail this on spelling alone: `plan --db` refuses
-/// a declaration the engine reads back differently before the plan exists
-/// (DECISIONS 101). An offline plan carries no such promise, and a value the
-/// engine stores differently from the way it is declared stops here rather
-/// than being applied, recorded, and proposed again by every plan after it —
-/// which is what the message names alongside a trigger.
+/// Connected plans check non-key cell spelling before a write (101). Keys
+/// instead retain the engine's aliases (71): an UPDATE must preserve the
+/// stored spelling it found, while an INSERT holds the key text it assigns
+/// (472). An offline assignment that loses that text is refused here too.
 fn wrote_the_row(
     table: &TableName,
     key: &RowKey,
     key_column: &str,
+    spelling: KeySpelling,
     cells: &[String],
 ) -> Result<String, DialectError> {
-    let mut predicate = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    let quoted = quote(key_column)?;
+    let expected = row_key(key);
+    // Native equality keeps precision lost by generic money/float rendering.
+    let actual_text = format!("CONVERT(nvarchar(max), {quoted})");
+    let text_check = match spelling {
+        KeySpelling::Inserted => {
+            // CASE retains text spelling/width while typing non-text keys.
+            // ISNULL supplies char/nchar padding only for length: comparing
+            // its converted text would hide code-page changes/truncation.
+            // Binary equality also pads spaces, so check both lengths (472).
+            let expected_text = format!(
+                "CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN {quoted} ELSE {expected} END)"
+            );
+            let padded_text = format!(
+                "CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN {quoted} END, {expected}))"
+            );
+            format!(
+                "{actual_text} = {expected_text} COLLATE Latin1_General_BIN2 \
+                 AND DATALENGTH({actual_text}) = DATALENGTH({padded_text}) \
+                 AND DATALENGTH({actual_text}) >= DATALENGTH({expected_text})"
+            )
+        }
+        KeySpelling::BeforeUpdate => format!(
+            "{actual_text} = @pbps_key_before COLLATE Latin1_General_BIN2 \
+             AND DATALENGTH({actual_text}) = DATALENGTH(@pbps_key_before)"
+        ),
+    };
+    let mut predicate = vec![format!("{quoted} = {expected}"), text_check];
     predicate.extend(cells.iter().cloned());
     Ok(format!(
         "IF NOT EXISTS (SELECT 1 FROM {} WHERE {})\n  THROW 50000, {}, 1;",
@@ -2464,7 +2508,13 @@ mod tests {
         assert!(
             sql[0].contains(
                 "IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] \
-                 WHERE [code] = N'new' AND [label] = N'New')"
+                 WHERE [code] = N'new' AND CONVERT(nvarchar(max), [code]) = \
+                 CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) \
+                 COLLATE Latin1_General_BIN2 AND DATALENGTH(CONVERT(nvarchar(max), [code])) = \
+                 DATALENGTH(CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new'))) \
+                 AND DATALENGTH(CONVERT(nvarchar(max), [code])) >= DATALENGTH(CONVERT(nvarchar(max), \
+                 CASE WHEN 1 = 0 THEN [code] ELSE N'new' END)) \
+                 AND [label] = N'New')"
             ),
             "{}",
             sql[0]
@@ -2642,8 +2692,12 @@ mod tests {
         assert_eq!(
             sql,
             [atomically(&format!(
-                "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
-                 IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new')\n  \
+                "DECLARE @pbps_key_before nvarchar(max);\n\
+                 UPDATE [dbo].[order_status] SET @pbps_key_before = CONVERT(nvarchar(max), [code]), \
+                 [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
+                 IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new' \
+                 AND CONVERT(nvarchar(max), [code]) = @pbps_key_before COLLATE Latin1_General_BIN2 \
+                 AND DATALENGTH(CONVERT(nvarchar(max), [code])) = DATALENGTH(@pbps_key_before))\n  \
                  THROW 50000, N'dbo.order_status row `new` is not what this plan wrote once the \
                  statement had run — a trigger on the table, another writer inside it, or a \
                  value the engine stores differently from the way it is declared. Nothing was \
@@ -2735,6 +2789,10 @@ mod tests {
             .strip_prefix("BEGIN TRANSACTION;\nBEGIN TRY\n")
             .expect("the write and its checks are one transaction");
         let mut lines = body.split('\n');
+        assert_eq!(
+            lines.next(),
+            Some("DECLARE @pbps_key_before nvarchar(max);")
+        );
         let update = lines.next().expect("the update");
         assert_eq!(lines.next(), Some(stale("dbo.t", "a").as_str()));
         // And the row holds what the plan wrote, by the same rendering
@@ -2754,7 +2812,8 @@ mod tests {
         assert!(!wrote.contains("[added]"), "{wrote}");
         assert!(
             update.starts_with(
-                "UPDATE [dbo].[t] SET [added] = N'y', [doc] = N'<a/>', [flag] = N'false', \
+                "UPDATE [dbo].[t] SET @pbps_key_before = CONVERT(nvarchar(max), [code]), \
+                 [added] = N'y', [doc] = N'<a/>', [flag] = N'false', \
                  [label] = N'New', [rank] = 2, [since] = N'2026-09-04', [sort] = 3, \
                  [stamp] = N'x' WHERE [code] = N'a'"
             ),
@@ -2824,7 +2883,7 @@ mod tests {
             .expect("the postcondition");
         // Only the changed column is set.
         assert!(
-            update.starts_with("UPDATE [dbo].[t] SET [label] = N'New' WHERE [code] = N'a'"),
+            update.starts_with("UPDATE [dbo].[t] SET @pbps_key_before = CONVERT(nvarchar(max), [code]), [label] = N'New' WHERE [code] = N'a'"),
             "{update}"
         );
         for held in [
@@ -3048,7 +3107,7 @@ mod tests {
             .collect(),
         });
         assert!(
-            sql[0].contains("UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';"),
+            sql[0].contains("UPDATE [dbo].[t] SET @pbps_key_before = CONVERT(nvarchar(max), [code]), [sort] = DEFAULT WHERE [code] = N'a';"),
             "{}",
             sql[0]
         );
@@ -3342,6 +3401,12 @@ mod tests {
                 "INSERT INTO [dbo].[t] ([code], [label]) ",
                 r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');",
                 "\nIF NOT EXISTS (SELECT 1 FROM [dbo].[t] WHERE [code] = N'o''brien' ",
+                "AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), ",
+                "CASE WHEN 1 = 0 THEN [code] ELSE N'o''brien' END) COLLATE Latin1_General_BIN2 ",
+                "AND DATALENGTH(CONVERT(nvarchar(max), [code])) = DATALENGTH(CONVERT(nvarchar(max), ",
+                "ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'o''brien'))) ",
+                "AND DATALENGTH(CONVERT(nvarchar(max), [code])) >= DATALENGTH(CONVERT(nvarchar(max), ",
+                "CASE WHEN 1 = 0 THEN [code] ELSE N'o''brien' END)) ",
                 r"AND [label] = N'''); DROP TABLE [dbo].[t]; --')",
                 "\n  THROW 50000, N'dbo.t row `o''brien` is not what this plan wrote once ",
                 "the statement had run — a trigger on the table, another writer inside it, ",

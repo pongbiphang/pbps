@@ -12269,3 +12269,6 @@ mod row_security;
 
 #[path = "live/self_reference.rs"]
 mod self_reference;
+
+#[path = "live/key_spelling.rs"]
+mod key_spelling;
