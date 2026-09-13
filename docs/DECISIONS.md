@@ -11513,3 +11513,40 @@ SPEC is in sync with all of these.
      schema fallback, and actual permitted/refused reads under the deployment
      login. Unit cases preserve distinct rename/reuse demands and recorded
      tables without turning an absent schema into an invented grant target.
+
+468. **SQL Server delete counts refuse active row filters and unreadable policy
+     metadata (issue #208).** Measured on SQL Server 17.0.4075.5, a FILTER
+     predicate hides a referencing child from `SELECT COUNT(*)` while the
+     parent's `ON DELETE CASCADE` still deletes it and `ON DELETE SET NULL`
+     still changes it. Both preflight and the emitted delete guard use the
+     same counting statement, so both refuse before trusting that count.
+
+     Unlike PostgreSQL's intrinsic owner bypass (329), SQL Server applies an
+     enabled FILTER predicate even to dbo. An arbitrary predicate's current
+     result is not proof that it admits every row; the refusal therefore
+     follows enabled FILTER predicates, without an owner exemption. Disabled
+     policies and BLOCK predicates do not filter SELECT and retain the normal
+     count. Disabled foreign keys and keys removed earlier by the plan remain
+     outside the probe's catalog read; the execution guard sees the keys left
+     after those statements actually run.
+
+     A policy can live outside the child's schema. Measured, child DML plus
+     schema VIEW DEFINITION exposes the FK but hides that policy. An empty
+     policy catalog is therefore trustworthy only with database VIEW
+     DEFINITION and no effective object/schema metadata DENY, using the same
+     visibility reasoning as key impacts (460). Check this before discovering
+     FKs: a parent-only deployer sees neither the FK nor the policy and can
+     still cascade into the hidden child. Every delete count therefore needs
+     this catalog visibility, including one that ultimately finds no retained
+     FK. A policy hidden by a direct or role-inherited DENY is refused rather
+     than treated as absent; an owner whose effective grant overrides a DENY
+     is not refused merely because the DENY row exists.
+
+     Live regressions measure both referential actions and inspect the child
+     before rolling back a deliberately attempted delete. They pin preflight
+     and execution refusals, cross-schema policy visibility, direct and
+     role-inherited metadata denials, an invisible referencing key, unfiltered
+     counts, and deletes with disabled or explicitly removed keys. Reverting
+     the shared count change makes the regressions fail by accepting a
+     filtered zero. Moving only the visibility check back after FK discovery
+     reproduces the parent-only deployer's silent cascade.

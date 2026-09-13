@@ -1198,11 +1198,37 @@ fn counting_statement(r: &Referencing<'_>) -> String {
         exclusion,
         arrival,
     } = r;
+    // SQL Server filters even dbo, while CASCADE/SET NULL can still reach the
+    // hidden child. Enabled FILTER predicates invalidate both callers' counts;
+    // block-only/disabled policies and keys removed by the plan do not (468).
+    // A policy can live outside the child's schema. Reading the child's
+    // definition does not reveal that policy, and a database grant still loses
+    // to an effective object/schema DENY: an empty policy catalog is evidence
+    // only after its visibility is established, just as for key impacts (460).
+    // Check before discovering keys: a parent-only deployer can see neither
+    // the FK nor its filtered child, yet its DELETE still cascades into it.
     format!(
-        "DECLARE @n int = 0, @sql nvarchar(max);\n\
+        "IF COALESCE(HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION'), 0) <> 1\n\
+             THROW 50000, N'Cannot count referencing rows: inspecting row-level security policies requires database VIEW DEFINITION.', 1;\n\
+         IF EXISTS (SELECT 1 FROM sys.database_permissions dp\n\
+                    WHERE dp.state = N'D' AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL')\n\
+                      AND (dp.grantee_principal_id = USER_ID() OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1)\n\
+                      AND ((dp.class = 1 AND dp.minor_id = 0 AND COALESCE(HAS_PERMS_BY_NAME(\n\
+                           QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(dp.major_id)),\n\
+                           N'OBJECT', N'VIEW DEFINITION'), 0) <> 1)\n\
+                        OR (dp.class = 3 AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id),\n\
+                           N'SCHEMA', N'VIEW DEFINITION'), 0) <> 1)))\n\
+             THROW 50000, N'Cannot count referencing rows: an effective object/schema metadata DENY prevents a complete view of row-level security policies.', 1;\n\
+         DECLARE @n int = 0, @sql nvarchar(max);\n\
          SELECT @sql = STRING_AGG(CONVERT(nvarchar(max), x.stmt), N' ')\n\
-           FROM (SELECT N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
-                 + {} + {} + N')' + {exclusion} + N')' + {arrival} + N';' AS stmt\n\
+           FROM (SELECT CASE WHEN EXISTS (\n\
+                       SELECT 1 FROM sys.security_predicates sp\n\
+                       JOIN sys.security_policies pol ON pol.object_id = sp.object_id\n\
+                       WHERE sp.target_object_id = t.object_id\n\
+                         AND sp.predicate_type = 0 AND pol.is_enabled = 1)\n\
+                 THEN N'THROW 50000, N''Cannot count referencing rows: an enabled row-level security FILTER predicate can hide rows from this session. Disable the policy before planning this delete.'', 1;'\n\
+                 ELSE N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
+                 + {} + {} + N')' + {exclusion} + N')' + {arrival} + N';' END AS stmt\n\
                    FROM sys.foreign_keys fk\n\
                    JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
                    JOIN sys.schemas s ON s.schema_id = t.schema_id\n\

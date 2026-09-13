@@ -1149,6 +1149,13 @@ plans that are perfectly safe. `row_security_active(oid)` is the question
 actually being asked — is this *session* filtered — and it is false for the
 owner and true for the restricted role.
 
+SQL Server needs a different test (decision 468). Its enabled FILTER
+predicates apply even to dbo, and measured CASCADE and SET NULL actions still
+reach hidden children. A policy can also live outside the child's schema:
+permission to read the child and its definition does not reveal that policy.
+Check complete policy-catalog visibility before trusting that no active filter
+exists. Disabled policies and BLOCK predicates do not filter the count.
+
 **The shape:** a query is used to establish that something is not there, and
 the query has a reason to return fewer rows than exist that is invisible in its
 result. Zero rows and zero visible rows are the same value.
