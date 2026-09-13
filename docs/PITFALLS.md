@@ -1071,12 +1071,14 @@ the value that was never a call site — enumerate the **values the plan claims
 to have written**, and check that each one is checked.
 
 The SQL Server counterpart needs both native equality and a binary-collated
-text comparison (DECISIONS 471). A raw text comparison against the declaration
-is not enough: canonical money, float and datetime keys do not use generic
-`CONVERT` formatting. Let the engine type the expected non-text key before
-rendering it, and keep native equality because generic conversion can round
-away a real value change. Row selection and delete absence still ask the
-separate question of identity under the column's collation.
+text comparison plus equal `DATALENGTH` (DECISIONS 471). Even binary equality
+pads away trailing spaces in `varchar` and `nvarchar`. Let the engine type the
+expected key before rendering it: `ISNULL` with a column-typed NULL preserves
+valid `char`/`nchar` padding, while a CASE mixing column and literal does not.
+Canonical money, float and datetime keys also differ from generic `CONVERT`
+formatting; keep native equality because that conversion can round away a
+real value change. Row selection and delete absence still ask the separate
+question of identity under the column's collation.
 
 **A fifth instance, in code written after this section was.** A planned
 column's backfill was spelled as its bare literal. Against a stored column the

@@ -48,14 +48,9 @@ async fn contents(conn: &mut Conn, table: &str) -> Vec<(String, String)> {
     .collect()
 }
 
-async fn respelled_key(is_update: bool) {
-    let mut db = TestDb::create(if is_update {
-        "key_update218"
-    } else {
-        "key_insert218"
-    })
-    .await;
-    db.conn.execute("CREATE TABLE dbo.key218 ([co'de]]x] varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20));").await.unwrap();
+async fn respelled_key(is_update: bool, key_type: &str, append_space: bool) {
+    let mut db = TestDb::create(&format!("key_{is_update}_{append_space}218")).await;
+    db.conn.execute(&format!("CREATE TABLE dbo.key218 ([co'de]]x] {key_type} COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20));")).await.unwrap();
     let key = "Ne'w";
     let seed = Mssql
         .emit(&insert("key218", key), Default::default())
@@ -81,7 +76,12 @@ async fn respelled_key(is_update: bool) {
     if is_update {
         db.conn.execute(&seed.sql).await.unwrap();
     }
-    db.conn.execute("CREATE TRIGGER dbo.respell218 ON dbo.key218 AFTER INSERT, UPDATE AS BEGIN SET NOCOUNT ON; IF TRIGGER_NESTLEVEL() > 1 RETURN; UPDATE t SET [co'de]]x]=LOWER(t.[co'de]]x]) FROM dbo.key218 t JOIN inserted i ON t.[co'de]]x]=i.[co'de]]x]; END;").await.unwrap();
+    let rewrite = if append_space {
+        "t.[co'de]]x] + N' '"
+    } else {
+        "LOWER(t.[co'de]]x])"
+    };
+    db.conn.execute(&format!("CREATE TRIGGER dbo.respell218 ON dbo.key218 AFTER INSERT, UPDATE AS BEGIN SET NOCOUNT ON; IF TRIGGER_NESTLEVEL() > 1 RETURN; UPDATE t SET [co'de]]x]={rewrite} FROM dbo.key218 t JOIN inserted i ON t.[co'de]]x]=i.[co'de]]x]; END;")).await.unwrap();
     let triggered = db
         .conn
         .execute(&stmt.sql)
@@ -112,13 +112,29 @@ async fn respelled_key(is_update: bool) {
 #[tokio::test]
 #[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
 async fn a_trigger_that_respells_the_inserted_key_rolls_the_statement_back() {
-    respelled_key(false).await;
+    respelled_key(false, "varchar(20)", false).await;
 }
 
 #[tokio::test]
 #[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
 async fn a_trigger_that_respells_the_updated_key_rolls_the_statement_back() {
-    respelled_key(true).await;
+    respelled_key(true, "varchar(20)", false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_trigger_that_appends_spaces_to_the_inserted_key_rolls_back() {
+    for key_type in ["varchar(20)", "nvarchar(20)"] {
+        respelled_key(false, key_type, true).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_trigger_that_appends_spaces_to_the_updated_key_rolls_back() {
+    for key_type in ["varchar(20)", "nvarchar(20)"] {
+        respelled_key(true, key_type, true).await;
+    }
 }
 
 #[tokio::test]
@@ -137,6 +153,9 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
         ("date", "date", "2026-09-04"),
         ("datetime", "datetime2(3)", "2026-09-04T12:34:56.123"),
         ("char", "char(10)", "New"),
+        ("nchar", "nchar(10)", "New"),
+        ("varchar", "varchar(20)", "New "),
+        ("nvarchar", "nvarchar(20)", "New "),
         ("hierarchy", "hierarchyid", "/1/"),
         (
             "uuid",

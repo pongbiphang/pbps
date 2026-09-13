@@ -1151,14 +1151,17 @@ fn wrote_the_row(
 ) -> Result<String, DialectError> {
     let quoted = quote(key_column)?;
     let expected = row_key(key);
-    // Keep the native comparison for the full value (money/float text may
-    // round). CASE lets SQL Server type the expected non-text key before
-    // rendering both sides alike; a text key keeps the declared spelling.
-    // The plan carries no key type, unlike its other cells (DECISIONS 471).
+    // Native equality keeps precision lost by generic money/float rendering.
+    // ISNULL takes the column's type from a typed NULL, so the expected key
+    // receives char/nchar padding as well as non-text conversion. DATALENGTH
+    // then distinguishes trailing spaces in varying text: even binary =
+    // pads those away. The plan carries no key type (DECISIONS 471).
+    let actual_text = format!("CONVERT(nvarchar(max), {quoted})");
+    let expected_text =
+        format!("CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN {quoted} END, {expected}))");
     let mut predicate = vec![format!(
-        "{quoted} = {expected} AND CONVERT(nvarchar(max), {quoted}) = \
-         CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN {quoted} ELSE {expected} END) \
-         COLLATE Latin1_General_BIN2"
+        "{quoted} = {expected} AND {actual_text} = {expected_text} \
+         COLLATE Latin1_General_BIN2 AND DATALENGTH({actual_text}) = DATALENGTH({expected_text})"
     )];
     predicate.extend(cells.iter().cloned());
     Ok(format!(
@@ -2475,8 +2478,10 @@ mod tests {
             sql[0].contains(
                 "IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] \
                  WHERE [code] = N'new' AND CONVERT(nvarchar(max), [code]) = \
-                 CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) \
-                 COLLATE Latin1_General_BIN2 AND [label] = N'New')"
+                 CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new')) \
+                 COLLATE Latin1_General_BIN2 AND DATALENGTH(CONVERT(nvarchar(max), [code])) = \
+                 DATALENGTH(CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new'))) \
+                 AND [label] = N'New')"
             ),
             "{}",
             sql[0]
@@ -2657,7 +2662,9 @@ mod tests {
                 "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
                  IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new' \
                  AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), \
-                 CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) COLLATE Latin1_General_BIN2)\n  \
+                 ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new')) COLLATE Latin1_General_BIN2 \
+                 AND DATALENGTH(CONVERT(nvarchar(max), [code])) = DATALENGTH(CONVERT(nvarchar(max), \
+                 ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new'))))\n  \
                  THROW 50000, N'dbo.order_status row `new` is not what this plan wrote once the \
                  statement had run — a trigger on the table, another writer inside it, or a \
                  value the engine stores differently from the way it is declared. Nothing was \
@@ -3357,7 +3364,9 @@ mod tests {
                 r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');",
                 "\nIF NOT EXISTS (SELECT 1 FROM [dbo].[t] WHERE [code] = N'o''brien' ",
                 "AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), ",
-                "CASE WHEN 1 = 0 THEN [code] ELSE N'o''brien' END) COLLATE Latin1_General_BIN2 ",
+                "ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'o''brien')) COLLATE Latin1_General_BIN2 ",
+                "AND DATALENGTH(CONVERT(nvarchar(max), [code])) = DATALENGTH(CONVERT(nvarchar(max), ",
+                "ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'o''brien'))) ",
                 r"AND [label] = N'''); DROP TABLE [dbo].[t]; --')",
                 "\n  THROW 50000, N'dbo.t row `o''brien` is not what this plan wrote once ",
                 "the statement had run — a trigger on the table, another writer inside it, ",
