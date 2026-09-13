@@ -97,6 +97,39 @@ impl RoutineArg {
     }
 }
 
+/// Which token a routine argument's parser is inside, which is what decides
+/// whether a `$` is a byte of a name or the start of a dollar quote.
+///
+/// A *state*, not a test of the last character emitted: a digit continues an
+/// identifier and also begins a numeric constant, and a letter continues both.
+/// Neither character can tell `a1` from `1e2` on its own, and only one of them
+/// may be followed by a `$`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Token {
+    /// Between tokens. The next name character opens one.
+    Closed,
+    /// Opened with the engine's `ident_start` — an ASCII letter, `_`, or any
+    /// non-ASCII byte. A `$` continues it.
+    Identifier,
+    /// Opened with an ASCII digit, and a numeric constant it stays: the
+    /// letters of an exponent or a base prefix, and the decimal point between
+    /// them, are part of the number and not the start of a name. **Measured**, `SELECT 1e2$$;` and `SELECT 0x1$$;` are
+    /// `trailing junk after numeric literal` on 18.6 and 16.15 — so there the
+    /// engine refuses them itself — while `SELECT 10$$;` is `unterminated
+    /// dollar-quoted string`. The junk check arrived in PostgreSQL 15 and this
+    /// tool has no lower bound on the server it will talk to, so the rule is
+    /// the lexer's and not that check's.
+    Numeric,
+}
+
+/// Whether a character can *begin* an unquoted identifier, which is the
+/// engine's `ident_start` as this whitelist can see it: an ASCII letter, `_`,
+/// or any non-ASCII byte. An ASCII digit is the one character this admits that
+/// cannot start a name.
+fn begins_an_identifier(c: char) -> bool {
+    (c.is_alphabetic() && c.is_ascii()) || c == '_' || !c.is_ascii()
+}
+
 /// What a routine argument's text may not be.
 ///
 /// Every rule here is about the *shape* the identity string needs, and none is
@@ -142,6 +175,7 @@ impl FromStr for RoutineArg {
         let mut brackets = 0usize;
         let mut quoted = false;
         let mut pending_space = false;
+        let mut token = Token::Closed;
         let mut chars = t.char_indices();
         while let Some((i, c)) = chars.next() {
             if quoted {
@@ -160,6 +194,8 @@ impl FromStr for RoutineArg {
             }
             if c.is_ascii_whitespace() {
                 pending_space = !out.is_empty();
+                // A space ends the token, so the next word starts one.
+                token = Token::Closed;
                 continue;
             }
             match c {
@@ -168,11 +204,27 @@ impl FromStr for RoutineArg {
                 '[' => brackets += 1,
                 ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
                 ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
-                ',' | '"' | '.' | '_' | '$' => {}
+                ',' | '"' | '.' | '_' => {}
+                // `$` only where an unquoted **identifier** is already open —
+                // not merely after a character a name may contain. That is the
+                // one position where this whitelist would otherwise stop
+                // making the statement safe. **Measured**: `dl.money$type` and
+                // `dl.a$$b` are types, identified as `dl."money$type"` and
+                // `dl."a$$b"` — the doubled `$` inside a word is two bytes of
+                // the name, because the identifier is the longer match. Where
+                // no identifier is open the `$` opens a quote instead:
+                // `CREATE DOMAIN dl.$x` is `syntax error at or near "$"`,
+                // `DROP FUNCTION dl.f($$)` is `unterminated dollar-quoted
+                // string at or near "$$); …"`, and — the case a test of the
+                // last character alone let through —
+                // `DROP FUNCTION app.f(numeric(10$$)); SELECT 1;` is
+                // `unterminated dollar-quoted string at or near
+                // "$$)); SELECT 1;"`. The statement suffix swallowed is what
+                // this whitelist exists to make impossible by construction.
+                '$' if token == Token::Identifier => {}
                 // Any non-ASCII byte is a name byte, which is the engine's own
                 // rule (`continues_ident`): a letter, a symbol, a space that is
-                // not the ASCII one. So is `$`, above — measured, `dl.money$type`
-                // is a type the engine identifies as `dl."money$type"`.
+                // not the ASCII one.
                 c if c.is_alphanumeric() || !c.is_ascii() => {}
                 // Everything else. A type name is written with letters,
                 // digits, `_`, `.`, and the punctuation above; a semicolon, an
@@ -184,6 +236,30 @@ impl FromStr for RoutineArg {
                 // one.
                 _ => return Err(shape(t)),
             }
+            // Which token the next character belongs to, updated in one place
+            // so that no arm above can forget it. Punctuation and a quoted
+            // region close the token; the first name character after that
+            // decides what it is, and nothing inside it can change that
+            // decision — which is the difference between `a1` and `1e2`.
+            token = match c {
+                // Only reachable inside an identifier, and it stays one.
+                '$' => Token::Identifier,
+                // Each variant named, so that a fourth one could not be
+                // carried through here by a wildcard.
+                c if c.is_alphanumeric() || c == '_' || !c.is_ascii() => match token {
+                    Token::Closed if begins_an_identifier(c) => Token::Identifier,
+                    Token::Closed | Token::Numeric => Token::Numeric,
+                    Token::Identifier => Token::Identifier,
+                },
+                // A decimal point does not end a number, and it does end a
+                // name: **measured**, `1.e2` is one numeric constant — `SELECT
+                // 1.e2$$;` is `trailing junk after numeric literal` — while
+                // `a.b` is two tokens and the `$` in `a.b$c` belongs to `b$c`.
+                // Closing the token here unconditionally let the `e` of an
+                // exponent open an identifier.
+                '.' if token == Token::Numeric => Token::Numeric,
+                _ => Token::Closed,
+            };
             // A space between two words is part of the name — `timestamp with
             // time zone` — and a space beside punctuation is layout.
             //
@@ -2497,6 +2573,12 @@ mod tests {
             ("TIMESTAMP  WITH   TIME ZONE", "timestamp with time zone"),
             ("Character Varying ( 10 )", "character varying(10)"),
             ("ID.Pos", "id.pos"),
+            // A `$` inside a word is a byte of the name, folded like the rest
+            // of it: measured, `dl.money$type` is a type the engine identifies
+            // as `dl."money$type"`, and `dl.a$$b` likewise — the doubled `$`
+            // is the longer identifier match, not a dollar quote opening.
+            ("MQ.money$amount", "mq.money$amount"),
+            ("DL.a$$b", "dl.a$$b"),
             // The engine accepts a space around a qualified type's dot and
             // never writes one back, so the two spellings have to be one key.
             ("md . my_type", "md.my_type"),
@@ -2586,6 +2668,60 @@ mod tests {
             "integer'",
             "integer -- note",
             "integer/*note*/",
+            // A token that *opens* with `$`. Measured, none of these names a
+            // type — `CREATE DOMAIN dl.$x` is a syntax error — and the first
+            // is the reason the rule is about position rather than about the
+            // character: interpolated into `DROP FUNCTION dl.f($$)` it is an
+            // `unterminated dollar-quoted string` that swallows the rest of
+            // the statement.
+            "$$",
+            "$a",
+            "a($b)",
+            "$",
+            "a.$b",
+            "a $b",
+            "\"a\"$b",
+            // And a `$` after a token that is not an identifier at all. A
+            // digit continues a name but cannot begin one, so `10` is a
+            // numeric token and the quote opens after it: **measured**,
+            // `SELECT 1$$;` is `unterminated dollar-quoted string at or near
+            // "$$;"`, and inside a modifier, where the parse is still live,
+            // `DROP FUNCTION app.f(numeric(10$$)); SELECT 1;` is
+            // `unterminated dollar-quoted string at or near "$$)); SELECT 1;"`
+            // — the statement suffix swallowed. Inferring the token from the
+            // last character emitted admitted every one of these.
+            "1$$",
+            "1$a",
+            "numeric(10$$)",
+            "a(1$$)",
+            "a[1$$]",
+            // A number does not become a name because it has letters in it.
+            // Measured on 18.6 and 16.15, `SELECT 1e2$$;` and `SELECT 0x1$$;`
+            // are `trailing junk after numeric literal` — the engine's own
+            // refusal, which arrived in PostgreSQL 15 and which this tool does
+            // not require a server to have. The rule is the lexer's: an
+            // exponent or a base prefix is part of the number.
+            "1e2$$",
+            "0x1$$",
+            "numeric(1e2$$)",
+            "1e2$a",
+            // And the decimal point does not end the number either. This one
+            // is not a pre-15 question: **measured on 18.6 and 16.15**,
+            // `SELECT 1.5$$;` is `unterminated dollar-quoted string at or near
+            // "$$;"` — no junk check catches it, because `1.5$$` is a number
+            // followed by a quote and nothing else. `1.e2$$` is the spelling
+            // that reached an identifier through the exponent's letter.
+            "1.5$$",
+            "1.e2$$",
+            "a[1.e2$$]",
+            "numeric(1.5$$)",
+            // The rest of what the engine's lexer counts as part of a number,
+            // swept rather than waited for: a digit separator and the other
+            // base prefixes. Every one of them is a character this whitelist
+            // admits, and none of them opens a name.
+            "1_0$$",
+            "0b1$$",
+            "0o7$$",
         ] {
             assert!(
                 bad.parse::<RoutineArg>().is_err(),
@@ -2594,14 +2730,31 @@ mod tests {
         }
         // And a comma that is *inside* something is not a separator.
         assert!("numeric(10,2)".parse::<RoutineArg>().is_ok());
-        // A `$` is a name byte: measured, `dl.money$type` is a type.
-        assert_eq!(
-            "dl.money$type"
-                .parse::<RoutineArg>()
-                .expect("one argument")
-                .as_str(),
-            "dl.money$type"
-        );
+        // A `$` is a name byte where a name may continue: measured,
+        // `dl.money$type` and `dl.a$$b` are types, identified as
+        // `dl."money$type"` and `dl."a$$b"`.
+        for good in [
+            "dl.money$type",
+            "dl.a$$b",
+            "a$",
+            "_$x",
+            "r8.a\u{a0}$b",
+            // A digit *inside* an identifier is a name byte, and the token it
+            // is in was opened by a letter — so this one is a name and `1$$`
+            // is not.
+            "a1$b",
+            "a(b1$c)",
+            // And the dot still ends a *name*, so the `$` in `a1.b$c` belongs
+            // to `b$c` and is one byte of it.
+            "a1.b$c",
+        ] {
+            assert_eq!(
+                good.parse::<RoutineArg>()
+                    .unwrap_or_else(|e| panic!("{good}: {e}"))
+                    .as_str(),
+                good
+            );
+        }
     }
 
     /// The identity string carries them the same way, which is what makes the

@@ -6468,6 +6468,74 @@ SPEC is in sync with all of these.
     with the identity `dl.h(dl."money$type")`, and the argument was refused
     before it reached the engine.
 
+    **Amended again: `$` is admitted only where an unquoted identifier is
+    already open** (issue #204). The character was admitted at any position,
+    which gave back the property the whitelist exists for. The whitelist is not
+    about which types exist — it is what makes the identity safe to interpolate
+    verbatim into `DROP FUNCTION` and `GRANT` by construction rather than by
+    review, and a `$` that opens a token is where the interpolated text stops
+    being a name. Measured on 18.6:
+
+    ```text
+    CREATE DOMAIN dq.a$$b AS numeric …   ->  dq.f(dq."a$$b")
+    CREATE DOMAIN dq.$x   AS numeric     ->  syntax error at or near "$"
+    DROP FUNCTION dq.f($$)               ->  unterminated dollar-quoted string
+                                             at or near "$$); SELECT 1;"
+    ```
+
+    Inside a word the `$` is a byte of the name — the identifier is the longer
+    match, so `a$$b` is one name and not a quote opening — and that spelling
+    stays accepted. A token that *opens* with one names no type in any case, so
+    refusing it costs nothing and takes the swallowed statement with it.
+
+    **And "an identifier is open" is state, not the last character emitted.**
+    The first rule read back one character and asked whether a name may contain
+    it, which a digit may — so `1$$` passed, and review round 1 on #520 was
+    right that it should not. An ASCII digit continues an identifier and cannot
+    begin one, so a token that starts with one is a numeric constant and the
+    `$$` after it opens a quote like any other. Measured:
+
+    ```text
+    SELECT 1$$;                              ->  unterminated dollar-quoted
+                                                 string at or near "$$;"
+    DROP FUNCTION app.f(numeric(10$$)); …    ->  unterminated dollar-quoted
+                                                 string at or near
+                                                 "$$)); SELECT 1;"
+    ```
+
+    The second is the one that matters: the parse is still live inside the
+    modifier, so nothing refuses the statement before the quote swallows its
+    suffix. The parser now carries which token is open — closed, an identifier,
+    or a numeric constant — updated in one place so no arm of the whitelist can
+    forget it.
+
+    **Three states and not two**, which review round 2 was right to ask for
+    even though its reasoning does not hold on any server this suite runs.
+    `1e2$$` passed a two-state parser, because the `e` made a token that had
+    begun with a digit look like an identifier. Measured on 18.6 and 16.15,
+    that spelling does *not* open a quote — `SELECT 1e2$$;` and `SELECT 0x1$$;`
+    are `trailing junk after numeric literal`, and so is `1e2$q$a$q$` — so
+    there the engine refuses it and nothing is swallowed. The junk check
+    arrived in PostgreSQL 15 and this tool sets no lower bound on the server it
+    will talk to, so the whitelist models the lexer rather than that check: a
+    token that opened with a digit stays numeric however many letters follow,
+    because an exponent and a base prefix are part of the number. A letter
+    inside a name is still a name (`a1$b`), which is the case the two-state
+    parser got right and this one keeps.
+
+    **And the decimal point does not end the number, though it does end a
+    name.** Round 3 found `1.e2$$`, where the dot closed the token and the
+    exponent's `e` opened an identifier. Measured on 18.6 and 16.15, that
+    spelling is junk like the others — but `SELECT 1.5$$;` is `unterminated
+    dollar-quoted string` on both, with no junk check to catch it, because a
+    number followed by a quote is exactly what it is. So the dot is carried
+    through a numeric token and closes an identifier one, which is the lexer's
+    own asymmetry: `1.e2` is one constant and `a.b` is two names. With that,
+    every character the engine counts as part of a number — digits, the point,
+    an exponent's letter, the `0x`/`0o`/`0b` prefixes and the `_` separator —
+    is inside the numeric state, and the family is closed rather than patched
+    one round at a time.
+
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
     edges to it:
