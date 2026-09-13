@@ -147,8 +147,8 @@ struct Moved {
     deleted: BTreeSet<RowKey>,
     /// Updated row -> column set by its update -> the value it is set to,
     /// as the SQL the engine compares (a literal, or the expression the
-    /// catalog spells a literal default in: `(1)`, `('old')`). `None` for
-    /// NULL or a default that is not a literal, which no probe can compare.
+    /// catalog spells a literal default in: `(1)`, `('old')`). Explicit NULL
+    /// stays a literal; defaults not retained by `constant_default` are `None`.
     ///
     /// An update that sets a *referencing* column to a value that is not the
     /// deleted key moves the row off the parent; one that sets any other
@@ -225,9 +225,9 @@ fn written(value: &Value) -> Option<String> {
         Value::Text(t) => Some(literal(t)),
         Value::Int(i) => Some(literal(&i.to_string())),
         Value::Bool(b) => Some(literal(&b.to_string())),
-        // A NULL foreign key references nothing, so no delete can cascade
-        // into the row through it.
-        Value::Null => None,
+        // Equality against NULL matches no parent. Keep it in the future
+        // tuple: None would retain the stored reference (DECISIONS 329).
+        Value::Null => Some("NULL".to_owned()),
     }
 }
 
@@ -3698,9 +3698,9 @@ mod tests {
     }
 
     /// A foreign key is a tuple: an update that sets two of its columns is
-    /// compared as one row after the update, a key spanning a column the
-    /// update sets to NULL keeps the row counted, and an insert that leaves
-    /// a column of the key to NULL is not asked about (121).
+    /// compared as one row after the update, including an explicit NULL
+    /// that makes the tuple reference no parent (329). An insert omitting
+    /// a column of the key still supplies no comparable value for it (121).
     #[test]
     fn a_composite_foreign_key_is_matched_as_one_tuple() {
         use pbps_model::{Cell, Value};
@@ -3759,16 +3759,17 @@ mod tests {
             sql.contains("AND c.name IN (N'grp', N'sub')) THEN N' AND NOT (ch.[id] = N''1''"),
             "{sql}"
         );
-        // The NULL is not compared: a key spanning `sub` counts row 2 as it
-        // is, one spanning `grp` alone compares it.
+        // NULL participates in the future tuple. A key spanning `sub` no
+        // longer references the parent; a key on `grp` alone still compares it.
         assert!(
             sql.contains(
-                "AND c.name IN (N'sub')) THEN N'' WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns"
+                "CASE c.name WHEN N'grp' THEN N'N''1''' WHEN N'sub' THEN N'NULL' \
+                 ELSE N'ch.' + QUOTENAME(c.name) END"
             ),
             "{sql}"
         );
         assert!(
-            sql.contains("AND c.name IN (N'grp')) THEN N' AND NOT (ch.[id] = N''2''"),
+            sql.contains("AND c.name IN (N'grp', N'sub')) THEN N' AND NOT (ch.[id] = N''2''"),
             "{sql}"
         );
         // The insert spells `id` and `grp`; a key reaching `sub` is not asked.

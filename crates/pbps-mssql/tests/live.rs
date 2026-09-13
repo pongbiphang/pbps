@@ -6586,8 +6586,8 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         ),
         (
             with(pair_update("1", &[("sub", Value::Null)])),
-            1,
-            "a cell set to NULL is not compared: the row stays counted",
+            0,
+            "a tuple set to (1, NULL) no longer references the deleted parent",
         ),
         (
             with(pair_update("2", &[("sub", int(1))])),
@@ -11852,4 +11852,160 @@ async fn retyping_an_included_column_recreates_fks_bound_to_its_unique_index() {
         assert_eq!(result, Ok(()));
         assert!(converged && next_empty && enforced);
     }
+}
+
+/// A planned NULL breaks the child's reference before the parent delete.
+/// Omitting that comparable value retains the stored reference in the probe.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delete() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+
+    async fn count(conn: &mut Conn, sql: &str) -> i32 {
+        conn.query(sql).await.expect("count")[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap()
+    }
+
+    let parent = TableName::new("dbo", "parent");
+    let child = TableName::new("dbo", "child");
+    let mut p = Table::default();
+    p.columns
+        .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
+    p.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    let mut c = p.clone();
+    c.columns
+        .insert("parent".into(), Column::new(ty("varchar(20)")));
+    c.foreign_keys.insert(
+        "fk_child".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    p.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [
+            (RowKey::from("old"), Row::default()),
+            (RowKey::from("keep"), Row::default()),
+        ]
+        .into_iter()
+        .collect(),
+    });
+    c.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [(
+            RowKey::from("c1"),
+            [("parent".into(), Value::Text("old".into()))]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let mut before = Schema::default();
+    before.tables.insert(parent.clone(), p);
+    before.tables.insert(child.clone(), c);
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    let mut db = TestDb::create("delete_null207").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &before, &ids),
+    )
+    .await;
+
+    let mut after = before.clone();
+    after
+        .tables
+        .get_mut(&parent)
+        .unwrap()
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .remove(&RowKey::from("old"));
+    // Negative control: a child this plan leaves on the parent still blocks it.
+    let blocked = plan(&before, &ids, &after, &ids);
+    let blocked_probe = Mssql
+        .preflight(&blocked)
+        .probes
+        .into_iter()
+        .find(|p| p.description.contains("row `old`"))
+        .expect("delete probe");
+    let blocked_count = count(&mut db.conn, &blocked_probe.sql).await;
+    let blocked_apply = try_apply(&mut db.conn, &blocked).await;
+
+    // The same literal also reaches inserted-row arrival checks. A new NULL
+    // reference must not be mistaken for an arrival on the deleted parent.
+    after
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .extend(["c1", "c2"].map(|key| {
+            (
+                RowKey::from(key),
+                [("parent".into(), Value::Null)].into_iter().collect(),
+            )
+        }));
+    let changes = plan(&before, &ids, &after, &ids);
+    let probes = Mssql.preflight(&changes).probes;
+    let mut counts = Vec::new();
+    for probe in &probes {
+        counts.push((
+            probe.description.clone(),
+            count(&mut db.conn, &probe.sql).await,
+        ));
+    }
+    // Execute the real ordered statements, including their transactional guards.
+    let applied = try_apply(&mut db.conn, &changes).await;
+    let old = count(
+        &mut db.conn,
+        "SELECT COUNT(*) FROM dbo.parent WHERE code = 'old';",
+    )
+    .await;
+    let keep = count(
+        &mut db.conn,
+        "SELECT COUNT(*) FROM dbo.parent WHERE code = 'keep';",
+    )
+    .await;
+    let nulled = count(
+        &mut db.conn,
+        "SELECT COUNT(*) FROM dbo.child WHERE code IN ('c1', 'c2') AND parent IS NULL;",
+    )
+    .await;
+    db.drop().await;
+
+    assert_eq!(blocked_count, 1, "an unchanged child must still be counted");
+    let refusal = blocked_apply.expect_err("the unchanged child blocks the delete");
+    assert!(
+        refusal.contains("arrived after this plan was checked"),
+        "{refusal}"
+    );
+    assert!(
+        counts
+            .iter()
+            .any(|(description, _)| description.contains("row `old`")),
+        "{counts:?}"
+    );
+    assert!(
+        counts.iter().all(|(_, n)| *n == 0),
+        "the row this plan sets to NULL must leave the pre-delete count: {counts:?}"
+    );
+    assert!(applied.is_ok(), "{applied:?}");
+    assert_eq!(
+        (old, keep, nulled),
+        (0, 1, 2),
+        "only the planned parent disappears and both children hold NULL"
+    );
 }
