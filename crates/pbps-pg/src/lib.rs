@@ -234,13 +234,15 @@ pub struct Postgres {
 }
 
 impl Postgres {
-    /// The dialect with nothing after an object's own schema on the write path.
+    /// The dialect with no configured extra project schemas on the write path.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The dialect with `extras` after an object's own schema, in that order.
+    /// The emitted path places the `pg_temp` alias once at the end, including
+    /// when it appears among these extras (DECISIONS 464).
     ///
     /// The order is part of what a declaration means, and ADR-0013 measured it:
     /// a view created under `(m_ea, m_eb)` keeps the binding it was created
@@ -253,7 +255,7 @@ impl Postgres {
         }
     }
 
-    /// The schemas after an object's own on the write path.
+    /// The configured extras, before the emitter moves `pg_temp` to the end.
     #[must_use]
     pub fn write_path_extras(&self) -> &[String] {
         &self.write_path_extras
@@ -787,10 +789,11 @@ impl Dialect for Postgres {
         true
     }
 
-    /// The write path: the object's own schema first, then the configured
-    /// extras in order, which is the `search_path` every statement of this
-    /// dialect runs under (DECISIONS 276). A bare name resolves through it
-    /// and nowhere else, and to the *first* entry that holds one: measured,
+    /// The project-schema portion of the write path: the object's own schema
+    /// first, then the configured extras in order (DECISIONS 276 and 464).
+    /// The implicit catalog and final temporary schema hold no declared
+    /// candidates. A bare project name resolves to the *first* entry that
+    /// holds one: measured,
     /// with `z.p` and `a.p` both present, a bare `p` under `SET search_path =
     /// "z", "a"` binds `z.p`, and under `"a", "z"` binds `a.p`. With no
     /// extras, `a.x AS SELECT * FROM b.z` over `b.z AS SELECT 1 AS x` is a

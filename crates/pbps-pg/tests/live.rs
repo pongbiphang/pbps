@@ -2932,6 +2932,96 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
     conn.drop().await;
 }
 
+/// Naming pg_temp last keeps session objects behind both project path sources.
+/// Inspect the stored dependencies: equal values alone cannot prove which
+/// relation and domain PostgreSQL bound when it parsed the default.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn temporary_relations_and_types_follow_the_declared_write_path() {
+    let mut db = TestDb::create("temp_writepath190").await;
+    db.execute(
+        "CREATE SCHEMA app;
+         CREATE SCHEMA consumer;
+         CREATE TABLE app.t (id bigint);
+         CREATE DOMAIN app.d AS bigint;
+         CREATE TEMP TABLE t (id bigint);
+         CREATE DOMAIN pg_temp.d AS bigint;",
+    )
+    .await
+    .unwrap();
+    let mut table = Table::default();
+    let mut id = Column::new(ty("bigint"));
+    id.default = Some("'t'::regclass::oid::bigint + 1::d".into());
+    table.columns.insert("id".into(), id);
+
+    async fn binds_to(conn: &mut Conn, table: &str, schema: &str) -> bool {
+        truth(
+            conn,
+            &format!(
+                "SELECT
+                 EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                   JOIN pg_catalog.pg_attrdef a ON d.objid = a.oid
+                  WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass
+                    AND a.adrelid = '{table}'::regclass
+                    AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                    AND d.refobjid = '{schema}.t'::regclass)
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                   JOIN pg_catalog.pg_attrdef a ON d.objid = a.oid
+                  WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass
+                    AND a.adrelid = '{table}'::regclass
+                    AND d.refclassid = 'pg_catalog.pg_type'::regclass
+                    AND d.refobjid = '{schema}.d'::regtype)"
+            ),
+        )
+        .await
+    }
+
+    let change = |schema: &str| pbps_model::Change::CreateTable {
+        uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        name: TableName::new(schema, "bound"),
+        table: Box::new(table.clone()),
+    };
+    // The same emitted statement without the final entry is the negative
+    // control, even in a session whose explicit path names only the project.
+    let baseline = Postgres::new()
+        .emit(&change("app"), Strategy::default())
+        .unwrap()[0]
+        .sql
+        .replace(", \"pg_temp\"", "");
+    db.execute(&baseline).await.unwrap();
+    let without_entry = binds_to(&mut db, "app.bound", "pg_temp").await;
+    db.execute("DROP TABLE app.bound;").await.unwrap();
+
+    let mut bindings = Vec::new();
+    for (schema, extras) in [
+        ("app", vec![]),
+        ("consumer", vec!["app".into()]),
+        (
+            "consumer",
+            vec!["pg_temp".into(), "app".into(), "pg_temp".into()],
+        ),
+    ] {
+        let pg = Postgres::with_write_path_extras(extras);
+        for statement in pg.emit(&change(schema), Strategy::default()).unwrap() {
+            db.execute(&statement.sql).await.unwrap();
+        }
+        bindings.push(binds_to(&mut db, &format!("{schema}.bound"), "app").await);
+        db.execute(&format!("DROP TABLE {schema}.bound;"))
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+    assert!(
+        without_entry,
+        "omitting pg_temp binds both temporary objects"
+    );
+    assert_eq!(
+        bindings,
+        vec![true; 3],
+        "own schema and extras precede temp"
+    );
+}
+
 /// The write `search_path` is what makes an unqualified name in a declared
 /// expression mean what the project means by it (ADR-0013 §3).
 ///
