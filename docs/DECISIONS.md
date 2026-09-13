@@ -10672,6 +10672,9 @@ SPEC is in sync with all of these.
      This supersedes decision 261's temporary permission for typed literals.
      NULL literals are excluded: their value is setting-independent, and
      rewriting their cast can erase a retained default (decision 361).
+     Omitted reference-row defaults carry the same plan facts: their guard
+     must compare against the canonical value emitted for the column, not
+     reinterpret the original source under the replay session's settings.
 
      Resolution is a connected free function in `pbps-pg`, routed by `engine`
      from planning and bootstrap. It owns a canonical read-only scope and

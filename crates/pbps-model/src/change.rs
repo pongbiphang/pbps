@@ -1909,6 +1909,25 @@ impl PlannedChange {
                 column,
                 ..
             } => add(ColumnRef::new(table.clone(), name), column),
+            Change::InsertRow {
+                table,
+                defaults: sources,
+                types,
+                ..
+            } => {
+                for (name, source) in sources {
+                    if let Some(ty) = types.get(name) {
+                        defaults.insert(
+                            ColumnRef::new(table.clone(), name),
+                            PlannedDefault {
+                                column_type: ty.clone(),
+                                source: source.clone(),
+                                resolution: DefaultResolution::Unresolved,
+                            },
+                        );
+                    }
+                }
+            }
             Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::DropColumn { .. }
@@ -1925,7 +1944,6 @@ impl PlannedChange {
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }

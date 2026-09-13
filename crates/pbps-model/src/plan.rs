@@ -647,7 +647,7 @@ mod tests {
             plan
         );
         json["changes"]["changes"][0]["default_resolutions"] = serde_json::json!({});
-        assert_eq!(
+        assert_ne!(
             serde_json::from_value::<SavedPlan>(json.clone()).unwrap(),
             plan
         );

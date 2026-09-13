@@ -2391,8 +2391,8 @@ pub(crate) fn emit_resolved(
         // Reference data (ADR-0004). Each row change is one statement — a `DO`
         // block carrying the write and the checks that hold it to what the
         // plan reviewed — under the table's own write path, because the
-        // defaults those checks compare against are the user's verbatim
-        // expressions.
+        // nonliteral defaults those checks compare against still use the
+        // user's expressions; planned literal defaults are resolved first.
         Change::InsertRow {
             table,
             key_column,

@@ -47,6 +47,20 @@ fn declared(p: &PlannedChange) -> BTreeMap<ColumnRef, (&str, Option<&ColumnType>
             to: Some(s),
             ..
         } => [(column.clone(), (s.as_str(), None))].into(),
+        Change::InsertRow {
+            table,
+            defaults,
+            types,
+            ..
+        } => defaults
+            .iter()
+            .map(|(name, source)| {
+                (
+                    ColumnRef::new(table.clone(), name),
+                    (source.as_str(), types.get(name)),
+                )
+            })
+            .collect(),
         Change::DropTable { .. }
         | Change::RenameTable { .. }
         | Change::DropColumn { .. }
@@ -63,7 +77,6 @@ fn declared(p: &PlannedChange) -> BTreeMap<ColumnRef, (&str, Option<&ColumnType>
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }
         | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
@@ -144,6 +157,10 @@ pub(crate) fn emit(
                     return Err(invalid(format!(
                         "canonical default for {at} is not a literal"
                     )));
+                }
+                if let Change::InsertRow { defaults, .. } = &mut change {
+                    *defaults.get_mut(&at.name).expect("validated row default") = rendered.clone();
+                    continue;
                 }
                 let slot = match &mut change {
                     Change::CreateTable { table, .. } => {
@@ -458,6 +475,51 @@ mod tests {
         ] {
             assert!(input(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn omitted_row_defaults_use_resolved_plan_facts_without_rewriting_source() {
+        let mut p = PlannedChange::new(Change::InsertRow {
+            table: "public.t".parse().unwrap(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: pbps_model::RowKey::from("a"),
+            row: Default::default(),
+            defaults: [
+                ("d".into(), "'01/02/2026'::date".into()),
+                ("n".into(), "7".into()),
+            ]
+            .into(),
+            types: [
+                ("d".into(), "date".parse().unwrap()),
+                ("n".into(), "integer".parse().unwrap()),
+            ]
+            .into(),
+        });
+        let pg = crate::Postgres::new();
+        assert!(
+            pg.emit_planned(&p).is_err(),
+            "an unresolved row guard must not emit"
+        );
+        p.default_resolutions
+            .get_mut(&"public.t.d".parse().unwrap())
+            .unwrap()
+            .resolution = DefaultResolution::Canonical {
+            rendered: "'2026-01-02'::date".into(),
+        };
+        let replay: PlannedChange =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        let sql = format!("{:?}", pg.emit_planned(&replay).unwrap());
+        assert!(sql.contains("2026-01-02"), "{sql}");
+        assert!(!sql.contains("01/02/2026"), "{sql}");
+        let Change::InsertRow { defaults, .. } = &replay.change else {
+            unreachable!()
+        };
+        assert_eq!(defaults["d"], "'01/02/2026'::date");
+        assert_eq!(defaults["n"], "7");
+        let mut missing = replay.clone();
+        missing.default_resolutions.clear();
+        assert!(pg.emit_planned(&missing).is_err());
     }
 
     #[test]

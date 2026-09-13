@@ -314,6 +314,46 @@ fn canonical_defaults_survive_bootstrap_saved_apply_and_the_next_plan() {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn exported_bootstrap_holds_omitted_defaults_under_hostile_datestyle() {
+    let own = OwnDatabase::new(&server(), "exported_defaults");
+    let replay = OwnDatabase::new(&server(), "replayed_defaults");
+    on_server(own.connection(), "CREATE SCHEMA app");
+    on_server(replay.connection(), "CREATE SCHEMA app");
+    let d = Demo::new("exported_defaults");
+    d.table("table: app.t\ncolumns:\n  code: {type: text, nullable: false}\n  d: {type: date, default: \"'01/02/2026'::date\"}\n  n: {type: integer, default: '7'}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    omitted: {}\n    explicit: {d: '2026-03-04', n: 9}\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let path = d.dir.join("bootstrap.sql");
+    succeeds(d.run(&[
+        "bootstrap",
+        "--db",
+        own.connection(),
+        "--sql",
+        path.to_str().unwrap(),
+    ]));
+    let sql = std::fs::read_to_string(path).unwrap();
+    on_server(
+        replay.connection(),
+        &format!("SET DateStyle = 'ISO, DMY';\n{sql}"),
+    );
+    assert_eq!(
+        scalar(
+            replay.connection(),
+            "SELECT count(*) FROM app.t WHERE (code = 'omitted' AND d = DATE '2026-01-02' AND n = 7) OR (code = 'explicit' AND d = DATE '2026-03-04' AND n = 9)"
+        ),
+        2
+    );
+    assert_eq!(
+        latest_snapshot(own.connection())
+            .declared
+            .expressions
+            .defaults[&"app.t".parse().unwrap()]["d"],
+        "'01/02/2026'::date"
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn retained_null_default_is_not_erased_by_connected_resolution() {
     let own = OwnDatabase::new(&server(), "retained_null_default");
     let connection = own.connection();
