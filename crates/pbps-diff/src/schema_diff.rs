@@ -772,16 +772,28 @@ pub fn diff_partial(
     // the table it will claim them on. Both sides carry `declared_table_name`
     // (`diff_columns`), so the two spellings meet.
     //
-    // Folded by the dialect, because "are these one name" is its question and
-    // the two dialects answer differently: SQL Server folds nothing, while
-    // PostgreSQL lowercases, so a declaration renaming to `Note` is claiming
-    // the name a baseline `note` holds.
+    // Folded by the dialect, because "are these one name" is its question —
+    // and then lowercased on top, because on SQL Server the dialect cannot
+    // answer it. `Mssql::fold_ident` is the identity, correctly: what makes
+    // two spellings one name there is the *database's* collation, which a
+    // plan computed offline does not have (SPEC 7.3). **Measured** on the
+    // pinned image: in a `SQL_Latin1_General_CP1_CI_AS` database — the server
+    // default, and this suite's — `note` and `Note` cannot coexist and
+    // `sp_rename` to `Note` is `Msg 15335`; in a `Latin1_General_CS_AS` one
+    // they sit side by side and the rename succeeds.
+    //
+    // So the match is deliberately wider than any one collation, because the
+    // two errors are not the same size. Missing a claim refuses a valid plan
+    // at the engine. Over-matching only moves a drop earlier than it had to
+    // go, and nothing between its old class and its new one can notice: a
+    // `Revoke` names no column, and a column this plan drops is never a
+    // rename's source, since the two come from different uids and no two
+    // baseline columns share a name.
+    let one_name = |ident: &str| dialect.fold_ident(ident).to_lowercase();
     let claimed_by_a_column_rename: BTreeSet<(TableName, String)> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::RenameColumn { table, to, .. } => {
-                Some((table.clone(), dialect.fold_ident(to).into_owned()))
-            }
+            Change::RenameColumn { table, to, .. } => Some((table.clone(), one_name(to))),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -819,10 +831,9 @@ pub fn diff_partial(
     // column name.
     let frees_a_renamed_column = |c: &Change| -> bool {
         match c {
-            Change::DropColumn { column, .. } => claimed_by_a_column_rename.contains(&(
-                column.table.clone(),
-                dialect.fold_ident(&column.name).into_owned(),
-            )),
+            Change::DropColumn { column, .. } => {
+                claimed_by_a_column_rename.contains(&(column.table.clone(), one_name(&column.name)))
+            }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -3883,6 +3894,92 @@ mod tests {
         assert!(
             drop_at < rename_at,
             "the drop must free the name first: {:?}",
+            kinds(&cs)
+        );
+    }
+
+    /// And where the two names differ only by case.
+    ///
+    /// `fold_ident` is the dialect's answer to "are these one name", and on
+    /// SQL Server it is the identity — because the answer there belongs to the
+    /// *database's* collation, which a plan computed offline does not have.
+    /// **Measured** on the pinned image: in a `SQL_Latin1_General_CP1_CI_AS`
+    /// database (the server default, and this container's) `note` and `Note`
+    /// cannot coexist and `sp_rename` to `Note` is `Msg 15335`; in a
+    /// `Latin1_General_CS_AS` one they sit side by side and the rename
+    /// succeeds. So the ordering takes the conservative side.
+    #[test]
+    fn a_dropped_columns_name_is_free_before_a_rename_that_differs_only_by_case() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("Note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "Note".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
+        };
+        let drop_at =
+            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note"));
+        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to == "Note"));
+        assert!(
+            drop_at < rename_at,
+            "the engine reads one name where the model reads two: {:?}",
             kinds(&cs)
         );
     }

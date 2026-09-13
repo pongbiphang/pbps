@@ -11887,9 +11887,21 @@ SPEC is in sync with all of these.
      under the same scheme, unchanged in effect.
 
      **Only the drop that frees a claimed name moves**, and the claim is the
-     dialect's own question: `Dialect::fold_ident` on both sides, because
-     PostgreSQL lowercases and SQL Server does not, so a declaration renaming
-     to `Note` is claiming the name a baseline `note` holds. A rename into a
+     dialect's own question — `Dialect::fold_ident` on both sides — lowercased
+     on top of it, because on SQL Server the dialect cannot answer. Its
+     `fold_ident` is the identity, correctly: what makes two spellings one name
+     there is the *database's* collation, which a plan computed offline does
+     not have (SPEC 7.3). **Measured** on the pinned image: in a
+     `SQL_Latin1_General_CP1_CI_AS` database — the server default, and this
+     suite's — `note` and `Note` cannot coexist and `sp_rename` to `Note` is
+     `Msg 15335`; in a `Latin1_General_CS_AS` one they sit side by side and the
+     rename succeeds. The match is therefore deliberately wider than any one
+     collation, because the two errors are not the same size: missing a claim
+     refuses a valid plan at the engine, while over-matching only moves a drop
+     earlier than it had to go, and nothing between its old class and its new
+     one can notice — a `Revoke` names no column, and a column this plan drops
+     is never a rename's source, since the two come from different uids and no
+     two baseline columns share a name. A rename into a
      name nothing in the plan gives up never reaches this sort at all —
      `resolve` refuses it as an occupied target, which is what keeps the
      reorder from reading as an implicit drop.
