@@ -64,6 +64,46 @@ impl Schema {
 }
 
 impl Table {
+    /// Reused declared names across this table's constraint kinds.
+    ///
+    /// Separate maps cannot enforce this shared rule. Indexes are excluded:
+    /// CHECK/FK names may match an ordinary index, while key-backed index
+    /// collisions and any wider namespace belong to the dialect (decision 459).
+    /// An unnamed primary key has no declared name to compare.
+    pub fn constraint_name_conflicts(&self) -> Vec<String> {
+        let primary = self.primary_key.as_ref().and_then(|pk| pk.name.as_deref());
+        let names = primary
+            .into_iter()
+            .map(|name| (name, "primary key"))
+            .chain(
+                self.unique
+                    .keys()
+                    .map(|name| (name.as_str(), "unique constraint")),
+            )
+            .chain(
+                self.foreign_keys
+                    .keys()
+                    .map(|name| (name.as_str(), "foreign key")),
+            )
+            .chain(
+                self.checks
+                    .keys()
+                    .map(|name| (name.as_str(), "check constraint")),
+            );
+        let mut seen = BTreeMap::new();
+        let mut problems = Vec::new();
+        for (name, kind) in names {
+            match seen.entry(name) {
+                std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(kind); }
+                std::collections::btree_map::Entry::Occupied(entry) => problems.push(format!(
+                    "{} and {kind} are both named `{name}`; constraint names must be distinct within a table",
+                    entry.get()
+                )),
+            }
+        }
+        problems
+    }
+
     /// The single column a declared row is keyed by, where this table has one.
     ///
     /// `None` is not "no key": it is a primary key that is absent or composite,

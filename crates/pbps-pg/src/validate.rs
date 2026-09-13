@@ -39,6 +39,7 @@ fn invalid(message: impl Into<String>) -> DialectError {
 /// the stock catalogue by an offline validator (DECISIONS 452).
 pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     let mut found = Vec::new();
+    found.extend(table.constraint_name_conflicts().into_iter().map(invalid));
     if let Some(pk) = &table.primary_key {
         found.extend(key_columns("primary key", &pk.columns, table, true));
     }
