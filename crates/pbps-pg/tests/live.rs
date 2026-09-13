@@ -8426,6 +8426,73 @@ async fn a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_
     drop_schema(&mut conn, &s).await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn quoted_routine_bodies_report_calls_but_not_their_string_data() {
+    let mut db = TestDb::create("quoted_callers228").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let mut declared = Schema::default();
+    for (name, definition) in [
+        ("g", "(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        (
+            "dollar",
+            "() RETURNS int LANGUAGE sql AS $$ SELECT app.g(1) $$",
+        ),
+        ("plain", "() RETURNS int LANGUAGE sql AS 'SELECT app.g(1)'"),
+        (
+            "escaped_quotes",
+            "() RETURNS int LANGUAGE plpgsql AS 'BEGIN PERFORM ''app.g(1)''; RETURN app.g(1); END'",
+        ),
+        (
+            "dollar_data",
+            "() RETURNS text LANGUAGE sql AS $$ SELECT 'app.g(1)' $$",
+        ),
+        (
+            "plain_data",
+            "() RETURNS text LANGUAGE sql AS 'SELECT ''app.g(1)'''",
+        ),
+    ] {
+        db.conn
+            .execute(&format!("CREATE FUNCTION app.{name}{definition}"))
+            .await
+            .unwrap();
+        let id = if name == "g" {
+            "app.g(integer)".to_owned()
+        } else {
+            format!("app.{name}()")
+        };
+        // The report reads declarations, whose body quoting need not match
+        // the dollar-quoted definition pg_get_functiondef returns later.
+        declared.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    for name in ["dollar", "plain", "escaped_quotes"] {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.{name}()")).await,
+            1
+        );
+    }
+    let target = "app.g(integer)".parse().unwrap();
+    in_a_transaction(&mut db.conn).await;
+    let edges =
+        pbps_pg::modules::dependents(&mut db.conn, &target, pbps_model::ModuleKind::Function)
+            .await
+            .unwrap();
+    rollback(&mut db.conn).await;
+    let callers = pbps_pg::modules::callers_by_name(&declared, &target);
+    db.drop().await;
+    assert!(
+        edges.is_empty(),
+        "literal routine bodies have no catalog edge: {edges:?}"
+    );
+    assert_eq!(
+        callers,
+        ["app.dollar()", "app.escaped_quotes()", "app.plain()"].map(|id| id.parse().unwrap())
+    );
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

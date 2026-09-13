@@ -727,11 +727,10 @@ impl Lexicon {
     /// emitted in name order, and `CREATE VIEW es.a` failed inside the plan's
     /// own transaction (DECISIONS 315).
     ///
-    /// A dollar-quoted string is a literal, blanked — except a routine's
-    /// body, which is one on the engine that has them, and which the name
-    /// scans exist to read: the string after the word `AS` is lexed as code
-    /// by these same rules, and every other one is a datum (see
-    /// `dollar_quoted_string`). This is the one place this scan and
+    /// On the engine with dollar quoting, a routine's body can also be a
+    /// plain single-quoted string. The body after `AS` at depth zero is lexed
+    /// as code, with doubled quotes decoded first for the single-quoted form;
+    /// its own literals still contain data. This is the one place this scan and
     /// [`normalize_definition`] part company on purpose.
     ///
     /// [`normalize_definition`]: Lexicon::normalize_definition
@@ -767,6 +766,7 @@ impl Lexicon {
         let bytes = definition.as_bytes();
         let mut at = At::Code;
         let mut consumed_to = 0usize;
+        let mut paren_depth = 0usize;
         for (i, ch) in definition.char_indices() {
             if i < consumed_to {
                 continue;
@@ -881,7 +881,9 @@ impl Lexicon {
                         && !continues_identifier(definition, i)
                         && let Some(len) = dollar_tag(&definition[i..])
                     {
-                        consumed_to = self.dollar_quoted_string(definition, i, len, &mut out);
+                        let body = paren_depth == 0
+                            && follows_the_word_as(&out, self.identifier_continues);
+                        consumed_to = self.dollar_quoted_string(definition, i, len, body, &mut out);
                         continue;
                     }
                     match (ch, next) {
@@ -895,6 +897,14 @@ impl Lexicon {
                         }
                         ('\'', _) => {
                             let prefix = self.blank_string_prefix(&mut out);
+                            if self.dollar_quoted_strings
+                                && prefix.is_none()
+                                && paren_depth == 0
+                                && follows_the_word_as(&out, self.identifier_continues)
+                            {
+                                consumed_to = self.single_quoted_body(definition, i, &mut out);
+                                continue;
+                            }
                             at = if self.escape_strings && opens_escape_string(definition, i) {
                                 At::Escape {
                                     after_backslash: false,
@@ -905,6 +915,14 @@ impl Lexicon {
                                 }
                             };
                             blank(&mut out, ch);
+                        }
+                        ('(', _) => {
+                            paren_depth += 1;
+                            out.push(ch);
+                        }
+                        (')', _) => {
+                            paren_depth = paren_depth.saturating_sub(1);
+                            out.push(ch);
                         }
                         _ => {
                             if ch == '"'
@@ -1001,6 +1019,36 @@ impl Lexicon {
         Some(end)
     }
 
+    /// A plain body uses SQL's doubled quote escaping before its contents are
+    /// SQL code. Padding after the decoded body retains the offsets of clauses
+    /// following it, without inserting gaps into quoted identifiers inside it.
+    fn single_quoted_body(&self, definition: &str, at: usize, out: &mut String) -> usize {
+        let mut inner = String::new();
+        let mut cursor = at + 1;
+        loop {
+            let Some(relative) = definition[cursor..].find('\'') else {
+                inner.push_str(&definition[cursor..]);
+                cursor = definition.len();
+                break;
+            };
+            let quote = cursor + relative;
+            inner.push_str(&definition[cursor..quote]);
+            cursor = quote + 1;
+            if definition[cursor..].starts_with('\'') {
+                inner.push('\'');
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        blank(out, '\'');
+        out.push_str(&self.code_only(&inner));
+        for _ in out.len()..cursor {
+            out.push(' ');
+        }
+        cursor
+    }
+
     /// Reads the dollar-quoted string that opens at `at` with a tag of `len`
     /// bytes, and returns the offset the code after it resumes at.
     ///
@@ -1024,6 +1072,7 @@ impl Lexicon {
         definition: &str,
         at: usize,
         len: usize,
+        body: bool,
         out: &mut String,
     ) -> usize {
         let tag = &definition[at..at + len];
@@ -1034,7 +1083,7 @@ impl Lexicon {
             // scan reads it the way the engine's lexer would have, to its end.
             None => (definition.len(), definition.len()),
         };
-        if follows_the_word_as(out, self.identifier_continues) {
+        if body {
             // The tags are delimiters, not code: `$a$` is never a name, and
             // kept, it matched a module named `$a$` and drew an edge from
             // every routine delimited by it.
@@ -2858,6 +2907,30 @@ mod code_only_tests {
         assert_eq!(PG.code_only("SELECT $1.00 FROM t"), "SELECT $1.00 FROM t");
         // SQL Server has no dollar quoting: the text is code.
         assert_eq!(MSSQL.code_only(datum), datum);
+    }
+
+    #[test]
+    fn a_plain_routine_body_decodes_quotes_without_exposing_its_data() {
+        let definition = "(arg text DEFAULT 'app.default_data()') RETURNS text
+            AS /* body */ 'SELECT app.\"a''b\"(), ''app.inner_data()'';'
+            LANGUAGE sql";
+        let code = PG.code_only(definition);
+        assert!(code.contains("app.\"a'b\"()"), "{code}");
+        assert!(!code.contains("default_data"), "{code}");
+        assert!(!code.contains("inner_data"), "{code}");
+        assert_eq!(code.len(), definition.len());
+        assert_eq!(code.find("LANGUAGE"), definition.find("LANGUAGE"));
+        assert_eq!(code.matches('\n').count(), definition.matches('\n').count());
+        assert!(!MSSQL.code_only(definition).contains("a'b"));
+
+        for datum in [
+            "SELECT 'app.datum()' AS value",
+            "SELECT as\u{a0} 'app.datum()' AS value",
+            "AS $$ SELECT 'app.datum()' $$",
+            "AS 'SELECT $$app.datum()$$'",
+        ] {
+            assert!(!PG.code_only(datum).contains("app.datum"), "{datum}");
+        }
     }
 
     #[test]
