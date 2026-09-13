@@ -56,8 +56,13 @@ async fn an_authorized_migration_connection_failure_does_not_claim_missing_right
     assert!(!message.contains("right it reports"), "{message}");
     assert!(!message.contains("needs ALTER"), "{message}");
     assert!(
-        message.contains("migration connection failure fixture"),
+        !message.contains("migration connection failure fixture"),
         "{message}"
+    );
+    let source = std::error::Error::source(&error).unwrap().to_string();
+    assert!(
+        source.contains("migration connection failure fixture"),
+        "{source}"
     );
     db.conn = connect_live(&conn_str()).await.unwrap();
     db.drop().await;
@@ -10552,8 +10557,12 @@ async fn a_login_without_alter_is_refused_by_name_on_a_pre_migration_ledger() {
         !message.contains("until that is fixed") && !message.contains("asks for today"),
         "the error must not describe doctor as incomplete: {message}"
     );
+    assert!(!message.contains("Cannot find the object"), "{message}");
     assert!(
-        message.contains("Cannot find the object")
+        std::error::Error::source(&err)
+            .unwrap()
+            .to_string()
+            .contains("Cannot find the object")
             && err.server_error_code().as_deref() == Some("1088"),
         "the original engine error and code must survive: {err:?}"
     );

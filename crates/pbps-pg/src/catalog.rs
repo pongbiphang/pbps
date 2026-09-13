@@ -1574,16 +1574,13 @@ async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbErro
 }
 
 fn schema_changed_underneath(e: DbError) -> DbError {
-    match &e {
-        DbError::Driver { code, .. } if code.as_deref() == Some("XX000") => DbError::Driver {
-            code: code.clone(),
-            message: format!(
-                "the catalog changed while it was being read: {e}.\n\
+    match e.server_error_code().as_deref() {
+        Some("XX000") => e.context(
+            "the catalog changed while it was being read.\n\
                  Something applied DDL to this database during the pull. The read is taken in \
                  one snapshot so that it cannot report half of a change as a whole schema, and \
-                 this is that guard firing. Run it again when the other change has finished."
-            ),
-        },
+                 this is that guard firing. Run it again when the other change has finished.",
+        ),
         // A deadlock, which — before issue #167 — reached an operator as
         // `db error` and nothing else, and now carries the server's own
         // "deadlock detected" sentence besides. It is the third way the
@@ -1604,23 +1601,14 @@ fn schema_changed_underneath(e: DbError) -> DbError {
         // Nothing is half-read and nothing is half-written: the engine chose a
         // victim and rolled it back whole. What the message has to say is that
         // it was a tie, not a fault, and that running again is the answer.
-        DbError::Driver { code, .. } if code.as_deref() == Some("40P01") => DbError::Driver {
-            code: code.clone(),
-            message: format!(
-                "the catalog changed while it was being read: {e} (deadlock).\n\
+        Some("40P01") => e.context(
+            "the catalog changed while it was being read (deadlock).\n\
                  Another session was changing this database while the pull was reading it, and \
                  the two needed the same objects in opposite orders. The engine broke the tie \
                  and rolled this read back whole. Run it again when the other change has \
-                 finished."
-            ),
-        },
-        DbError::Driver { .. }
-        | DbError::Refused(_)
-        | DbError::BadConnectionString(_)
-        | DbError::Connect { .. }
-        | DbError::ConnectTimeout { .. }
-        | DbError::WrongSession { .. }
-        | DbError::BadRow(_) => e,
+                 finished.",
+        ),
+        _ => e,
     }
 }
 
@@ -2092,6 +2080,28 @@ fn quote_for_regclass(part: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_guidance_preserves_a_separate_source_only_for_recognized_codes() {
+        for code in [Some("XX000"), Some("40P01"), Some("57014"), None] {
+            let error = schema_changed_underneath(DbError::Driver {
+                message: "original server sentence".into(),
+                code: code.map(str::to_owned),
+            });
+            assert_eq!(error.server_error_code().as_deref(), code);
+            if matches!(code, Some("XX000" | "40P01")) {
+                assert!(error.to_string().contains("Run it again"));
+                assert!(!error.to_string().contains("original server sentence"));
+                assert_eq!(
+                    std::error::Error::source(&error).unwrap().to_string(),
+                    "original server sentence"
+                );
+            } else {
+                assert!(matches!(error, DbError::Driver { .. }));
+                assert_eq!(error.to_string(), "original server sentence");
+            }
+        }
+    }
 
     #[test]
     fn catalog_batch_fields_distinguish_null_missing_and_wrong_types() {

@@ -690,17 +690,14 @@ fn migration_error(e: DbError, ownership_missing: bool) -> DbError {
          ownership right it reports before retrying."
     } else {
         "The timeline-column migration failed. Investigate the original database \
-         or connection error above before retrying."
+         or connection error in the error chain before retrying."
     };
-    DbError::Driver {
-        message: format!(
-            "public.__pbps_state is missing the timeline columns (state_version, \
+    e.context(format!(
+        "public.__pbps_state is missing the timeline columns (state_version, \
                      tables_count, modules_count, staged_completed, staged_total) issue \
-                     #103 added, and this role could not add them: {e}\n\
+                     #103 added, and this role could not add them.\n\
                      {guidance}"
-        ),
-        code,
-    }
+    ))
 }
 
 /// The savepoint [`ensure_tables`] takes, named for what takes it: a caller
@@ -1334,7 +1331,11 @@ mod tests {
                 );
                 assert_eq!(error.server_error_code().as_deref(), code);
                 let message = error.to_string();
-                assert!(message.contains(original));
+                assert!(!message.contains(original));
+                assert_eq!(
+                    std::error::Error::source(&error).unwrap().to_string(),
+                    original
+                );
                 assert_eq!(
                     message
                         .contains("with the same `--db` or `--env` target as the failed command"),
