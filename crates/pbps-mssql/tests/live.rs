@@ -3215,6 +3215,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
     let hidden = doctor::permissions(
         &mut db.conn,
         &[],
+        &[],
         &Default::default(),
         &doctor::GrantTargets::default(),
         &doctor::DataTables::new(),
@@ -3255,6 +3256,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
             .unwrap();
         let held = doctor::permissions(
             &mut db.conn,
+            &[],
             &[],
             &Default::default(),
             &doctor::GrantTargets::default(),
@@ -3348,6 +3350,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3383,6 +3386,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3416,6 +3420,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // creation requirement and not the ordinary managed-schema `ALTER`.
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3454,6 +3459,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3485,6 +3491,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3546,6 +3553,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3577,6 +3585,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .expect("create app schema");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["App".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3601,6 +3610,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // readiness report.
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["nowhere".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3674,6 +3684,7 @@ async fn data_permissions(
 ) -> pbps_mssql::doctor::Held {
     pbps_mssql::doctor::permissions(
         conn,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -3701,6 +3712,7 @@ async fn referenced_permissions(
 ) -> pbps_mssql::doctor::Held {
     pbps_mssql::doctor::permissions(
         conn,
+        &[],
         &["app".to_owned()],
         referenced,
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -4037,6 +4049,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -4074,6 +4087,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -4214,6 +4228,7 @@ async fn a_renamed_and_a_reused_name_keep_their_own_distinct_demands() {
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -4345,6 +4360,7 @@ async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &targets,
@@ -4469,6 +4485,7 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -5059,6 +5076,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -5084,6 +5102,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -5447,6 +5466,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     // were not, the assertion below would pass for the wrong reason.
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -5464,6 +5484,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     // And with one, the target it points at is asked about.
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &reference_names(&["shared.parent".parse().unwrap()]),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -5492,6 +5513,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["app".to_owned()],
         &reference_names(&["shared.parent".parse().unwrap()]),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -8724,6 +8746,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
         &[],
+        &[],
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -8770,6 +8793,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         .unwrap();
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
+        &[],
         &[],
         &Default::default(),
         &Default::default(),
@@ -8845,6 +8869,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     // The control: with no role declared, this account is ready.
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
@@ -8869,6 +8894,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     };
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &targets,
@@ -8953,6 +8979,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     };
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &managed,
@@ -8989,6 +9016,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     };
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &nowhere,
@@ -9017,6 +9045,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         .expect("grant the role permissions");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
+        &[],
         &["dbo".to_owned()],
         &Default::default(),
         &managed,
@@ -9544,6 +9573,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
     };
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
+        &[],
         &["dbo".to_owned()],
         &reference_names(std::slice::from_ref(&bracket)),
         &targets,
@@ -9618,6 +9648,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
     };
     let held = pbps_mssql::doctor::permissions(
         &mut db.conn,
+        &[],
         &["dbo".to_owned()],
         &reference_names(&objects),
         &targets,

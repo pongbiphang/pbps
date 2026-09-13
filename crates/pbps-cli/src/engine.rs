@@ -796,6 +796,7 @@ pub async fn permissions(
         Driver::Mssql => {
             let held = pbps_mssql::doctor::permissions(
                 conn,
+                ask.managed_tables,
                 ask.managed_schemas,
                 ask.referenced_columns,
                 ask.granted,

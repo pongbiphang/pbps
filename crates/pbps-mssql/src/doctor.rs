@@ -45,9 +45,12 @@ pub use pbps_db::doctor::{DataDemand, DataTables, GrantTargets, ReferencedColumn
 pub enum Needed {
     /// Grantable only at the database, so that is the only place to ask.
     Database,
-    /// Needed on every schema pbps manages, and on `dbo`, where the ledger
-    /// tables live.
+    /// Needed on every schema pbps manages.
     Managed,
+    /// Probe reads on each managed table, including recorded tables awaiting
+    /// a drop. Existing tables accept object or complete column grants;
+    /// missing tables retain the schema grant needed before their creation.
+    ManagedTable,
     /// Needed on the ledger's schema, but only while the ledger does not exist.
     ///
     /// `CREATE TABLE` at the database is not enough to create
@@ -234,7 +237,7 @@ pub const REQUIRED: [Requirement; 21] = [
     req(
         "SELECT",
         "the pre-flight probes, which count rows that would break",
-        Needed::Managed,
+        Needed::ManagedTable,
     ),
     req(
         "SELECT",
@@ -396,9 +399,15 @@ pub struct Held {
     /// same as holding nothing there — see [`missing`].
     ///
     /// The ledger's schema is deliberately not forced in here. It used to be,
-    /// which quietly demanded `ALTER` and the probes' `SELECT` on `dbo` from a
+    /// which quietly demanded `ALTER` on `dbo` from a
     /// project that manages only `app` and never touches a `dbo` table.
     pub schemas: BTreeMap<String, BTreeSet<String>>,
+
+    /// Probe rights at the securable that answers each managed table: the
+    /// current object, or its creation schema before it exists. Keying by
+    /// securable deduplicates shared fallbacks without merging the distinct
+    /// needs of a renamed table and a new table reusing its old name.
+    pub managed_tables: BTreeMap<Securable, BTreeSet<String>>,
 
     /// Managed schemas the database does not have — and schemas a managed
     /// role is granted on, for the same reason: `GRANT ... ON SCHEMA::x`
@@ -530,7 +539,7 @@ pub struct Gap {
 
 /// The securable a [`Gap`] is about, kept typed so the report cannot spell one
 /// of them wrongly and so a caller can tell them apart without parsing prose.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Securable {
     Database,
     Schema(String),
@@ -1035,9 +1044,9 @@ fn resolve_for_query<'a>(
 /// unasked rather than reported as gaps — the alternative would fire on the
 /// most common first run there is.
 ///
-/// # Why the declared data and grant targets are resolved before they are asked
+/// # Why declared managed, data and grant targets are resolved before asking
 ///
-/// `data` and `granted.objects` name their objects the way the declarations
+/// `managed_tables`, `data` and `granted.objects` name objects as the declarations
 /// do. Until a pending rename reaches *this* environment, the object there
 /// still answers to its old name, and `sp_rename` keeps a `GRANT` or a `DENY`
 /// with the object rather than with the name (measured on the pinned image,
@@ -1076,6 +1085,7 @@ fn resolve_for_query<'a>(
 /// an unconditional gap instead.
 pub async fn permissions(
     conn: &mut Conn,
+    managed_tables: &[ObjectName],
     schemas: &[String],
     referenced: &ReferencedColumns,
     granted: &GrantTargets,
@@ -1128,6 +1138,7 @@ pub async fn permissions(
             matches!(
                 r.needed,
                 Needed::Managed
+                    | Needed::ManagedTable
                     | Needed::Ledger
                     | Needed::LedgerCreation
                     | Needed::DataInsert
@@ -1212,6 +1223,37 @@ pub async fn permissions(
     // ledger objects retain their existing creation/DML readiness reports.
     let ledger_migration_needed = ledger_objects.contains_key(&ledger_tables()[0])
         && !crate::state::timeline_columns_present(conn).await?;
+
+    let (managed_securable, _) =
+        resolve_for_query(managed_tables.iter(), project_ids, &recorded_ids);
+    // Recorded names already belong to this environment. Resolve only the
+    // declarations: a departing table and a new declaration reusing its name
+    // must retain both the existing-object and future-schema questions.
+    let managed_names: BTreeSet<ObjectName> = managed_securable
+        .values()
+        .cloned()
+        .chain(recorded.tables.keys().cloned())
+        .collect();
+    let managed_perms: Vec<&str> = REQUIRED
+        .iter()
+        .filter(|r| matches!(r.needed, Needed::ManagedTable))
+        .map(|r| r.name)
+        .collect();
+    let managed_objects = object_permissions(
+        conn,
+        &managed_names.into_iter().collect::<Vec<_>>(),
+        &managed_perms,
+        Existing::Only,
+        Columns::Catalog,
+    )
+    .await?;
+    let managed_tables = managed_table_rights(
+        managed_tables,
+        &managed_securable,
+        recorded.tables.keys(),
+        &managed_objects,
+        &per_schema,
+    );
 
     // The declared data tables at object scope, `Existing::Only` like the
     // ledger and for the ledger's reason: a table this deployment has still to
@@ -1464,6 +1506,7 @@ pub async fn permissions(
     Ok(Held {
         database,
         schemas: per_schema,
+        managed_tables,
         absent_schemas,
         ledger_schema,
         ledger_objects,
@@ -1479,6 +1522,30 @@ pub async fn permissions(
         data_securable,
         data_objects,
     })
+}
+
+/// Keep each declaration's fallback independent from the recorded names that
+/// still exist, and choose the narrowest securable whose answer was read.
+fn managed_table_rights<'a>(
+    declared: &[ObjectName],
+    resolved: &BTreeMap<ObjectName, ObjectName>,
+    recorded: impl Iterator<Item = &'a ObjectName>,
+    objects: &BTreeMap<ObjectName, BTreeSet<String>>,
+    schemas: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<Securable, BTreeSet<String>> {
+    let mut rights = BTreeMap::new();
+    for (table, query) in declared
+        .iter()
+        .map(|table| (table, resolved.get(table)))
+        .chain(recorded.map(|table| (table, Some(table))))
+    {
+        if let Some((query, granted)) = query.and_then(|q| objects.get(q).map(|g| (q, g))) {
+            rights.insert(Securable::Object(query.clone()), granted.clone());
+        } else if let Some(granted) = schemas.get(&table.schema) {
+            rights.insert(Securable::Schema(table.schema.clone()), granted.clone());
+        }
+    }
+    rights
 }
 
 /// The declared data tables that are missing `r`, at the securable each of
@@ -1576,6 +1643,17 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                             permission: r.name,
                             why: r.why,
                             securable: Securable::Schema(schema.clone()),
+                        });
+                    }
+                }
+            }
+            Needed::ManagedTable => {
+                for (securable, granted) in &held.managed_tables {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: securable.clone(),
                         });
                     }
                 }
@@ -1835,6 +1913,7 @@ mod tests {
                 .iter()
                 .map(|s| ((*s).to_owned(), schema_perms.clone()))
                 .collect(),
+            managed_tables: BTreeMap::new(),
             // Everything asked about exists in this helper; the absent case has
             // its own test below.
             absent_schemas: BTreeSet::new(),
@@ -2191,6 +2270,78 @@ mod tests {
 
     fn table(name: &str) -> ObjectName {
         name.parse().expect("a `schema.table` constant")
+    }
+
+    #[test]
+    fn managed_probe_rights_keep_the_existing_object_and_future_name_distinct() {
+        let old = table("app.old");
+        let renamed = table("app.renamed");
+        let schemas = [("app".to_owned(), BTreeSet::new())].into_iter().collect();
+        let objects = [(old.clone(), ["SELECT".to_owned()].into_iter().collect())]
+            .into_iter()
+            .collect();
+        let resolved = [(renamed.clone(), old.clone())].into_iter().collect();
+        let mut held = everything(&["app"]);
+        held.managed_tables = managed_table_rights(
+            &[renamed, old.clone()],
+            &resolved,
+            std::iter::once(&old),
+            &objects,
+            &schemas,
+        );
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
+        assert_eq!(gaps[0].securable, Securable::Schema("app".into()));
+        assert!(held.managed_tables[&Securable::Object(old)].contains("SELECT"));
+    }
+
+    #[test]
+    fn managed_probe_rights_keep_recorded_tables_and_do_not_invent_schema_gaps() {
+        let old = table("app.old");
+        let schemas = [(
+            "app".to_owned(),
+            ["SELECT".to_owned()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        let objects = [(old.clone(), BTreeSet::new())].into_iter().collect();
+        let mut held = everything(&["app"]);
+        held.managed_tables = managed_table_rights(
+            &[],
+            &BTreeMap::new(),
+            std::iter::once(&old),
+            &objects,
+            &schemas,
+        );
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].securable, Securable::Object(old));
+        // Nothing declared or recorded must not inherit demands from unrelated
+        // visible tables; a missing schema is diagnosed separately.
+        assert!(
+            managed_table_rights(
+                &[table("absent.future")],
+                &BTreeMap::new(),
+                std::iter::empty(),
+                &objects,
+                &schemas,
+            )
+            .is_empty()
+        );
+        let rights = managed_table_rights(
+            &[table("app.future_a"), table("app.future_b")],
+            &BTreeMap::new(),
+            std::iter::empty(),
+            &objects,
+            &schemas,
+        );
+        assert_eq!(
+            rights.len(),
+            1,
+            "one schema fallback for both absent tables"
+        );
+        assert!(rights[&Securable::Schema("app".into())].contains("SELECT"));
     }
 
     /// The collision `resolve_for_query` exists for: a rename frees the name
@@ -3131,6 +3282,7 @@ mod tests {
         let held = Held {
             database: BTreeSet::new(),
             schemas: [("dbo".to_owned(), BTreeSet::new())].into_iter().collect(),
+            managed_tables: BTreeMap::new(),
             absent_schemas: BTreeSet::new(),
             ledger_schema: BTreeSet::new(),
             ledger_objects: BTreeMap::new(),
@@ -3153,6 +3305,7 @@ mod tests {
                 !matches!(
                     r.needed,
                     Needed::Referenced
+                        | Needed::ManagedTable
                         | Needed::LedgerMigration
                         | Needed::RoleAdmin
                         | Needed::Granted
