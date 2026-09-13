@@ -11550,3 +11550,28 @@ SPEC is in sync with all of these.
      the shared count change makes the regressions fail by accepting a
      filtered zero. Moving only the visibility check back after FK discovery
      reproduces the parent-only deployer's silent cascade.
+
+469. **Offline row-key spelling is a separate question from collisions (issue #211).**
+     A single key can fail to convert or read back differently without having
+     a second key to collide with. Both dialects emit a `dialect.not-checked`
+     note for a nonempty data block with a single-column key whose conversion
+     is not identity. PostgreSQL retains its existing multi-key collision note;
+     neither note changes validation success or replaces the connected check.
+
+     Normalize the declared type, not its `ValueKind`: that row-value enum
+     also calls UUID, date and decimal renderings text. PostgreSQL `text` and
+     unbounded `character varying` preserve spelling. SQL Server's unbounded
+     `nvarchar` preserves Unicode, while `varchar` also depends on the live
+     code page. Bounded varying text can truncate and fixed-width text can
+     pad or trim, so these still need the note. An invalid key shape or unknown
+     type is left to the existing validation errors rather than adding a note
+     about a conversion the declaration cannot identify.
+
+     Measurements on PostgreSQL 18.6 and SQL Server 17.0.4075.5 show integer
+     `01` becoming `1`, bounded text truncation and fixed-width text changes.
+     PostgreSQL also canonicalizes UUID case; SQL Server can replace Unicode
+     characters when converting to a non-Unicode code page. The CLI regression
+     pins the single-key diagnostic and unchanged successful exit, including
+     PostgreSQL malformed UUID and identity-text negative cases. Unit cases
+     cover aliases, non-string scalar renderings, empty data and invalid key
+     shapes; the live collation test retains the separate collision question.

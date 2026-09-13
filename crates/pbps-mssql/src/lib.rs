@@ -146,6 +146,10 @@ impl Dialect for Mssql {
         validate::table(name, table)
     }
 
+    fn declaration_notes(&self, schema: &Schema) -> Vec<String> {
+        rows::not_checked_offline(schema)
+    }
+
     fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {
         validate::module(id, module)
     }

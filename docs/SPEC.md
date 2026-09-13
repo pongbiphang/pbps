@@ -1019,6 +1019,13 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |
 | `pbps schema` / `completions` / `man` | Editor schemas, shell completions and man pages, generated from the binary's own definitions (see 9.7) |
 
+`validate` also names unchecked row-key spelling as a note: even one key can
+fail its column's conversion or read back differently. The note applies to
+nonempty data blocks with a single-column key whose type conversion is not
+identity; unbounded identity text does not need it. PostgreSQL's separate
+multi-key collision note remains. These notes do not make validation fail;
+`plan --db` asks the live engine about the keys (DECISIONS 469).
+
 Two of these will use a connection when one is offered but never require it:
 `explain --db` adds whether the target is mid-deployment, and `doctor` checks
 each configured environment as well as the project.

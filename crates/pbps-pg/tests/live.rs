@@ -10991,8 +10991,17 @@ async fn two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offl
         );
     }
     let notes = pg.declaration_notes(&declared);
-    assert_eq!(notes.len(), 2, "{notes:#?}");
-    assert!(notes.iter().all(|n| n.contains("collation")), "{notes:#?}");
+    assert_eq!(notes.len(), 4, "{notes:#?}");
+    assert_eq!(
+        notes.iter().filter(|n| n.contains("whether two")).count(),
+        2,
+        "{notes:#?}"
+    );
+    assert_eq!(
+        notes.iter().filter(|n| n.contains("spelling")).count(),
+        2,
+        "{notes:#?}"
+    );
 
     // Connected: the engine is asked, under each key column's own collation,
     // and answers differently for the two tables.

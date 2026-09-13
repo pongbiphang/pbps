@@ -6420,8 +6420,13 @@ fn an_oversized_data_block_warns_but_still_plans() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     // The `data.max-rows` policy rule, with `max_data_rows` as its default
     // parameter (ADR-0008).
-    assert_eq!(v["findings"][0]["id"], "data.max-rows", "{v}");
-    assert_eq!(v["findings"][0]["severity"], "warning", "{v}");
+    let warning = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "data.max-rows")
+        .expect("the row-count warning remains alongside dialect notes");
+    assert_eq!(warning["severity"], "warning", "{v}");
     // A warning is not a finding the pipeline must act on.
     assert_eq!(code(&o), 0, "{}", stdout(&o));
     assert_eq!(code(&d.run(&["plan"])), 0);
@@ -13650,4 +13655,74 @@ fn unmodelled_check_and_unique_enforcement_refuses_connected_retypes_before_writ
             "IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID('dbo.t') AND name='id' AND system_type_id=56) THROW 50000, 'refused retype changed the column', 1;",
         );
     }
+}
+
+#[test]
+fn offline_validation_names_unchecked_key_spelling_without_refusing_valid_declarations() {
+    let mut missing = Vec::new();
+    for (i, (dialect, ty, key, should_note)) in [
+        ("postgres", "integer", "01", true),
+        ("postgres", "uuid", "not-a-uuid", true),
+        ("postgres", "varchar(3)", "abcdef", true),
+        ("postgres", "character(5)", "ab  ", true),
+        ("postgres", "text", "only", false),
+        ("postgres", "varchar", "only", false),
+        ("mssql", "integer", "01", true),
+        (
+            "mssql",
+            "uniqueidentifier",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            true,
+        ),
+        ("mssql", "nvarchar(3)", "abcdef", true),
+        ("mssql", "varchar(8)", "漢", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let d = Demo::new(&format!("key-spelling211-{i}"));
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
+        d.table(&format!("table: dbo.t\ncolumns:\n  code: {{type: {ty}, nullable: false}}\nprimary_key: {{name: pk_t, columns: [code]}}\ndata:\n  mode: exact\n  rows:\n    '{key}': {{}}\n"));
+        let out = d.run(&["validate", "--format", "json"]);
+        assert_eq!(
+            code(&out),
+            0,
+            "{dialect}/{ty}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        let notes: Vec<_> = json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "dialect.not-checked")
+            .collect();
+        let spelling: Vec<_> = notes
+            .iter()
+            .filter(|f| f["message"].as_str().unwrap().contains("spelling"))
+            .collect();
+        if spelling.len() != usize::from(should_note) {
+            missing.push(format!(
+                "{dialect}/{ty}: expected spelling note={should_note}, got {notes:?}"
+            ));
+        }
+        for note in spelling {
+            assert_eq!(note["severity"], "note");
+            let message = note["message"].as_str().unwrap();
+            assert!(
+                message.contains("dbo.t")
+                    && message.contains("code")
+                    && message.contains("plan --db"),
+                "{message}"
+            );
+        }
+        if !should_note {
+            assert!(
+                notes.is_empty(),
+                "identity text needs no single-key note: {notes:?}"
+            );
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
