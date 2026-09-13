@@ -257,22 +257,20 @@ async fn lossy_key(is_update: bool, key_type: &str, stored: &str, declared: &str
         .await
         .map(|_| ())
         .map_err(|e| e.to_string());
-    // No trigger or concurrent writer: assignment itself may discard
-    // over-width spaces or map Unicode through a varchar code page.
+    // INSERT assigns the key and must retain its text. UPDATE only uses
+    // the declared alias to find the existing key; it does not assign it.
     let after = contents(&mut db.conn, "key218").await;
     db.drop().await;
     assert!(plain.is_ok(), "{key_type}: {plain:?}");
     assert_eq!(plain_rows, vec![(stored.into(), "a".into())]);
-    let error = attempted.expect_err("the engine cannot retain the declared key text");
-    assert!(error.contains("is not what this plan wrote"), "{error}");
-    assert_eq!(
-        after,
-        if is_update {
-            vec![(stored.into(), "a".into())]
-        } else {
-            vec![]
-        }
-    );
+    if is_update {
+        assert!(attempted.is_ok(), "{key_type}: {attempted:?}");
+        assert_eq!(after, vec![(stored.into(), "b".into())]);
+    } else {
+        let error = attempted.expect_err("the engine cannot retain the declared key text");
+        assert!(error.contains("is not what this plan wrote"), "{error}");
+        assert!(after.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -289,12 +287,105 @@ async fn an_insert_refuses_keys_that_lose_declared_text() {
 
 #[tokio::test]
 #[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
-async fn an_update_refuses_keys_that_lose_declared_text() {
+async fn an_update_preserves_existing_text_key_aliases() {
     for (key_type, stored, declared) in [
+        ("varchar(20)", "ne'w", "Ne'w"),
+        ("nvarchar(20)", "ne'w", "Ne'w"),
         ("varchar(3)", "abc", "abc "),
         ("nvarchar(3)", "abc", "abc "),
         ("varchar(3)", "A", "Ａ"),
     ] {
         lossy_key(true, key_type, stored, declared).await;
     }
+}
+
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn an_update_refuses_a_trigger_that_rewrites_an_existing_key_alias() {
+    let mut db = TestDb::create("key_alias_rewrite218").await;
+    let mut results = Vec::new();
+    for (tag, key_type, rewritten) in [
+        ("case", "varchar(20)", "Ne'w"),
+        ("space", "nvarchar(20)", "ne'w "),
+    ] {
+        let table = format!("key_alias218_{tag}");
+        db.conn.execute(&format!("CREATE TABLE dbo.{table} ([co'de]]x] {key_type} COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20)); INSERT dbo.{table} VALUES (N'ne''w', N'a');")).await.unwrap();
+        let stmt = Mssql
+            .emit(&update(&table, "Ne'w"), Default::default())
+            .unwrap()
+            .remove(0);
+        let plain = db
+            .conn
+            .execute(&stmt.sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let plain_rows = contents(&mut db.conn, &table).await;
+        db.conn
+            .execute(&format!("UPDATE dbo.{table} SET label=N'a';"))
+            .await
+            .unwrap();
+        let rewritten = rewritten.replace('\'', "''");
+        // Capturing the old key must not mark that column as assigned.
+        // A rewrite to the declaration itself is still a change to this row.
+        db.conn.execute(&format!("CREATE TRIGGER dbo.alias218_{tag} ON dbo.{table} AFTER UPDATE AS BEGIN SET NOCOUNT ON; IF TRIGGER_NESTLEVEL() > 1 RETURN; IF UPDATE([co'de]]x]) THROW 50000, 'the statement assigned its key', 1; UPDATE dbo.{table} SET [co'de]]x]=N'{rewritten}'; END;")).await.unwrap();
+        let triggered = db
+            .conn
+            .execute(&stmt.sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let triggered_rows = contents(&mut db.conn, &table).await;
+        results.push((tag, plain, plain_rows, triggered, triggered_rows));
+    }
+    db.drop().await;
+    for (tag, plain, plain_rows, triggered, triggered_rows) in results {
+        assert!(plain.is_ok(), "{tag}: {plain:?}");
+        assert_eq!(plain_rows, vec![("ne'w".into(), "b".into())]);
+        let refusal = triggered.expect_err("a trigger rewrote the stored alias");
+        assert!(
+            refusal.contains("is not what this plan wrote"),
+            "{tag}: {refusal}"
+        );
+        assert_eq!(triggered_rows, vec![("ne'w".into(), "a".into())]);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn exported_updates_keep_key_capture_variables_in_separate_batches() {
+    let mut db = TestDb::create("key_batch218").await;
+    db.conn.execute("CREATE TABLE dbo.key_batch218 ([co'de]]x] varchar(20) PRIMARY KEY, label nvarchar(20)); INSERT dbo.key_batch218 VALUES ('first', N'a'), ('second', N'a');").await.unwrap();
+    let mut statements = Vec::new();
+    for key in ["first", "second"] {
+        statements.extend(
+            Mssql
+                .emit(&update("key_batch218", key), Default::default())
+                .unwrap(),
+        );
+    }
+    let script = pbps_dialect::render_script(&statements, &Mssql);
+    let mut results = Vec::new();
+    for batch in script
+        .split("\nGO\n")
+        .filter(|batch| !batch.trim().is_empty())
+    {
+        results.push(
+            db.conn
+                .execute(batch)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
+    }
+    let mut rows = contents(&mut db.conn, "key_batch218").await;
+    rows.sort();
+    db.drop().await;
+    for result in results {
+        assert!(result.is_ok(), "{result:?}\n{script}");
+    }
+    assert_eq!(
+        rows,
+        vec![("first".into(), "b".into()), ("second".into(), "b".into())]
+    );
 }

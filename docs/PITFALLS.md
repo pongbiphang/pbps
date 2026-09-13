@@ -1071,13 +1071,14 @@ the value that was never a call site — enumerate the **values the plan claims
 to have written**, and check that each one is checked.
 
 The SQL Server counterpart needs native identity plus text and length checks
-(DECISIONS 472). Binary equality pads away trailing spaces. ISNULL with a
-column-typed NULL supplies char/nchar padding, but can also truncate over-width
-spaces or recode Unicode exactly as assignment did. A separate CASE preserves
-the text literal for content comparison and the minimum accepted length;
-ISNULL supplies only the padded length. The engine still converts non-text
-keys, preserving the numeric aliases intentionally supported by 71/101.
-Generic rendering can lose money/float precision, so retain native equality.
+(DECISIONS 472). For INSERT, CASE retains the text literal while ISNULL with a
+column-typed NULL supplies only char/nchar padding's length: comparing ISNULL's
+contents would repeat assignment's truncation and code-page loss. For UPDATE,
+the key is an existing alias, not an assigned value. Capture its stored text
+inside the UPDATE and hold that text and length after triggers; comparing to
+the declaration would refuse ordinary label changes through a valid alias.
+The capture variable also needs its own exported batch. Generic rendering
+can lose money/float precision, so retain native equality for both writes.
 
 **A fifth instance, in code written after this section was.** A planned
 column's backfill was spelled as its bare literal. Against a stored column the
