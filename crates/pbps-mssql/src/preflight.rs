@@ -33,7 +33,7 @@ use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Value,
 };
 
-use crate::emit::qualified;
+use crate::emit::{qualified, verbatim};
 use crate::ident::{literal, quote};
 use crate::types;
 
@@ -239,6 +239,7 @@ fn constant_default(default: &str) -> Option<&str> {
 }
 
 fn assigned_default(default: &str, ty: Option<&ColumnType>) -> String {
+    let default = verbatim(default);
     match ty {
         Some(ty) => format!(
             "CONVERT({}, ({default}))",
@@ -614,7 +615,7 @@ fn build(
                 // and is reported as unchecked, which is honest.
                 "SELECT COUNT(*) AS n FROM {} WHERE NOT ({})",
                 qualified(&stored)?,
-                constraint.expression
+                verbatim(&constraint.expression)
             );
             // Minus the rows it deletes: they will not be there to violate
             // anything, and counting them refused a plan that cleans up after
@@ -1594,7 +1595,9 @@ fn rows_after(
             // Parenthesised, because the predicate is the user's text and an
             // `OR` in it would otherwise bind looser than the exclusion below.
             if let Some(predicate) = filter {
-                where_clauses.push(format!("({predicate})"));
+                // The closer and later clauses must survive a trailing line
+                // comment in the declaration (DECISIONS 281).
+                where_clauses.push(format!("({})", verbatim(predicate)));
             }
             // Minus the rows this plan takes away or moves within these columns:
             // both run first, so counting them is counting a state that will not
@@ -2449,6 +2452,54 @@ mod tests {
     }
 
     #[test]
+    fn a_commented_default_keeps_the_typed_and_legacy_probe_closers() {
+        for ty in [Some(ty("int")), None] {
+            let sql = assigned_default("7 -- reason", ty.as_ref());
+            assert!(sql.contains("-- reason\n)"), "{sql}");
+        }
+        assert!(constant_default("NEWID() -- reason").is_none());
+    }
+
+    #[test]
+    fn trailing_line_comments_leave_probe_closers_and_deleted_row_exclusions_executable() {
+        let delete = Change::DeleteRow {
+            table: tname("dbo.customer"),
+            key_column: "code".into(),
+            key: RowKey::from("gone"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            dropped: Default::default(),
+            row: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        for change in [
+            Change::AddCheck {
+                table: tname("dbo.customer"),
+                name: "ck_amount".into(),
+                constraint: CheckConstraint {
+                    expression: "[amount] >= 0 -- reason".into(),
+                },
+            },
+            index(&["email"], true, Some("[amount] >= 0 -- reason")),
+        ] {
+            let report = probes(&plan(vec![delete.clone(), change]));
+            let sql: Vec<_> = report
+                .iter()
+                .filter(|p| {
+                    p.description.contains("ck_amount")
+                        || p.description.contains("ix_customer_email")
+                })
+                .map(|p| p.sql.as_str())
+                .collect();
+            assert_eq!(sql.len(), 1, "{report:?}");
+            assert!(sql[0].contains("-- reason\n) AND "), "{}", sql[0]);
+            assert!(sql[0].contains("[code] NOT IN (N'gone')"), "{}", sql[0]);
+        }
+        // A plain index imposes no uniqueness check even with a commented filter.
+        assert!(sql_of(&index(&["email"], false, Some("[amount] >= 0 -- reason"))).is_empty());
+    }
+
+    #[test]
     fn a_check_counts_the_rows_it_would_reject() {
         let sql = sql_of(&Change::AddCheck {
             table: tname("dbo.customer"),
@@ -2459,7 +2510,7 @@ mod tests {
         });
         assert_eq!(
             sql,
-            ["SELECT COUNT(*) AS n FROM [dbo].[customer] WHERE NOT ([amount] >= 0);"]
+            ["SELECT COUNT(*) AS n FROM [dbo].[customer] WHERE NOT ([amount] >= 0\n);"]
         );
     }
 
@@ -2930,7 +2981,7 @@ mod tests {
     fn a_filtered_unique_index_counts_only_the_rows_its_predicate_keeps() {
         let sql = sql_of(&index(&["email"], true, Some("[deleted_at] IS NULL")));
         assert_eq!(sql.len(), 1, "{sql:?}");
-        assert!(sql[0].contains("WHERE ([deleted_at] IS NULL)"), "{sql:?}");
+        assert!(sql[0].contains("WHERE ([deleted_at] IS NULL\n)"), "{sql:?}");
 
         // Beside a delete, both survive: the predicate decides membership and
         // the exclusion drops a row that will not be there to collide.
@@ -2953,7 +3004,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
-            sql[0].contains("WHERE ([deleted_at] IS NULL) AND c.[code] NOT IN (N'dup')"),
+            sql[0].contains("WHERE ([deleted_at] IS NULL\n) AND c.[code] NOT IN (N'dup')"),
             "{sql:?}"
         );
     }
@@ -3092,7 +3143,7 @@ mod tests {
         let s = sql(vec![check.clone()]);
         assert_eq!(s.len(), 1, "{s:?}");
         assert!(
-            s[0].contains("FROM [dbo].[customer] WHERE NOT ([amount] >= 0);"),
+            s[0].contains("FROM [dbo].[customer] WHERE NOT ([amount] >= 0\n);"),
             "{s:?}"
         );
 
@@ -3308,7 +3359,7 @@ mod tests {
         let s = sql(added(false, Some("N'eu'")));
         let child = s.iter().find(|s| s.contains("k0")).expect("a probe");
         assert!(
-            child.contains("TRY_CONVERT(varchar(10), CONVERT(varchar(10), (N'eu'))) AS k0 FROM [dbo].[customer]"),
+            child.contains("TRY_CONVERT(varchar(10), CONVERT(varchar(10), (N'eu'\n))) AS k0 FROM [dbo].[customer]"),
             "{child}"
         );
 
@@ -3567,7 +3618,7 @@ mod tests {
         let sql = sql_of(&plan(vec![insert("('old')"), delete.clone()]));
         assert!(
             sql.contains("WHEN N'status_code' THEN N'CONVERT('")
-                && sql.contains("N', (''old''))'")
+                && sql.contains("N', (''old''\n))'")
                 && sql.contains(") THEN 1 ELSE 0 END)'"),
             "the literal default is what the engine compares: {sql}"
         );
@@ -3651,7 +3702,8 @@ mod tests {
         };
         let sql = sql_of(&plan(vec![update, delete]));
         assert!(
-            sql.contains("WHEN N'status_code' THEN N'CONVERT('") && sql.contains("N', (''old''))'"),
+            sql.contains("WHEN N'status_code' THEN N'CONVERT('")
+                && sql.contains("N', (''old''\n))'"),
             "{sql}"
         );
         assert!(
@@ -3687,14 +3739,14 @@ mod tests {
         assert!(names.types.is_empty());
         assert_eq!(
             names.moved[&table].updated[&key]["k"].as_deref(),
-            Some("CONVERT(varchar(10), (-CAST('01' AS int)))")
+            Some("CONVERT(varchar(10), (-CAST('01' AS int)\n))")
         );
         assert!(names.moved[&table].untyped_defaults.is_empty());
         assert_eq!(
             assigned_default("1.25", Some(&ty("numeric(8,2)"))),
-            "CONVERT(decimal(8, 2), (1.25))"
+            "CONVERT(decimal(8, 2), (1.25\n))"
         );
-        assert_eq!(assigned_default("1.25", None), "(1.25)");
+        assert_eq!(assigned_default("1.25", None), "(1.25\n)");
     }
 
     /// A foreign key is a tuple: an update that sets two of its columns is

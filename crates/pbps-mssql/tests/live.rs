@@ -4871,13 +4871,12 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
     let absent_gaps = named_gaps(&referenced_permissions(&mut lp, &absent).await);
     let restored = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
 
-    // Assertions after cleanup also leave no login/database on counterfactual failure.
+    // Client drop does not wait for the server to release the login. Drop the
+    // database first to terminate its sessions, then use best-effort login cleanup
+    // so a disconnect race cannot hide the permission assertions below.
     drop(lp);
-    db.conn
-        .execute(&format!("USE master; DROP LOGIN [{login}];"))
-        .await
-        .unwrap();
     db.drop().await;
+    drop_login(&login).await;
     assert!(!object_select);
     assert!(
         unrelated.is_err(),
