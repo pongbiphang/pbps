@@ -432,59 +432,7 @@ fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     Some(rest)
 }
 
-/// Past the whitespace and comments that follow one piece of a string
-/// constant, and whether what they separate can still be a *continuation* of
-/// it.
-///
-/// **Measured**, and neither half is the obvious one:
-///
-/// ```text
-/// '01/02/' -- c ⏎ '2026'     -> 01/02/2026     a line comment is part of the
-/// '01/02/' -- /* x ⏎ '2026'  -> 01/02/2026     gap, and the newline that ends
-///                                              it is the newline a
-///                                              continuation needs
-/// '01/02/' /* c */ ⏎ '2026'  -> syntax error   a block comment ends the
-/// '01/02/' ⏎ /* c */ '2026'  -> syntax error   possibility of a continuation,
-/// '01/02/' /* -- x ⏎ */ '2026' -> syntax error wherever the newline stands
-/// '01/02/2026' -- c          -> 01/02/2026     after the last piece either
-/// '01/02/2026' /* c */       -> 01/02/2026     comment is only trailing text
-/// ```
-///
-/// So the two comment forms are not interchangeable here, which is why they
-/// are scanned rather than skipped together: the engine's `{whitespace}` rule
-/// counts a `--` comment among the things a continuation may be written
-/// across, and does not count a `/* … */` one (DECISIONS 278).
-pub(crate) fn after_the_gap(tail: &str) -> (&str, bool) {
-    let mut rest = tail;
-    let mut newline = false;
-    let mut blocked = false;
-    loop {
-        let trimmed = ascii_trim_start(rest);
-        newline |= rest[..rest.len() - trimmed.len()].contains(NEWLINE);
-        rest = trimmed;
-        if let Some(after) = rest.strip_prefix("--") {
-            let Some(at) = after.find(NEWLINE) else {
-                // Runs to the end of the text: nothing can follow it, so this
-                // is the whole gap and no continuation is coming.
-                return ("", newline);
-            };
-            newline = true;
-            rest = &after[at + 1..];
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            let Some(next) = end_of_block_comment(after) else {
-                // Nothing closes it. The engine refuses that by name
-                // (`unterminated /* comment`), and a declaration it refuses by
-                // name is left to it (DECISIONS 266) — so this is not a gap
-                // and the expression is not a literal this guard knows.
-                return (rest, false);
-            };
-            blocked = true;
-            rest = next;
-        } else {
-            return (rest, newline && !blocked);
-        }
-    }
-}
+pub(crate) use pbps_dialect::after_string_gap as after_the_gap;
 
 /// The expression with the whitespace and comments that *follow* it removed.
 ///

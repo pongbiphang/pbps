@@ -757,18 +757,23 @@ impl Lexicon {
                     .unwrap_or(rest.len());
                 cursor += len;
                 if depth == 0 && rest[..len].eq_ignore_ascii_case("language") {
-                    let name = skip_sql_trivia(&definition[cursor..]);
+                    let name = after_string_gap(&definition[cursor..]).0;
                     let name = if name.starts_with('\'') {
                         plain_quoted_contents(name, 0).0
-                    } else if name.starts_with('"') {
-                        quoted_identifier_len(name)
-                            .map(|end| name[1..end - 1].replace("\"\"", "\""))
-                            .unwrap_or_default()
                     } else {
-                        let end = name
-                            .find(|c| !(self.identifier_continues)(c))
-                            .unwrap_or(name.len());
-                        name[..end].to_ascii_lowercase()
+                        // The header already decodes Unicode identifiers and
+                        // pads their span, so this offset also covers U&"…".
+                        let name = &header[definition.len() - name.len()..];
+                        if name.starts_with('"') {
+                            quoted_identifier_len(name)
+                                .map(|end| name[1..end - 1].replace("\"\"", "\""))
+                                .unwrap_or_default()
+                        } else {
+                            let end = name
+                                .find(|c| !(self.identifier_continues)(c))
+                                .unwrap_or(name.len());
+                            name[..end].to_ascii_lowercase()
+                        }
                     };
                     if matches!(name.as_str(), "c" | "internal") {
                         return true;
@@ -1077,12 +1082,13 @@ impl Lexicon {
     /// SQL code. Padding after the decoded body retains the offsets of clauses
     /// following it, without inserting gaps into quoted identifiers inside it.
     fn single_quoted_body(&self, definition: &str, at: usize, out: &mut String) -> usize {
-        let (inner, cursor) = plain_quoted_contents(definition, at);
+        let (inner, cursor, breaks) = plain_quoted_contents(definition, at);
         blank(out, '\'');
         out.push_str(&self.code_only(&inner));
-        for _ in out.len()..cursor {
+        for _ in out.len() + breaks.len()..cursor {
             out.push(' ');
         }
+        out.push_str(&breaks);
         cursor
     }
 
@@ -1141,13 +1147,14 @@ impl Lexicon {
     }
 }
 
-fn plain_quoted_contents(definition: &str, at: usize) -> (String, usize) {
+fn plain_quoted_contents(definition: &str, at: usize) -> (String, usize, String) {
     let mut inner = String::new();
+    let mut breaks = String::new();
     let mut cursor = at + 1;
     loop {
         let Some(relative) = definition[cursor..].find('\'') else {
             inner.push_str(&definition[cursor..]);
-            return (inner, definition.len());
+            return (inner, definition.len(), breaks);
         };
         let quote = cursor + relative;
         inner.push_str(&definition[cursor..quote]);
@@ -1156,16 +1163,58 @@ fn plain_quoted_contents(definition: &str, at: usize) -> (String, usize) {
             inner.push('\'');
             cursor += 1;
         } else {
-            return (inner, cursor);
+            let (after, continues) = after_string_gap(&definition[cursor..]);
+            if !continues || !after.starts_with('\'') {
+                return (inner, cursor, breaks);
+            }
+            let next = definition.len() - after.len();
+            // Gaps join pieces without inserting data; their line breaks
+            // still belong in the padded span returned to name-scan callers.
+            breaks.extend(
+                definition[cursor..next]
+                    .chars()
+                    .filter(|c| matches!(c, '\r' | '\n')),
+            );
+            cursor = next + 1;
         }
     }
 }
 
-fn skip_sql_trivia(mut text: &str) -> &str {
+/// Past PostgreSQL's whitespace and comments following one piece of a string
+/// constant, and whether what they separate can still be a *continuation* of
+/// it.
+///
+/// **Measured**, and neither half is the obvious one:
+///
+/// ```text
+/// '01/02/' -- c ⏎ '2026'     -> 01/02/2026     a line comment is part of the
+/// '01/02/' -- /* x ⏎ '2026'  -> 01/02/2026     gap, and the newline that ends
+///                                              it is the newline a
+///                                              continuation needs
+/// '01/02/' /* c */ ⏎ '2026'  -> syntax error   a block comment ends the
+/// '01/02/' ⏎ /* c */ '2026'  -> syntax error   possibility of a continuation,
+/// '01/02/' /* -- x ⏎ */ '2026' -> syntax error wherever the newline stands
+/// '01/02/2026' -- c          -> 01/02/2026     after the last piece either
+/// '01/02/2026' /* c */       -> 01/02/2026     comment is only trailing text
+/// ```
+///
+/// So the two comment forms are not interchangeable here, which is why they
+/// are scanned rather than skipped together: the engine's `{whitespace}` rule
+/// counts a `--` comment among the things a continuation may be written
+/// across, and does not count a `/* … */` one (DECISIONS 278).
+pub fn after_string_gap(mut text: &str) -> (&str, bool) {
+    let mut newline = false;
+    let mut blocked = false;
     loop {
-        text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let trimmed = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        newline |= text[..text.len() - trimmed.len()].contains(['\r', '\n']);
+        text = trimmed;
         if let Some(comment) = text.strip_prefix("--") {
-            text = &comment[comment.find(['\r', '\n']).unwrap_or(comment.len())..];
+            let Some(end) = comment.find(['\r', '\n']) else {
+                return ("", newline);
+            };
+            newline = true;
+            text = &comment[end + 1..];
         } else if let Some(comment) = text.strip_prefix("/*") {
             let mut depth = 1usize;
             let mut cursor = 0;
@@ -1180,9 +1229,13 @@ fn skip_sql_trivia(mut text: &str) -> &str {
                     cursor += comment[cursor..].chars().next().unwrap().len_utf8();
                 }
             }
+            if depth != 0 {
+                return (text, false);
+            }
+            blocked = true;
             text = &comment[cursor..];
         } else {
-            return text;
+            return (text, newline && !blocked);
         }
     }
 }
@@ -3026,6 +3079,9 @@ mod code_only_tests {
             "INTERNAL",
             "\"c\"",
             "'internal'",
+            "U&\"c\"",
+            "U&\"\\0063\"",
+            "U&\"intern!0061l\" UESCAPE '!'",
             "/* outer /* nested */ end */ c",
             "-- language name\r\ninternal",
         ] {
@@ -3048,11 +3104,39 @@ mod code_only_tests {
             "() RETURNS int LANGUAGE sql AS 'SELECT app.f()' SET \"language\" = 'c'",
             "() RETURNS int LANGUAGE \"INTERNAL\" AS 'SELECT app.f()'",
             "() RETURNS int LANGUAGE 'C' AS 'SELECT app.f()'",
+            "() RETURNS int LANGUAGE U&\"s!0071l\" UESCAPE '!' AS 'SELECT app.f()'",
         ] {
             assert!(PG.code_only(definition).contains("app.f()"), "{definition}");
         }
         // An unfinished declaration should still be safe to scan.
         assert_eq!(PG.code_only("LANGUAGE \""), "LANGUAGE \"");
+    }
+
+    #[test]
+    fn continued_body_pieces_form_one_source_before_its_literals_are_blanked() {
+        for gap in ["\n", "\r", "\r\n", " -- comment\n", " -- /* comment\r "] {
+            let definition = format!(
+                "() RETURNS text AS 'SELECT app.'{gap}'f(), ''app.'{gap}'datum()''' LANGUAGE sql"
+            );
+            let code = PG.code_only(&definition);
+            assert!(code.contains("app.f()"), "{code}");
+            assert!(!code.contains("datum()"), "{code}");
+            assert_eq!(code.len(), definition.len());
+            assert_eq!(code.find("LANGUAGE"), definition.find("LANGUAGE"));
+            for newline in ['\n', '\r'] {
+                assert_eq!(
+                    code.matches(newline).count(),
+                    definition.matches(newline).count()
+                );
+            }
+        }
+        for gap in [" ", "\t", " /* x */\n", "\n/* x */", "\u{a0}\n"] {
+            let definition = format!("AS 'SELECT app.'{gap}'f()'");
+            assert!(
+                !PG.code_only(&definition).contains("app.f()"),
+                "{definition}"
+            );
+        }
     }
 
     #[test]
