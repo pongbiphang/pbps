@@ -266,12 +266,11 @@ fn quote(ident: &str) -> Result<String, DialectError> {
 
 /// The settings every write of this dialect runs under, as one statement.
 ///
-/// A macro rather than a constant because both users need it as a **literal**:
+/// A macro rather than a constant because the framing needs a **literal**:
 /// [`Dialect::transaction_framing`] builds `begin` by `concat!`ing it with
-/// `BEGIN;`, and `concat!` takes literals and not constants. One text, two
-/// call sites, and no way for the transactional and staged paths to pin
-/// different things — which is the failure this replaces, since the staged path
-/// pinned nothing at all.
+/// `BEGIN;`, and `concat!` takes literals and not constants. Transactional
+/// execution, staged/resumed execution and rendered scripts share this text,
+/// so their parser settings cannot drift apart.
 macro_rules! session_pins {
     () => {
         "SET standard_conforming_strings = on; SET check_function_bodies = on; \
@@ -943,6 +942,11 @@ impl Dialect for Postgres {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_postgres_script_does_not_change_session_settings() {
+        assert!(pbps_dialect::render_script(&[], &super::Postgres::new()).is_empty());
+    }
+
     #[test]
     fn planned_required_add_uses_postgres_default_identifier_boundaries() {
         use pbps_model::{Column, Hints, IdsFile, RiskClass, Schema, Table, TableName};

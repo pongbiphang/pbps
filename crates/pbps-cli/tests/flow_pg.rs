@@ -10,6 +10,8 @@
 //!
 //! Run with `scripts/live-tests-pg.sh`, or by hand:
 //! `PBPS_TEST_PG_DB=... cargo test -p pbps-cli --test flow_pg -- --ignored`.
+//! Script tests use `PBPS_TEST_PSQL`, the psql inside `PBPS_TEST_PG_CONTAINER`
+//! (set by the local script and CI), or local `psql`, in that order.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -249,6 +251,238 @@ fn approved_apply(d: &Demo, connection: &str, plan: &std::path::Path, extra: &[&
     ];
     args.extend_from_slice(extra);
     d.run(&args)
+}
+
+/// Use psql's actual statement scanner: sending the whole file in one simple
+/// query would parse the DDL before the leading SETs take effect (decision 458).
+fn psql_script(db: &OwnDatabase, script: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let options = "-c standard_conforming_strings=off -c check_function_bodies=off \
+        -c DateStyle=German,DMY -c TimeZone=America/New_York -c IntervalStyle=sql_standard \
+        -c timezone_abbreviations=Australia -c transform_null_equals=on \
+        -c bytea_output=escape -c extra_float_digits=-3";
+    let mut command = if let Some(psql) = std::env::var_os("PBPS_TEST_PSQL") {
+        let mut command = Command::new(psql);
+        command
+            .arg("--dbname")
+            .arg(db.connection())
+            .env("PGOPTIONS", options);
+        command
+    } else if let Some(container) = std::env::var_os("PBPS_TEST_PG_CONTAINER") {
+        let mut command = Command::new("docker");
+        command.args(["exec", "-i", "-e", &format!("PGOPTIONS={options}")]);
+        command
+            .arg(container)
+            .args(["psql", "-U", "postgres", "-d", &db.name]);
+        command
+    } else {
+        let mut command = Command::new("psql");
+        command
+            .arg("--dbname")
+            .arg(db.connection())
+            .env("PGOPTIONS", options);
+        command
+    };
+    let mut child = command
+        .args([
+            "-X",
+            "-Atq",
+            "--set=ON_ERROR_STOP=1",
+            "--set=VERBOSITY=verbose",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("script regression needs psql or PBPS_TEST_PG_CONTAINER");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL and psql; see scripts/live-tests-pg.sh"]
+fn every_sql_output_pins_the_parser_before_the_generated_definitions() {
+    let planning = OwnDatabase::new(&server(), "script_planning");
+    on_server(planning.connection(), "CREATE SCHEMA app");
+    let empty = Demo::new("script-empty");
+    succeeds(empty.run(&["plan"]));
+    empty.commit();
+    succeeds(empty.run(&["bootstrap", "--db", planning.connection()]));
+
+    let d = Demo::new("script-pins");
+    d.table(
+        r#"table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  d: {type: date}
+  label: {type: text}
+primary_key: [id]
+checks:
+  date_pin: "d >= '01/02/2026'"
+  string_pin: "label <> 'a\\n'"
+"#,
+    );
+    let offline = d.dir.join("offline.sql");
+    let bootstrap = d.dir.join("bootstrap.sql");
+    let connected = d.dir.join("connected.sql");
+    succeeds(d.run(&["plan", "--sql", offline.to_str().unwrap()]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--sql", bootstrap.to_str().unwrap()]));
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        planning.connection(),
+        "--sql",
+        connected.to_str().unwrap(),
+    ]));
+
+    for (name, path) in [
+        ("offline", offline),
+        ("bootstrap", bootstrap),
+        ("connected", connected),
+    ] {
+        let db = OwnDatabase::new(&server(), &format!("script_{name}"));
+        on_server(db.connection(), "CREATE SCHEMA app");
+        let generated = std::fs::read_to_string(path).unwrap();
+        let script = format!(
+            r#"
+SELECT 'initial=' || current_setting('standard_conforming_strings') || ',' || current_setting('DateStyle');
+{generated}
+SELECT 'pins=' || current_setting('standard_conforming_strings') || ',' || current_setting('check_function_bodies') || ',' || current_setting('DateStyle') || ',' || current_setting('TimeZone') || ',' || current_setting('IntervalStyle') || ',' || current_setting('timezone_abbreviations') || ',' || current_setting('transform_null_equals') || ',' || current_setting('bytea_output') || ',' || current_setting('extra_float_digits');
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='app.t'::regclass AND conname IN ('date_pin', 'string_pin') ORDER BY conname;
+"#
+        );
+        let out = succeeds(psql_script(&db, &script));
+        let output = stdout(&out);
+        assert!(
+            output.contains("initial=off,German, DMY"),
+            "{name}: {output}"
+        );
+        assert!(
+            output.contains("pins=on,on,ISO, MDY,UTC,postgres,Default,off,hex,1"),
+            "{name}: {output}"
+        );
+        assert!(output.contains("'2026-01-02'::date"), "{name}: {output}");
+        assert!(output.contains(r"'a\n'::text"), "{name}: {output}");
+
+        // A spelling accepted only with the operator's old string parser must
+        // fail, rather than reaching the database under a different meaning.
+        on_server(db.connection(), "DROP TABLE app.t");
+        let invalid = generated.replace(r"'a\n'", r"'it\'s  here'");
+        assert_ne!(
+            invalid, generated,
+            "the negative case must change a literal"
+        );
+        let refused = psql_script(&db, &invalid);
+        assert_eq!(
+            code(&refused),
+            3,
+            "{name}: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("42601"),
+            "{name}: {}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                db.connection(),
+                "SELECT count(*) FROM pg_constraint WHERE conrelid=to_regclass('app.t') AND conname='string_pin'"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn staged_and_resumed_writes_pin_the_session_before_the_next_statement() {
+    for resume in [false, true] {
+        let slug = if resume { "pins_resume" } else { "pins_staged" };
+        let own = OwnDatabase::new(&server(), slug);
+        let connection = own.connection();
+        let base = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  d: {type: date}\n  label: {type: text}\nprimary_key: [id]\n";
+        let d = bootstrapped_demo(connection, slug, ONE_COLUMN);
+        // Database-local defaults affect fresh deployment connections without
+        // changing the shared test login or another test's session.
+        on_server(
+            connection,
+            &format!(
+                "ALTER DATABASE {} SET standard_conforming_strings = off; ALTER DATABASE {} SET DateStyle = 'German, DMY'",
+                own.name, own.name
+            ),
+        );
+        std::fs::write(
+            d.dir.join("schema/app.u.yml"),
+            format!(
+                "{}checks:\n  b_date: \"d >= '01/02/2026'\"\n  c_string: \"label <> 'a\\\\n'\"\n",
+                base.replace("table: app.t", "table: app.u")
+            ),
+        )
+        .unwrap();
+        let plan = connected_artifact(&d, connection, true);
+        if resume {
+            on_server(
+                connection,
+                r#"
+CREATE SCHEMA witness;
+CREATE FUNCTION witness.stop_after_first() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='app.u'::regclass AND conname='b_date') THEN
+    RAISE EXCEPTION 'stop before the date constraint commits';
+  END IF;
+END $$;
+CREATE EVENT TRIGGER stop_after_first ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.stop_after_first();
+"#,
+            );
+            let stopped = approved_apply(&d, connection, &plan, &["--staged"]);
+            assert_eq!(
+                code(&stopped),
+                1,
+                "{}{}",
+                stdout(&stopped),
+                stderr(&stopped)
+            );
+            let checkpoint = latest_snapshot(connection);
+            assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 1);
+            on_server(connection, "DROP EVENT TRIGGER stop_after_first");
+        }
+        let flags: &[&str] = if resume {
+            &["--staged", "--resume"]
+        } else {
+            &["--staged"]
+        };
+        succeeds(approved_apply(&d, connection, &plan, flags));
+        on_server(
+            connection,
+            "INSERT INTO app.u (id, d, label) VALUES (1, DATE '2026-01-15', 'present')",
+        );
+        assert!(
+            try_on_server(
+                connection,
+                "INSERT INTO app.u (id, d, label) VALUES (2, DATE '2026-01-01', 'present')"
+            )
+            .is_err()
+        );
+        assert!(try_on_server(connection, "INSERT INTO app.u (id, d, label) VALUES (3, DATE '2026-01-15', 'a' || chr(92) || 'n')").is_err());
+        on_server(
+            connection,
+            "INSERT INTO app.u (id, d, label) VALUES (4, DATE '2026-01-15', 'a' || chr(10))",
+        );
+        let snapshot = latest_snapshot(connection);
+        assert!(snapshot.staged.is_none());
+        assert_eq!(snapshot.kind, pbps_model::StateKind::Apply);
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
 }
 
 fn bootstrapped_demo(connection: &str, slug: &str, table: &str) -> Demo {

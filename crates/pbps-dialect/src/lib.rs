@@ -1581,7 +1581,9 @@ pub trait Dialect {
     /// starts on a fresh connection partway through the plan.
     ///
     /// So this is the same pins without the `BEGIN`, established on the
-    /// connection before the first statement of a staged run. `None` is the
+    /// connection before the first statement of a staged run. Rendered scripts
+    /// carry the same list before their DDL; the client must send it before
+    /// parsing later statements (DECISIONS 458). `None` is the
     /// right answer for a dialect whose framing carries nothing but the
     /// transaction — SQL Server's `SET XACT_ABORT ON` governs a transaction and
     /// means nothing outside one — and it is the default, so a dialect says
@@ -1767,7 +1769,25 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     problems
 }
 
-pub fn render_script(statements: &[Statement], separator: Option<&str>) -> String {
+/// Render the dialect's session setup and statements in execution order.
+///
+/// Taking the dialect, rather than just its separator, keeps a new script
+/// caller from omitting settings the deployment connection already establishes.
+pub fn render_script(statements: &[Statement], dialect: &dyn Dialect) -> String {
+    let Some(pins) = dialect.session_pins().filter(|_| !statements.is_empty()) else {
+        return render_batches(statements, dialect.batch_separator());
+    };
+    let prepared: Vec<_> = std::iter::once(Statement::new(pins).own_batch())
+        .chain(statements.iter().cloned())
+        .collect();
+    format!(
+        "-- Execute statements/batches in order, not as one query.\n\
+         -- Session settings must take effect before the following SQL is parsed.\n\n{}",
+        render_batches(&prepared, dialect.batch_separator())
+    )
+}
+
+fn render_batches(statements: &[Statement], separator: Option<&str>) -> String {
     let mut out = String::new();
     let mut previous_own_batch = false;
     for (i, s) in statements.iter().enumerate() {
@@ -1861,11 +1881,16 @@ mod tests {
             Statement::new("D;"),
         ];
         assert_eq!(
-            render_script(&stmts, Some("GO")),
+            render_batches(&stmts, Some("GO")),
             "A;\nGO\n\nB;\nGO\n\nC;\n\nD;\n"
         );
-        assert_eq!(render_script(&stmts, None), "A;\n\nB;\n\nC;\n\nD;\n");
-        assert_eq!(render_script(&[], Some("GO")), "");
+        assert_eq!(render_batches(&stmts, None), "A;\n\nB;\n\nC;\n\nD;\n");
+        assert_eq!(render_batches(&[], Some("GO")), "");
+        assert_eq!(
+            render_script(&stmts, &MinimalDialect),
+            render_batches(&stmts, None)
+        );
+        assert_eq!(render_script(&[], &MinimalDialect), "");
     }
 
     /// Almost all DDL is transactional, and the default has to reflect that —

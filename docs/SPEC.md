@@ -697,6 +697,14 @@ annotation (see open question 2); anything that genuinely needs manual handling
 uses the escape hatch that already exists: a DBA runs the SQL, then
 `pbps baseline`.
 
+SQL output from `plan --sql` (offline or connected) and `bootstrap --sql`
+carries the dialect's deployment session settings before its DDL. These are
+part of the rendered execution context, not extra saved-plan changes or staged
+checkpoints. A PostgreSQL script must be consumed statement by statement, as
+by `psql -f` or psql's standard input: submitting the entire file as one query
+(including `psql -c`) lexes later SQL before the leading settings take effect.
+The preview and approval rules above still apply (DECISIONS 458).
+
 ### 7.4 Rename impact report
 
 When `plan` detects a rename and a connection is available, it queries
