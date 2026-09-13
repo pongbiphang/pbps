@@ -997,18 +997,17 @@ async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError>
     if probe.as_deref() == Some(token.as_str()) {
         return Ok(());
     }
-    Err(DbError::Driver {
-        code: None,
-        message: "this read has to run inside the transaction that will do the rebuild, and this \
-                  connection has none open.\nWhat it reads is what a `DROP` is about to destroy, \
-                  and it takes the object's lock so that nothing changes between the read and the \
-                  `DROP`. Outside a transaction the lock is released at the end of the statement \
-                  that took it, and the canonical `search_path` these reads pin is set \
-                  `is_local` and does nothing at all — so the answer would be true when it was \
-                  given, unenforced afterwards, and worded by whatever path the session happened \
-                  to hold (ADR-0009 §3)."
+    Err(DbError::Refused(
+        "this read has to run inside the transaction that will do the rebuild, and this \
+         connection has none open.\nWhat it reads is what a `DROP` is about to destroy, \
+         and it takes the object's lock so that nothing changes between the read and the \
+         `DROP`. Outside a transaction the lock is released at the end of the statement \
+         that took it, and the canonical `search_path` these reads pin is set \
+         `is_local` and does nothing at all — so the answer would be true when it was \
+         given, unenforced afterwards, and worded by whatever path the session happened \
+         to hold (ADR-0009 §3)."
             .to_owned(),
-    })
+    ))
 }
 
 /// The one thing these reads must never answer with silence.
@@ -1022,28 +1021,22 @@ async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError>
 /// this transaction, which the lock is there to stop — so it is reported
 /// rather than absorbed.
 fn vanished(oid: i64) -> DbError {
-    DbError::Driver {
-        code: None,
-        message: format!(
-            "the catalog entry for oid {oid} was there when this read resolved it and gone when \
-             it read what the object carries. Something dropped it between two statements of this \
-             transaction. Nothing is reported rather than \"it carries nothing\", because that \
-             answer is what lets a rebuild go ahead."
-        ),
-    }
+    DbError::Refused(format!(
+        "the catalog entry for oid {oid} was there when this read resolved it and gone when \
+         it read what the object carries. Something dropped it between two statements of this \
+         transaction. Nothing is reported rather than \"it carries nothing\", because that \
+         answer is what lets a rebuild go ahead."
+    ))
 }
 
 fn not_in_the_catalog(id: &ModuleId) -> DbError {
-    DbError::Driver {
-        code: None,
-        message: format!(
-            "`{id}` is not in this database's catalog, and this read is about what a rebuild of \
-             it would destroy.\nAn answer of \"nothing\" here would mean \"nothing is attached to \
-             it\", which is what lets a rebuild go ahead — so a module that is not there is \
-             refused instead. If the plan means to create it, it is not being rebuilt and this \
-             question does not apply."
-        ),
-    }
+    DbError::Refused(format!(
+        "`{id}` is not in this database's catalog, and this read is about what a rebuild of \
+         it would destroy.\nAn answer of \"nothing\" here would mean \"nothing is attached to \
+         it\", which is what lets a rebuild go ahead — so a module that is not there is \
+         refused instead. If the plan means to create it, it is not being rebuilt and this \
+         question does not apply."
+    ))
 }
 
 fn quoted(name: &TableName) -> String {
@@ -1724,7 +1717,9 @@ const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
 /// Process B: SELECT … pg_get_viewdef(c.oid, true) …
 /// ```
 ///
-/// Reaching a caller as `db error`, that is unactionable — and the action is
+/// Before issue #167, that reached a caller as `db error` alone, which is
+/// unactionable; now it carries the server's own "deadlock detected" text
+/// too. Either way this function's own message is what says the action is
 /// exactly one thing: run it again. Nothing was half-done; the engine rolled
 /// the victim back whole before either side wrote.
 fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
@@ -1740,6 +1735,7 @@ fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
             ),
         },
         DbError::Driver { .. }
+        | DbError::Refused(_)
         | DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }

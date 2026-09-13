@@ -125,10 +125,7 @@ fn required(row: &Row, name: &str) -> Result<i64, DbError> {
 }
 
 fn error(message: String) -> DbError {
-    DbError::Driver {
-        code: None,
-        message,
-    }
+    DbError::Refused(message)
 }
 
 struct Classes {

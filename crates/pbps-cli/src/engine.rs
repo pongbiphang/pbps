@@ -190,6 +190,155 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
     }
 }
 
+/// Renders a failed deployment's error chain the way anything written
+/// **durably** (the ledger) or **outward** (the `on_apply_attempt` hook) is
+/// allowed to: every frame this tool itself composed, kept verbatim, and
+/// every `DbError::Driver` frame — the one place a server's own sentence
+/// enters this chain — replaced by its code alone.
+///
+/// Ready-phase review of PR #464 measured that `db.message()` is not always
+/// safe the way `pbps-db`'s object identifiers are: a failed type conversion
+/// names the value it could not convert
+/// (`invalid input syntax for type integer: "…"` on 18.6, `Conversion failed
+/// when converting the varchar value '…' to data type int.` on SQL Server
+/// 2025 — measured on both engines, since `crates/pbps-db/src/mssql.rs`'s
+/// `From<tiberius::error::Error>` builds the very same `DbError::Driver` this
+/// reads), and `crates/pbps-pg/src/emit.rs`'s own comment on `as_stored`
+/// confirms this tool's own column-retype apply reaches that path with a real
+/// cell's value. Unlike the enrichment fields the seam itself dropped
+/// (DECISIONS 454), `message()` cannot be dropped at the seam without
+/// silencing the diagnosis issue #167 exists to give the operator — so the
+/// split is here, between what stays on the operator's own terminal and what
+/// this tool writes down or sends elsewhere (DECISIONS 455).
+///
+/// A second ready-phase round on that fix found this function redacting more
+/// than the server ever said. `DbError::Driver` used to be built by any
+/// caller with a message and an optional code — including several `pbps-pg`
+/// guards refusing something *this tool* decided on its own (an unsafe data
+/// trigger, a catalog read outside the transaction it needs), never a server.
+/// Redacting those the same way as a real driver frame hid the one thing that
+/// told an operator which trigger or rule to fix. [`DbError::Refused`]
+/// (DECISIONS 455) is the fix at the type: a tool-composed refusal is no
+/// longer representable as `Driver`, so it falls to the `_` arm below and
+/// passes through unchanged — this function needs no case for it.
+///
+/// The same round measured that "SQLSTATE" is a PostgreSQL word.
+/// `tiberius::Error::code()` returns SQL Server's own numeric message number
+/// (`208`, `2627`, …), not a SQLSTATE, so naming every `Driver.code` a
+/// SQLSTATE was simply wrong on that engine. The wording below is the engine's
+/// own code, unnamed by convention, rather than a borrowed one.
+///
+/// Walking `error.chain()` rather than reading only the top frame is what
+/// makes this work regardless of *where* the driver frame sits: most of this
+/// codebase lets a `DbError` reach `anyhow::Error` through a bare `?`, which
+/// puts it at the top with no frame of this tool's own text above it at all,
+/// while a few call sites — `execute_statements`,
+/// `apply_staged_under_lock`'s per-statement loop — wrap it in a `.context()`
+/// frame first. **Both shapes must build their `anyhow::Error` with
+/// `.context()`, never `anyhow::anyhow!("...{e}")`**: the macro's string
+/// interpolation bakes the driver's `Display` into a new, sourceless string
+/// before this function ever runs, which is exactly the shape that lost the
+/// two calls above their downcast target until this fix.
+///
+/// `.chain().rev()`, not `.chain()`: `reason` is a bounded column
+/// (`crate::engine::truncate_reason` keeps only the *first* `REASON_CHARS`
+/// characters of what it is handed, never the last), so its content has to be
+/// ordered by diagnostic value per character, highest first — not by the
+/// order this tool happened to build the chain in. The redacted driver
+/// marker is the highest: it is the one fact that identifies *why* the
+/// server refused, and it exists nowhere else once `message()` is gone.
+/// `stmt.sql` in `execute_statements`' own `.context()` sentence is the
+/// lowest: it is this tool's own generated text, deterministic from the
+/// checksum-pinned plan and the declarations already in git, so a partial
+/// copy of it in the ledger tells a reader nothing they cannot read better
+/// from the plan itself. Putting the marker last, where an un-reversed
+/// `error.chain()` (outermost-first) leaves it, ordered the column by build
+/// order instead — and a third ready-phase round measured the consequence:
+/// a `CREATE VIEW` or a large reference-data block puts a `stmt.sql` past
+/// `REASON_CHARS` on its own, so truncation cut before it ever reached the
+/// marker, leaving a `Failed` row with a fragment of the emitted SQL and
+/// neither the server's message nor its code. "Absent, empty and unreadable
+/// are three different things," and a redaction result that reads as
+/// *nothing was ever recorded* is the third one wearing the first one's
+/// face. Reversing is the fix that cannot be quietly undone by a future
+/// caller composing a longer chain: the priority order is structural, not a
+/// truncation workaround this function has to remember to preserve.
+///
+/// The operator's own stderr is unaffected: `main.rs` prints `{e:#}`, which
+/// walks the chain outermost-first — the natural reading order for a person,
+/// who is never truncated — and shows every frame, driver sentence included;
+/// that is issue #167's deliverable, and it is still what someone running an
+/// apply against a database they already hold credentials for sees.
+pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|frame| {
+            // `RowsError::Read` boxes its `#[source]` (`Box<DbError>`, kept
+            // small beside every `Ok` it travels next to) — and a boxed
+            // `#[source]` is not merely a `DbError` behind one more layer of
+            // indirection: `thiserror` stores the trait object over `Box<T>`
+            // itself, so `downcast_ref::<DbError>()` on that frame **fails**
+            // (measured: a `Box<T>` field downcasts to `Box<T>`, never to
+            // `T`, because `Box<T>`'s own blanket `Error` impl is what is
+            // actually in the vtable). A first version of this fix missed
+            // that and fell through to the frame's own `Display` — which
+            // still renders the driver's message, since `Box`'s `Display`
+            // forwards to what it holds — silently un-redacting exactly the
+            // frame this match exists to catch. Trying both shapes is what a
+            // boxed `#[source]` costs a redaction that has to survive being
+            // downcast through it.
+            // `LedgerError::Db` and `ImpactError::Query` are
+            // `#[error(transparent)]`: not merely a `DbError` behind a
+            // named wrapper, but thiserror's specific instruction to forward
+            // `Display` to the wrapped value and — the part that matters
+            // here — forward `source()` to *its* `source()`, skipping the
+            // wrapped value itself. **Measured**: `error.chain()` on such a
+            // value is one frame long, and that one frame downcasts to the
+            // wrapper type (`LedgerError`), never to what it wraps
+            // (`DbError`) — the opposite failure from the boxed case above,
+            // for the opposite reason: there a real chain link downcast to
+            // the wrong type, here `.chain()` never produces a second link
+            // to downcast at all. Both still leave `frame.to_string()`
+            // rendering the driver's raw message, since `Display` forwards
+            // regardless of whether `source()` does.
+            let as_driver = frame
+                .downcast_ref::<DbError>()
+                .or_else(|| frame.downcast_ref::<Box<DbError>>().map(AsRef::as_ref))
+                .or_else(|| match frame.downcast_ref::<LedgerError>() {
+                    Some(LedgerError::Db(inner)) => Some(inner),
+                    _ => None,
+                })
+                .or_else(|| match frame.downcast_ref::<ImpactError>() {
+                    Some(ImpactError::Query(inner)) => Some(inner),
+                    _ => None,
+                });
+            match as_driver {
+                Some(DbError::Driver { code, .. }) => match code {
+                    Some(code) => {
+                        format!("the driver reported code {code}; its message is not recorded here")
+                    }
+                    None => "the driver reported a failure with no code; its message is not \
+                              recorded here"
+                        .to_owned(),
+                },
+                // Every other `DbError` variant — including `Refused`, this
+                // tool's own composed refusal, which can never carry a server
+                // value by construction — and every frame that is not a
+                // `DbError` at all, is this tool's own composed text: a
+                // malformed connection string, an `io::Error` naming a host
+                // that refused a socket, a catalog row the introspection SQL
+                // got wrong, or a `.context()` sentence this crate wrote.
+                // None of it echoes a server-supplied value back.
+                _ => frame.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 /// A failure reason cut to what the ledger's `reason` column holds.
 ///
 /// Each engine counts differently — UTF-16 units on one, characters on the
@@ -993,6 +1142,269 @@ pub async fn check_data_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one frame the ready-phase review named: a `DbError::Driver`'s
+    /// `message` is exactly what a driver's `db.message()` can carry — a
+    /// value nobody declared to this tool, measured on both engines
+    /// (DECISIONS 455) — and this is the only frame `ledger_safe_reason` may
+    /// not repeat verbatim. The code is PostgreSQL's SQLSTATE here, but the
+    /// marker names it neutrally: SQL Server's own `Driver` frame carries a
+    /// numeric message number instead, not a SQLSTATE (see the MSSQL test
+    /// below), and this function has one wording for both.
+    #[test]
+    fn a_driver_frame_is_redacted_to_its_code_and_nothing_else() {
+        let db = anyhow::Error::new(DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        });
+        let rendered = ledger_safe_reason(&db);
+        assert!(
+            !rendered.contains("super-secret-abc"),
+            "the driver's own text must not survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("22P02"),
+            "the code must survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SQLSTATE"),
+            "SQLSTATE is a PostgreSQL word; SQL Server's own code is not one \
+             (this same wording renders both): {rendered}"
+        );
+    }
+
+    /// A driver failure with no code at all (a broken protocol, not a
+    /// refused statement) is still redacted — the marker just says so, rather
+    /// than rendering an empty code or falling back to the message it exists
+    /// to withhold.
+    #[test]
+    fn a_driver_frame_with_no_code_is_redacted_without_inventing_one() {
+        let db = anyhow::Error::new(DbError::Driver {
+            message: "super-secret-protocol-detail".to_owned(),
+            code: None,
+        });
+        let rendered = ledger_safe_reason(&db);
+        assert!(
+            !rendered.contains("super-secret-protocol-detail"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered,
+            "the driver reported a failure with no code; its message is not recorded here"
+        );
+    }
+
+    /// SQL Server's own `Driver` frame: `tiberius::Error::code()` is a numeric
+    /// message number (`208`, "cannot drop the object because..."; `2627`,
+    /// a constraint violation), never a SQLSTATE — ready-phase review found
+    /// this function calling every engine's code a SQLSTATE regardless, which
+    /// is simply wrong on this one. The marker must still redact the message
+    /// and keep the code, without calling it something it is not.
+    #[test]
+    fn a_mssql_driver_frame_is_redacted_without_being_called_a_sqlstate() {
+        let db = anyhow::Error::new(DbError::Driver {
+            message: "Conversion failed when converting the varchar value \
+                      'super-secret-abc' to data type int."
+                .to_owned(),
+            code: Some("245".to_owned()),
+        });
+        let rendered = ledger_safe_reason(&db);
+        assert!(
+            !rendered.contains("super-secret-abc"),
+            "the driver's own text must not survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("245"),
+            "the code must survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SQLSTATE"),
+            "245 is a SQL Server message number, not a SQLSTATE: {rendered}"
+        );
+    }
+
+    /// Every other `DbError` variant is this tool's own composed text, not a
+    /// value the server echoed back, and passes through unchanged — the
+    /// redaction is narrow, not "any `DbError` at all".
+    #[test]
+    fn a_non_driver_dberror_frame_passes_through_unchanged() {
+        let bad_row = anyhow::Error::new(DbError::BadRow(
+            "column `n` was read as an unsigned byte".to_owned(),
+        ));
+        assert_eq!(
+            ledger_safe_reason(&bad_row),
+            "unexpected row shape: column `n` was read as an unsigned byte"
+        );
+    }
+
+    /// A tool-composed refusal — an unsafe data trigger, a catalog read
+    /// outside the transaction it needs — names its own rule or trigger in
+    /// its message, never a server value, and `DbError::Refused` makes that
+    /// unrepresentable as `Driver` by construction (DECISIONS 455). Ready-phase
+    /// review found this function redacting exactly this shape before the
+    /// split existed; this pins that it cannot happen again even if a new
+    /// call site is added, since `Refused` falls to the same `_` arm as any
+    /// other non-`Driver` frame rather than a case naming it specially.
+    #[test]
+    fn a_refused_frame_names_its_own_rule_and_is_never_redacted() {
+        let refused = anyhow::Error::new(DbError::Refused(
+            "unsafe data trigger `audit.enforce_price` on `sales.orders`: this trigger is not \
+             part of the recorded baseline"
+                .to_owned(),
+        ));
+        assert_eq!(
+            ledger_safe_reason(&refused),
+            "unsafe data trigger `audit.enforce_price` on `sales.orders`: this trigger is not \
+             part of the recorded baseline"
+        );
+    }
+
+    /// The shape `execute_statements` and `apply_staged_under_lock` build
+    /// today: this tool's own `.context()` sentence naming the emitted
+    /// statement (safe — it is the plan's own SQL, not server-echoed data) on
+    /// top of the driver's frame underneath it. Both survive, but only one of
+    /// them keeps its own text.
+    #[test]
+    fn a_context_wrapped_driver_frame_keeps_the_context_and_redacts_the_source() {
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(db).context(
+            "the database rejected this statement, and the whole plan was rolled back:\n\
+             ALTER TABLE t ALTER COLUMN n TYPE integer",
+        );
+        let rendered = ledger_safe_reason(&wrapped);
+        assert!(
+            rendered.contains("the database rejected this statement"),
+            "this tool's own framing must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("ALTER TABLE t ALTER COLUMN n TYPE integer"),
+            "the plan's own emitted SQL is not server-echoed data, and must survive: {rendered}"
+        );
+        assert!(!rendered.contains("super-secret-abc"), "{rendered}");
+        assert!(rendered.contains("22P02"), "{rendered}");
+    }
+
+    /// The boundary a ready-phase round found: a `.context()` sentence long
+    /// enough on its own to fill the ledger's `reason` column — a `CREATE
+    /// VIEW` or a large reference-data block, not a contrived string — used
+    /// to push the redacted driver marker past where `truncate_reason` cuts,
+    /// leaving a `Failed` row with a fragment of the emitted SQL and neither
+    /// the server's message nor its code. `ledger_safe_reason` now orders the
+    /// marker first for exactly this reason, so this test builds a context
+    /// frame longer than *both* engines' column widths and checks the code
+    /// still survives `truncate_reason` for each.
+    #[test]
+    fn a_context_frame_longer_than_the_column_does_not_crowd_out_the_code() {
+        assert_eq!(
+            pbps_pg::state::REASON_CHARS,
+            pbps_mssql::state::REASON_UTF16_UNITS,
+            "this test's one oversized context frame must outgrow both engines' columns"
+        );
+        let long_statement = "x".repeat(pbps_pg::state::REASON_CHARS * 2);
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(db).context(format!(
+            "the database rejected this statement, and the whole plan was rolled back:\n{long_statement}"
+        ));
+        let rendered = ledger_safe_reason(&wrapped);
+
+        for driver in [Driver::Postgres, Driver::Mssql] {
+            let cut = truncate_reason(driver, &rendered);
+            assert!(
+                cut.contains("22P02"),
+                "{driver:?}: the code is the highest-value fact in a bounded column \
+                 and must survive truncation even behind an oversized context frame: {cut}"
+            );
+            assert!(
+                !cut.contains("super-secret-abc"),
+                "{driver:?}: redaction must still hold after reordering: {cut}"
+            );
+        }
+    }
+
+    /// A ready-phase round on the truncation fix found this shape: a wrapper
+    /// whose own `Display` interpolates `{source}` — `RowsError::Read`, for
+    /// an apply whose managed-row read hits a data-bearing server error —
+    /// reproduces the driver's full, unredacted text as part of *its own*
+    /// rendered frame, before `error.chain()` ever reaches the `DbError`
+    /// separately to redact it. Redacting that later frame changes nothing;
+    /// the leak already happened one frame up. Fixed by dropping `{source}`
+    /// from `RowsError::Read`'s format string (`crates/pbps-db/src/
+    /// catalog.rs`) rather than special-casing `RowsError` here: `#[source]`
+    /// alone still lets `.chain()` walk into the `DbError`, so this function
+    /// needs no new arm, the same way it needed none for `DbError::Refused`.
+    #[test]
+    fn a_wrapper_that_names_its_source_does_not_repeat_the_drivers_text() {
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-xyz\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(RowsError::Read {
+            table: TableName::new("app", "t"),
+            source: Box::new(db),
+        });
+        let rendered = ledger_safe_reason(&wrapped);
+        assert!(
+            !rendered.contains("super-secret-xyz"),
+            "a wrapper frame's own Display must not smuggle the driver's text \
+             past the redaction that runs on the frame beneath it: {rendered}"
+        );
+        assert!(
+            rendered.contains("22P02"),
+            "the code must still survive, from the DbError frame beneath the \
+             wrapper: {rendered}"
+        );
+        assert!(
+            rendered.contains("reading its rows back failed"),
+            "the wrapper's own text, which names no server value, must still \
+             survive: {rendered}"
+        );
+    }
+
+    /// A ready-phase round on the previous fix found a third shape:
+    /// `LedgerError::Db` and `ImpactError::Query` are `#[error(transparent)]`,
+    /// which is not a boxed `#[source]` either — thiserror forwards
+    /// `Display` to the wrapped `DbError` but forwards `source()` to *its*
+    /// `source()`, so `error.chain()` never produces a second link to
+    /// downcast at all: the one frame it does produce downcasts to
+    /// `LedgerError`, never to `DbError`, and its `Display` still renders
+    /// the driver's raw message regardless. `ledger_safe_reason` now also
+    /// tries `downcast_ref::<LedgerError>()` (and `ImpactError`) and unwraps
+    /// their transparent `DbError` directly, rather than relying on `.chain()`
+    /// to have produced it as its own link.
+    #[test]
+    fn a_transparent_wrapper_does_not_repeat_the_drivers_text() {
+        let db = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-def\"".to_owned(),
+            code: Some("22P02".to_owned()),
+        };
+        let wrapped = anyhow::Error::new(LedgerError::Db(db));
+        let rendered = ledger_safe_reason(&wrapped);
+        assert!(
+            !rendered.contains("super-secret-def"),
+            "a transparent wrapper's forwarded Display must not smuggle the \
+             driver's text past redaction: {rendered}"
+        );
+        assert!(
+            rendered.contains("22P02"),
+            "the code must still survive, from the DbError a transparent \
+             wrapper hides from .chain(): {rendered}"
+        );
+
+        let db2 = DbError::Driver {
+            message: "invalid input syntax for type integer: \"super-secret-ghi\"".to_owned(),
+            code: Some("22P03".to_owned()),
+        };
+        let wrapped2 = anyhow::Error::new(ImpactError::Query(db2));
+        let rendered2 = ledger_safe_reason(&wrapped2);
+        assert!(!rendered2.contains("super-secret-ghi"), "{rendered2}");
+        assert!(rendered2.contains("22P03"), "{rendered2}");
+    }
 
     #[test]
     fn replacement_checks_include_paired_drops_but_not_ordinary_drops() {

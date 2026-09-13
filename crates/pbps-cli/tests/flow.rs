@@ -9560,6 +9560,101 @@ fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
     );
 }
 
+/// SQL Server's own driver frame, on the ledger: `tiberius::Error::code()` is
+/// a numeric message number (`50000` for an ad hoc `THROW`, `2627` for a
+/// constraint, …), never a SQLSTATE — that word belongs to the other engine.
+///
+/// A second ready-phase round on PR #464 found `crate::engine::ledger_safe_reason`
+/// calling every engine's code a SQLSTATE regardless of which one produced it.
+/// Measured here on the real driver: a trigger's own `THROW` names a value
+/// nobody declared to this tool, the operator's stderr still gets the whole
+/// sentence, and the durable ledger keeps the code without calling it
+/// something SQL Server never sent (DECISIONS 455).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_triggers_own_throw_is_redacted_without_being_called_a_sqlstate() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&connection, "invariant_mssql_code");
+    let db = own.connection().to_owned();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("invariant-mssql-code");
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+         label: {type: nvarchar(50), nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    assert_eq!(code(&d.run(&["bootstrap", "--db", &db])), 0);
+
+    rt.block_on(async {
+        let mut conn = connect_live(&db).await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER reject ON dbo.t AFTER INSERT AS BEGIN \
+             THROW 50000, 'rejected: super-secret-mssql-value-167', 1; END",
+        )
+        .await
+        .unwrap();
+    });
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+         label: {type: nvarchar(50), nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n\
+         data:\n  mode: exact\n  rows:\n    x: {label: New}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("invariant-code.json");
+    let made = d.run(&["plan", "--db", &db, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&made), 0, "{}", stderr(&made));
+    let checksum = plan_checksum(&plan);
+    let applied = d.run(&[
+        "apply",
+        "--db",
+        &db,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(
+        code(&applied),
+        1,
+        "{}{}",
+        stdout(&applied),
+        stderr(&applied)
+    );
+    assert!(
+        stderr(&applied).contains("super-secret-mssql-value-167"),
+        "the operator, who already holds credentials to this database, still \
+         gets the server's own sentence: {}",
+        stderr(&applied)
+    );
+
+    rt.block_on(async {
+        let mut conn = connect_live(&db).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
+        let reason = latest.snapshot.reason.clone().unwrap_or_default();
+        assert!(
+            !reason.contains("super-secret-mssql-value-167"),
+            "a value nobody declared to this tool must never reach the durable \
+             ledger: {reason}"
+        );
+        assert!(
+            reason.contains("50000"),
+            "an ad hoc THROW's own message number is not data and should still \
+             help an operator reading the ledger later: {reason}"
+        );
+        assert!(
+            !reason.contains("SQLSTATE"),
+            "50000 is a SQL Server message number, not a SQLSTATE — that word \
+             belongs to the other engine: {reason}"
+        );
+    });
+}
+
 /// SQL Server DDL is transactional, but that guarantee is lost if COMMIT comes
 /// before read-back or the success-ledger insert. Force the latter to fail and
 /// prove the column addition is rolled back with it.

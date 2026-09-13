@@ -1473,15 +1473,14 @@ async fn open(conn: &mut Conn, scope: Scope) -> Result<(), DbError> {
         }
         Scope::CallersTransaction => {
             if !in_transaction(conn).await? {
-                return Err(DbError::Driver {
-                    code: None,
-                    message: "this connection has no open transaction, and a read-back of one \
-                              cannot run outside it.\nThe read exists to see what the \
-                              caller's transaction has written and not yet committed; outside \
-                              a transaction there is nothing of the kind, and the plain read \
-                              takes its own snapshot instead."
+                return Err(DbError::Refused(
+                    "this connection has no open transaction, and a read-back of one \
+                     cannot run outside it.\nThe read exists to see what the \
+                     caller's transaction has written and not yet committed; outside \
+                     a transaction there is nothing of the kind, and the plain read \
+                     takes its own snapshot instead."
                         .to_owned(),
-                });
+                ));
             }
             conn.execute(SAVEPOINT).await
         }
@@ -1532,9 +1531,15 @@ async fn close<T>(
 ///
 /// That is the snapshot doing its job in the only direction it can. Without the
 /// transaction the pull would have returned a table with no columns and called
-/// it a schema; with it, the read fails. What is left is to say so, because the
-/// driver renders `XX000` as `db error` and an unreadable failure is the third
-/// thing CLAUDE.md's rule names (issue #167).
+/// it a schema; with it, the read fails. What is left is to say so — and
+/// legibly: this seam's `From<tokio_postgres::Error>` used to render `XX000`
+/// as the literal `db error`, an unreadable failure being the third thing
+/// CLAUDE.md's rule names, until issue #167 read the server's own sentence
+/// off `as_db_error()` instead of `Display`. [`schema_changed_underneath`]
+/// below still folds that sentence into a sentence of its own: the server's
+/// text says a cache lookup failed, and what a reader needs is why — that
+/// this snapshot cannot see a concurrent `DROP` and is refusing rather than
+/// guessing.
 /// The one question that has to be asked **before** `BEGIN`.
 ///
 /// PostgreSQL does not nest: inside an open transaction a plain `BEGIN` is a
@@ -1555,16 +1560,15 @@ async fn close<T>(
 /// "what the database looks like" means.
 async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
     if in_transaction(conn).await? {
-        return Err(DbError::Driver {
-            code: None,
-            message: "this connection already has an open transaction, and a pull cannot run \
-                      inside one.\nThe read takes its own `REPEATABLE READ READ ONLY` \
-                      transaction to own its snapshot and restore its local settings. \
-                      PostgreSQL does not nest transactions, so running here would neither get \
-                      that snapshot nor be able to end without committing yours. Commit or roll \
-                      back first."
+        return Err(DbError::Refused(
+            "this connection already has an open transaction, and a pull cannot run \
+             inside one.\nThe read takes its own `REPEATABLE READ READ ONLY` \
+             transaction to own its snapshot and restore its local settings. \
+             PostgreSQL does not nest transactions, so running here would neither get \
+             that snapshot nor be able to end without committing yours. Commit or roll \
+             back first."
                 .to_owned(),
-        });
+        ));
     }
     Ok(())
 }
@@ -1580,9 +1584,11 @@ fn schema_changed_underneath(e: DbError) -> DbError {
                  this is that guard firing. Run it again when the other change has finished."
             ),
         },
-        // A deadlock, which reaches an operator as `db error` and nothing
-        // else. It is the third way the catalog moves under this read, and
-        // the only one where the engine has already decided the outcome.
+        // A deadlock, which — before issue #167 — reached an operator as
+        // `db error` and nothing else, and now carries the server's own
+        // "deadlock detected" sentence besides. It is the third way the
+        // catalog moves under this read, and the only one where the engine
+        // has already decided the outcome.
         //
         // The pull deparses every view in the database, and
         // `pg_get_viewdef` opens each one — so the read holds `ACCESS SHARE`
@@ -1609,6 +1615,7 @@ fn schema_changed_underneath(e: DbError) -> DbError {
             ),
         },
         DbError::Driver { .. }
+        | DbError::Refused(_)
         | DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
@@ -1640,16 +1647,13 @@ fn schema_changed_underneath(e: DbError) -> DbError {
 /// that is not wrong here. **Absent, empty and unreadable are three different
 /// things**, and a vanished object is the third.
 fn deparsed_away(kind: char, schema: &str, name: &str) -> DbError {
-    DbError::Driver {
-        code: None,
-        message: format!(
-            "the catalog changed while it was being read: `{schema}.{name}` (kind `{kind}`) was \
-             there when the catalog was scanned and gone when its definition was deparsed.\n\
-             Something applied DDL to this database during the pull. The read is taken in one \
-             snapshot so that it cannot report half of a change as a whole schema, and this is \
-             that guard firing. Run it again when the other change has finished."
-        ),
-    }
+    DbError::Refused(format!(
+        "the catalog changed while it was being read: `{schema}.{name}` (kind `{kind}`) was \
+         there when the catalog was scanned and gone when its definition was deparsed.\n\
+         Something applied DDL to this database during the pull. The read is taken in one \
+         snapshot so that it cannot report half of a change as a whole schema, and this is \
+         that guard firing. Run it again when the other change has finished."
+    ))
 }
 
 fn missing(column: &str) -> DbError {

@@ -1583,8 +1583,11 @@ fn ledger_migration_guidance_keeps_the_explicit_or_configured_target() {
             message.contains("needs ownership of public.__pbps_state"),
             "{message}"
         );
+        // Before issue #167 this seam rendered the ownership refusal as the
+        // literal `db error`; the server's own sentence is what a reader
+        // needs beside the guidance the assertion above already checks.
         assert!(
-            message.contains("this role could not add them: db error"),
+            message.contains("this role could not add them: must be owner of table __pbps_state"),
             "{message}"
         );
         assert!(
@@ -2536,6 +2539,190 @@ fn the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate() {
     assert_eq!(
         latest_snapshot(connection).reason.as_deref(),
         Some("after unlock")
+    );
+}
+
+/// A trigger's own `RAISE EXCEPTION` naming a value nobody declared to this
+/// tool keeps that value on the operator's own screen and off the ledger.
+///
+/// The ready-phase finding on PR #464 named two shapes that can put row data
+/// into `db.message()` rather than the enrichment fields DECISIONS 454
+/// already strips: an engine conversion error, and a "PL/pgSQL/check/trigger
+/// exception whose primary MESSAGE contains row data." The first was tried
+/// here first and **measured** not to be reachable through this tool's own
+/// emitted DDL: `ALTER COLUMN ... TYPE` without an explicit `USING` — which is
+/// all pbps ever emits (ADR-0012 §5 refuses a retype no automatic cast
+/// covers) — fails a real out-of-range or over-length row with a *generic*
+/// message (`integer out of range`, `value too long for type character
+/// varying(10)`, `numeric field overflow`), none of which named the value on
+/// 18.6; only a bare `CAST('text' AS type)` from an untyped literal does that,
+/// and this tool never emits one against existing data. The second shape,
+/// below, is reachable exactly as the finding named it, through a data
+/// trigger this tool's own guard (`crates/pbps-pg/src/data_triggers.rs`)
+/// already treats as approved because it exists in the very first recorded
+/// state.
+///
+/// The secret lives in a table this plan never declares and this trigger
+/// reads on its own — not in the row the plan writes. A first draft of this
+/// fixture put the literal in the *declared* row instead, and its failure was
+/// the useful measurement: pbps's own emitted `INSERT` necessarily restates
+/// what was declared, so a secret placed there also appears in this tool's
+/// own `.context()` framing around the statement, which is not the driver
+/// frame and is not supposed to be redacted (it is the plan's own checksummed
+/// text, already in git — DECISIONS 455). Reading a genuinely undeclared
+/// value out of a side table, the way `unapproved_data_triggers_
+/// cannot_use_the_deployers_privileges` above already reads `public.secret`,
+/// isolates the one frame this test means to pin: the driver's.
+///
+/// The trigger is adopted the way an operator's own would be — pulled after
+/// it exists live, declared from that pulled text, and folded into a fresh
+/// `baseline` — rather than written by hand, for the same reason the
+/// `trigger:`-pulling tests elsewhere in this file give: only a pulled
+/// definition is the engine's own deparsed text, and this is what makes the
+/// reference-data write below a *recorded managed* use of the trigger, not
+/// the refusal `unapproved_data_triggers_cannot_use_the_deployers_privileges`
+/// covers.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_triggers_own_exception_keeps_the_row_value_off_the_ledger_but_not_off_the_operator() {
+    let own = OwnDatabase::new(&server(), "invariant_trigger_message");
+    let connection = own.connection();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+         label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    let d = bootstrapped_demo(connection, "invariant-trigger-message", declared);
+    on_server(
+        connection,
+        "CREATE TABLE public.secret(value text); \
+         INSERT INTO public.secret VALUES ('super-secret-value-167'); \
+         CREATE FUNCTION app.reject() RETURNS trigger LANGUAGE plpgsql AS \
+         $$DECLARE v text; BEGIN SELECT value INTO v FROM public.secret; \
+           RAISE EXCEPTION 'rejected: %', v; END$$; \
+         CREATE TRIGGER reject BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.reject()",
+    );
+    let puller = Demo::new("invariant-trigger-message-pull");
+    succeeds(puller.run(&["pull", "--db", connection]));
+    let module = std::fs::read_dir(puller.dir.join("schema"))
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let body = std::fs::read_to_string(&path).ok()?;
+            body.lines()
+                .any(|line| line.starts_with("trigger:"))
+                .then_some(body)
+        })
+        .next()
+        .expect("the engine's own spelling of the trigger");
+    std::fs::write(d.dir.join("schema/reject.yml"), module).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopt the reject trigger",
+    ]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    d.table(&format!(
+        "{declared}data:\n  mode: exact\n  rows:\n    x: {{label: New}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let failed = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+    assert!(
+        stderr(&failed).contains("super-secret-value-167"),
+        "the operator, who already holds credentials to this database, still \
+         gets the server's own sentence: {}",
+        stderr(&failed)
+    );
+    assert!(stderr(&failed).contains("rejected:"), "{}", stderr(&failed));
+
+    let after = latest_snapshot(connection);
+    assert_eq!(after.kind, pbps_model::StateKind::Failed);
+    let reason = after.reason.clone().unwrap_or_default();
+    assert!(
+        !reason.contains("super-secret-value-167"),
+        "a value nobody declared to this tool must never reach the durable \
+         ledger: {reason}"
+    );
+    assert!(
+        reason.contains("P0001"),
+        "the SQLSTATE for a bare RAISE EXCEPTION is not data and should still \
+         help an operator reading the ledger later: {reason}"
+    );
+    assert!(
+        reason.contains("the database rejected this statement"),
+        "this tool's own framing is not data either, and should survive \
+         beside the redacted driver frame: {reason}"
+    );
+    assert!(
+        reason.contains("New"),
+        "the plan's own declared value is not the driver's data and must \
+         survive in this tool's own emitted-statement text: {reason}"
+    );
+}
+
+/// A tool-composed refusal — this tool's own guard naming an unapproved
+/// trigger, never a server value — keeps naming the trigger in the durable
+/// ledger, unlike the driver's own sentence the test above pins.
+///
+/// A second ready-phase round on PR #464 found `ledger_safe_reason` treating
+/// this refusal the same way as a real driver frame: `data_triggers.rs`'s
+/// `refused()` used to build a `DbError::Driver` with no code, exactly the
+/// shape `ledger_safe_reason` could not tell apart from a server's, and it
+/// redacted the one thing an operator reading the ledger later needs — which
+/// trigger to remove. `DbError::Refused` (DECISIONS 455) makes this
+/// unrepresentable as `Driver`: this test pins that the redaction can never
+/// happen again, whatever call site builds the refusal.
+///
+/// The trigger is created live *after* the plan is computed against the
+/// clean baseline, so `plan` never sees it and only `apply`'s own re-check
+/// (`crate::engine::prepare_data_writes`, run fresh inside the transaction)
+/// catches it — the same shape a trigger installed between approval and
+/// deployment would take outside a test.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_unapproved_triggers_own_refusal_keeps_naming_it_on_the_ledger() {
+    let own = OwnDatabase::new(&server(), "invariant_refused_trigger");
+    let connection = own.connection();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+         label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    let d = bootstrapped_demo(connection, "invariant-refused-trigger", declared);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nunmanaged: ignore\n",
+    )
+    .unwrap();
+    d.table(&format!(
+        "{declared}data:\n  mode: exact\n  rows:\n    x: {{label: New}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    on_server(
+        connection,
+        "CREATE FUNCTION app.audit() RETURNS trigger LANGUAGE plpgsql AS \
+         $$BEGIN RETURN NEW; END$$; \
+         CREATE TRIGGER audit BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.audit()",
+    );
+    let failed = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+    assert!(
+        stderr(&failed).contains("unsafe data trigger") && stderr(&failed).contains("audit"),
+        "{}",
+        stderr(&failed)
+    );
+
+    let after = latest_snapshot(connection);
+    assert_eq!(after.kind, pbps_model::StateKind::Failed);
+    let reason = after.reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("unsafe data trigger") && reason.contains("audit"),
+        "a tool-composed refusal names its own trigger, and must survive on \
+         the ledger unredacted: {reason}"
+    );
+    assert!(
+        !reason.contains("its message is not recorded here"),
+        "this is not a driver frame, and must never be run through the \
+         driver-only redaction marker: {reason}"
     );
 }
 

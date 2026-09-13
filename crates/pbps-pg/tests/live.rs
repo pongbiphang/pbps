@@ -200,6 +200,7 @@ async fn a_refused_socket_names_the_address_it_could_not_reach() {
         DbError::BadConnectionString(_)
         | DbError::ConnectTimeout { .. }
         | DbError::Driver { .. }
+        | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a refused socket is not {error:?}"),
     }
@@ -291,6 +292,7 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
         DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::Driver { .. }
+        | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
     }
@@ -330,6 +332,7 @@ async fn a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling() {
         DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::Driver { .. }
+        | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
     }
@@ -582,6 +585,7 @@ async fn a_session_the_connection_string_excludes_is_refused() {
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
             | DbError::Driver { .. }
+            | DbError::Refused(_)
             | DbError::BadRow(_) => panic!("a session mismatch is not {error:?}"),
         }
         // Reached, not unreachable: the message must not read as a network
@@ -2454,6 +2458,7 @@ fn sqlstate(e: &DbError) -> &str {
         other @ (DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
+        | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_)) => panic!("not a refusal from the server: {other:?}"),
     }
@@ -4730,8 +4735,12 @@ async fn an_owner_trigger_permission_failure_does_not_claim_missing_ownership() 
         message.contains("timeline-column migration failed"),
         "{message}"
     );
+    // Before issue #167 this seam rendered the event trigger's own refusal as
+    // the literal `db error`; the server's own sentence is what makes this
+    // distinguishable from the ownership refusal `!message.contains("needs
+    // ownership")` below rules out.
     assert!(
-        message.contains("this role could not add them: db error"),
+        message.contains("this role could not add them: migration denied by event trigger"),
         "{message}"
     );
     assert!(!message.contains("needs ownership"), "{message}");
@@ -4760,7 +4769,13 @@ async fn an_authorized_migration_connection_failure_does_not_claim_missing_right
     );
     assert!(!message.contains("right it reports"), "{message}");
     assert!(!message.contains("needs ownership"), "{message}");
-    assert!(message.contains("db error"), "{message}");
+    // Before issue #167 this seam rendered the killed connection's own error as
+    // the literal `db error`; the server's actual sentence is what a reader
+    // needs to tell this apart from the ownership refusal above it.
+    assert!(
+        message.contains("terminating connection due to administrator command"),
+        "{message}"
+    );
     assert_eq!(error.server_error_code().as_deref(), Some("57P01"));
     db.drop().await;
 }
@@ -5005,6 +5020,7 @@ async fn a_ledger_never_initialized_an_empty_one_and_an_unreachable_database_sta
         other @ (DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
+        | DbError::Refused(_)
         | DbError::WrongSession { .. }
         | DbError::BadRow(_)) => {
             panic!("a database that is not there is refused by the server: {other:?}")
@@ -17068,11 +17084,13 @@ async fn connect_as(role: &str, database: &str) -> Conn {
 
 /// The SQLSTATE of a statement that must fail.
 ///
-/// The **code**, not the text: `tokio_postgres::Error` renders as `db error`
-/// and keeps the server's message in a source the seam deliberately does not
-/// carry (ADR-0014 §1) — so a test that matched on prose would pass on any
-/// failure at all, including the wrong one. A SQLSTATE is the engine's own
-/// identifier for *which* refusal this is.
+/// The **code**, not the text. `pbps_db::DbError`'s message carries the
+/// server's own sentence (issue #167), but matching this helper's callers on
+/// it would pin exact prose — locale-dependent, and free to change between
+/// engine versions — for the one property every caller here actually needs:
+/// *which* refusal this is. A SQLSTATE is the engine's own stable identifier
+/// for that, and a test that matched on prose instead would pass on any
+/// failure at all, including the wrong one.
 async fn refused(conn: &mut Conn, sql: &str) -> String {
     match conn.execute(sql).await {
         Ok(()) => panic!("the engine accepted `{sql}`, and this test needs it not to"),
@@ -20960,6 +20978,7 @@ async fn the_read_back_savepoint_is_read_only_and_gives_the_transaction_back_wri
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_read_back_outside_a_transaction_is_refused_not_answered() {
+    use std::error::Error as _;
     let mut conn = connect().await;
     let e = pbps_pg::catalog::introspect_within_transaction(&mut conn)
         .await
@@ -20972,7 +20991,15 @@ async fn a_read_back_outside_a_transaction_is_refused_not_answered() {
     )
     .await
     .expect_err("refused outside a transaction");
-    assert!(e.to_string().contains("no open transaction"), "{e}");
+    // `RowsError::Read`'s own text names no server value and does not repeat
+    // its source's (issue #167 P1 round 4): the refusal itself is on the
+    // wrapped `DbError`, reached through `source()`, not through `e`'s own
+    // `Display`.
+    let source = e.source().expect("a Read variant carries its DbError");
+    assert!(
+        source.to_string().contains("no open transaction"),
+        "{source}"
+    );
     // And the connection is usable afterwards.
     assert_eq!(number(&mut conn, "SELECT 1").await, 1);
     assert!(
@@ -21533,8 +21560,11 @@ async fn a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger()
         !message.contains("until that is fixed") && !message.contains("asks for today"),
         "the error must not describe doctor as incomplete: {message}"
     );
+    // Before issue #167 this seam rendered the underlying refusal as the
+    // literal `db error`; the server's own sentence is what makes this
+    // distinguishable from any other 42501 this migration could hit.
     assert!(
-        message.contains("this role could not add them: db error")
+        message.contains("this role could not add them: must be owner of table __pbps_state")
             && err.server_error_code().as_deref() == Some("42501"),
         "the original engine error must survive: {message}"
     );

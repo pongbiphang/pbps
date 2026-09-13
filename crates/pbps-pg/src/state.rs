@@ -562,16 +562,13 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
             ))
         })
         .collect::<Result<_, DbError>>()?;
-    Err(DbError::Driver {
-        code: None,
-        message: format!(
-            "{}.\n\
-             A ledger name is occupied by a relation pbps did not create; this call refuses to \
-             use it as the ledger. Rename or drop the existing relation, or point pbps at a \
-             database where {STATE_TABLE} and {LOCK_TABLE} are free.",
-            occupants.join("; ")
-        ),
-    })
+    Err(DbError::Refused(format!(
+        "{}.\n\
+         A ledger name is occupied by a relation pbps did not create; this call refuses to \
+         use it as the ledger. Rename or drop the existing relation, or point pbps at a \
+         database where {STATE_TABLE} and {LOCK_TABLE} are free.",
+        occupants.join("; ")
+    )))
 }
 
 /// The relations, if any, that keep either ledger name from naming an ordinary

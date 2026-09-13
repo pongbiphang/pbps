@@ -3225,6 +3225,10 @@ pub fn cmd_bootstrap(
 /// back. The empty state was established before the lock was taken, so it is
 /// the last trustworthy state to carry forward; the declared identity mapping
 /// has not become an environment mapping until the build succeeds.
+///
+/// `reason` goes through [`crate::engine::ledger_safe_reason`] for the same
+/// reason `failed_apply_snapshot`'s does: bootstrap fails the same way apply
+/// does, through the same `execute_statements` (DECISIONS 455).
 async fn record_failed_bootstrap(
     conn: &mut Conn,
     root: &std::path::Path,
@@ -3240,7 +3244,7 @@ async fn record_failed_bootstrap(
     failed.git_sha = db::git_sha(root);
     failed.reason = Some(crate::engine::truncate_reason(
         conn.driver(),
-        &error.to_string(),
+        &crate::engine::ledger_safe_reason(error),
     ));
     match crate::engine::record(conn, &failed).await {
         Ok(id) => eprintln!("Bootstrap failure recorded as ledger entry #{id}."),
@@ -3914,7 +3918,13 @@ pub fn cmd_apply(
         Err(error) => (error, None),
     };
     if let Some(hook) = &project.config.hooks.on_apply_attempt {
-        let message = error.to_string();
+        // `ledger_safe_reason`, not `error.to_string()`: the hook's own doc
+        // comment calls this payload "stable input" a `pbps.yml` author wires
+        // to an arbitrary shell command, which can relay it anywhere — a
+        // wider and less accountable audience than the operator's own
+        // terminal, and exactly the "emitted outward" case DECISIONS 455
+        // exists for, beside the ledger it names directly.
+        let message = crate::engine::ledger_safe_reason(&error);
         crate::hooks::run_apply_attempt(
             hook,
             plan_path,
@@ -4143,6 +4153,11 @@ async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow
 /// must not relabel that checkpoint with the attempted plan's checksum or git
 /// revision: doing so could let the next `--resume` skip statements from the
 /// wrong artifact. The operator and reason still describe the failed attempt.
+///
+/// `reason` is [`crate::engine::ledger_safe_reason`], not `error.to_string()`:
+/// this row is durable — SPEC's own audit trail — and a driver's own sentence
+/// can name a value nobody declared to this tool (DECISIONS 455). The
+/// operator still sees the whole thing; only what gets written down is cut.
 fn failed_apply_snapshot(
     driver: pbps_db::Driver,
     mut current: StateSnapshot,
@@ -4158,7 +4173,10 @@ fn failed_apply_snapshot(
         current.git_sha = attempted_git_sha;
         current.plan_checksum = Some(attempted_plan_checksum.to_owned());
     }
-    current.reason = Some(crate::engine::truncate_reason(driver, &error.to_string()));
+    current.reason = Some(crate::engine::truncate_reason(
+        driver,
+        &crate::engine::ledger_safe_reason(error),
+    ));
     current
 }
 
@@ -4645,13 +4663,20 @@ async fn apply_staged_under_lock(
             conn.execute(&stmt.sql).await.map_err(anyhow::Error::from)
         };
         if let Err(e) = executed {
-            return Err(anyhow::anyhow!(
-                "the database rejected statement {} of {total}; earlier committed statements were not rolled back:\n{}\n\n{e}\n\n\
+            // `.context()` on the already-built `anyhow::Error`, not
+            // `anyhow::anyhow!("...{e}")`: the latter would bake `e`'s
+            // `Display` — which can carry the driver's own sentence — into an
+            // opaque string with nothing left to downcast. This keeps
+            // whatever `e` already carries (a `DbError::Driver`, most often)
+            // as the source, so `crate::engine::ledger_safe_reason` can find
+            // and redact just that frame later (DECISIONS 455).
+            return Err(e.context(format!(
+                "the database rejected statement {} of {total}; earlier committed statements were not rolled back:\n{}\n\n\
                  The ledger records everything that did complete. Fix the cause, then continue \
                  with `pbps apply --staged --resume`.",
                 i + 1,
                 stmt.sql
-            ));
+            )));
         }
 
         // Applied before the checkpoint is taken: this statement has committed,
@@ -5342,11 +5367,19 @@ async fn execute_statements(
     for stmt in statements {
         crate::engine::check_data_write(conn, stmt, data_guard).await?;
         if let Err(e) = conn.execute(&stmt.sql).await {
-            return Err(anyhow::anyhow!(
-                "the database rejected this statement, and the whole plan was rolled back:\n\
-                 {}\n\n{e}",
+            // `.context()`, not `anyhow::anyhow!("...{e}")`: interpolating the
+            // driver error into the message text would bake its `Display`
+            // into an opaque string with no error left inside to find. Kept
+            // as the source instead, `e` survives in this anyhow::Error's
+            // chain, which is what lets `crate::engine::ledger_safe_reason`
+            // downcast to `DbError::Driver` and redact only that frame later —
+            // the server's sentence still reaches the operator through the
+            // top-level context here plus `{:#}` at the CLI's own top level
+            // (DECISIONS 455).
+            return Err(anyhow::Error::new(e).context(format!(
+                "the database rejected this statement, and the whole plan was rolled back:\n{}",
                 stmt.sql
-            ));
+            )));
         }
     }
     Ok(())
