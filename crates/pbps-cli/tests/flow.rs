@@ -1753,7 +1753,38 @@ fn offline_default_sql_requires_resolution_without_preventing_identity_minting()
     .unwrap();
     let minted = d.run(&["plan"]);
     assert_eq!(code(&minted), 0, "{}", stderr(&minted));
+    let preview = d.dir.join("preview.json");
+    let planned = d.run(&["plan", "--out", preview.to_str().unwrap()]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    for format in ["text", "json"] {
+        let explained = d.run(&[
+            "explain",
+            "--plan",
+            preview.to_str().unwrap(),
+            "--format",
+            format,
+        ]);
+        assert_eq!(code(&explained), 0, "{}", stderr(&explained));
+        if format == "json" {
+            let json: serde_json::Value = serde_json::from_str(&stdout(&explained)).unwrap();
+            assert_eq!(json["data"]["statement_count"], 1);
+            assert_eq!(json["data"]["applyable"], false);
+        }
+    }
     let sql = d.dir.join("plan.sql");
+    let plan: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&preview).unwrap()).unwrap();
+    let apply = d.run(&[
+        "apply",
+        "--plan",
+        preview.to_str().unwrap(),
+        "--db",
+        "not a connection",
+        "--checksum",
+        &plan.checksum(),
+    ]);
+    assert_ne!(code(&apply), 0);
+    assert!(stderr(&apply).contains("preview"), "{}", stderr(&apply));
     let refused = d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]);
     assert_ne!(code(&refused), 0);
     assert!(

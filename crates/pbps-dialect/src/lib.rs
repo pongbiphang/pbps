@@ -1548,6 +1548,16 @@ pub trait Dialect {
         self.emit(&planned.change, planned.strategy)
     }
 
+    /// Counts statements for explanation without promising executable SQL.
+    /// Only preview reporting may use this; execution must use `emit_planned`.
+    fn preview_statement_count(
+        &self,
+        planned: &pbps_model::PlannedChange,
+    ) -> Result<usize, DialectError> {
+        self.emit_planned(planned)
+            .map(|statements| statements.len())
+    }
+
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///
     /// The unit is the plan and not one change, and that is not a convenience.

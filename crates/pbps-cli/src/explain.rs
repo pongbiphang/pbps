@@ -374,7 +374,9 @@ fn explain(
             .into_iter()
             .map(|p| p.description)
             .collect(),
-        statement_count: crate::statements(cs, dialect)?.len(),
+        statement_count: cs.changes.iter().try_fold(0, |count, change| {
+            dialect.preview_statement_count(change).map(|n| count + n)
+        })?,
         target: match target {
             Resolved::None => None,
             Resolved::Reachable(t) => Some(target_state(t)?),

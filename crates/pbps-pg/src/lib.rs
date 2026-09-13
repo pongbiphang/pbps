@@ -916,6 +916,13 @@ impl Dialect for Postgres {
         defaults::emit(self, planned)
     }
 
+    fn preview_statement_count(
+        &self,
+        planned: &pbps_model::PlannedChange,
+    ) -> Result<usize, DialectError> {
+        defaults::preview_statement_count(self, planned)
+    }
+
     /// What this plan implies about the data, asked before its first
     /// statement (SPEC §7.5).
     ///

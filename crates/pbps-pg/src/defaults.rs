@@ -140,11 +140,31 @@ pub(crate) fn emit(
     pg: &crate::Postgres,
     p: &PlannedChange,
 ) -> Result<Vec<Statement>, DialectError> {
+    emit_inner(pg, p, false)
+}
+
+pub(crate) fn preview_statement_count(
+    pg: &crate::Postgres,
+    p: &PlannedChange,
+) -> Result<usize, DialectError> {
+    // Discard the internal rendering: unresolved SQL must never escape this
+    // count-only path, even though its statement shape is already knowable.
+    emit_inner(pg, p, true).map(|statements| statements.len())
+}
+
+fn emit_inner(
+    pg: &crate::Postgres,
+    p: &PlannedChange,
+    count_only: bool,
+) -> Result<Vec<Statement>, DialectError> {
     validate(p)?;
     let mut change = p.change.clone();
     for (at, d) in &p.default_resolutions {
         match (&d.resolution, needs_resolution(&d.column_type, &d.source)?) {
             (DefaultResolution::Unresolved, true) => {
+                if count_only {
+                    continue;
+                }
                 return Err(invalid(format!(
                     "default for {at} needs canonical engine resolution; use plan --db or bootstrap --db"
                 )));
@@ -475,6 +495,39 @@ mod tests {
         ] {
             assert!(input(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn preview_counts_preserve_emission_guards_and_match_resolved_statements() {
+        let pg = crate::Postgres::new();
+        let mut p = add("date", "'01/02/2026'::date");
+        let count = pg.preview_statement_count(&p).unwrap();
+        assert_eq!(count, 1);
+        assert!(pg.emit_planned(&p).is_err());
+        p.default_resolutions
+            .values_mut()
+            .next()
+            .unwrap()
+            .resolution = DefaultResolution::Canonical {
+            rendered: "'2026-01-02'::date".into(),
+        };
+        assert_eq!(
+            pg.preview_statement_count(&p).unwrap(),
+            pg.emit_planned(&p).unwrap().len()
+        );
+        assert_eq!(count, pg.emit_planned(&p).unwrap().len());
+        p.default_resolutions.clear();
+        assert!(pg.preview_statement_count(&p).is_err());
+        let mut invalid = add("integer", "7");
+        invalid
+            .default_resolutions
+            .values_mut()
+            .next()
+            .unwrap()
+            .resolution = DefaultResolution::Canonical {
+            rendered: "7".into(),
+        };
+        assert!(pg.preview_statement_count(&invalid).is_err());
     }
 
     #[test]
