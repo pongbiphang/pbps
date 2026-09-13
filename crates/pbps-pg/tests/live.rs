@@ -8493,6 +8493,93 @@ async fn quoted_routine_bodies_report_calls_but_not_their_string_data() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
+    let mut db = TestDb::create("native_callers228").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let mut declared = Schema::default();
+    for (id, definition) in [
+        (
+            "app.c_before(text, text)",
+            "(a text, b text) RETURNS real LANGUAGE c STRICT AS '$libdir/pg_trgm', 'similarity'",
+        ),
+        (
+            "app.c_after(text, text)",
+            "(a text, b text) RETURNS real AS '$libdir/pg_trgm', 'similarity' LANGUAGE \"c\" STRICT",
+        ),
+        (
+            "app.internal_before(integer, integer)",
+            "(a int, b int) RETURNS int LANGUAGE internal STRICT AS 'int4pl'",
+        ),
+        (
+            "app.internal_after(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE /* name */ 'internal' STRICT",
+        ),
+    ] {
+        let id: pbps_model::ModuleId = id.parse().unwrap();
+        db.conn
+            .execute(&format!("CREATE FUNCTION {}{definition}", id.object_name()))
+            .await
+            .unwrap();
+        declared
+            .modules
+            .insert(id, module(pbps_model::ModuleKind::Function, definition));
+    }
+    for name in ["c_before", "c_after"] {
+        assert_eq!(
+            number(
+                &mut db.conn,
+                &format!("SELECT (app.{name}('abc', 'abc') = 1)::int")
+            )
+            .await,
+            1
+        );
+    }
+    for name in ["internal_before", "internal_after"] {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.{name}(1, 2)")).await,
+            3
+        );
+    }
+    db.conn
+        .execute("CREATE VIEW app.external_dependent AS SELECT app.c_before('abc', 'abc')")
+        .await
+        .unwrap();
+    in_a_transaction(&mut db.conn).await;
+    let dependent = pbps_pg::modules::dependents(
+        &mut db.conn,
+        &"app.c_before(text, text)".parse().unwrap(),
+        pbps_model::ModuleKind::Function,
+    )
+    .await
+    .unwrap();
+    rollback(&mut db.conn).await;
+    db.drop().await;
+    assert!(
+        pbps_pg::modules::unmanaged_refusal(
+            &"app.c_before(text, text)".parse().unwrap(),
+            &dependent,
+            &declared
+        )
+        .is_some()
+    );
+
+    let arriving = ["app.pg_trgm()", "app.int4pl(integer)"].map(|id| id.parse().unwrap());
+    for id in &arriving {
+        assert!(
+            pbps_pg::modules::callers_by_name(&declared, id).is_empty(),
+            "{id}"
+        );
+    }
+    let rebound =
+        pbps_pg::modules::rebound_by_this_plan(&declared, &[], &arriving, &Default::default());
+    assert!(
+        rebound.is_empty(),
+        "native symbols cannot be captured: {rebound:?}"
+    );
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

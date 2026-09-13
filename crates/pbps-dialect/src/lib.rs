@@ -735,6 +735,58 @@ impl Lexicon {
     ///
     /// [`normalize_definition`]: Lexicon::normalize_definition
     pub fn code_only(&self, definition: &str) -> String {
+        // LANGUAGE may follow AS. Inspect the header with every string blanked
+        // first, so body text cannot masquerade as a language clause. Native
+        // routines store library/symbol names in AS, not SQL source to scan.
+        let native = self.dollar_quoted_strings
+            && self.has_native_language(definition, &self.code_only_inner(definition, false));
+        self.code_only_inner(definition, !native)
+    }
+
+    fn has_native_language(&self, definition: &str, header: &str) -> bool {
+        let mut cursor = 0;
+        let mut depth = 0usize;
+        while cursor < header.len() {
+            let rest = &header[cursor..];
+            let ch = rest.chars().next().unwrap();
+            if ch == '"' {
+                cursor += quoted_identifier_len(rest).unwrap_or(rest.len());
+            } else if (self.identifier_continues)(ch) {
+                let len = rest
+                    .find(|c| !(self.identifier_continues)(c))
+                    .unwrap_or(rest.len());
+                cursor += len;
+                if depth == 0 && rest[..len].eq_ignore_ascii_case("language") {
+                    let name = skip_sql_trivia(&definition[cursor..]);
+                    let name = if name.starts_with('\'') {
+                        plain_quoted_contents(name, 0).0
+                    } else if name.starts_with('"') {
+                        quoted_identifier_len(name)
+                            .map(|end| name[1..end - 1].replace("\"\"", "\""))
+                            .unwrap_or_default()
+                    } else {
+                        let end = name
+                            .find(|c| !(self.identifier_continues)(c))
+                            .unwrap_or(name.len());
+                        name[..end].to_ascii_lowercase()
+                    };
+                    if matches!(name.as_str(), "c" | "internal") {
+                        return true;
+                    }
+                }
+            } else {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                cursor += ch.len_utf8();
+            }
+        }
+        false
+    }
+
+    fn code_only_inner(&self, definition: &str, scan_bodies: bool) -> String {
         enum At {
             Code,
             /// Inside `'…'`: a doubled quote is a quote *inside* the
@@ -881,7 +933,8 @@ impl Lexicon {
                         && !continues_identifier(definition, i)
                         && let Some(len) = dollar_tag(&definition[i..])
                     {
-                        let body = paren_depth == 0
+                        let body = scan_bodies
+                            && paren_depth == 0
                             && follows_the_word_as(&out, self.identifier_continues);
                         consumed_to = self.dollar_quoted_string(definition, i, len, body, &mut out);
                         continue;
@@ -897,7 +950,8 @@ impl Lexicon {
                         }
                         ('\'', _) => {
                             let prefix = self.blank_string_prefix(&mut out);
-                            if self.dollar_quoted_strings
+                            if scan_bodies
+                                && self.dollar_quoted_strings
                                 && prefix.is_none()
                                 && paren_depth == 0
                                 && follows_the_word_as(&out, self.identifier_continues)
@@ -1023,24 +1077,7 @@ impl Lexicon {
     /// SQL code. Padding after the decoded body retains the offsets of clauses
     /// following it, without inserting gaps into quoted identifiers inside it.
     fn single_quoted_body(&self, definition: &str, at: usize, out: &mut String) -> usize {
-        let mut inner = String::new();
-        let mut cursor = at + 1;
-        loop {
-            let Some(relative) = definition[cursor..].find('\'') else {
-                inner.push_str(&definition[cursor..]);
-                cursor = definition.len();
-                break;
-            };
-            let quote = cursor + relative;
-            inner.push_str(&definition[cursor..quote]);
-            cursor = quote + 1;
-            if definition[cursor..].starts_with('\'') {
-                inner.push('\'');
-                cursor += 1;
-            } else {
-                break;
-            }
-        }
+        let (inner, cursor) = plain_quoted_contents(definition, at);
         blank(out, '\'');
         out.push_str(&self.code_only(&inner));
         for _ in out.len()..cursor {
@@ -1061,8 +1098,9 @@ impl Lexicon {
     /// (DECISIONS 315). The two are told apart by what precedes the string:
     /// a body follows the word `AS`, and a datum never does — measured, `AS
     /// $x$` where a view's alias would go is a syntax error, so a
-    /// dollar-quoted string after `AS` in a definition the engine accepts can
-    /// only be a body. The body is lexed as code by the same rules: its own
+    /// dollar-quoted string after `AS` is a body unless LANGUAGE identifies
+    /// a native library/symbol (checked before this scan). The body is lexed
+    /// as code by the same rules: its own
     /// literals and comments are blanked, an `E'…'` by the escape rule, and a
     /// dollar-quoted datum inside it by this one. Its tags are blanked too:
     /// a delimiter is not a name, and one that read as code matched a module
@@ -1100,6 +1138,52 @@ impl Lexicon {
             }
         }
         end
+    }
+}
+
+fn plain_quoted_contents(definition: &str, at: usize) -> (String, usize) {
+    let mut inner = String::new();
+    let mut cursor = at + 1;
+    loop {
+        let Some(relative) = definition[cursor..].find('\'') else {
+            inner.push_str(&definition[cursor..]);
+            return (inner, definition.len());
+        };
+        let quote = cursor + relative;
+        inner.push_str(&definition[cursor..quote]);
+        cursor = quote + 1;
+        if definition[cursor..].starts_with('\'') {
+            inner.push('\'');
+            cursor += 1;
+        } else {
+            return (inner, cursor);
+        }
+    }
+}
+
+fn skip_sql_trivia(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(comment) = text.strip_prefix("--") {
+            text = &comment[comment.find(['\r', '\n']).unwrap_or(comment.len())..];
+        } else if let Some(comment) = text.strip_prefix("/*") {
+            let mut depth = 1usize;
+            let mut cursor = 0;
+            while cursor < comment.len() && depth > 0 {
+                if comment[cursor..].starts_with("/*") {
+                    depth += 1;
+                    cursor += 2;
+                } else if comment[cursor..].starts_with("*/") {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += comment[cursor..].chars().next().unwrap().len_utf8();
+                }
+            }
+            text = &comment[cursor..];
+        } else {
+            return text;
+        }
     }
 }
 
@@ -2931,6 +3015,44 @@ mod code_only_tests {
         ] {
             assert!(!PG.code_only(datum).contains("app.datum"), "{datum}");
         }
+    }
+
+    #[test]
+    fn native_language_operands_are_data_on_either_side_of_the_body() {
+        for language in [
+            "c",
+            "internal",
+            "C",
+            "INTERNAL",
+            "\"c\"",
+            "'internal'",
+            "/* outer /* nested */ end */ c",
+            "-- language name\r\ninternal",
+        ] {
+            for body in ["'app.native_symbol'", "$$app.native_symbol$$"] {
+                for definition in [
+                    format!("() RETURNS int LANGUAGE {language} AS {body}"),
+                    format!("() RETURNS int AS {body} LANGUAGE {language}"),
+                ] {
+                    let code = PG.code_only(&definition);
+                    assert!(!code.contains("native_symbol"), "{definition}: {code}");
+                    assert_eq!(code.len(), definition.len());
+                }
+            }
+        }
+        for definition in [
+            "() RETURNS int AS 'SELECT app.f(), ''LANGUAGE internal''' LANGUAGE sql",
+            "() RETURNS int LANGUAGE sql AS $$ SELECT app.f(), 'LANGUAGE c' $$",
+            "(language internal) RETURNS int LANGUAGE sql AS 'SELECT app.f()'",
+            "() RETURNS int LANGUAGE sql AS 'SELECT app.f()' /* LANGUAGE c */",
+            "() RETURNS int LANGUAGE sql AS 'SELECT app.f()' SET \"language\" = 'c'",
+            "() RETURNS int LANGUAGE \"INTERNAL\" AS 'SELECT app.f()'",
+            "() RETURNS int LANGUAGE 'C' AS 'SELECT app.f()'",
+        ] {
+            assert!(PG.code_only(definition).contains("app.f()"), "{definition}");
+        }
+        // An unfinished declaration should still be safe to scan.
+        assert_eq!(PG.code_only("LANGUAGE \""), "LANGUAGE \"");
     }
 
     #[test]
