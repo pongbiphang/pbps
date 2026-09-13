@@ -1945,22 +1945,28 @@ fn refuse_unplanned_movement(
                 // `order_key` order, so the rename's `Present` is the net
                 // promise about the name (DECISIONS 280).
                 //
-                // Only while the earlier read still holds the source, which is
-                // what says it was taken before the rename ran. A staged run's
-                // closing read is compared against the checkpoint the last
-                // statement left: both sides already hold the survivor under
-                // the claimed name and neither holds the source, so there is
-                // nothing to fall back *to* — and falling through anyway
-                // returned `None`, which the rename's `Whole` then excused as
-                // a one-sided column. A concurrent retype between that
-                // checkpoint and the closing read would have been recorded as
-                // this plan's own result, which is exactly what SPEC 7.6
-                // promises to catch. Once both reads have the target, they are
-                // compared directly.
-                let given_up = from.is_some_and(|from| was.columns.contains_key(from))
-                    && dropped_columns
-                        .get(now_name)
-                        .is_some_and(|d| d.contains(column.as_str()));
+                // Only across the rename itself: the earlier read still has
+                // the source and the later one does not. That is the one
+                // arrangement in which the entry under this name really is the
+                // doomed column on one side and the survivor on the other.
+                //
+                // Both halves were a review finding of their own. Without the
+                // first, a staged run's closing read — compared against the
+                // checkpoint the last statement left, where neither side holds
+                // the source — fell through to nothing, and the rename's
+                // `Whole` excused the `None` as a one-sided column, so a
+                // concurrent retype between that checkpoint and the closing
+                // read passed. Without the second, a checkpoint spanning the
+                // *drop* alone did the same when another session put the name
+                // back before the read: the source is still there, the rename
+                // has not run, and what stands under the claimed name is a
+                // replacement rather than the survivor. Either way SPEC 7.6
+                // promises to catch it, so neither read may take this branch.
+                let given_up = from.is_some_and(|from| {
+                    was.columns.contains_key(from) && !now.columns.contains_key(from)
+                }) && dropped_columns
+                    .get(now_name)
+                    .is_some_and(|d| d.contains(column.as_str()));
                 let was_c = was.columns.get(column).filter(|_| !given_up).or_else(|| {
                     let from = from?;
                     if now.columns.contains_key(from) {
@@ -6696,6 +6702,30 @@ mod tests {
             Settled::Whole,
         )
         .expect_err("once both reads hold the survivor, they are compared directly");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
+
+        // A checkpoint spanning the drop alone, with another session putting
+        // the name back before the read: the source is still there, so the
+        // rename has not run and what stands under the claimed name is not the
+        // survivor. Falling through there compared the baseline's doomed
+        // column with nothing at all and let the replacement past.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &table(&[
+                ("code", "varchar(20)"),
+                ("label", "nvarchar(50)"),
+                ("note", "int"),
+            ]),
+            &table(&[
+                ("code", "varchar(20)"),
+                ("label", "nvarchar(50)"),
+                ("note", "bigint"),
+            ]),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("a name put back before the rename claims it is not the survivor");
         assert!(format!("{e:#}").contains("`note`"), "{e:#}");
     }
 
