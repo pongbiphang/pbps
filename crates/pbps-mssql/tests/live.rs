@@ -10962,7 +10962,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     let plan = |changes: Vec<Change>| ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
-    conn.execute("CREATE TABLE dbo.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON dbo.indexed(id); CREATE TABLE dbo.index_child (id integer CONSTRAINT index_fk REFERENCES dbo.indexed(id)); CREATE UNIQUE INDEX other_standalone ON dbo.indexed(id); CREATE INDEX ordinary_index ON dbo.indexed(id);").await.unwrap();
+    conn.execute("CREATE TABLE dbo.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON dbo.indexed(id); CREATE TABLE dbo.index_child (id integer CONSTRAINT index_fk REFERENCES dbo.indexed(id)); CREATE UNIQUE INDEX other_standalone ON dbo.indexed(id); CREATE INDEX ordinary_index ON dbo.indexed(id); CREATE UNIQUE INDEX filtered_index ON dbo.indexed(id) WHERE id > 0;").await.unwrap();
     let drop_index = |name: &str| Change::DropIndex {
         table: TableName::new("dbo", "indexed"),
         name: name.into(),
@@ -10971,6 +10971,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         ("standalone_key", true),
         ("other_standalone", false),
         ("ordinary_index", false),
+        ("filtered_index", false),
     ] {
         let reports =
             pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
@@ -11072,7 +11073,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
             .is_err(),
         "an absent existing key is not a successful dependency read"
     );
-    conn.execute("CREATE USER key_guard177_reader WITHOUT LOGIN; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.parent TO key_guard177_reader; GRANT VIEW DEFINITION ON OBJECT::dbo.indexed TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
+    conn.execute("CREATE USER key_guard177_reader WITHOUT LOGIN; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.parent TO key_guard177_reader; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.indexed TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
     assert!(
         pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("ordinary_index")]))
             .await
@@ -11080,6 +11081,17 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
             .is_empty(),
         "an ordinary index drop does not need database metadata grants"
     );
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("filtered_index")]))
+            .await
+            .expect(
+                "a filtered unique index cannot back an FK and needs no database metadata grant"
+            )
+            .is_empty()
+    );
+    conn.execute("DROP INDEX filtered_index ON dbo.indexed; CREATE UNIQUE INDEX filtered_index ON dbo.indexed(id) WHERE id > 0;")
+        .await
+        .expect("the deployment account can replace the filtered index with parent-only grants");
     assert!(
         pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("standalone_key")]))
             .await

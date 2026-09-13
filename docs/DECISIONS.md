@@ -11180,8 +11180,13 @@ SPEC is in sync with all of these.
      while respecting owner overrides. The check refuses insufficient visibility
      instead of treating that zero as proof of absence. This requirement is asked only
      for an existing unique key drop. SQL Server first reads the index kind
-     with the parent's metadata rights; an ordinary nonunique index drop does
-     not acquire a database-level permission prerequisite.
+     with the parent's metadata rights; an ordinary nonunique or filtered
+     unique index drop does not acquire a database-level permission
+     prerequisite. Measured on both engines: a filtered/partial unique index
+     cannot back an FK, so the pure differ excludes it from managed-FK
+     recreation too. The SQL Server regression replaces a filtered index
+     with only parent-level grants, while an unfiltered unique index still
+     requires complete dependency visibility.
 
      Live CLI tests on both engines cover primary and unique key replacement,
      the explicit four-change saved plan, orphan refusal after recreation,

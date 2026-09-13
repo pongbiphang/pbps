@@ -131,7 +131,7 @@ pub async fn key_drop_blockers(
         let qualified = qualified(&table)?;
         let rows = conn
             .query_with(
-                "SELECT i.object_id AS parent, i.index_id AS idx, i.name, i.is_unique
+                "SELECT i.object_id AS parent, i.index_id AS idx, i.name, i.is_unique, i.has_filter
              FROM sys.indexes i LEFT JOIN sys.key_constraints kc
                ON kc.parent_object_id=i.object_id AND kc.unique_index_id=i.index_id
              WHERE i.object_id=OBJECT_ID(@P1, N'U')
@@ -146,9 +146,10 @@ pub async fn key_drop_blockers(
             ))
             .into());
         };
-        // A nonunique index cannot back a foreign key. Resolve its kind with
-        // the parent's metadata rights before asking for broader visibility.
-        if !get::<bool>(row, "is_unique")? {
+        // Neither a nonunique nor a filtered index can back a foreign key.
+        // Resolve that with the parent's metadata rights before asking for
+        // broader visibility (decision 459).
+        if !get::<bool>(row, "is_unique")? || get::<bool>(row, "has_filter")? {
             continue;
         }
         keys.push(Key {

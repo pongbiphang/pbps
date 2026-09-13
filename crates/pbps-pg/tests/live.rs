@@ -22035,7 +22035,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     let plan = |changes: Vec<Change>| ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
-    conn.execute("CREATE TABLE key_guard177.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON key_guard177.indexed(id); CREATE TABLE key_guard177.index_child (id integer CONSTRAINT index_fk REFERENCES key_guard177.indexed(id)); CREATE UNIQUE INDEX other_standalone ON key_guard177.indexed(id); CREATE INDEX ordinary_index ON key_guard177.indexed(id);").await.unwrap();
+    conn.execute("CREATE TABLE key_guard177.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON key_guard177.indexed(id); CREATE TABLE key_guard177.index_child (id integer CONSTRAINT index_fk REFERENCES key_guard177.indexed(id)); CREATE UNIQUE INDEX other_standalone ON key_guard177.indexed(id); CREATE INDEX ordinary_index ON key_guard177.indexed(id); CREATE UNIQUE INDEX filtered_index ON key_guard177.indexed(id) WHERE id > 0;").await.unwrap();
     let drop_index = |name: &str| Change::DropIndex {
         table: TableName::new("key_guard177", "indexed"),
         name: name.into(),
@@ -22044,6 +22044,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         ("standalone_key", true),
         ("other_standalone", false),
         ("ordinary_index", false),
+        ("filtered_index", false),
     ] {
         let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
             .await

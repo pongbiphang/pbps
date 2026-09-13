@@ -1017,7 +1017,7 @@ fn recreate_referenced_foreign_keys(
                 let Some(index) = aligned
                     .get(table)
                     .and_then(|t| t.indexes.get(name))
-                    .filter(|i| i.unique)
+                    .filter(|i| i.unique && i.filter.is_none())
                 else {
                     continue;
                 };
@@ -4440,6 +4440,43 @@ mod tests {
                     .iter()
                     .any(|p| matches!(p.change, Change::AddForeignKey { .. }))
             );
+        }
+    }
+
+    #[test]
+    fn replacing_indexes_that_cannot_back_foreign_keys_keeps_the_foreign_keys() {
+        for (unique, filter) in [(false, None), (true, Some("id > 0"))] {
+            let mut parent = sku_table();
+            parent.primary_key = Some(PrimaryKey {
+                name: Some("parent_pk".into()),
+                columns: vec!["id".into()],
+            });
+            parent.indexes.insert(
+                "old_index".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "id".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique,
+                    filter: filter.map(str::to_owned),
+                },
+            );
+            let mut child = sku_table();
+            child
+                .foreign_keys
+                .insert("child_fk".into(), fk(&["id"], "dbo.parent", &["id"]));
+            let base = two_tables(("dbo.parent", parent), ("dbo.child", child));
+            let mut declared = base.clone();
+            let parent = declared
+                .tables
+                .get_mut(&"dbo.parent".parse().unwrap())
+                .unwrap();
+            let index = parent.indexes.remove("old_index").unwrap();
+            parent.indexes.insert("new_index".into(), index);
+            let cs = run(&base, &declared, &[]);
+            assert_eq!(kinds(&cs), vec!["DropIndex", "AddIndex"], "{cs:?}");
         }
     }
 
