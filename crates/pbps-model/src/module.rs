@@ -97,6 +97,17 @@ impl RoutineArg {
     }
 }
 
+/// Whether a character can continue an unquoted name, which is what a `$` has
+/// to follow to be one byte of a type name rather than the start of a token.
+///
+/// The engine's `ident_cont` as this whitelist can see it: what `FromStr`
+/// already admits outside quotes, minus the punctuation that separates one
+/// name from the next. `.` is not here — a name does not resume after a
+/// qualifying dot with a `$`, because `a.$b` names nothing (measured).
+fn continues_a_name(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii()
+}
+
 /// What a routine argument's text may not be.
 ///
 /// Every rule here is about the *shape* the identity string needs, and none is
@@ -168,11 +179,23 @@ impl FromStr for RoutineArg {
                 '[' => brackets += 1,
                 ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
                 ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
-                ',' | '"' | '.' | '_' | '$' => {}
+                ',' | '"' | '.' | '_' => {}
+                // `$` continues a name and cannot begin one, which is the
+                // engine's own rule and the one position where this whitelist
+                // would stop making the statement safe. **Measured**:
+                // `dl.money$type` and `dl.a$$b` are types, identified as
+                // `dl."money$type"` and `dl."a$$b"` — the doubled `$` inside a
+                // word is two bytes of the name, because the identifier is the
+                // longer match. Opening a token with one is not a name at all:
+                // `CREATE DOMAIN dl.$x` is `syntax error at or near "$"`, and
+                // `DROP FUNCTION dl.f($$)` is `unterminated dollar-quoted
+                // string at or near "$$); …"` — the rest of the statement
+                // swallowed, which is what this whitelist exists to make
+                // impossible by construction.
+                '$' if !pending_space && out.chars().next_back().is_some_and(continues_a_name) => {}
                 // Any non-ASCII byte is a name byte, which is the engine's own
                 // rule (`continues_ident`): a letter, a symbol, a space that is
-                // not the ASCII one. So is `$`, above — measured, `dl.money$type`
-                // is a type the engine identifies as `dl."money$type"`.
+                // not the ASCII one.
                 c if c.is_alphanumeric() || !c.is_ascii() => {}
                 // Everything else. A type name is written with letters,
                 // digits, `_`, `.`, and the punctuation above; a semicolon, an
@@ -2497,6 +2520,12 @@ mod tests {
             ("TIMESTAMP  WITH   TIME ZONE", "timestamp with time zone"),
             ("Character Varying ( 10 )", "character varying(10)"),
             ("ID.Pos", "id.pos"),
+            // A `$` inside a word is a byte of the name, folded like the rest
+            // of it: measured, `dl.money$type` is a type the engine identifies
+            // as `dl."money$type"`, and `dl.a$$b` likewise — the doubled `$`
+            // is the longer identifier match, not a dollar quote opening.
+            ("MQ.money$amount", "mq.money$amount"),
+            ("DL.a$$b", "dl.a$$b"),
             // The engine accepts a space around a qualified type's dot and
             // never writes one back, so the two spellings have to be one key.
             ("md . my_type", "md.my_type"),
@@ -2586,6 +2615,19 @@ mod tests {
             "integer'",
             "integer -- note",
             "integer/*note*/",
+            // A token that *opens* with `$`. Measured, none of these names a
+            // type — `CREATE DOMAIN dl.$x` is a syntax error — and the first
+            // is the reason the rule is about position rather than about the
+            // character: interpolated into `DROP FUNCTION dl.f($$)` it is an
+            // `unterminated dollar-quoted string` that swallows the rest of
+            // the statement.
+            "$$",
+            "$a",
+            "a($b)",
+            "$",
+            "a.$b",
+            "a $b",
+            "\"a\"$b",
         ] {
             assert!(
                 bad.parse::<RoutineArg>().is_err(),
@@ -2594,14 +2636,17 @@ mod tests {
         }
         // And a comma that is *inside* something is not a separator.
         assert!("numeric(10,2)".parse::<RoutineArg>().is_ok());
-        // A `$` is a name byte: measured, `dl.money$type` is a type.
-        assert_eq!(
-            "dl.money$type"
-                .parse::<RoutineArg>()
-                .expect("one argument")
-                .as_str(),
-            "dl.money$type"
-        );
+        // A `$` is a name byte where a name may continue: measured,
+        // `dl.money$type` and `dl.a$$b` are types, identified as
+        // `dl."money$type"` and `dl."a$$b"`.
+        for good in ["dl.money$type", "dl.a$$b", "a$", "_$x", "r8.a\u{a0}$b"] {
+            assert_eq!(
+                good.parse::<RoutineArg>()
+                    .unwrap_or_else(|e| panic!("{good}: {e}"))
+                    .as_str(),
+                good
+            );
+        }
     }
 
     /// The identity string carries them the same way, which is what makes the

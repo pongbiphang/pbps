@@ -6468,6 +6468,26 @@ SPEC is in sync with all of these.
     with the identity `dl.h(dl."money$type")`, and the argument was refused
     before it reached the engine.
 
+    **Amended again: `$` is a continuation and never a first character**
+    (issue #204). The character was admitted at any position, which gave back
+    the property the whitelist exists for. The whitelist is not about which
+    types exist — it is what makes the identity safe to interpolate verbatim
+    into `DROP FUNCTION` and `GRANT` by construction rather than by review,
+    and a leading `$` is the one position where the interpolated text stops
+    being a name. Measured on 18.6:
+
+    ```text
+    CREATE DOMAIN dq.a$$b AS numeric …   ->  dq.f(dq."a$$b")
+    CREATE DOMAIN dq.$x   AS numeric     ->  syntax error at or near "$"
+    DROP FUNCTION dq.f($$)               ->  unterminated dollar-quoted string
+                                             at or near "$$); SELECT 1;"
+    ```
+
+    Inside a word the `$` is a byte of the name — the identifier is the longer
+    match, so `a$$b` is one name and not a quote opening — and that spelling
+    stays accepted. A token that *opens* with one names no type in any case, so
+    refusing it costs nothing and takes the swallowed statement with it.
+
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
     edges to it:
