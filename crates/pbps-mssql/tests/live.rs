@@ -12305,10 +12305,13 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
     };
     // The three declarations of the history: the deployed one, the revision
     // nobody deployed, and the one this plan is for.
+    // The two columns differ on purpose: identical ones would let the closing
+    // apply guard's own half of this pass for the wrong reason, with nothing
+    // for its comparison to disagree about (DECISIONS 472).
     let base = schema_of(table(&[
         ("code", "varchar(20)"),
         ("label", "nvarchar(50)"),
-        ("note", "nvarchar(50)"),
+        ("note", "int"),
     ]));
     let intermediate = schema_of(table(&[("code", "varchar(20)"), ("label", "nvarchar(50)")]));
     let declared = schema_of(table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]));

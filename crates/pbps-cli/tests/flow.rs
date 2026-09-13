@@ -6602,6 +6602,101 @@ fn a_rename_and_a_column_drop_in_one_revision_apply_together() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// Two revisions deployed at once, where the second reuses the name the first
+/// gave up: `note` dropped, then `label` renamed into `note` (issue #398).
+///
+/// Two things only this can witness, and both of them broke. The engine
+/// refused `sp_rename` while the doomed column still held the name
+/// (`Msg 15335`), because `order_key` ran the rename first; and once the
+/// ordering was fixed, the closing `refuse_unplanned_movement` compared the
+/// dropped `note` with the renamed one and reported a type it could not
+/// excuse — a valid plan refused at its own checkpoint, after the engine had
+/// already performed it.
+///
+/// The two columns are given **different types** on purpose. Identical ones
+/// make the second half pass for the wrong reason: there is nothing for the
+/// comparison to disagree about.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "reusedname398");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("reusedname398-live");
+    let declare = |columns: &str| {
+        std::fs::write(
+            d.dir.join("schema/dbo.s.yml"),
+            format!(
+                "table: dbo.s\ncolumns:\n  code: {{type: varchar(20), nullable: false}}\n{columns}\
+                 primary_key: {{name: pk_s, columns: [code]}}\n"
+            ),
+        )
+        .unwrap();
+    };
+
+    // v1, and the only revision this database ever gets deployed.
+    declare("  label: {type: nvarchar(50)}\n  note: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // v2: `note` goes. Committed, never deployed.
+    declare("  label: {type: nvarchar(50)}\n");
+    let o = d.run(&["drop", "dbo.s.note", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // v3: `label` takes the name `note` just vacated.
+    declare("  note: {type: nvarchar(50)}\n");
+    let o = d.run(&["rename", "dbo.s.label", "note"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The database is still at v1, so this one plan carries both revisions.
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    let drop_at = out
+        .find("drop column note")
+        .unwrap_or_else(|| panic!("{out}"));
+    let rename_at = out
+        .find("rename column label -> note")
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(drop_at < rename_at, "the drop frees the name first: {out}");
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the drop and the rename must apply together: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The database really is in the declared shape, not merely un-errored.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
 /// One revision that renames a table **and** one of its columns, applied.
 ///
 /// The engine is the honest witness for the same reason as the case above:

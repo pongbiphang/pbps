@@ -11894,6 +11894,24 @@ SPEC is in sync with all of these.
      `resolve` refuses it as an occupied target, which is what keeps the
      reorder from reading as an implicit drop.
 
+     **And the closing guard has to know the name belongs to two columns.**
+     Found in review, and it is the other half of the same fact: with the
+     ordering fixed the engine performs the plan, and then
+     `refuse_unplanned_movement` refused it. That comparison is keyed by name;
+     the baseline holds both spellings, so the rename rewind is skipped (the
+     ambiguity rule of 189), and the entry the baseline has under `note` is the
+     doomed column while the entry the read-back has is the survivor. Comparing
+     them reads the rename as a retype of a column nobody touched — invisible
+     while the two happen to share a definition, and `note int` against `label
+     nvarchar(50)` is a difference `ColumnField::Whole` does not excuse. A
+     valid plan, refused at its own checkpoint after the engine had already
+     performed it. The `was` side now falls through to the rename's source
+     whenever this plan drops the occupant of the name, which is the branch
+     that already existed for the ordinary rename. The doomed column is not
+     left uncompared: its absence is what `columns_after` holds the plan to,
+     and in `order_key` order the rename's `Present` is the net promise about
+     the name (280) — which is the ordering above, once more, doing the work.
+
      **The sweep this closes, and the one it does not.** Every other pair
      where one change gives up a name another claims already ran in the right
      order: a column drop before an add (5 before 8), an index or constraint
