@@ -6739,3 +6739,155 @@ fn identity_increments_at_the_sequence_span_produce_two_values() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn failed_concurrent_index_builds_are_cleaned_recorded_and_retried_without_resume() {
+    let own = OwnDatabase::new(&server(), "concurrent_index_recovery");
+    let connection = own.connection();
+    let mut base = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n".to_owned();
+    let mut keys = vec!["id".to_owned()];
+    // The emitted SQL exceeds the ledger reason limit. Recovery still has to
+    // be recorded, rather than truncated behind the statement's column list.
+    for n in 0..24 {
+        let name = format!("column_{n:02}_{}", "x".repeat(48));
+        base.push_str(&format!(
+            "  {name}: {{type: integer, nullable: false, default: '1'}}\n"
+        ));
+        keys.push(name);
+    }
+    let d = bootstrapped_demo(connection, "concurrent-index-recovery", &base);
+    on_server(connection, "INSERT INTO app.t(id) VALUES (1)");
+    d.table(&format!(
+        "{base}strategy: {{online: true}}\nindexes:\n  ix_recovery: {{columns: [{}], unique: true}}\n", keys.join(", ")
+    ));
+    let plan = connected_artifact(&d, connection, true);
+    // Introduce the duplicate only after the preflight has passed. This
+    // controlled DDL trigger pins the engine failure without a timing race.
+    on_server(
+        connection,
+        r#"
+CREATE SCHEMA witness;
+CREATE FUNCTION witness.duplicate_at_index_build() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_query() LIKE '%ix_recovery%' THEN
+    INSERT INTO app.t(id) VALUES (1);
+  END IF;
+END $$;
+CREATE EVENT TRIGGER duplicate_at_index_build ON ddl_command_start
+  WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION witness.duplicate_at_index_build();
+"#,
+    );
+    for _ in 0..2 {
+        let failed = approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--staged", "--allow", "constraint"],
+        );
+        assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+        assert!(
+            stderr(&failed).contains("could not create unique index"),
+            "{}",
+            stderr(&failed)
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE oid=to_regclass('app.ix_recovery')"
+            ),
+            0,
+            "the failed build must not leave its invalid index behind"
+        );
+        let recorded = latest_snapshot(connection);
+        assert_eq!(recorded.kind, pbps_model::StateKind::Failed);
+        assert!(recorded.staged.is_none());
+        let reason = recorded.reason.as_deref().unwrap();
+        assert!(
+            reason.contains("ix_recovery") && reason.contains("removed invalid index"),
+            "{reason}"
+        );
+        assert!(reason.contains("23505"), "{reason}");
+        assert!(
+            stderr(&failed).contains("no staged checkpoint"),
+            "{}",
+            stderr(&failed)
+        );
+        let resume = approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--staged", "--resume", "--allow", "constraint"],
+        );
+        assert_eq!(code(&resume), 1);
+        assert!(
+            stderr(&resume).contains("no staged apply in progress"),
+            "{}",
+            stderr(&resume)
+        );
+        on_server(
+            connection,
+            "TRUNCATE app.t; INSERT INTO app.t(id) VALUES (1)",
+        );
+    }
+    on_server(
+        connection,
+        r#"
+CREATE FUNCTION witness.deny_recovery() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'cleanup-sensitive-value' USING ERRCODE='P0001'; END $$;
+CREATE EVENT TRIGGER deny_recovery ON ddl_command_start WHEN TAG IN ('DROP INDEX')
+  EXECUTE FUNCTION witness.deny_recovery();
+"#,
+    );
+    let failed = approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    );
+    assert_eq!(code(&failed), 1);
+    assert!(
+        stderr(&failed).contains("could not create unique index"),
+        "{}",
+        stderr(&failed)
+    );
+    let reason = latest_snapshot(connection).reason.unwrap();
+    assert!(
+        reason.contains("Recovery of index") && reason.contains("artifact may remain"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("23505") && !reason.contains("cleanup-sensitive-value"),
+        "{reason}"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_index WHERE indexrelid='app.ix_recovery'::regclass AND NOT indisvalid"
+        ),
+        1
+    );
+    on_server(
+        connection,
+        "DROP EVENT TRIGGER deny_recovery; DROP EVENT TRIGGER duplicate_at_index_build",
+    );
+    on_server(connection, "DROP INDEX CONCURRENTLY app.ix_recovery");
+    on_server(
+        connection,
+        "TRUNCATE app.t; INSERT INTO app.t(id) VALUES (1)",
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_index WHERE indexrelid='app.ix_recovery'::regclass AND indisvalid"
+        ),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}

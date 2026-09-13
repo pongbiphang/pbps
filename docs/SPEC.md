@@ -744,6 +744,14 @@ clean. Two supporting rules:
   **before** anything has run, filling in the information an offline plan cannot
   see.
 
+A failed staged concurrent index build can leave an invalid index even though
+its statement failed. The executor removes that artifact only when its name
+was absent before the build and it is still an invalid index on the original
+table. The failed-attempt record names the cleanup outcome; failed inspection
+or cleanup requires operator inspection before retrying. A first-statement
+failure with no checkpoint starts again without `--resume` (DECISIONS 463).
+This recovery follows the single-deployer assumption in 7.6.
+
 Replacing a primary/unique constraint or standalone unique index includes
 explicit drops and recreations of its affected managed foreign keys in the typed plan, with ordinary ordering
 and risk classification. Matching is conservative when equivalent keys share

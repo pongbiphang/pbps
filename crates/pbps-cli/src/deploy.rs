@@ -4685,7 +4685,9 @@ async fn apply_staged_under_lock(
             .await;
             finish_transaction(conn, dialect, result).await
         } else {
-            conn.execute(&stmt.sql).await.map_err(anyhow::Error::from)
+            crate::engine::execute_staged_statement(conn, stmt)
+                .await
+                .map_err(anyhow::Error::from)
         };
         if let Err(e) = executed {
             // `.context()` on the already-built `anyhow::Error`, not
@@ -4695,10 +4697,16 @@ async fn apply_staged_under_lock(
             // whatever `e` already carries (a `DbError::Driver`, most often)
             // as the source, so `crate::engine::ledger_safe_reason` can find
             // and redact just that frame later (DECISIONS 455).
+            let recovery = if !stmt.transactional && i == 0 && entry.snapshot.staged.is_none() {
+                "There is no staged checkpoint: the first non-transactional statement failed. \
+                 Fix the cause, then start this plan again with `pbps apply --staged` without `--resume`."
+            } else {
+                "The ledger records everything that did complete. Fix the cause, then continue \
+                 with `pbps apply --staged --resume`."
+            };
             return Err(e.context(format!(
                 "the database rejected statement {} of {total}; earlier committed statements were not rolled back:\n{}\n\n\
-                 The ledger records everything that did complete. Fix the cause, then continue \
-                 with `pbps apply --staged --resume`.",
+                 {recovery}",
                 i + 1,
                 stmt.sql
             )));

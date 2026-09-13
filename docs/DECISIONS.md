@@ -11276,3 +11276,48 @@ SPEC is in sync with all of these.
      CLI tests pin refusal before connecting and bootstrap the six exact-span
      boundaries, insert two generated rows and verify convergence. Reverting
      the span check makes the new refusal regressions fail.
+
+463. **A failed concurrent index build recovers its own invalid artifact (issue #186).**
+     Measured on PostgreSQL 18.6, a duplicate-key failure during `CREATE UNIQUE
+     INDEX CONCURRENTLY` leaves an index with `indisvalid = false`. Dropping it
+     concurrently lets the next attempt reach the duplicate-key failure again,
+     instead of colliding with the old index name. A failed statement therefore
+     does not mean that this non-transactional operation left nothing behind.
+
+     The emitter attaches the table and index identity to the concurrent build's
+     `Statement`, beside its transaction and batch markers. This is derived
+     execution metadata, not SQL parsing, a model field or a saved-plan change.
+     PostgreSQL's connected staged executor captures the table OID and whether
+     the index name already exists before executing. On failure it removes only
+     a newly present invalid index on that same table, using the emitter's
+     quoted `DROP INDEX CONCURRENTLY`. Pre-existing names, valid indexes and
+     objects on a different table are preserved. This retains SPEC 7.6's
+     single-deployer assumption; it does not lock out concurrent external DDL
+     that replaces an object during the recovery window.
+
+     Recovery finishes before the CLI writes its existing failed-attempt audit.
+     Its outcome names the artifact and wraps the original driver error, so
+     ledger redaction retains the SQLSTATE and our own cleanup account while
+     excluding driver text (455/456). If inspection or cleanup fails, the error
+     says the artifact may remain and requires inspection before retrying;
+     cleanup never replaces the original failure or claims success. The
+     ledger's existing source-first ordering preserves this outcome even when
+     the emitted SQL exceeds the reason column's width.
+
+     A failure of the first non-transactional statement leaves no checkpoint.
+     Its message directs a corrected fresh staged attempt, without `--resume`;
+     existing resume validation still refuses that failed ordinary state.
+     Checkpointed failures retain their resume path. Transactional statements
+     and SQL Server's staged execution retain their existing behavior.
+
+     The live CLI regression injects duplicate rows at DDL start, after the
+     preflight, without a scheduling race. It verifies repeated failure and
+     cleanup, the failed ledger row, no-checkpoint resume refusal, cleanup
+     denial without losing the original SQLSTATE or recording driver text,
+     and eventual successful application. A long composite index pins durable
+     outcome ordering. Engine cases preserve pre-existing valid and invalid
+     indexes, another table's index and a same-named table, exercise hostile
+     quoted names, and retain successful builds and transactional controls.
+     Reverting the recovery dispatch, no-checkpoint guidance and pre-existing
+     object guard independently makes the respective live regression fail;
+     restoring them passes both suites.

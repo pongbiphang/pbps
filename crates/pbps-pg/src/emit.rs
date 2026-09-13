@@ -57,6 +57,15 @@ use crate::{Postgres, quote, types};
 
 type Sql = Result<Vec<Statement>, DialectError>;
 
+/// Compensation for the artifact left by this statement's failed build.
+pub(crate) fn drop_failed_index(build: &pbps_dialect::IndexBuild) -> Result<String, DialectError> {
+    Ok(format!(
+        "DROP INDEX CONCURRENTLY {}.{};",
+        quote(&build.table.schema)?,
+        quote(&build.name)?
+    ))
+}
+
 fn invalid(message: String) -> DialectError {
     DialectError::Invalid {
         dialect: DIALECT,
@@ -2274,7 +2283,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 // than in the runner is what lets a plan carrying one be
                 // refused at plan time, with the whole plan intact, instead of
                 // halfway through an apply.
-                Ok(vec![Statement::new(sql).own_batch().non_transactional()])
+                Ok(vec![
+                    Statement::new(sql)
+                        .own_batch()
+                        .non_transactional()
+                        .building_index(table.clone(), name),
+                ])
             } else {
                 Ok(vec![on(pg, table, &sql)?])
             }
