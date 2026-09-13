@@ -263,6 +263,122 @@ fn bootstrapped_demo(connection: &str, slug: &str, table: &str) -> Demo {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn canonical_defaults_survive_bootstrap_saved_apply_and_the_next_plan() {
+    let own = OwnDatabase::new(&server(), "canonical_defaults");
+    let connection = own.connection();
+    on_server(
+        &server(),
+        &format!("ALTER DATABASE \"{}\" SET DateStyle = 'ISO, DMY'", own.name),
+    );
+    let source = "table: app.t\ncolumns:\n  d: {type: date, default: \"'01/02/2026'::date\"}\n  n: {type: integer, default: '7'}\n";
+    let d = bootstrapped_demo(connection, "canonical_defaults", source);
+    on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE d = DATE '2026-01-02' AND n = 7"
+        ),
+        1
+    );
+    let snapshot = latest_snapshot(connection);
+    assert_eq!(
+        snapshot.declared.expressions.defaults[&"app.t".parse().unwrap()]["d"],
+        "'01/02/2026'::date"
+    );
+    d.table(&source.replace("01/02/2026", "03/04/2026"));
+    let path = connected_artifact(&d, connection, false);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let plan: pbps_model::SavedPlan = serde_json::from_str(&raw).unwrap();
+    assert!(raw.contains("'2026-03-04'::date"), "{raw}");
+    let changed: pbps_model::SavedPlan =
+        serde_json::from_str(&raw.replace("'2026-03-04'::date", "'2026-04-03'::date")).unwrap();
+    assert_ne!(plan.checksum(), changed.checksum());
+    succeeds(approved_apply(&d, connection, &path, &[]));
+    on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE d = DATE '2026-03-04'"
+        ),
+        1
+    );
+    assert_eq!(
+        latest_snapshot(connection).declared.expressions.defaults[&"app.t".parse().unwrap()]["d"],
+        "'03/04/2026'::date"
+    );
+    let next = connected_artifact(&d, connection, false);
+    let next: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(next).unwrap()).unwrap();
+    assert!(next.changes.is_empty(), "{:?}", next.changes);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn exported_bootstrap_holds_omitted_defaults_under_hostile_datestyle() {
+    let own = OwnDatabase::new(&server(), "exported_defaults");
+    let replay = OwnDatabase::new(&server(), "replayed_defaults");
+    on_server(own.connection(), "CREATE SCHEMA app");
+    on_server(replay.connection(), "CREATE SCHEMA app");
+    let d = Demo::new("exported_defaults");
+    d.table("table: app.t\ncolumns:\n  code: {type: text, nullable: false}\n  d: {type: date, default: \"'01/02/2026'::date\"}\n  n: {type: integer, default: '7'}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    omitted: {}\n    explicit: {d: '2026-03-04', n: 9}\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let path = d.dir.join("bootstrap.sql");
+    succeeds(d.run(&[
+        "bootstrap",
+        "--db",
+        own.connection(),
+        "--sql",
+        path.to_str().unwrap(),
+    ]));
+    let sql = std::fs::read_to_string(path).unwrap();
+    on_server(
+        replay.connection(),
+        &format!("SET DateStyle = 'ISO, DMY';\n{sql}"),
+    );
+    assert_eq!(
+        scalar(
+            replay.connection(),
+            "SELECT count(*) FROM app.t WHERE (code = 'omitted' AND d = DATE '2026-01-02' AND n = 7) OR (code = 'explicit' AND d = DATE '2026-03-04' AND n = 9)"
+        ),
+        2
+    );
+    assert_eq!(
+        latest_snapshot(own.connection())
+            .declared
+            .expressions
+            .defaults[&"app.t".parse().unwrap()]["d"],
+        "'01/02/2026'::date"
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn retained_null_default_is_not_erased_by_connected_resolution() {
+    let own = OwnDatabase::new(&server(), "retained_null_default");
+    let connection = own.connection();
+    let source = "table: app.t\ncolumns:\n  d: {type: timestamptz, default: 'NULL::timestamp(3) with time zone'}\n";
+    let d = bootstrapped_demo(connection, "retained-null-default", source);
+    let count = "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.t'::regclass";
+    assert_eq!(scalar(connection, count), 1);
+    succeeds(d.run(&["verify", "--db", connection]));
+    d.table(&source.replace("timestamp(3)", "timestamp(2)"));
+    let path = connected_artifact(&d, connection, false);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("NULL::timestamp(2) with time zone"), "{raw}");
+    assert!(!raw.contains("\"canonical\""), "{raw}");
+    succeeds(approved_apply(&d, connection, &path, &[]));
+    assert_eq!(scalar(connection, count), 1);
+    succeeds(d.run(&["verify", "--db", connection]));
+    d.table(&source.replace("NULL::timestamp(3) with time zone", "NULL::timestamptz"));
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0);
+    assert!(stderr(&refused).contains("NULL"), "{}", stderr(&refused));
+    assert_eq!(scalar(connection, count), 1);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
     let own = OwnDatabase::new(&server(), "cost");
     let connection = own.connection();

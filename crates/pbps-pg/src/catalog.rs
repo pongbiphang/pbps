@@ -573,7 +573,7 @@ fn indexes_query() -> String {
     )
 }
 
-const BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
+pub(crate) const BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
 
 /// The two halves of the probe that says whether a transaction is already open.
 ///
@@ -645,7 +645,7 @@ pub(crate) fn probe_set(token: &str) -> String {
 /// `lc_monetary` is deliberately absent: it belongs to the same class, and
 /// `SET` fails outright on a locale the server does not have, which would turn
 /// a readable database into an unreadable one.
-const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
+pub(crate) const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
        pg_catalog.set_config('quote_all_identifiers', 'off', true),
        pg_catalog.set_config('datestyle', 'ISO, MDY', true),
        pg_catalog.set_config('intervalstyle', 'postgres', true),
@@ -1553,7 +1553,7 @@ async fn close<T>(
 /// It is a refusal rather than an accommodation. Reading inside somebody's
 /// transaction would answer from their uncommitted writes, which is not what
 /// "what the database looks like" means.
-async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
+pub(crate) async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
     if in_transaction(conn).await? {
         return Err(DbError::Driver {
             code: None,

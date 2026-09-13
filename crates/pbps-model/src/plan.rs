@@ -92,7 +92,9 @@ use crate::schema::Schema;
 /// Bumped to 8 for `DeleteRow::dropped`, a separate reviewer-only map of
 /// baseline cells whose columns are dropped. Older readers deny unknown
 /// change fields; the version identifies that format boundary (DECISIONS 442).
-pub const CURRENT_VERSION: u32 = 8;
+/// Bumped to 9 for plan-owned canonical defaults. An older emitter would ignore
+/// the resolution and execute the session-sensitive declaration instead.
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -458,7 +460,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 8);
+        assert_eq!(CURRENT_VERSION, 9);
     }
 
     /// Sorting the keys must not sort away a difference. The same three
@@ -620,6 +622,61 @@ mod tests {
         let mut json = serde_json::to_value(plan_over(ChangeSet::default())).unwrap();
         json["approved"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<SavedPlan>(json).is_err());
+    }
+
+    #[test]
+    fn row_defaults_and_default_resolution_context_have_distinct_json_fields() {
+        let plan = plan_over(ChangeSet {
+            changes: vec![PlannedChange::new(Change::InsertRow {
+                table: "app.t".parse().unwrap(),
+                key_column: "id".into(),
+                identity_key: false,
+                key: crate::RowKey("1".into()),
+                row: crate::Row::default(),
+                defaults: [("label".into(), "'Unlabelled'".into())].into(),
+                types: [("label".into(), "text".parse().unwrap())].into(),
+            })],
+        });
+        let mut json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            json["changes"]["changes"][0]["defaults"]["label"],
+            "'Unlabelled'"
+        );
+        assert_eq!(
+            serde_json::from_value::<SavedPlan>(json.clone()).unwrap(),
+            plan
+        );
+        json["changes"]["changes"][0]["default_resolutions"] = serde_json::json!({});
+        assert_ne!(
+            serde_json::from_value::<SavedPlan>(json.clone()).unwrap(),
+            plan
+        );
+        json["changes"]["changes"][0]["defaults"] = serde_json::json!({});
+        assert_ne!(serde_json::from_value::<SavedPlan>(json).unwrap(), plan);
+    }
+
+    #[test]
+    fn old_default_plans_deserialize_without_inventing_resolution() {
+        let mut column = Column::new("date".parse().unwrap());
+        column.default = Some("'01/02/2026'::date".into());
+        let plan = plan_over(ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                table: "dbo.customer".parse().unwrap(),
+                name: "d".into(),
+                column: Box::new(column),
+            })],
+        });
+        let mut old = serde_json::to_value(plan).unwrap();
+        old["version"] = serde_json::json!(8);
+        old["changes"]["changes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("default_resolutions");
+        let old: SavedPlan = serde_json::from_value(old).unwrap();
+        assert_eq!(old.version, 8);
+        assert_ne!(old.version, CURRENT_VERSION);
+        assert!(old.changes.changes[0].default_resolutions.is_empty());
     }
 
     #[test]

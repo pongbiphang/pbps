@@ -2780,7 +2780,7 @@ fn statements(
     for p in &cs.changes {
         statements.extend(
             dialect
-                .emit(&p.change, p.strategy)
+                .emit_planned(p)
                 .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?,
         );
     }

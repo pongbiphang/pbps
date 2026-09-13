@@ -1857,6 +1857,26 @@ pub struct PlannedChange {
     /// can be suppressed, a risk class is what the gate reads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<crate::finding::Finding>,
+
+    /// Plan-time facts, not declaration state: the source remains in `change`
+    /// so recording a deployment never replaces the human's declaration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub default_resolutions: BTreeMap<ColumnRef, PlannedDefault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedDefault {
+    pub column_type: crate::ColumnType,
+    pub source: String,
+    pub resolution: DefaultResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DefaultResolution {
+    Unresolved,
+    Canonical { rendered: String },
 }
 
 impl PlannedChange {
@@ -1864,11 +1884,85 @@ impl PlannedChange {
     /// The differ replaces this set with the selected dialect's complete risks.
     pub fn new(change: Change) -> Self {
         let risks = change.intrinsic_risks();
+        let mut defaults = BTreeMap::new();
+        let mut add = |at: ColumnRef, column: &crate::Column| {
+            if let Some(source) = &column.default {
+                defaults.insert(
+                    at,
+                    PlannedDefault {
+                        column_type: column.ty.clone(),
+                        source: source.clone(),
+                        resolution: DefaultResolution::Unresolved,
+                    },
+                );
+            }
+        };
+        match &change {
+            Change::CreateTable { name, table, .. } => {
+                for (column_name, column) in &table.columns {
+                    add(ColumnRef::new(name.clone(), column_name), column);
+                }
+            }
+            Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } => add(ColumnRef::new(table.clone(), name), column),
+            Change::InsertRow {
+                table,
+                defaults: sources,
+                types,
+                ..
+            } => {
+                for (name, source) in sources {
+                    if let Some(ty) = types.get(name) {
+                        defaults.insert(
+                            ColumnRef::new(table.clone(), name),
+                            PlannedDefault {
+                                column_type: ty.clone(),
+                                source: source.clone(),
+                                resolution: DefaultResolution::Unresolved,
+                            },
+                        );
+                    }
+                }
+            }
+            Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::AlterColumnDefault { .. } => {}
+        }
         Self {
             change,
             risks,
             strategy: Strategy::default(),
             findings: Vec::new(),
+            default_resolutions: defaults,
         }
     }
 

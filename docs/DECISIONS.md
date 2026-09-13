@@ -10651,3 +10651,42 @@ SPEC is in sync with all of these.
     already claimed. It is called from `declaration_problems` beside
     `check_module_names`, so `validate`, `init`, `plan --db` and `bootstrap`
     all ask it (141).
+
+454. **Canonical defaults are plan facts, not rewritten declarations.**
+     PostgreSQL 18.6 again measured all three spellings of the date literal
+     (`::date`, `DATE`, and `CAST`) as January 2 under MDY and February 1
+     under DMY. Canonical read-only resolution produces `'2026-01-02'::date`,
+     which remains January 2 under either applying setting. The same read
+     supplies explicit offsets for timetz/timestamptz, signed interval parts,
+     and the engine's float rendering. The resolver also pins the input
+     abbreviation dictionary locally; it does not change write framing.
+
+     A String alone cannot distinguish a declaration from that engine answer.
+     `PlannedChange.default_resolutions` therefore carries the column type, source, and
+     unresolved/canonical state keyed by full column reference. The differ
+     supplies the type that `AlterColumnDefault` itself does not carry.
+     `emit_planned` validates coverage and source consistency before using a
+     resolved literal; offline emission refuses the unresolved class. The
+     original `Change` is unchanged, so `Declared::advance` continues recording
+     the human's text and the next plan does not propose the same default again.
+     This supersedes decision 261's temporary permission for typed literals.
+     NULL literals are excluded: their value is setting-independent, and
+     rewriting their cast can erase a retained default (decision 361).
+     Omitted reference-row defaults carry the same plan facts: their guard
+     must compare against the canonical value emitted for the column, not
+     reinterpret the original source under the replay session's settings.
+
+     Resolution is a connected free function in `pbps-pg`, routed by `engine`
+     from planning and bootstrap. It owns a canonical read-only scope and
+     reconstructs built-in literal/cast syntax rather than executing arbitrary
+     input functions accepted by the broader constant classifier. This adds
+     no general expression execution or write-setting contract (#174/#319).
+     Schema equality and declaration YAML are unchanged (ARCHITECTURE 1, 8).
+
+     The sidecar is serialized and checksum-pinned. Missing fields deserialize
+     as empty for old artifacts, but plan version 9 names the incompatibility:
+     an old reader would otherwise ignore the answer and emit the original
+     session-sensitive default. Tests cover hostile-setting replay, all eight
+     sensitive types, offline refusal with unrelated defaults allowed, stale
+     context, checksum changes, ledger source preservation and an empty next
+     connected plan.
