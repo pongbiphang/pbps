@@ -902,9 +902,11 @@ fn recorded_cell(
         Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
         Cell::Value(v) => {
             let recorded = literal(&recorded_text(v));
-            // A retyped `image` column is carried and not held: there is no
-            // expression that puts its recorded text back through the old
-            // type, so there is nothing to compare the converted column with.
+            // A retyped column whose old type has no way back from its own
+            // rendering is carried and not held — `image`, `geometry` and
+            // `geography` (DECISIONS 470): there is no expression that puts
+            // the recorded text back through that type, so there is nothing
+            // to compare the converted column with.
             let Some(expected) = ty.as_stored(&recorded) else {
                 return Ok(None);
             };
@@ -2663,8 +2665,9 @@ mod tests {
     /// it only up to the moment `apply` reads it. Each recorded cell goes
     /// into the predicate, compared by the rendering that read it — the
     /// column's type's — and a NULL as `IS NULL`; a literal default as the
-    /// read-back compared it; a default the engine would have to run, a
-    /// type without `=`, and a column the base does not have hold nothing.
+    /// read-back compared it; a default the engine would have to run, and a
+    /// column the base does not have, hold nothing. The type no longer
+    /// excludes anything: the comparison is of text (DECISIONS 470).
     #[test]
     fn an_update_holds_the_row_to_what_the_plan_recorded() {
         let cell = |from: Cell, to: Cell| (from, to);

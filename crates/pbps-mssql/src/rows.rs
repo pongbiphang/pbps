@@ -111,8 +111,10 @@ pub struct Slot {
     /// means (see the module docs).
     pub has_default: bool,
     /// The column has a default that is *not* asked about — an expression the
-    /// engine would have to run, or a type without `=` — so the cell is taken
-    /// as at its default (module docs).
+    /// engine would have to run — so the cell is taken as at its default
+    /// (module docs). The type is no longer part of that question: the
+    /// comparison is of text, which every type this dialect holds renders as
+    /// (DECISIONS 470).
     pub assume_default: bool,
 }
 

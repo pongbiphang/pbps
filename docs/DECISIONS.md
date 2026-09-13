@@ -1070,6 +1070,11 @@ SPEC is in sync with all of these.
     window for structure too, and is the shape to reach for if the row
     predicate ever proves too narrow; it reorganises every apply path, and
     the predicate is what the reviewed plan actually asserts.
+
+    **Amended by 470: the type is no longer one of the things that hold
+    nothing.** The comparison became one of text on both sides, so the types
+    without an `=` are held like every other; a default the engine would have
+    to run, and a column the base does not have, are still the whole list.
 123. **The names a plan's remaining statements need free are compared with
     one another, not only with the catalog.** 119 asked the engine which
     existing principal holds each wanted name; two declared roles the
@@ -1569,6 +1574,13 @@ SPEC is in sync with all of these.
     invisible — the column no longer holds what would tell them apart. The
     baseline checksum still covers it up to the moment `apply` reads the
     state.
+
+    **Amended by 470: "a type with no comparison at either end" is no longer a
+    case.** That sentence kept 146's answer for `xml`, `text` and the spatial
+    types; the comparison is of text now, so all of them are held. What is left
+    of 146's answer is narrower, and is about the retype alone: a column this
+    plan retypes whose old type cannot be spelled back from its own rendering
+    — `image`, `geometry`, `geography` — is carried and held by nothing.
 
 150. **What `apply` records has to be the baseline plus the plan, and the
     part of that the tool can check exactly is everything the plan does not
