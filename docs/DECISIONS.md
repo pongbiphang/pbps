@@ -11133,7 +11133,6 @@ SPEC is in sync with all of these.
      index and named key-backing-index collisions. Generated PostgreSQL names
      remain the separate issue #465.
 
-
 460. **Replacing a referenced key carries its foreign keys through the typed
      plan (issue #177).** `pbps-diff` now adds `DropForeignKey` and
      `AddForeignKey` for retained managed foreign keys whose referenced
@@ -11205,3 +11204,15 @@ SPEC is in sync with all of these.
      guards cover their actual index identities. The shared regressions run
      all three key kinds, with a nonunique-index negative control. Restoring
      each reviewed scan independently makes its new regression fail.
+
+     SQL Server FK enforcement flags also stay outside the declaration: a
+     disabled, untrusted (`WITH NOCHECK`) or `NOT FOR REPLICATION` FK cannot
+     be recreated as an ordinary enabled, trusted FK without changing its
+     semantics. The catalog carries all three flags into the pure assembler,
+     which omits the FK with one named relation limitation per constraint.
+     Existing managed-set drift checks then refuse connected planning and
+     apply before writing; pull reports the limitation. No model or saved-plan
+     fields are added. Composite-FK unit tests retain the ordinary control,
+     and live CLI tests cover clean and orphaned disabled/untrusted keys,
+     replication semantics, changes after approval, unchanged engine flags on
+     refusal, and applying the same plan after an explicit operator repair.

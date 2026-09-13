@@ -148,7 +148,7 @@ pub async fn key_drop_blockers(
         };
         // Neither a nonunique nor a filtered index can back a foreign key.
         // Resolve that with the parent's metadata rights before asking for
-        // broader visibility (decision 459).
+        // broader visibility (decision 460).
         if !get::<bool>(row, "is_unique")? || get::<bool>(row, "has_filter")? {
             continue;
         }

@@ -752,7 +752,7 @@ an external foreign key the plan cannot remove. These checks run during
 connected planning and again before apply, without adding statements to an
 approved plan. SQL Server needs database `VIEW DEFINITION` for that external
 dependency read without overriding metadata denials; insufficient visibility
-is refused (DECISIONS 459).
+is refused (DECISIONS 460).
 
 Pre-flight also runs **probes derived automatically from the plan itself**.
 The differ's output is a typed `ChangeSet`, so the tool already knows how each
