@@ -744,8 +744,8 @@ clean. Two supporting rules:
   **before** anything has run, filling in the information an offline plan cannot
   see.
 
-Replacing a primary or unique key includes explicit drops and recreations of
-its affected managed foreign keys in the typed plan, with ordinary ordering
+Replacing a primary/unique constraint or standalone unique index includes
+explicit drops and recreations of its affected managed foreign keys in the typed plan, with ordinary ordering
 and risk classification. Matching is conservative when equivalent keys share
 columns; connected checks use the actual backing-index dependency to refuse
 an external foreign key the plan cannot remove. These checks run during

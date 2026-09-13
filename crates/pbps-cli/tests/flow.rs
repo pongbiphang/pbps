@@ -12686,15 +12686,17 @@ fn constraint_name_collisions_are_refused_before_connecting_on_both_dialects() {
 #[ignore = "needs a live database; run the engine's live-test script"]
 fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
     let server = std::env::var("PBPS_TEST_DB").expect("set PBPS_TEST_DB");
-    for primary in [false, true] {
+    for kind in ["index", "unique", "primary"] {
         for staged in [false, true] {
-            let slug = format!("referenced_key_{}_{}", primary, staged);
+            let slug = format!("referenced_key_{kind}_{staged}");
             let own = OwnDatabase::new(&server, &slug);
             let connection = own.connection();
             let d = Demo::new(&slug);
 
-            let key = if primary {
+            let key = if kind == "primary" {
                 "primary_key: {name: old_key, columns: [id]}\n"
+            } else if kind == "index" {
+                "indexes:\n  old_key: {columns: [id], unique: true}\n"
             } else {
                 "unique:\n  old_key: [id]\n"
             };
@@ -12771,14 +12773,16 @@ fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
 #[ignore = "needs a live database; run the engine's live-test script"]
 fn external_referenced_key_dependencies_are_refused_before_planning_and_writing() {
     let server = std::env::var("PBPS_TEST_DB").expect("set PBPS_TEST_DB");
-    for primary in [false, true] {
-        let slug = format!("external_key_{primary}");
+    for kind in ["index", "unique", "primary"] {
+        let slug = format!("external_key_{kind}");
         let own = OwnDatabase::new(&server, &slug);
         let connection = own.connection();
         let d = Demo::new(&slug);
 
-        let key = if primary {
+        let key = if kind == "primary" {
             "primary_key: {name: old_key, columns: [id]}\nunique:\n  other_key: [code]\n"
+        } else if kind == "index" {
+            "indexes:\n  old_key: {columns: [id], unique: true}\nunique:\n  other_key: [code]\n"
         } else {
             "unique:\n  old_key: [id]\n  other_key: [code]\n"
         };
@@ -12853,7 +12857,7 @@ fn external_referenced_key_dependencies_are_refused_before_planning_and_writing(
         );
         on_server(
             connection,
-            "IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE parent_object_id=OBJECT_ID('dbo.t') AND name='old_key') OR EXISTS (SELECT 1 FROM sys.key_constraints WHERE parent_object_id=OBJECT_ID('dbo.t') AND name='new_key') THROW 50000, 'refused apply changed the key', 1;",
+            "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.t') AND name='old_key') OR EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.t') AND name='new_key') THROW 50000, 'refused apply changed the key', 1;",
         );
         on_server(connection, "DROP TABLE outside.child");
         success(d.run(&args));

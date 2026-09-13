@@ -61,7 +61,7 @@ fn stored_key_table(
     Some(name)
 }
 
-/// Existing inbound FK dependencies of primary/unique keys the plan drops.
+/// Existing inbound FK dependencies of constraint or standalone unique keys.
 /// Called in the planning/preflight transaction; it never tries DDL to learn
 /// whether a drop is legal. The engine's key_index_id, not a column-set match,
 /// decides which standing key an external foreign key actually depends on.
@@ -84,6 +84,7 @@ pub async fn key_drop_blockers(
                     ..
                 } => (table, "PK", ""),
                 Change::DropUnique { table, name } => (table, "UQ", name.as_str()),
+                Change::DropIndex { table, name } => (table, "IX", name.as_str()),
                 Change::CreateTable { .. }
                 | Change::DropTable { .. }
                 | Change::RenameTable { .. }
@@ -101,7 +102,6 @@ pub async fn key_drop_blockers(
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
                 | Change::InsertRow { .. }
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
@@ -119,7 +119,47 @@ pub async fn key_drop_blockers(
             Some((index, stored, kind, name))
         })
         .collect();
-    if targets.is_empty() {
+    struct Key {
+        change_index: usize,
+        table: TableName,
+        name: String,
+        parent: i32,
+        index: i32,
+    }
+    let mut keys = Vec::new();
+    for (change_index, table, kind, name) in targets {
+        let qualified = qualified(&table)?;
+        let rows = conn
+            .query_with(
+                "SELECT i.object_id AS parent, i.index_id AS idx, i.name, i.is_unique
+             FROM sys.indexes i LEFT JOIN sys.key_constraints kc
+               ON kc.parent_object_id=i.object_id AND kc.unique_index_id=i.index_id
+             WHERE i.object_id=OBJECT_ID(@P1, N'U')
+               AND ((@P2=N'PK' AND kc.type=N'PK') OR (@P2=N'UQ' AND kc.type=N'UQ' AND kc.name=@P3)
+                 OR (@P2=N'IX' AND i.name=@P3))",
+                &[Param::Str(&qualified), Param::Str(kind), Param::Str(name)],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Err(DbError::Refused(format!(
+                "key_drop_blockers: {kind} `{name}` on {table} is absent from the readable catalog"
+            ))
+            .into());
+        };
+        // A nonunique index cannot back a foreign key. Resolve its kind with
+        // the parent's metadata rights before asking for broader visibility.
+        if !get::<bool>(row, "is_unique")? {
+            continue;
+        }
+        keys.push(Key {
+            change_index,
+            table,
+            name: get::<&str>(row, "name")?.into(),
+            parent: get::<i32>(row, "parent")?,
+            index: get::<i32>(row, "idx")?,
+        });
+    }
+    if keys.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -208,22 +248,14 @@ pub async fn key_drop_blockers(
         }
     }
     let mut reports = Vec::new();
-    for (index, table, kind, name) in targets {
-        let qualified = qualified(&table)?;
-        let rows = conn.query_with(
-            "SELECT kc.parent_object_id AS parent, kc.unique_index_id AS idx, kc.name AS name FROM sys.key_constraints kc
-             WHERE kc.parent_object_id=OBJECT_ID(@P1, N'U') AND kc.type=@P2 AND (@P2=N'PK' OR kc.name=@P3)",
-            &[Param::Str(&qualified), Param::Str(kind), Param::Str(name)],
-        ).await?;
-        let Some(key) = rows.first() else {
-            return Err(DbError::Refused(format!(
-                "key_drop_blockers: {kind} `{name}` on {table} is absent from the readable catalog"
-            ))
-            .into());
-        };
-        let parent = get::<i32>(key, "parent")?;
-        let idx = get::<i32>(key, "idx")?;
-        let key_name = get::<&str>(key, "name")?;
+    for Key {
+        change_index: index,
+        table,
+        name: key_name,
+        parent,
+        index: idx,
+    } in keys
+    {
         let mut blocking = BTreeSet::new();
         for row in conn.query_with(
             "SELECT fk.object_id AS oid, fk.parent_object_id AS child, s.name AS schema_name, t.name AS table_name, fk.name AS name

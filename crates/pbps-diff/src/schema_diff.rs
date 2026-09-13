@@ -982,7 +982,9 @@ fn recreate_referenced_foreign_keys(
     if !changes.iter().any(|c| {
         matches!(
             c,
-            Change::SetPrimaryKey { from: Some(_), .. } | Change::DropUnique { .. }
+            Change::SetPrimaryKey { from: Some(_), .. }
+                | Change::DropUnique { .. }
+                | Change::DropIndex { .. }
         )
     }) {
         return;
@@ -1004,12 +1006,29 @@ fn recreate_referenced_foreign_keys(
                 table,
                 from: Some(key),
                 ..
-            } => (table, &key.columns),
+            } => (table, key.columns.iter().cloned().collect::<BTreeSet<_>>()),
             Change::DropUnique { table, name } => {
                 let Some(key) = aligned.get(table).and_then(|t| t.unique.get(name)) else {
                     continue;
                 };
-                (table, &key.columns)
+                (table, key.columns.iter().cloned().collect::<BTreeSet<_>>())
+            }
+            Change::DropIndex { table, name } => {
+                let Some(index) = aligned
+                    .get(table)
+                    .and_then(|t| t.indexes.get(name))
+                    .filter(|i| i.unique)
+                else {
+                    continue;
+                };
+                (
+                    table,
+                    index
+                        .columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<BTreeSet<_>>(),
+                )
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
@@ -1028,7 +1047,6 @@ fn recreate_referenced_foreign_keys(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
@@ -1044,10 +1062,7 @@ fn recreate_referenced_foreign_keys(
         };
         // PostgreSQL can bind a permutation of a composite candidate key.
         // SQL Server requires its order; a set conservatively covers both.
-        removed.insert((
-            table.clone(),
-            columns.iter().cloned().collect::<BTreeSet<_>>(),
-        ));
+        removed.insert((table.clone(), columns));
     }
     for (table, before) in &aligned {
         let Some(after) = declared.schema.tables.get(table) else {
@@ -4324,13 +4339,26 @@ mod tests {
 
     #[test]
     fn replacing_a_referenced_key_surrounds_it_with_visible_foreign_key_changes() {
-        for primary in [false, true] {
+        for kind in ["index", "unique", "primary"] {
             let mut parent = sku_table();
-            if primary {
+            if kind == "primary" {
                 parent.primary_key = Some(PrimaryKey {
                     name: Some("old_key".into()),
                     columns: vec!["id".into()],
                 });
+            } else if kind == "index" {
+                parent.indexes.insert(
+                    "old_key".into(),
+                    pbps_model::Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            name: "id".into(),
+                            descending: false,
+                        }],
+                        include: vec![],
+                        unique: true,
+                        filter: None,
+                    },
+                );
             } else {
                 parent.unique.insert("old_key".into(), unique(&["id"]));
             }
@@ -4349,8 +4377,11 @@ mod tests {
                 .tables
                 .get_mut(&"dbo.parent".parse().unwrap())
                 .unwrap();
-            if primary {
+            if kind == "primary" {
                 parent.primary_key.as_mut().unwrap().name = Some("new_key".into());
+            } else if kind == "index" {
+                let index = parent.indexes.remove("old_key").unwrap();
+                parent.indexes.insert("new_key".into(), index);
             } else {
                 let key = parent.unique.remove("old_key").unwrap();
                 parent.unique.insert("new_key".into(), key);
@@ -4358,13 +4389,15 @@ mod tests {
             let cs = run(&base, &declared, &[]);
             assert_eq!(
                 kinds(&cs),
-                if primary {
+                if kind == "primary" {
                     vec![
                         "DropForeignKey",
                         "SetPrimaryKey",
                         "SetPrimaryKey",
                         "AddForeignKey",
                     ]
+                } else if kind == "index" {
+                    vec!["DropForeignKey", "DropIndex", "AddIndex", "AddForeignKey"]
                 } else {
                     vec!["DropForeignKey", "DropUnique", "AddUnique", "AddForeignKey"]
                 },

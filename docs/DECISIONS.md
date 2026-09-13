@@ -11137,7 +11137,7 @@ SPEC is in sync with all of these.
 460. **Replacing a referenced key carries its foreign keys through the typed
      plan (issue #177).** `pbps-diff` now adds `DropForeignKey` and
      `AddForeignKey` for retained managed foreign keys whose referenced
-     primary/unique key is dropped. Existing ordering places those changes
+     primary/unique constraint or standalone unique index is dropped. Existing ordering places those changes
      before the key removal and after the replacement; risk classification
      runs afterward, so recreation carries `constraint` and FK removal keeps
      its existing ungated classification. Explicit FK changes are not
@@ -11160,8 +11160,9 @@ SPEC is in sync with all of these.
      does not block the change.
 
      PostgreSQL extends the existing object-address DROP dependency graph to
-     primary/unique-key roots. SQL Server reads `sys.foreign_keys.key_index_id`
-     against the key's `unique_index_id`. Both count only earlier typed
+     primary/unique-key and index roots. SQL Server reads
+     `sys.foreign_keys.key_index_id` against `sys.indexes.index_id`, resolving
+     constraint-backed keys through `sys.key_constraints`. Both count only earlier typed
      removals and reverse only preceding table renames when querying the
      original catalog. A missing existing key is a failed read, not a report
      of no dependencies. An FK outside the plan is named and refused during
@@ -11178,7 +11179,9 @@ SPEC is in sync with all of these.
      metadata denials, including those inherited through a database role,
      while respecting owner overrides. The check refuses insufficient visibility
      instead of treating that zero as proof of absence. This requirement is asked only
-     for an existing key drop, not ordinary planning with no such change.
+     for an existing unique key drop. SQL Server first reads the index kind
+     with the parent's metadata rights; an ordinary nonunique index drop does
+     not acquire a database-level permission prerequisite.
 
      Live CLI tests on both engines cover primary and unique key replacement,
      the explicit four-change saved plan, orphan refusal after recreation,
@@ -11190,3 +11193,10 @@ SPEC is in sync with all of these.
      regression fail. The existing staged restriction remains: this is a
      multi-change transactional plan, and `--staged` refuses it before writing
      an artifact.
+
+     The first review found the same dependency on a standalone unique index:
+     its `DropIndex`/`AddIndex` changes had been omitted from all three key
+     scans. The differ now includes unique baseline indexes, and both connected
+     guards cover their actual index identities. The shared regressions run
+     all three key kinds, with a nonunique-index negative control. Restoring
+     each reviewed scan independently makes its new regression fail.

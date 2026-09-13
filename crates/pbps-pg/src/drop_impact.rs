@@ -160,8 +160,8 @@ impl Classes {
     }
 }
 
-/// Read existing blockers for table, column and primary/unique-key drops. Must run in the
-/// caller's transaction; no DDL or catalog mutation is used to test a drop.
+/// Read existing blockers for table, column, key and index drops. Must run in
+/// the caller's transaction; no DDL or catalog mutation is used to test a drop.
 pub async fn drop_blockers(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -181,6 +181,9 @@ pub async fn drop_blockers(
             Change::DropUnique { table, name } => {
                 Some((index, format!("unique constraint `{name}` on {table}")))
             }
+            Change::DropIndex { table, name } => {
+                Some((index, format!("index `{name}` on {table}")))
+            }
             Change::CreateTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -196,7 +199,6 @@ pub async fn drop_blockers(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
@@ -238,7 +240,8 @@ pub async fn drop_blockers(
             from: Some(_),
             ..
         }
-        | Change::DropUnique { table, .. } = &cs.changes[index].change
+        | Change::DropUnique { table, .. }
+        | Change::DropIndex { table, .. } = &cs.changes[index].change
             && stored(cs, index, table, None).is_some()
         {
             return Err(error(format!(

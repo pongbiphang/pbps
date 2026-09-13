@@ -10962,6 +10962,45 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     let plan = |changes: Vec<Change>| ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
+    conn.execute("CREATE TABLE dbo.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON dbo.indexed(id); CREATE TABLE dbo.index_child (id integer CONSTRAINT index_fk REFERENCES dbo.indexed(id)); CREATE UNIQUE INDEX other_standalone ON dbo.indexed(id); CREATE INDEX ordinary_index ON dbo.indexed(id);").await.unwrap();
+    let drop_index = |name: &str| Change::DropIndex {
+        table: TableName::new("dbo", "indexed"),
+        name: name.into(),
+    };
+    for (name, blocked) in [
+        ("standalone_key", true),
+        ("other_standalone", false),
+        ("ordinary_index", false),
+    ] {
+        let reports =
+            pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
+                .await
+                .unwrap();
+        assert_eq!(
+            reports.iter().any(|r| !r.blocking.is_empty()),
+            blocked,
+            "{name}: {reports:?}"
+        );
+    }
+    let removed = plan(vec![
+        Change::DropForeignKey {
+            table: TableName::new("dbo", "index_child"),
+            name: "index_fk".into(),
+        },
+        drop_index("standalone_key"),
+    ]);
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &removed)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.blocking.is_empty())
+    );
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("missing")]))
+            .await
+            .is_err()
+    );
     let reports =
         pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("other_key")]))
             .await
@@ -11033,7 +11072,21 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
             .is_err(),
         "an absent existing key is not a successful dependency read"
     );
-    conn.execute("CREATE USER key_guard177_reader WITHOUT LOGIN; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.parent TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
+    conn.execute("CREATE USER key_guard177_reader WITHOUT LOGIN; GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.parent TO key_guard177_reader; GRANT VIEW DEFINITION ON OBJECT::dbo.indexed TO key_guard177_reader; EXECUTE AS USER='key_guard177_reader';").await.unwrap();
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("ordinary_index")]))
+            .await
+            .unwrap()
+            .is_empty(),
+        "an ordinary index drop does not need database metadata grants"
+    );
+    assert!(
+        pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_index("standalone_key")]))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("database VIEW DEFINITION")
+    );
     let hidden = pbps_mssql::impact::key_drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
         .await
         .unwrap_err();

@@ -646,7 +646,7 @@ pub async fn check_drop_blockers(
                 engine: "SQL Server",
                 status: "unavailable",
                 message: format!(
-                    "{} primary/unique-key drop(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
+                    "{} unique-key drop(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
                     reports.len()
                 ),
             })
@@ -659,7 +659,7 @@ pub async fn check_drop_blockers(
                 engine: "PostgreSQL",
                 status: "passed",
                 message: format!(
-                    "{} table/column/key drop(s) checked against current catalog dependencies",
+                    "{} table/column/key/index drop(s) checked against current catalog dependencies",
                     reports.len()
                 ),
             })

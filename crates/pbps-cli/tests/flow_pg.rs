@@ -6490,15 +6490,17 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
 #[ignore = "needs a live database; run the engine's live-test script"]
 fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
     let server = server();
-    for primary in [false, true] {
+    for kind in ["index", "unique", "primary"] {
         for staged in [false, true] {
-            let slug = format!("referenced_key_{}_{}", primary, staged);
+            let slug = format!("referenced_key_{kind}_{staged}");
             let own = OwnDatabase::new(&server, &slug);
             let connection = own.connection();
             let d = Demo::new(&slug);
             on_server(connection, "CREATE SCHEMA app");
-            let key = if primary {
+            let key = if kind == "primary" {
                 "primary_key: {name: old_key, columns: [id]}\n"
+            } else if kind == "index" {
+                "indexes:\n  old_key: {columns: [id], unique: true}\n"
             } else {
                 "unique:\n  old_key: [id]\n"
             };
@@ -6575,14 +6577,16 @@ fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
 #[ignore = "needs a live database; run the engine's live-test script"]
 fn external_referenced_key_dependencies_are_refused_before_planning_and_writing() {
     let server = server();
-    for primary in [false, true] {
-        let slug = format!("external_key_{primary}");
+    for kind in ["index", "unique", "primary"] {
+        let slug = format!("external_key_{kind}");
         let own = OwnDatabase::new(&server, &slug);
         let connection = own.connection();
         let d = Demo::new(&slug);
         on_server(connection, "CREATE SCHEMA app");
-        let key = if primary {
+        let key = if kind == "primary" {
             "primary_key: {name: old_key, columns: [id]}\nunique:\n  other_key: [code]\n"
+        } else if kind == "index" {
+            "indexes:\n  old_key: {columns: [id], unique: true}\nunique:\n  other_key: [code]\n"
         } else {
             "unique:\n  old_key: [id]\n  other_key: [code]\n"
         };
@@ -6657,7 +6661,7 @@ fn external_referenced_key_dependencies_are_refused_before_planning_and_writing(
         );
         on_server(
             connection,
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid='app.t'::regclass AND conname='old_key') OR EXISTS (SELECT FROM pg_constraint WHERE conrelid='app.t'::regclass AND conname='new_key') THEN RAISE EXCEPTION 'refused apply changed the key'; END IF; END $$",
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_class WHERE oid=to_regclass('app.old_key')) OR EXISTS (SELECT FROM pg_class WHERE oid=to_regclass('app.new_key')) THEN RAISE EXCEPTION 'refused apply changed the key'; END IF; END $$",
         );
         on_server(connection, "DROP TABLE outside.child");
         success(d.run(&args));
