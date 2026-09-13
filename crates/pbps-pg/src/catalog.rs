@@ -155,6 +155,17 @@ const ORDINARY_TABLE: &str = "c.relkind = 'r'
         AND c.reloftype = 0
         AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')";
 
+/// `pg_get_viewdef` omits these options. Only the two boolean options set to
+/// false have the behavior a plain declaration recreates; check options and
+/// unknown options must be named instead. The engine keeps boolean aliases
+/// such as `off` and `0` in `reloptions`, so compare their values, not spelling.
+/// Shared by the view reader and the trigger-parent predicate (DECISIONS 304).
+const DEFAULT_VIEW_OPTIONS: &str = "NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_options_to_table(c.reloptions) AS opt
+             WHERE (CASE WHEN opt.option_name IN ('security_invoker', 'security_barrier')
+                         THEN opt.option_value::boolean
+                         ELSE true END) IS DISTINCT FROM false)";
+
 /// Whether the relation `c` a trigger is on is one the pull reads back — a
 /// view, or a table [`tables_query`] holds.
 ///
@@ -163,7 +174,7 @@ const ORDINARY_TABLE: &str = "c.relkind = 'r'
 /// trigger read back without the relation it is on is a module whose `on:`
 /// names a table the schema does not have — `check_names` refuses that, so
 /// the whole pull was one nothing could load. The relation is already named
-/// as a limitation by [`partitioned_query`]; the trigger is named beside it
+/// as a limitation by its own reader; the trigger is named beside it
 /// by [`unheld_modules_query`] rather than silently gone.
 fn on_a_relation_the_pull_holds() -> String {
     let not_one_of_ours = not_one_of_ours();
@@ -175,7 +186,8 @@ fn on_a_relation_the_pull_holds() -> String {
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
     format!(
         "({not_an_extensions}
-          AND (c.relkind = 'v' OR ({ORDINARY_TABLE} AND {not_one_of_ours})))"
+          AND ((c.relkind = 'v' AND {DEFAULT_VIEW_OPTIONS})
+               OR ({ORDINARY_TABLE} AND {not_one_of_ours})))"
     )
 }
 
@@ -237,6 +249,7 @@ fn modules_query() -> String {
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE c.relkind = 'v'
+            AND {DEFAULT_VIEW_OPTIONS}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {view_not_extension}
           UNION ALL
@@ -285,10 +298,10 @@ fn module_args_query() -> String {
 /// The module-shaped objects the model does not hold, so that they are named
 /// rather than missing — the same rule as [`unheld_query`] for tables.
 ///
-/// A materialized view is a view with rows; an aggregate and a window function
-/// are `pg_proc` entries `pg_get_functiondef` refuses outright. Reading any of
-/// them back as the ordinary kind would make a plan that recreates it as
-/// something else.
+/// A materialized view is a view with rows; a view's non-default options do not
+/// survive `pg_get_viewdef`; an aggregate and a window function are `pg_proc`
+/// entries `pg_get_functiondef` refuses outright. Reading any of them back as
+/// the ordinary kind would make a plan that recreates it as something else.
 ///
 /// [`NOT_AN_EXTENSIONS`] here too, and for the same reason it is on the module
 /// queries: an extension installed into a project's schema owns aggregates and
@@ -299,7 +312,7 @@ fn module_args_query() -> String {
 /// would refuse a plan that is correct. A filter the ordinary reader applies
 /// and the limitation reader does not is a rule with a hole in it.
 fn unheld_modules_query() -> String {
-    let matview_not_extension = not_an_extensions("c.oid", "pg_class");
+    let view_not_extension = not_an_extensions("c.oid", "pg_class");
     let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
     let trigger_not_extension = not_an_extensions("tg.oid", "pg_trigger");
     let held = on_a_relation_the_pull_holds();
@@ -311,7 +324,17 @@ fn unheld_modules_query() -> String {
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE c.relkind = 'm'
             AND {NOT_A_PROJECTS_SCHEMA}
-            AND {matview_not_extension}
+            AND {view_not_extension}
+          UNION ALL
+         SELECT n.nspname, c.relname,
+                'a view with options ' || pg_catalog.array_to_string(c.reloptions, ', '),
+                'v', c.oid::int8, ''
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind = 'v'
+            AND NOT ({DEFAULT_VIEW_OPTIONS})
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {view_not_extension}
           UNION ALL
          SELECT n.nspname, p.proname,
                 CASE p.prokind WHEN 'a' THEN 'an aggregate function'
@@ -1094,7 +1117,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         let name = text(row, "name")?;
         let here = TableName::new(&schema, &name);
         let target = match text(row, "kind")?.as_str() {
-            "m" => LimitationTarget::Relation(here),
+            "v" | "m" => LimitationTarget::Relation(here),
             "a" | "w" => {
                 let oid = number(row, "oid")?;
                 let args = raw
@@ -1121,6 +1144,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             }
         };
         let kind = match text(row, "kind")?.as_str() {
+            "v" => "view",
             "m" => "materialized view",
             "a" => "aggregate",
             "w" => "window function",
