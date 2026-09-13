@@ -97,15 +97,35 @@ impl RoutineArg {
     }
 }
 
-/// Whether a character can *begin* an unquoted identifier, which is the
-/// engine's `ident_start` as this whitelist can see it: a letter, `_`, or any
-/// non-ASCII byte.
+/// Which token a routine argument's parser is inside, which is what decides
+/// whether a `$` is a byte of a name or the start of a dollar quote.
 ///
-/// An ASCII digit is the one character that continues an identifier without
-/// being able to start one, and the difference is the whole of the `$` rule:
-/// **measured**, `SELECT 1$$;` is `unterminated dollar-quoted string at or
-/// near "$$;"`, because `1` is a numeric token and the `$$` after it opens a
-/// quote rather than continuing a name.
+/// A *state*, not a test of the last character emitted: a digit continues an
+/// identifier and also begins a numeric constant, and a letter continues both.
+/// Neither character can tell `a1` from `1e2` on its own, and only one of them
+/// may be followed by a `$`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Token {
+    /// Between tokens. The next name character opens one.
+    Closed,
+    /// Opened with the engine's `ident_start` — an ASCII letter, `_`, or any
+    /// non-ASCII byte. A `$` continues it.
+    Identifier,
+    /// Opened with an ASCII digit, and a numeric constant it stays: the
+    /// letters of an exponent or a base prefix are part of the number, not the
+    /// start of a name. **Measured**, `SELECT 1e2$$;` and `SELECT 0x1$$;` are
+    /// `trailing junk after numeric literal` on 18.6 and 16.15 — so there the
+    /// engine refuses them itself — while `SELECT 10$$;` is `unterminated
+    /// dollar-quoted string`. The junk check arrived in PostgreSQL 15 and this
+    /// tool has no lower bound on the server it will talk to, so the rule is
+    /// the lexer's and not that check's.
+    Numeric,
+}
+
+/// Whether a character can *begin* an unquoted identifier, which is the
+/// engine's `ident_start` as this whitelist can see it: an ASCII letter, `_`,
+/// or any non-ASCII byte. An ASCII digit is the one character this admits that
+/// cannot start a name.
 fn begins_an_identifier(c: char) -> bool {
     (c.is_alphabetic() && c.is_ascii()) || c == '_' || !c.is_ascii()
 }
@@ -155,12 +175,7 @@ impl FromStr for RoutineArg {
         let mut brackets = 0usize;
         let mut quoted = false;
         let mut pending_space = false;
-        // Whether the character about to be read continues an unquoted
-        // *identifier* — a token that began with `ident_start`. Tracked rather
-        // than inferred from the last character emitted, because a digit
-        // continues an identifier and also begins a numeric token, and only
-        // one of those may be followed by a `$`.
-        let mut in_identifier = false;
+        let mut token = Token::Closed;
         let mut chars = t.char_indices();
         while let Some((i, c)) = chars.next() {
             if quoted {
@@ -180,7 +195,7 @@ impl FromStr for RoutineArg {
             if c.is_ascii_whitespace() {
                 pending_space = !out.is_empty();
                 // A space ends the token, so the next word starts one.
-                in_identifier = false;
+                token = Token::Closed;
                 continue;
             }
             match c {
@@ -206,7 +221,7 @@ impl FromStr for RoutineArg {
                 // `unterminated dollar-quoted string at or near
                 // "$$)); SELECT 1;"`. The statement suffix swallowed is what
                 // this whitelist exists to make impossible by construction.
-                '$' if in_identifier => {}
+                '$' if token == Token::Identifier => {}
                 // Any non-ASCII byte is a name byte, which is the engine's own
                 // rule (`continues_ident`): a letter, a symbol, a space that is
                 // not the ASCII one.
@@ -221,18 +236,22 @@ impl FromStr for RoutineArg {
                 // one.
                 _ => return Err(shape(t)),
             }
-            // Where the token the next character belongs to stands, updated in
-            // one place so that no arm above can forget it. Punctuation and a
-            // quoted region end the token; a letter, `_` or a non-ASCII byte
-            // opens one; a digit continues an identifier without opening one —
-            // `10` in `numeric(10,2)` is a numeric token, and that is the whole
-            // difference the `$` rule turns on.
-            in_identifier = match c {
-                '$' => true,
-                c if c.is_alphanumeric() || c == '_' || !c.is_ascii() => {
-                    in_identifier || begins_an_identifier(c)
-                }
-                _ => false,
+            // Which token the next character belongs to, updated in one place
+            // so that no arm above can forget it. Punctuation and a quoted
+            // region close the token; the first name character after that
+            // decides what it is, and nothing inside it can change that
+            // decision — which is the difference between `a1` and `1e2`.
+            token = match c {
+                // Only reachable inside an identifier, and it stays one.
+                '$' => Token::Identifier,
+                // Each variant named, so that a fourth one could not be
+                // carried through here by a wildcard.
+                c if c.is_alphanumeric() || c == '_' || !c.is_ascii() => match token {
+                    Token::Closed if begins_an_identifier(c) => Token::Identifier,
+                    Token::Closed | Token::Numeric => Token::Numeric,
+                    Token::Identifier => Token::Identifier,
+                },
+                _ => Token::Closed,
             };
             // A space between two words is part of the name — `timestamp with
             // time zone` — and a space beside punctuation is layout.
@@ -2669,6 +2688,16 @@ mod tests {
             "numeric(10$$)",
             "a(1$$)",
             "a[1$$]",
+            // A number does not become a name because it has letters in it.
+            // Measured on 18.6 and 16.15, `SELECT 1e2$$;` and `SELECT 0x1$$;`
+            // are `trailing junk after numeric literal` — the engine's own
+            // refusal, which arrived in PostgreSQL 15 and which this tool does
+            // not require a server to have. The rule is the lexer's: an
+            // exponent or a base prefix is part of the number.
+            "1e2$$",
+            "0x1$$",
+            "numeric(1e2$$)",
+            "1e2$a",
         ] {
             assert!(
                 bad.parse::<RoutineArg>().is_err(),

@@ -6505,8 +6505,23 @@ SPEC is in sync with all of these.
 
     The second is the one that matters: the parse is still live inside the
     modifier, so nothing refuses the statement before the quote swallows its
-    suffix. The parser now carries whether a token opened with `ident_start`,
-    updated in one place so no arm of the whitelist can forget it.
+    suffix. The parser now carries which token is open — closed, an identifier,
+    or a numeric constant — updated in one place so no arm of the whitelist can
+    forget it.
+
+    **Three states and not two**, which review round 2 was right to ask for
+    even though its reasoning does not hold on any server this suite runs.
+    `1e2$$` passed a two-state parser, because the `e` made a token that had
+    begun with a digit look like an identifier. Measured on 18.6 and 16.15,
+    that spelling does *not* open a quote — `SELECT 1e2$$;` and `SELECT 0x1$$;`
+    are `trailing junk after numeric literal`, and so is `1e2$q$a$q$` — so
+    there the engine refuses it and nothing is swallowed. The junk check
+    arrived in PostgreSQL 15 and this tool sets no lower bound on the server it
+    will talk to, so the whitelist models the lexer rather than that check: a
+    token that opened with a digit stays numeric however many letters follow,
+    because an exponent and a base prefix are part of the number. A letter
+    inside a name is still a name (`a1$b`), which is the case the two-state
+    parser got right and this one keeps.
 
 314. **`pg_depend` holds a row per column a dependent uses, not a row per
     dependent.** Measured, a routine reading three columns of a view has three
