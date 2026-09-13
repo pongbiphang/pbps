@@ -13017,3 +13017,176 @@ fn nonstandard_foreign_key_state_refuses_key_replacement_before_writing() {
         success(d.run(&["verify", "--db", connection]));
     }
 }
+
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn retyped_defaults_and_referenced_keys_apply_through_the_saved_plan_gate() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is set");
+    for key in [false, true] {
+        let own = OwnDatabase::new(
+            &server,
+            if key {
+                "retypekey180"
+            } else {
+                "retypedefault180"
+            },
+        );
+        let connection = own.connection();
+        let d = Demo::new(if key {
+            "retypekey180"
+        } else {
+            "retypedefault180"
+        });
+        let declarations = |ty: &str| {
+            format!(
+                "table: dbo.t\ncolumns:\n  n: {{type: {ty}, nullable: false, default: \"1\"}}\n{}",
+                if key {
+                    "primary_key: {name: pk_t, columns: ['n']}\n"
+                } else {
+                    ""
+                }
+            )
+        };
+        let child = |ty: &str| {
+            format!(
+                "table: dbo.child\ncolumns:\n  n: {{type: {ty}}}\nforeign_keys:\n  fk_child:\n    columns: ['n']\n    references: dbo.t(n)\n"
+            )
+        };
+        d.table(&declarations("int"));
+        if key {
+            std::fs::write(d.dir.join("schema/dbo.child.yml"), child("int")).unwrap();
+        }
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        let o = d.run(&["bootstrap", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.table(&declarations("bigint"));
+        if key {
+            std::fs::write(d.dir.join("schema/dbo.child.yml"), child("bigint")).unwrap();
+        }
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        let path = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("alter_column_default"), "{saved}");
+        assert_eq!(saved.contains("drop_foreign_key"), key, "{saved}");
+        assert_eq!(saved.contains("set_primary_key"), key, "{saved}");
+        let checksum = plan_checksum(&path);
+        let mut args = vec![
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        if key {
+            let refused = d.run(&args);
+            assert_ne!(
+                code(&refused),
+                0,
+                "rebuilding keys retains ordinary approval risks"
+            );
+            args.extend(["--allow", "constraint,destructive"]);
+        }
+        let o = d.run(&args);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let o = d.run(&["verify", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let o = d.run(&["plan", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    }
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn unmodelled_check_and_unique_enforcement_refuses_connected_retypes_before_writes() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is set");
+    for unique in [false, true] {
+        let own = OwnDatabase::new(
+            &server,
+            if unique {
+                "retype_unique_guard180"
+            } else {
+                "retype_check_guard180"
+            },
+        );
+        let connection = own.connection();
+        let d = Demo::new(if unique {
+            "retype_unique_guard180"
+        } else {
+            "retype_check_guard180"
+        });
+        let declarations = |ty: &str| {
+            format!(
+                "table: dbo.t\ncolumns:\n  id: {{type: {ty}, nullable: false}}\n{}",
+                if unique {
+                    "unique:\n  uq: [id]\n"
+                } else {
+                    "checks:\n  ck: id > 0\n"
+                }
+            )
+        };
+        d.table(&declarations("int"));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let o = d.run(&["bootstrap", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.table(&declarations("bigint"));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let path = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let checksum = plan_checksum(&path);
+        on_server(
+            connection,
+            if unique {
+                "ALTER TABLE dbo.t DROP CONSTRAINT uq; ALTER TABLE dbo.t ADD CONSTRAINT uq UNIQUE(id) WITH (IGNORE_DUP_KEY=ON);"
+            } else {
+                "ALTER TABLE dbo.t NOCHECK CONSTRAINT ck;"
+            },
+        );
+        let expected = if unique {
+            "IGNORE_DUP_KEY"
+        } else {
+            "check constraint `ck`"
+        };
+        let verify = d.run(&["verify", "--db", connection]);
+        assert_ne!(code(&verify), 0);
+        assert!(format!("{}{}", stdout(&verify), stderr(&verify)).contains(expected));
+        for args in [
+            vec!["plan", "--db", connection],
+            vec![
+                "apply",
+                "--db",
+                connection,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "constraint,destructive",
+            ],
+        ] {
+            let o = d.run(&args);
+            assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+            assert!(
+                format!("{}{}", stdout(&o), stderr(&o)).contains(expected),
+                "{}{}",
+                stdout(&o),
+                stderr(&o)
+            );
+        }
+        on_server(
+            connection,
+            "IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID('dbo.t') AND name='id' AND system_type_id=56) THROW 50000, 'refused retype changed the column', 1;",
+        );
+    }
+}

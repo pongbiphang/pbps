@@ -79,6 +79,8 @@ pub struct RawColumn {
 /// One column of a PRIMARY KEY or UNIQUE constraint, in key order.
 #[derive(Debug, Clone)]
 pub struct RawKeyColumn {
+    pub is_disabled: bool,
+    pub ignore_dup_key: bool,
     pub object_id: i32,
     pub constraint_name: String,
     pub is_primary: bool,
@@ -106,6 +108,9 @@ pub struct RawForeignKeyColumn {
 /// One row of `sys.check_constraints`.
 #[derive(Debug, Clone)]
 pub struct RawCheck {
+    pub is_disabled: bool,
+    pub is_not_trusted: bool,
+    pub is_not_for_replication: bool,
     pub object_id: i32,
     pub constraint_object_id: i32,
     pub name: String,
@@ -161,6 +166,8 @@ fn index_type_name(code: u8) -> String {
 /// One column of an index that is not backing a PK or UNIQUE constraint.
 #[derive(Debug, Clone)]
 pub struct RawIndexColumn {
+    pub is_disabled: bool,
+    pub ignore_dup_key: bool,
     pub object_id: i32,
     pub index_name: String,
     pub is_unique: bool,
@@ -831,10 +838,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         table.columns.insert(c.name.clone(), column);
     }
 
+    let mut unsupported_keys = BTreeSet::new();
     for k in &raw.key_columns {
         let Some(table) = tables.get_mut(&k.object_id) else {
             continue;
         };
+        if k.is_disabled || k.ignore_dup_key {
+            if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&k.object_id),
+                    format!(
+                        "{}: key constraint `{}` has unmodelled write behavior (disabled={}, IGNORE_DUP_KEY={}); it was left out of the declarations",
+                        name_of(k.object_id, &names),
+                        k.constraint_name,
+                        k.is_disabled,
+                        k.ignore_dup_key
+                    ),
+                );
+            }
+            continue;
+        }
         if k.is_primary {
             let pk = table.primary_key.get_or_insert_with(|| PrimaryKey {
                 name: Some(k.constraint_name.clone()),
@@ -921,6 +946,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&c.object_id) else {
             continue;
         };
+        if c.is_disabled || c.is_not_trusted || c.is_not_for_replication {
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{}: check constraint `{}` has unmodelled enforcement (disabled={}, not_trusted={}, NOT FOR REPLICATION={}); it was left out of the declarations",
+                    name_of(c.object_id, &names),
+                    c.name,
+                    c.is_disabled,
+                    c.is_not_trusted,
+                    c.is_not_for_replication
+                ),
+            );
+            continue;
+        }
         if raw.object_dependencies.iter().any(|dependency| {
             dependency.referencing_object_id == c.constraint_object_id
                 && unavailable_object_ids.contains(&dependency.referenced_object_id)
@@ -950,6 +991,26 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&i.object_id) else {
             continue;
         };
+        // Ordinary disabled indexes affect access paths only. Unique indexes
+        // change which writes survive, so rebuilding them must not silently
+        // enable enforcement or replace IGNORE_DUP_KEY with rejection.
+        if i.is_unique && (i.is_disabled || i.ignore_dup_key) {
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{}: unique index `{}` has unmodelled write behavior (disabled={}, IGNORE_DUP_KEY={}); it was left out of the declarations",
+                        name_of(i.object_id, &names),
+                        i.index_name,
+                        i.is_disabled,
+                        i.ignore_dup_key
+                    ),
+                );
+            }
+            continue;
+        }
         if let IndexKind::Unmodelled(code) = i.kind {
             // The model holds a nonclustered rowstore index and nothing else;
             // recording any other kind without what makes it that kind would
@@ -1600,6 +1661,8 @@ mod tests {
             tables: vec![raw_table(10, "dbo", "customer")],
             columns: vec![id_col, email, status],
             key_columns: vec![RawKeyColumn {
+                is_disabled: false,
+                ignore_dup_key: false,
                 object_id: 10,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
@@ -2000,12 +2063,16 @@ mod tests {
         let mut raw = one_table_catalog();
         raw.key_columns = vec![
             RawKeyColumn {
+                is_disabled: false,
+                ignore_dup_key: false,
                 object_id: 10,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "email".into(),
             },
             RawKeyColumn {
+                is_disabled: false,
+                ignore_dup_key: false,
                 object_id: 10,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
@@ -2139,6 +2206,8 @@ mod tests {
     fn index_key_and_include_columns_are_kept_apart() {
         let mut raw = one_table_catalog();
         let base = RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
             object_id: 10,
             index_name: "ix_email".into(),
             is_unique: false,
@@ -2168,6 +2237,8 @@ mod tests {
         raw.tables.push(raw_table(20, "dbo", "archive"));
         raw.columns.push(raw_column(20, "id", "bigint"));
         let customer_index = RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
             object_id: 10,
             index_name: "cx_shared".into(),
             is_unique: false,
@@ -2185,6 +2256,8 @@ mod tests {
         });
         // The same index name on a different table is a distinct limitation.
         raw.index_columns.push(RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
             object_id: 20,
             index_name: "cx_shared".into(),
             is_unique: false,
@@ -2222,6 +2295,8 @@ mod tests {
         // Through `from_type_code`, so the test pins the catalog's reading of
         // `sys.indexes.type` and not only the assembler's use of it.
         let column = |name: &str, type_code: u8| RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
             object_id: 10,
             index_name: name.to_owned(),
             is_unique: false,
@@ -2278,6 +2353,9 @@ mod tests {
         let mut raw = one_table_catalog();
         raw.columns.push(raw_column(99, "ghost", "int"));
         raw.checks.push(RawCheck {
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
             object_id: 99,
             constraint_object_id: 199,
             name: "ck_ghost".into(),
@@ -2538,6 +2616,9 @@ mod module_tests {
         function.requires_bound_references = true;
         raw.modules.push(function);
         raw.checks.push(RawCheck {
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
             object_id: 2,
             constraint_object_id: 20,
             name: "ck_plain_temporal_fn".into(),

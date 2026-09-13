@@ -53,18 +53,24 @@ fn full_catalog() -> RawCatalog {
         columns: vec![id, email, status, price, region],
         key_columns: vec![
             RawKeyColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
                 object_id: 1,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "id".into(),
             },
             RawKeyColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
                 object_id: 1,
                 constraint_name: "uq_customer_email".into(),
                 is_primary: false,
                 column: "email".into(),
             },
             RawKeyColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
                 object_id: 2,
                 constraint_name: "pk_region".into(),
                 is_primary: true,
@@ -85,6 +91,9 @@ fn full_catalog() -> RawCatalog {
             is_not_for_replication: false,
         }],
         checks: vec![RawCheck {
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
             object_id: 1,
             constraint_object_id: 12,
             name: "ck_price".into(),
@@ -92,6 +101,8 @@ fn full_catalog() -> RawCatalog {
         }],
         index_columns: vec![
             RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
                 object_id: 1,
                 index_name: "ix_customer_email".into(),
                 is_unique: false,
@@ -102,6 +113,8 @@ fn full_catalog() -> RawCatalog {
                 is_descending: true,
             },
             RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
                 object_id: 1,
                 index_name: "ix_customer_email".into(),
                 is_unique: false,

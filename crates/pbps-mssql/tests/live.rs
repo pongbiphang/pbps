@@ -11141,3 +11141,509 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     drop(conn);
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn retyping_preserves_adopted_defaults_and_leaves_absence_absent() {
+    let mut db = TestDb::create("retype_defaults180").await;
+    db.conn.execute("CREATE TABLE dbo.[retype't] ([n]]x] int CONSTRAINT [df']]x] DEFAULT (1), other int DEFAULT (2), absent int);").await.unwrap();
+    let before = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let names = db
+        .conn
+        .query("SELECT name FROM sys.default_constraints ORDER BY name")
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get::<&str>("name").unwrap().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let mut after = before.clone();
+    for table in after.tables.values_mut() {
+        for column in table.columns.values_mut() {
+            column.ty = ty("bigint");
+        }
+    }
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    let changes = plan(&before, &ids, &after, &ids);
+    assert_eq!(
+        changes.changes.len(),
+        3,
+        "unchanged defaults stay part of their column"
+    );
+    let result = try_apply(&mut db.conn, &changes).await;
+    let observed = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let actual_names = db
+        .conn
+        .query("SELECT name FROM sys.default_constraints ORDER BY name")
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get::<&str>("name").unwrap().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let inserted = db
+        .conn
+        .execute("INSERT dbo.[retype't] DEFAULT VALUES;")
+        .await;
+    let rows = db
+        .conn
+        .query("SELECT [n]]x] AS n, other, absent FROM dbo.[retype't]")
+        .await
+        .unwrap();
+    db.drop().await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(observed, after);
+    assert!(plan(&observed, &ids, &after, &ids).is_empty());
+    assert_eq!(
+        actual_names, names,
+        "both adopted and server-generated names survive"
+    );
+    inserted.unwrap();
+    assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(1));
+    assert_eq!(rows[0].try_get::<i64>("other").unwrap(), Some(2));
+    assert_eq!(rows[0].try_get::<i64>("absent").unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_failed_retype_restores_the_default_it_temporarily_removed() {
+    let mut db = TestDb::create("retype_default_rollback180").await;
+    db.conn
+        .execute("CREATE TABLE dbo.t (n int CONSTRAINT df_n DEFAULT 1); INSERT dbo.t VALUES (300);")
+        .await
+        .unwrap();
+    let before = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let mut after = before.clone();
+    after
+        .tables
+        .get_mut(&TableName::new("dbo", "t"))
+        .unwrap()
+        .columns["n"]
+        .ty = ty("tinyint");
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    let result = try_apply(&mut db.conn, &plan(&before, &ids, &after, &ids)).await;
+    let observed = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let insert = db.conn.execute("INSERT dbo.t DEFAULT VALUES;").await;
+    let values = db
+        .conn
+        .query("SELECT n FROM dbo.t ORDER BY n")
+        .await
+        .unwrap();
+    db.drop().await;
+    assert!(
+        result.is_err(),
+        "the out-of-range stored row must refuse the conversion"
+    );
+    assert_eq!(observed, before);
+    insert.unwrap();
+    assert_eq!(values[0].try_get::<i32>("n").unwrap(), Some(1));
+    assert_eq!(values[1].try_get::<i32>("n").unwrap(), Some(300));
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn retyped_keys_checks_indexes_and_foreign_keys_converge_and_still_enforce() {
+    use pbps_model::Change;
+    let mut db = TestDb::create("retype_dependents180").await;
+    db.conn.execute("CREATE TABLE dbo.p (id int NOT NULL CONSTRAINT pk_p PRIMARY KEY, u int CONSTRAINT uq_p UNIQUE, x int, CONSTRAINT ck_p CHECK(id > 0), CONSTRAINT fk_self FOREIGN KEY(u) REFERENCES dbo.p(id)); CREATE INDEX ix_key ON dbo.p(u); CREATE INDEX ix_include ON dbo.p(x) INCLUDE(id); CREATE INDEX ix_filter ON dbo.p(x) WHERE id > 0; CREATE INDEX ix_unrelated ON dbo.p(x); CREATE TABLE dbo.c (n int CONSTRAINT fk_c REFERENCES dbo.p(id)); INSERT dbo.p VALUES(1,1,7); INSERT dbo.c VALUES(1);").await.unwrap();
+    let before = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let mut after = before.clone();
+    let parent = after.tables.get_mut(&TableName::new("dbo", "p")).unwrap();
+    parent.columns["id"].ty = ty("bigint");
+    parent.columns["u"].ty = ty("bigint");
+    after
+        .tables
+        .get_mut(&TableName::new("dbo", "c"))
+        .unwrap()
+        .columns["n"]
+        .ty = ty("bigint");
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    let changes = plan(&before, &ids, &after, &ids);
+    assert!(
+        !changes
+            .changes
+            .iter()
+            .any(|p| matches!(&p.change, Change::DropIndex { name, .. } if name == "ix_unrelated"))
+    );
+    assert_eq!(
+        changes
+            .changes
+            .iter()
+            .filter(|p| matches!(&p.change, Change::DropForeignKey { .. }))
+            .count(),
+        2
+    );
+    let result = try_apply(&mut db.conn, &changes).await;
+    let observed = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let fk_refused = db.conn.execute("INSERT dbo.c VALUES(2)").await.is_err();
+    let check_refused = db
+        .conn
+        .execute("INSERT dbo.p VALUES(-1,NULL,7)")
+        .await
+        .is_err();
+    let unique_refused = db.conn.execute("INSERT dbo.p VALUES(2,1,7)").await.is_err();
+    db.drop().await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(observed, after);
+    assert!(plan(&observed, &ids, &after, &ids).is_empty());
+    assert!(fk_refused && check_refused && unique_refused);
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filter() {
+    use pbps_model::Change;
+    let mut db = TestDb::create("retype_width180").await;
+    db.conn.execute("CREATE TABLE dbo.p (n varchar(10) NOT NULL CONSTRAINT pk_p PRIMARY KEY, x int, CONSTRAINT ck_p CHECK(n <> '')); CREATE INDEX ix_n ON dbo.p(n); CREATE INDEX ix_filter ON dbo.p(x) WHERE n IS NOT NULL; CREATE TABLE dbo.c (n varchar(10) CONSTRAINT fk_c REFERENCES dbo.p(n)); INSERT dbo.p VALUES('one',1); INSERT dbo.c VALUES('one');").await.unwrap();
+    let before = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let mut after = before.clone();
+    after
+        .tables
+        .get_mut(&TableName::new("dbo", "p"))
+        .unwrap()
+        .columns["n"]
+        .ty = ty("varchar(20)");
+    after
+        .tables
+        .get_mut(&TableName::new("dbo", "c"))
+        .unwrap()
+        .columns["n"]
+        .ty = ty("varchar(20)");
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    let changes = plan(&before, &ids, &after, &ids);
+    assert_eq!(changes.changes.len(), 6, "{changes:?}");
+    assert!(!changes.changes.iter().any(|p| matches!(
+        &p.change,
+        Change::SetPrimaryKey { .. } | Change::DropCheck { .. }
+    ) || matches!(&p.change, Change::DropIndex { name, .. } if name == "ix_n")));
+    let result = try_apply(&mut db.conn, &changes).await;
+    let observed = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let refused = db
+        .conn
+        .execute("INSERT dbo.c VALUES('missing')")
+        .await
+        .is_err();
+    db.drop().await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(observed, after);
+    assert!(refused);
+}
+
+#[test]
+fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_changes() {
+    use pbps_model::{Change, CheckConstraint, Hints};
+    let parent_name = TableName::new("dbo", "p");
+    let child_name = TableName::new("dbo", "c");
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("n".into(), Column::new(ty("int")).not_null());
+    parent
+        .columns
+        .insert("other".into(), Column::new(ty("int")));
+    parent.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["n".into()],
+    });
+    parent.unique.insert(
+        "uq".into(),
+        UniqueConstraint {
+            columns: vec!["n".into()],
+        },
+    );
+    parent.checks.insert(
+        "ck".into(),
+        CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    let mut child = Table::default();
+    child.columns.insert("n".into(), Column::new(ty("int")));
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["n".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["n".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut before = Schema::default();
+    before.tables.insert(parent_name.clone(), parent);
+    before.tables.insert(child_name.clone(), child);
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    assert!(plan(&before, &ids, &before, &ids).is_empty());
+    let mut after = before.clone();
+    after.tables.get_mut(&parent_name).unwrap().columns["n"].ty = ty("bigint");
+    after.tables.get_mut(&child_name).unwrap().columns["n"].ty = ty("bigint");
+    // The default trait answer adds no dependency maintenance on other engines.
+    let other = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &before,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &after,
+            ids: &ids,
+        },
+        &pbps_dialect::MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert_eq!(other.changes.len(), 2);
+    for explicit in [false, true] {
+        let mut wanted = after.clone();
+        if explicit {
+            let parent = wanted.tables.get_mut(&parent_name).unwrap();
+            parent
+                .unique
+                .get_mut("uq")
+                .unwrap()
+                .columns
+                .push("other".into());
+            parent.checks.clear();
+            wanted
+                .tables
+                .get_mut(&child_name)
+                .unwrap()
+                .foreign_keys
+                .get_mut("fk")
+                .unwrap()
+                .on_delete = ReferentialAction::Cascade;
+        }
+        let changes = plan(&before, &ids, &wanted, &ids);
+        let count =
+            |test: fn(&Change) -> bool| changes.changes.iter().filter(|p| test(&p.change)).count();
+        assert_eq!(count(|c| matches!(c, Change::DropForeignKey { .. })), 1);
+        assert_eq!(count(|c| matches!(c, Change::AddForeignKey { .. })), 1);
+        assert_eq!(count(|c| matches!(c, Change::DropUnique { .. })), 1);
+        assert_eq!(count(|c| matches!(c, Change::AddUnique { .. })), 1);
+        assert_eq!(count(|c| matches!(c, Change::DropCheck { .. })), 1);
+        assert_eq!(
+            count(|c| matches!(c, Change::AddCheck { .. })),
+            usize::from(!explicit)
+        );
+        assert!(matches!(
+            changes.changes[0].change,
+            Change::DropForeignKey { .. }
+        ));
+        assert!(matches!(
+            changes.changes.last().unwrap().change,
+            Change::AddForeignKey { .. }
+        ));
+    }
+    let new_parent = TableName::new("dbo", "renamed");
+    let mut renamed = after.tables.remove(&parent_name).unwrap();
+    let column = renamed.columns.shift_remove("n").unwrap();
+    renamed.columns.insert("wide".into(), column);
+    renamed.primary_key.as_mut().unwrap().columns = vec!["wide".into()];
+    renamed.unique.get_mut("uq").unwrap().columns = vec!["wide".into()];
+    renamed.checks.get_mut("ck").unwrap().expression = "wide > 0".into();
+    after.tables.insert(new_parent.clone(), renamed);
+    let fk = after
+        .tables
+        .get_mut(&child_name)
+        .unwrap()
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap();
+    fk.references_table = new_parent.clone();
+    fk.references_columns = vec!["wide".into()];
+    let renamed_ids = mint_ids(
+        &after,
+        &ids,
+        &[
+            Intent::RenameTable {
+                from: parent_name,
+                to: new_parent.clone(),
+            },
+            Intent::RenameColumn {
+                table: new_parent.clone(),
+                from: "n".into(),
+                to: "wide".into(),
+            },
+        ],
+    );
+    let changes = plan(&before, &ids, &after, &renamed_ids);
+    assert!(changes.changes.iter().any(|p| matches!(&p.change,
+        Change::SetPrimaryKey { table, from: None, to: Some(key) }
+        if table == &new_parent && key.columns == ["wide"])));
+    assert!(changes.changes.iter().any(|p| matches!(&p.change,
+        Change::AddForeignKey { constraint, .. } if constraint.references_table == new_parent
+            && constraint.references_columns == ["wide"])));
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn unmodelled_check_and_unique_write_behavior_is_inventoried_before_rebuild() {
+    let mut db = TestDb::create("retype_enforcement180").await;
+    for (suffix, setup, expected) in [
+        (
+            "check_disabled",
+            "ALTER TABLE dbo.t NOCHECK CONSTRAINT ck;",
+            "check constraint `ck`",
+        ),
+        (
+            "check_untrusted",
+            "ALTER TABLE dbo.t NOCHECK CONSTRAINT ck; ALTER TABLE dbo.t CHECK CONSTRAINT ck;",
+            "check constraint `ck`",
+        ),
+        (
+            "check_replication",
+            "ALTER TABLE dbo.t DROP CONSTRAINT ck; ALTER TABLE dbo.t ADD CONSTRAINT ck CHECK NOT FOR REPLICATION (n > 0);",
+            "check constraint `ck`",
+        ),
+        (
+            "unique_disabled",
+            "CREATE UNIQUE INDEX ux ON dbo.t(n); ALTER INDEX ux ON dbo.t DISABLE;",
+            "unique index `ux`",
+        ),
+        (
+            "unique_ignore",
+            "CREATE UNIQUE INDEX ux ON dbo.t(n,x) WITH (IGNORE_DUP_KEY=ON);",
+            "unique index `ux`",
+        ),
+        (
+            "pk_ignore",
+            "ALTER TABLE dbo.t ADD CONSTRAINT pk PRIMARY KEY(n) WITH (IGNORE_DUP_KEY=ON);",
+            "key constraint `pk`",
+        ),
+        (
+            "uq_ignore",
+            "ALTER TABLE dbo.t ADD CONSTRAINT uq UNIQUE(n,x) WITH (IGNORE_DUP_KEY=ON);",
+            "key constraint `uq`",
+        ),
+        (
+            "uq_disabled",
+            "ALTER TABLE dbo.t ADD CONSTRAINT uq UNIQUE(n); ALTER INDEX uq ON dbo.t DISABLE;",
+            "key constraint `uq`",
+        ),
+    ] {
+        db.conn
+            .execute(
+                "CREATE TABLE dbo.t(n int NOT NULL CONSTRAINT ck CHECK(n > 0), x int NOT NULL);",
+            )
+            .await
+            .unwrap();
+        db.conn.execute(setup).await.unwrap();
+        let pulled = pbps_mssql::catalog::introspect(&mut db.conn).await.unwrap();
+        db.conn.execute("DROP TABLE dbo.t").await.unwrap();
+        assert_eq!(
+            pulled.limitations.len(),
+            1,
+            "{suffix}: {:?}",
+            pulled.limitations
+        );
+        assert!(
+            pulled.limitations[0].detail.contains(expected),
+            "{suffix}: {:?}",
+            pulled.limitations
+        );
+        assert_eq!(
+            pulled.limitations[0].target.object_name(),
+            TableName::new("dbo", "t")
+        );
+    }
+    // Access-path-only differences retain the existing storage-policy boundary.
+    db.conn.execute("CREATE TABLE dbo.t(n int NOT NULL CONSTRAINT pk PRIMARY KEY, v int CONSTRAINT uq UNIQUE, CONSTRAINT ck CHECK(n > 0)); CREATE INDEX ix ON dbo.t(n); ALTER INDEX ix ON dbo.t DISABLE;").await.unwrap();
+    let ordinary = pbps_mssql::catalog::introspect(&mut db.conn).await.unwrap();
+    db.drop().await;
+    assert!(
+        ordinary.limitations.is_empty(),
+        "{:?}",
+        ordinary.limitations
+    );
+    let t = &ordinary.schema.tables[&TableName::new("dbo", "t")];
+    assert!(
+        t.primary_key.is_some()
+            && t.unique.contains_key("uq")
+            && t.checks.contains_key("ck")
+            && t.indexes.contains_key("ix")
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn retyping_an_included_column_recreates_fks_bound_to_its_unique_index() {
+    use pbps_model::Change;
+    let mut db = TestDb::create("retype_included_fk180").await;
+    let mut results = Vec::new();
+    for unique in [false, true] {
+        db.conn
+            .execute("CREATE TABLE dbo.p (x int NOT NULL, n int);")
+            .await
+            .unwrap();
+        if !unique {
+            db.conn
+                .execute("ALTER TABLE dbo.p ADD CONSTRAINT uq_p UNIQUE(x)")
+                .await
+                .unwrap();
+        }
+        db.conn.execute(&format!("CREATE {}INDEX ix_p ON dbo.p(x) INCLUDE(n); CREATE TABLE dbo.c (x int CONSTRAINT fk_c REFERENCES dbo.p(x)); INSERT dbo.p VALUES(1,7); INSERT dbo.c VALUES(1);", if unique { "UNIQUE " } else { "" })).await.unwrap();
+        let before = pbps_mssql::catalog::introspect(&mut db.conn)
+            .await
+            .unwrap()
+            .schema;
+        let mut after = before.clone();
+        after
+            .tables
+            .get_mut(&TableName::new("dbo", "p"))
+            .unwrap()
+            .columns["n"]
+            .ty = ty("bigint");
+        let ids = mint_ids(&before, &IdsFile::default(), &[]);
+        let changes = plan(&before, &ids, &after, &ids);
+        let fk_drops = changes
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, Change::DropForeignKey { .. }))
+            .count();
+        let result = try_apply(&mut db.conn, &changes).await;
+        let observed = pbps_mssql::catalog::introspect(&mut db.conn)
+            .await
+            .unwrap()
+            .schema;
+        let refused = db.conn.execute("INSERT dbo.c VALUES(2)").await.is_err();
+        db.conn
+            .execute("DROP TABLE dbo.c; DROP TABLE dbo.p;")
+            .await
+            .unwrap();
+        results.push((
+            unique,
+            fk_drops,
+            result,
+            observed == after,
+            plan(&observed, &ids, &after, &ids).is_empty(),
+            refused,
+        ));
+    }
+    db.drop().await;
+    for (unique, fk_drops, result, converged, next_empty, enforced) in results {
+        assert_eq!(fk_drops, usize::from(unique));
+        assert_eq!(result, Ok(()));
+        assert!(converged && next_empty && enforced);
+    }
+}

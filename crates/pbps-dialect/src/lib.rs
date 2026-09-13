@@ -1214,9 +1214,28 @@ fn opens_escape_string(text: &str, at: usize) -> bool {
     }
 }
 
+/// Managed dependents an engine requires rebuilt around a column type change.
+/// The differ turns these facts into ordinary changes before ordering and risk
+/// classification. Expressions are opaque, so CHECKs and filtered indexes are
+/// conservatively selected at table scope; named column lists are exact.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetypeDependents {
+    pub keys_and_indexes: bool,
+    pub checks: bool,
+    pub filtered_indexes: bool,
+    pub foreign_keys: bool,
+}
+
 /// Dialect knowledge that needs no database connection.
 pub trait Dialect {
     fn name(&self) -> &'static str;
+
+    /// Dependencies that cannot remain standing while this type changes.
+    /// Engines that perform their own dependency maintenance need no extra
+    /// changes. Defaults remain part of the column and are the emitter's work.
+    fn retype_dependents(&self, _from: &ColumnType, _to: &ColumnType) -> RetypeDependents {
+        RetypeDependents::default()
+    }
 
     /// Expands aliases and fills in omitted default arguments, so that two
     /// semantically identical spellings become the same value.

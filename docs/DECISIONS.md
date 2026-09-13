@@ -11216,3 +11216,39 @@ SPEC is in sync with all of these.
      and live CLI tests cover clean and orphaned disabled/untrusted keys,
      replication semantics, changes after approval, unchanged engine flags on
      refusal, and applying the same plan after an explicit operator repair.
+
+461. **SQL Server retypes preserve defaults and explicitly rebuild managed dependents (issue #180).**
+     Measured on SQL Server 17.0.4075.5, changing `int` to `bigint` is refused
+     while a default, CHECK, primary/unique key, ordinary/filtered index or FK
+     binds the column. Modifier-only changes preserve CHECKs; bounded
+     `varchar`, `nvarchar` and `varbinary` widenings also preserve ordinary
+     indexes and keys. FKs and filtered predicates still block those widenings;
+     fixed-width, numeric modifier and `max` transitions do not share the index
+     exception. The dialect reports these distinctions through the pure
+     `retype_dependents` hook. The differ adds ordinary drop/add changes before
+     sorting and classification, retaining destructive/constraint approval and
+     probe behavior. Column lists select exact dependents; CHECK/filter text
+     stays opaque, so these expressions are conservatively selected at table
+     scope. Identity alignment handles table/column renames, and explicit
+     replacements/removals are not duplicated. Referenced-key expansion also
+     covers FKs whose backing unique index includes a retyped non-key column.
+     PostgreSQL requests no such maintenance and keeps its existing plan shape.
+
+     An unchanged default remains part of its column, without extra shared
+     `AlterColumnDefault` changes or saved-plan fields. The SQL Server emitter
+     saves the catalog's actual constraint name and definition, drops it,
+     changes the type, then restores the same default in one isolated batch.
+     A named default with an unreadable definition refuses; an absent default
+     remains absent. Dynamic identifiers and literals retain their quoting.
+     A default explicitly changed by this plan follows decision 271's existing
+     drop/type/add ordering. The transaction restores the default if conversion
+     fails. Cross-table dependencies are never discovered as extra runtime DDL;
+     the saved plan carries their ordinary risks and connected guards.
+
+     Rebuilding may not replace unmodelled write behavior with default behavior.
+     The catalog therefore inventories disabled/untrusted/NOT FOR REPLICATION
+     CHECKs and disabled/IGNORE_DUP_KEY unique indexes or key constraints as
+     limitations; connected commands already refuse a managed limitation before
+     writes. The names stay in the diagnostic, not as ordinary enforcing model
+     objects. Ordinary disabled nonunique indexes are access-path differences
+     and retain the existing storage-policy boundary of issue #171.
