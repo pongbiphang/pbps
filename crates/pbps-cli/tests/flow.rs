@@ -12638,3 +12638,46 @@ fn a_staged_rename_checks_recreated_names_under_the_database_collation() {
         );
     }
 }
+
+#[test]
+fn constraint_name_collisions_are_refused_before_connecting_on_both_dialects() {
+    for (dialect, unreachable) in [
+        (
+            "mssql",
+            "Server=127.0.0.1,1;User Id=sa;Password=no;TrustServerCertificate=true",
+        ),
+        (
+            "postgres",
+            "host=127.0.0.1 port=1 user=postgres password=no dbname=none",
+        ),
+    ] {
+        let d = Demo::new(&format!("constraint-names-{dialect}"));
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
+        let declaration = "table: app.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\nchecks:\n  shared: id > 0\nforeign_keys:\n  shared:\n    columns: [id]\n    references: app.t(id)\n";
+        d.table(declaration);
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        for command in [
+            vec!["validate"],
+            vec!["plan", "--db", unreachable],
+            vec!["bootstrap", "--db", unreachable],
+        ] {
+            let out = d.run(&command);
+            assert_ne!(code(&out), 0, "{dialect} {command:?}: {}", stdout(&out));
+            let message = format!("{}{}", stdout(&out), stderr(&out));
+            for expected in ["foreign key", "check constraint", "`shared`"] {
+                assert!(
+                    message.contains(expected),
+                    "{dialect} {command:?}: {message}"
+                );
+            }
+            assert!(
+                !message.contains("127.0.0.1"),
+                "must refuse before connecting: {message}"
+            );
+        }
+        d.table(&declaration.replace("foreign_keys:\n  shared:", "foreign_keys:\n  fk_t:"));
+        let out = d.run(&["validate"]);
+        assert_eq!(code(&out), 0, "{dialect}: {}{}", stdout(&out), stderr(&out));
+    }
+}

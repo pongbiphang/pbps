@@ -21944,3 +21944,74 @@ async fn the_legacy_fallback_batches_past_postgresqls_parameter_ceiling() {
 
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs a live pg"]
+async fn constraint_name_validation_preserves_legal_index_sharing() {
+    let s = emit_schema("constraint_names179");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let name = TableName::new(&s, "child");
+    conn.execute(&format!("CREATE TABLE {s}.parent (id int PRIMARY KEY); CREATE TABLE {s}.child (id int NOT NULL, CONSTRAINT shared CHECK (id > 0)); CREATE INDEX shared ON {s}.child(id)")).await.unwrap();
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+    table.checks.insert(
+        "shared".into(),
+        pbps_model::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    table.indexes.insert(
+        "shared".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        },
+    );
+    assert!(Postgres::new().validate_table(&name, &table).is_empty());
+    table.foreign_keys.insert(
+        "shared".into(),
+        ForeignKey {
+            columns: vec!["id".into()],
+            references_table: TableName::new(&s, "parent"),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let problems = Postgres::new().validate_table(&name, &table);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    let problem = problems[0].to_string();
+    for expected in ["foreign key", "check constraint", "shared"] {
+        assert!(problem.contains(expected), "{problem}");
+    }
+    let error = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT shared FOREIGN KEY (id) REFERENCES {s}.parent(id)"
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.server_error_code().as_deref(),
+        Some("42710"),
+        "{error}"
+    );
+    let fk = table.foreign_keys.remove("shared").unwrap();
+    table.foreign_keys.insert("fk_child".into(), fk);
+    assert!(Postgres::new().validate_table(&name, &table).is_empty());
+    conn.execute(&format!(
+        "ALTER TABLE {s}.child ADD CONSTRAINT fk_child FOREIGN KEY (id) REFERENCES {s}.parent(id)"
+    ))
+    .await
+    .unwrap();
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .unwrap();
+}

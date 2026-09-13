@@ -11116,3 +11116,19 @@ SPEC is in sync with all of these.
      failure and a refused resume, and keep successful clean deployments as
      controls. Restoring the reviewed guard makes the new test accept the
      replaced UNIQUE and fail its refusal assertion.
+
+459. **Declared constraint kinds share a table-local name check (issue #179).**
+     Primary-key, unique, foreign-key and check declarations occupy separate
+     model fields, so their maps cannot refuse the same explicit name used by
+     two kinds. `Table::constraint_name_conflicts` compares those names once;
+     both dialect validators consume it through the existing declaration
+     gate. It reports every later claimant against the first, naming both
+     kinds. An unnamed primary key contributes no guessed generated name.
+     This changes no model serialization, identity, diff or emission behavior.
+
+     Measured on PostgreSQL 18.6 and SQL Server 2025, CHECK and FK sharing a
+     name on one table are refused, while a CHECK and an ordinary index of
+     that name are accepted. Indexes therefore remain outside this check;
+     PostgreSQL's schema relation/index check from decision 453 still handles
+     index and named key-backing-index collisions. Generated PostgreSQL names
+     remain the separate issue #465.

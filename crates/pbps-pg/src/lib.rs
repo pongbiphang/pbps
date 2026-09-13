@@ -1970,13 +1970,13 @@ mod tests {
             columns: vec!["id".to_owned()],
         });
         table.unique.insert(
-            long.clone(),
+            format!("uq_{long}"),
             pbps_model::UniqueConstraint {
                 columns: vec!["id".to_owned()],
             },
         );
         table.checks.insert(
-            long.clone(),
+            format!("ck_{long}"),
             pbps_model::CheckConstraint {
                 expression: "id > 0".to_owned(),
             },
@@ -2188,5 +2188,106 @@ mod tests {
 
     fn ty(s: &str) -> ColumnType {
         s.parse().expect("a type parses")
+    }
+    #[test]
+    fn every_cross_kind_constraint_name_collision_is_reported() {
+        use pbps_model::{
+            CheckConstraint, Column, ForeignKey, Index, IndexColumn, PrimaryKey, ReferentialAction,
+            UniqueConstraint,
+        };
+        let kinds = [
+            "primary key",
+            "unique constraint",
+            "foreign key",
+            "check constraint",
+        ];
+        for first in 0..kinds.len() {
+            for second in first + 1..kinds.len() {
+                let mut table = Table::default();
+                table
+                    .columns
+                    .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+                for (kind, name) in [(first, "same"), (second, "same")] {
+                    match kind {
+                        0 => {
+                            table.primary_key = Some(PrimaryKey {
+                                name: Some(name.into()),
+                                columns: vec!["id".into()],
+                            })
+                        }
+                        1 => {
+                            table.unique.insert(
+                                name.into(),
+                                UniqueConstraint {
+                                    columns: vec!["id".into()],
+                                },
+                            );
+                        }
+                        2 => {
+                            table.foreign_keys.insert(
+                                name.into(),
+                                ForeignKey {
+                                    columns: vec!["id".into()],
+                                    references_table: "app.parent".parse().unwrap(),
+                                    references_columns: vec!["id".into()],
+                                    on_delete: ReferentialAction::NoAction,
+                                    on_update: ReferentialAction::NoAction,
+                                },
+                            );
+                        }
+                        3 => {
+                            table.checks.insert(
+                                name.into(),
+                                CheckConstraint {
+                                    expression: "id > 0".into(),
+                                },
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                let errors: Vec<String> = Postgres::new()
+                    .validate_table(&"app.t".parse().unwrap(), &table)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                for expected in [kinds[first], kinds[second], "`same`"] {
+                    assert!(errors[0].contains(expected), "{errors:?}");
+                }
+            }
+        }
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        table.checks.insert(
+            "same".into(),
+            CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        table.indexes.insert(
+            "same".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "id".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        assert!(
+            Postgres::new()
+                .validate_table(&"app.t".parse().unwrap(), &table)
+                .is_empty(),
+            "a check and an ordinary index may share a name"
+        );
     }
 }
