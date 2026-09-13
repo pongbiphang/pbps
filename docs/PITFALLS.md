@@ -1070,15 +1070,14 @@ the stored `new` for ever after. A sweep that enumerates *call sites* misses
 the value that was never a call site — enumerate the **values the plan claims
 to have written**, and check that each one is checked.
 
-The SQL Server counterpart needs both native equality and a binary-collated
-text comparison plus equal `DATALENGTH` (DECISIONS 471). Even binary equality
-pads away trailing spaces in `varchar` and `nvarchar`. Let the engine type the
-expected key before rendering it: `ISNULL` with a column-typed NULL preserves
-valid `char`/`nchar` padding, while a CASE mixing column and literal does not.
-Canonical money, float and datetime keys also differ from generic `CONVERT`
-formatting; keep native equality because that conversion can round away a
-real value change. Row selection and delete absence still ask the separate
-question of identity under the column's collation.
+The SQL Server counterpart needs native identity plus text and length checks
+(DECISIONS 472). Binary equality pads away trailing spaces. ISNULL with a
+column-typed NULL supplies char/nchar padding, but can also truncate over-width
+spaces or recode Unicode exactly as assignment did. A separate CASE preserves
+the text literal for content comparison and the minimum accepted length;
+ISNULL supplies only the padded length. The engine still converts non-text
+keys, preserving the numeric aliases intentionally supported by 71/101.
+Generic rendering can lose money/float precision, so retain native equality.
 
 **A fifth instance, in code written after this section was.** A planned
 column's backfill was spelled as its bare literal. Against a stored column the

@@ -1152,16 +1152,20 @@ fn wrote_the_row(
     let quoted = quote(key_column)?;
     let expected = row_key(key);
     // Native equality keeps precision lost by generic money/float rendering.
-    // ISNULL takes the column's type from a typed NULL, so the expected key
-    // receives char/nchar padding as well as non-text conversion. DATALENGTH
-    // then distinguishes trailing spaces in varying text: even binary =
-    // pads those away. The plan carries no key type (DECISIONS 471).
+    // CASE preserves the text literal's spelling/width while typing non-text
+    // keys. ISNULL supplies char/nchar padding only for the length check:
+    // using its converted text would hide code-page changes and truncation.
+    // Binary = also pads spaces, so require the padded length without ever
+    // accepting less than the full literal. No key type is carried (DECISIONS 472).
     let actual_text = format!("CONVERT(nvarchar(max), {quoted})");
     let expected_text =
+        format!("CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN {quoted} ELSE {expected} END)");
+    let padded_text =
         format!("CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN {quoted} END, {expected}))");
     let mut predicate = vec![format!(
         "{quoted} = {expected} AND {actual_text} = {expected_text} \
-         COLLATE Latin1_General_BIN2 AND DATALENGTH({actual_text}) = DATALENGTH({expected_text})"
+         COLLATE Latin1_General_BIN2 AND DATALENGTH({actual_text}) = DATALENGTH({padded_text}) \
+         AND DATALENGTH({actual_text}) >= DATALENGTH({expected_text})"
     )];
     predicate.extend(cells.iter().cloned());
     Ok(format!(
@@ -2478,9 +2482,11 @@ mod tests {
             sql[0].contains(
                 "IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] \
                  WHERE [code] = N'new' AND CONVERT(nvarchar(max), [code]) = \
-                 CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new')) \
+                 CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) \
                  COLLATE Latin1_General_BIN2 AND DATALENGTH(CONVERT(nvarchar(max), [code])) = \
                  DATALENGTH(CONVERT(nvarchar(max), ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new'))) \
+                 AND DATALENGTH(CONVERT(nvarchar(max), [code])) >= DATALENGTH(CONVERT(nvarchar(max), \
+                 CASE WHEN 1 = 0 THEN [code] ELSE N'new' END)) \
                  AND [label] = N'New')"
             ),
             "{}",
@@ -2662,9 +2668,11 @@ mod tests {
                 "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
                  IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new' \
                  AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), \
-                 ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new')) COLLATE Latin1_General_BIN2 \
+                 CASE WHEN 1 = 0 THEN [code] ELSE N'new' END) COLLATE Latin1_General_BIN2 \
                  AND DATALENGTH(CONVERT(nvarchar(max), [code])) = DATALENGTH(CONVERT(nvarchar(max), \
-                 ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new'))))\n  \
+                 ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'new'))) \
+                 AND DATALENGTH(CONVERT(nvarchar(max), [code])) >= DATALENGTH(CONVERT(nvarchar(max), \
+                 CASE WHEN 1 = 0 THEN [code] ELSE N'new' END)))\n  \
                  THROW 50000, N'dbo.order_status row `new` is not what this plan wrote once the \
                  statement had run — a trigger on the table, another writer inside it, or a \
                  value the engine stores differently from the way it is declared. Nothing was \
@@ -3364,9 +3372,11 @@ mod tests {
                 r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');",
                 "\nIF NOT EXISTS (SELECT 1 FROM [dbo].[t] WHERE [code] = N'o''brien' ",
                 "AND CONVERT(nvarchar(max), [code]) = CONVERT(nvarchar(max), ",
-                "ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'o''brien')) COLLATE Latin1_General_BIN2 ",
+                "CASE WHEN 1 = 0 THEN [code] ELSE N'o''brien' END) COLLATE Latin1_General_BIN2 ",
                 "AND DATALENGTH(CONVERT(nvarchar(max), [code])) = DATALENGTH(CONVERT(nvarchar(max), ",
                 "ISNULL(CASE WHEN 1 = 0 THEN [code] END, N'o''brien'))) ",
+                "AND DATALENGTH(CONVERT(nvarchar(max), [code])) >= DATALENGTH(CONVERT(nvarchar(max), ",
+                "CASE WHEN 1 = 0 THEN [code] ELSE N'o''brien' END)) ",
                 r"AND [label] = N'''); DROP TABLE [dbo].[t]; --')",
                 "\n  THROW 50000, N'dbo.t row `o''brien` is not what this plan wrote once ",
                 "the statement had run — a trigger on the table, another writer inside it, ",

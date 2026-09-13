@@ -11737,39 +11737,43 @@ SPEC is in sync with all of these.
      `read_expr` writes for them, which is the recorded text of every spatial
      cell. Filed rather than done here.
 
-471. **SQL Server row-write postconditions also hold the key's text spelling
-     (issue #218).** The native key comparison identifies a row under its
-     column's collation; it can accept a trigger changing `New` to `new`.
-     `wrote_the_row` keeps that comparison and adds both a binary-collated text
-     comparison and equal `DATALENGTH` for inserts and updates. Even binary
-     collation pads strings for equality, so the length check is necessary
-     to catch a trigger appending spaces to a `varchar` or `nvarchar` key.
-     Row selection and the delete postcondition still ask about native
-     identity (132), not spelling.
+472. **SQL Server row-write postconditions hold text key spelling without
+     changing numeric aliases (issue #218).** Native key equality can accept
+     a trigger changing `New` to `new`. Keep native equality and additionally
+     compare rendered text under a binary collation, with length checks since
+     even binary equality pads away trailing spaces. UPDATE/DELETE selection
+     and the delete postcondition retain native comparisons (132).
 
-     A saved row change carries types for non-key cells only. Rather than
-     add a model field or require catalog visibility, compare the key's
-     generic `nvarchar(max)` rendering with the rendering of
-     `ISNULL(CASE WHEN 1 = 0 THEN <key column> END, <declared literal>)`.
-     The first argument is a NULL with the column's type; `ISNULL` converts
-     the expected value to that type, including `char` and `nchar` padding.
-     Thus matching lengths do not reject valid fixed-width text. A CASE
-     mixing the column with the literal instead chooses a varying-text type
-     for text keys and does not supply that padding.
+     A saved row change carries types for non-key cells only. The expected
+     text is `CONVERT(nvarchar(max), CASE WHEN 1 = 0 THEN <key column>
+     ELSE <declared literal> END)`. The Unicode literal retains its text and
+     width, while SQL Server applies the column's conversion for numeric,
+     temporal, UUID and hierarchyid keys. This preserves the convertible
+     numeric aliases of 71/101, including `01` for int and `1.5` for decimal.
+     Requiring the raw spelling for those would refuse existing valid plans;
+     their alias contract is distinct from the text-write defect here.
 
-     Measured on SQL Server 17.0.4075.5, the pair also agrees for canonical
-     decimal, money, float, date, datetime, hierarchyid and UUID keys.
-     Comparing a generic rendering directly to the raw declaration would
-     reject money, float and datetime keys that the canonical reader accepts.
-     Native equality remains necessary as well: generic text conversion can
-     round two distinct money or float values to the same text.
+     A second expression, `ISNULL(CASE WHEN 1 = 0 THEN <key column> END,
+     <declared literal>)`, supplies the exact column type, including char/nchar
+     padding. Require the actual rendered length to equal that padded length
+     and to be at least the full expected text's length. Assignment and
+     ISNULL can both silently discard over-width trailing spaces (`abc ` in
+     varchar(3) or nvarchar(3)); the lower bound catches that loss. Varying
+     text spaces that fit and fixed-width padding remain valid.
 
-     Live regressions accept the same emitted INSERT/UPDATE without a trigger,
-     then refuse and atomically undo triggers that lowercase a quoted key or
-     append a space to either varying-text type. Canonical non-text keys,
-     both fixed-width text types and declared varying-text keys ending in a
-     space still accept both writes. A money trigger changing only precision
-     lost by generic rendering is refused. Restoring the first binary-only
-     guard fails the trailing-space tests; removing expected fixed-width
-     padding refuses a valid char key; removing native equality accepts the
-     money change. The complete guard passes all cases.
+     Compare contents against the full expected text, not ISNULL's converted
+     text: the latter can also reproduce a lossy code-page conversion.
+     Measured on SQL Server 17.0.4075.5 under SQL_Latin1_General_CP1_CI_AS,
+     fullwidth Latin A becomes ASCII A in varchar while native equality
+     accepts it. Native equality is still needed for non-text precision:
+     generic conversion can render distinct money or float values alike.
+     These expressions add no catalog permission or saved-plan field.
+
+     Live regressions inspect statement-owned rollback for INSERT/UPDATE
+     triggers changing case or appending spaces, over-width trailing spaces
+     and code-page conversion. Positive cases retain canonical non-text keys,
+     numeric aliases, fixed-width padding and varying-text spaces that fit;
+     a money change lost by generic rendering is refused. Counterfactuals
+     restore the prior guard, compare converted text or remove the length
+     lower bound, then prove the corresponding tests fail. The complete
+     guard and the existing numeric-alias read-back regression pass.

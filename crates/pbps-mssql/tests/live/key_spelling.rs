@@ -148,6 +148,9 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
     for (tag, key_type, key) in [
         ("int", "int", "7"),
         ("decimal", "decimal(5,2)", "1.50"),
+        // Numeric key aliases are accepted intentionally (DECISIONS 71/101).
+        ("int_alias", "int", "01"),
+        ("decimal_alias", "decimal(5,2)", "1.5"),
         ("money", "money", "1.0001"),
         ("float", "float", "-2.5500000000000000e+002"),
         ("date", "date", "2026-09-04"),
@@ -185,8 +188,8 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
             results.push((key_type, result));
         }
     }
-    // The generic rendering rounds both money values to 1.00. Retaining
-    // native equality is what catches the changed key despite that rounding.
+    // Generic text rounds both money values to 1.00. Native equality must
+    // still catch a changed key despite that loss of precision.
     db.conn.execute("CREATE TRIGGER dbo.money218 ON dbo.key218_money AFTER UPDATE AS BEGIN SET NOCOUNT ON; IF TRIGGER_NESTLEVEL() > 1 RETURN; UPDATE dbo.key218_money SET [co'de]]x]=1.0002; END;").await.unwrap();
     db.conn
         .execute("UPDATE dbo.key218_money SET label=N'a';")
@@ -205,15 +208,14 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
         .await
         .map(|_| ())
         .map_err(|e| e.to_string());
-    let money_value: String = db
+    let money_rows = db
         .conn
         .query("SELECT CONVERT(nvarchar(max), [co'de]]x], 2) FROM dbo.key218_money")
         .await
-        .unwrap()[0]
-        .try_get_at::<&str>(0)
-        .unwrap()
-        .unwrap()
-        .into();
+        .unwrap();
+    let money_value = money_rows
+        .first()
+        .map(|row| row.try_get_at::<&str>(0).unwrap().unwrap().to_owned());
     db.drop().await;
     for (key_type, result) in results {
         assert!(result.is_ok(), "{key_type}: {result:?}");
@@ -223,5 +225,76 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
             .unwrap_err()
             .contains("is not what this plan wrote")
     );
-    assert_eq!(money_value, "1.0001");
+    assert_eq!(money_value.as_deref(), Some("1.0001"));
+}
+
+async fn lossy_key(is_update: bool, key_type: &str, stored: &str, declared: &str) {
+    let mut db = TestDb::create(&format!("key_lossy_{is_update}218")).await;
+    db.conn.execute(&format!("CREATE TABLE dbo.key218 ([co'de]]x] {key_type} COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20));")).await.unwrap();
+    let seed = Mssql
+        .emit(&insert("key218", stored), Default::default())
+        .unwrap()
+        .remove(0);
+    let plain = db
+        .conn
+        .execute(&seed.sql)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    let plain_rows = contents(&mut db.conn, "key218").await;
+    if !is_update {
+        db.conn.execute("DELETE FROM dbo.key218;").await.unwrap();
+    }
+    let change = if is_update {
+        update("key218", declared)
+    } else {
+        insert("key218", declared)
+    };
+    let stmt = Mssql.emit(&change, Default::default()).unwrap().remove(0);
+    let attempted = db
+        .conn
+        .execute(&stmt.sql)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    // No trigger or concurrent writer: assignment itself may discard
+    // over-width spaces or map Unicode through a varchar code page.
+    let after = contents(&mut db.conn, "key218").await;
+    db.drop().await;
+    assert!(plain.is_ok(), "{key_type}: {plain:?}");
+    assert_eq!(plain_rows, vec![(stored.into(), "a".into())]);
+    let error = attempted.expect_err("the engine cannot retain the declared key text");
+    assert!(error.contains("is not what this plan wrote"), "{error}");
+    assert_eq!(
+        after,
+        if is_update {
+            vec![(stored.into(), "a".into())]
+        } else {
+            vec![]
+        }
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn an_insert_refuses_keys_that_lose_declared_text() {
+    for (key_type, stored, declared) in [
+        ("varchar(3)", "abc", "abc "),
+        ("nvarchar(3)", "abc", "abc "),
+        ("varchar(3)", "A", "Ａ"),
+    ] {
+        lossy_key(false, key_type, stored, declared).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn an_update_refuses_keys_that_lose_declared_text() {
+    for (key_type, stored, declared) in [
+        ("varchar(3)", "abc", "abc "),
+        ("nvarchar(3)", "abc", "abc "),
+        ("varchar(3)", "A", "Ａ"),
+    ] {
+        lossy_key(true, key_type, stored, declared).await;
+    }
 }
