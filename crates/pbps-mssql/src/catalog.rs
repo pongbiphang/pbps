@@ -87,8 +87,10 @@ SELECT c.object_id, c.name, ty.name AS type_name,
 const KEY_COLUMNS: &str = "\
 SELECT kc.parent_object_id AS object_id, kc.name,
        CONVERT(bit, CASE WHEN kc.type = 'PK' THEN 1 ELSE 0 END) AS is_primary,
-       col.name AS column_name
+       col.name AS column_name, ki.is_disabled, ki.ignore_dup_key
   FROM sys.key_constraints kc
+  JOIN sys.indexes ki
+    ON ki.object_id = kc.parent_object_id AND ki.index_id = kc.unique_index_id
   JOIN sys.index_columns ic
     ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id
   JOIN sys.columns col
@@ -114,7 +116,7 @@ SELECT fk.parent_object_id AS object_id, fk.name,
 
 const CHECKS: &str = "\
 SELECT cc.parent_object_id AS object_id, cc.object_id AS constraint_object_id,
-       cc.name, cc.definition
+       cc.name, cc.definition, cc.is_disabled, cc.is_not_trusted, cc.is_not_for_replication
   FROM sys.check_constraints cc
  WHERE cc.is_ms_shipped = 0
  ORDER BY cc.parent_object_id, cc.name;";
@@ -129,7 +131,7 @@ SELECT cc.parent_object_id AS object_id, cc.object_id AS constraint_object_id,
 /// as the ordinary rowstore index it is not. The code is what lets the
 /// assembler say which kind it left out.
 const INDEX_COLUMNS: &str = "\
-SELECT i.object_id, i.name, i.is_unique, i.type AS index_type,
+SELECT i.object_id, i.name, i.is_unique, i.type AS index_type, i.is_disabled, i.ignore_dup_key,
        i.filter_definition,
        col.name AS column_name, ic.is_included_column, ic.is_descending_key
   FROM sys.indexes i
@@ -287,6 +289,9 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 
     for row in conn.query(KEY_COLUMNS).await? {
         raw.key_columns.push(RawKeyColumn {
+            is_disabled: get(&row, "is_disabled")?,
+            ignore_dup_key: get(&row, "ignore_dup_key")?,
+
             object_id: get(&row, "object_id")?,
             constraint_name: get::<&str>(&row, "name")?.to_owned(),
             is_primary: get(&row, "is_primary")?,
@@ -312,6 +317,10 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 
     for row in conn.query(CHECKS).await? {
         raw.checks.push(RawCheck {
+            is_disabled: get(&row, "is_disabled")?,
+            is_not_trusted: get(&row, "is_not_trusted")?,
+            is_not_for_replication: get(&row, "is_not_for_replication")?,
+
             object_id: get(&row, "object_id")?,
             constraint_object_id: get(&row, "constraint_object_id")?,
             name: get::<&str>(&row, "name")?.to_owned(),
@@ -321,6 +330,9 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 
     for row in conn.query(INDEX_COLUMNS).await? {
         raw.index_columns.push(RawIndexColumn {
+            is_disabled: get(&row, "is_disabled")?,
+            ignore_dup_key: get(&row, "ignore_dup_key")?,
+
             object_id: get(&row, "object_id")?,
             index_name: get::<&str>(&row, "name")?.to_owned(),
             is_unique: get(&row, "is_unique")?,

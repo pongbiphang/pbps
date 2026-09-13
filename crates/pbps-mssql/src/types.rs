@@ -655,6 +655,34 @@ pub fn alter_column_is_refused(ty: &ColumnType) -> bool {
     normalize(ty).is_ok_and(|t| t.base == "timestamp")
 }
 
+/// Measured on SQL Server: modifier-only changes preserve CHECKs, and widening
+/// bounded variable-length columns also preserves ordinary indexes and keys.
+/// Foreign keys and filtered predicates still block those widenings. A change
+/// of storage type (such as int -> bigint) requires all four kinds removed.
+pub fn retype_dependents(from: &ColumnType, to: &ColumnType) -> pbps_dialect::RetypeDependents {
+    let (Ok(from), Ok(to)) = (normalize(from), normalize(to)) else {
+        return pbps_dialect::RetypeDependents {
+            keys_and_indexes: true,
+            checks: true,
+            filtered_indexes: true,
+            foreign_keys: true,
+        };
+    };
+    if from == to {
+        return pbps_dialect::RetypeDependents::default();
+    }
+    let keeps_indexes = from.base == to.base
+        && matches!(from.base.as_str(), "varchar" | "nvarchar" | "varbinary")
+        && matches!((from.args.as_slice(), to.args.as_slice()),
+            ([TypeArg::Int(a)], [TypeArg::Int(b)]) if b >= a);
+    pbps_dialect::RetypeDependents {
+        keys_and_indexes: !keeps_indexes,
+        checks: from.base != to.base,
+        filtered_indexes: true,
+        foreign_keys: true,
+    }
+}
+
 fn safe_if(cond: bool) -> TypeChangeRisk {
     if cond {
         TypeChangeRisk::Safe
@@ -675,6 +703,36 @@ mod tests {
     }
     fn risk(from: &str, to: &str) -> TypeChangeRisk {
         change_risk(&normalize(&ty(from)).unwrap(), &normalize(&ty(to)).unwrap())
+    }
+
+    #[test]
+    fn retype_dependency_rules_preserve_legal_in_place_widenings() {
+        for (from, to, keys, checks) in [
+            ("int", "bigint", true, true),
+            ("varchar(10)", "varchar(20)", false, false),
+            ("nvarchar(10)", "nvarchar(20)", false, false),
+            ("varbinary(10)", "varbinary(20)", false, false),
+            ("varchar(20)", "varchar(10)", true, false),
+            ("varchar(20)", "varchar(max)", true, false),
+            ("char(10)", "char(20)", true, false),
+            ("decimal(5,2)", "decimal(7,2)", true, false),
+            ("datetime2(3)", "datetime2(7)", true, false),
+        ] {
+            let d = retype_dependents(&ty(from), &ty(to));
+            assert_eq!(
+                (d.keys_and_indexes, d.checks),
+                (keys, checks),
+                "{from} -> {to}"
+            );
+            assert!(d.filtered_indexes && d.foreign_keys, "{from} -> {to}");
+        }
+        let unchanged = retype_dependents(&ty("integer"), &ty("int"));
+        assert!(
+            !unchanged.keys_and_indexes
+                && !unchanged.checks
+                && !unchanged.filtered_indexes
+                && !unchanged.foreign_keys
+        );
     }
 
     #[test]

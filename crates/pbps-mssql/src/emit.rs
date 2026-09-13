@@ -407,14 +407,22 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             ..
         } => {
             let normalized = types::normalize(to)?;
-            one(format!(
+            let alter = format!(
                 "ALTER TABLE {} ALTER COLUMN {} {} {}{};",
                 qualified(&column.table)?,
                 quote(&column.name)?,
                 normalized,
                 null_clause(*to_nullable),
                 online(strategy)
-            ))
+            );
+            Ok(vec![
+                Statement::new(preserve_default_during_retype(
+                    &column.table,
+                    &column.name,
+                    &alter,
+                )?)
+                .own_batch(),
+            ])
         }
 
         Change::AlterColumnNullability {
@@ -1513,6 +1521,44 @@ fn drop_default_block(table: &TableName, column: &str) -> Result<String, Dialect
     ))
 }
 
+/// An unchanged default is not a separate schema change, but SQL Server still
+/// requires it out of the way while the column changes type. Preserve the actual
+/// name and stored expression, including defaults adopted by `pull`. A default
+/// this plan replaces has already been dropped by its explicit change.
+fn preserve_default_during_retype(
+    table: &TableName,
+    column: &str,
+    alter: &str,
+) -> Result<String, DialectError> {
+    let q = qualified(table)?;
+    Ok(format!(
+        "DECLARE @df sysname, @definition nvarchar(max), @sql nvarchar(max);\n\
+         SELECT @df = dc.name, @definition = dc.definition\n\
+           FROM sys.default_constraints dc\n\
+           JOIN sys.columns c ON c.object_id = dc.parent_object_id\n\
+                             AND c.column_id = dc.parent_column_id\n\
+          WHERE dc.parent_object_id = OBJECT_ID({}) AND c.name = {};\n\
+         IF @df IS NOT NULL AND @definition IS NULL\n\
+             THROW 50000, 'Cannot preserve an unreadable default during a column type change', 1;\n\
+         IF @df IS NOT NULL\n\
+         BEGIN\n\
+             SET @sql = {} + QUOTENAME(@df);\n\
+             EXEC(@sql);\n\
+         END;\n\
+         {alter}\n\
+         IF @df IS NOT NULL\n\
+         BEGIN\n\
+             SET @sql = {} + QUOTENAME(@df) + N' DEFAULT ' + @definition + {};\n\
+             EXEC(@sql);\n\
+         END;",
+        literal(&q),
+        literal(column),
+        literal(&format!("ALTER TABLE {q} DROP CONSTRAINT ")),
+        literal(&format!("ALTER TABLE {q} ADD CONSTRAINT ")),
+        literal(&format!(" FOR {};", quote(column)?)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1635,10 +1681,8 @@ mod tests {
             from_nullable: false,
             to_nullable: false,
         });
-        assert_eq!(
-            sql,
-            ["ALTER TABLE [dbo].[t] ALTER COLUMN [amount] bigint NOT NULL;"]
-        );
+        assert_eq!(sql.len(), 1);
+        assert!(sql[0].contains("ALTER TABLE [dbo].[t] ALTER COLUMN [amount] bigint NOT NULL;"));
     }
 
     #[test]

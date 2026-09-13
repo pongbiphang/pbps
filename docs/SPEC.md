@@ -779,6 +779,16 @@ returns no readable count. It never contributes to the passed count. Changes
 that need no data probe (such as an ordinary index) do not contribute to the
 unchecked count either.
 
+Column type changes can require dependency maintenance specific to the engine.
+SQL Server's required managed key, CHECK, index and FK rebuilds are ordinary
+explicit changes in the saved plan, ordered around the retype and subject to
+the same risks and probes as other replacements. Its unchanged default stays
+part of the column: the emitter preserves the actual default in the retype's
+isolated batch. Unsupported CHECK or unique-key enforcement settings are
+reported as managed limitations before writes, rather than recreated with
+different write behavior. PostgreSQL keeps its existing type-change plan shape
+(DECISIONS 461).
+
 **Nothing user-supplied runs between the approval and the statements.** The
 pre-flight is derived from the plan; the exec hooks of 13.5 run after an apply
 has finished. That gap is closed deliberately: anything executing inside it

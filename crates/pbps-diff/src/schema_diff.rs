@@ -272,6 +272,7 @@ pub fn diff_partial(
         );
     }
 
+    recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
@@ -1085,6 +1086,163 @@ fn recreate_referenced_foreign_keys(
                 name: name.clone(),
                 constraint: Box::new(wanted.clone()),
             });
+        }
+    }
+}
+
+/// Dependency maintenance is visible in the saved plan, including its ordinary
+/// drop/add risks (DECISIONS 461). The emitter must not discover extra
+/// cross-table work after approval. Align identities first so the selection survives simultaneous
+/// table and column renames; explicit replacements already have their own pair.
+fn recreate_retyped_dependents(
+    base: Side<'_>,
+    declared: Side<'_>,
+    renames: &Renames,
+    dialect: &dyn Dialect,
+    changes: &mut Vec<Change>,
+) {
+    let retyped: BTreeMap<_, _> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::AlterColumnType {
+                column, from, to, ..
+            } => Some((column.clone(), dialect.retype_dependents(from, to))),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect();
+    if retyped.is_empty() {
+        return;
+    }
+    for (uid, old_name) in &base.ids.tables {
+        let Some(name) = declared.ids.tables.get(uid) else {
+            continue;
+        };
+        let (Some(old), Some(after)) = (
+            base.schema.tables.get(old_name),
+            declared.schema.tables.get(name),
+        ) else {
+            continue;
+        };
+        let before = renames.apply(old, old_name);
+        let key_column = |column: &str| {
+            retyped
+                .get(&name.column(column))
+                .is_some_and(|d| d.keys_and_indexes)
+        };
+        let checks = retyped.iter().any(|(c, d)| &c.table == name && d.checks);
+        let filters = retyped
+            .iter()
+            .any(|(c, d)| &c.table == name && d.filtered_indexes);
+        if let (Some(key), Some(wanted)) = (&before.primary_key, &after.primary_key)
+            && key.columns.iter().any(|c| key_column(c))
+            && !changes
+                .iter()
+                .any(|c| matches!(c, Change::SetPrimaryKey { table, .. } if table == name))
+        {
+            changes.push(Change::SetPrimaryKey {
+                table: name.clone(),
+                from: Some(key.clone()),
+                to: None,
+            });
+            changes.push(Change::SetPrimaryKey {
+                table: name.clone(),
+                from: None,
+                to: Some(wanted.clone()),
+            });
+        }
+        for (n, key) in &before.unique {
+            if after.unique.get(n) == Some(key) && key.columns.iter().any(|c| key_column(c)) {
+                changes.push(Change::DropUnique {
+                    table: name.clone(),
+                    name: n.clone(),
+                });
+                changes.push(Change::AddUnique {
+                    table: name.clone(),
+                    name: n.clone(),
+                    constraint: key.clone(),
+                });
+            }
+        }
+        for (n, check) in &before.checks {
+            if checks && after.checks.get(n) == Some(check) {
+                changes.push(Change::DropCheck {
+                    table: name.clone(),
+                    name: n.clone(),
+                });
+                changes.push(Change::AddCheck {
+                    table: name.clone(),
+                    name: n.clone(),
+                    constraint: check.clone(),
+                });
+            }
+        }
+        for (n, index) in &before.indexes {
+            if after.indexes.get(n) == Some(index)
+                && (index.columns.iter().any(|c| key_column(&c.name))
+                    || index.include.iter().any(|c| key_column(c))
+                    || (filters && index.filter.is_some()))
+            {
+                changes.push(Change::DropIndex {
+                    table: name.clone(),
+                    name: n.clone(),
+                });
+                changes.push(Change::AddIndex {
+                    table: name.clone(),
+                    name: n.clone(),
+                    index: Box::new(index.clone()),
+                });
+            }
+        }
+        for (n, fk) in &before.foreign_keys {
+            let local = fk.columns.iter().map(|c| name.column(c));
+            let referenced = fk
+                .references_columns
+                .iter()
+                .map(|c| fk.references_table.column(c));
+            if after.foreign_keys.get(n) == Some(fk)
+                && local
+                    .chain(referenced)
+                    .any(|c| retyped.get(&c).is_some_and(|d| d.foreign_keys))
+            {
+                changes.push(Change::DropForeignKey {
+                    table: name.clone(),
+                    name: n.clone(),
+                });
+                changes.push(Change::AddForeignKey {
+                    table: name.clone(),
+                    name: n.clone(),
+                    constraint: Box::new(fk.clone()),
+                });
+            }
         }
     }
 }

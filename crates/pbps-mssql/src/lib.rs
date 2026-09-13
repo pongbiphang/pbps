@@ -88,6 +88,14 @@ impl Dialect for Mssql {
         types::normalize(ty)
     }
 
+    fn retype_dependents(
+        &self,
+        from: &ColumnType,
+        to: &ColumnType,
+    ) -> pbps_dialect::RetypeDependents {
+        types::retype_dependents(from, to)
+    }
+
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         // Comparing unnormalized types would call `int` -> `integer` a change.
         // The trait says the caller normalizes first, but a dialect that only
