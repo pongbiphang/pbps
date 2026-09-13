@@ -7698,6 +7698,60 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
         .expect("drop the role");
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usable() {
+    let mut db = TestDb::create("routine_lock_timeout226").await;
+    db.conn
+        .execute(
+            "CREATE FUNCTION public.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$;
+             CREATE PROCEDURE public.p(n int) LANGUAGE sql AS $$ SELECT n $$;",
+        )
+        .await
+        .unwrap();
+    let mut probe = db.second().await;
+    let changes = pbps_model::ChangeSet::default();
+
+    use pbps_model::ModuleKind::{Function, Procedure};
+    for (name, kind) in [
+        ("public.f(integer)", Function),
+        ("public.p(integer)", Procedure),
+    ] {
+        let id = name.parse().unwrap();
+        let uncontended = read_a_rebuild(&mut probe, &id, kind, &changes).await;
+        assert!(matches!(
+            uncontended.serialized,
+            pbps_pg::modules::Serialized::By(_)
+        ));
+
+        in_a_transaction(&mut db.conn).await;
+        db.conn
+            .query(&format!(
+                "SELECT oid::int8 FROM pg_catalog.pg_proc
+                 WHERE oid = '{name}'::regprocedure FOR UPDATE"
+            ))
+            .await
+            .unwrap();
+        for (setting, code) in [("statement_timeout", "57014"), ("lock_timeout", "55P03")] {
+            in_a_transaction(&mut probe).await;
+            probe
+                .execute(&format!("SET LOCAL {setting} = '200ms'"))
+                .await
+                .unwrap();
+            let result = pbps_pg::modules::before_a_rebuild(&mut probe, &id, kind, &changes).await;
+            // The error must reach the caller after recovery, rather than leave
+            // the transaction aborted or become a missing-privilege note.
+            assert_eq!(number(&mut probe, "SELECT 1::int").await, 1);
+            rollback(&mut probe).await;
+            let error = result.expect_err("a timeout is not an unavailable privilege");
+            assert_eq!(error.server_error_code().as_deref(), Some(code), "{error}");
+        }
+        rollback(&mut db.conn).await;
+    }
+    drop(probe);
+    db.drop().await;
+}
+
 /// ADR-0009 §4: on this engine the dependency refusal is the ordinary case, and
 /// the enumeration is over **every** reverse `pg_depend` edge and not only
 /// modules.

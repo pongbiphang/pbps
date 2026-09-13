@@ -324,12 +324,15 @@ async fn serialize(
                         "a row lock on the routine's `pg_proc` entry",
                     ))
                 }
-                // Not an error to the caller: refusing here would refuse every
-                // routine edit, since §3 makes them all rebuilds. The residual
-                // is named where the reviewer sees it instead.
                 Err(e) => {
                     conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_lock")
                         .await?;
+                    // Only missing privileges permit an unserialized read
+                    // (ADR-0009 §3). A cancellation or another engine failure
+                    // must still abort the probe after recovering its caller.
+                    if e.server_error_code().as_deref() != Some("42501") {
+                        return Err(e);
+                    }
                     Ok(Serialized::Not(format!(
                         "this rebuild is not serialized: a routine is not a relation, so the \
                          only lock that would serialize it is a row lock on its `pg_proc` entry, \
