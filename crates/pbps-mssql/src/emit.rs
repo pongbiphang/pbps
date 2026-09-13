@@ -274,8 +274,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // comparison is of text, so a cell that used to be carried unheld
             // for want of a native `=` is held like any other; what is still
             // carried unheld is narrower — a column this plan *retypes* whose
-            // old type has no way back from its own rendering, which is
-            // `image` alone (DECISIONS 143 and 470).
+            // old type has no way back from its own rendering: `image`, which
+            // has no conversion from text at all, and the two spatial types,
+            // whose text leaves out the SRID (DECISIONS 143 and 470).
             let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
             for (column, cell) in row {
                 predicates.extend(recorded_cell(
@@ -998,9 +999,10 @@ impl<'a> Held<'a> {
     /// and the column no longer holds what would tell them apart.
     ///
     /// `None` only where this plan retypes the column *and* the type that
-    /// rendered the text has no way back from it — `image` alone
-    /// ([`crate::rows::from_text`]). A column this plan leaves alone never
-    /// converts anything, so it is always held, whatever its type.
+    /// rendered the text has no way back from it — `image`, `geometry` and
+    /// `geography` ([`crate::rows::from_text`], which measures why for each).
+    /// A column this plan leaves alone never converts anything, so it is
+    /// always held, whatever its type.
     fn as_stored(self, recorded: &str) -> Option<String> {
         if !self.retyped() {
             return Some(recorded.to_owned());

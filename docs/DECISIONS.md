@@ -1418,7 +1418,9 @@ SPEC is in sync with all of these.
     of a type without an operator is held by the rendering that read it like
     every other. One case remains, and it is narrower: a column *this plan
     retypes* whose old type cannot be spelled back from its own rendering —
-    `image` alone, measured. Unretyped, an `image` cell is held.
+    `image`, which has no conversion from text at all, and `geometry` and
+    `geography`, whose text leaves out the SRID. All three measured. Unretyped,
+    a cell of any of them is held.
 
 144. **A disabled foreign key is not counted when a row is deleted.**
     `NOCHECK CONSTRAINT` leaves the constraint in `sys.foreign_keys` and stops
