@@ -431,12 +431,9 @@ fn managed_tables(project: &Project) -> Vec<pbps_model::ObjectName> {
 /// about at all — together with the columns a declared key actually names on
 /// each one, unioned across every key that points there.
 ///
-/// PostgreSQL grants `SELECT` and `REFERENCES` per column, and a key needs
-/// them only on the columns it names (issue #215): asking `doctor` to hold
-/// them on the whole table pushed towards a wider grant than the key the
-/// account already has actually needs. SQL Server has no per-column
-/// counterpart in this list yet, so `pbps_mssql::doctor` reads the target
-/// list alone and leaves this map unread (DECISIONS 440).
+/// Both engines grant `SELECT` and `REFERENCES` per column (issues #195 and
+/// #215). Passing the union keeps a key's subset distinct from the target's
+/// complete catalog column set, which would demand unrelated grants.
 ///
 /// Declarations that do not load give an empty target list and an empty map,
 /// for the reason [`managed_schemas`] gives.

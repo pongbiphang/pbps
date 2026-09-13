@@ -797,7 +797,7 @@ pub async fn permissions(
             let held = pbps_mssql::doctor::permissions(
                 conn,
                 ask.managed_schemas,
-                ask.referenced,
+                ask.referenced_columns,
                 ask.granted,
                 ask.data,
                 project_ids,

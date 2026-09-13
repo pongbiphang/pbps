@@ -1241,6 +1241,13 @@ create-time `ALTER` on the ledger's schema is required only while the ledger
 tables are still missing — per table, since `ensure_tables` recreates whichever
 one is gone.
 
+For foreign-key targets outside the managed schemas, SQL Server asks for
+`REFERENCES` for the key and `SELECT` for its preflight probe on the **union of
+columns named by the declared keys**. An object-level grant covers that demand;
+otherwise every named column must grant the permission. Unrelated target
+columns do not require grants, and an empty subset or an unknown column cannot
+establish column-level readiness (DECISIONS 466).
+
 An existing `__pbps_state` that still needs the timeline columns also requires
 `ALTER` on that object (SQL Server), or ownership/equivalent (PostgreSQL).
 Readiness uses the same read-only shape probe as the ledger migration. Once
