@@ -100,7 +100,8 @@ const FOREIGN_KEY_COLUMNS: &str = "\
 SELECT fk.parent_object_id AS object_id, fk.name,
        rs.name AS ref_schema, rt.name AS ref_table,
        pc.name AS column_name, rc.name AS ref_column_name,
-       fk.delete_referential_action, fk.update_referential_action
+       fk.delete_referential_action, fk.update_referential_action,
+       fk.is_disabled, fk.is_not_trusted, fk.is_not_for_replication
   FROM sys.foreign_keys fk
   JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
   JOIN sys.columns pc
@@ -303,6 +304,9 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             ref_column: get::<&str>(&row, "ref_column_name")?.to_owned(),
             on_delete: get(&row, "delete_referential_action")?,
             on_update: get(&row, "update_referential_action")?,
+            is_disabled: get(&row, "is_disabled")?,
+            is_not_trusted: get(&row, "is_not_trusted")?,
+            is_not_for_replication: get(&row, "is_not_for_replication")?,
         });
     }
 

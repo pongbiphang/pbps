@@ -160,8 +160,8 @@ impl Classes {
     }
 }
 
-/// Read the existing blockers for every DropTable/DropColumn. Must run in the
-/// caller's transaction; no DDL or catalog mutation is used to test a drop.
+/// Read existing blockers for table, column, key and index drops. Must run in
+/// the caller's transaction; no DDL or catalog mutation is used to test a drop.
 pub async fn drop_blockers(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -173,6 +173,17 @@ pub async fn drop_blockers(
         .filter_map(|(index, p)| match &p.change {
             Change::DropTable { name, .. } => Some((index, format!("table {name}"))),
             Change::DropColumn { column, .. } => Some((index, format!("column {column}"))),
+            Change::SetPrimaryKey {
+                table,
+                from: Some(_),
+                ..
+            } => Some((index, format!("primary key on {table}"))),
+            Change::DropUnique { table, name } => {
+                Some((index, format!("unique constraint `{name}` on {table}")))
+            }
+            Change::DropIndex { table, name } => {
+                Some((index, format!("index `{name}` on {table}")))
+            }
             Change::CreateTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -183,13 +194,11 @@ pub async fn drop_blockers(
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
@@ -226,6 +235,19 @@ pub async fn drop_blockers(
     for index in 0..=last {
         if let Some(address) = removal(conn, &classes, cs, index).await? {
             removals.push((index, address));
+        } else if let Change::SetPrimaryKey {
+            table,
+            from: Some(_),
+            ..
+        }
+        | Change::DropUnique { table, .. }
+        | Change::DropIndex { table, .. } = &cs.changes[index].change
+            && stored(cs, index, table, None).is_some()
+        {
+            return Err(error(format!(
+                "drop_blockers: key on {table} is absent from the catalog"
+            ))
+            .into());
         }
     }
     let roots: BTreeSet<_> = removals.iter().map(|(_, a)| *a).collect();

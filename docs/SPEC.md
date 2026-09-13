@@ -744,6 +744,16 @@ clean. Two supporting rules:
   **before** anything has run, filling in the information an offline plan cannot
   see.
 
+Replacing a primary/unique constraint or standalone unique index includes
+explicit drops and recreations of its affected managed foreign keys in the typed plan, with ordinary ordering
+and risk classification. Matching is conservative when equivalent keys share
+columns; connected checks use the actual backing-index dependency to refuse
+an external foreign key the plan cannot remove. These checks run during
+connected planning and again before apply, without adding statements to an
+approved plan. SQL Server needs database `VIEW DEFINITION` for that external
+dependency read without overriding metadata denials; insufficient visibility
+is refused (DECISIONS 460).
+
 Pre-flight also runs **probes derived automatically from the plan itself**.
 The differ's output is a typed `ChangeSet`, so the tool already knows how each
 change can fail, and `Dialect::preflight(change)` turns that knowledge into

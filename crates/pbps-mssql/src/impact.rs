@@ -39,6 +39,247 @@ use crate::emit::qualified;
 // module rename here.
 pub use pbps_db::impact::{ImpactError, ImpactReport, Referrer, RenameTarget};
 
+/// The original table at one statement's position. Reversing only the prefix
+/// keeps a name reused by CREATE from resolving to the previous occupant.
+fn stored_key_table(
+    cs: &pbps_model::ChangeSet,
+    index: usize,
+    table: &TableName,
+) -> Option<TableName> {
+    let mut name = table.clone();
+    for p in cs.changes[..index].iter().rev() {
+        if let Change::RenameTable { from, to, .. } = &p.change
+            && to == &name
+        {
+            name = from.clone();
+        } else if let Change::CreateTable { name: created, .. } = &p.change
+            && created == &name
+        {
+            return None;
+        }
+    }
+    Some(name)
+}
+
+/// Existing inbound FK dependencies of constraint or standalone unique keys.
+/// Called in the planning/preflight transaction; it never tries DDL to learn
+/// whether a drop is legal. The engine's key_index_id, not a column-set match,
+/// decides which standing key an external foreign key actually depends on.
+pub async fn key_drop_blockers(
+    conn: &mut Conn,
+    cs: &pbps_model::ChangeSet,
+) -> Result<Vec<pbps_db::impact::DropReport>, ImpactError> {
+    use pbps_db::{DbError, Param};
+    use std::collections::BTreeSet;
+
+    let targets: Vec<_> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, p)| {
+            let (table, kind, name) = match &p.change {
+                Change::SetPrimaryKey {
+                    table,
+                    from: Some(_),
+                    ..
+                } => (table, "PK", ""),
+                Change::DropUnique { table, name } => (table, "UQ", name.as_str()),
+                Change::DropIndex { table, name } => (table, "IX", name.as_str()),
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. } => return None,
+            };
+            let stored = stored_key_table(cs, index, table)?;
+            Some((index, stored, kind, name))
+        })
+        .collect();
+    struct Key {
+        change_index: usize,
+        table: TableName,
+        name: String,
+        parent: i32,
+        index: i32,
+    }
+    let mut keys = Vec::new();
+    for (change_index, table, kind, name) in targets {
+        let qualified = qualified(&table)?;
+        let rows = conn
+            .query_with(
+                "SELECT i.object_id AS parent, i.index_id AS idx, i.name, i.is_unique, i.has_filter
+             FROM sys.indexes i LEFT JOIN sys.key_constraints kc
+               ON kc.parent_object_id=i.object_id AND kc.unique_index_id=i.index_id
+             WHERE i.object_id=OBJECT_ID(@P1, N'U')
+               AND ((@P2=N'PK' AND kc.type=N'PK') OR (@P2=N'UQ' AND kc.type=N'UQ' AND kc.name=@P3)
+                 OR (@P2=N'IX' AND i.name=@P3))",
+                &[Param::Str(&qualified), Param::Str(kind), Param::Str(name)],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Err(DbError::Refused(format!(
+                "key_drop_blockers: {kind} `{name}` on {table} is absent from the readable catalog"
+            ))
+            .into());
+        };
+        // Neither a nonunique nor a filtered index can back a foreign key.
+        // Resolve that with the parent's metadata rights before asking for
+        // broader visibility (decision 460).
+        if !get::<bool>(row, "is_unique")? || get::<bool>(row, "has_filter")? {
+            continue;
+        }
+        keys.push(Key {
+            change_index,
+            table,
+            name: get::<&str>(row, "name")?.into(),
+            parent: get::<i32>(row, "parent")?,
+            index: get::<i32>(row, "idx")?,
+        });
+    }
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // ALTER plus VIEW DEFINITION on the parent still hides an FK on a child
+    // with no grants. Measured: zero sys.foreign_keys rows until database-wide
+    // VIEW DEFINITION is granted. An invisible external child is not absent.
+    let visibility = conn
+        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS visible")
+        .await?;
+    if visibility
+        .first()
+        .map(|row| get::<i32>(row, "visible"))
+        .transpose()?
+        != Some(1)
+    {
+        return Err(DbError::Refused("key_drop_blockers requires database VIEW DEFINITION to see foreign keys outside the managed tables".into()).into());
+    }
+    // A database grant does not override an object/schema DENY. Its own
+    // permission row remains visible even when the child FK disappears, also
+    // through role membership. Effective permission keeps owner/sysadmin
+    // overrides from being mistaken for denials (decision 460).
+    let denials = conn.query(
+        "SELECT dp.class, dp.major_id FROM sys.database_permissions dp
+         WHERE dp.state=N'D' AND dp.permission_name IN (N'VIEW DEFINITION',N'CONTROL')
+           AND (dp.grantee_principal_id=USER_ID() OR IS_MEMBER(USER_NAME(dp.grantee_principal_id))=1)
+           AND ((dp.class=1 AND COALESCE(HAS_PERMS_BY_NAME(
+                    QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id))+N'.'+QUOTENAME(OBJECT_NAME(dp.major_id)),
+                    'OBJECT','VIEW DEFINITION'),0)<>1)
+             OR (dp.class=3 AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id),
+                    'SCHEMA','VIEW DEFINITION'),0)<>1))"
+    ).await?;
+    if !denials.is_empty() {
+        return Err(DbError::Refused("key_drop_blockers cannot prove external dependencies are visible: an effective object/schema metadata DENY overrides database VIEW DEFINITION".into()).into());
+    }
+    let mut removals = Vec::new();
+    for (index, p) in cs.changes.iter().enumerate() {
+        let (table, fk) = match &p.change {
+            Change::DropForeignKey { table, name } => (table, Some(name)),
+            Change::DropTable { name, .. } => (name, None),
+            Change::CreateTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => continue,
+        };
+        let Some(table) = stored_key_table(cs, index, table) else {
+            continue;
+        };
+        let qualified = qualified(&table)?;
+        let rows = if let Some(name) = fk {
+            conn.query_with("SELECT fk.object_id AS oid, fk.parent_object_id AS parent FROM sys.foreign_keys fk WHERE fk.parent_object_id=OBJECT_ID(@P1, N'U') AND fk.name=@P2", &[Param::Str(&qualified), Param::Str(name)]).await?
+        } else {
+            conn.query_with("SELECT t.object_id AS oid, t.object_id AS parent FROM sys.tables t WHERE t.object_id=OBJECT_ID(@P1, N'U')", &[Param::Str(&qualified)]).await?
+        };
+        for row in rows {
+            removals.push((
+                index,
+                get::<i32>(&row, "oid")?,
+                get::<i32>(&row, "parent")?,
+                fk.is_none(),
+            ));
+        }
+    }
+    let mut reports = Vec::new();
+    for Key {
+        change_index: index,
+        table,
+        name: key_name,
+        parent,
+        index: idx,
+    } in keys
+    {
+        let mut blocking = BTreeSet::new();
+        for row in conn.query_with(
+            "SELECT fk.object_id AS oid, fk.parent_object_id AS child, s.name AS schema_name, t.name AS table_name, fk.name AS name
+             FROM sys.foreign_keys fk JOIN sys.tables t ON t.object_id=fk.parent_object_id JOIN sys.schemas s ON s.schema_id=t.schema_id
+             WHERE fk.referenced_object_id=@P1 AND fk.key_index_id=@P2",
+            &[Param::I32(parent), Param::I32(idx)],
+        ).await? {
+            let oid = get::<i32>(&row, "oid")?;
+            let child = get::<i32>(&row, "child")?;
+            if !removals.iter().any(|&(at, removed, on, whole)| at < index && if whole { on == child } else { removed == oid }) {
+                let child = TableName::new(get::<&str>(&row, "schema_name")?, get::<&str>(&row, "table_name")?);
+                blocking.insert(format!("foreign key `{}` on {child}", get::<&str>(&row, "name")?));
+            }
+        }
+        reports.push(pbps_db::impact::DropReport {
+            change_index: index,
+            target: format!("key `{key_name}` on {table}"),
+            blocking: blocking.into_iter().collect(),
+        });
+    }
+    Ok(reports)
+}
+
 /// Every rename in a plan, as the objects they are renamed *from* — which is
 /// the name the catalog still knows them by.
 pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {

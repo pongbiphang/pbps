@@ -97,6 +97,10 @@ pub struct RawForeignKeyColumn {
     /// `sys.foreign_keys.delete_referential_action`: 0..=3.
     pub on_delete: u8,
     pub on_update: u8,
+    /// Enforcement and trust affect semantics but have no declaration syntax.
+    pub is_disabled: bool,
+    pub is_not_trusted: bool,
+    pub is_not_for_replication: bool,
 }
 
 /// One row of `sys.check_constraints`.
@@ -850,8 +854,36 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     }
 
     let mut unsupported_temporal_foreign_keys = BTreeSet::new();
+    let mut unsupported_fk_enforcement = BTreeSet::new();
     for f in &raw.foreign_key_columns {
         if !tables.contains_key(&f.object_id) {
+            continue;
+        }
+        // Recreating one of these as an ordinary FK would enable or validate
+        // enforcement the source did not promise (decision 460). Keep the
+        // omission visible to managed-set drift checks, once per composite FK.
+        if f.is_disabled || f.is_not_trusted || f.is_not_for_replication {
+            if unsupported_fk_enforcement.insert((f.object_id, f.constraint_name.clone())) {
+                let states: Vec<_> = [
+                    (f.is_disabled, "disabled"),
+                    (f.is_not_trusted, "untrusted"),
+                    (f.is_not_for_replication, "NOT FOR REPLICATION"),
+                ]
+                .into_iter()
+                .filter_map(|(present, state)| present.then_some(state))
+                .collect();
+                let table_name = name_of(f.object_id, &names);
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&f.object_id),
+                    format!(
+                        "{table_name}: foreign key `{}` is {}; these enforcement states are outside the declarations, so the foreign key was left out instead of recreated with different semantics",
+                        f.constraint_name,
+                        states.join(", ")
+                    ),
+                );
+            }
             continue;
         }
         let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
@@ -1998,6 +2030,9 @@ mod tests {
                 ref_column: b.into(),
                 on_delete: 1,
                 on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
             });
         }
         let p = assemble(&raw);
@@ -2006,6 +2041,64 @@ mod tests {
         assert_eq!(fk.references_columns, ["cid", "cemail"]);
         assert_eq!(fk.on_delete, ReferentialAction::Cascade);
         assert_eq!(fk.on_update, ReferentialAction::NoAction);
+    }
+
+    #[test]
+    fn unmodelled_foreign_key_enforcement_is_reported_once_per_constraint() {
+        for (disabled, untrusted, replication) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut raw = one_table_catalog();
+            for (column, referenced) in [("id", "cid"), ("email", "cemail")] {
+                raw.foreign_key_columns.push(RawForeignKeyColumn {
+                    object_id: 10,
+                    constraint_name: "fk_state".into(),
+                    ref_schema: "dbo".into(),
+                    ref_table: "other".into(),
+                    column: column.into(),
+                    ref_column: referenced.into(),
+                    on_delete: 0,
+                    on_update: 0,
+                    is_disabled: disabled,
+                    is_not_trusted: untrusted,
+                    is_not_for_replication: replication,
+                });
+            }
+            let pulled = assemble(&raw);
+            let name = TableName::new("dbo", "customer");
+            let unsupported = disabled || untrusted || replication;
+            assert_eq!(
+                pulled.schema.tables[&name].foreign_keys.is_empty(),
+                unsupported
+            );
+            let notes: Vec<_> = pulled
+                .limitations
+                .iter()
+                .filter(|l| l.detail.contains("fk_state"))
+                .collect();
+            assert_eq!(notes.len(), usize::from(unsupported), "{pulled:?}");
+            if unsupported {
+                assert_eq!(notes[0].target, LimitationTarget::Relation(name));
+                for (present, state) in [
+                    (disabled, "disabled"),
+                    (untrusted, "untrusted"),
+                    (replication, "NOT FOR REPLICATION"),
+                ] {
+                    if present {
+                        assert!(notes[0].detail.contains(state));
+                    }
+                }
+            } else {
+                assert_eq!(
+                    pulled.schema.tables[&name].foreign_keys["fk_state"].columns,
+                    ["id", "email"]
+                );
+            }
+        }
     }
 
     #[test]
@@ -2023,6 +2116,9 @@ mod tests {
             ref_column: "id".into(),
             on_delete: 0,
             on_update: 0,
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
         });
 
         let pulled = assemble(&raw);

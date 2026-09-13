@@ -17,7 +17,7 @@ use pbps_model::{ColumnRef, ObjectName, TableName};
 
 use crate::DbError;
 
-/// Existing catalog dependencies of a table or column the typed plan drops.
+/// Existing catalog dependencies of a table, column or key the typed plan drops.
 /// A replacement may introduce new dependencies; this reports the objects the
 /// catalog contains now and whether the plan removes them in time.
 #[derive(Debug, Clone, PartialEq, Eq)]

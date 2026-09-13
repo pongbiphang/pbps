@@ -12681,3 +12681,339 @@ fn constraint_name_collisions_are_refused_before_connecting_on_both_dialects() {
         assert_eq!(code(&out), 0, "{dialect}: {}{}", stdout(&out), stderr(&out));
     }
 }
+
+#[test]
+#[ignore = "needs a live database; run the engine's live-test script"]
+fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
+    let server = std::env::var("PBPS_TEST_DB").expect("set PBPS_TEST_DB");
+    for kind in ["index", "unique", "primary"] {
+        for staged in [false, true] {
+            let slug = format!("referenced_key_{kind}_{staged}");
+            let own = OwnDatabase::new(&server, &slug);
+            let connection = own.connection();
+            let d = Demo::new(&slug);
+
+            let key = if kind == "primary" {
+                "primary_key: {name: old_key, columns: [id]}\n"
+            } else if kind == "index" {
+                "indexes:\n  old_key: {columns: [id], unique: true}\n"
+            } else {
+                "unique:\n  old_key: [id]\n"
+            };
+            let parent =
+                format!("table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\n{key}");
+            d.table(&parent);
+            std::fs::write(d.dir.join("schema/child.yml"),
+                "table: dbo.child\ncolumns:\n  id: {type: int}\nforeign_keys:\n  fk_child:\n    columns: [id]\n    references: dbo.t(id)\n").unwrap();
+            let must_succeed = |out: Output| {
+                assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            };
+            must_succeed(d.run(&["plan"]));
+            d.commit();
+            must_succeed(d.run(&["bootstrap", "--db", connection]));
+            on_server(
+                connection,
+                "INSERT INTO dbo.t (id) VALUES (1); INSERT INTO dbo.child (id) VALUES (1);",
+            );
+            d.table(&parent.replace("old_key", "new_key"));
+            must_succeed(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("key-plan.json");
+            let mut args = vec!["plan", "--db", connection, "--out", path.to_str().unwrap()];
+            if staged {
+                args.push("--staged");
+            }
+            let planned = d.run(&args);
+            if staged {
+                assert_eq!(code(&planned), 1);
+                assert!(stderr(&planned).contains("--staged applies one logical change"));
+                assert!(!path.exists());
+                continue;
+            }
+            must_succeed(planned);
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved.changes.changes.len(), 4, "{:?}", saved.changes);
+            assert!(
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name == "fk_child")
+            );
+            assert!(
+                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name == "fk_child")
+            );
+            let checksum = plan_checksum(&path);
+            let mut args = vec![
+                "apply",
+                "--db",
+                connection,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "destructive,constraint",
+            ];
+            if staged {
+                args.push("--staged");
+            }
+            must_succeed(d.run(&args));
+            assert!(
+                try_on_server(connection, "INSERT INTO dbo.child (id) VALUES (2)").is_err(),
+                "the recreated FK must still reject an orphan"
+            );
+            must_succeed(d.run(&["verify", "--db", connection]));
+            must_succeed(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+            let next: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(next.changes.is_empty(), "{:?}", next.changes);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a live database; run the engine's live-test script"]
+fn external_referenced_key_dependencies_are_refused_before_planning_and_writing() {
+    let server = std::env::var("PBPS_TEST_DB").expect("set PBPS_TEST_DB");
+    for kind in ["index", "unique", "primary"] {
+        let slug = format!("external_key_{kind}");
+        let own = OwnDatabase::new(&server, &slug);
+        let connection = own.connection();
+        let d = Demo::new(&slug);
+
+        let key = if kind == "primary" {
+            "primary_key: {name: old_key, columns: [id]}\nunique:\n  other_key: [code]\n"
+        } else if kind == "index" {
+            "indexes:\n  old_key: {columns: [id], unique: true}\nunique:\n  other_key: [code]\n"
+        } else {
+            "unique:\n  old_key: [id]\n  other_key: [code]\n"
+        };
+        let parent = format!(
+            "table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\n  code: {{type: int, nullable: false}}\n{key}"
+        );
+        let success = |out: Output| assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        d.table(&parent);
+        success(d.run(&["plan"]));
+        d.commit();
+        success(d.run(&["bootstrap", "--db", connection]));
+        on_server(connection, "CREATE SCHEMA outside");
+        let external =
+            "CREATE TABLE outside.child (id int CONSTRAINT external_fk REFERENCES dbo.t(id))";
+        on_server(connection, external);
+        d.table(&parent.replace("old_key", "new_key"));
+        success(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("external-key-plan.json");
+        let refused = d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("drop_blockers")
+                && stderr(&refused).contains("outside.child"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(
+            !path.exists(),
+            "a refused plan must not produce an artifact"
+        );
+        on_server(connection, "DROP TABLE outside.child");
+        // Another external FK still exists, but its backing key is unchanged.
+        on_server(
+            connection,
+            "CREATE TABLE outside.unrelated (code int CONSTRAINT unrelated_fk REFERENCES dbo.t(code))",
+        );
+        success(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+        let checksum = plan_checksum(&path);
+        // An unmanaged dependency arriving after approval must be caught again.
+        on_server(connection, external);
+        let args = [
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "destructive,constraint",
+        ];
+        let refused = d.run(&args);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("drop_blockers")
+                && stderr(&refused).contains("outside.child"),
+            "{}",
+            stderr(&refused)
+        );
+        on_server(
+            connection,
+            "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.t') AND name='old_key') OR EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.t') AND name='new_key') THROW 50000, 'refused apply changed the key', 1;",
+        );
+        on_server(connection, "DROP TABLE outside.child");
+        success(d.run(&args));
+        // The unrelated external dependency survives this permitted replacement.
+        assert!(
+            try_on_server(
+                connection,
+                "INSERT INTO outside.unrelated (code) VALUES (99)"
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live database; run the engine's live-test script"]
+fn nonstandard_foreign_key_state_refuses_key_replacement_before_writing() {
+    let server = std::env::var("PBPS_TEST_DB").expect("set PBPS_TEST_DB");
+    for (state, orphan) in [
+        ("disabled", false),
+        ("disabled", true),
+        ("untrusted", false),
+        ("untrusted", true),
+        ("NOT FOR REPLICATION", false),
+    ] {
+        let slug = format!("key_state177_{}_{}", state.replace(' ', "_"), orphan);
+        let own = OwnDatabase::new(&server, &slug);
+        let connection = own.connection();
+        let d = Demo::new(&slug);
+        let parent = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nunique:\n  old_key: [id]\n";
+        d.table(parent);
+        std::fs::write(d.dir.join("schema/child.yml"),
+            "table: dbo.child\ncolumns:\n  id: {type: int}\nforeign_keys:\n  fk_child:\n    columns: [id]\n    references: dbo.t(id)\n").unwrap();
+        let success = |out: Output| assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        success(d.run(&["plan"]));
+        d.commit();
+        success(d.run(&["bootstrap", "--db", connection]));
+        on_server(
+            connection,
+            "INSERT INTO dbo.t VALUES (1); INSERT INTO dbo.child VALUES (1);",
+        );
+        d.table(&parent.replace("old_key", "new_key"));
+        success(d.run(&["plan"]));
+        d.commit();
+        let approved = d.dir.join("approved.json");
+        success(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            approved.to_str().unwrap(),
+        ]));
+        let checksum = plan_checksum(&approved);
+        if state == "NOT FOR REPLICATION" {
+            on_server(
+                connection,
+                "ALTER TABLE dbo.child DROP CONSTRAINT fk_child; ALTER TABLE dbo.child ADD CONSTRAINT fk_child FOREIGN KEY(id) REFERENCES dbo.t(id) NOT FOR REPLICATION;",
+            );
+        } else {
+            on_server(
+                connection,
+                "ALTER TABLE dbo.child NOCHECK CONSTRAINT fk_child;",
+            );
+            if orphan {
+                on_server(connection, "INSERT INTO dbo.child VALUES (2);");
+            }
+            if state == "untrusted" {
+                on_server(
+                    connection,
+                    "ALTER TABLE dbo.child CHECK CONSTRAINT fk_child;",
+                );
+            }
+        }
+        let (disabled, untrusted, replication) = match state {
+            "disabled" => (1, 1, 0),
+            "untrusted" => (0, 1, 0),
+            "NOT FOR REPLICATION" => (0, 1, 1),
+            _ => unreachable!(),
+        };
+        let unchanged = format!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE parent_object_id=OBJECT_ID('dbo.child') AND name='fk_child' AND is_disabled={disabled} AND is_not_trusted={untrusted} AND is_not_for_replication={replication}) THROW 50000, 'FK enforcement state changed', 1; IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.t') AND name='old_key') OR EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.t') AND name='new_key') THROW 50000, 'key replacement ran', 1;"
+        );
+        on_server(connection, &unchanged);
+        let verify = d.run(&["verify", "--db", connection, "--format", "json"]);
+        assert_eq!(
+            code(&verify),
+            FINDING,
+            "{state}: {}{}",
+            stdout(&verify),
+            stderr(&verify)
+        );
+        assert!(
+            stdout(&verify).contains("fk_child") && stdout(&verify).contains(state),
+            "{}",
+            stdout(&verify)
+        );
+        let refused_path = d.dir.join("refused.json");
+        let refused = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            refused_path.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{state}: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("fk_child") && stderr(&refused).contains(state),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(!refused_path.exists());
+        let args = [
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            approved.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "destructive,constraint",
+        ];
+        let refused = d.run(&args);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{state}: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("fk_child") && stderr(&refused).contains(state),
+            "{}",
+            stderr(&refused)
+        );
+        on_server(connection, &unchanged);
+        // Once the operator restores the declared semantics, the same approved
+        // plan is valid. Repairing the foreign key is never an implicit step.
+        if state == "NOT FOR REPLICATION" {
+            on_server(
+                connection,
+                "ALTER TABLE dbo.child DROP CONSTRAINT fk_child; ALTER TABLE dbo.child ADD CONSTRAINT fk_child FOREIGN KEY(id) REFERENCES dbo.t(id);",
+            );
+        } else {
+            on_server(
+                connection,
+                "DELETE FROM dbo.child WHERE id=2; ALTER TABLE dbo.child WITH CHECK CHECK CONSTRAINT fk_child;",
+            );
+        }
+        success(d.run(&args));
+        success(d.run(&["verify", "--db", connection]));
+    }
+}

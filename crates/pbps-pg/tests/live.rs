@@ -22015,3 +22015,133 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "needs a live database; run the engine's live-test script"]
+async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
+    use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
+    let mut conn = connect().await;
+    conn.begin(Postgres::new().transaction_framing())
+        .await
+        .unwrap();
+    conn.execute("CREATE SCHEMA key_guard177").await.unwrap();
+    conn.execute("CREATE TABLE key_guard177.parent (id integer NOT NULL, CONSTRAINT old_key UNIQUE(id)); CREATE TABLE key_guard177.child (id integer CONSTRAINT child_fk REFERENCES key_guard177.parent(id)); ALTER TABLE key_guard177.parent ADD CONSTRAINT other_key UNIQUE(id);").await.unwrap();
+    let parent = TableName::new("key_guard177", "parent");
+    let child = TableName::new("key_guard177", "child");
+    let drop_key = |name: &str| Change::DropUnique {
+        table: parent.clone(),
+        name: name.into(),
+    };
+    let plan = |changes: Vec<Change>| ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    };
+    conn.execute("CREATE TABLE key_guard177.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON key_guard177.indexed(id); CREATE TABLE key_guard177.index_child (id integer CONSTRAINT index_fk REFERENCES key_guard177.indexed(id)); CREATE UNIQUE INDEX other_standalone ON key_guard177.indexed(id); CREATE INDEX ordinary_index ON key_guard177.indexed(id); CREATE UNIQUE INDEX filtered_index ON key_guard177.indexed(id) WHERE id > 0;").await.unwrap();
+    let drop_index = |name: &str| Change::DropIndex {
+        table: TableName::new("key_guard177", "indexed"),
+        name: name.into(),
+    };
+    for (name, blocked) in [
+        ("standalone_key", true),
+        ("other_standalone", false),
+        ("ordinary_index", false),
+        ("filtered_index", false),
+    ] {
+        let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            reports.iter().any(|r| !r.blocking.is_empty()),
+            blocked,
+            "{name}: {reports:?}"
+        );
+    }
+    let removed = plan(vec![
+        Change::DropForeignKey {
+            table: TableName::new("key_guard177", "index_child"),
+            name: "index_fk".into(),
+        },
+        drop_index("standalone_key"),
+    ]);
+    assert!(
+        pbps_pg::impact::drop_blockers(&mut conn, &removed)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.blocking.is_empty())
+    );
+    assert!(
+        pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_index("missing")]))
+            .await
+            .is_err()
+    );
+    let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("other_key")]))
+        .await
+        .unwrap();
+    assert!(
+        reports.iter().all(|r| r.blocking.is_empty()),
+        "the other key has the same columns but no binding: {reports:?}"
+    );
+    let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].blocking.iter().any(|b| b.contains("child_fk")),
+        "{reports:?}"
+    );
+    let fk = Change::DropForeignKey {
+        table: child.clone(),
+        name: "child_fk".into(),
+    };
+    let reports =
+        pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![fk.clone(), drop_key("old_key")]))
+            .await
+            .unwrap();
+    assert!(reports.iter().all(|r| r.blocking.is_empty()), "{reports:?}");
+    let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("old_key"), fk]))
+        .await
+        .unwrap();
+    assert!(
+        !reports[0].blocking.is_empty(),
+        "a later FK removal does not clear an earlier key drop"
+    );
+    let renamed_parent = TableName::new("key_guard177", "renamed_parent");
+    let renamed_child = TableName::new("key_guard177", "renamed_child");
+    let renamed = plan(vec![
+        Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: parent.clone(),
+            to: renamed_parent.clone(),
+        },
+        Change::RenameTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            from: child.clone(),
+            to: renamed_child.clone(),
+        },
+        Change::DropForeignKey {
+            table: renamed_child,
+            name: "child_fk".into(),
+        },
+        Change::DropUnique {
+            table: renamed_parent,
+            name: "old_key".into(),
+        },
+    ]);
+    assert!(
+        pbps_pg::impact::drop_blockers(&mut conn, &renamed)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.blocking.is_empty())
+    );
+    assert!(
+        pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("missing")]))
+            .await
+            .is_err(),
+        "an absent existing key is not a successful dependency read"
+    );
+
+    conn.rollback(Postgres::new().transaction_framing())
+        .await
+        .unwrap();
+}

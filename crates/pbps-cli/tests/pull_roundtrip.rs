@@ -80,6 +80,9 @@ fn full_catalog() -> RawCatalog {
             ref_column: "region_id".into(),
             on_delete: 0,
             on_update: 1,
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
         }],
         checks: vec![RawCheck {
             object_id: 1,

@@ -11132,3 +11132,87 @@ SPEC is in sync with all of these.
      PostgreSQL's schema relation/index check from decision 453 still handles
      index and named key-backing-index collisions. Generated PostgreSQL names
      remain the separate issue #465.
+
+460. **Replacing a referenced key carries its foreign keys through the typed
+     plan (issue #177).** `pbps-diff` now adds `DropForeignKey` and
+     `AddForeignKey` for retained managed foreign keys whose referenced
+     primary/unique constraint or standalone unique index is dropped. Existing ordering places those changes
+     before the key removal and after the replacement; risk classification
+     runs afterward, so recreation carries `constraint` and FK removal keeps
+     its existing ungated classification. Explicit FK changes are not
+     duplicated. Table/column identity is brought forward before matching,
+     including self-references and composite keys. Ordinary unchanged keys
+     produce no extra work. Constraint names still mean drop plus add; no
+     engine-specific rename change or saved-plan field is introduced.
+
+     Measured on PostgreSQL 18.6 and SQL Server 2025, an FK binds a particular
+     backing index. Creating another UNIQUE over the same columns does not
+     let the old key drop: PostgreSQL reports `2BP01`, SQL Server `3727`.
+     Dropping the FK first, dropping the old key, then recreating the FK
+     succeeds and binds it to the remaining key. PostgreSQL permits a
+     permutation of referenced composite columns; SQL Server rejects that
+     declaration with `1776`. The differ therefore matches column sets
+     conservatively and exposes all affected managed FK recreations for
+     review. It does not claim to know which of several equivalent keys a
+     standing FK uses. The connected dependency check answers that question
+     from the catalog, so an external FK bound to a different standing key
+     does not block the change.
+
+     PostgreSQL extends the existing object-address DROP dependency graph to
+     primary/unique-key and index roots. SQL Server reads
+     `sys.foreign_keys.key_index_id` against `sys.indexes.index_id`, resolving
+     constraint-backed keys through `sys.key_constraints`. Both count only earlier typed
+     removals and reverse only preceding table renames when querying the
+     original catalog. A missing existing key is a failed read, not a report
+     of no dependencies. An FK outside the plan is named and refused during
+     connected planning and checked again before apply; nothing is added to
+     the approved plan at execution time. SQL Server's table/column DROP
+     reader remains separately unavailable.
+
+     SQL Server's new key check requires database `VIEW DEFINITION`:
+     measured, ALTER plus VIEW DEFINITION on the parent alone returns zero
+     `sys.foreign_keys` rows for an external child; the database permission
+     exposes the dependency. An explicit child-table DENY still hides it while
+     the database-level permission check answers true; that denial's own row
+     remains readable. The guard therefore also refuses effective object/schema
+     metadata denials, including those inherited through a database role,
+     while respecting owner overrides. The check refuses insufficient visibility
+     instead of treating that zero as proof of absence. This requirement is asked only
+     for an existing unique key drop. SQL Server first reads the index kind
+     with the parent's metadata rights; an ordinary nonunique or filtered
+     unique index drop does not acquire a database-level permission
+     prerequisite. Measured on both engines: a filtered/partial unique index
+     cannot back an FK, so the pure differ excludes it from managed-FK
+     recreation too. The SQL Server regression replaces a filtered index
+     with only parent-level grants, while an unfiltered unique index still
+     requires complete dependency visibility.
+
+     Live CLI tests on both engines cover primary and unique key replacement,
+     the explicit four-change saved plan, orphan refusal after recreation,
+     an empty next plan, and external dependencies present during planning or
+     arriving after approval. Engine tests distinguish two keys over the same
+     columns, earlier/later FK removal, renamed tables, missing keys and SQL
+     Server metadata visibility. Counterfactuals restore the old planner and
+     each connected guard independently and observe their corresponding new
+     regression fail. The existing staged restriction remains: this is a
+     multi-change transactional plan, and `--staged` refuses it before writing
+     an artifact.
+
+     The first review found the same dependency on a standalone unique index:
+     its `DropIndex`/`AddIndex` changes had been omitted from all three key
+     scans. The differ now includes unique baseline indexes, and both connected
+     guards cover their actual index identities. The shared regressions run
+     all three key kinds, with a nonunique-index negative control. Restoring
+     each reviewed scan independently makes its new regression fail.
+
+     SQL Server FK enforcement flags also stay outside the declaration: a
+     disabled, untrusted (`WITH NOCHECK`) or `NOT FOR REPLICATION` FK cannot
+     be recreated as an ordinary enabled, trusted FK without changing its
+     semantics. The catalog carries all three flags into the pure assembler,
+     which omits the FK with one named relation limitation per constraint.
+     Existing managed-set drift checks then refuse connected planning and
+     apply before writing; pull reports the limitation. No model or saved-plan
+     fields are added. Composite-FK unit tests retain the ordinary control,
+     and live CLI tests cover clean and orphaned disabled/untrusted keys,
+     replication semantics, changes after approval, unchanged engine flags on
+     refusal, and applying the same plan after an explicit operator repair.
