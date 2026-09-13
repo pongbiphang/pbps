@@ -1964,6 +1964,16 @@ Acceptance criteria for that slice:
    deterministic.
 6. Generated artifacts carry the pbps version and the schema version, so editor
    assistance and templates cannot silently drift from the installed binary.
+   The published JSON Schema set advances once per merged change to any kind's
+   JSON content, including editor annotations, rather than once per release.
+   All kinds share `x-pbps-schema-version`; whitespace, object-key order and
+   the top-level `x-pbps-tool-version` stamp do not require a change. Each new
+   version archives the complete set, and existing archives remain unchanged.
+   Comparing generated documents with the archive selected by their version
+   catches a stale number even when the generator and current copies agree.
+   This is separate from the envelope's wire version (§9.8) and saved-plan or
+   state formats. Version 10 establishes this rule for the accumulated changes
+   after 9; previously published version-9 documents remain ambiguous (465).
 
 ### 14.3 Product guardrails
 

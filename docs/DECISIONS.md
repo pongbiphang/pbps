@@ -11348,3 +11348,31 @@ SPEC is in sync with all of these.
      statement with the final alias removed binds both temporary objects,
      pinning the negative case. Unit cases keep ordinary names, quoting and
      extra ordering intact.
+
+465. **A published schema version identifies a fixed set of documents (issue #191).**
+     `integration::SCHEMA_VERSION` moves once per merged change to the JSON
+     content of any published schema kind, not per tool release or individual
+     commit. All three kinds move together. Whitespace, object-key order and
+     the top-level tool-version stamp are excluded; everything else, including
+     editor descriptions, is part of this conservative content contract. Exact
+     parsed-document equality is stronger than equal validation behavior and
+     avoids pretending to decide arbitrary JSON Schema equivalence.
+
+     Version 10 covers the accumulated changes after 9, including envelope
+     version pinning, doctor optional fields, timeline unreadability variants,
+     the positive state-list limit and later payload additions. The envelope's
+     own wire version, saved plans, state snapshots and declaration formats do
+     not move with this schema-set stamp. Existing version-9 publications have
+     different contents; assigning a new number now cannot repair a cached
+     legacy copy. Regenerate it from the updated binary or retain the exact
+     document rather than relying on the old number alone.
+
+     Tests archive the complete published set under its version, separately
+     from the mutable top-level copies. The current generator must match the
+     archive selected by its version, ignoring only the tool stamp. A future
+     schema change therefore needs a new number and a new complete archive;
+     old archives stay unchanged. Regenerating today's checked-in documents
+     alone cannot make the version guard pass. An actual version-9 publication
+     from `9a01bfa` pins the old acceptance of `state list` with `limit: 0`;
+     the current document refuses it under a distinct schema-set version,
+     while both accept a positive limit and reject a future envelope version.
