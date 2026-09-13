@@ -22233,3 +22233,109 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own_artifact() {
+    use pbps_model::{Change, Index, IndexColumn, Strategy, TableName};
+    let mut db = TestDb::create("index_recovery186").await;
+    db.execute("CREATE SCHEMA app; CREATE TABLE app.t(id integer); CREATE TABLE app.u(id integer); INSERT INTO app.t VALUES (1),(1); INSERT INTO app.u VALUES (2),(2)").await.unwrap();
+    let emitted = |name: &str, unique: bool, online: bool| {
+        Postgres::new()
+            .emit(
+                &Change::AddIndex {
+                    table: TableName::new("app", "t"),
+                    name: name.into(),
+                    index: Box::new(Index {
+                        columns: vec![IndexColumn {
+                            name: "id".into(),
+                            descending: false,
+                        }],
+                        include: vec![],
+                        unique,
+                        filter: None,
+                    }),
+                },
+                Strategy { online },
+            )
+            .unwrap()
+            .remove(0)
+    };
+    for (name, sql, invalid) in [
+        (
+            "existing_invalid",
+            "CREATE UNIQUE INDEX CONCURRENTLY existing_invalid ON app.t(id)",
+            true,
+        ),
+        (
+            "existing_valid",
+            "CREATE INDEX existing_valid ON app.t(id)",
+            false,
+        ),
+        (
+            "other_invalid",
+            "CREATE UNIQUE INDEX CONCURRENTLY other_invalid ON app.u(id)",
+            true,
+        ),
+        (
+            "existing_table",
+            "CREATE TABLE app.existing_table(id integer)",
+            false,
+        ),
+    ] {
+        let result = db.execute(sql).await;
+        assert_eq!(result.is_err(), invalid);
+        let query = format!("SELECT 'app.{name}'::regclass::oid::text");
+        let before = text(&mut db, &query).await;
+        let error = pbps_pg::staged::execute(&mut db, &emitted(name, true, true))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            text(&mut db, &query).await,
+            before,
+            "existing object {name} must retain its identity"
+        );
+        assert!(
+            error.to_string().contains("existed before the statement"),
+            "{error}"
+        );
+    }
+    let hostile = "ix \"'; -- recovery";
+    for _ in 0..2 {
+        let error = pbps_pg::staged::execute(&mut db, &emitted(hostile, true, true))
+            .await
+            .unwrap_err();
+        assert_eq!(error.server_error_code().as_deref(), Some("23505"));
+        assert!(
+            error.to_string().contains("removed invalid index"),
+            "{error}"
+        );
+        let rows = db.query_with("SELECT count(*)::int AS n FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app' AND c.relname=$1", &[hostile.into()]).await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(0));
+    }
+    // The successful concurrent build is kept; a failed transactional build
+    // relies on the engine's rollback and must not enter artifact recovery.
+    pbps_pg::staged::execute(&mut db, &emitted("kept_success", false, true))
+        .await
+        .unwrap();
+    assert!(
+        truth(
+            &mut db,
+            "SELECT indisvalid FROM pg_index WHERE indexrelid='app.kept_success'::regclass"
+        )
+        .await
+    );
+    let error = pbps_pg::staged::execute(&mut db, &emitted("ordinary_failure", true, false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.server_error_code().as_deref(), Some("23505"));
+    assert!(!error.to_string().contains("recovery"));
+    assert!(
+        truth(
+            &mut db,
+            "SELECT to_regclass('app.ordinary_failure') IS NULL"
+        )
+        .await
+    );
+    db.drop().await;
+}

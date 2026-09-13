@@ -38,6 +38,18 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+/// Execute one staged DDL statement, including recovery owned by its engine.
+pub async fn execute_staged_statement(
+    conn: &mut Conn,
+    statement: &pbps_dialect::Statement,
+) -> Result<(), DbError> {
+    match conn.driver() {
+        // SQL Server's emitted DDL has no non-transactional build artifact.
+        Driver::Mssql => conn.execute(&statement.sql).await,
+        Driver::Postgres => pbps_pg::staged::execute(conn, statement).await,
+    }
+}
+
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::CostReport {

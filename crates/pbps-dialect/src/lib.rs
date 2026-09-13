@@ -123,6 +123,10 @@ pub struct Statement {
     /// Derived by the emitter, never inferred by parsing the SQL.
     pub row_write: Option<RowWrite>,
 
+    /// An index this statement builds outside a transaction. The executor
+    /// needs its identity to recover a failed build without parsing SQL.
+    pub index_build: Option<IndexBuild>,
+
     /// Must be sent as a batch of its own.
     ///
     /// Some SQL Server DDL cannot share a batch with statements that reference it
@@ -205,6 +209,12 @@ pub struct RowWrite {
     pub operation: RowOperation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBuild {
+    pub table: TableName,
+    pub name: String,
+}
+
 /// An object a statement creates, for a staged checkpoint to adopt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Created {
@@ -218,6 +228,7 @@ impl Statement {
         Self {
             sql: sql.into(),
             row_write: None,
+            index_build: None,
             own_batch: false,
             transactional: true,
             renames: Vec::new(),
@@ -228,6 +239,14 @@ impl Statement {
 
     pub fn writing_rows(mut self, table: TableName, operation: RowOperation) -> Self {
         self.row_write = Some(RowWrite { table, operation });
+        self
+    }
+
+    pub fn building_index(mut self, table: TableName, name: impl Into<String>) -> Self {
+        self.index_build = Some(IndexBuild {
+            table,
+            name: name.into(),
+        });
         self
     }
 

@@ -63,6 +63,7 @@ pub mod modules;
 mod preflight;
 pub mod roles;
 pub mod rows;
+pub mod staged;
 pub mod state;
 mod types;
 pub mod validate;
