@@ -2841,11 +2841,6 @@ mod tests {
         }
     }
 
-    /// A column this plan adds and populates in the same revision has no
-    /// recorded cell to hold the row to *before* the write — but it has one
-    /// after: `AddColumn` and `AlterColumnType` both sort ahead of the row
-    /// changes, so the `UPDATE` meets the declared type. Held to the base
-    /// type alone, the added cell was checked by nothing, and an `AFTER
     /// The types with no way back from their own rendering. Removing
     /// `rows::comparable` made every cell held, and a *retyped* column of one
     /// of these is where that is one step too far, each for its own measured
@@ -2947,6 +2942,11 @@ mod tests {
         );
     }
 
+    /// A column this plan adds and populates in the same revision has no
+    /// recorded cell to hold the row to *before* the write — but it has one
+    /// after: `AddColumn` and `AlterColumnType` both sort ahead of the row
+    /// changes, so the `UPDATE` meets the declared type. Held to the base
+    /// type alone, the added cell was checked by nothing, and an `AFTER
     /// UPDATE` trigger rewriting it was recorded as the plan's own result
     /// (DECISIONS 140).
     #[test]
