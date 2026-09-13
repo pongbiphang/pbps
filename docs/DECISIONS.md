@@ -11252,3 +11252,27 @@ SPEC is in sync with all of these.
      writes. The names stay in the diagnostic, not as ordinary enforcing model
      objects. Ordinary disabled nonunique indexes are access-path differences
      and retain the existing storage-policy boundary of issue #171.
+
+462. **An identity increment must fit PostgreSQL's directional sequence span
+     (issue #181).** The existing identity check already uses the sequence's
+     own default bounds: `1..=type_max` when ascending, `type_min..=-1` when
+     descending. It now refuses an increment whose magnitude exceeds the
+     difference between those endpoints. Equality is allowed: measured on
+     PostgreSQL 18.6, `smallint` starting at 1 by 32766 produces 1 and 32767,
+     and starting at -1 by -32767 produces -1 and -32768. The corresponding
+     integer and bigint boundaries work in both directions too.
+
+     PostgreSQL accepts larger increments at `CREATE TABLE` and stores them
+     unchanged; the second insert then fails with sequence exhaustion
+     (`2200H`) for every valid seed. This is an explicit data-path validation
+     rule requested by #181, not a claim that the engine rejects or silently
+     rewrites the declaration (decision 266). The diagnostic says which step,
+     type, bounds and usable span caused the refusal. It does not narrow the
+     seed rule: a seed at an endpoint with an ordinary increment stays legal.
+
+     Arithmetic widens to i128 before subtraction or absolute value, so the
+     model's i64 minimum increment is refused without overflow. Unit cases
+     cover all three integer types, both directions, aliases and endpoints.
+     CLI tests pin refusal before connecting and bootstrap the six exact-span
+     boundaries, insert two generated rows and verify convergence. Reverting
+     the span check makes the new refusal regressions fail.
