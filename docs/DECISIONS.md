@@ -1228,6 +1228,10 @@ SPEC is in sync with all of these.
     spatial types have no `=`, and asking for one is an error rather than a
     false answer. An older plan carries no types and checks nothing here,
     exactly as an older `UpdateRow` holds the row to its key alone.
+
+    **Amended by 471: the type no longer says anything.** The comparison is of
+    text on both sides and has been for some time, so the six types without an
+    `=` are held like every other. Only the *default* decides now.
 134. **A permission on a schema is probed before the plan runs.** `validate`
     accepts a schema target it cannot see inside — an external schema has no
     declared objects — and this tool never creates a schema, so a grant on
@@ -1408,6 +1412,10 @@ SPEC is in sync with all of these.
     carried but not held — the same limit, in the same place, as an update's.
     A mismatch is `@@ROWCOUNT <> 1`, which already says "changed or deleted
     since the plan was made. Plan again."
+
+    **Amended by 471: nothing is carried unheld any more.** That limit was the
+    native `=`, and the comparison became one of text; a cell of a type without
+    an operator is held by the rendering that read it, like every other.
 
 144. **A disabled foreign key is not counted when a row is deleted.**
     `NOCHECK CONSTRAINT` leaves the constraint in `sys.foreign_keys` and stops
@@ -11604,3 +11612,58 @@ SPEC is in sync with all of these.
      pbps guard before the engine constraint or cascade, and effects are
      read before rollback. Restoring the old guard makes both tests fail by
      refusing the self-only delete.
+471. **This dialect's read of a defaulted cell asks the same question the write
+     does, and the guard that asked about the type had nothing left to guard.**
+     The port of 330 and 331 to `pbps-mssql`, and worse here than there because
+     it needs no unusual collation at all.
+
+     **The read-back's `at_default` was the column's comparison, not pbps's.**
+     `emit::defaulted_cell` holds a cell to its default as text under
+     `COLLATE Latin1_General_BIN2` and through the column's type; `rows::query`
+     asked the same question with a native `=` on the raw column. **Measured on
+     `SQL_Latin1_General_CP1_CI_AS`** — the server's default collation, and the
+     one this suite's container runs on — with `label varchar(20) DEFAULT 'new'`
+     holding `New`:
+
+     ```text
+     label = ('new')                                  ->  at_default
+     the same, as text under Latin1_General_BIN2      ->  drift
+     ```
+
+     The first answer marks the cell at its default, so `ObservedRow::as_seen_by`
+     leaves it out of the read-back, the drift is not in the observed state at
+     all, and neither a connected plan nor `verify` proposes to put the value
+     back. On PostgreSQL the same defect needs a `CREATE COLLATION`; here the
+     default server collation is case-insensitive, so every installation that
+     never chose one is exposed.
+
+     **And `rows::comparable` went with it.** It answered "does this type have
+     `=`?" for `xml`, `geometry`, `geography`, `text`, `ntext` and `image`, and
+     was asked in three places because the comparisons there were native. Every
+     one of them is a comparison of text now — `read_expr` on both sides, under
+     the binary collation — so the guard cost those six types their read-back
+     and bought nothing: a cell of one was never asked about, was read as
+     indistinguishable from its default, and a hand edit to it was drift no plan
+     would settle.
+
+     **Measured**, both halves of why removing it is safe:
+
+     ```text
+     CONVERT(nvarchar(max), doc) = CONVERT(nvarchar(max), TRY_CONVERT(xml, '<a/>'))
+                                                    ->  at_default for the default,
+                                                        drift for an edit
+     CREATE TABLE k (c xml PRIMARY KEY)             ->  Msg 1919 … invalid for use
+                                                        as a key column in an index
+     CREATE TABLE u (c xml UNIQUE)                  ->  Msg 1919, the same
+     ```
+
+     The last two lines are what make the sweep complete rather than hopeful,
+     and they were run for all six types, not for `xml` alone. The native `=`
+     this dialect still writes is on key columns — `WHERE [key] = N'…'` — and
+     none of the six can be one: refused as a `PRIMARY KEY` and as a `UNIQUE`,
+     so no foreign key can reference one either. There is no type left for the
+     guard to protect, and `Held::as_stored` no longer returns an `Option`.
+
+     What a plan holds therefore widens: an `INSERT` that leaves an `xml`
+     column to a literal default now carries a predicate holding it to that
+     default, where before it carried none.

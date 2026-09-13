@@ -1110,6 +1110,23 @@ they are one function or they are one bug waiting. Search for the *question*
 (here: "at its default"), not for the code you just changed — and prefer
 extracting the comparison over remembering to sweep for it.
 
+**And then it was found again, in the other dialect, by sweeping for the shape
+rather than for the code.** `pbps-mssql` had the same pair, written at the same
+two times, and it is worse there: PostgreSQL needs a `CREATE COLLATION` to
+reach the defect, while SQL Server's **default** server collation is
+case-insensitive, so no unusual anything is required. Measured on
+`SQL_Latin1_General_CP1_CI_AS`, with `label varchar(20) DEFAULT 'new'` holding
+`New`:
+
+```text
+label = ('new')                               ->  at_default
+the same, under Latin1_General_BIN2           ->  drift
+```
+
+A fix on one dialect is a question to ask of the other, and the answer here was
+filed as an issue from the sweep — a year of `verify` runs on the default
+collation would never have shown it.
+
 ## The guard outlived the reason, and took a whole type with it
 
 `rows::comparable` answered one question — does this type have a native `=`? —
@@ -1122,6 +1139,15 @@ It was not inert. `json` is the one type in this dialect's catalogue with no
 `=`, so a `json` cell with a literal default was never asked about, was read
 back as a cell nobody can tell from its default, was dropped from the
 read-back, and a hand-edited document became drift no plan would settle.
+
+**The same guard, the same fate, on the other dialect**: `pbps-mssql`'s
+`rows::comparable` excluded six types — `xml`, `geometry`, `geography`, `text`,
+`ntext`, `image` — and lost all six the moment its comparisons became
+comparisons of text. Removing a guard like this is only safe with the sweep
+that says where the native operator still *is*: here it is the key predicate,
+and the six were measured refused as a `PRIMARY KEY` and as a `UNIQUE`
+(`Msg 1919 … invalid for use as a key column in an index`), so none can reach
+it. Measuring one type and generalising would not have been that proof.
 
 **The shape:** a fix removes the reason for a check without removing the check.
 The check still runs, still refuses things, and now refuses them for a reason

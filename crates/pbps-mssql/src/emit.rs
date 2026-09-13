@@ -270,9 +270,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // key-only DELETE removes whatever an application session left
             // under that key in between, and `@@ROWCOUNT = 1` calls the loss
             // a success. Each recorded cell is compared the way the read-back
-            // rendered it, exactly as an update's precondition does; a cell
-            // whose type has no comparison is carried and not held
-            // (DECISIONS 143).
+            // rendered it, exactly as an update's precondition does. Every
+            // type is held now: the comparison is of text, so a cell that
+            // used to be carried unheld for want of a native `=` is held like
+            // any other (DECISIONS 143, and this dialect's port of 331).
             let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
             for (column, cell) in row {
                 predicates.extend(recorded_cell(
@@ -898,9 +899,7 @@ fn recorded_cell(
         Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
         Cell::Value(v) => {
             let recorded = literal(&recorded_text(v));
-            let Some(expected) = ty.as_stored(&recorded) else {
-                return Ok(None);
-            };
+            let expected = ty.as_stored(&recorded);
             Some(format!(
                 "{} = {} COLLATE Latin1_General_BIN2",
                 crate::rows::read_expr(&quoted, &now.base),
@@ -961,15 +960,6 @@ impl<'a> Held<'a> {
         normalized(self.now.unwrap_or(self.read))
     }
 
-    /// Whether a retyped column can be held at all: `xml`, `text` and the
-    /// spatial types have no comparison to give, so asking either end for one
-    /// would be an error rather than a false answer — the same reason
-    /// [`defaulted_cell`] asks first. An unretyped column needs nothing of
-    /// its type but the rendering, and never comes here.
-    fn comparable(self) -> bool {
-        crate::rows::comparable(&self.read().base) && crate::rows::comparable(&self.now().base)
-    }
-
     /// `value`, an expression of the type the cell was recorded in, as the
     /// column holds it now.
     ///
@@ -999,18 +989,15 @@ impl<'a> Held<'a> {
     /// conversion erases. Measured — a cell moved from `1.50` to `1.99`
     /// before a `decimal(5,2)` becomes `int` reads back as `1` either way,
     /// and the column no longer holds what would tell them apart.
-    fn as_stored(self, recorded: &str) -> Option<String> {
+    fn as_stored(self, recorded: &str) -> String {
         if !self.retyped() {
-            return Some(recorded.to_owned());
-        }
-        if !self.comparable() {
-            return None;
+            return recorded.to_owned();
         }
         let now = self.now();
-        Some(crate::rows::read_expr(
+        crate::rows::read_expr(
             &self.converted(&crate::rows::from_text(recorded, &self.read())),
             &now.base,
-        ))
+        )
     }
 }
 
@@ -1078,10 +1065,13 @@ fn atomically(body: &str) -> String {
 /// or nothing, where there is no answer the engine can give without running
 /// something.
 ///
-/// The type decides whether the comparison exists at all: `xml`, `text` and
-/// the spatial types have no `=`, and asking for one is an error rather than
-/// a false answer. A plan made before the types travelled carries none, and
-/// checks nothing here — the same as an older plan's `UpdateRow`.
+/// What decides that is the *default*, not the type: a default the engine
+/// would have to run is not asked about at all. The type used to decide too,
+/// because `xml`, `text` and the spatial types have no native `=` — but this
+/// comparison has never been a native one, and the guard outlived its reason
+/// while costing those six types their whole read-back. A plan made before
+/// the types travelled carries none, and checks nothing here — the same as an
+/// older plan's `UpdateRow`.
 ///
 /// Both sides are rendered as the read-back renders the column, and compared
 /// under a binary collation: the default is first converted to the column's
@@ -1097,7 +1087,7 @@ fn defaulted_cell(
     let Some(ty) = ty else {
         return Ok(None);
     };
-    if !ty.comparable() || !crate::rows::is_constant(default) {
+    if !crate::rows::is_constant(default) {
         return Ok(None);
     }
     let (read, now) = (ty.read(), ty.now());
@@ -2486,7 +2476,8 @@ mod tests {
                 // value before it runs, and a sequence would be consumed.
                 ("seq".to_owned(), "(NEXT VALUE FOR dbo.s)".to_owned()),
                 ("stamp".to_owned(), "(getdate())".to_owned()),
-                // No `=` exists for the type, so no comparison does either.
+                // A type with no native `=` is held like any other: the
+                // comparison is of the text the read-back renders.
                 ("doc".to_owned(), "('<a/>')".to_owned()),
                 // A plan made before the types travelled carries none.
                 ("old".to_owned(), "((1))".to_owned()),
@@ -2520,6 +2511,9 @@ mod tests {
             // renders the column, the default converted to its type first.
             "(CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
             "(CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), CONVERT(nvarchar(50), (NULL))) COLLATE Latin1_General_BIN2 OR ([note] IS NULL AND ((NULL)) IS NULL))",
+            // `xml` has no `=`, and it is held anyway, because the two sides
+            // are text by the time they meet.
+            "(CONVERT(nvarchar(max), [doc]) = CONVERT(nvarchar(max), CONVERT(xml, ('<a/>'))) COLLATE Latin1_General_BIN2 OR ([doc] IS NULL AND (('<a/>')) IS NULL))",
             " AND [rank] IS NULL",
             " AND [body] IS NULL",
         ] {
@@ -2530,7 +2524,6 @@ mod tests {
         for absent in [
             "[seq]",
             "[stamp]",
-            "[doc]",
             "[old]",
             "[label] = N'New'",
             "[label] IS NULL",
