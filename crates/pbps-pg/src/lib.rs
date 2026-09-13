@@ -121,7 +121,8 @@ impl Unbuilt {
 ///   table the declarations do not contain.
 pub(crate) const MAX_IDENT_BYTES: usize = 63;
 
-/// What this engine refuses about an `identity:`, each measured on 18.6.
+/// Identity declaration checks: engine refusals and increments that exhaust
+/// every valid starting point after one value (decision 462), measured on 18.6.
 ///
 /// `validate` is where a declaration should fail, and until the catalogue
 /// existed this could not be asked: `validate_table` refused every table
@@ -156,7 +157,24 @@ fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<Dialect
             accepted.end(),
             identity.seed
         ))),
-        Some(_) => {}
+        Some(accepted) => {
+            // An exact span can reach both endpoints. PostgreSQL accepts a
+            // larger step at CREATE, but no valid seed then yields a second
+            // value. Widen before taking a magnitude: i64::MIN is spellable.
+            let span = i128::from(*accepted.end()) - i128::from(*accepted.start());
+            if i128::from(identity.increment).abs() > span {
+                found.push(invalid(format!(
+                    "column `{column}` has an `identity:` increment of {} whose magnitude exceeds \
+                     the sequence span {span} for `{}` ({}..={}). PostgreSQL accepts the table, \
+                     but no valid seed can produce a second value; use an increment magnitude \
+                     at most {span}.",
+                    identity.increment,
+                    declared.ty,
+                    accepted.start(),
+                    accepted.end()
+                )));
+            }
+        }
     }
     // `GENERATED ... AS IDENTITY` implies NOT NULL, and saying both is
     // `conflicting NULL/NOT NULL declarations`.
@@ -2106,6 +2124,59 @@ mod tests {
                 accepted,
                 "`{declared}` starting at {seed} by {increment}: {found:?}"
             );
+        }
+    }
+
+    #[test]
+    fn identity_increments_must_fit_the_directional_sequence_span() {
+        for (declared, seed, increment, accepted) in [
+            ("smallint", 1, 40000, false),
+            ("smallint", 1, 32767, false),
+            ("smallint", 1, 32766, true),
+            ("smallint", -1, -40000, false),
+            ("smallint", -1, -32768, false),
+            ("smallint", -1, -32767, true),
+            ("integer", 1, 2_147_483_647, false),
+            ("integer", 1, 2_147_483_646, true),
+            ("integer", -1, -2_147_483_648, false),
+            ("integer", -1, -2_147_483_647, true),
+            ("bigint", 1, i64::MAX, false),
+            ("bigint", 1, i64::MAX - 1, true),
+            ("bigint", -1, i64::MIN, false),
+            ("bigint", -1, -i64::MAX, true),
+            ("int2", 1, 40000, false),
+            ("int4", -1, -2_147_483_647, true),
+            ("int8", -1, i64::MIN, false),
+            // This rule concerns the increment, not remaining values from a
+            // particular seed; the existing seed-boundary contract remains.
+            ("smallint", 32767, 1, true),
+            ("bigint", i64::MIN, -1, true),
+        ] {
+            let mut table = Table::default();
+            let mut column = pbps_model::Column::new(ty(declared));
+            column.nullable = false;
+            column.identity = Some(pbps_model::Identity { seed, increment });
+            table.columns.insert("id".into(), column);
+            let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
+            assert_eq!(
+                found.is_empty(),
+                accepted,
+                "{declared} increment {increment}: {found:?}"
+            );
+            if !accepted {
+                assert_eq!(found.len(), 1, "{found:?}");
+                let message = found[0].to_string();
+                for expected in [
+                    "sequence span".to_owned(),
+                    increment.to_string(),
+                    "id".to_owned(),
+                ] {
+                    assert!(message.contains(&expected), "{message}");
+                }
+                if declared == "smallint" && increment == 40000 {
+                    assert!(message.contains("32767"), "{message}");
+                }
+            }
         }
     }
 

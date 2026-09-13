@@ -6675,3 +6675,67 @@ fn external_referenced_key_dependencies_are_refused_before_planning_and_writing(
         );
     }
 }
+
+#[test]
+fn impossible_identity_increments_are_refused_before_connecting() {
+    let unreachable = "host=127.0.0.1 port=1 user=postgres password=no dbname=none";
+    for (seed, increment) in [(1, 40000), (-1, -40000)] {
+        let d = Demo::new(&format!("identity-span-validation-{increment}"));
+        d.table(&format!("table: app.t\ncolumns:\n  id: {{type: smallint, nullable: false, identity: [{seed}, {increment}]}}\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        for args in [vec!["validate"], vec!["bootstrap", "--db", unreachable]] {
+            let out = d.run(&args);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            let message = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                message.contains("sequence span") && message.contains(&increment.to_string()),
+                "{message}"
+            );
+            assert!(
+                !message.contains("127.0.0.1"),
+                "validation must precede connection: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+fn identity_increments_at_the_sequence_span_produce_two_values() {
+    for (declared, low, high) in [
+        ("smallint", i64::from(i16::MIN), i64::from(i16::MAX)),
+        ("integer", i64::from(i32::MIN), i64::from(i32::MAX)),
+        ("bigint", i64::MIN, i64::MAX),
+    ] {
+        for (direction, seed, increment, second) in
+            [("up", 1, high - 1, high), ("down", -1, low + 1, low)]
+        {
+            let slug = format!("identity_span_{declared}_{direction}");
+            let own = OwnDatabase::new(&server(), &slug);
+            let connection = own.connection();
+            on_server(connection, "CREATE SCHEMA app");
+            let d = Demo::new(&slug);
+            d.table(&format!("table: app.t\ncolumns:\n  id: {{type: {declared}, nullable: false, identity: [{seed}, {increment}]}}\nprimary_key: {{name: pk_t, columns: [id]}}\n"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["validate"]));
+            succeeds(d.run(&["bootstrap", "--db", connection]));
+            assert_eq!(
+                scalar(
+                    connection,
+                    "INSERT INTO app.t DEFAULT VALUES RETURNING id::bigint"
+                ),
+                seed
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "INSERT INTO app.t DEFAULT VALUES RETURNING id::bigint"
+                ),
+                second
+            );
+            succeeds(d.run(&["verify", "--db", connection]));
+        }
+    }
+}
