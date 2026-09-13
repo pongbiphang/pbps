@@ -206,6 +206,8 @@ jobs:
       # seam in `engine.rs`. Serial, because each test creates and drops a
       # database of its own.
       - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1
+        env:
+          PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
 
   # `plan --dev docker://<image>` starts a throwaway container of its own, and
   # nothing else reaches that code: every other `--dev` test passes a connection

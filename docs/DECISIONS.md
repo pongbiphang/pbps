@@ -11059,3 +11059,60 @@ SPEC is in sync with all of these.
      responses, and CSP permits only shipped assets plus the measured style
      hash. These boundaries ship with the read views, before any compose or
      deployment UI exists.
+
+458. **SQL scripts carry the same session pins as deployment (issue #174).**
+     PR #205 supplied `Dialect::session_pins` for staged runs and a fresh
+     connection resuming a checkpoint; #285 moved the pins ahead of probes.
+     The remaining script path passed only a batch separator to the renderer,
+     so offline/connected `plan --sql` and `bootstrap --sql` omitted the nine
+     PostgreSQL settings. `render_script` now takes the dialect and obtains
+     both its separator and its pins. The setup is an initial script batch,
+     outside the saved changes, checksums and checkpoint statement counts.
+     A dialect with no pins retains its output; an empty script stays empty.
+
+     The client must execute that batch before parsing the DDL. Measured on
+     PostgreSQL 18.6 with psql reading standard input, an initial
+     `standard_conforming_strings=off` and `DateStyle=German,DMY` interpreted
+     `01/02/2026` as February 1 and `a\n` as a string containing a newline.
+     The shared pins make them January 2 and a literal backslash followed by
+     `n`; `it\'s  here`, previously accepted, fails with `42601`. Concatenating
+     setup and DDL into one simple query cannot establish the lexical setting
+     in time (decision 260), so the output names the ordered-execution rule.
+     `psql -f` and standard input satisfy it; `psql -c` with the whole file
+     does not. This does not add approval or ledger recording to SQL previews.
+
+     The CLI regression feeds all three actual output files to psql under
+     hostile values of all nine settings and asks the server for the stored
+     constraints. Its invalid-quote control must report `42601`. The local
+     script and CI use the test container's psql; `PBPS_TEST_PSQL` selects a
+     local client for a separately hosted test server. Another live case uses
+     database-local hostile defaults so it leaves the shared login untouched:
+     a single CreateTable change checkpoints before its CHECK statements,
+     then a new CLI process resumes it. Accepted and refused rows distinguish
+     the pinned date and string meanings on both staged and resumed paths.
+
+     That live case exposed a valid-plan refusal in the checkpoint guard:
+     after CREATE TABLE's first statement, the table exists in the previous
+     read, and a later CHECK from the same CreateTable payload was treated as
+     an unplanned addition. The payload's pending unique/foreign-key/check/
+     index names now permit only their absent-to-present transition at a
+     statement checkpoint. An already recorded part still compares by its
+     complete read-back definition, removal is still movement, and a name
+     outside the payload is still refused. The exemption does not apply to
+     the closing read, where no statement ran. Negative unit cases pin those
+     boundaries for all four kinds. This is the valid-plan-refusal case of
+     the review rule, needed to exercise the issue's staged/resume path.
+
+     A pending part's first observed definition must also answer to the
+     CREATE payload. Review found that a ddl_command_end trigger could
+     replace a newly added UNIQUE/index before its checkpoint, after which
+     comparing that checkpoint against itself let the run close. The created
+     table's existing structure validation now runs at every read, including
+     resumed and closing reads, even when the previous checkpoint already
+     holds the table. Foreign keys carried in the payload receive the same
+     structural comparison as separately added foreign keys. Checks and
+     filters still follow SPEC 7.6's expression-text exclusion. Live trigger
+     regressions replace UNIQUE and index columns, require a retained staged
+     failure and a refused resume, and keep successful clean deployments as
+     controls. Restoring the reviewed guard makes the new test accept the
+     replaced UNIQUE and fail its refusal assertion.

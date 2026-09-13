@@ -67,6 +67,8 @@ done
 # does not need the password percent-encoded.
 export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWORD dbname=$DB"
 export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password=$PASSWORD dbname=$DB"
+# The script-output regression uses this server's psql, including its lexer.
+export PBPS_TEST_PG_CONTAINER="$NAME"
 
 # One of these tests waits out `pbps_db::CONNECT_TIMEOUT` on purpose — a
 # firewall that drops rather than refuses is a category of its own, and thirty
