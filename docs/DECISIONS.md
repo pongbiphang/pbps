@@ -12315,6 +12315,22 @@ SPEC is in sync with all of these.
      after the typed rebuild. PostgreSQL rejects inline column-constraint
      INCLUDE, so no rule is inferred from that rejected spelling.
 
+     A CREATE TABLE header's PARTITION BY RANGE/LIST/HASH names the partition
+     strategy, including quoted/mixed-case spellings accepted by the engine.
+     Exclude only that name and keep the key expressions visible.
+     Stop the header scan at AS so a window query's PARTITION BY expression
+     remains a routine reference. Live partition dependency OIDs and a window
+     result confirm that actual calls still switch to the arriving routine.
+     TABLESAMPLE methods are pg_proc(internal) functions returning tsm_handler,
+     not pg_am access methods: custom handlers must remain rebind candidates.
+     Only the unqualified system/bernoulli catalog handlers (including exact
+     quoted spellings) cannot be captured under the emitted implicit-catalog-
+     first path (276/277), even by same-signature arrivals. Exclude those method
+     operands and the trailing REPEATABLE keyword, retaining argument/seed
+     expressions. Live views keep unmanaged dependents for built-in methods;
+     custom handler and expression pg_proc dependencies retain the old binding
+     after arrival-only and switch only after the typed rebuild.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

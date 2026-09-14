@@ -9734,6 +9734,361 @@ async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn partition_strategy_expressions_keep_real_calls() {
+    let mut db = TestDb::create("partition_calls230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared")
+        .await
+        .unwrap();
+    for name in ["range", "list", "hash"] {
+        db.conn.execute(&format!("CREATE FUNCTION shared.{name}(integer) RETURNS int LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN 7; END'")).await.unwrap();
+    }
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let mut bodies = Vec::new();
+    for name in ["range", "list", "hash"] {
+        bodies.push(format!("DECLARE result int; BEGIN CREATE TABLE child(id int) PARTITION BY {name}({name}(id)); SELECT CASE WHEN p.pronamespace='shared'::regnamespace THEN 7 ELSE 42 END INTO result FROM pg_depend d JOIN pg_proc p ON p.oid=d.refobjid WHERE d.classid='pg_class'::regclass AND d.objid='app.child'::regclass AND d.refclassid='pg_proc'::regclass AND p.proname='{name}'; DROP TABLE child; RETURN result; END"));
+    }
+    // AS ends the table header: this PARTITION BY belongs to a window query.
+    bodies.push("DECLARE result int; BEGIN CREATE TABLE child AS SELECT sum(id) OVER(PARTITION BY range(id)) AS total FROM (VALUES (1),(2)) source(id); SELECT CASE WHEN sum(total)=6 THEN 7 ELSE 42 END INTO result FROM child; DROP TABLE child; RETURN result; END".into());
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    for name in ["range", "list", "hash"] {
+        b.modules.insert(
+            format!("app.{name}(integer)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                "(integer) RETURNS int LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN $1 * 42; END'",
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 3, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn sampling_custom_handlers_and_argument_calls_keep_their_rebuilds() {
+    let mut db = TestDb::create("sampling_calls230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE app.source(n int); INSERT INTO app.source VALUES (7); CREATE FUNCTION shared.custom_sample(internal) RETURNS tsm_handler LANGUAGE internal STRICT AS 'tsm_system_handler'; CREATE FUNCTION shared.system(integer) RETURNS int LANGUAGE sql AS 'SELECT 100'; CREATE FUNCTION shared.repeatable(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        (
+            "custom_sample",
+            "SELECT count(*)::int AS value FROM app.source TABLESAMPLE custom_sample(100)",
+        ),
+        (
+            "custom_sample",
+            "SELECT count(*)::int AS value FROM app.source TABLESAMPLE \"custom_sample\"(100)",
+        ),
+        (
+            "system",
+            "SELECT count(*)::int AS value FROM app.source TABLESAMPLE system(system(1))",
+        ),
+        (
+            "repeatable",
+            "SELECT count(*)::int AS value FROM app.source TABLESAMPLE pg_catalog.bernoulli(100) REPEATABLE(repeatable(1))",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (i, (_, definition)) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    let mut b = a.clone();
+    for (name, definition) in [
+        (
+            "custom_sample(internal)",
+            "(internal) RETURNS tsm_handler LANGUAGE internal STRICT AS 'tsm_bernoulli_handler'",
+        ),
+        (
+            "system(integer)",
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 0'",
+        ),
+        (
+            "repeatable(integer)",
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    ] {
+        b.modules.insert(
+            format!("app.{name}").parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 3, "{arrival:#?}");
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for (i, (name, _)) in definitions.iter().enumerate() {
+        let dependency = format!(
+            "SELECT count(*)::int FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_proc p ON p.oid=d.refobjid WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_proc'::regclass AND r.ev_class='app.v{i}'::regclass AND p.proname='{name}' AND p.pronamespace='shared'::regnamespace"
+        );
+        assert_eq!(number(&mut db.conn, &dependency).await, 1, "{name}");
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            1
+        );
+    }
+    let mut rebuilds = arrival.clone();
+    rebuilds
+        .changes
+        .retain(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &rebuilds).await;
+    for (i, (name, _)) in definitions.iter().enumerate() {
+        // Method handlers have pg_proc dependencies just like expression calls.
+        let dependency = format!(
+            "SELECT count(*)::int FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_proc p ON p.oid=d.refobjid WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_proc'::regclass AND r.ev_class='app.v{i}'::regclass AND p.proname='{name}' AND p.pronamespace='app'::regnamespace"
+        );
+        assert_eq!(number(&mut db.conn, &dependency).await, 1, "{name}");
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            if *name == "system" { 0 } else { 1 }
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn partition_strategy_keywords_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("partition_names230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE app.parent(id int) PARTITION BY RANGE(id)")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "CREATE TABLE child(id int) PARTITION BY RANGE(id)",
+        "CREATE TABLE child(id int) PARTITION BY LIST(id)",
+        "CREATE TABLE child(id int) PARTITION BY HASH(id)",
+        "CREATE TEMP TABLE child(id int) PARTITION BY RANGE(id)",
+        "CREATE TABLE child PARTITION OF app.parent FOR VALUES FROM(0) TO(10) PARTITION BY HASH(id)",
+        "CREATE TABLE child(id int) PARTITION BY RANGE((id+1))",
+        "CREATE TABLE child(id int) PARTITION BY \"range\"(id)",
+        "CREATE TABLE child(id int) PARTITION BY \"RANGE\"(id)",
+        "CREATE TABLE child(id int) PARTITION BY \"list\"(id)",
+        "CREATE TABLE child(id int) PARTITION BY \"HASH\"(id)",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; DROP TABLE child; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    for name in ["range", "list", "hash"] {
+        b.modules.insert(
+            format!("app.{name}(integer)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 3, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn catalog_sampling_methods_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("sampling_names230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE TABLE app.source(n int); INSERT INTO app.source VALUES (7)",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        (
+            "system",
+            "SELECT sum(n)::text AS value FROM app.source TABLESAMPLE system(100)",
+        ),
+        (
+            "bernoulli",
+            "SELECT sum(n)::text AS value FROM app.source TABLESAMPLE bernoulli(100)",
+        ),
+        (
+            "system",
+            "SELECT sum(n)::text AS value FROM app.source TABLESAMPLE \"system\"(100)",
+        ),
+        (
+            "repeatable",
+            "SELECT sum(n)::text AS value FROM app.source TABLESAMPLE system(100) REPEATABLE(1)",
+        ),
+        (
+            "bernoulli",
+            "SELECT sum(n)::text AS value FROM app.source TABLESAMPLE \"bernoulli\"(100) REPEATABLE(1)",
+        ),
+        (
+            "system",
+            "SELECT sum(n)::text AS value FROM app.source TABLESAMPLE pg_catalog.system(100)",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (i, (_, definition)) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    let mut before = Vec::new();
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT value FROM app.v{i}"
+            ))
+            .await
+            .unwrap();
+        before.push(text(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await);
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    for (name, _) in &definitions {
+        b.modules.insert(
+            format!("app.{name}(integer)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+            ),
+        );
+    }
+    for (name, handler) in [
+        ("system", "tsm_bernoulli_handler"),
+        ("bernoulli", "tsm_system_handler"),
+    ] {
+        b.modules.insert(
+            format!("app.{name}(internal)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("(internal) RETURNS tsm_handler LANGUAGE internal STRICT AS '{handler}'"),
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for (i, value) in before.iter().enumerate() {
+        assert_eq!(
+            &text(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            value
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 5, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn period_overlap_syntax_does_not_rebuild_for_routine_arrivals() {
     let mut db = TestDb::create("overlaps_syntax230").await;
     db.conn.execute("CREATE SCHEMA app").await.unwrap();

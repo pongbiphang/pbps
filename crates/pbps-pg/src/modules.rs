@@ -2405,6 +2405,7 @@ fn index_reference_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
 fn ddl_reference_spans(
     code: &str,
     tokens: &[RebindToken<'_>],
+    declarations: &mut Vec<usize>,
 ) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
     let mut spans = Vec::new();
     let mut separators = Vec::new();
@@ -2486,6 +2487,25 @@ fn ddl_reference_spans(
             continue;
         }
         let mut item = target + 1;
+        if create && !view && !domain && !composite {
+            // PARTITION BY in a table header names a strategy. Stop at AS:
+            // a CREATE TABLE AS query may partition a window by a real call.
+            // Skipping groups preserves partition expressions and bounds (477).
+            let mut clause = item;
+            while clause < tokens.len()
+                && !token_is(tokens, clause, ";")
+                && !token_is(tokens, clause, "as")
+            {
+                if token_is(tokens, clause, "partition")
+                    && token_is(tokens, clause + 1, "by")
+                    && tokens.get(clause + 2).is_some_and(RebindToken::name)
+                    && after_group(tokens, clause + 3).is_some()
+                {
+                    declarations.push(clause + 2);
+                }
+                clause = tokens[clause].close.map_or(clause + 1, |close| close + 1);
+            }
+        }
         if domain {
             if token_is(tokens, item, "as") {
                 item += 1;
@@ -2722,7 +2742,7 @@ fn rebind_code(
     if routine {
         let (locals, cursors) = procedural_type_spans(&tokens);
         type_spans.extend(locals);
-        let (ddl_types, separators) = ddl_reference_spans(&code, &tokens);
+        let (ddl_types, separators) = ddl_reference_spans(&code, &tokens, &mut declarations);
         type_spans.extend(ddl_types);
         target_separators.extend(separators);
         declarations.extend(cursors);
@@ -2741,6 +2761,25 @@ fn rebind_code(
         }
         if sql_expression_keyword(&tokens, i, version) {
             declarations.push(i);
+        }
+        if token.word("tablesample")
+            && tokens.get(i + 1).is_some_and(RebindToken::name)
+            && let Some(after) = after_group(&tokens, i + 2)
+        {
+            let method = &tokens[i + 1];
+            // Sampling handlers are pg_proc functions, so custom methods
+            // retain their references. Only the built-in catalog handlers
+            // win every allowed write path, even for internal overloads (477).
+            if method.word("system")
+                || method.word("bernoulli")
+                || matches!(method.text, "\"system\"" | "\"bernoulli\"")
+            {
+                declarations.push(i + 1);
+            }
+            if token_is(&tokens, after, "repeatable") && after_group(&tokens, after + 1).is_some() {
+                // The seed is an expression; the preceding word is grammar.
+                declarations.push(after);
+            }
         }
         if token.word("overlaps")
             && i > 0
@@ -4163,6 +4202,146 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_strategies_keep_key_and_window_expression_calls() {
+        for name in ["range", "list", "hash"] {
+            for (statement, calls) in [
+                (
+                    format!("CREATE TABLE child(id int) PARTITION BY {name}(id)"),
+                    0,
+                ),
+                (
+                    format!(
+                        "CREATE TABLE child PARTITION OF parent FOR VALUES FROM(0) TO(10) PARTITION BY {name}(id)"
+                    ),
+                    0,
+                ),
+                (
+                    format!("CREATE TABLE child(id int) PARTITION BY {name}({name}(id))"),
+                    1,
+                ),
+                (
+                    format!(
+                        "CREATE TABLE child AS SELECT sum(id) OVER(PARTITION BY {name}(id)) FROM parent"
+                    ),
+                    1,
+                ),
+                (
+                    format!("PERFORM sum(id) OVER(PARTITION BY {name}(id)) FROM parent"),
+                    1,
+                ),
+                (format!("PERFORM {name}(1)"), 1),
+                (
+                    format!("CREATE TABLE child(id int) PARTITION BY \"{name}\"(id)"),
+                    0,
+                ),
+                (
+                    format!(
+                        "CREATE TABLE child(id int) PARTITION BY \"{}\"(id)",
+                        name.to_uppercase()
+                    ),
+                    0,
+                ),
+            ] {
+                let mut declared = Schema::default();
+                declared.modules.insert(
+                    id("app.f()"),
+                    module(&format!(
+                        "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                    )),
+                );
+                assert_eq!(
+                    rebound_by_this_plan(
+                        &declared,
+                        &[],
+                        &[id(&format!("app.{name}(integer)"))],
+                        &BTreeSet::new()
+                    )
+                    .len(),
+                    calls,
+                    "{statement}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_methods_keep_custom_handlers_and_expression_calls() {
+        for (query, name, calls) in [
+            (
+                "SELECT * FROM t TABLESAMPLE system(1)",
+                "system(integer)",
+                0,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE SYSTEM(1)",
+                "system(internal)",
+                0,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE \"system\"(1)",
+                "system(internal)",
+                0,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE bernoulli(1)",
+                "bernoulli(internal)",
+                0,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE system(1) REPEATABLE(1)",
+                "repeatable(integer)",
+                0,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE pg_catalog.system(1) REPEATABLE(1)",
+                "repeatable(integer)",
+                0,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE custom(1)",
+                "custom(internal)",
+                1,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE \"custom\"(1)",
+                "custom(internal)",
+                1,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE app.custom(1)",
+                "custom(internal)",
+                1,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE system(system(1))",
+                "system(integer)",
+                1,
+            ),
+            (
+                "SELECT * FROM t TABLESAMPLE system(1) REPEATABLE(repeatable(1))",
+                "repeatable(integer)",
+                1,
+            ),
+            ("SELECT repeatable(1)", "repeatable(integer)", 1),
+            ("SELECT system(1)", "system(integer)", 1),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(query));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id(&format!("app.{name}"))],
+                    &BTreeSet::new()
+                )
+                .len(),
+                calls,
+                "{query}"
             );
         }
     }
