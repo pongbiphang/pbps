@@ -12413,6 +12413,20 @@ SPEC is in sync with all of these.
      change after the typed rebuild. Record column definitions without an
      alias still retain their type references.
 
+     CURRENT_SCHEMA() is a SQL value expression in its bare spelling, even
+     though the catalog also exposes a routine. Exclude the grammar form and
+     retain quoted or qualified actual calls; live overload controls switch
+     from 7 to 42 while grammar-only modules keep their unmanaged dependents.
+     UPDATE's optional target alias follows the same rule as FROM aliases,
+     including ONLY, inheritance, CTE and quoted forms. The target relation
+     and SET/FROM/RETURNING expressions remain references. FOR UPDATE and
+     FOR NO KEY UPDATE are row-lock clauses, and conflict/MERGE UPDATE SET
+     actions do not introduce another target. Keep their later references
+     and expressions intact, as well as ordinary calls named update. UPDATE
+     aliases have no column declarations: a following SET row-assignment group
+     contains targets whose subscripts can call routines, so it is never a
+     type-declaration span. Live subscript indices switch from 7 to 42.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

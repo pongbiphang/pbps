@@ -2779,12 +2779,12 @@ fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize, version: Option
         return version.is_some_and(|v| v >= 170000);
     }
     match word.as_str() {
-        "row" | "exists" | "values" | "current_time" | "current_timestamp" | "localtime"
-        | "localtimestamp" | "coalesce" | "nullif" | "greatest" | "least" | "extract"
-        | "normalize" | "position" | "trim" | "cast" | "treat" | "grouping" | "xmlconcat"
-        | "xmlelement" | "xmlattributes" | "xmlforest" | "xmlparse" | "xmlpi" | "xmlroot"
-        | "xmlserialize" | "xmlexists" | "xmltable" | "xmlnamespaces" | "json" | "json_array"
-        | "json_object" | "json_arrayagg" | "json_objectagg" => true,
+        "row" | "exists" | "values" | "current_schema" | "current_time" | "current_timestamp"
+        | "localtime" | "localtimestamp" | "coalesce" | "nullif" | "greatest" | "least"
+        | "extract" | "normalize" | "position" | "trim" | "cast" | "treat" | "grouping"
+        | "xmlconcat" | "xmlelement" | "xmlattributes" | "xmlforest" | "xmlparse" | "xmlpi"
+        | "xmlroot" | "xmlserialize" | "xmlexists" | "xmltable" | "xmlnamespaces" | "json"
+        | "json_array" | "json_object" | "json_arrayagg" | "json_objectagg" => true,
         "substring" | "overlay" => {
             let mut i = at + 2;
             while i < after - 1 {
@@ -3117,6 +3117,25 @@ fn rebind_code(
                     *from.last_mut().unwrap() = true;
                 }
                 relation_column_declarations(&tokens, i + 1, &mut declarations, &mut type_spans);
+            }
+            "update"
+                if routine
+                    && (i == 0
+                        || (!token_is(&tokens, i - 1, "for")
+                            && !token_is(&tokens, i - 1, "key")))
+                    && !token_is(&tokens, i + 1, "set")
+                    && (token_is(&tokens, i + 1, "only")
+                        || tokens.get(i + 1).is_some_and(RebindToken::name)) =>
+            {
+                // UPDATE declares an optional target alias, like FROM. Row
+                // locks and conflict/MERGE actions have no target here; their
+                // later references and SET expressions must remain code.
+                if let Some((alias, _)) = relation_columns(&tokens, i + 1) {
+                    // UPDATE aliases have no column declarations. A following
+                    // SET group contains assignment targets whose subscripts
+                    // can call routines, so do not treat that group as types.
+                    declarations.extend(alias);
+                }
             }
             "into" => {
                 if procedural_start.is_some_and(|start| i >= start)
@@ -5548,6 +5567,114 @@ mod tests {
                 rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
                 1,
                 "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_grammar_keeps_explicit_routine_calls() {
+        for (definition, arrival, count) in [
+            (
+                "() RETURNS name LANGUAGE sql AS $$SELECT current_schema()$$",
+                "app.current_schema()",
+                0,
+            ),
+            (
+                "() RETURNS name LANGUAGE sql AS $$SELECT CURRENT_SCHEMA /* comment */ ()$$",
+                "app.current_schema()",
+                0,
+            ),
+            (
+                "() RETURNS int LANGUAGE sql AS $$SELECT \"current_schema\"(7)$$",
+                "app.current_schema(integer)",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE sql AS $$SELECT app.current_schema(7)$$",
+                "app.current_schema(integer)",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(definition));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{definition}: {arrival}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_target_aliases_keep_targets_expressions_and_row_lock_mentions() {
+        for (definition, arrival, count) in [
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE shared.target AS orders SET id=7; END",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE ONLY(shared.target) orders SET id=7; END",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE shared.target * orders SET id=7; END",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC WITH seed AS (SELECT 7 AS id) UPDATE shared.target orders SET id=seed.id FROM seed; END",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE orders AS orders SET id=7; END",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE shared.target orders SET id=orders(7); END",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT id FROM shared.target orders FOR UPDATE OF orders; END",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT id FROM shared.target orders FOR NO KEY UPDATE OF orders; END",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO shared.target(id) VALUES(7) ON CONFLICT(id) DO UPDATE SET id=orders(7); END",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT update(7); END",
+                "app.update(integer)",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE shared.target SET (a[orders(7)],b)=(1,0); END",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE shared.target SET (a,b)=(1,0); END",
+                "app.set(integer,integer)",
+                0,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(definition));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{definition}: {arrival}"
             );
         }
     }
