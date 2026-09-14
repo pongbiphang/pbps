@@ -12171,6 +12171,11 @@ SPEC is in sync with all of these.
      ALTER variants with unmanaged dependents require only the routine arrival.
      Companion default, generated-column and conversion expressions keep their
      real calls, rebuild and switch from the shared routine to the arriving one.
+     CREATE DOMAIN base types and CREATE/ALTER TYPE composite attributes use
+     those same prefixes, including optional AS and ADD/ALTER ATTRIBUTE forms.
+     Domain defaults and checks remain expressions. Live domain and composite
+     DDL retain unmanaged dependents without false routine-arrival rebuilds;
+     a real domain default call still rebuilds and changes its resulting value.
 
      View arrivals retain path-resolved modified type names: a view creates a
      same-named composite type. Only the modifier group is removed for this
@@ -12181,8 +12186,14 @@ SPEC is in sync with all of these.
      rebuild would record a declaration whose binding no longer matches.
      Unquoted built-in type keywords bind pg_catalog directly in the grammar;
      their modifiers remain excluded even for view arrivals. A same-named view
-     does not stop a newly compiled NUMERIC local from working. Quoted type
-     names retain path resolution and are not given that exception.
+     does not stop a newly compiled NUMERIC local from working. Catalog type
+     aliases such as varbit, bpchar, timestamptz and their array names also win:
+     the emitted path leaves pg_catalog implicit and first (276/277). Its
+     modifier-capable names are excluded for view arrivals, including exact
+     quoted lower-case spellings. Live OUT parameters and locals retain their
+     unmanaged dependents and recompile with unchanged types after same-named
+     views arrive. Qualified project types and distinct quoted mixed-case names
+     retain their references, as do generic non-catalog types.
 
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name

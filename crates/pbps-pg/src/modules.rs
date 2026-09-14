@@ -2048,9 +2048,42 @@ fn relation_column_declarations(
     }
 }
 
-/// These unquoted type keywords bind pg_catalog directly in PostgreSQL's
-/// grammar. Quoted and generic type names still resolve through the path.
+/// Grammar type keywords bind pg_catalog directly. Its modifier-capable catalog
+/// names also win on the emitted path, which leaves pg_catalog implicit (276).
+/// Quoted mixed-case and qualified project types retain their own identities.
 fn fixed_type_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
+    let text = tokens[at].text;
+    let catalog_name =
+        if let Some(quoted) = text.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            quoted.to_owned()
+        } else {
+            text.to_ascii_lowercase()
+        };
+    if matches!(
+        catalog_name.as_str(),
+        "bit"
+            | "bpchar"
+            | "interval"
+            | "numeric"
+            | "time"
+            | "timestamp"
+            | "timestamptz"
+            | "timetz"
+            | "varbit"
+            | "varchar"
+            | "_bit"
+            | "_bpchar"
+            | "_interval"
+            | "_numeric"
+            | "_time"
+            | "_timestamp"
+            | "_timestamptz"
+            | "_timetz"
+            | "_varbit"
+            | "_varchar"
+    ) {
+        return true;
+    }
     match tokens[at].text.to_ascii_lowercase().as_str() {
         "int" | "integer" | "smallint" | "bigint" | "real" | "float" | "decimal" | "dec"
         | "numeric" | "boolean" | "bit" | "character" | "char" | "varchar" | "nchar"
@@ -2303,7 +2336,9 @@ fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range
                 target += 1;
             }
         }
-        if !token_is(tokens, target, "table") {
+        let composite = token_is(tokens, target, "type");
+        let domain = create && token_is(tokens, target, "domain");
+        if !token_is(tokens, target, "table") && !composite && !domain {
             at += 1;
             continue;
         }
@@ -2325,7 +2360,18 @@ fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range
             continue;
         }
         let mut item = target + 1;
+        if domain {
+            if token_is(tokens, item, "as") {
+                item += 1;
+            }
+            mark_type(item);
+            at += 1;
+            continue;
+        }
         if create {
+            if composite && token_is(tokens, item, "as") {
+                item += 1;
+            }
             if let Some(after) = after_group(tokens, item) {
                 let close = after - 1;
                 item += 1;
@@ -2347,7 +2393,7 @@ fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range
                 let add = token_is(tokens, item, "add");
                 if add || token_is(tokens, item, "alter") {
                     let mut name = item + 1;
-                    if token_is(tokens, name, "column") {
+                    if token_is(tokens, name, if composite { "attribute" } else { "column" }) {
                         name += 1;
                     }
                     if add
@@ -3531,6 +3577,146 @@ mod tests {
     }
 
     #[test]
+    fn domain_and_composite_type_positions_preserve_only_actual_calls() {
+        for statement in [
+            "CREATE DOMAIN d AS geometry(10,2)",
+            "CREATE DOMAIN d geometry(10,2) DEFAULT NULL",
+            "CREATE TYPE t AS (g geometry(10,2), h geometry(5,1))",
+            "ALTER TYPE t ADD ATTRIBUTE g geometry(10,2)",
+            "ALTER TYPE t ALTER ATTRIBUTE g TYPE geometry(10,2)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            for (arrival, count) in [("app.geometry(integer,integer)", 0), ("app.geometry", 1)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+        for statement in [
+            "CREATE DOMAIN d AS geometry(10,2) DEFAULT geometry(1,2)",
+            "CREATE DOMAIN d AS geometry(10,2) CHECK (geometry(1,2) > 0)",
+            "ALTER DOMAIN d SET DEFAULT geometry(1,2)",
+            "CREATE TYPE t AS (g geometry(10,2)); PERFORM geometry(1,2)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.geometry(integer,integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_typmod_aliases_are_fixed_but_qualified_and_distinct_names_are_not() {
+        for name in [
+            "bit",
+            "bpchar",
+            "interval",
+            "numeric",
+            "time",
+            "timestamp",
+            "timestamptz",
+            "timetz",
+            "varbit",
+            "varchar",
+            "_bit",
+            "_bpchar",
+            "_interval",
+            "_numeric",
+            "_time",
+            "_timestamp",
+            "_timestamptz",
+            "_timetz",
+            "_varbit",
+            "_varchar",
+        ] {
+            for spelling in [name.to_owned(), name.to_uppercase(), format!("\"{name}\"")] {
+                let mut declared = Schema::default();
+                declared.modules.insert(
+                    id("app.f()"),
+                    module(&format!(
+                        "(OUT n {spelling}(4)) LANGUAGE sql AS 'SELECT NULL'"
+                    )),
+                );
+                assert!(
+                    rebound_by_this_plan(
+                        &declared,
+                        &[],
+                        &[id(&format!("app.{name}"))],
+                        &BTreeSet::new()
+                    )
+                    .is_empty(),
+                    "{spelling}"
+                );
+            }
+            for spelling in [format!("app.{name}"), format!("app.\"{name}\"")] {
+                let mut declared = Schema::default();
+                declared.modules.insert(
+                    id("app.f()"),
+                    module(&format!(
+                        "(OUT n {spelling}(4)) LANGUAGE sql AS 'SELECT NULL'"
+                    )),
+                );
+                assert_eq!(
+                    rebound_by_this_plan(
+                        &declared,
+                        &[],
+                        &[id(&format!("app.{name}"))],
+                        &BTreeSet::new()
+                    )
+                    .len(),
+                    1,
+                    "{spelling}"
+                );
+            }
+        }
+        let mut declared = Schema::default();
+        declared.modules.insert(
+            id("app.f()"),
+            module("(OUT n \"VARBIT\"(4)) LANGUAGE sql AS 'SELECT NULL'"),
+        );
+        assert_eq!(
+            rebound_by_this_plan(&declared, &[], &[id("app.VARBIT")], &BTreeSet::new()).len(),
+            1
+        );
+        declared.modules.insert(
+            id("app.f()"),
+            module("() RETURNS int LANGUAGE sql AS 'SELECT varbit(4)'"),
+        );
+        assert_eq!(
+            rebound_by_this_plan(
+                &declared,
+                &[],
+                &[id("app.varbit(integer)")],
+                &BTreeSet::new()
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn alias_declarations_do_not_hide_calls_in_bodies_arguments_or_later_clauses() {
         for body in [
             "WITH orders(id) AS (SELECT orders(7)) SELECT id FROM orders",
@@ -3701,7 +3887,7 @@ mod tests {
         ] {
             for (definition, count) in [
                 (body.to_owned(), 0),
-                (body.replace("numeric", "\"numeric\""), 1),
+                (body.replace("numeric", "\"numeric\""), 0),
             ] {
                 let mut declared = Schema::default();
                 declared.modules.insert(id("app.f()"), module(&definition));

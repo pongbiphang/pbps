@@ -9914,6 +9914,86 @@ async fn argument_free_cursor_operands_do_not_rebuild_for_view_arrivals() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn catalog_type_aliases_do_not_rebuild_for_view_arrivals() {
+    let mut db = TestDb::create("catalog_alias230").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let pg = Postgres::new();
+    let bodies = [
+        "(OUT n varbit(4)) LANGUAGE sql BEGIN ATOMIC SELECT B'1'::varbit(4); END",
+        "(OUT n bpchar(3)) LANGUAGE sql BEGIN ATOMIC SELECT 'abc'::bpchar(3); END",
+        "(OUT n \"varbit\"(4)) LANGUAGE sql BEGIN ATOMIC SELECT B'1'::\"varbit\"(4); END",
+        "(OUT n \"bpchar\"(3)) LANGUAGE sql BEGIN ATOMIC SELECT 'abc'::\"bpchar\"(3); END",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n varbit(4) := B'1'; BEGIN RETURN bit_length(n); END$$",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n bpchar(3) := 'abc'; BEGIN RETURN length(n); END$$",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, body),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..bodies.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT 7 AS value FROM app.f{i}()"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.varbit".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    b.modules.insert(
+        "app.bpchar".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Match the emitted write path: pg_catalog is implicit and searched first.
+    db.conn
+        .execute("SET search_path = app, pg_temp")
+        .await
+        .unwrap();
+    for (i, body) in bodies.iter().enumerate() {
+        db.conn
+            .execute(&format!("CREATE OR REPLACE FUNCTION app.f{i}{body}"))
+            .await
+            .unwrap();
+    }
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 2, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn bound_cursor_arguments_and_queries_keep_real_routine_calls() {
     let mut db = TestDb::create("cursor_calls230").await;
     db.conn
@@ -9994,6 +10074,7 @@ async fn ddl_expressions_keep_real_routine_calls() {
         "DECLARE result int; BEGIN CREATE TEMP TABLE ddl_call (g int GENERATED ALWAYS AS (\"numeric\"(1,2)) STORED); INSERT INTO ddl_call DEFAULT VALUES; SELECT g INTO result FROM ddl_call; DROP TABLE ddl_call; RETURN result; END",
         "DECLARE result int; BEGIN CREATE TEMP TABLE ddl_call (g int); INSERT INTO ddl_call VALUES (1); ALTER TABLE ddl_call ALTER g TYPE numeric(10,2) USING \"numeric\"(1,2); SELECT g::int INTO result FROM ddl_call; DROP TABLE ddl_call; RETURN result; END",
         "DECLARE result int; BEGIN CREATE TEMP TABLE ddl_call (id int); INSERT INTO ddl_call VALUES (1); ALTER TABLE ddl_call ADD g numeric(10,2) DEFAULT \"numeric\"(1,2); SELECT g::int INTO result FROM ddl_call; DROP TABLE ddl_call; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE DOMAIN app.ddl_domain_call AS numeric(10,2) DEFAULT \"numeric\"(1,2); CREATE TEMP TABLE ddl_call (g app.ddl_domain_call); INSERT INTO ddl_call DEFAULT VALUES; SELECT g::int INTO result FROM ddl_call; DROP TABLE ddl_call; DROP DOMAIN app.ddl_domain_call; RETURN result; END",
     ];
     let mut a = Schema::default();
     for (i, body) in bodies.iter().enumerate() {
@@ -10283,6 +10364,86 @@ async fn ddl_column_types_do_not_rebuild_for_routine_arrivals() {
         "CREATE TEMP TABLE ddl_set (g int); ALTER TABLE ddl_set ALTER g SET DATA TYPE numeric(10,2)",
         "CREATE TEMP TABLE ddl_multi (id int); ALTER TABLE ddl_multi ADD g numeric(10,2), ADD h numeric(5,1)",
         "CREATE TEMP TABLE ddl_default (g numeric(10,2) DEFAULT 7, CHECK (g > 0))",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn domain_and_composite_types_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("domain_types230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.orders(id int); INSERT INTO shared.orders VALUES (7); CREATE TABLE shared.source(id int)")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "CREATE DOMAIN app.ddl_domain AS numeric(10,2)",
+        "CREATE DOMAIN app.ddl_no_as numeric(10,2)",
+        "CREATE DOMAIN app.ddl_default AS numeric(10,2) DEFAULT 7 CHECK (VALUE > 0)",
+        "CREATE TYPE app.ddl_composite AS (g numeric(10,2), h varchar(3))",
+        "CREATE TYPE app.ddl_add AS (g int); ALTER TYPE app.ddl_add ADD ATTRIBUTE n numeric(10,2)",
+        "CREATE TYPE app.ddl_alter AS (g int); ALTER TYPE app.ddl_alter ALTER ATTRIBUTE g TYPE numeric(10,2)",
     ];
     let mut a = Schema::default();
     for (i, statement) in statements.iter().enumerate() {
