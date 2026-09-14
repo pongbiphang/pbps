@@ -1733,6 +1733,8 @@ impl Change {
             Change::DropTable { .. }
             | Change::DropColumn { .. }
             | Change::DropIndex { .. }
+            // Removing uniqueness needs approval even without deleting rows;
+            // FK/CHECK relaxation has a separate policy (DECISIONS 486).
             | Change::DropUnique { .. } => {
                 r.insert(RiskClass::Destructive);
             }
@@ -1810,6 +1812,8 @@ impl Change {
             }
             | Change::AlterColumnDefault { .. }
             | Change::SetColumnDeprecated { .. }
+            // These relaxations add no intrinsic risk class; the uniqueness
+            // exception above is deliberate, not a rule for all drops (486).
             | Change::DropForeignKey { .. }
             | Change::DropCheck { .. }
             // Only the non-unique ones: the arm above has already taken the
