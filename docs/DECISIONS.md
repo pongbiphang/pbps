@@ -12389,6 +12389,20 @@ SPEC is in sync with all of these.
      nested, quoted and loop labels avoid spurious view rebuilds; actual body
      and WHEN calls and queries still switch bindings after typed rebuilding.
 
+     INTO in a procedural SELECT, EXECUTE, RETURNING or FETCH names local
+     destinations, including STRICT, target lists, records and fields. Only a
+     recognized procedural body enables that exclusion; SQL bodies and
+     INSERT/MERGE relation targets retain ordinary matching. Reuse the actual
+     AS boundary and skip compiler directives before recognizing the labeled
+     DECLARE/BEGIN block, sharing that start with local declaration masking.
+     Live source calls, queries and INSERT view targets switch bindings after
+     rebuilding, while destination-only routines keep unmanaged dependents.
+     COLLATE operands bind pg_collation, including qualified and quoted names.
+     Exclude only that operand in both views and routines, retaining the
+     surrounding expression and query references. Live collation-only SQL,
+     PL/pgSQL and view definitions keep dependents after a same-named view
+     arrives; genuine surrounding routine calls and relations still rebuild.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

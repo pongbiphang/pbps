@@ -2343,6 +2343,30 @@ fn procedural_statement_boundary(
             .is_some_and(|start| at >= start && statement_boundary(&tokens[start..], at - start))
 }
 
+fn procedural_body_start(tokens: &[RebindToken<'_>], body_start: Option<usize>) -> Option<usize> {
+    let mut at = body_start?;
+    // PL/pgSQL compiler directives precede the labeled declaration/block.
+    while token_is(tokens, at, "#")
+        && ["variable_conflict", "print_strict_params", "option"]
+            .iter()
+            .any(|word| token_is(tokens, at + 1, word))
+    {
+        at += 3;
+    }
+    let start = at;
+    while token_is(tokens, at, "<")
+        && token_is(tokens, at + 1, "<")
+        && tokens.get(at + 2).is_some_and(RebindToken::name)
+        && token_is(tokens, at + 3, ">")
+        && token_is(tokens, at + 4, ">")
+    {
+        at += 5;
+    }
+    ((token_is(tokens, at, "begin") && !token_is(tokens, at + 1, "atomic"))
+        || (token_is(tokens, at, "declare") && declaration_block_start(tokens, at, Some(at))))
+    .then_some(start)
+}
+
 /// DECLARE is also a SQL column or alias. A procedural declaration block must
 /// start at a statement boundary (including the actual quoted body's start)
 /// and lead into BEGIN. A SQL DECLARE cursor has no such block (477).
@@ -2870,11 +2894,12 @@ fn rebind_code(
     let mut declarations = Vec::new();
     let mut referenced_columns = Vec::new();
     let mut target_separators = Vec::new();
+    let body_start = header
+        .body_as_end
+        .and_then(|end| tokens.iter().position(|token| token.offset >= end));
+    let procedural_start = procedural_body_start(&tokens, body_start);
     if routine {
-        let body_start = header
-            .body_as_end
-            .and_then(|end| tokens.iter().position(|token| token.offset >= end));
-        let (locals, cursors) = procedural_type_spans(&tokens, body_start);
+        let (locals, cursors) = procedural_type_spans(&tokens, procedural_start.or(body_start));
         type_spans.extend(locals);
         let (ddl_types, separators) = ddl_reference_spans(&code, &tokens, &mut declarations);
         type_spans.extend(ddl_types);
@@ -2895,6 +2920,11 @@ fn rebind_code(
         }
         if sql_expression_keyword(&tokens, i, version) {
             declarations.push(i);
+        }
+        if token.word("collate") && tokens.get(i + 1).is_some_and(RebindToken::name) {
+            // A collation operand binds pg_collation, never pg_class/pg_proc.
+            // The expression before it keeps its real references (477).
+            declarations.push(i + 1);
         }
         if routine
             && token.word("key")
@@ -3081,6 +3111,29 @@ fn rebind_code(
                 relation_column_declarations(&tokens, i + 1, &mut declarations, &mut type_spans);
             }
             "into" => {
+                if procedural_start.is_some_and(|start| i >= start)
+                    && i > 0
+                    && !token_is(&tokens, i - 1, "insert")
+                    && !token_is(&tokens, i - 1, "merge")
+                {
+                    // Procedural SELECT/EXECUTE/RETURNING/FETCH destinations
+                    // are local variables, records or fields. SQL bodies and
+                    // INSERT/MERGE relation targets retain ordinary matching.
+                    let mut target = i + 1;
+                    if token_is(&tokens, target, "strict") {
+                        declarations.push(target);
+                        target += 1;
+                    }
+                    while tokens.get(target).is_some_and(RebindToken::name) {
+                        declarations.push(target);
+                        target += 1;
+                        if !token_is(&tokens, target, ",") {
+                            break;
+                        }
+                        target += 1;
+                    }
+                    continue;
+                }
                 // INSERT's target group is already a column list, not the
                 // argument group a FROM item may have. Do not consume it and
                 // mistake a following VALUES expression for an alias list.
@@ -4355,6 +4408,137 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedural_into_destinations_preserve_dml_targets_and_sources() {
+        for (definition, arrival, count) in [
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$DECLARE orders int; BEGIN SELECT 7 INTO orders; RETURN 7; END$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$BEGIN SELECT 7 INTO STRICT orders; RETURN 7; END$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$<<root>> BEGIN EXECUTE 'SELECT 7' INTO orders; RETURN 7; END$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$DECLARE orders int; other int; BEGIN SELECT 7,8 INTO other,orders; RETURN 7; END$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$#variable_conflict use_variable\nDECLARE orders int; BEGIN SELECT 7 INTO orders; RETURN 7; END$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN INSERT INTO orders(id) VALUES(7); RETURN result; END$$",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN MERGE INTO orders USING source ON false WHEN NOT MATCHED THEN INSERT(id) VALUES(7); RETURN result; END$$",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN SELECT value INTO result FROM orders; RETURN result; END$$",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN SELECT orders(1) INTO result; RETURN result; END$$",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE sql AS $$SELECT 7 INTO orders$$",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT value FROM orders; END",
+                "app.orders",
+                1,
+            ),
+            (
+                "() RETURNS int LANGUAGE sql AS $$BEGIN ATOMIC SELECT value INTO orders FROM source; END$$",
+                "app.orders",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(definition));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{definition}: {arrival}"
+            );
+        }
+    }
+
+    #[test]
+    fn collate_operands_are_names_in_the_collation_namespace() {
+        for (definition, arrival, count) in [
+            (
+                "() RETURNS text LANGUAGE sql AS $$SELECT value COLLATE orders FROM source$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS text LANGUAGE sql AS $$SELECT value COLLATE app.\"orders\" FROM source$$",
+                "app.orders",
+                0,
+            ),
+            (
+                "() RETURNS text LANGUAGE sql AS $$SELECT orders(value) COLLATE orders FROM source$$",
+                "app.orders(text)",
+                1,
+            ),
+            (
+                "() RETURNS text LANGUAGE sql AS $$SELECT value COLLATE orders FROM orders$$",
+                "app.orders",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(definition));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{definition}: {arrival}"
+            );
+        }
+    }
+
+    #[test]
+    fn collated_view_expressions_keep_their_real_module_references() {
+        for (definition, arrival, count) in [
+            ("SELECT value COLLATE orders FROM source", "app.orders", 0),
+            (
+                "SELECT orders(value) COLLATE orders FROM source",
+                "app.orders(text)",
+                1,
+            ),
+            ("SELECT value COLLATE orders FROM orders", "app.orders", 1),
+        ] {
+            let mut declared = Schema::default();
+            let mut view = module(definition);
+            view.kind = ModuleKind::View;
+            declared.modules.insert(id("app.v"), view);
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{definition}: {arrival}"
             );
         }
     }
