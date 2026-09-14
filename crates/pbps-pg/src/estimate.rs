@@ -56,7 +56,7 @@
 //! to be *measured* under the one the catalog still has, and only something
 //! holding the whole plan can know the difference (DECISIONS 409).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
 use pbps_model::{Change, ChangeSet, ColumnType, Strategy, TableName};
@@ -150,6 +150,9 @@ pub struct Estimate {
     /// identity has no catalog name to query, even when it reuses a name a
     /// different identity vacates (DECISIONS 478).
     source: CatalogSource,
+    /// Catalog CHECKs removed before this statement, under its current table
+    /// identity. A later removal cannot invalidate an earlier proof (479).
+    removed_checks: BTreeSet<String>,
     pub rewrite: Rewrite,
     pub reads: Reads,
     pub lock: Lock,
@@ -182,6 +185,7 @@ impl Estimate {
                 table: table.clone(),
                 column: None,
             },
+            removed_checks: BTreeSet::new(),
             table,
             rewrite,
             reads,
@@ -357,12 +361,31 @@ fn estimates_with(
             tables.insert(name, &identities[uid]);
         }
     }
+    let mut removed_checks: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
     changes
         .changes
         .iter()
         .enumerate()
         .filter_map(|(index, p)| {
+            // Unlike catalog spellings, CHECK lifetime depends on the prefix
+            // already executed. Carry that prefix through a table rename;
+            // a new identity reusing its name starts with no removed checks.
+            if let Change::RenameTable { from, to, .. } = &p.change
+                && let Some(checks) = removed_checks.remove(from)
+            {
+                removed_checks.insert(to.clone(), checks);
+            }
+            if let Change::CreateTable { name, .. } = &p.change {
+                removed_checks.remove(name);
+            }
+            if let Change::DropCheck { table, name } = &p.change {
+                removed_checks
+                    .entry(table.clone())
+                    .or_default()
+                    .insert(name.clone());
+            }
             let mut e = estimate(&p.change, strategy(p))?;
+            e.removed_checks = removed_checks.get(&e.table).cloned().unwrap_or_default();
             let source = if let Change::RenameTable { uid, .. } = &p.change {
                 // Its label is the old name, which may now name a different
                 // planned table. Only its own UID selects the right source.
@@ -400,18 +423,25 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
     };
     match change {
         Change::AlterColumnType {
-            column, from, to, ..
+            column,
+            from,
+            to,
+            from_nullable,
+            to_nullable,
+            ..
         } => {
             let rewrite = rewrites(from, to);
-            // Measured, the two answers move together for this statement and
-            // for no other: `text -> varchar(50)` rebuilds and reads every row,
-            // and `varchar(10) -> varchar(20)` does neither — the rewrite *is*
-            // the read. A change whose rewrite is unknown has an unknown read
-            // for the same reason.
-            let reads = match &rewrite {
-                Rewrite::Yes => Reads::EveryRow,
-                Rewrite::No => Reads::Nothing,
-                Rewrite::Unknown(why) => Reads::Unknown(why.clone()),
+            // The emitter folds SET NOT NULL into this ALTER TABLE. Its scan
+            // remains even when widening the type alone rebuilds nothing;
+            // the connected half can still find a surviving CHECK proof (479).
+            let reads = if *from_nullable && !*to_nullable {
+                Reads::EveryRow
+            } else {
+                match &rewrite {
+                    Rewrite::Yes => Reads::EveryRow,
+                    Rewrite::No => Reads::Nothing,
+                    Rewrite::Unknown(why) => Reads::Unknown(why.clone()),
+                }
             };
             e(
                 format!("changing {column} to {to}"),
@@ -644,6 +674,8 @@ SELECT c.relkind::text AS relkind,
                           AND a.attnum = ANY (i.indkey::int2[])))) AS column_is_indexed,
        (SELECT k.conname::text FROM pg_catalog.pg_constraint k
          WHERE k.conrelid = c.oid AND k.contype = 'c' AND k.convalidated
+           AND k.conname::text NOT IN
+               (SELECT pg_catalog.jsonb_array_elements_text($3::text::jsonb))
            AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
                         WHERE a.attrelid = c.oid AND a.attname = $2
                           AND NOT a.attisdropped AND a.attnum = ANY (k.conkey))
@@ -669,6 +701,10 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
         return Ok(());
     };
     let has_column = column.is_some();
+    // JSON preserves every legal constraint spelling without inventing a
+    // delimiter or interpolating identifiers into the catalog query.
+    let removed_checks = serde_json::to_string(&estimate.removed_checks)
+        .expect("constraint names serialize as JSON");
     let relation = match crate::emit::qualified(table) {
         Ok(name) => name,
         // A name this dialect cannot write is not a table with no rows in it.
@@ -683,6 +719,7 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
             &[
                 relation.as_str().into(),
                 column.as_deref().unwrap_or_default().into(),
+                removed_checks.as_str().into(),
             ],
         )
         .await?;
@@ -1096,6 +1133,98 @@ mod tests {
         assert_eq!(widened.rewrite, Rewrite::No);
         assert_eq!(widened.reads, Reads::Nothing);
         assert!(widened.is_cheap());
+    }
+
+    #[test]
+    fn nullability_folded_into_a_type_change_keeps_its_scan_requirement() {
+        for (from_nullable, to_nullable) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let e = estimate(
+                &Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: cref("app.t.v"),
+                    from: ty("varchar(10)"),
+                    to: ty("varchar(20)"),
+                    from_nullable,
+                    to_nullable,
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+            assert_eq!(e.rewrite, Rewrite::No);
+            assert_eq!(e.lock, Lock::AccessExclusive);
+            assert_eq!(
+                e.reads,
+                if from_nullable && !to_nullable {
+                    Reads::EveryRow
+                } else {
+                    Reads::Nothing
+                }
+            );
+            assert_eq!(e.is_cheap(), !from_nullable || to_nullable);
+        }
+    }
+
+    #[test]
+    fn nullability_check_removals_follow_only_the_executed_prefix_and_identity() {
+        use pbps_model::PlannedChange;
+        let tighten = |table| {
+            PlannedChange::new(Change::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: tname(table).column("v"),
+                ty: ty("integer"),
+                to_nullable: false,
+            })
+        };
+        let drop = |table, name: &str| {
+            PlannedChange::new(Change::DropCheck {
+                table: tname(table),
+                name: name.into(),
+            })
+        };
+        let cs = ChangeSet {
+            changes: vec![
+                tighten("app.t"),
+                drop("app.t", "gone\"check"),
+                drop("app.other", "unrelated"),
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: tname("app.t"),
+                    to: tname("app.kept"),
+                }),
+                tighten("app.kept"),
+                drop("app.kept", "later"),
+                tighten("app.kept"),
+                PlannedChange::new(Change::CreateTable {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    name: tname("app.t"),
+                    table: Box::default(),
+                }),
+                tighten("app.t"),
+            ],
+        };
+        let es = planned_estimates(&cs);
+        let names = |index| {
+            &es.iter()
+                .find(|(i, _)| *i == index)
+                .unwrap()
+                .1
+                .removed_checks
+        };
+        assert!(
+            names(0).is_empty(),
+            "a future drop cannot remove a current proof"
+        );
+        assert_eq!(names(4), &BTreeSet::from(["gone\"check".into()]));
+        assert_eq!(
+            names(6),
+            &BTreeSet::from(["gone\"check".into(), "later".into()])
+        );
+        assert!(
+            names(8).is_empty(),
+            "a new identity cannot inherit old CHECK removals"
+        );
     }
 
     /// ADR-0012 §4's ruled-out guess: an unparsed default expression is

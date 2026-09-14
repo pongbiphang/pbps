@@ -836,10 +836,9 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
             if let Change::AlterColumnNullability { column, .. } = &p.change
                 && column.name == "required"
             {
-                // CHECK lifecycle is #291's separate scope. Here the
-                // connected lookup must first find its old catalog column.
-                assert_eq!(c["reads"]["value"], "unknown", "{report:#}");
-                assert!(c["reads"]["reason"].as_str().unwrap().contains("ck_n"));
+                // The renamed CHECK is replaced after tightening. Its old
+                // catalog definition is gone before the statement (479).
+                assert_eq!(c["reads"]["value"], "every_row", "{report:#}");
                 assert_eq!(c["rewrite"]["value"], "no");
                 verified += 1;
             }
@@ -856,7 +855,6 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
         let cost_text = human.split_once("Operational cost estimate").unwrap().1;
         for text in [
             "index is built over the column",
-            "validated check constraint ck_n",
             "approximately 20",
             "amount",
             "required",
