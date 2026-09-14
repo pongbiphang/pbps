@@ -1405,7 +1405,7 @@ fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
 /// Returns the slice the name occupies, the trivia inside it included, so a
 /// caller can both read it and skip it. `None` where the text does not start
 /// with one.
-fn qualified_name_at(text: &str) -> Option<&str> {
+pub(crate) fn qualified_name_at(text: &str) -> Option<&str> {
     let mut at = one_ident_len(text)?;
     loop {
         // A Unicode-escaped part may carry its `UESCAPE 'x'` right after it,

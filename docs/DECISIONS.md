@@ -12076,6 +12076,18 @@ SPEC is in sync with all of these.
      function arrival can refuse a valid plan when the view has an unmanaged
      dependent, although its relation binding could not move.
 
+     CTE and relation-alias column lists also use parentheses without calling
+     a routine. The PostgreSQL rebind scan masks only the declaration's name,
+     for either arriving kind: stripping its parentheses would invent a view
+     reference instead. Balanced groups identify `name(columns) AS (body)`
+     and aliases of FROM items, including derived relations, table functions,
+     joins and ordinalities. Calls inside those groups remain visible, and no
+     subsequent use is resolved to an alias. Measured with unmanaged view
+     dependents, these declarations keep returning the same value after a
+     routine arrival and need no rebuild. Companion live cases put a real
+     same-named call inside the CTE, derived relation, function argument or
+     aliased query: each still rebuilds and binds the arriving routine.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

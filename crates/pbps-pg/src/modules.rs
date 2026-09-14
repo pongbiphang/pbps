@@ -1933,6 +1933,175 @@ const LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
     bare_rank: &pbps_model::module::every_schema,
 };
 
+const REBIND_LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
+    code_only: &rebind_code_only,
+    ..LEXIS
+};
+
+struct RebindToken<'a> {
+    text: &'a str,
+    offset: usize,
+    close: Option<usize>,
+}
+
+impl RebindToken<'_> {
+    fn word(&self, word: &str) -> bool {
+        self.text.eq_ignore_ascii_case(word)
+    }
+
+    fn name(&self) -> bool {
+        self.text.starts_with('"')
+            || (self
+                .text
+                .chars()
+                .next()
+                .is_some_and(|c| pbps_dialect::continues_ident(c) && !c.is_ascii_digit())
+                && !crate::types::is_reserved(&self.text.to_ascii_lowercase()))
+    }
+}
+
+fn token_is(tokens: &[RebindToken<'_>], at: usize, word: &str) -> bool {
+    tokens.get(at).is_some_and(|t| t.word(word))
+}
+
+fn after_group(tokens: &[RebindToken<'_>], at: usize) -> Option<usize> {
+    tokens
+        .get(at)
+        .filter(|t| t.text == "(")?
+        .close
+        .map(|i| i + 1)
+}
+
+/// Return only the alias occurrence after one FROM item. Argument and body
+/// groups are skipped here, but remain in the text for the ordinary call scan.
+fn relation_column_alias(tokens: &[RebindToken<'_>], mut at: usize) -> Option<usize> {
+    if token_is(tokens, at, "lateral") {
+        at += 1;
+    }
+    if token_is(tokens, at, "only") {
+        at += 1;
+    }
+    if token_is(tokens, at, "rows") && token_is(tokens, at + 1, "from") {
+        at = after_group(tokens, at + 2)?;
+    } else if let Some(after) = after_group(tokens, at) {
+        at = after;
+    } else if tokens.get(at)?.name() {
+        at += 1;
+        if let Some(after) = after_group(tokens, at) {
+            at = after;
+        }
+    } else {
+        return None;
+    }
+    if token_is(tokens, at, "*") {
+        at += 1;
+    }
+    if token_is(tokens, at, "with") && token_is(tokens, at + 1, "ordinality") {
+        at += 2;
+    }
+    if token_is(tokens, at, "as") {
+        at += 1;
+    }
+    (tokens.get(at)?.name() && after_group(tokens, at + 1).is_some()).then_some(at)
+}
+
+/// CTE and relation alias column lists declare names; they cannot call an
+/// arriving routine. Mask the declaration itself for either arrival kind so
+/// removing its parentheses does not invent a relation reference instead.
+/// No name is resolved to an alias: later uses remain conservative (476).
+fn rebind_code_only(definition: &str) -> String {
+    let mut code = code_only(definition);
+    let mut tokens: Vec<RebindToken<'_>> = Vec::new();
+    let mut groups: Vec<usize> = Vec::new();
+    let mut at = 0;
+    while at < code.len() {
+        let c = code[at..].chars().next().unwrap();
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c') {
+            at += 1;
+            continue;
+        }
+        let text =
+            crate::emit::qualified_name_at(&code[at..]).unwrap_or(&code[at..at + c.len_utf8()]);
+        let index = tokens.len();
+        match text {
+            "(" | "[" => groups.push(index),
+            ")" | "]" => {
+                if let Some(open) = groups.pop()
+                    && matches!((tokens[open].text, text), ("(", ")") | ("[", "]"))
+                {
+                    tokens[open].close = Some(index);
+                }
+            }
+            _ => {}
+        }
+        tokens.push(RebindToken {
+            text,
+            offset: at,
+            close: None,
+        });
+        at += text.len();
+    }
+    let mut declarations = Vec::new();
+    // Parenthesis/bracket scopes keep commas in arguments, subqueries and
+    // arrays from introducing another item in the outer FROM list.
+    let mut from = vec![false];
+    for (i, token) in tokens.iter().enumerate() {
+        if token.name()
+            && let Some(after) = after_group(&tokens, i + 1)
+        {
+            let explicit_alias = i > 0 && token_is(&tokens, i - 1, "as");
+            let mut body = after + 1;
+            if token_is(&tokens, body, "not") {
+                body += 1;
+            }
+            if token_is(&tokens, body, "materialized") {
+                body += 1;
+            }
+            // name(columns) AS [NOT MATERIALIZED] (body) identifies each
+            // CTE independently, including after SEARCH/CYCLE clauses.
+            let cte = token_is(&tokens, after, "as") && after_group(&tokens, body).is_some();
+            if explicit_alias || cte {
+                declarations.push(i);
+            }
+        }
+        match token.text.to_ascii_lowercase().as_str() {
+            "(" | "[" => from.push(false),
+            ")" | "]" => {
+                if from.len() > 1 {
+                    from.pop();
+                }
+            }
+            "from" | "join" | "using" => {
+                *from.last_mut().unwrap() = true;
+                if let Some(alias) = relation_column_alias(&tokens, i + 1) {
+                    declarations.push(alias);
+                }
+            }
+            "," if *from.last().unwrap() => {
+                if let Some(alias) = relation_column_alias(&tokens, i + 1) {
+                    declarations.push(alias);
+                }
+            }
+            "where" | "group" | "having" | "order" | "limit" | "offset" | "fetch" | "for"
+            | "union" | "intersect" | "except" | "window" | "returning" | ";" => {
+                *from.last_mut().unwrap() = false;
+            }
+            _ => {}
+        }
+    }
+    let ranges: Vec<_> = declarations
+        .into_iter()
+        .map(|i| {
+            let t = &tokens[i];
+            t.offset..t.offset + t.text.len()
+        })
+        .collect();
+    for range in ranges {
+        code.replace_range(range.clone(), &" ".repeat(range.len()));
+    }
+    code
+}
+
 #[must_use]
 pub fn rebound_by_this_plan(
     declared: &Schema,
@@ -1981,7 +2150,8 @@ pub fn rebound_by_this_plan(
                         )
                     })
                 });
-            if support_matches || pbps_model::module::references_module_with(&ordinary, new, &LEXIS)
+            if support_matches
+                || pbps_model::module::references_module_with(&ordinary, new, &REBIND_LEXIS)
             {
                 out.push(Rebound {
                     module: module.clone(),
@@ -2540,6 +2710,89 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 expected.into_iter().map(id).collect::<BTreeSet<_>>(),
                 "{arriving}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_list_declarations_are_neither_routine_nor_relation_references() {
+        for body in [
+            "WITH orders(id) AS (VALUES (7)) SELECT 7",
+            "WITH seed AS (VALUES (7)), orders(id) AS (SELECT * FROM seed) SELECT 7",
+            "WITH RECURSIVE orders(id) AS NOT MATERIALIZED (VALUES (7)) SELECT 7",
+            "WITH orders(id) AS MATERIALIZED (VALUES (7)) SELECT 7",
+            "SELECT id FROM shared.source AS orders(id)",
+            "SELECT id FROM shared.source orders(id)",
+            "SELECT id FROM (VALUES (7)) orders(id)",
+            "SELECT id FROM shared.rows_fn() orders(id)",
+            "SELECT 7 FROM shared.source seed, shared.source orders(id)",
+            "SELECT 7 FROM shared.source seed JOIN shared.source orders(id) ON true",
+            "SELECT 7 FROM shared.source seed CROSS JOIN LATERAL shared.rows_fn() orders(id)",
+            "SELECT id FROM ROWS FROM (shared.rows_fn()) orders(id)",
+            "SELECT id FROM shared.rows_fn() WITH ORDINALITY orders(id, ordinal)",
+            "SELECT id FROM ONLY shared.source orders(id)",
+            "SELECT id FROM ONLY (shared.source) orders(id)",
+            "SELECT id FROM shared.source * orders(id)",
+            "SELECT id FROM shared.source TABLESAMPLE system(1), shared.source orders(id)",
+            "SELECT id FROM shared.source AS U&\"or!0064ers\" UESCAPE '!' (id)",
+            "SELECT id FROM shared.source AS \"orders\" /* columns */ (id)",
+            "WITH \"orders\" /* columns */ (id) AS (VALUES (7)) SELECT 7",
+            "SELECT id FROM (shared.source a JOIN shared.source b USING (id)) orders(id)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            for arrival in ["app.orders", "app.orders(integer)"] {
+                assert!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new())
+                        .is_empty(),
+                    "{arrival}: {body}"
+                );
+            }
+            // Caller reports and creation ordering retain their conservative
+            // lexical scan; this filter belongs only to the rebind decision.
+            assert!(pbps_model::module::references_with(
+                body,
+                &"app.orders".parse().unwrap(),
+                &LEXIS
+            ));
+        }
+    }
+
+    #[test]
+    fn alias_declarations_do_not_hide_calls_in_bodies_arguments_or_later_clauses() {
+        for body in [
+            "WITH orders(id) AS (SELECT orders(7)) SELECT id FROM orders",
+            "SELECT * FROM (SELECT orders(7)) orders(id)",
+            "SELECT * FROM shared.rows_fn(orders(7)) orders(id)",
+            "SELECT orders(id) FROM shared.source orders(id)",
+            "SELECT id FROM shared.source orders(id) WHERE orders(id) > 0",
+            "SELECT id FROM shared.source ORDER BY id, orders(id)",
+            "SELECT * FROM shared.source FETCH FIRST orders(7) ROWS ONLY",
+            "SELECT sum(id) OVER (ROWS orders(7) PRECEDING) FROM shared.source",
+            "SELECT json_object('id' VALUE orders(7)) FROM shared.source",
+            "SELECT * FROM shared.rows_fn(1, orders(7))",
+            "SELECT * FROM shared.rows_fn(ARRAY[1, orders(7)])",
+            "SELECT * FROM orders(7)",
+            "SELECT * FROM shared.source seed, orders(7)",
+            "SELECT * FROM shared.source seed JOIN orders(7) ON true",
+            "SELECT * FROM shared.source seed, LATERAL orders(7)",
+            "SELECT orders(7) AS materialized FROM shared.source",
+            "SELECT \"as\", orders(7)",
+            "SELECT \"from\", orders(7)",
+            "SELECT orders\u{a0}(7), orders(7)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{body}"
             );
         }
     }

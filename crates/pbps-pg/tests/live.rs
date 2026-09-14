@@ -9277,6 +9277,157 @@ async fn a_support_column_alias_does_not_rebuild_modules_with_unmanaged_dependen
     assert_eq!(arrival_plan.changes.len(), 1, "{arrival_plan:#?}");
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn cte_and_relation_alias_column_lists_cannot_capture_an_arriving_routine() {
+    let mut db = TestDb::create("column_alias230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+         CREATE TABLE shared.source (id integer); INSERT INTO shared.source VALUES (7); \
+         CREATE FUNCTION shared.rows_fn() RETURNS SETOF integer LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let definitions = [
+        "WITH orders(id) AS (VALUES (7)) SELECT id FROM orders",
+        "WITH seed AS (VALUES (7)), orders(id) AS (SELECT * FROM seed) SELECT id FROM orders",
+        "WITH RECURSIVE orders(id) AS (VALUES (7)) SELECT id FROM orders",
+        "WITH orders(id) AS MATERIALIZED (VALUES (7)) SELECT id FROM orders",
+        "WITH orders(id) AS NOT MATERIALIZED (VALUES (7)) SELECT id FROM orders",
+        "SELECT id FROM shared.source AS orders(id)",
+        "SELECT id FROM shared.source orders(id)",
+        "SELECT id FROM (VALUES (7)) orders(id)",
+        "SELECT id FROM shared.rows_fn() orders(id)",
+        "SELECT orders.id FROM shared.source seed, shared.source orders(id)",
+        "SELECT orders.id FROM shared.source seed CROSS JOIN LATERAL shared.rows_fn() orders(id)",
+        "SELECT id FROM ROWS FROM (shared.rows_fn()) orders(id)",
+        "SELECT id FROM shared.rows_fn() WITH ORDINALITY orders(id, ordinal)",
+        "SELECT id FROM ONLY (shared.source) orders(id)",
+        "WITH RECURSIVE seed(id) AS (VALUES (7) UNION ALL SELECT id + 1 FROM seed WHERE id < 7) \
+         SEARCH DEPTH FIRST BY id SET seq CYCLE id SET cycle USING path, \
+         orders(id) AS (SELECT id FROM seed) SELECT id FROM orders",
+        "SELECT id FROM shared.source AS U&\"or!0064ers\" UESCAPE '!' (id)",
+    ];
+    let pg = Postgres::new();
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT id FROM app.v{i}"
+            ))
+            .await
+            .unwrap();
+    }
+    // A spurious AlterModule would refuse the otherwise valid arrival: the
+    // dependent is real and unmanaged, and the declaration cannot bind a call.
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT id FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn alias_declarations_leave_real_calls_available_for_rebinding() {
+    let mut db = TestDb::create("alias_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+         CREATE TABLE shared.source (id integer); INSERT INTO shared.source VALUES (7); \
+         CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'; \
+         CREATE FUNCTION shared.echo(n integer) RETURNS int LANGUAGE sql AS 'SELECT n'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        "WITH orders(id) AS (SELECT orders(7)) SELECT id FROM orders",
+        "SELECT id FROM (SELECT orders(7)) orders(id)",
+        "SELECT id FROM shared.echo(orders(7)) orders(id)",
+        "SELECT orders(id) AS id FROM shared.source orders(id)",
+        "SELECT id FROM orders(7) orders(id)",
+        "SELECT orders.id FROM shared.source s, LATERAL orders(s.id) orders(id)",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT id FROM app.v{i}")).await,
+            7
+        );
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT id FROM app.v{i}")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**
