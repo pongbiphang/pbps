@@ -8860,6 +8860,106 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_arrival_cannot_capture_a_relation_and_a_view_cannot_capture_a_call() {
+    let mut db = TestDb::create("arrival_kind230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+         CREATE TABLE shared.orders (id integer); INSERT INTO shared.orders VALUES (7);
+         CREATE FUNCTION shared.orders() RETURNS int LANGUAGE sql AS $$ SELECT 9 $$;
+         SET search_path = app, shared;
+         CREATE VIEW app.v AS SELECT * FROM orders;
+         CREATE FUNCTION app.caller() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT orders(); END;
+         CREATE VIEW app.external_dependent AS SELECT * FROM app.v;",
+        )
+        .await
+        .unwrap();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        "app.v".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT * FROM orders"),
+    );
+    declared.modules.insert(
+        "app.caller()".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT orders(); END",
+        ),
+    );
+    assert_eq!(number(&mut db.conn, "SELECT id FROM app.v").await, 7);
+    assert_eq!(number(&mut db.conn, "SELECT app.caller()").await, 9);
+
+    db.conn
+        .execute("CREATE FUNCTION app.orders() RETURNS int LANGUAGE sql AS $$ SELECT 42 $$")
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT id FROM app.v").await,
+        7,
+        "a pg_proc arrival cannot move the view's pg_class binding"
+    );
+    assert_eq!(number(&mut db.conn, "SELECT app.caller()").await, 9);
+    db.conn.execute("CREATE OR REPLACE FUNCTION app.caller() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT orders(); END").await.unwrap();
+    assert_eq!(number(&mut db.conn, "SELECT app.caller()").await, 42);
+
+    db.conn
+        .execute("CREATE VIEW app.orders AS SELECT 99 AS id")
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT app.caller()").await,
+        42,
+        "a pg_class arrival cannot move the routine call's pg_proc binding"
+    );
+    assert_eq!(number(&mut db.conn, "SELECT id FROM app.v").await, 7);
+    db.conn
+        .execute("CREATE OR REPLACE VIEW app.v AS SELECT * FROM orders")
+        .await
+        .unwrap();
+    assert_eq!(number(&mut db.conn, "SELECT id FROM app.v").await, 99);
+
+    in_a_transaction(&mut db.conn).await;
+    let view = "app.v".parse().unwrap();
+    let dependents =
+        pbps_pg::modules::dependents(&mut db.conn, &view, pbps_model::ModuleKind::View)
+            .await
+            .unwrap();
+    rollback(&mut db.conn).await;
+    let routine_rebound = pbps_pg::modules::rebound_by_this_plan(
+        &declared,
+        &[],
+        &["app.orders()".parse().unwrap()],
+        &Default::default(),
+    );
+    let view_rebound = pbps_pg::modules::rebound_by_this_plan(
+        &declared,
+        &[],
+        &["app.orders".parse().unwrap()],
+        &Default::default(),
+    );
+    db.drop().await;
+    assert!(
+        pbps_pg::modules::unmanaged_refusal(&view, &dependents, &declared).is_some(),
+        "an unnecessary view rebuild would refuse the routine-only arrival"
+    );
+    assert_eq!(
+        routine_rebound,
+        vec![pbps_pg::modules::Rebound {
+            module: "app.caller()".parse().unwrap(),
+            arriving: "app.orders()".parse().unwrap()
+        }]
+    );
+    assert_eq!(
+        view_rebound,
+        vec![pbps_pg::modules::Rebound {
+            module: view,
+            arriving: "app.orders".parse().unwrap()
+        }]
+    );
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

@@ -1905,7 +1905,10 @@ pub struct Rebound {
 ///
 /// So the test is: this plan brings an object into a schema on that module's
 /// effective write path, and the module's text mentions that object's bare
-/// name. One rebuild, once, and the state re-recorded (DECISIONS 307).
+/// name in the arrival's lexical reference form: followed by `(` for a
+/// routine, and not followed by `(` for a view. A pg_proc arrival cannot
+/// capture a pg_class reference; this refinement still does not parse SQL
+/// positions or resolve overloads (DECISIONS 307, 473).
 ///
 /// `pg_catalog` is not a schema a write path may list (DECISIONS 277), so
 /// nothing this plan creates can arrive there and it is not considered.
@@ -1957,10 +1960,7 @@ pub fn rebound_by_this_plan(
             // Tested by `object_name`, a trigger `app.orders.audit` rebuilt
             // every caller of `audit()` for a binding that cannot move, and
             // the rebuild of a caller with dependents is a refusal (307).
-            let Some(name) = new.referenced_name() else {
-                continue;
-            };
-            if pbps_model::module::references_with(&definition.definition, &name, &LEXIS) {
+            if pbps_model::module::references_module_with(&definition.definition, new, &LEXIS) {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2481,5 +2481,44 @@ mod tests {
         assert!(
             rebound_by_this_plan(&declared, &extras, &[id("app.f(integer)")], &already).is_empty()
         );
+    }
+
+    #[test]
+    fn an_arrival_rebinds_only_mentions_with_its_reference_form() {
+        let mut declared = Schema::default();
+        for (name, body) in [
+            ("app.view", "SELECT * FROM orders"),
+            ("app.qualified", "SELECT * FROM app . \"orders\""),
+            ("app.call()", "SELECT orders /* gap */ (1)"),
+            (
+                "app.qualified_call()",
+                "SELECT app . \"orders\" -- gap\r(1)",
+            ),
+            ("app.both()", "SELECT orders, orders(1) FROM orders"),
+            ("app.data()", "SELECT 'orders(1)', $$orders$$"),
+            ("app.longer()", "SELECT orders\u{a0}(1), orders_suffix(1)"),
+        ] {
+            declared.modules.insert(id(name), module(body));
+        }
+        for (arriving, expected) in [
+            (
+                "app.orders(integer)",
+                vec!["app.both()", "app.call()", "app.qualified_call()"],
+            ),
+            (
+                "app.orders",
+                vec!["app.both()", "app.qualified", "app.view"],
+            ),
+        ] {
+            let rebound = rebound_by_this_plan(&declared, &[], &[id(arriving)], &BTreeSet::new());
+            assert_eq!(
+                rebound
+                    .iter()
+                    .map(|r| r.module.clone())
+                    .collect::<BTreeSet<_>>(),
+                expected.into_iter().map(id).collect::<BTreeSet<_>>(),
+                "{arriving}"
+            );
+        }
     }
 }

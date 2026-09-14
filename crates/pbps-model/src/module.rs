@@ -938,6 +938,27 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
         lexis.continues_ident,
         lexis.reserved,
         true,
+        None,
+    )
+}
+
+/// A name scan restricted to the module's lexical reference form: a routine
+/// mention is followed by `(` after trivia, and a named relation is not.
+/// Triggers have no reference form. This does not resolve SQL positions or
+/// overloads; callers opt into the refinement instead of changing every name
+/// report and creation-order edge (DECISIONS 473).
+pub fn references_module_with(definition: &str, module: &ModuleId, lexis: &Lexis<'_>) -> bool {
+    let Some(name) = module.referenced_name() else {
+        return false;
+    };
+    references_in(
+        &(lexis.code_only)(definition),
+        &name,
+        Case::Folded,
+        lexis.continues_ident,
+        lexis.reserved,
+        true,
+        Some(matches!(module, ModuleId::Routine(_))),
     )
 }
 
@@ -983,6 +1004,7 @@ fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
         is_regular_identifier_continue,
         never_reserved,
         true,
+        None,
     )
 }
 
@@ -997,12 +1019,13 @@ fn references_in(
     continues: fn(char) -> bool,
     reserved: fn(&str) -> bool,
     bare: bool,
+    call: Option<bool>,
 ) -> bool {
     let haystack = scannable_code(code, case, continues, false);
 
     // The qualified form first — a word after a dot is a name whatever it
     // is: measured, `FROM app.select` is accepted on PostgreSQL.
-    if contains_word(&haystack, &qualified(name, case), continues) {
+    if contains_word(&haystack, &qualified(name, case), continues, call) {
         return true;
     }
     // A bare name resolves through the engine's lookup path and nowhere
@@ -1020,9 +1043,9 @@ fn references_in(
     let bare = cased(&name.name, case);
     if reserved(&name.name.to_ascii_lowercase()) {
         let quoted = scannable_code(code, case, continues, true);
-        contains_word(&quoted, &format!("\"{bare}\""), continues)
+        contains_word(&quoted, &format!("\"{bare}\""), continues, call)
     } else {
-        contains_word(&haystack, &bare, continues)
+        contains_word(&haystack, &bare, continues, call)
     }
 }
 
@@ -1332,13 +1355,22 @@ fn scannable_code(
 }
 
 /// Whether `needle` occurs with no identifier character on either side.
-fn contains_word(haystack: &str, needle: &str, continues: fn(char) -> bool) -> bool {
+fn contains_word(
+    haystack: &str,
+    needle: &str,
+    continues: fn(char) -> bool,
+    call: Option<bool>,
+) -> bool {
     let mut from = 0;
     while let Some(at) = haystack[from..].find(needle) {
         let start = from + at;
         let end = start + needle.len();
         if !is_ident_char(haystack[..start].chars().next_back(), continues)
             && !is_ident_char(haystack[end..].chars().next(), continues)
+            && call.is_none_or(|wanted| {
+                let next = haystack[end..].chars().find(|c| !is_a_gap(*c, continues));
+                (next == Some('(')) == wanted
+            })
         {
             return true;
         }
@@ -1460,7 +1492,7 @@ pub fn creation_order_with(
                     && other.referenced_name().is_some_and(|n| {
                         let bare = bare_rank(name.schema(), other.schema())
                             .is_some_and(|rank| nearest.get(&cased(&n.name, case)) == Some(&rank));
-                        references_in(code, &n, case, continues, reserved, bare)
+                        references_in(code, &n, case, continues, reserved, bare, None)
                     });
                 if declared || attached || referenced {
                     set.insert(other.clone());

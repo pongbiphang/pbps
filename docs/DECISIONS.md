@@ -12021,3 +12021,28 @@ SPEC is in sync with all of these.
      known metadata. Row-projection failures do not suppress this independent
      check. Live tests compare 25 collation pairs with actual constraint DDL
      and cover renames, new columns, created tables, retypes and missing objects.
+
+477. **The rebind scan distinguishes routine calls from relation mentions
+     (issue #230).** Refine 307's name-and-write-path test by the arriving
+     module's reference form: a routine requires `(` as the next non-trivia
+     character, while a view requires another character or the end of the
+     definition. The dialect blanks comments and string data first, and the
+     existing name scan retains its qualification, reserved-word and identifier
+     boundary rules. It considers every occurrence, so a non-call mention does
+     not hide a later call of the same name. Triggers still have no referenced
+     name and cannot capture anything.
+
+     Measured on PostgreSQL: a view reading the shared `orders` relation keeps
+     that binding when `app.orders()` arrives. A parsed routine calling the
+     shared `orders()` keeps its old binding until recreated, then calls the
+     new function. Creating the `app.orders` view cannot change that routine
+     call; recreating the original view does bind the newly arrived relation.
+     The two catalog namespaces can coexist. Inventing a view rebuild for the
+     function arrival can refuse a valid plan when the view has an unmanaged
+     dependent, although its relation binding could not move.
+
+     This is a lexical refinement, not SQL parsing or overload resolution.
+     Fully qualified mentions and every overload of a mentioned routine name
+     remain conservative rebind candidates on the effective write path.
+     The general caller report and creation-order name scan keep their existing
+     behavior; the rebind caller explicitly opts into the reference-form scan.
