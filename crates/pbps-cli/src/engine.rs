@@ -1149,6 +1149,14 @@ pub async fn prepare_data_writes(
     }
 }
 
+/// Whether deferred work was flushed and its effects need a managed-state check.
+pub async fn settle_data_writes(conn: &mut Conn, guard: &DataWriteGuard) -> anyhow::Result<bool> {
+    match (conn.driver(), &guard.postgres) {
+        (Driver::Postgres, Some(guard)) => Ok(pbps_pg::data_triggers::settle(conn, guard).await?),
+        _ => Ok(false),
+    }
+}
+
 pub async fn check_data_write(
     conn: &mut Conn,
     statement: &pbps_dialect::Statement,

@@ -56,6 +56,7 @@
 //! the three verbatim expressions — a column's default, a check's expression
 //! and an index's filter — are carried through untouched.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 
@@ -1330,7 +1331,9 @@ fn add_module(
             // `pg_get_viewdef` returns the query and ends it with a `;`, and
             // the declaration holds what follows `AS` — where a `;` would end
             // the `CREATE` statement rather than the query inside it.
-            Some(raw.definition.trim().trim_end_matches(';').trim_end()),
+            Some(Cow::Borrowed(
+                raw.definition.trim().trim_end_matches(';').trim_end(),
+            )),
         ),
         kind @ ('f' | 'p') => {
             let mut args = Vec::new();
@@ -1365,7 +1368,7 @@ fn add_module(
                     ModuleKind::Procedure
                 },
                 ModuleId::Routine(RoutineId::new(here.clone(), args)),
-                after_the_name(&raw.definition, prefix),
+                after_the_name(&raw.definition, prefix).map(Cow::Borrowed),
             )
         }
         't' => (
@@ -1374,7 +1377,7 @@ fn add_module(
                 on: ObjectName::new(&raw.schema, &raw.on_table),
                 name: raw.name.clone(),
             },
-            after_the_name(&raw.definition, "CREATE TRIGGER "),
+            trigger_definition(&raw.definition),
         ),
         other => {
             return note_module(
@@ -1425,7 +1428,7 @@ fn add_module(
         Module {
             kind,
             description: None,
-            definition: definition.to_owned(),
+            definition: definition.into_owned(),
         },
     );
 }
@@ -1447,9 +1450,19 @@ fn add_module(
 /// the deparser's job, not this reader's. `None` where the text is not this
 /// shape at all, so that the caller can say so rather than record an empty
 /// body (DECISIONS 304).
-pub(crate) fn after_the_name<'a>(deparsed: &'a str, prefix: &str) -> Option<&'a str> {
+fn after_the_name<'a>(deparsed: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = deparsed.trim_start().strip_prefix(prefix)?;
     Some(after_a_qualified_name(rest)?.trim())
+}
+
+/// Keep the constraint marker in the opaque declaration so its emitter and
+/// the reference-data guard agree on the same recorded definition (473).
+pub(crate) fn trigger_definition(deparsed: &str) -> Option<Cow<'_, str>> {
+    if let Some(body) = after_the_name(deparsed, "CREATE CONSTRAINT TRIGGER ") {
+        // A marker alone must not turn a missing body into a manageable module.
+        return (!body.is_empty()).then(|| Cow::Owned(format!("CONSTRAINT {body}")));
+    }
+    after_the_name(deparsed, "CREATE TRIGGER ").map(Cow::Borrowed)
 }
 
 fn after_a_qualified_name(text: &str) -> Option<&str> {
@@ -3242,6 +3255,29 @@ mod tests {
             "{:?}",
             pulled.warnings
         );
+    }
+
+    #[test]
+    fn constraint_trigger_readback_keeps_the_kind_and_refuses_missing_bodies() {
+        let body = "AFTER INSERT ON app.t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.trf()";
+        for name in ["audit", "\"audit x\"", "\"audit\"\"x\""] {
+            assert_eq!(
+                trigger_definition(&format!("CREATE CONSTRAINT TRIGGER {name} {body}")).as_deref(),
+                Some(format!("CONSTRAINT {body}").as_str())
+            );
+            assert_eq!(
+                trigger_definition(&format!("CREATE TRIGGER {name} {body}")).as_deref(),
+                Some(body)
+            );
+        }
+        for definition in [
+            "CREATE CONSTRAINT TRIGGER audit",
+            "CREATE CONSTRAINT TRIGGER ",
+            "CREATE CONSTRAINT TRIGGER \"unfinished",
+            "CREATE FUNCTION audit()",
+        ] {
+            assert!(trigger_definition(definition).is_none(), "{definition}");
+        }
     }
 
     /// Measured on 18.6, one shape per kind. The declaration holds everything

@@ -11781,3 +11781,50 @@ SPEC is in sync with all of these.
      omitting the update text check accepts trigger rewrites; removing the
      batch boundary makes the exported script fail. Restoring the guards and
      batch boundary makes these regressions pass.
+
+473. **A user constraint trigger is one trigger module, including its
+     `CONSTRAINT` marker, rather than a second table constraint.** Measured on
+     PostgreSQL 18.6, `CREATE CONSTRAINT TRIGGER` creates a non-internal
+     `pg_trigger` row and a `pg_constraint` row with `contype = 't'`. The latter
+     has an internal `pg_depend` edge (`deptype = 'i'`) to the trigger:
+     `DROP TRIGGER` removes both, while `ALTER TABLE ... DROP CONSTRAINT`
+     refuses and tells the operator to drop the trigger instead. Reading the
+     companion as a separate unsupported constraint both duplicated the object
+     and prevented its table from being managed (issue #229).
+
+     The trigger keeps the identity and drop/create path of ADR-0009. Its
+     opaque `definition` begins `CONSTRAINT AFTER ...`; the emitter moves that
+     leading marker into `CREATE CONSTRAINT TRIGGER <name>` and keeps the
+     remaining text, including `DEFERRABLE INITIALLY DEFERRED`, intact. A new
+     model kind or PostgreSQL-specific flag would duplicate a distinction the
+     opaque definition already holds. Ordinary trigger declarations retain
+     their existing spelling. DECISIONS 302's `ON` scan still validates the
+     same identity against the same clause.
+
+     `constraints_query` excludes only `contype = 't'` for this reason. The
+     module query still excludes `tgisinternal`, so an FK's internal
+     `RI_ConstraintTrigger` objects remain represented by their FK, not by
+     modules. The reference-data guard uses the same conversion as the pull:
+     stripping only `CREATE TRIGGER` would refuse a recorded managed constraint
+     trigger, while stripping the constraint marker would equate different
+     definitions. The live CLI fixtures cover serialized pull, adoption with
+     an empty connected plan, bootstrap, module alteration, deferred execution,
+     internal FK exclusion and enforcement, and the guard's acceptance of the
+     exact record and refusal of an ordinary or absent one.
+
+     **The success record must also precede no deferred trigger work.** The
+     first implementation passed the inventory round trip but, measured on
+     18.6, a managed `INITIALLY DEFERRED` trigger could rewrite an inserted
+     label at `COMMIT`: `apply` reported success and `verify` immediately
+     reported drift. That is a wrong recording with a single deployer, so it
+     is part of this fix under the review rule. A transactional apply reaching
+     a managed constraint trigger now flushes `SET CONSTRAINTS ALL IMMEDIATE`
+     after all plan statements, while its locks and transaction still hold,
+     then rereads the managed state. A change from the state that passed the
+     row statements' checks rolls back the entire apply. Only the settled
+     inventory may feed the remaining absence checks and success record.
+     Flushing after each row would refuse a valid constraint requiring two
+     rows the same plan inserts; the positive fixture requires both, and the
+     negative fixture rewrites a label after the ordinary statement check.
+     Staged row writes already commit before their checkpoint read, so they
+     have no pre-commit success snapshot to settle by this rule.

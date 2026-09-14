@@ -29,6 +29,7 @@ const UPDATE: i16 = 16;
 #[derive(Default)]
 pub struct Guard {
     approved: BTreeMap<i64, i64>,
+    constraint_trigger: bool,
 }
 
 /// What the plan takes away before its row statements run, in the spelling the
@@ -74,16 +75,30 @@ pub async fn prepare(
             }
             let matches_record = baseline.modules.get(&id).is_some_and(|m| {
                 m.kind == ModuleKind::Trigger
-                    && crate::introspect::after_the_name(&trigger.definition, "CREATE TRIGGER ")
+                    && crate::introspect::trigger_definition(&trigger.definition).as_deref()
                         == Some(m.definition.as_str())
             });
             if !matches_record || !trigger.trusted_owner {
                 return Err(refused(&trigger, &write.table));
             }
             guard.approved.insert(trigger.oid, trigger.function_oid);
+            guard.constraint_trigger |=
+                trigger.definition.starts_with("CREATE CONSTRAINT TRIGGER ");
         }
     }
     Ok(guard)
+}
+
+/// Finish deferred trigger work before recording a transactional apply (473).
+/// The caller compares managed state before and after this flush: committing
+/// first would let a trigger mutate rows after their success record was read.
+/// No later plan write may run after this point.
+pub async fn settle(conn: &mut Conn, guard: &Guard) -> Result<bool, DbError> {
+    if !guard.constraint_trigger {
+        return Ok(false);
+    }
+    conn.execute("SET CONSTRAINTS ALL IMMEDIATE").await?;
+    Ok(true)
 }
 
 /// Recheck immediately before each row statement, including on a newly created

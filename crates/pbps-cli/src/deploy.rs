@@ -4326,7 +4326,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // opens a window another session could write a declared row or a
         // managed role's grants into, for this read to take in and record as
         // the plan's own result (DECISIONS 147).
-        let after = managed_state(
+        let mut after = managed_state(
             conn,
             &plan.ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
@@ -4336,6 +4336,30 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             crate::engine::Read::InsideOwnTransaction,
         )
         .await?;
+        // A deferred trigger runs at COMMIT unless explicitly settled. Compare
+        // its effects inside this transaction, after every planned write: an
+        // earlier flush can refuse a constraint that the full plan satisfies,
+        // while a later one records rows that the commit then changes (473).
+        if crate::engine::settle_data_writes(conn, &data_guard).await? {
+            let settled = managed_state(
+                conn,
+                &plan.ids,
+                &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
+                project.config.unmanaged,
+                &plan.data,
+                &Schema::default(),
+                crate::engine::Read::InsideOwnTransaction,
+            )
+            .await?;
+            refuse_unexpressible(&settled, &target.label, "apply again")?;
+            if settled.schema != after.schema {
+                bail!(
+                    "deferred constraint triggers changed the managed state after the plan's \
+                     row checks. Nothing has been applied — the transaction was rolled back."
+                );
+            }
+            after = settled;
+        }
         refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
             .await
             .map_err(|e| {

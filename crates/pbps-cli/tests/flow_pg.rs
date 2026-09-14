@@ -3206,6 +3206,321 @@ fn the_cli_probe_counts_real_null_rows_before_any_statement_and_then_accepts_cle
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn constraint_triggers_pull_bootstrap_and_plan_without_duplicate_constraints() {
+    use pbps_model::{Change, ModuleKind, SavedPlan};
+    let own = OwnDatabase::new(&server(), "constraint_trigger229");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app;
+        CREATE TABLE app.t (id integer PRIMARY KEY);
+        CREATE TABLE app.child (id integer REFERENCES app.t(id));
+        CREATE TABLE app.calls (id integer);
+        CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql AS
+            $$BEGIN INSERT INTO app.calls VALUES (NEW.id); RETURN NEW; END$$;
+        CREATE CONSTRAINT TRIGGER \"constraint name\" AFTER INSERT ON app.t
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.fire()",
+    );
+    let d = Demo::new("constraint-trigger229-pull");
+    succeeds(d.run(&["pull", "--db", connection]));
+    let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+    let trigger = "app.t.constraint name".parse().unwrap();
+    assert_eq!(
+        loaded.schema.modules.len(),
+        2,
+        "{:?}",
+        loaded.schema.modules
+    );
+    let module = &loaded.schema.modules[&trigger];
+    assert_eq!(module.kind, ModuleKind::Trigger);
+    assert!(
+        module
+            .definition
+            .starts_with("CONSTRAINT AFTER INSERT ON app.t ")
+    );
+    assert!(module.definition.contains("DEFERRABLE INITIALLY DEFERRED"));
+    // The four internal RI triggers stay out while their FK stays represented.
+    assert_eq!(
+        loaded.schema.tables[&"app.child".parse().unwrap()]
+            .foreign_keys
+            .len(),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_trigger WHERE tgisinternal
+        AND tgrelid IN ('app.t'::regclass, 'app.child'::regclass)"
+        ),
+        4
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let pulled = pbps_pg::catalog::introspect(&mut conn).await.unwrap();
+            assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        });
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopt a user constraint trigger",
+    ]));
+    let plan = d.dir.join("adoption-plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let saved: SavedPlan = serde_json::from_str(&std::fs::read_to_string(plan).unwrap()).unwrap();
+    assert!(saved.changes.is_empty(), "{:?}", saved.changes);
+
+    // Bootstrap the actual serialized pull, then measure the promised timing.
+    let rebuilt = OwnDatabase::new(&server(), "constraint_trigger229_rebuilt");
+    let rebuilt = rebuilt.connection();
+    on_server(rebuilt, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", rebuilt]));
+    assert_eq!(
+        latest_snapshot(rebuilt).schema.modules,
+        loaded.schema.modules
+    );
+    assert_eq!(
+        scalar(
+            rebuilt,
+            "SELECT count(*) FROM pg_trigger WHERE tgname='constraint name'
+        AND NOT tgisinternal AND tgconstraint <> 0 AND tgdeferrable AND tginitdeferred"
+        ),
+        1
+    );
+    on_server(
+        rebuilt,
+        "BEGIN; INSERT INTO app.t VALUES (1);
+        DO $$BEGIN ASSERT (SELECT count(*) FROM app.calls) = 0; END$$;
+        SET CONSTRAINTS ALL IMMEDIATE;
+        DO $$BEGIN ASSERT (SELECT count(*) FROM app.calls) = 1; END$$; ROLLBACK",
+    );
+    assert!(try_on_server(rebuilt, "INSERT INTO app.child VALUES (99)").is_err());
+
+    // An edit takes the ordinary module drop/create path and retains CONSTRAINT.
+    let mut paths = vec![d.dir.join("schema")];
+    let path = loop {
+        let path = paths.pop().expect("the pulled trigger declaration");
+        if path.is_dir() {
+            paths.extend(std::fs::read_dir(path).unwrap().map(|e| e.unwrap().path()));
+        } else if std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("trigger:"))
+        {
+            break path;
+        }
+    };
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        path,
+        text.replace("INITIALLY DEFERRED", "INITIALLY IMMEDIATE"),
+    )
+    .unwrap();
+    let plan = connected_artifact(&d, rebuilt, false);
+    let saved: SavedPlan = serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(saved.changes.changes.len(), 1, "{:?}", saved.changes);
+    assert!(
+        matches!(&saved.changes.changes[0].change, Change::AlterModule { id, .. } if id == &trigger)
+    );
+    succeeds(approved_apply(&d, rebuilt, &plan, &[]));
+    assert_eq!(
+        scalar(
+            rebuilt,
+            "SELECT count(*) FROM pg_trigger WHERE tgname='constraint name'
+        AND tgconstraint <> 0 AND tgdeferrable AND NOT tginitdeferred"
+        ),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", rebuilt]));
+}
+
+const CONSTRAINT_TRIGGER_TABLE: &str = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+
+fn adopted_constraint_trigger(connection: &str, slug: &str, function_body: &str) -> Demo {
+    let d = bootstrapped_demo(connection, slug, CONSTRAINT_TRIGGER_TABLE);
+    on_server(
+        connection,
+        &format!(
+            "CREATE FUNCTION app.late() RETURNS trigger LANGUAGE plpgsql AS $$ {function_body} $$;
+        CREATE CONSTRAINT TRIGGER late AFTER INSERT ON app.t
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.late()"
+        ),
+    );
+    let modules = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .unwrap()
+                .schema
+                .modules
+        });
+    for (id, module) in modules {
+        let body = module
+            .definition
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        let kind = module.kind.as_str();
+        let identity = if kind == "trigger" {
+            "app.late\non: app.t".to_owned()
+        } else {
+            id.to_string()
+        };
+        std::fs::write(
+            d.dir.join(format!("schema/late-{kind}.yml")),
+            format!("{kind}: {identity}\ndefinition: |-\n{body}"),
+        )
+        .unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopt a deferred trigger",
+    ]));
+    d
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn constraint_trigger_checks_wait_for_every_planned_row() {
+    let own = OwnDatabase::new(&server(), "constraint_trigger229_complete");
+    let connection = own.connection();
+    let d = adopted_constraint_trigger(
+        connection,
+        "constraint-trigger229-complete",
+        "BEGIN IF (SELECT count(*) FROM app.t) <> 2 THEN RAISE EXCEPTION 'both rows are required'; END IF; RETURN NEW; END",
+    );
+    d.table(&format!("{CONSTRAINT_TRIGGER_TABLE}data:\n  mode: exact\n  rows:\n    first: {{label: First}}\n    second: {{label: Second}}\n"));
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.t"), 2);
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn constraint_trigger_effects_cannot_arrive_after_the_recorded_row_check() {
+    let own = OwnDatabase::new(&server(), "constraint_trigger229_late");
+    let connection = own.connection();
+    let d = adopted_constraint_trigger(
+        connection,
+        "constraint-trigger229-late",
+        "BEGIN UPDATE app.t SET label='rewritten' WHERE code=NEW.code; RETURN NEW; END",
+    );
+    d.table(&format!(
+        "{CONSTRAINT_TRIGGER_TABLE}data:\n  mode: exact\n  rows:\n    first: {{label: Expected}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let outcome = approved_apply(&d, connection, &plan, &[]);
+    assert_eq!(
+        code(&outcome),
+        1,
+        "{}{}",
+        stdout(&outcome),
+        stderr(&outcome)
+    );
+    assert!(
+        stderr(&outcome).contains("deferred constraint triggers changed"),
+        "{}",
+        stderr(&outcome)
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.t"), 0);
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let own = OwnDatabase::new(&server(), "constraint_trigger229_guard");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer);
+        CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+        CREATE CONSTRAINT TRIGGER guarded AFTER INSERT ON app.t
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.fire()",
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let baseline = pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .unwrap()
+                .schema;
+            let pg = pbps_pg::Postgres::new();
+            let write = RowWrite {
+                table: "app.t".parse().unwrap(),
+                operation: RowOperation::Insert,
+            };
+            conn.begin(pg.transaction_framing()).await.unwrap();
+            let guard = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                std::slice::from_ref(&write),
+                &baseline,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            pbps_pg::data_triggers::check(&mut conn, &write, &guard)
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO app.t VALUES (1)").await.unwrap();
+            conn.commit(pg.transaction_framing()).await.unwrap();
+            // A matching body without the marker must not authenticate another kind.
+            let mut ordinary = baseline.clone();
+            ordinary
+                .modules
+                .get_mut(&"app.t.guarded".parse().unwrap())
+                .unwrap()
+                .definition = baseline.modules[&"app.t.guarded".parse().unwrap()]
+                .definition
+                .strip_prefix("CONSTRAINT ")
+                .unwrap()
+                .to_owned();
+            for record in [ordinary, Default::default()] {
+                conn.begin(pg.transaction_framing()).await.unwrap();
+                assert!(
+                    pbps_pg::data_triggers::prepare(
+                        &mut conn,
+                        std::slice::from_ref(&write),
+                        &record,
+                        &Default::default()
+                    )
+                    .await
+                    .is_err()
+                );
+                conn.rollback(pg.transaction_framing()).await.unwrap();
+            }
+        });
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn modules_apply_then_pull_round_trip_and_changed_bodies_are_drift() {
     let own = OwnDatabase::new(&server(), "invariant_modules");
     let connection = own.connection();
