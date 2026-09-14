@@ -2102,6 +2102,119 @@ fn fixed_type_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
     }
 }
 
+fn statement_boundary(tokens: &[RebindToken<'_>], mut at: usize) -> bool {
+    // A closing >> alone may be a shift operator. Strip only complete labels,
+    // and still require a statement boundary before them.
+    while at >= 5
+        && token_is(tokens, at - 5, "<")
+        && token_is(tokens, at - 4, "<")
+        && tokens[at - 3].name()
+        && token_is(tokens, at - 2, ">")
+        && token_is(tokens, at - 1, ">")
+    {
+        at -= 5;
+    }
+    at == 0
+        || [";", "begin", "then", "else", "loop"]
+            .iter()
+            .any(|word| token_is(tokens, at - 1, word))
+}
+
+fn procedural_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
+    let token = &tokens[at];
+    if statement_boundary(tokens, at)
+        && [
+            "if", "elsif", "while", "assert", "perform", "return", "execute",
+        ]
+        .iter()
+        .any(|word| token.word(word))
+    {
+        return true;
+    }
+    if at > 0
+        && (token.word("next") || token.word("query"))
+        && token_is(tokens, at - 1, "return")
+        && statement_boundary(tokens, at - 1)
+    {
+        return true;
+    }
+    if !token.word("execute") {
+        return false;
+    }
+    if at > 1
+        && token_is(tokens, at - 1, "query")
+        && token_is(tokens, at - 2, "return")
+        && statement_boundary(tokens, at - 2)
+    {
+        return true;
+    }
+    if at > 2
+        && token_is(tokens, at - 1, "for")
+        && tokens[at - 2].name()
+        && token_is(tokens, at - 3, "open")
+        && statement_boundary(tokens, at - 3)
+    {
+        return true;
+    }
+    if at > 0 && token_is(tokens, at - 1, "in") {
+        // A dynamic FOR query follows one record or a comma-separated target
+        // list. Names inside its query expression are never consumed here.
+        let mut start = at - 1;
+        while start > 0 && (tokens[start - 1].name() || token_is(tokens, start - 1, ",")) {
+            start -= 1;
+        }
+        return start > 0
+            && token_is(tokens, start - 1, "for")
+            && statement_boundary(tokens, start - 1);
+    }
+    false
+}
+
+/// CONFLICT is also a legal function name in a JOIN's ON expression. Require
+/// the arbiter group's DO action, skipping its optional predicate's groups.
+fn conflict_target_clause(tokens: &[RebindToken<'_>], at: usize) -> bool {
+    if at == 0 || !token_is(tokens, at - 1, "on") {
+        return false;
+    }
+    let Some(mut end) = after_group(tokens, at + 1) else {
+        return false;
+    };
+    if token_is(tokens, end, "where") {
+        end += 1;
+        while end < tokens.len() && !token_is(tokens, end, "do") && !token_is(tokens, end, ";") {
+            end = tokens[end].close.map_or(end + 1, |close| close + 1);
+        }
+    }
+    token_is(tokens, end, "do")
+        && (token_is(tokens, end + 1, "nothing") || token_is(tokens, end + 1, "update"))
+}
+
+/// A window specification can copy a window before its expression clauses.
+/// Only that leading identifier names a window; partition/order/frame operands
+/// still participate in the ordinary relation and routine scans.
+fn window_base_name(tokens: &[RebindToken<'_>], open: usize) -> Option<usize> {
+    let at = open + 1;
+    (tokens.get(at).is_some_and(RebindToken::name)
+        && !["partition", "order", "rows", "range", "groups"]
+            .iter()
+            .any(|word| token_is(tokens, at, word)))
+    .then_some(at)
+}
+
+fn window_declarations(tokens: &[RebindToken<'_>], mut at: usize, names: &mut Vec<usize>) {
+    while tokens.get(at).is_some_and(RebindToken::name) && token_is(tokens, at + 1, "as") {
+        let Some(after) = after_group(tokens, at + 2) else {
+            break;
+        };
+        names.push(at);
+        names.extend(window_base_name(tokens, at + 2));
+        if !token_is(tokens, after, ",") {
+            break;
+        }
+        at = after + 1;
+    }
+}
+
 /// PL/pgSQL declaration statements end at semicolons before BEGIN. Only
 /// their type portion is marked: defaults, assignments and cursor queries
 /// remain expressions. Skipping balanced groups avoids treating a parameter
@@ -2110,7 +2223,7 @@ fn fixed_type_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
 /// not a routine call. Only that operand is excluded; its arguments stay code.
 fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
     let mut spans = Vec::new();
-    let mut cursors = Vec::new();
+    let mut declarations = Vec::new();
     let mut statement = None;
     let mut at = 0;
     while at < tokens.len() {
@@ -2123,17 +2236,19 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
             statement = Some(at + 1);
         } else if token.word("begin") {
             statement = None;
+        } else if statement.is_none() && procedural_keyword(tokens, at) {
+            // Parenthesized operands do not turn statement keywords into calls.
+            // Mask the whole keyword chain so a removed EXECUTE cannot attach
+            // its group to QUERY or RETURN. Operand contents stay intact.
+            declarations.push(at);
         } else if statement.is_none()
             && (token.word("open") || token.word("close"))
             && tokens.get(at + 1).is_some_and(RebindToken::name)
         {
-            cursors.push(at + 1);
+            declarations.push(at + 1);
         } else if statement.is_none()
             && (token.word("fetch") || token.word("move"))
-            && at > 0
-            && [";", "begin", "then", "else", "loop"]
-                .iter()
-                .any(|word| token_is(tokens, at - 1, word))
+            && statement_boundary(tokens, at)
         {
             // FETCH's operand ends before INTO; MOVE's ends at the statement.
             // Direction/count expressions precede it and remain code. Requiring
@@ -2146,7 +2261,7 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
                 end = tokens[end].close.map_or(end + 1, |close| close + 1);
             }
             if end > at + 1 && tokens[end - 1].name() {
-                cursors.push(end - 1);
+                declarations.push(end - 1);
             }
         } else if token.text == ";"
             && let Some(start) = statement
@@ -2165,7 +2280,7 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
                     if item.word("cursor") {
                         // With or without arguments, the declared cursor is
                         // a variable rather than a relation on the write path.
-                        cursors.extend([start, end]);
+                        declarations.extend([start, end]);
                         if let Some(after) = after_group(tokens, end + 1) {
                             spans.push(tokens[end + 1].offset..tokens[after - 1].offset);
                         }
@@ -2182,7 +2297,7 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
         }
         at += 1;
     }
-    (spans, cursors)
+    (spans, declarations)
 }
 
 /// Utility target parentheses contain column names, not call arguments.
@@ -2499,13 +2614,27 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     let mut from = vec![false];
     let mut open_groups: Vec<usize> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
-        if i > 0
-            && tokens[i - 1].text == ")"
-            && after_group(&tokens, i + 1).is_some()
-            && (token.word("over") || (token.word("filter") && token_is(&tokens, i + 2, "where")))
-        {
-            // These postfix aggregate/window clauses introduce expressions,
-            // not calls to their keyword. Keep their predicates and frames.
+        if i > 0 && tokens[i - 1].text == ")" {
+            if token.word("over") {
+                if after_group(&tokens, i + 1).is_some() {
+                    declarations.push(i);
+                    declarations.extend(window_base_name(&tokens, i + 1));
+                } else if tokens.get(i + 1).is_some_and(RebindToken::name) {
+                    declarations.extend([i, i + 1]);
+                }
+            } else if token.word("filter")
+                && after_group(&tokens, i + 1).is_some()
+                && token_is(&tokens, i + 2, "where")
+            {
+                // Keep predicate expressions after this postfix keyword.
+                declarations.push(i);
+            }
+        }
+        if token.word("window") {
+            window_declarations(&tokens, i + 1, &mut declarations);
+        }
+        if token.word("conflict") && conflict_target_clause(&tokens, i) {
+            // Arbiter expressions, predicates and update expressions stay code.
             declarations.push(i);
         }
         // PostgreSQL brackets delimit arrays, never identifiers. The shared
@@ -3852,6 +3981,171 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedural_keywords_keep_their_operand_calls() {
+        for keyword in [
+            "if", "elsif", "while", "assert", "perform", "return", "execute",
+        ] {
+            for boundary in ["BEGIN", ";", "THEN", "ELSE", "LOOP", "<<label>>"] {
+                let mut declared = Schema::default();
+                declared.modules.insert(id("app.f()"), module(&format!(
+                    "() RETURNS int LANGUAGE plpgsql AS $$BEGIN {boundary} {keyword} (true); END$$"
+                )));
+                assert!(
+                    rebound_by_this_plan(
+                        &declared,
+                        &[],
+                        &[id(&format!("app.{keyword}(boolean)"))],
+                        &BTreeSet::new()
+                    )
+                    .is_empty(),
+                    "{boundary}: {keyword}"
+                );
+            }
+            for body in [
+                format!("BEGIN IF ({keyword}(true)) THEN RETURN 7; END IF; END"),
+                format!("BEGIN WHILE (\"{keyword}\"(true)) LOOP RETURN 7; END LOOP; END"),
+                format!("BEGIN SELECT app.{keyword}(true); END"),
+                format!("BEGIN PERFORM ({keyword}(true)); END"),
+                format!("BEGIN RETURN 7 >> {keyword}(true); END"),
+                format!("BEGIN RETURN 7 << shift >> {keyword}(true); END"),
+                format!("BEGIN RETURN NEXT ({keyword}(true)); END"),
+                format!("BEGIN RETURN QUERY (SELECT {keyword}(true)); END"),
+                format!("BEGIN RETURN QUERY EXECUTE ({keyword}(true)); END"),
+                format!(
+                    "BEGIN FOR result IN EXECUTE ({keyword}(true)) LOOP RETURN 7; END LOOP; END"
+                ),
+                format!("BEGIN OPEN c FOR EXECUTE ({keyword}(true)); END"),
+            ] {
+                let mut declared = Schema::default();
+                declared.modules.insert(
+                    id("app.f()"),
+                    module(&format!("() RETURNS int LANGUAGE plpgsql AS $${body}$$")),
+                );
+                assert_eq!(
+                    rebound_by_this_plan(
+                        &declared,
+                        &[],
+                        &[id(&format!("app.{keyword}(boolean)"))],
+                        &BTreeSet::new()
+                    )
+                    .len(),
+                    1,
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conflict_clauses_keep_arbiter_predicate_update_and_join_calls() {
+        for body in [
+            "INSERT INTO target VALUES (1) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO target VALUES (1) ON CONFLICT (id) DO UPDATE SET id=excluded.id",
+            "INSERT INTO target VALUES (1) ON CONFLICT ((id)) WHERE (id > 0) DO UPDATE SET id=excluded.id",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE sql BEGIN ATOMIC {body}; END"
+                )),
+            );
+            assert!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.conflict(integer)")],
+                    &BTreeSet::new()
+                )
+                .is_empty(),
+                "{body}"
+            );
+        }
+        for body in [
+            "INSERT INTO target VALUES (1) ON CONFLICT ((conflict(id))) DO NOTHING",
+            "INSERT INTO target VALUES (1) ON CONFLICT (id) WHERE conflict(id)>0 DO NOTHING",
+            "INSERT INTO target VALUES (1) ON CONFLICT (id) DO UPDATE SET id=conflict(excluded.id)",
+            "SELECT * FROM source JOIN target ON conflict(id) WHERE id>0",
+            "SELECT * FROM source JOIN target ON \"conflict\"(id)",
+            "SELECT * FROM source JOIN target ON app.conflict(id)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE sql BEGIN ATOMIC {body}; END"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.conflict(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_names_keep_relations_and_calls_inside_their_specifications() {
+        for body in [
+            "SELECT count(*) OVER orders FROM source WINDOW orders AS ()",
+            "SELECT count(*) OVER (orders) FROM source WINDOW orders AS ()",
+            "SELECT count(*) OVER follow FROM source WINDOW orders AS (), follow AS (orders)",
+            "SELECT count(*) OVER \"orders\" FROM source WINDOW \"orders\" AS ()",
+            "SELECT count(*) OVER orders FROM source WINDOW seed AS (), orders AS (seed)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(body));
+            for arrival in ["app.orders", "app.orders(integer)"] {
+                assert!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new())
+                        .is_empty(),
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for (body, arrival) in [
+            (
+                "SELECT count(*) OVER orders FROM source WINDOW orders AS (PARTITION BY orders(id))",
+                "app.orders(integer)",
+            ),
+            (
+                "SELECT count(*) OVER (orders ORDER BY orders(id)) FROM source WINDOW orders AS ()",
+                "app.orders(integer)",
+            ),
+            (
+                "SELECT count(*) OVER orders FROM source WINDOW orders AS (ORDER BY (SELECT id FROM orders))",
+                "app.orders",
+            ),
+            (
+                "SELECT count(*) OVER (PARTITION BY (SELECT id FROM orders)) FROM source",
+                "app.orders",
+            ),
+            (
+                "SELECT orders(id), count(*) OVER orders FROM source WINDOW orders AS ()",
+                "app.orders(integer)",
+            ),
+            (
+                "SELECT count(*) OVER orders FROM orders WINDOW orders AS ()",
+                "app.orders",
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                1,
+                "{body}"
             );
         }
     }

@@ -12150,6 +12150,29 @@ SPEC is in sync with all of these.
      and cursor queries stay code. Live cases cover argument-free, quoted,
      scroll and nested cursors with unmanaged dependents and no false rebuild.
 
+     Parenthesized PL/pgSQL control and expression statements retain only their
+     operands in the call scan. IF/ELSIF, WHILE, ASSERT, PERFORM, RETURN and
+     EXECUTE keywords are excluded at statement boundaries. RETURN NEXT/QUERY
+     and dynamic-query EXECUTE operands in RETURN, FOR and OPEN statements use
+     their complete keyword context. Calls nested in
+     conditions and operands remain visible. Labels require complete <<name>>
+     syntax at a statement boundary; shift operators do not start statements.
+     Live routines with unmanaged
+     dependents need only the arriving keywords' routines, while real condition
+     calls still rebuild and change their result after the arrival.
+
+     ON CONFLICT arbiter lists are clauses rather than calls to conflict. The
+     following DO action distinguishes them from a JOIN's ON conflict(...)
+     expression. Mask only the keyword: index expressions, inference predicates
+     and update expressions retain real calls. Live parsed routines with
+     unmanaged dependents need only the routine arrival; a real predicate/update
+     call keeps its old result until the typed plan rebuilds the routine.
+     Named OVER operands, WINDOW declarations and copied window names bind
+     window specifications, not relations. Exclude those names without masking
+     partition/order/frame expressions. Live views with unmanaged dependents
+     need only the arriving view; a relation subquery inside a named window
+     still rebuilds and changes its row ordering when that view arrives.
+
      ANALYZE/ANALYSE and COPY utility targets also accept column lists. Their
      target column groups are blanked, keeping the names as relation mentions
      rather than calls. ANALYZE options and multiple targets, its VERBOSE form,
