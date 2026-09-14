@@ -943,10 +943,11 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
 }
 
 /// A name scan restricted to the module's lexical reference form: a routine
-/// mention is followed by `(` after trivia, and a named relation is not.
-/// Triggers have no reference form. This does not resolve SQL positions or
-/// overloads; callers opt into the refinement instead of changing every name
-/// report and creation-order edge (DECISIONS 473).
+/// mention is followed by `(` after trivia, except an `INTO` target whose
+/// parentheses introduce a column list. Named relations match the remaining
+/// mentions; triggers have no reference form. This does not resolve aliases
+/// or overloads. Callers opt into the refinement instead of changing every
+/// name report and creation-order edge (DECISIONS 473).
 pub fn references_module_with(definition: &str, module: &ModuleId, lexis: &Lexis<'_>) -> bool {
     let Some(name) = module.referenced_name() else {
         return false;
@@ -1369,7 +1370,14 @@ fn contains_word(
             && !is_ident_char(haystack[end..].chars().next(), continues)
             && call.is_none_or(|wanted| {
                 let next = haystack[end..].chars().find(|c| !is_a_gap(*c, continues));
-                (next == Some('(')) == wanted
+                // INSERT INTO orders (id) names a relation, even with a
+                // column list. Treating that parenthesis as a call skipped
+                // the rebuild that moves a parsed writer to an arriving view.
+                let before = haystack[..start].trim_end_matches(|c| is_a_gap(c, continues));
+                let into_target = before
+                    .strip_suffix("into")
+                    .is_some_and(|prefix| !is_ident_char(prefix.chars().next_back(), continues));
+                (next == Some('(') && !into_target) == wanted
             })
         {
             return true;

@@ -8960,6 +8960,104 @@ async fn a_routine_arrival_cannot_capture_a_relation_and_a_view_cannot_capture_a
     );
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_target_column_list_rebinds_for_a_view_arrival_but_not_a_routine() {
+    let mut db = TestDb::create("insert_target230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+             CREATE TABLE shared.orders (id integer);
+             CREATE TABLE app.storage (id integer);",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let writer: pbps_model::ModuleId = "app.store(integer)".parse().unwrap();
+    let mut a = Schema::default();
+    a.modules.insert(
+        writer.clone(),
+        module(
+            pbps_model::ModuleKind::Procedure,
+            "(n integer) LANGUAGE sql BEGIN ATOMIC \
+             INSERT INTO orders /* columns */ (id) VALUES (n); END",
+        ),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders()".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql AS $$ SELECT 42 $$",
+        ),
+    );
+    let routine_plan = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = routine_plan.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    db.conn.execute("CALL app.store(1)").await.unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT sum(id)::int FROM shared.orders").await,
+        1
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM app.storage").await,
+        0
+    );
+
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT id FROM app.storage"),
+    );
+    let view_plan = plan(&b, &ids, &c, &ids);
+    let mut arrival_only = view_plan.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    db.conn.execute("CALL app.store(2)").await.unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT sum(id)::int FROM shared.orders").await,
+        3
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM app.storage").await,
+        0
+    );
+
+    // The first two writes measure the old binding. Only the typed plan's
+    // rebuild may move the third write onto the newly arrived view.
+    let mut rebuild = view_plan.clone();
+    rebuild
+        .changes
+        .retain(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &rebuild).await;
+    db.conn.execute("CALL app.store(3)").await.unwrap();
+    let shared_sum = number(&mut db.conn, "SELECT sum(id)::int FROM shared.orders").await;
+    let arrived_sum = number(
+        &mut db.conn,
+        "SELECT coalesce(sum(id), 0)::int FROM app.storage",
+    )
+    .await;
+    db.drop().await;
+    assert_eq!((shared_sum, arrived_sum), (3, 3));
+    assert_eq!(routine_plan.changes.len(), 1, "{routine_plan:#?}");
+    assert_eq!(view_plan.changes.len(), 2, "{view_plan:#?}");
+    assert!(matches!(&view_plan.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &writer));
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

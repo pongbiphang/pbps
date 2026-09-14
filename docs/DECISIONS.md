@@ -12032,6 +12032,15 @@ SPEC is in sync with all of these.
      not hide a later call of the same name. Triggers still have no referenced
      name and cannot capture anything.
 
+     A name immediately after the `INTO` token remains a relation mention
+     even when followed by `(`: `INSERT INTO orders (id)` introduces a target
+     column list, not a call. Ignoring that lexical context skipped a required
+     writer rebuild. Measured with a parsed SQL procedure: after an updatable
+     view arrives earlier on the path, an insert still reaches the shared
+     table until the typed plan rebuilds the procedure; subsequent writes
+     then reach the arrived view's table. Qualified and quoted targets keep
+     the same rule, and a target occurrence does not hide a later routine call.
+
      Measured on PostgreSQL: a view reading the shared `orders` relation keeps
      that binding when `app.orders()` arrives. A parsed routine calling the
      shared `orders()` keeps its old binding until recreated, then calls the

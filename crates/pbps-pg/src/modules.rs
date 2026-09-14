@@ -1906,7 +1906,8 @@ pub struct Rebound {
 /// So the test is: this plan brings an object into a schema on that module's
 /// effective write path, and the module's text mentions that object's bare
 /// name in the arrival's lexical reference form: followed by `(` for a
-/// routine, and not followed by `(` for a view. A pg_proc arrival cannot
+/// routine, and not followed by `(` for a view, except an `INTO` target's
+/// column list remains a relation mention. A pg_proc arrival cannot
 /// capture a pg_class reference; this refinement still does not parse SQL
 /// positions or resolve overloads (DECISIONS 307, 473).
 ///
@@ -2518,6 +2519,54 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 expected.into_iter().map(id).collect::<BTreeSet<_>>(),
                 "{arriving}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_column_lists_remain_relation_mentions() {
+        for (target, name) in [
+            ("orders", "orders"),
+            ("app . \"orders\"", "orders"),
+            ("\"select\"", "select"),
+            ("app . \"select\"", "select"),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.writer(integer)"),
+                module(&format!(
+                    "(n integer) LANGUAGE sql BEGIN ATOMIC \
+                     INSERT /* target */ INTO -- name\r {target} /* columns */ (id) \
+                     VALUES (n); END"
+                )),
+            );
+            for (arrival, count) in [
+                (format!("app.{name}"), 1),
+                (format!("app.{name}(integer)"), 0),
+            ] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(&arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{target}: {arrival}"
+                );
+            }
+            let writer = declared
+                .modules
+                .get_mut(&id("app.writer(integer)"))
+                .unwrap();
+            writer.definition = writer
+                .definition
+                .replace("VALUES (n)", &format!("VALUES ({target}(n))"));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id(&format!("app.{name}(integer)"))],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "a target must not hide a later call: {target}"
             );
         }
     }
