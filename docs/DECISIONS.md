@@ -12087,6 +12087,13 @@ SPEC is in sync with all of these.
      routine arrival and need no rebuild. Companion live cases put a real
      same-named call inside the CTE, derived relation, function argument or
      aliased query: each still rebuilds and binds the arriving routine.
+     Postfix aggregate FILTER (WHERE ...) and window OVER (...) clauses are
+     also syntax, not calls to those unreserved words. Mask only the clause
+     keyword after the preceding expression group; retain its predicate, window
+     partition/order expressions and frame bounds. Live unchanged views with
+     unmanaged dependents need only the arriving routines. Companion FILTER
+     predicates and OVER partitions keep genuine same-named calls: their views
+     retain old results after arrival and switch only after the typed rebuild.
 
      A record-returning table function can also spell `name(args) AS (columns)`.
      CTE candidates must therefore follow WITH, its RECURSIVE modifier, or a

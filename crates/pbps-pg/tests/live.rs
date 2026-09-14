@@ -10940,6 +10940,162 @@ async fn record_column_names_cannot_capture_an_arriving_view() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn aggregate_filter_and_window_clauses_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("aggregate_names230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.events(active boolean); INSERT INTO shared.events VALUES (true),(false)")
+        .await
+        .unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        "SELECT (count(*) FILTER (WHERE active))::int AS value FROM shared.events",
+        "SELECT (count(*) FILTER (WHERE active AND NOT false))::int AS value FROM shared.events",
+        "SELECT (count(*) FILTER (WHERE active) OVER ())::int AS value FROM shared.events",
+        "SELECT (count(*) OVER ())::int AS value FROM shared.events",
+        "SELECT (count(*) OVER (PARTITION BY active))::int AS value FROM shared.events",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT value FROM app.v{i}"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    for name in ["filter", "over"] {
+        b.modules.insert(
+            format!("app.{name}(integer)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            if i == 3 { 2 } else { 1 }
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 2, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn aggregate_predicates_and_windows_keep_real_routine_calls() {
+    let mut db = TestDb::create("aggregate_calls230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.events(id int); INSERT INTO shared.events VALUES (1),(2); CREATE FUNCTION shared.filter(integer) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 0'; CREATE FUNCTION shared.over(integer) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 0'").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let mut a = Schema::default();
+    for (name, definition) in [
+        (
+            "app.v_filter",
+            "SELECT (count(*) FILTER (WHERE filter(id) > 0))::int AS value FROM shared.events",
+        ),
+        (
+            "app.v_over",
+            "SELECT (count(*) OVER (PARTITION BY over(id)))::int AS value FROM shared.events",
+        ),
+    ] {
+        a.modules.insert(
+            name.parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.v_filter").await,
+        0
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.v_over").await,
+        2
+    );
+    let mut b = a.clone();
+    for (name, definition) in [
+        (
+            "app.filter(integer)",
+            "(integer) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1'",
+        ),
+        (
+            "app.over(integer)",
+            "(integer) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1'",
+        ),
+    ] {
+        b.modules.insert(
+            name.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), 4, "{arrival:#?}");
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.v_filter").await,
+        0
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.v_over").await,
+        2
+    );
+    let mut rebuilds = arrival;
+    rebuilds
+        .changes
+        .retain(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &rebuilds).await;
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.v_filter").await,
+        2
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.v_over").await,
+        1
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_arrival_must_recheck_a_modified_type_binding() {
     let mut db = TestDb::create("type_view230").await;
     db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; \

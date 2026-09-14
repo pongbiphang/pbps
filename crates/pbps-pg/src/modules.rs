@@ -2499,6 +2499,15 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     let mut from = vec![false];
     let mut open_groups: Vec<usize> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
+        if i > 0
+            && tokens[i - 1].text == ")"
+            && after_group(&tokens, i + 1).is_some()
+            && (token.word("over") || (token.word("filter") && token_is(&tokens, i + 2, "where")))
+        {
+            // These postfix aggregate/window clauses introduce expressions,
+            // not calls to their keyword. Keep their predicates and frames.
+            declarations.push(i);
+        }
         // PostgreSQL brackets delimit arrays, never identifiers. The shared
         // name scanner also supports bracket quoting, so retain the group for
         // this pass and blank its punctuation before handing names to it.
@@ -3843,6 +3852,57 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_clauses_do_not_hide_real_predicate_or_window_calls() {
+        for body in [
+            "SELECT count(*) FILTER (WHERE active) FROM source",
+            "SELECT count(*) FILTER /* predicate */ (WHERE active) OVER () FROM source",
+            "SELECT count(*) OVER (PARTITION BY active ORDER BY id) FROM source",
+            "SELECT count(*) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM source",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(body));
+            for arrival in [
+                "app.filter(integer)",
+                "app.over(integer)",
+                "app.filter",
+                "app.over",
+            ] {
+                assert!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new())
+                        .is_empty(),
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for (body, arrival) in [
+            (
+                "SELECT count(*) FILTER (WHERE filter(id)) FROM source",
+                "app.filter(integer)",
+            ),
+            (
+                "SELECT count(*) OVER (PARTITION BY over(id)) FROM source",
+                "app.over(integer)",
+            ),
+            (
+                "SELECT count(*) OVER (ROWS over(1) PRECEDING) FROM source",
+                "app.over(integer)",
+            ),
+            ("SELECT filter(1), over(1)", "app.filter(integer)"),
+            ("SELECT filter(1), over(1)", "app.over(integer)"),
+            ("SELECT app.filter(1), app.over(1)", "app.filter(integer)"),
+            ("SELECT \"filter\"(1), \"over\"(1)", "app.over(integer)"),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                1,
+                "{body}"
             );
         }
     }
