@@ -7740,6 +7740,247 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
     drop_schema(&mut conn, &s).await;
 }
 
+/// The oid of one catalog row, for the tests that have to talk about two
+/// objects which by then share a name.
+async fn oid(conn: &mut Conn, sql: &str) -> i64 {
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    rows.first()
+        .expect("one row")
+        .try_get_at::<i64>(0)
+        .expect("an int8 column")
+        .expect("not null")
+}
+
+/// Waits until some session is queued for a lock on `relation`, so the race
+/// below is **made rather than hoped for**: the other side commits only once
+/// the rebuild is already blocked, which is the one interleaving that puts the
+/// replacement under the name between the resolve and the lock.
+///
+/// Polled rather than slept: a fixed sleep would be a race on a loaded machine,
+/// and this suite runs against two servers at once.
+async fn wait_until_queued_for(conn: &mut Conn, relation: i64) {
+    for _ in 0..400 {
+        let waiting = number(
+            conn,
+            &format!(
+                "SELECT count(*)::int FROM pg_catalog.pg_locks \
+                 WHERE NOT granted AND relation = ({relation}::int8)::oid"
+            ),
+        )
+        .await;
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("nothing ever queued for a lock on oid {relation}");
+}
+
+/// A lock taken by **name** does not pin the object an **oid** read describes.
+///
+/// `before_a_rebuild` resolves the module's oid once and keys every
+/// carried-state read by it, but the lock that serializes the read is
+/// `LOCK TABLE <schema>.<view> IN ACCESS EXCLUSIVE MODE` — and PostgreSQL
+/// resolves that name when it runs the statement. A session that renames the
+/// view away and creates a replacement under its name in between leaves the
+/// lock on the replacement while the reads describe the original, and the
+/// `DROP VIEW <name>` that follows destroys the replacement.
+///
+/// The interleaving is built from the other side's transaction: B renames and
+/// replaces without committing, so A still resolves the original; A's lock then
+/// queues behind B's; B commits, and A's lock lands on the replacement. That is
+/// the window, held open on purpose.
+///
+/// Beside it, the negative case: with nothing concurrent the answer is
+/// `Serialized::By` exactly as before.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized() {
+    let s = emit_schema("relock_view");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+    ] {
+        a.execute(&sql).await.expect("build");
+    }
+    let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+
+    // Nothing concurrent: the lock is the view's own and the answer says so.
+    let quiet = read_a_rebuild(
+        &mut a,
+        &id,
+        pbps_model::ModuleKind::View,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await;
+    match &quiet.serialized {
+        pbps_pg::modules::Serialized::By(what) => {
+            assert!(what.contains("the view's own"), "{what}");
+        }
+        pbps_pg::modules::Serialized::Not(why) => panic!("the view's own lock is reachable: {why}"),
+    }
+
+    let original = oid(
+        &mut a,
+        &format!(
+            "SELECT c.oid::int8 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 'v'"
+        ),
+    )
+    .await;
+
+    let mut b = connect().await;
+    b.execute("BEGIN").await.expect("the other session's own");
+    for sql in [
+        format!("ALTER VIEW {s}.v RENAME TO v_old"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+    ] {
+        b.execute(&sql).await.expect("rename and replace");
+    }
+
+    let no_changes = pbps_model::ChangeSet::default();
+    in_a_transaction(&mut a).await;
+    let (answered, committed) = tokio::join!(
+        pbps_pg::modules::before_a_rebuild(&mut a, &id, pbps_model::ModuleKind::View, &no_changes),
+        async {
+            wait_until_queued_for(&mut b, original).await;
+            b.execute("COMMIT").await
+        }
+    );
+    committed.expect("the other session commits");
+    rollback(&mut a).await;
+
+    let refused = answered.expect_err("the lock landed on the replacement");
+    let said = format!("{refused}");
+    assert!(
+        said.contains("was replaced between this rebuild's read and its lock"),
+        "{said}"
+    );
+    // Both objects, and by more than a name they now share.
+    assert!(said.contains(&format!("oid {original}")), "{said}");
+    let replacement = oid(
+        &mut a,
+        &format!(
+            "SELECT c.oid::int8 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 'v'"
+        ),
+    )
+    .await;
+    assert_ne!(original, replacement, "the race never happened");
+    assert!(said.contains(&format!("oid {replacement}")), "{said}");
+
+    drop_schema(&mut a, &s).await;
+}
+
+/// The same window, one relation over: a trigger's lock is its **parent
+/// table's**, taken by name, so a renamed-and-replaced parent leaves the lock
+/// on a table whose trigger is not the one the reads describe.
+///
+/// Here the mismatch is the trigger's own oid rather than the locked relation's
+/// — the reads are keyed by `pg_trigger.oid` — which is why the check asks the
+/// same question the resolve asked instead of comparing the relation it locked.
+///
+/// Beside it, the negative case: with nothing concurrent the answer is
+/// `Serialized::By` exactly as before.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than_serialized() {
+    let s = emit_schema("relock_trigger");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!(
+            "CREATE FUNCTION {s}.trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+        format!("CREATE TRIGGER a AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+    ] {
+        a.execute(&sql).await.expect("build");
+    }
+    let id: pbps_model::ModuleId = format!("{s}.t.a").parse().expect("a module id");
+
+    let quiet = read_a_rebuild(
+        &mut a,
+        &id,
+        pbps_model::ModuleKind::Trigger,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await;
+    match &quiet.serialized {
+        pbps_pg::modules::Serialized::By(what) => {
+            assert!(what.contains("parent table"), "{what}");
+        }
+        pbps_pg::modules::Serialized::Not(why) => panic!("the parent's lock is reachable: {why}"),
+    }
+
+    let parent = oid(
+        &mut a,
+        &format!(
+            "SELECT c.oid::int8 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 't'"
+        ),
+    )
+    .await;
+    let trigger = format!(
+        "SELECT tg.oid::int8 FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = '{s}' AND c.relname = 't' AND tg.tgname = 'a'"
+    );
+    let original = oid(&mut a, &trigger).await;
+
+    let mut b = connect().await;
+    b.execute("BEGIN").await.expect("the other session's own");
+    for sql in [
+        format!("ALTER TABLE {s}.t RENAME TO t_old"),
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE TRIGGER a AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+    ] {
+        b.execute(&sql)
+            .await
+            .expect("rename and replace the parent");
+    }
+
+    let no_changes = pbps_model::ChangeSet::default();
+    in_a_transaction(&mut a).await;
+    let (answered, committed) = tokio::join!(
+        pbps_pg::modules::before_a_rebuild(
+            &mut a,
+            &id,
+            pbps_model::ModuleKind::Trigger,
+            &no_changes
+        ),
+        async {
+            wait_until_queued_for(&mut b, parent).await;
+            b.execute("COMMIT").await
+        }
+    );
+    committed.expect("the other session commits");
+    rollback(&mut a).await;
+
+    let refused = answered.expect_err("the lock landed on the replacement's parent");
+    let said = format!("{refused}");
+    assert!(
+        said.contains("was replaced between this rebuild's read and its lock"),
+        "{said}"
+    );
+    assert!(said.contains(&format!("oid {original}")), "{said}");
+    let replacement = oid(&mut a, &trigger).await;
+    assert_ne!(original, replacement, "the race never happened");
+    assert!(said.contains(&format!("oid {replacement}")), "{said}");
+
+    drop_schema(&mut a, &s).await;
+}
+
 /// The account this tool is actually built for cannot take a routine's lock,
 /// and the attempt must not destroy the transaction it was protecting.
 ///

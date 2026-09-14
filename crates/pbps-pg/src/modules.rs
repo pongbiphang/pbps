@@ -266,6 +266,7 @@ async fn serialize(
                 quoted(&id.object_name())
             ))
             .await?;
+            locked_what_the_reads_describe(conn, id, kind, oid).await?;
             Ok(Serialized::By("the view's own ACCESS EXCLUSIVE lock"))
         }
         // A trigger is neither a relation nor a routine, and the lock that
@@ -283,6 +284,7 @@ async fn serialize(
                 quoted(on)
             ))
             .await?;
+            locked_what_the_reads_describe(conn, id, kind, oid).await?;
             Ok(Serialized::By(
                 "the trigger's parent table's ACCESS EXCLUSIVE lock",
             ))
@@ -344,6 +346,103 @@ async fn serialize(
             }
         }
     }
+}
+
+/// Checks that the lock just taken is held on the object the reads are keyed
+/// to, and refuses when it is not.
+///
+/// The lock is taken **by name** while every carried-state read is keyed by an
+/// **oid** resolved before it, and PostgreSQL resolves a `LOCK TABLE`'s name
+/// when it runs the statement. Between the two, another session can rename the
+/// object away and create a replacement under its name; the lock then lands on
+/// the replacement while the reads describe the original. **Measured** on 18.6,
+/// A being the rebuild and B the other session:
+///
+/// ```text
+/// A: BEGIN;   -- module_oid resolves m.v to 16389
+/// B: ALTER VIEW m.v RENAME TO v_old;  CREATE VIEW m.v AS …   -- the new one is 16393
+/// A: LOCK TABLE m.v IN ACCESS EXCLUSIVE MODE;   -- succeeds
+///    pg_locks: A holds ACCESS EXCLUSIVE on 16393
+/// ```
+///
+/// The trigger arm has the same window one relation over — its lock is its
+/// parent table's, also taken by name — and it was measured the same way: a
+/// renamed-and-replaced parent leaves the lock on a table whose trigger is not
+/// the one the reads describe.
+///
+/// So the name is resolved once more with the lock held. Nothing can move it
+/// out from under this second read: a rename needs the lock this transaction
+/// now has. A mismatch is refused rather than retried, because the caller is
+/// inside the apply's transaction (ADR-0009 §3) and the `DROP` it would go on
+/// to run goes by *name* — it would destroy the replacement, an object no plan
+/// approved over. SPEC §7.6's read-back catches that too, but at the end of the
+/// apply and as two unrelated-looking surprises; this is the same refusal one
+/// statement after the cause, with the two objects named. DECISIONS 475
+/// records the choice; `data_triggers::lock_by_oid` is the same device applied
+/// to the mirror image, where the oid is known and the name is read for the
+/// lock (DECISIONS 445).
+async fn locked_what_the_reads_describe(
+    conn: &mut Conn,
+    id: &ModuleId,
+    kind: ModuleKind,
+    oid: i64,
+) -> Result<(), DbError> {
+    let now = module_oid(conn, id, kind).await?;
+    if now == Some(oid) {
+        return Ok(());
+    }
+    let catalog = catalog_of(kind);
+    let reads_describe = described(conn, catalog, oid).await?;
+    let lock_holds = match now {
+        Some(now) => described(conn, catalog, now).await?,
+        None => format!("nothing this read can name — `{id}` matches no catalog entry now"),
+    };
+    Err(DbError::Refused(format!(
+        "`{id}` was replaced between this rebuild's read and its lock: the reads that say what \
+         a rebuild would destroy are keyed to {reads_describe}, and the `ACCESS EXCLUSIVE` lock \
+         this transaction now holds is on {lock_holds}. Another session renamed the object away \
+         and created a replacement under its name in between, and a `LOCK TABLE` resolves its \
+         name when it runs.\nNothing is reported rather than an answer about one object beside \
+         a lock on another: the `DROP` that follows goes by name, so it would destroy the \
+         replacement — an object no plan approved over. Run the deploy again once the other \
+         session has finished."
+    )))
+}
+
+/// The catalog a kind's oid belongs to, which is what `pg_describe_object`
+/// needs to turn one back into a name.
+const fn catalog_of(kind: ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::View => "pg_class",
+        ModuleKind::Function | ModuleKind::Procedure => "pg_proc",
+        ModuleKind::Trigger => "pg_trigger",
+    }
+}
+
+/// The engine's own words for an oid, for a message a reader can act on.
+///
+/// The oid is carried beside the words rather than replaced by them, because
+/// this is called about two objects that by now share a name: "view m.v" twice
+/// would say nothing. And `pg_describe_object` answers `NULL` for an oid that
+/// is no longer there (**measured**, 16.15 and 18.6), which is a case this
+/// message must be able to say — an object that has been dropped rather than
+/// renamed aside is exactly as much of a mismatch.
+async fn described(conn: &mut Conn, catalog: &str, oid: i64) -> Result<String, DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT pg_catalog.pg_describe_object(
+                        ($1::text)::regclass::oid, ($2::int8)::oid, 0) AS described",
+            &[Param::Str(catalog), Param::I64(oid)],
+        )
+        .await?;
+    let named = match rows.first() {
+        Some(row) => row.try_get::<&str>("described")?.map(ToOwned::to_owned),
+        None => None,
+    };
+    Ok(match named {
+        Some(named) => format!("{named} (oid {oid})"),
+        None => format!("oid {oid}, which is no longer in the catalog"),
+    })
 }
 
 /// A view's owner, ACL and `reloptions`.
