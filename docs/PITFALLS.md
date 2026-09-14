@@ -2252,3 +2252,38 @@ pull would rebuild different behavior. Hold ordinary mode only and name the
 other modes as module limitations, for both ordinary and constraint triggers;
 keep the parent table manageable and exclude internal FK triggers (DECISIONS
 473).
+
+
+## A lock taken by name does not pin the object an oid read describes
+
+`before_a_rebuild` resolves a module's oid once and keys every carried-state
+read by it — the right call, and its own comment says why two name matches
+would be two chances to disagree. Then it took the lock that serializes those
+reads **by name**, and a name is not an object: PostgreSQL resolves a
+`LOCK TABLE`'s name when it runs the statement, so a session that renames the
+view away and creates a replacement under the name in between leaves the lock
+on the replacement while every read describes the original. The answer said
+`Serialized::By(...)`, which is a claim, and the `DROP VIEW` that follows goes
+by name (DECISIONS 499).
+
+The two halves were each written carefully and the seam between them is where
+the window is. That is the shape: **a resolve and the action it authorizes are
+two statements, and anything that identifies the object differently in each is
+a window**. The fix is not a second lock but a second resolve — with the lock
+held nothing can move the name, because a rename needs that lock — and it is
+the same device `data_triggers::lock_by_oid` already applied to the mirror
+image, where the oid is known and the *name* is read for the lock.
+
+Two things it is easy to get wrong on the way out:
+
+- **The sweep is per lock, not per kind.** The view's lock and the trigger's
+  parent-table lock are two arms of one `match` and both take a name; the
+  routine's is `FOR UPDATE` on a `pg_proc` row found by oid and has no window
+  at all. Fixing the arm the issue names and leaving the one beside it is how
+  a shape gets found a second time in review.
+- **Refusing is not the same as being safe.** SPEC §7.6's read-back already
+  rolled this apply back; what the refusal adds is a message one statement
+  after the cause, naming both objects. When two objects share a name, name
+  them by oid as well — `pg_describe_object` alone prints the same words
+  twice, and it answers `NULL` for an oid that is gone, which is a case the
+  message has to be able to say out loud.
