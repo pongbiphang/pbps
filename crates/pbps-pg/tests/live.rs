@@ -2616,6 +2616,22 @@ fn plan(
     declared: &Schema,
     declared_ids: &IdsFile,
 ) -> pbps_model::ChangeSet {
+    plan_with_dialect(
+        base_schema,
+        base_ids,
+        declared,
+        declared_ids,
+        &Postgres::new(),
+    )
+}
+
+fn plan_with_dialect(
+    base_schema: &Schema,
+    base_ids: &IdsFile,
+    declared: &Schema,
+    declared_ids: &IdsFile,
+    dialect: &Postgres,
+) -> pbps_model::ChangeSet {
     pbps_diff::diff(
         pbps_diff::Side {
             schema: base_schema,
@@ -2625,7 +2641,7 @@ fn plan(
             schema: declared,
             ids: declared_ids,
         },
-        &Postgres::new(),
+        dialect,
         &pbps_model::Hints::default(),
     )
     .expect("diff")
@@ -9293,6 +9309,10 @@ async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
             ("json_table", "SELECT value::text FROM json_table('{\"r\":7}', '$' COLUMNS(value int PATH '$.r')) source"),
         ]);
     }
+    let pg = pg.with_server_version_num(i64::from(server));
+    let plan = |base: &Schema, base_ids: &IdsFile, declared: &Schema, declared_ids: &IdsFile| {
+        plan_with_dialect(base, base_ids, declared, declared_ids, &pg)
+    };
     let mut a = Schema::default();
     for (i, (_, definition)) in definitions.iter().enumerate() {
         a.modules.insert(

@@ -12258,6 +12258,19 @@ SPEC is in sync with all of these.
      routines arrive; explicit calls and ordinary substring/overlay calls keep
      the old binding until rebuilt, then change from 7 to 42.
 
+     SQL/JSON names introduced as grammar in PostgreSQL 17, and MERGE_ACTION,
+     remain ordinary calls on PostgreSQL 16. Connected planning reads the
+     target version and configures the pure dialect's optional grammar context.
+     Offline previews have no target and conservatively retain those possible
+     calls. The database version is not serialized into the plan: applying a
+     saved plan rechecks these version-dependent arrivals against unchanged
+     declarations from the locked ledger on the actual target. If a required
+     alteration is absent, both transactional and staged apply refuse before
+     writing and require a newly approved connected plan. Apply never inserts
+     additional writes into the approved artifact. Live CLI regressions cover
+     seven old-server routine names, current-server expression constructs with
+     unmanaged dependents, and missing-rebuild refusal in both apply modes.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

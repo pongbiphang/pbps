@@ -38,6 +38,44 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+/// Configure pure planning rules from the connected target's capabilities.
+/// Offline previews keep the unconfigured dialect and its conservative rules.
+pub async fn connected_dialect(conn: &mut Conn) -> anyhow::Result<Box<dyn pbps_dialect::Dialect>> {
+    match conn.driver() {
+        Driver::Mssql => Ok(Box::new(pbps_mssql::Mssql)),
+        Driver::Postgres => Ok(Box::new(
+            pbps_pg::modules::dialect_for_connection(conn).await?,
+        )),
+    }
+}
+
+/// Refuse an artifact missing alterations required by this server's grammar;
+/// never add unapproved writes while applying it.
+pub async fn require_version_rebinds(
+    conn: &mut Conn,
+    recorded: &StateSnapshot,
+    changes: &ChangeSet,
+) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Mssql => Ok(()),
+        Driver::Postgres => {
+            let missing =
+                pbps_pg::modules::missing_version_rebinds(conn, recorded, changes).await?;
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "module_rebinds (PostgreSQL): this server requires rebuilds missing from the saved plan: {}. Recompute with `pbps plan --db` and approve the new plan.",
+                    missing
+                        .iter()
+                        .map(|r| format!("{} for arriving {}", r.module, r.arriving))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Execute one staged DDL statement, including recovery owned by its engine.
 pub async fn execute_staged_statement(
     conn: &mut Conn,

@@ -232,6 +232,7 @@ fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<Dialect
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Postgres {
     write_path_extras: Vec<String>,
+    server_version_num: Option<i64>,
 }
 
 impl Postgres {
@@ -253,7 +254,17 @@ impl Postgres {
     pub fn with_write_path_extras(extras: Vec<String>) -> Self {
         Self {
             write_path_extras: extras,
+            server_version_num: None,
         }
+    }
+
+    /// Select the grammar measured on a connected target. Without a version,
+    /// offline previews retain names that are ordinary calls on supported older
+    /// servers; assuming the newest grammar could omit a required rebuild (477).
+    #[must_use]
+    pub fn with_server_version_num(mut self, version: i64) -> Self {
+        self.server_version_num = Some(version);
+        self
     }
 
     /// The configured extras, before the emitter moves `pg_temp` to the end.
@@ -816,11 +827,12 @@ impl Dialect for Postgres {
         arriving: &[ModuleId],
         already_changed: &std::collections::BTreeSet<ModuleId>,
     ) -> std::collections::BTreeSet<ModuleId> {
-        modules::rebound_by_this_plan(
+        modules::rebound_by_this_plan_at_version(
             declared,
             self.write_path_extras(),
             arriving,
             already_changed,
+            self.server_version_num,
         )
         .into_iter()
         .map(|rebound| rebound.module)

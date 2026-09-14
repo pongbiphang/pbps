@@ -2054,6 +2054,208 @@ fn doctor_reports_data_and_role_grant_gaps_from_the_declarations() {
 }
 
 #[test]
+#[ignore = "needs PostgreSQL below 17; set PBPS_TEST_PG_OLD_DB"]
+fn later_json_names_rebind_as_ordinary_calls_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("set PBPS_TEST_PG_OLD_DB");
+    let own = OwnDatabase::new(&server, "old-json-rebind230");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "DO $$ BEGIN IF current_setting('server_version_num')::int >= 170000 THEN RAISE EXCEPTION 'this regression needs PostgreSQL below 17'; END IF; END $$; CREATE SCHEMA app",
+    );
+    let d = Demo::new("old-json-rebind230");
+    let names = [
+        "json_query",
+        "json_exists",
+        "json_value",
+        "json_table",
+        "json_scalar",
+        "json_serialize",
+        "merge_action",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        std::fs::write(d.dir.join(format!("schema/old{i}.yml")), format!("function: app.{name}(bigint)\ndefinition: (n bigint) RETURNS int LANGUAGE sql AS $$ SELECT 7 $$\n")).unwrap();
+        std::fs::write(
+            d.dir.join(format!("schema/caller{i}.yml")),
+            format!("view: app.v{i}\ndefinition: SELECT {name}(1) AS value\n"),
+        )
+        .unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    for i in 0..names.len() {
+        on_server(
+            connection,
+            &format!(
+                "DO $$ BEGIN IF (SELECT value FROM app.v{i}) <> 7 THEN RAISE EXCEPTION 'wrong initial binding'; END IF; END $$"
+            ),
+        );
+    }
+    for (i, name) in names.iter().enumerate() {
+        std::fs::write(d.dir.join(format!("schema/new{i}.yml")), format!("function: app.{name}(integer)\ndefinition: (n integer) RETURNS int LANGUAGE sql AS $$ SELECT 42 $$\n")).unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let mut omitted = saved.clone();
+    omitted
+        .changes
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    let incomplete = d.dir.join("incomplete-plan.json");
+    std::fs::write(&incomplete, serde_json::to_string_pretty(&omitted).unwrap()).unwrap();
+    let refused = apply_plan(&d, connection, &incomplete, false);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("module_rebinds"),
+        "{}",
+        stderr(&refused)
+    );
+    let mut staged_omission = omitted.clone().staged();
+    staged_omission.changes.changes.truncate(1);
+    let incomplete_staged = d.dir.join("incomplete-staged.json");
+    std::fs::write(
+        &incomplete_staged,
+        serde_json::to_string_pretty(&staged_omission).unwrap(),
+    )
+    .unwrap();
+    let refused = apply_plan(&d, connection, &incomplete_staged, true);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("module_rebinds"),
+        "{}",
+        stderr(&refused)
+    );
+    for name in names {
+        on_server(
+            connection,
+            &format!(
+                "DO $$ BEGIN IF to_regprocedure('app.\"{name}\"(integer)') IS NOT NULL THEN RAISE EXCEPTION 'incomplete plan wrote before refusal'; END IF; END $$"
+            ),
+        );
+    }
+    succeeds(apply_plan(&d, connection, &plan, false));
+    for i in 0..names.len() {
+        on_server(
+            connection,
+            &format!(
+                "DO $$ BEGIN IF (SELECT value FROM app.v{i}) <> 42 THEN RAISE EXCEPTION 'successful apply retained a pre-17 routine binding'; END IF; END $$"
+            ),
+        );
+    }
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
+            .count(),
+        names.len()
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 17 or newer; set PBPS_TEST_PG_DB"]
+fn later_json_names_remain_expressions_on_the_connected_current_server() {
+    let own = OwnDatabase::new(&server(), "current-json-rebind230");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "DO $$ BEGIN IF current_setting('server_version_num')::int < 170000 THEN RAISE EXCEPTION 'this regression needs PostgreSQL 17 or newer'; END IF; END $$; CREATE SCHEMA app",
+    );
+    let d = Demo::new("current-json-rebind230");
+    let definitions = [
+        (
+            "json_query",
+            "SELECT json_query('{\"r\":[7]}', '$.r')::text AS value",
+        ),
+        (
+            "json_exists",
+            "SELECT json_exists('{\"r\":7}', '$.r')::text AS value",
+        ),
+        (
+            "json_value",
+            "SELECT json_value('{\"r\":7}', '$.r')::text AS value",
+        ),
+        (
+            "json_table",
+            "SELECT value::text FROM json_table('{\"r\":7}', '$' COLUMNS(value int PATH '$.r')) source",
+        ),
+        ("json_scalar", "SELECT json_scalar(7)::text AS value"),
+        (
+            "json_serialize",
+            "SELECT json_serialize('{\"r\":7}')::text AS value",
+        ),
+    ];
+    for (i, (_, definition)) in definitions.iter().enumerate() {
+        std::fs::write(
+            d.dir.join(format!("schema/view{i}.yml")),
+            format!("view: app.v{i}\ndefinition: |\n  {definition}\n"),
+        )
+        .unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    for i in 0..definitions.len() {
+        on_server(
+            connection,
+            &format!("CREATE VIEW app.external{i} AS SELECT value FROM app.v{i}"),
+        );
+    }
+    for (i, (name, _)) in definitions.iter().enumerate() {
+        std::fs::write(d.dir.join(format!("schema/function{i}.yml")), format!("function: app.{name}(integer)\ndefinition: (n integer) RETURNS int LANGUAGE sql AS $$ SELECT 42 $$\n")).unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(saved.changes.changes.len(), definitions.len());
+    assert!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .all(|p| matches!(p.change, pbps_model::Change::CreateModule { .. }))
+    );
+    succeeds(apply_plan(&d, connection, &plan, false));
+    for (i, (_, definition)) in definitions.iter().enumerate() {
+        on_server(
+            connection,
+            &format!(
+                "DO $$ BEGIN IF (SELECT value FROM app.external{i}) IS DISTINCT FROM ({definition}) THEN RAISE EXCEPTION 'SQL/JSON grammar binding changed'; END IF; END $$"
+            ),
+        );
+    }
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     let server = server();

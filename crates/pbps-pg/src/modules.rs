@@ -2557,21 +2557,39 @@ fn ddl_reference_spans(
     (spans, separators)
 }
 
+fn later_sql_json_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "json_scalar"
+            | "json_serialize"
+            | "json_query"
+            | "json_exists"
+            | "json_value"
+            | "json_table"
+            | "merge_action"
+    )
+}
+
 /// Bare SQL expression keywords either build dedicated expression nodes or
 /// bind catalog routines directly (477). SUBSTRING/OVERLAY additionally allow
 /// ordinary calls, so only their keyword-argument forms are excluded.
-fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
+fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize, version: Option<i64>) -> bool {
     let Some(after) = after_group(tokens, at + 1) else {
         return false;
     };
-    match tokens[at].text.to_ascii_lowercase().as_str() {
+    let word = tokens[at].text.to_ascii_lowercase();
+    if later_sql_json_keyword(&word) {
+        // These were ordinary routine names on PostgreSQL 16. A preview has
+        // no target version and must retain that possible binding as well.
+        return version.is_some_and(|v| v >= 170000);
+    }
+    match word.as_str() {
         "row" | "exists" | "values" | "current_time" | "current_timestamp" | "localtime"
         | "localtimestamp" | "coalesce" | "nullif" | "greatest" | "least" | "extract"
         | "normalize" | "position" | "trim" | "cast" | "treat" | "grouping" | "xmlconcat"
         | "xmlelement" | "xmlattributes" | "xmlforest" | "xmlparse" | "xmlpi" | "xmlroot"
         | "xmlserialize" | "xmlexists" | "xmltable" | "xmlnamespaces" | "json" | "json_array"
-        | "json_object" | "json_arrayagg" | "json_objectagg" | "json_scalar" | "json_serialize"
-        | "json_query" | "json_exists" | "json_value" | "json_table" | "merge_action" => true,
+        | "json_object" | "json_arrayagg" | "json_objectagg" => true,
         "substring" | "overlay" => {
             let mut i = at + 2;
             while i < after - 1 {
@@ -2593,7 +2611,12 @@ fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
 /// No name is resolved to an alias: later uses remain conservative (477).
-fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> String {
+fn rebind_code(
+    definition: &str,
+    routine: bool,
+    arriving_routine: bool,
+    version: Option<i64>,
+) -> String {
     let mut code = crate::LEXICON.code_only_with_literal_markers(definition);
     let mut type_spans = if routine {
         crate::emit::routine_type_spans(definition)
@@ -2646,7 +2669,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     let mut from = vec![false];
     let mut open_groups: Vec<usize> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
-        if sql_expression_keyword(&tokens, i) {
+        if sql_expression_keyword(&tokens, i, version) {
             declarations.push(i);
         }
         if i > 0 && tokens[i - 1].text == ")" {
@@ -2865,6 +2888,16 @@ pub fn rebound_by_this_plan(
     arriving: &[ModuleId],
     already_changed: &BTreeSet<ModuleId>,
 ) -> Vec<Rebound> {
+    rebound_by_this_plan_at_version(declared, write_path_extras, arriving, already_changed, None)
+}
+
+pub(crate) fn rebound_by_this_plan_at_version(
+    declared: &Schema,
+    write_path_extras: &[String],
+    arriving: &[ModuleId],
+    already_changed: &BTreeSet<ModuleId>,
+    version: Option<i64>,
+) -> Vec<Rebound> {
     let mut out = Vec::new();
     for (module, definition) in &declared.modules {
         if already_changed.contains(module) {
@@ -2910,7 +2943,12 @@ pub fn rebound_by_this_plan(
                         )
                     })
                 });
-            let code = rebind_code(&ordinary, routine, matches!(new, ModuleId::Routine(_)));
+            let code = rebind_code(
+                &ordinary,
+                routine,
+                matches!(new, ModuleId::Routine(_)),
+                version,
+            );
             if support_matches
                 || pbps_model::module::references_module_with(&code, new, &REBIND_LEXIS)
             {
@@ -2922,6 +2960,61 @@ pub fn rebound_by_this_plan(
         }
     }
     out
+}
+
+/// Only this connected helper reads the server; the resulting dialect stays
+/// pure and can be used by the ordinary differ and ordering pass.
+pub async fn dialect_for_connection(conn: &mut Conn) -> Result<crate::Postgres, DbError> {
+    Ok(crate::Postgres::new()
+        .with_server_version_num(crate::roles::server_version_num(conn).await?))
+}
+
+/// A saved plan can move to an older server where a new grammar word was an
+/// ordinary call. Check its unchanged recorded declarations under that grammar
+/// before any write; missing alterations must be approved in a fresh plan.
+pub async fn missing_version_rebinds(
+    conn: &mut Conn,
+    recorded: &pbps_model::StateSnapshot,
+    changes: &ChangeSet,
+) -> Result<Vec<Rebound>, DbError> {
+    let arriving: Vec<_> = changes
+        .changes
+        .iter()
+        .filter_map(|planned| {
+            if let pbps_model::Change::CreateModule {
+                id: id @ ModuleId::Routine(_),
+                ..
+            } = &planned.change
+                && id
+                    .referenced_name()
+                    .is_some_and(|name| later_sql_json_keyword(&name.name))
+            {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if arriving.is_empty() {
+        return Ok(Vec::new());
+    }
+    let version = crate::roles::server_version_num(conn).await?;
+    if version >= 170000 {
+        return Ok(Vec::new());
+    }
+    let changed = changes
+        .changes
+        .iter()
+        .filter_map(|p| p.change.module_id().cloned())
+        .collect();
+    let declared = recorded.declared.overlay(&recorded.schema);
+    Ok(rebound_by_this_plan_at_version(
+        &declared,
+        &[],
+        &arriving,
+        &changed,
+        Some(version),
+    ))
 }
 
 #[cfg(test)]
@@ -4337,7 +4430,7 @@ mod tests {
                 .len(),
                 1,
                 "{body}: {}",
-                rebind_code(body, true, true)
+                rebind_code(body, true, true, None)
             );
         }
         let mut declared = Schema::default();
@@ -4486,7 +4579,12 @@ mod tests {
                 )
                 .is_empty(),
                 "{cursor}: {}",
-                rebind_code(&declared.modules[&id("app.f()")].definition, true, true)
+                rebind_code(
+                    &declared.modules[&id("app.f()")].definition,
+                    true,
+                    true,
+                    None
+                )
             );
         }
         for body in [
@@ -4706,6 +4804,41 @@ mod tests {
     }
 
     #[test]
+    fn later_json_words_follow_the_connected_grammar_or_remain_conservative() {
+        use pbps_dialect::Dialect;
+        for name in [
+            "json_query",
+            "json_exists",
+            "json_value",
+            "json_table",
+            "json_scalar",
+            "json_serialize",
+            "merge_action",
+        ] {
+            for version in [None, Some(160015), Some(170000), Some(180006)] {
+                let pg = version.map_or_else(crate::Postgres::new, |v| {
+                    crate::Postgres::new().with_server_version_num(v)
+                });
+                for (body, quoted) in [
+                    (format!("SELECT {name}(7)"), false),
+                    (format!("SELECT \"{name}\"(7)"), true),
+                    (format!("SELECT app.{name}(7)"), true),
+                ] {
+                    let mut declared = Schema::default();
+                    declared.modules.insert(id("app.v"), module(&body));
+                    let matches = pg.rebound_modules(
+                        &declared,
+                        &[id(&format!("app.{name}(integer)"))],
+                        &BTreeSet::new(),
+                    );
+                    let expected = quoted || version.is_none_or(|v| v < 170000);
+                    assert_eq!(!matches.is_empty(), expected, "{version:?}: {body}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn expression_keywords_keep_explicit_calls_and_expression_operands() {
         for name in [
             "row",
@@ -4773,14 +4906,15 @@ mod tests {
             declared
                 .modules
                 .insert(id("app.v"), module(&format!("SELECT {name}(7)")));
-            assert!(
+            assert_eq!(
                 rebound_by_this_plan(
                     &declared,
                     &[],
                     &[id(&format!("app.{name}(integer)"))],
                     &BTreeSet::new()
                 )
-                .is_empty(),
+                .len(),
+                usize::from(later_sql_json_keyword(name)),
                 "{name}"
             );
         }

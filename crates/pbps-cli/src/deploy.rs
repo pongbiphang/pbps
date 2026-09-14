@@ -3415,6 +3415,7 @@ pub fn cmd_plan_db(
 
     let (cs, baseline_checksum, baseline_description, connected_checks, findings, cost) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        let dialect = crate::engine::connected_dialect(&mut conn).await?;
         let mut findings = Vec::new();
 
         let Some(mut entry) = crate::engine::latest(&mut conn).await? else {
@@ -4299,6 +4300,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         );
     };
     refuse_mid_deployment(&entry, &target.label)?;
+    crate::engine::require_version_rebinds(conn, &entry.snapshot, &plan.changes).await?;
     let original_ids = entry.snapshot.ids.clone();
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
@@ -4536,6 +4538,7 @@ async fn apply_staged_under_lock(
         );
     };
 
+    crate::engine::require_version_rebinds(conn, &entry.snapshot, &plan.changes).await?;
     let original_ids = entry.snapshot.ids.clone();
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
