@@ -2475,6 +2475,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
         at += text.len();
     }
     let mut declarations = Vec::new();
+    let mut referenced_columns = Vec::new();
     if routine {
         let (locals, cursors) = procedural_type_spans(&tokens);
         type_spans.extend(locals);
@@ -2595,6 +2596,16 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
                     }
                 }
             }
+            "references" => {
+                // Foreign-key target parentheses hold referenced column names,
+                // not call arguments. Surrounding constraints remain code.
+                if tokens.get(i + 1).is_some_and(RebindToken::name)
+                    && let Some(after) = after_group(&tokens, i + 2)
+                {
+                    let close = &tokens[after - 1];
+                    referenced_columns.push(tokens[i + 2].offset..close.offset + close.text.len());
+                }
+            }
             "," if *from.last().unwrap() => {
                 relation_column_declarations(&tokens, i + 1, &mut declarations, &mut type_spans);
             }
@@ -2641,6 +2652,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
             t.offset..t.offset + t.text.len()
         })
         .chain(modifier_ranges)
+        .chain(referenced_columns)
         .chain(index_methods)
         .chain(
             routine
@@ -3714,6 +3726,59 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn foreign_key_targets_are_relations_and_constraint_calls_remain_visible() {
+        for statement in [
+            "CREATE TABLE child(id int REFERENCES orders(id))",
+            "CREATE TABLE child(id int, FOREIGN KEY(id) REFERENCES orders(id))",
+            "ALTER TABLE child ADD FOREIGN KEY(id) REFERENCES orders(id)",
+            "CREATE TABLE child(id int REFERENCES app . \"orders\" /* columns */ (id))",
+            "CREATE TABLE child(id int REFERENCES U&\"ord!0065rs\" UESCAPE '!' (id))",
+            "CREATE TABLE child(id int REFERENCES orders)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            for (arrival, count) in [("app.orders(integer)", 0), ("app.orders", 1)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+        for statement in [
+            "CREATE TABLE child(id int DEFAULT orders(7) REFERENCES orders(id))",
+            "CREATE TABLE child(id int REFERENCES orders(id) CHECK (orders(id) > 0))",
+            "ALTER TABLE child ADD FOREIGN KEY(id) REFERENCES orders(id), ADD CHECK (orders(id) > 0)",
+            "CREATE TABLE child(id int REFERENCES orders(id)); PERFORM orders(7)",
+            "SELECT \"references\", orders(7)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{statement}"
+            );
+        }
     }
 
     #[test]

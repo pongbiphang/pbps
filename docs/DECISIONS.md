@@ -12157,6 +12157,12 @@ SPEC is in sync with all of these.
      index expression starts with another parenthesis. Live procedural index
      creation with unmanaged dependents accepts the routine arrival alone;
      expression and predicate controls retain real calls in the rebind scan.
+     Foreign-key REFERENCES targets likewise name relations. Blank only their
+     referenced-column groups, including inside CREATE/ALTER TABLE constraints;
+     defaults, checks and later expressions keep their actual calls. Live child
+     tables with unmanaged routine dependents require only the routine arrival,
+     while a real default call beside the foreign key still rebuilds and changes
+     from 7 to 42 without changing the referenced table.
      An explicit USING access method binds pg_am, not pg_proc or pg_class.
      Mask that operand for either arrival kind while keeping the following
      expression list and predicates visible. Live plain, quoted and expression
