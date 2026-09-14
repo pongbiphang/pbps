@@ -12256,3 +12256,29 @@ SPEC is in sync with all of these.
     any new execution authority. CLI regressions compare human and JSON paths,
     warning/error and unresolved/resolved cases, refused artifact preservation,
     operational errors, and real SQL Server edition warnings (#338–#341).
+
+486. **Constraint-drop approval distinguishes uniqueness from FK/CHECK
+     relaxation (issue #241).** Removing a UNIQUE constraint carries the
+     `destructive` risk because it removes a uniqueness guarantee, even if
+     every existing row stays unchanged. Dropped indexes and removed primary
+     keys already face that gate; declaring uniqueness as a constraint must
+     not make its removal bypass approval (issue #110, PR #237).
+
+     DROP FOREIGN KEY and DROP CHECK retain their existing empty intrinsic
+     risk set. They relax validation of future writes without themselves
+     rewriting stored values. The extra approval for lost uniqueness is an
+     explicit product boundary, not a general classification of every lost
+     integrity guarantee. FK/CHECK removal can admit later inconsistent data
+     or encounter operational failures; ungated does not promise otherwise.
+     The declaration diff and checksum-pinned plan still expose those drops
+     for review, and any other changes retain their own risks (SPEC 7.2–7.3).
+
+     Keep this distinction in the model's intrinsic classification for both
+     dialects. Changing which constraint relaxations require approval needs
+     an explicit policy change rather than grouping all constraint drops by
+     their similar SQL spelling. The existing focused tests
+     `dropping_a_unique_constraint_is_destructive` and
+     `dropping_foreign_keys_and_checks_remains_ungated` pin both sides;
+     `destructive_rationale_covers_data_and_uniqueness_loss` pins the gate's
+     explanation. This entry records the existing behavior; it changes no
+     risk class or execution rule.

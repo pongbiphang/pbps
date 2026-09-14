@@ -658,6 +658,15 @@ The criterion is **whether this kind of change can fail or change stored values*
 to decide whether this particular run happens to be safe. Data-level validation is
 a runtime concern and outside the declarative layer's responsibility.
 
+Removing a UNIQUE constraint is also deliberately gated for the loss of its
+uniqueness guarantee, even when no stored values change. Dropping FOREIGN KEY
+or CHECK constraints remains an ungated relaxation: those changes add no
+intrinsic risk class. This is an explicit approval-policy boundary, not a claim
+that removing those constraints preserves future data integrity or cannot fail
+operationally. Their removal remains part of the reviewed declarations and
+checksum-pinned plan, and other changes in that plan may still need approval
+(DECISIONS 486).
+
 ### 7.3 Saved plan plus checksum: two layers of review
 
 Review happens twice, and the two layers answer different questions:
