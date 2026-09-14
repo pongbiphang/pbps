@@ -2618,4 +2618,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_parameter_named_support_does_not_change_its_types_reference_form() {
+        for body in [
+            "(support orders) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "(OUT support orders) LANGUAGE sql AS 'SELECT 7'",
+            "(OUT support app . \"orders\") LANGUAGE sql AS 'SELECT 7'",
+            "(\"close)\" integer, OUT support orders) LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS TABLE (support orders) LANGUAGE sql AS 'SELECT 7'",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.params()"), module(body));
+            for (arrival, count) in [("app.orders", 1), ("app.orders(internal)", 0)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{body}: {arrival}"
+                );
+            }
+        }
+    }
 }

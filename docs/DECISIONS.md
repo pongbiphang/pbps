@@ -12049,6 +12049,15 @@ SPEC is in sync with all of these.
      the old `prosupport` OID until the typed plan rebuilds the function. A view
      of the operand's name cannot change that OID and causes no rebuild.
 
+     The option keyword applies outside parentheses. Inside a parameter list
+     or `RETURNS TABLE` list, `support` can be an ordinary parameter name, and
+     the following row type remains a relation reference. The scan partitions
+     the already lexed code by parenthesis depth before unquoting identifiers,
+     preserving call delimiters and ignoring parentheses inside quoted names.
+     Measured with `OUT support orders`: the routine's identity stays `f()`,
+     but a view arriving earlier on its path requires a rebuild to move the
+     result from the shared view's row shape to the new view's row shape.
+
      Measured on PostgreSQL: a view reading the shared `orders` relation keeps
      that binding when `app.orders()` arrives. A parsed routine calling the
      shared `orders()` keeps its old binding until recreated, then calls the

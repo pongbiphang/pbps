@@ -949,7 +949,7 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
 /// or overloads. Callers opt into the refinement instead of changing every
 /// name report and creation-order edge (DECISIONS 473).
 /// `routine_operands` supplies the dialect's lower-case keywords whose next
-/// name is a routine reference without call parentheses.
+/// name outside parentheses is a routine reference without call parentheses.
 pub fn references_module_with(
     definition: &str,
     module: &ModuleId,
@@ -959,18 +959,70 @@ pub fn references_module_with(
     let Some(name) = module.referenced_name() else {
         return false;
     };
-    references_in(
-        &(lexis.code_only)(definition),
-        &name,
-        Case::Folded,
-        lexis.continues_ident,
-        lexis.reserved,
-        true,
-        Some(ReferenceForm {
-            routine: matches!(module, ModuleId::Routine(_)),
-            routine_operands,
-        }),
-    )
+    let code = (lexis.code_only)(definition);
+    let scan = |code: &str, routine_operands: &[&str]| {
+        references_in(
+            code,
+            &name,
+            Case::Folded,
+            lexis.continues_ident,
+            lexis.reserved,
+            true,
+            Some(ReferenceForm {
+                routine: matches!(module, ModuleId::Routine(_)),
+                routine_operands,
+            }),
+        )
+    };
+    if routine_operands.is_empty() {
+        return scan(&code, &[]);
+    }
+    // A parameter named `support` does not introduce an option operand.
+    // Separate levels before removing identifier quotes: a `)` inside a
+    // quoted parameter name must not close its parameter list (473).
+    let (outer, nested) = reference_levels(&code);
+    scan(&outer, routine_operands) || scan(&nested, &[])
+}
+
+/// Code outside and inside parentheses, with both copies retaining structural
+/// parentheses so a name's following call delimiter survives the partition.
+/// The dialect has already hidden string data and comments. Standard quoted
+/// identifiers stay whole, including doubled quotes and parenthesis bytes.
+fn reference_levels(code: &str) -> (String, String) {
+    let mut outer = String::with_capacity(code.len());
+    let mut nested = String::with_capacity(code.len());
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut doubled = false;
+    for (at, ch) in code.char_indices() {
+        let paren = !quoted && matches!(ch, '(' | ')');
+        for (out, visible) in [(&mut outer, depth == 0), (&mut nested, depth > 0)] {
+            if visible || paren || matches!(ch, '\n' | '\r') {
+                out.push(ch);
+            } else {
+                out.push(' ');
+            }
+        }
+        if quoted {
+            if doubled {
+                doubled = false;
+            } else if ch == '"' {
+                if code.as_bytes().get(at + 1) == Some(&b'"') {
+                    doubled = true;
+                } else {
+                    quoted = false;
+                }
+            }
+        } else {
+            match ch {
+                '"' => quoted = true,
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    (outer, nested)
 }
 
 #[derive(Clone, Copy)]

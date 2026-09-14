@@ -9129,6 +9129,68 @@ async fn a_support_operand_rebinds_to_an_arriving_routine_without_call_parenthes
     assert_eq!(view_plan.changes.len(), 1, "{view_plan:#?}");
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_out_parameter_named_support_rebinds_its_row_type_for_a_view_arrival() {
+    let mut db = TestDb::create("support_parameter230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+             CREATE VIEW shared.orders AS SELECT 0 AS old_field;",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let target: pbps_model::ModuleId = "app.f()".parse().unwrap();
+    let mut a = Schema::default();
+    a.modules.insert(
+        target.clone(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(OUT support orders) LANGUAGE sql AS 'SELECT 7'",
+        ),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    assert_eq!(
+        text(&mut db.conn, "SELECT to_json(app.f())::text").await,
+        "{\"old_field\":7}"
+    );
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        ),
+    );
+    let routine_plan = plan(&a, &ids, &b, &ids);
+    apply(&mut db.conn, &pg, &routine_plan).await;
+    assert_eq!(
+        text(&mut db.conn, "SELECT to_json(app.f())::text").await,
+        "{\"old_field\":7}"
+    );
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 0 AS new_field"),
+    );
+    let view_plan = plan(&b, &ids, &c, &ids);
+    apply(&mut db.conn, &pg, &view_plan).await;
+    let result = text(&mut db.conn, "SELECT to_json(app.f())::text").await;
+    db.drop().await;
+    assert_eq!(result, "{\"new_field\":7}");
+    assert_eq!(routine_plan.changes.len(), 1, "{routine_plan:#?}");
+    assert_eq!(view_plan.changes.len(), 2, "{view_plan:#?}");
+    assert!(matches!(&view_plan.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &target));
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**
