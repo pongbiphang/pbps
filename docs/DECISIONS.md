@@ -12355,6 +12355,18 @@ SPEC is in sync with all of these.
      live constraint-index dependencies switch to the arriving function, while
      method-only routines keep their unmanaged dependents without rebuilding.
 
+     CREATE STATISTICS owns a pg_statistic_ext name and an optional list of
+     statistics kinds. Neither can bind a routine or view, including when the
+     object name or kind list is omitted. Exclude that declaration prefix while
+     retaining ON expressions and FROM relations. Live unmanaged dependents
+     remain usable, and expression pg_proc dependencies switch on rebuilding.
+     CREATE TYPE's AS ENUM/AS RANGE names its kind rather than a call. Exclude
+     only that keyword; range option operands and composite attributes retain
+     their type references, and later ordinary calls remain visible. Live range
+     subtype OIDs switch to the arriving view's row type, while separate plans
+     select only the actual enum/range routine callers. Quoted kind keywords
+     are rejected by the engine, so no extra syntax is inferred from them.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

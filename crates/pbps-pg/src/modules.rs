@@ -2497,6 +2497,27 @@ fn ddl_reference_spans(
                 target += 1;
             }
         }
+        if create && token_is(tokens, target, "statistics") {
+            // The keyword, optional object name and kinds belong to
+            // pg_statistic_ext. ON expressions and FROM targets stay code.
+            declarations.push(target);
+            let mut options = target + 1;
+            if token_is(tokens, options, "if")
+                && token_is(tokens, options + 1, "not")
+                && token_is(tokens, options + 2, "exists")
+            {
+                options += 3;
+            }
+            if tokens.get(options).is_some_and(RebindToken::name) {
+                declarations.push(options);
+                options += 1;
+            }
+            if let Some(after) = after_group(tokens, options) {
+                declarations.extend(options..after);
+            }
+            at += 1;
+            continue;
+        }
         let altered_materialized_view = !create
             && token_is(tokens, target, "materialized")
             && token_is(tokens, target + 1, "view");
@@ -2566,6 +2587,14 @@ fn ddl_reference_spans(
         if create {
             if composite && token_is(tokens, item, "as") {
                 item += 1;
+            }
+            if composite
+                && (token_is(tokens, item, "enum") || token_is(tokens, item, "range"))
+                && after_group(tokens, item + 1).is_some()
+            {
+                // These are type-kind keywords, not calls. RANGE option
+                // operands may name path-resolved types and must stay visible.
+                declarations.push(item);
             }
             if let Some(after) = after_group(tokens, item) {
                 if !composite {
@@ -4275,6 +4304,114 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_options_are_declarations_but_on_and_from_keep_references() {
+        for (statement, arrival, count) in [
+            (
+                "CREATE STATISTICS orders(dependencies) ON a,b FROM source",
+                "app.orders(integer)",
+                0,
+            ),
+            (
+                "CREATE STATISTICS IF NOT EXISTS orders(ndistinct,mcv) ON a,b FROM source",
+                "app.orders",
+                0,
+            ),
+            (
+                "CREATE STATISTICS orders(dependencies) ON a,b FROM source",
+                "app.dependencies",
+                0,
+            ),
+            (
+                "CREATE STATISTICS (dependencies) ON a,b FROM source",
+                "app.statistics(integer)",
+                0,
+            ),
+            ("CREATE STATISTICS ON a,b FROM source", "app.statistics", 0),
+            (
+                "CREATE STATISTICS orders ON a,b FROM source",
+                "app.orders",
+                0,
+            ),
+            (
+                "CREATE STATISTICS orders(dependencies) ON orders(a),b FROM source",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "CREATE STATISTICS (dependencies) ON orders(a),b FROM source",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "CREATE STATISTICS ON (orders(a)),b FROM source",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "CREATE STATISTICS orders(dependencies) ON a,b FROM source",
+                "app.source",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{statement}: {arrival}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_and_range_kind_keywords_keep_actual_type_and_call_references() {
+        for (statement, arrival, count) in [
+            ("CREATE TYPE child AS ENUM('a','b')", "app.enum(integer)", 0),
+            ("CREATE TYPE child AS ENUM()", "app.enum(integer)", 0),
+            (
+                "CREATE TYPE child AS RANGE(SUBTYPE=int4)",
+                "app.range(integer)",
+                0,
+            ),
+            ("CREATE TYPE child AS RANGE(SUBTYPE=range)", "app.range", 1),
+            (
+                "CREATE TYPE child AS RANGE(SUBTYPE=app.range)",
+                "app.range",
+                1,
+            ),
+            ("CREATE TYPE child AS (value range)", "app.range", 1),
+            (
+                "CREATE TYPE child AS ENUM('a'); PERFORM enum(1)",
+                "app.enum(integer)",
+                1,
+            ),
+            (
+                "CREATE TYPE child AS RANGE(SUBTYPE=int4); PERFORM range(1)",
+                "app.range(integer)",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{statement}: {arrival}"
             );
         }
     }
