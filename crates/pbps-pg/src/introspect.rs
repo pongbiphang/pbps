@@ -273,6 +273,7 @@ pub struct RawCatalog {
     pub module_args: Vec<RawModuleArg>,
     pub roles: Vec<RawRole>,
     pub grants: Vec<RawGrant>,
+    pub empty_routine_acls: Vec<RawEmptyRoutineAcl>,
     /// One row per argument of every routine a grant can name, in order — the
     /// same shape as [`RawCatalog::module_args`], and a wider set: a grant may
     /// be on a routine the module pull leaves out.
@@ -384,6 +385,16 @@ pub struct RawGrant {
     pub owner: String,
 }
 
+/// A routine with an explicitly empty ACL: no grant row can represent it.
+/// Kept beside grants so that absence of PUBLIC's EXECUTE remains reportable
+/// without inventing a grantee or permission (ADR-0010 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawEmptyRoutineAcl {
+    pub schema: String,
+    pub name: String,
+    pub routine_oid: i64,
+}
+
 /// What a grant's target is, by the catalog the row came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrantedKind {
@@ -437,6 +448,9 @@ pub struct RawOtherGrant {
     /// somebody touches them, and touching one writes the owner's own
     /// inherent entry beside the change.
     pub owner: Option<String>,
+    /// Whether this privilege is present in the engine's own default ACL
+    /// for the class and owner, even if that default was stored explicitly.
+    pub defaulted: bool,
 }
 
 /// One `ALTER DEFAULT PRIVILEGES` entry (ADR-0010 §2).
@@ -786,6 +800,11 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         .iter()
         .filter(|g| matches!(g.kind, GrantedKind::Routine('f' | 'p')) && !g.defaulted)
         .map(|g| target_label(g, &signatures))
+        .chain(
+            raw.empty_routine_acls
+                .iter()
+                .map(|r| routine_label(&r.schema, &r.name, r.routine_oid, &signatures)),
+        )
         .collect();
 
     for g in &raw.grants {
@@ -975,14 +994,24 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
     // database has as many of these as it has types: one line per
     // (role, class, permission), naming the objects it covers.
     let mut others: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    let mut public_others: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for g in &raw.other_grants {
-        let grantee = match g.grantee.as_deref() {
-            // PUBLIC holds `USAGE` on every built-in type and on `sql` and
-            // `plpgsql` in every database there is. Context, and not even
-            // interesting context: it is the same in every database, and
-            // listing it would bury the rows that are not.
-            None => continue,
-            Some(grantee) => grantee,
+        let permission = if g.grantable {
+            format!("{} WITH GRANT OPTION", g.permission)
+        } else {
+            g.permission.clone()
+        };
+        let Some(grantee) = g.grantee.as_deref() else {
+            // Untouched ACLs produce no rows here. Once touched, the engine
+            // may materialize default PUBLIC access beside a new grant;
+            // only access beyond that zero point needs this warning (#258).
+            if !g.defaulted {
+                public_others
+                    .entry((g.class.clone(), permission))
+                    .or_default()
+                    .push(g.name.clone());
+            }
+            continue;
         };
         // The zero point again (DECISIONS 371), on the catalogs that carry no
         // `acldefault` expansion because they need none: every one of these
@@ -998,15 +1027,18 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         if !pulled.schema.roles.contains_key(grantee) {
             continue;
         }
-        let permission = if g.grantable {
-            format!("{} WITH GRANT OPTION", g.permission)
-        } else {
-            g.permission.clone()
-        };
         others
             .entry((grantee.to_owned(), g.class.clone(), permission))
             .or_default()
             .push(g.name.clone());
+    }
+    for ((class, permission), names) in public_others {
+        pulled.warnings.push(format!(
+            "PUBLIC holds {permission} on {class}: {}. This is access beyond the engine's \
+             default for every principal in the cluster, reported as context rather than \
+             compared as a role's grants (ADR-0010 §5)",
+            listed(&names)
+        ));
     }
     for ((role, class, permission), names) in others {
         pulled.unexpressible.push(Unexpressible {
@@ -1290,14 +1322,22 @@ fn routine_kind(prokind: char) -> &'static str {
 /// whether it can hold one.
 fn target_label(g: &RawGrant, signatures: &BTreeMap<i64, Vec<&str>>) -> String {
     match (&g.object, g.routine_oid) {
-        (Some(object), Some(_)) => format!(
-            "`{}.{object}({})`",
-            g.schema,
-            routine_args(g, signatures).join(", ")
-        ),
+        (Some(object), Some(oid)) => routine_label(&g.schema, object, oid, signatures),
         (Some(object), None) => format!("`{}.{object}`", g.schema),
         (None, _) => format!("schema `{}`", g.schema),
     }
+}
+
+fn routine_label(
+    schema: &str,
+    name: &str,
+    oid: i64,
+    signatures: &BTreeMap<i64, Vec<&str>>,
+) -> String {
+    let args = signatures
+        .get(&oid)
+        .map_or_else(String::new, |args| args.join(", "));
+    format!("`{schema}.{name}({args})`")
 }
 
 /// The argument types of the routine this grant is on, in order.
@@ -2668,6 +2708,92 @@ mod tests {
         assert!(said.contains("app.f()"), "{said}");
     }
 
+    #[test]
+    fn empty_routine_acls_report_closed_signatures_without_inventing_grants() {
+        let raw = RawCatalog {
+            roles: vec![role("deploy")],
+            empty_routine_acls: vec![RawEmptyRoutineAcl {
+                schema: "app".to_owned(),
+                name: "closed".to_owned(),
+                routine_oid: 42,
+            }],
+            routine_args: vec![RawModuleArg {
+                routine_oid: 42,
+                position: 1,
+                ty: "integer".to_owned(),
+            }],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("revoked from PUBLIC") && w.contains("app.closed(integer)")),
+            "{:?}",
+            pulled.warnings
+        );
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .all(|w| !w.contains("PUBLIC can execute"))
+        );
+        assert!(pulled.unexpressible.is_empty());
+        assert!(pulled_role(&pulled, "deploy").grants.is_empty());
+
+        let absent = assemble(&RawCatalog {
+            empty_routine_acls: Vec::new(),
+            ..raw
+        });
+        assert!(
+            absent
+                .warnings
+                .iter()
+                .all(|w| !w.contains("revoked from PUBLIC"))
+        );
+    }
+
+    #[test]
+    fn public_nondefault_acl_entries_are_grouped_context_and_never_role_grants() {
+        let entry = |name: &str, defaulted| RawOtherGrant {
+            grantee: None,
+            class: "a foreign server".to_owned(),
+            name: name.to_owned(),
+            permission: "USAGE".to_owned(),
+            grantable: false,
+            owner: Some("deploy".to_owned()),
+            defaulted,
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("deploy")],
+            other_grants: vec![
+                entry("server_a", false),
+                entry("server_b", false),
+                RawOtherGrant {
+                    class: "a type".to_owned(),
+                    ..entry("app.default_type", true)
+                },
+            ],
+            ..RawCatalog::default()
+        });
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        let warning = &pulled.warnings[0];
+        for part in [
+            "PUBLIC holds USAGE",
+            "a foreign server",
+            "server_a",
+            "server_b",
+            "context",
+        ] {
+            assert!(warning.contains(part), "{warning}");
+        }
+        assert!(!warning.contains("app.default_type"), "{warning}");
+        assert!(pulled.unexpressible.is_empty());
+        assert!(pulled_role(&pulled, "deploy").grants.is_empty());
+        assert!(!pulled.schema.roles.contains_key("PUBLIC"));
+    }
+
     /// The three ADR-0005 shapes, on this engine's catalogs. Each is left out
     /// of the role's set and reported, because folded in `verify` compares
     /// what remains and calls a changed role clean.
@@ -2992,6 +3118,7 @@ mod tests {
             permission: "USAGE".to_owned(),
             grantable: false,
             owner: Some("someone_else".to_owned()),
+            defaulted: grantee.is_none(),
         };
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
@@ -2999,9 +3126,8 @@ mod tests {
                 other(Some("app_reader"), "a type", "app.money"),
                 other(Some("app_reader"), "a type", "app.code"),
                 other(Some("app_reader"), "a procedural language", "plpgsql"),
-                // PUBLIC holds `USAGE` on every built-in type in every
-                // database there is: the same everywhere, so listing it would
-                // bury the rows that are not.
+                // A touched ACL can materialize default PUBLIC access. The
+                // engine's default fact keeps that zero point out of warnings.
                 other(None, "a type", "text"),
                 // And a role this project cannot declare is not its business.
                 other(Some("someone_else"), "a type", "app.money"),
@@ -3041,6 +3167,7 @@ mod tests {
                 permission: "USAGE".to_owned(),
                 grantable: false,
                 owner: Some("ot_owner".to_owned()),
+                defaulted: true,
             }],
             ..RawCatalog::default()
         });
@@ -3193,6 +3320,7 @@ mod tests {
                 permission: "USAGE".to_owned(),
                 grantable: true,
                 owner: Some("someone_else".to_owned()),
+                defaulted: false,
             }],
             ..RawCatalog::default()
         });
