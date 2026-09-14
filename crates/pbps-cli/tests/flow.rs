@@ -1802,6 +1802,290 @@ fn explain_reads_a_plan_computed_for_postgres() {
     assert_eq!(v["data"]["change_count"], 1, "{v}");
 }
 
+// ---- Saved-plan dialect and optional environment agreement ----
+
+fn explain_dialect_plan(d: &Demo, dialect: &str) -> PathBuf {
+    let path = write_plan(d, "dialect.json", "transactional");
+    let mut plan: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    plan.dialect = dialect.to_owned();
+    std::fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    path
+}
+
+/// Count real TCP arrivals, then close each socket so a wrong connection does
+/// not hang waiting for a database handshake. Matching targets below prove the
+/// listener can observe both drivers; a diagnostic string alone cannot do so.
+fn explain_connection_attempts(run: impl FnOnce(u16) -> Output) -> (Output, usize) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let mut attempts = 0;
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    attempts += 1;
+                    drop(socket);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Drain arrivals before checking stop: a client can close
+                    // quickly enough to finish before this thread is scheduled.
+                    if !matches!(
+                        stopped.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ) {
+                        return attempts;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("connection witness failed: {e}"),
+            }
+        }
+    });
+    let output = run(port);
+    drop(stop);
+    (output, server.join().unwrap())
+}
+
+fn explain_dialect_connection(dialect: &str, port: u16) -> String {
+    match dialect {
+        "mssql" => format!(
+            "Server=127.0.0.1,{port};Database=explain;User Id=u;Password=explain-secret;TrustServerCertificate=true"
+        ),
+        "postgres" => format!(
+            "host=127.0.0.1 port={port} dbname=explain user=u password=explain-secret sslmode=disable connect_timeout=2"
+        ),
+        _ => panic!("the network controls exercise the two supported drivers"),
+    }
+}
+
+#[test]
+fn explain_dialects_refuse_mismatched_environments_without_connecting() {
+    for (plan_dialect, environment_dialect) in [("mssql", "postgres"), ("postgres", "mssql")] {
+        let d = Demo::new(&format!("explain-dialects-mismatch-{plan_dialect}"));
+        let plan = explain_dialect_plan(&d, plan_dialect);
+        for format in ["text", "json"] {
+            let (out, attempts) = explain_connection_attempts(|port| {
+                let connection = explain_dialect_connection(environment_dialect, port);
+                std::fs::write(
+                    d.dir.join("pbps.yml"),
+                    format!("dialect: {environment_dialect}\nenvironments:\n  wrong_engine:\n    url_env: PBPS_EXPLAIN_DIALECT_TARGET\n"),
+                )
+                .unwrap();
+                Command::new(BIN)
+                    .arg("--project")
+                    .arg(&d.dir)
+                    .env("PBPS_EXPLAIN_DIALECT_TARGET", &connection)
+                    .args([
+                        "explain",
+                        "--plan",
+                        plan.to_str().unwrap(),
+                        "--env",
+                        "wrong_engine",
+                        "--format",
+                        format,
+                    ])
+                    .output()
+                    .unwrap()
+            });
+            let text = stdout(&out);
+            assert_eq!(code(&out), 0, "{text}{}", stderr(&out));
+            assert_eq!(
+                attempts, 0,
+                "a mismatched environment was contacted: {text}"
+            );
+            assert!(text.contains("dialect mismatch"), "{text}");
+            assert!(text.contains("was not queried"), "{text}");
+            assert!(
+                text.contains("Mssql") && text.contains("Postgres"),
+                "{text}"
+            );
+            assert!(!text.contains("explain-secret"), "{text}");
+            assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+            let approval = if format == "json" {
+                let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(report["command"], "explain", "{report}");
+                assert_eq!(report["data"]["dialect"], plan_dialect, "{report}");
+                assert_eq!(report["data"]["applyable"], true, "{report}");
+                assert_eq!(report["data"]["checksum"], plan_checksum(&plan), "{report}");
+                assert_eq!(
+                    report["data"]["target"]["environment"], "wrong_engine",
+                    "{report}"
+                );
+                assert_eq!(
+                    report["data"]["target"]["state"], "unconfigured",
+                    "{report}"
+                );
+                assert!(
+                    report["findings"].as_array().unwrap().iter().any(|f| {
+                        f["id"] == "target.not-ready"
+                            && f["message"].as_str().unwrap().contains("dialect mismatch")
+                    }),
+                    "{report}"
+                );
+                report["data"]["approve_with"].as_str().unwrap().to_owned()
+            } else {
+                assert!(
+                    text.contains(&format!("dialect     {plan_dialect}")),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("What it changes") && text.contains(&plan_checksum(&plan)),
+                    "{text}"
+                );
+                text.lines()
+                    .find(|l| l.trim_start().starts_with("pbps apply"))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert!(approval.contains("--env \"<environment>\""), "{approval}");
+            assert!(!approval.contains("wrong_engine"), "{approval}");
+        }
+    }
+}
+
+#[test]
+fn explain_dialects_keep_matching_and_bare_targets_connectable() {
+    for dialect in ["mssql", "postgres"] {
+        let d = Demo::new(&format!("explain-dialects-connect-{dialect}"));
+        let plan = explain_dialect_plan(&d, dialect);
+        for bare in [false, true] {
+            for format in ["text", "json"] {
+                let (out, attempts) = explain_connection_attempts(|port| {
+                    let connection = explain_dialect_connection(dialect, port);
+                    // A bare --db must use the plan even beside a project that
+                    // names the other engine. --env must use a matching one.
+                    let project_dialect = if bare {
+                        if dialect == "mssql" {
+                            "postgres"
+                        } else {
+                            "mssql"
+                        }
+                    } else {
+                        dialect
+                    };
+                    std::fs::write(
+                        d.dir.join("pbps.yml"),
+                        format!("dialect: {project_dialect}\nenvironments:\n  matching_engine:\n    url_env: PBPS_EXPLAIN_DIALECT_TARGET\n"),
+                    ).unwrap();
+                    let (flag, target) = if bare {
+                        ("--db", connection.as_str())
+                    } else {
+                        ("--env", "matching_engine")
+                    };
+                    Command::new(BIN)
+                        .arg("--project")
+                        .arg(&d.dir)
+                        .env("PBPS_EXPLAIN_DIALECT_TARGET", &connection)
+                        .args([
+                            "explain",
+                            "--plan",
+                            plan.to_str().unwrap(),
+                            flag,
+                            target,
+                            "--format",
+                            format,
+                        ])
+                        .output()
+                        .unwrap()
+                });
+                let text = stdout(&out);
+                assert_eq!(code(&out), 0, "{text}{}", stderr(&out));
+                assert!(
+                    attempts > 0,
+                    "the matching driver never reached the witness: {text}"
+                );
+                assert!(text.contains("unreachable"), "{text}");
+                assert!(!text.contains("dialect mismatch"), "{text}");
+                assert!(!text.contains("explain-secret"), "{text}");
+                let approval = if format == "json" {
+                    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(report["data"]["dialect"], dialect, "{report}");
+                    assert_eq!(report["data"]["target"]["state"], "unreachable", "{report}");
+                    report["data"]["approve_with"].as_str().unwrap().to_owned()
+                } else {
+                    text.lines()
+                        .find(|l| l.trim_start().starts_with("pbps apply"))
+                        .unwrap()
+                        .to_owned()
+                };
+                let expected = if bare {
+                    "--env \"<environment>\""
+                } else {
+                    "--env matching_engine"
+                };
+                assert!(approval.contains(expected), "{approval}");
+            }
+        }
+    }
+}
+
+#[test]
+fn explain_dialects_accept_every_configured_name_and_reject_unknown_plans() {
+    let d = Demo::new("explain-dialects-names");
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+    // Enumerate the configuration's actual names instead of maintaining a
+    // second support list that could miss a future configured dialect (#310).
+    let schema = serde_json::to_value(schemars::schema_for!(pbps_config::DialectName)).unwrap();
+    let names = schema["enum"].as_array().unwrap();
+    assert!(!names.is_empty());
+    for name in names {
+        let dialect = name.as_str().unwrap();
+        let plan = explain_dialect_plan(&d, dialect);
+        for format in ["text", "json"] {
+            let out = d.run(&[
+                "explain",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--format",
+                format,
+            ]);
+            let text = stdout(&out);
+            assert_eq!(code(&out), 0, "{dialect}: {text}{}", stderr(&out));
+            assert!(stderr(&out).is_empty());
+            if format == "json" {
+                let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(report["data"]["dialect"], dialect, "{report}");
+                assert_eq!(report["data"]["checksum"], plan_checksum(&plan), "{report}");
+                assert!(report["data"].get("target").is_none(), "{report}");
+            } else {
+                assert!(text.contains(&format!("dialect     {dialect}")), "{text}");
+                assert!(text.contains("Not checked"), "{text}");
+            }
+        }
+    }
+    for dialect in ["unknown-engine", "MSSQL", "postgres ", ""] {
+        let plan = explain_dialect_plan(&d, dialect);
+        for format in ["text", "json"] {
+            let out = d.run(&[
+                "explain",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--format",
+                format,
+            ]);
+            assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+            let expected =
+                format!("this plan was computed for `{dialect}`, which this build cannot explain");
+            if format == "json" {
+                let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+                assert_eq!(report["result"], "unanswerable", "{report}");
+                assert_eq!(
+                    report["findings"][0]["id"], "plan.unsupported-dialect",
+                    "{report}"
+                );
+                assert_eq!(report["findings"][0]["message"], expected, "{report}");
+                assert!(report["data"].is_null(), "{report}");
+            } else {
+                assert!(stderr(&out).contains(&expected), "{}", stderr(&out));
+                assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+            }
+        }
+    }
+}
+
 // ---- docs (SPEC 9.4) and the strategy block (ADR-0003) ----
 
 /// Written with explicit `\n` rather than a `\`-continued literal: Rust strips

@@ -12127,3 +12127,24 @@ SPEC is in sync with all of these.
      CLI regression uses a sequence-backed DDL witness, whose increments
      survive rollback, to prove refusal before statement one and successful
      reuse of the approved plan after the offending row is removed.
+
+481. **Explain's optional environment must use the saved plan's dialect.**
+     SPEC 9.6 makes the file authoritative even beside another project's
+     configuration. A pre-resolved `--env` target therefore has its driver
+     compared with the saved plan's before any connection (#309). A mismatch
+     becomes diagnostic context with no connection left to query, retaining the
+     complete file explanation and exit 0. It uses the existing `unconfigured`
+     target state and `target.not-ready` finding; no output envelope changes.
+
+     A known mismatch also removes that environment's name from the approval
+     command, leaving the existing environment placeholder. An environment
+     whose configuration could not be read is still distinct: its engine is
+     unknown, so its previous guidance remains. Matching environments and bare
+     `--db` targets keep their behavior; the latter gets its driver from the
+     plan regardless of any local project.
+
+     The saved dialect string is deserialized as the shared `DialectName` and
+     passed to `dialect_for` and `db::driver_for` (#310, 417). There is no second
+     string-to-engine factory in `explain`. Unknown names retain their existing
+     explanation error and `plan.unsupported-dialect` envelope. A future
+     configured name requires a deliberate answer in both exhaustive selectors.

@@ -125,23 +125,29 @@ impl From<anyhow::Result<db::Target>> for Target {
 
 /// A target once the plan has said which engine it was computed for.
 ///
-/// The same three states as [`Target`] minus the one that still holds a bare
-/// string, so that everything downstream of [`Target::resolve`] cannot be
-/// handed an unresolved connection at all. A fourth arm reading "this should
-/// not happen" would be the alternative, and a state that cannot exist beats a
-/// branch that checks for it.
+/// Bare strings are resolved here, and a mismatched target loses its connection
+/// altogether. The distinction from an unresolved environment also prevents
+/// approval guidance from naming an environment known to use the wrong engine.
 enum Resolved {
     None,
     Reachable(db::Target),
     Unresolved(anyhow::Error),
+    DialectMismatch(anyhow::Error),
 }
 
 impl Target {
-    /// Turns a bare `--db` string into a target, now that the driver is known.
+    /// Binds optional context to the plan's driver before any connection.
     fn resolve(self, driver: pbps_db::Driver) -> Resolved {
         match self {
             Target::None => Resolved::None,
             Target::Connection(c) => Resolved::Reachable(db::target_from_connection(&c, driver)),
+            Target::Reachable(t) if t.driver() != driver => {
+                Resolved::DialectMismatch(anyhow::anyhow!(
+                    "environment dialect mismatch: the plan requires {driver:?}, but the \
+                     configured target uses {:?}; the environment was not queried",
+                    t.driver()
+                ))
+            }
             Target::Reachable(t) => Resolved::Reachable(t),
             Target::Unresolved(e) => Resolved::Unresolved(e),
         }
@@ -246,16 +252,16 @@ fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
 /// computed for one and applied to another is nonsense the file can catch;
 /// reading it here is the same check, made earlier and without a connection.
 fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dialect>)> {
-    match plan.dialect.as_str() {
-        "mssql" => Ok((pbps_db::Driver::Mssql, Box::new(pbps_mssql::Mssql))),
-        "postgres" => Ok((
-            pbps_db::Driver::Postgres,
-            Box::new(pbps_pg::Postgres::new()),
-        )),
-        other => {
-            anyhow::bail!("this plan was computed for `{other}`, which this build cannot explain")
-        }
-    }
+    // Deserialize the shared name, so another configured dialect must receive
+    // an answer in both exhaustive selectors (DECISIONS 417), including here.
+    let name: pbps_config::DialectName =
+        serde_json::from_value(serde_json::Value::String(plan.dialect.clone())).map_err(|_| {
+            anyhow::anyhow!(
+                "this plan was computed for `{}`, which this build cannot explain",
+                plan.dialect
+            )
+        })?;
+    Ok((db::driver_for(name), crate::dialect_for(name)))
 }
 
 fn explain(
@@ -319,7 +325,7 @@ fn explain(
             "pbps apply --env {} --plan {} --checksum {}",
             // A placeholder rather than a value, so it is not `shell_arg`'s
             // to quote — `placeholder` spells it for every shell at once.
-            match env {
+            match env.filter(|_| !matches!(target, Resolved::DialectMismatch(_))) {
                 Some(name) => shell_arg(name).unwrap_or_else(|| placeholder("environment")),
                 None => placeholder("environment"),
             },
@@ -380,7 +386,7 @@ fn explain(
             Resolved::Reachable(t) => Some(target_state(t)?),
             // Reported, not fatal, and phrased as what it is: the environment
             // was never reached because it was never resolved.
-            Resolved::Unresolved(e) => Some(TargetState {
+            Resolved::Unresolved(e) | Resolved::DialectMismatch(e) => Some(TargetState {
                 environment: env.unwrap_or("the given target").to_owned(),
                 state: "unconfigured",
                 detail: Some(format!("{e:#}")),
