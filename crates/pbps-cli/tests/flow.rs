@@ -2609,9 +2609,8 @@ fn staged_needs_a_target() {
     assert!(stderr(&o).contains("--db or --env"), "{}", stderr(&o));
 }
 
-/// Writes a plan file by hand: the mode check is a property of the artifact,
-/// and it is made before the plan's contents matter at all — so an empty change
-/// list is enough, and nothing here has to connect.
+/// Writes a minimal artifact for checks that do not require a logical change.
+/// A staged fixture reaching content validation must supply one separately.
 fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
     let version = pbps_model::plan::CURRENT_VERSION;
@@ -2630,6 +2629,157 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     );
     std::fs::write(&path, plan).unwrap();
     path
+}
+
+fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_model::SavedPlan {
+    use pbps_model::{
+        Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, SavedPlan,
+    };
+
+    let mut ids = IdsFile::default();
+    let changes = [
+        ("t_aaaaaa", "app.t", "archive.renamed"),
+        ("t_bbbbbb", "app.u", "app.v"),
+    ]
+    .into_iter()
+    .take(count)
+    .map(|(uid, from, to)| {
+        let uid: pbps_model::Uid = uid.parse().unwrap();
+        let to: pbps_model::TableName = to.parse().unwrap();
+        ids.tables.insert(uid.clone(), to.clone());
+        PlannedChange::new(Change::RenameTable {
+            uid,
+            from: from.parse().unwrap(),
+            to,
+        })
+    })
+    .collect();
+    let plan = SavedPlan::new(
+        PlanOrigin::Database,
+        dialect,
+        "2026-09-15T00:00:00Z",
+        PlanBaseline {
+            description: "cardinality fixture".into(),
+            checksum: "0".repeat(64),
+        },
+        ChangeSet { changes },
+        ids,
+    );
+    if staged { plan.staged() } else { plan }
+}
+
+#[test]
+fn saved_staged_cardinality_is_refused_before_connection() {
+    for (dialect, unreachable) in [
+        (
+            "mssql",
+            "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        ),
+        (
+            "postgres",
+            "host=127.0.0.1 port=1 user=postgres dbname=nowhere connect_timeout=1",
+        ),
+    ] {
+        let d = Demo::new(&format!("staged-cardinality-{dialect}"));
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
+        let path = d.dir.join("plan.json");
+        for count in [0, 2] {
+            let plan = staged_cardinality_plan(dialect, count, true);
+            std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+            let checksum = plan.checksum();
+            for resume in [false, true] {
+                let mut args = vec![
+                    "apply",
+                    "--db",
+                    unreachable,
+                    "--plan",
+                    path.to_str().unwrap(),
+                    "--checksum",
+                    &checksum,
+                    "--staged",
+                    "--allow",
+                    "rename",
+                ];
+                if resume {
+                    args.push("--resume");
+                }
+                let out = d.run(&args);
+                let err = stderr(&out);
+                assert_eq!(code(&out), 1, "{dialect}/{count}/{resume}: {err}");
+                assert!(
+                    err.contains("staged plan must contain exactly one logical change"),
+                    "{err}"
+                );
+                assert!(err.contains(&format!("artifact has {count}")), "{err}");
+                assert!(
+                    !err.contains("connect"),
+                    "refuse before contacting the target: {err}"
+                );
+            }
+            let out = d.run(&[
+                "explain",
+                "--plan",
+                path.to_str().unwrap(),
+                "--format",
+                "json",
+            ]);
+            assert_eq!(code(&out), 1, "{}", stderr(&out));
+            let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+            assert_eq!(report["findings"][0]["id"], "plan.inconsistent");
+            assert!(
+                report["findings"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("exactly one logical change")
+            );
+        }
+
+        // One logical rename may emit two statements; transactional artifacts
+        // retain both their empty and multiple-change forms.
+        for (staged, count, statements) in [(true, 1, 2), (false, 0, 0), (false, 2, 3)] {
+            let plan = staged_cardinality_plan(dialect, count, staged);
+            std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+            let out = d.run(&[
+                "explain",
+                "--plan",
+                path.to_str().unwrap(),
+                "--format",
+                "json",
+            ]);
+            assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+            assert_eq!(report["data"]["statement_count"], statements, "{report}");
+            if count > 0 {
+                let checksum = plan.checksum();
+                let mut args = vec![
+                    "apply",
+                    "--db",
+                    unreachable,
+                    "--plan",
+                    path.to_str().unwrap(),
+                    "--checksum",
+                    &checksum,
+                    "--allow",
+                    "rename",
+                ];
+                if staged {
+                    args.push("--staged");
+                }
+                let out = d.run(&args);
+                assert_eq!(code(&out), 1, "{}", stderr(&out));
+                assert!(
+                    stderr(&out).contains("connect"),
+                    "valid cardinality must reach the target: {}",
+                    stderr(&out)
+                );
+                assert!(
+                    !stderr(&out).contains("exactly one logical change"),
+                    "{}",
+                    stderr(&out)
+                );
+            }
+        }
+    }
 }
 
 /// The mode lives in the file because that is what the deployment gate
@@ -2660,7 +2810,12 @@ fn apply_refuses_a_mode_the_plan_does_not_declare() {
     assert!(stderr(&o).contains("transactional plan"), "{}", stderr(&o));
 
     // ...and a staged plan applied without it.
-    let staged = write_plan(&d, "staged.json", "staged");
+    let staged = d.dir.join("staged.json");
+    std::fs::write(
+        &staged,
+        serde_json::to_string_pretty(&staged_cardinality_plan("mssql", 1, true)).unwrap(),
+    )
+    .unwrap();
     let staged_checksum = plan_checksum(&staged);
     let o = d.run(&[
         "apply",
