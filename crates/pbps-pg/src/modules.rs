@@ -2221,7 +2221,10 @@ fn window_declarations(tokens: &[RebindToken<'_>], mut at: usize, names: &mut Ve
 /// named declare, or a nested SQL expression, as a declaration block.
 /// Outside declarations, OPEN's argument list belongs to its cursor operand,
 /// not a routine call. Only that operand is excluded; its arguments stay code.
-fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
+fn procedural_type_spans(
+    tokens: &[RebindToken<'_>],
+    body_start: Option<usize>,
+) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
     let mut spans = Vec::new();
     let mut declarations = Vec::new();
     let mut statement = None;
@@ -2232,7 +2235,10 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
             at = close + 1;
             continue;
         }
-        if token.word("declare") && tokens.get(at + 1).is_some_and(RebindToken::name) {
+        if token.word("declare")
+            && tokens.get(at + 1).is_some_and(RebindToken::name)
+            && declaration_block_start(tokens, at, body_start)
+        {
             statement = Some(at + 1);
         } else if token.word("begin") {
             statement = None;
@@ -2299,6 +2305,35 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
         at += 1;
     }
     (spans, declarations)
+}
+
+/// DECLARE is also a SQL column or alias. A procedural declaration block must
+/// start at a statement boundary (including the actual quoted body's start)
+/// and lead into BEGIN. A SQL DECLARE cursor has no such block (477).
+fn declaration_block_start(
+    tokens: &[RebindToken<'_>],
+    at: usize,
+    body_start: Option<usize>,
+) -> bool {
+    if !statement_boundary(tokens, at)
+        && !body_start
+            .is_some_and(|start| at >= start && statement_boundary(&tokens[start..], at - start))
+    {
+        return false;
+    }
+    let mut next = at + 1;
+    while next < tokens.len() {
+        if statement_boundary(tokens, next) {
+            if token_is(tokens, next, "begin") {
+                return !token_is(tokens, next + 1, "atomic");
+            }
+            if token_is(tokens, next, "end") {
+                return false;
+            }
+        }
+        next = tokens[next].close.map_or(next + 1, |close| close + 1);
+    }
+    false
 }
 
 /// Utility target parentheses contain column names, not call arguments.
@@ -2725,11 +2760,12 @@ fn rebind_code(
     version: Option<i64>,
 ) -> String {
     let mut code = crate::LEXICON.code_only_with_literal_markers(definition);
-    let mut type_spans = if routine {
-        crate::emit::routine_type_spans(definition)
+    let header = if routine {
+        crate::emit::routine_scan_header(definition)
     } else {
-        Vec::new()
+        crate::emit::RoutineScanHeader::default()
     };
+    let mut type_spans = header.types;
     let mut tokens: Vec<RebindToken<'_>> = Vec::new();
     let mut groups: Vec<usize> = Vec::new();
     let mut at = 0;
@@ -2764,7 +2800,10 @@ fn rebind_code(
     let mut referenced_columns = Vec::new();
     let mut target_separators = Vec::new();
     if routine {
-        let (locals, cursors) = procedural_type_spans(&tokens);
+        let body_start = header
+            .body_as_end
+            .and_then(|end| tokens.iter().position(|token| token.offset >= end));
+        let (locals, cursors) = procedural_type_spans(&tokens, body_start);
         type_spans.extend(locals);
         let (ddl_types, separators) = ddl_reference_spans(&code, &tokens, &mut declarations);
         type_spans.extend(ddl_types);
@@ -2785,6 +2824,16 @@ fn rebind_code(
         }
         if sql_expression_keyword(&tokens, i, version) {
             declarations.push(i);
+        }
+        if routine
+            && token.word("exclude")
+            && token_is(&tokens, i + 1, "using")
+            && tokens.get(i + 2).is_some_and(RebindToken::name)
+            && after_group(&tokens, i + 3).is_some()
+        {
+            // CREATE/ALTER exclusion constraints bind a pg_am method. Key
+            // expressions and predicates must retain their actual calls.
+            declarations.push(i + 2);
         }
         if token.word("tablesample")
             && tokens.get(i + 1).is_some_and(RebindToken::name)
@@ -4225,6 +4274,100 @@ mod tests {
                 )
                 .len(),
                 1,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn declare_is_a_block_opener_only_at_a_procedural_statement_boundary() {
+        for body in [
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT declare orders FROM app.t WHERE capture(1)=7; END",
+            "() RETURNS int LANGUAGE sql AS 'SELECT declare orders FROM app.t WHERE capture(1)=7'",
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT id AS declare FROM app.t WHERE capture(1)=7; END",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN SELECT declare orders INTO result FROM app.t WHERE capture(1)=7; RETURN result; END$$",
+            "() RETURNS SETOF int LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT declare orders FROM app.t WHERE capture(1)=7; END$$",
+            "() RETURNS void LANGUAGE sql AS $$DECLARE c CURSOR FOR SELECT capture(1);$$",
+            "() RETURNS int AS $$<<root>> DECLARE result int := capture(1); BEGIN RETURN result; END$$ LANGUAGE plpgsql",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.capture(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{body}"
+            );
+        }
+        for body in [
+            "() RETURNS int AS $$<<root>> DECLARE result numeric(10,2); BEGIN RETURN 7; END$$ LANGUAGE 'plpgsql'",
+            "() RETURNS int LANGUAGE plpgsql AS E'<<root>>\\nDECLARE result numeric(10,2); BEGIN RETURN 7; END'",
+            "() RETURNS int LANGUAGE plpgsql AS $$BEGIN <<nested>> DECLARE result numeric(10,2); BEGIN RETURN 7; END; END$$",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.numeric(integer,integer)")],
+                    &BTreeSet::new()
+                )
+                .is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusion_access_methods_keep_their_expression_calls() {
+        for (statement, calls) in [
+            (
+                "ALTER TABLE t ADD CONSTRAINT guard EXCLUDE USING gist(span WITH &&)",
+                0,
+            ),
+            (
+                "ALTER TABLE ONLY t ADD EXCLUDE USING \"gist\"(span WITH &&)",
+                0,
+            ),
+            (
+                "CREATE TABLE t(span int4range, EXCLUDE USING gist(span WITH &&))",
+                0,
+            ),
+            (
+                "ALTER TABLE t ADD EXCLUDE USING gist(gist(span) WITH &&)",
+                1,
+            ),
+            (
+                "CREATE TABLE t(span int4range, EXCLUDE USING gist(gist(span) WITH &&))",
+                1,
+            ),
+            (
+                "ALTER TABLE t ADD EXCLUDE USING gist(span WITH &&) WHERE(gist(span) IS NOT NULL)",
+                1,
+            ),
+            (
+                "CREATE TABLE t(span int4range, EXCLUDE USING gist(span WITH &&) WHERE(gist(span) IS NOT NULL))",
+                1,
+            ),
+            ("PERFORM gist(1)", 1),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id("app.gist(integer)")], &BTreeSet::new())
+                    .len(),
+                calls,
                 "{statement}"
             );
         }

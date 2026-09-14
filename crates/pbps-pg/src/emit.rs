@@ -1574,10 +1574,18 @@ pub(crate) fn routine_parameter_names(definition: &str) -> Vec<std::ops::Range<u
 
 /// Parameter defaults remain expressions. Everything before each default,
 /// and the return/transform type operands, can contain modifiers but no calls.
-pub(crate) fn routine_type_spans(definition: &str) -> Vec<std::ops::Range<usize>> {
-    let mut spans = Vec::new();
+#[derive(Default)]
+pub(crate) struct RoutineScanHeader {
+    pub types: Vec<std::ops::Range<usize>>,
+    // This position precedes body decoding, so it remains valid in code_only.
+    pub body_as_end: Option<usize>,
+}
+
+pub(crate) fn routine_scan_header(definition: &str) -> RoutineScanHeader {
+    let mut header = RoutineScanHeader::default();
+    let spans = &mut header.types;
     let Some(list) = parameter_list(definition) else {
-        return spans;
+        return header;
     };
     let mut rest = after_the_gap(definition).0;
     let list_start = definition.len() - rest.len() + 1;
@@ -1595,6 +1603,9 @@ pub(crate) fn routine_type_spans(definition: &str) -> Vec<std::ops::Range<usize>
         match item.to_ascii_lowercase().as_str() {
             "begin" | "return" => break,
             "as" => {
+                header
+                    .body_as_end
+                    .get_or_insert(definition.len() - rest.len());
                 header_item(&mut rest);
             }
             "returns" => {
@@ -1625,7 +1636,7 @@ pub(crate) fn routine_type_spans(definition: &str) -> Vec<std::ops::Range<usize>
             _ => {}
         }
     }
-    spans
+    header
 }
 
 /// One header item without decoding it. Reuse the emitter's literal, quoted

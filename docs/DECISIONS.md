@@ -12340,6 +12340,21 @@ SPEC is in sync with all of these.
      custom handler and expression pg_proc dependencies retain the old binding
      after arrival-only and switch only after the typed rebuild.
 
+     DECLARE can be a SQL column or alias, even inside a PL/pgSQL statement.
+     Declaration masking requires a statement boundary and a following BEGIN
+     block, excluding SQL's BEGIN ATOMIC. The routine header supplies the exact
+     AS boundary before body decoding so a root declaration or complete label
+     is recognized without accepting a query's AS alias as a block boundary.
+     SQL and embedded PL/pgSQL queries retain their actual calls; parsed SQL
+     bodies keep the old binding after arrival-only and change after rebuilding.
+     Root, labeled, escaped and nested declaration blocks still exclude their
+     local type modifiers and retain their default/body expressions.
+     Exclusion constraints in CREATE and ALTER TABLE bind the EXCLUDE USING
+     method through pg_am. Only that method operand is excluded, including
+     quoted spellings. Keys and partial predicates retain real routine calls;
+     live constraint-index dependencies switch to the arriving function, while
+     method-only routines keep their unmanaged dependents without rebuilding.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

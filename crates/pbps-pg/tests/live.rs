@@ -9734,6 +9734,228 @@ async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn exclusion_access_methods_keep_key_and_predicate_calls() {
+    let mut db = TestDb::create("exclusion_calls230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE FUNCTION shared.gist(int4range) RETURNS int4range LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN $1; END'").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "DECLARE result int; BEGIN CREATE TABLE child(span int4range, CONSTRAINT guard EXCLUDE USING gist(gist(span) WITH &&)); SELECT CASE WHEN p.pronamespace='shared'::regnamespace THEN 7 ELSE 42 END INTO result FROM pg_constraint c JOIN pg_depend d ON d.objid=c.conindid JOIN pg_proc p ON p.oid=d.refobjid WHERE c.conrelid='app.child'::regclass AND c.conname='guard' AND d.classid='pg_class'::regclass AND d.refclassid='pg_proc'::regclass AND p.proname='gist'; DROP TABLE child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE TABLE child(span int4range); ALTER TABLE child ADD CONSTRAINT guard EXCLUDE USING gist(gist(span) WITH &&); SELECT CASE WHEN p.pronamespace='shared'::regnamespace THEN 7 ELSE 42 END INTO result FROM pg_constraint c JOIN pg_depend d ON d.objid=c.conindid JOIN pg_proc p ON p.oid=d.refobjid WHERE c.conrelid='app.child'::regclass AND c.conname='guard' AND d.classid='pg_class'::regclass AND d.refclassid='pg_proc'::regclass AND p.proname='gist'; DROP TABLE child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE TABLE child(span int4range, CONSTRAINT guard EXCLUDE USING gist(span WITH &&) WHERE(gist(span) IS NOT NULL)); SELECT CASE WHEN p.pronamespace='shared'::regnamespace THEN 7 ELSE 42 END INTO result FROM pg_constraint c JOIN pg_depend d ON d.objid=c.conindid JOIN pg_proc p ON p.oid=d.refobjid WHERE c.conrelid='app.child'::regclass AND c.conname='guard' AND d.classid='pg_class'::regclass AND d.refclassid='pg_proc'::regclass AND p.proname='gist'; DROP TABLE child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE TABLE child(span int4range); ALTER TABLE child ADD CONSTRAINT guard EXCLUDE USING gist(span WITH &&) WHERE(gist(span) IS NOT NULL); SELECT CASE WHEN p.pronamespace='shared'::regnamespace THEN 7 ELSE 42 END INTO result FROM pg_constraint c JOIN pg_depend d ON d.objid=c.conindid JOIN pg_proc p ON p.oid=d.refobjid WHERE c.conrelid='app.child'::regclass AND c.conname='guard' AND d.classid='pg_class'::regclass AND d.refclassid='pg_proc'::regclass AND p.proname='gist'; DROP TABLE child; RETURN result; END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.gist(int4range)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(int4range) RETURNS int4range LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN $1; END'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn exclusion_access_methods_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("exclusion_methods230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE app.parent(id int) PARTITION BY RANGE(id); CREATE TABLE app.target(id int); CREATE MATERIALIZED VIEW app.mv AS SELECT 7 AS id")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "CREATE TEMP TABLE child(span int4range); ALTER TABLE child ADD CONSTRAINT guard EXCLUDE USING gist(span WITH &&); DROP TABLE child",
+        "CREATE TEMP TABLE child(span int4range); ALTER TABLE ONLY child ADD EXCLUDE USING \"gist\"(span WITH &&); DROP TABLE child",
+        "CREATE TEMP TABLE child(span int4range, EXCLUDE USING gist(span WITH &&)); DROP TABLE child",
+        "CREATE TEMP TABLE child(span int4range, CONSTRAINT guard EXCLUDE USING \"gist\"(span WITH &&)); DROP TABLE child",
+        "CREATE TEMP TABLE child(span int4range, extra int); ALTER TABLE child ADD CONSTRAINT guard EXCLUDE USING gist(span WITH &&) INCLUDE(extra); DROP TABLE child",
+        "CREATE TEMP TABLE child(span int4range); ALTER TABLE child ADD CONSTRAINT guard EXCLUDE USING gist(span WITH &&) WHERE (span IS NOT NULL); DROP TABLE child",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.gist(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn declare_columns_keep_real_routine_references_in_sql_statements() {
+    let mut db = TestDb::create("declare_columns230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE app.t(declare int); INSERT INTO app.t VALUES(7); CREATE FUNCTION shared.capture(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT declare orders FROM app.t WHERE capture(1)=7; END",
+        "() RETURNS int LANGUAGE sql AS 'SELECT declare orders FROM app.t WHERE capture(1)=7'",
+        "() RETURNS SETOF int LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT declare orders FROM app.t WHERE capture(1)=7; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN SELECT declare orders INTO result FROM app.t WHERE capture(1)=7; RETURN result; END$$",
+        "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT declare AS declare FROM app.t WHERE capture(1)=7; END",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path=app,shared,pg_temp")
+        .await
+        .unwrap();
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(
+                &mut db.conn,
+                &format!("SELECT coalesce((SELECT app.f{i}()),0)")
+            )
+            .await,
+            7
+        );
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.capture(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 1, "{arrival:#?}");
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Parsed SQL bodies retain their pg_proc binding until the typed rebuild.
+    for i in [0, 4] {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut rebuilds = arrival;
+    rebuilds
+        .changes
+        .retain(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &rebuilds).await;
+    db.conn
+        .execute("SET search_path=app,shared,pg_temp")
+        .await
+        .unwrap();
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(
+                &mut db.conn,
+                &format!("SELECT coalesce((SELECT app.f{i}()),0)")
+            )
+            .await,
+            0
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn table_access_methods_keep_query_and_expression_references() {
     let mut db = TestDb::create("table_method_refs230").await;
     db.conn
@@ -11185,6 +11407,9 @@ async fn procedural_local_type_modifiers_do_not_rebuild_for_routine_arrivals() {
         "() RETURNS int LANGUAGE plpgsql AS $$DECLARE amount CONSTANT numeric(10,2) NOT NULL DEFAULT 7; BEGIN RETURN amount::int; END$$",
         "() RETURNS int LANGUAGE plpgsql AS $$BEGIN DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END; END$$",
         "() RETURNS int LANGUAGE plpgsql AS $$DECLARE c CURSOR(n numeric(10,2)) FOR SELECT n; BEGIN RETURN 7; END$$",
+        "() RETURNS int AS $$<<outer_block>> DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END$$ LANGUAGE 'plpgsql'",
+        "() RETURNS int LANGUAGE plpgsql AS E'<<outer_block>>\\nDECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END'",
+        "() RETURNS int LANGUAGE plpgsql AS $$BEGIN <<nested>> DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END; END$$",
     ];
     let mut a = Schema::default();
     for (i, definition) in definitions.iter().enumerate() {
