@@ -8020,3 +8020,229 @@ fn doctor_json_follows_recorded_table_and_column_ids_before_pending_renames() {
     );
     assert_eq!(diagnose().0, 0);
 }
+
+fn connected_policy_change(connection: &str, slug: &str) -> Demo {
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    d.table(TWO_COLUMNS);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    d.table("table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  added: {type: integer}\nprimary_key: {name: pk_t, columns: [id]}\n");
+    succeeds(d.run(&["drop", "app.t.label", "--reason", "retire the old field"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    d
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn connected_plan_json_retains_error_policy_findings_without_artifacts() {
+    let own = OwnDatabase::new(&server(), "json-policy-error");
+    let connection = own.connection();
+    let d = connected_policy_change(connection, "json-policy-error");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\npolicies:\n  rules:\n    change.expand-contract: error\n",
+    )
+    .unwrap();
+    let plan = d.dir.join("rejected.json");
+    let sql = d.dir.join("rejected.sql");
+    let args = [
+        "plan",
+        "--db",
+        connection,
+        "--format",
+        "json",
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ];
+    let out = d.run(&args);
+    assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+    let report = json_output(out);
+    assert_eq!(report["result"], "findings", "{report}");
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|f| f["id"] == "change.expand-contract" && f["severity"] == "error")
+            .count(),
+        1,
+        "{report}"
+    );
+    assert!(
+        !findings.iter().any(|f| f["id"] == "plan.failed"),
+        "{report}"
+    );
+    assert!(!plan.exists() && !sql.exists());
+    // A refused report cannot overwrite an artifact from an earlier attempt.
+    std::fs::write(&plan, "previous plan").unwrap();
+    std::fs::write(&sql, "previous SQL").unwrap();
+    assert_eq!(code(&d.run(&args)), 2);
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), "previous plan");
+    assert_eq!(std::fs::read_to_string(&sql).unwrap(), "previous SQL");
+    let human = d.run(&["plan", "--db", connection]);
+    assert_eq!(code(&human), 1, "{}{}", stdout(&human), stderr(&human));
+    assert!(stderr(&human).contains("error: change.expand-contract"));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn connected_plan_json_keeps_policy_warnings_without_duplicate_prose() {
+    let own = OwnDatabase::new(&server(), "json-policy-warning");
+    let connection = own.connection();
+    let d = connected_policy_change(connection, "json-policy-warning");
+    let path = d.dir.join("approved.json");
+    let out = succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--format",
+        "json",
+        "--out",
+        path.to_str().unwrap(),
+    ]));
+    assert!(
+        !stderr(&out).contains("change.expand-contract"),
+        "{}",
+        stderr(&out)
+    );
+    let report = json_output(out);
+    assert_eq!(report["result"], "ok");
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "change.expand-contract" && f["severity"] == "warning")
+            .count(),
+        1,
+        "{report}"
+    );
+    assert!(report["data"]["changes"].as_u64().unwrap() > 0);
+    assert!(report["data"]["connected_checks"].is_array());
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(!saved.changes.is_empty());
+    let human = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stderr(&human).contains("warning: change.expand-contract"));
+    assert!(stdout(&human).contains("Baseline:"));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn connected_plan_json_retains_identity_remedies_and_operational_errors() {
+    let own = OwnDatabase::new(&server(), "json-identity");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("json-identity");
+    d.table(TWO_COLUMNS);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    d.table(ONE_COLUMN);
+    let path = d.dir.join("identity.json");
+    let sql = d.dir.join("identity.sql");
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--format",
+        "json",
+        "--out",
+        path.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    let connected = json_output(out);
+    assert_eq!(connected["result"], "findings");
+    let offline = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(
+        code(&offline),
+        2,
+        "{}{}",
+        stdout(&offline),
+        stderr(&offline)
+    );
+    let offline = json_output(offline);
+    assert_eq!(connected["findings"], offline["findings"]);
+    let blocker = connected["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "identity.drop-column-needs-reason")
+        .unwrap();
+    assert!(
+        blocker["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("pbps drop app.t.label")
+    );
+    assert!(!path.exists() && !sql.exists());
+    let human = d.run(&["plan", "--db", connection]);
+    assert_eq!(code(&human), 1);
+    assert!(stderr(&human).contains("pbps drop app.t.label"));
+    d.table("table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  renamed: {type: varchar(50)}\nprimary_key: {name: pk_t, columns: [id]}\n");
+    let ambiguous = d.run(&["plan", "--db", connection, "--format", "json"]);
+    assert_eq!(
+        code(&ambiguous),
+        2,
+        "{}{}",
+        stdout(&ambiguous),
+        stderr(&ambiguous)
+    );
+    assert!(stderr(&ambiguous).is_empty(), "{}", stderr(&ambiguous));
+    let ambiguous = json_output(ambiguous);
+    let offline = json_output(d.run(&["plan", "--check", "--format", "json"]));
+    assert_eq!(ambiguous["findings"], offline["findings"]);
+    assert!(
+        ambiguous["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "identity.ambiguous-columns"
+                && f["remedy"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pbps rename app.t.label renamed")),
+        "{ambiguous}"
+    );
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["drop", "app.t.label", "--reason", "retire the old field"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let resolved = succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--format",
+        "json",
+        "--out",
+        path.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    assert_eq!(json_output(resolved)["result"], "ok");
+    assert!(path.exists() && sql.exists());
+    let unreachable = d.run(&[
+        "plan",
+        "--db",
+        "host=127.0.0.1 port=1 user=postgres dbname=unreachable connect_timeout=1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        code(&unreachable),
+        1,
+        "{}{}",
+        stdout(&unreachable),
+        stderr(&unreachable)
+    );
+    let report = json_output(unreachable);
+    assert_eq!(report["result"], "unanswerable");
+    assert_eq!(report["findings"][0]["id"], "plan.failed");
+}

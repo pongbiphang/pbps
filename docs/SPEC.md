@@ -1351,12 +1351,20 @@ copy blesses files the loader refuses, and does it quietly.
 
 ### 9.8 Machine-readable output and exit codes
 
-Every read-only command — `plan` (offline, including `--check`), `validate`,
-`fmt`, `explain`, `doctor`, `verify`, `status`, `state list` — takes
-`--format human|json`
-and, in JSON, emits one envelope. `plan --db` is deliberately outside that set:
-it connects, reads the ledger and writes the deployment artifact, and what a
-reviewer reads *from* that artifact is `explain` (DECISIONS 215).
+Every read-only command — `plan` (offline, including `--check`, or connected
+with `--db`/`--env`), `validate`, `fmt`, `explain`, `doctor`, `verify`, `status`,
+`state list` — takes `--format human|json` and, in JSON, emits one envelope.
+A connected plan reports change counts, named capability checks, cost estimates
+and typed findings (DECISIONS 429). This summary is distinct from the
+checksum-pinned deployment artifact written by `--out`, which `apply` accepts;
+`explain --plan` reads that artifact's full change list.
+
+Connected JSON retains error-policy and unresolved-identity findings with their
+stable IDs and available remedies/locations, reports `findings` and exits `2`,
+and writes neither a plan nor SQL artifact for those refusals. Warning-only
+policy/edition findings remain in the single JSON report with exit `0`, without
+duplicate human prose on stderr. Operational failures remain `unanswerable`
+and exit `1`. Human output keeps its existing diagnostics.
 
 The envelope's own schema is published, generated from the types the commands
 serialize: `pbps schema --kind envelope`, and `schemas/envelope.schema.json` in

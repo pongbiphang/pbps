@@ -14164,3 +14164,110 @@ fn offline_validation_names_unchecked_key_spelling_without_refusing_valid_declar
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
+
+#[test]
+fn connected_plan_json_help_distinguishes_summary_from_saved_artifact() {
+    let out = Command::new(BIN).args(["plan", "--help"]).output().unwrap();
+    assert_eq!(code(&out), 0);
+    let help = stdout(&out);
+    assert!(
+        help.contains("With --db/--env, JSON reports change counts"),
+        "{help}"
+    );
+    assert!(help.contains("separate saved plan"), "{help}");
+    assert!(help.contains("pbps explain --plan"), "{help}");
+    assert!(!help.contains("Not accepted with --db/--env"), "{help}");
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn connected_plan_json_keeps_edition_warnings_without_duplicate_prose() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "json-edition");
+    let connection = own.connection();
+    let limited = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = connect_live(connection).await.unwrap();
+            let edition = pbps_mssql::edition::edition(&mut conn).await.unwrap();
+            eprintln!("edition warning control: {}", edition.name());
+            !edition.supports_online()
+        });
+    let d = Demo::new("json-edition");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n");
+    let initial = d.run(&["plan"]);
+    assert_eq!(
+        code(&initial),
+        0,
+        "{}{}",
+        stdout(&initial),
+        stderr(&initial)
+    );
+    d.commit();
+    let bootstrapped = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(
+        code(&bootstrapped),
+        0,
+        "{}{}",
+        stdout(&bootstrapped),
+        stderr(&bootstrapped)
+    );
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  added: {type: int, nullable: false, default: \"0\"}\n");
+    let minted = d.run(&["plan"]);
+    assert_eq!(code(&minted), 0, "{}{}", stdout(&minted), stderr(&minted));
+    d.commit();
+    let out = d.run(&["plan", "--db", connection, "--format", "json"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(report["result"], "ok");
+    let warnings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "plan.edition")
+        .collect();
+    assert_eq!(warnings.len(), usize::from(limited), "{report}");
+    for warning in warnings {
+        assert_eq!(warning["severity"], "warning");
+        assert!(
+            warning["message"]
+                .as_str()
+                .unwrap()
+                .contains("rewrites every row")
+        );
+        assert!(
+            !stderr(&out).contains(warning["message"].as_str().unwrap()),
+            "{}",
+            stderr(&out)
+        );
+    }
+    let human = d.run(&["plan", "--db", connection]);
+    assert_eq!(code(&human), 0, "{}{}", stdout(&human), stderr(&human));
+    assert_eq!(
+        stderr(&human).contains("rewrites every row"),
+        limited,
+        "{}",
+        stderr(&human)
+    );
+    // A nullable addition does not carry this edition advisory on either server.
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  added: {type: int, default: \"0\"}\n");
+    let no_warning = d.run(&["plan", "--db", connection, "--format", "json"]);
+    assert_eq!(
+        code(&no_warning),
+        0,
+        "{}{}",
+        stdout(&no_warning),
+        stderr(&no_warning)
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout(&no_warning)).unwrap();
+    assert!(
+        !report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "plan.edition"),
+        "{report}"
+    );
+}

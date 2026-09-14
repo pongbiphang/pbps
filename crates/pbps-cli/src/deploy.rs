@@ -3419,6 +3419,16 @@ pub fn cmd_plan_db(
     ) {
         Ok(r) => r,
         Err(blockers) => {
+            if json {
+                return crate::output::Report::plain(
+                    "plan",
+                    blockers
+                        .iter()
+                        .map(crate::report::blocker_finding)
+                        .collect(),
+                )
+                .emit_json();
+            }
             eprintln!("{}", crate::report::blockers(&blockers));
             bail!("some changes could not be decided automatically");
         }
@@ -3739,13 +3749,21 @@ pub fn cmd_plan_db(
         // against. An `error` refuses the plan here, before anything is
         // written; `apply` never sees a policy.
         let policy = crate::attach_policy_findings(&mut cs, project, true);
-        for f in &policy {
-            eprintln!("{}: {} — {}", f.severity_word(), f.id, f.message);
+        if !json {
+            for f in &policy {
+                eprintln!("{}: {} — {}", f.severity_word(), f.id, f.message);
+            }
         }
         if policy
             .iter()
             .any(|f| f.severity == crate::output::Severity::Error)
         {
+            if json {
+                // This is an answered policy question, before any artifact is
+                // written. Keep the rule's typed fields and any earlier notes.
+                findings.extend(policy);
+                crate::output::Report::plain("plan", findings).emit_json()?;
+            }
             bail!(
                 "a policy set to `error` refuses this plan; fix the declarations, or suppress \
                  the rule in pbps.yml with a reason"
@@ -3773,7 +3791,9 @@ pub fn cmd_plan_db(
             );
         }
         for w in &verdict.warnings {
-            eprintln!("warning: {w}");
+            if !json {
+                eprintln!("warning: {w}");
+            }
             findings.push(crate::output::Finding::warning("plan.edition", w));
         }
 
