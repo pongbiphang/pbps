@@ -747,12 +747,25 @@ impl Lexicon {
     ///
     /// [`normalize_definition`]: Lexicon::normalize_definition
     pub fn code_only(&self, definition: &str) -> String {
+        self.code_with_data_markers(definition, false)
+    }
+
+    /// Like `code_only`, but leave one apostrophe at each string datum's
+    /// opening. Callers can distinguish a typed literal from a call without
+    /// seeing its contents. Routine bodies are decoded before marking their
+    /// inner data, so offsets must be interpreted in this returned text.
+    pub fn code_only_with_literal_markers(&self, definition: &str) -> String {
+        self.code_with_data_markers(definition, true)
+    }
+
+    fn code_with_data_markers(&self, definition: &str, mark_data: bool) -> String {
         // LANGUAGE may follow AS. Inspect the header with every string blanked
         // first, so body text cannot masquerade as a language clause. Native
         // routines store library/symbol names in AS, not SQL source to scan.
         let native = self.dollar_quoted_strings
-            && self.has_native_language(definition, &self.code_only_inner(definition, false));
-        self.code_only_inner(definition, !native)
+            && self
+                .has_native_language(definition, &self.code_only_inner(definition, false, false));
+        self.code_only_inner(definition, !native, mark_data)
     }
 
     fn has_native_language(&self, definition: &str, header: &str) -> bool {
@@ -803,7 +816,7 @@ impl Lexicon {
         false
     }
 
-    fn code_only_inner(&self, definition: &str, scan_bodies: bool) -> String {
+    fn code_only_inner(&self, definition: &str, scan_bodies: bool, mark_data: bool) -> String {
         enum At {
             Code,
             /// Inside `'…'`: a doubled quote is a quote *inside* the
@@ -953,7 +966,8 @@ impl Lexicon {
                         let body = scan_bodies
                             && paren_depth == 0
                             && follows_the_word_as(&out, self.identifier_continues);
-                        consumed_to = self.dollar_quoted_string(definition, i, len, body, &mut out);
+                        consumed_to = self
+                            .dollar_quoted_string(definition, i, len, body, mark_data, &mut out);
                         continue;
                     }
                     match (ch, next) {
@@ -978,6 +992,7 @@ impl Lexicon {
                                     definition,
                                     i,
                                     prefix.map_or(0, str::len),
+                                    mark_data,
                                     &mut out,
                                 )
                             {
@@ -990,8 +1005,12 @@ impl Lexicon {
                             {
                                 // A datum carries its continuations and
                                 // UESCAPE clause too; none of it is source.
+                                let opening = out.len();
                                 for ch in definition[i..literal.end].chars() {
                                     blank(&mut out, ch);
+                                }
+                                if mark_data {
+                                    out.replace_range(opening..opening + 1, "'");
                                 }
                                 consumed_to = literal.end;
                                 continue;
@@ -1005,7 +1024,11 @@ impl Lexicon {
                                     unicode: prefix.is_some_and(|p| p.eq_ignore_ascii_case("u&")),
                                 }
                             };
-                            blank(&mut out, ch);
+                            if mark_data {
+                                out.push('\'');
+                            } else {
+                                blank(&mut out, ch);
+                            }
                         }
                         ('(', _) => {
                             paren_depth += 1;
@@ -1094,11 +1117,12 @@ impl Lexicon {
         definition: &str,
         at: usize,
         prefix_len: usize,
+        mark_data: bool,
         out: &mut String,
     ) -> Option<usize> {
         let literal = sql_string(definition, at - prefix_len)?;
         blank(out, '\'');
-        out.push_str(&self.code_only(&literal.contents));
+        out.push_str(&self.code_with_data_markers(&literal.contents, mark_data));
         for _ in out.len() + literal.breaks.len()..literal.end {
             out.push(' ');
         }
@@ -1131,6 +1155,7 @@ impl Lexicon {
         at: usize,
         len: usize,
         body: bool,
+        mark_data: bool,
         out: &mut String,
     ) -> usize {
         let tag = &definition[at..at + len];
@@ -1148,13 +1173,19 @@ impl Lexicon {
             for ch in tag.chars() {
                 blank(out, ch);
             }
-            out.push_str(&self.code_only(&definition[inner_start..inner_end]));
+            out.push_str(
+                &self.code_with_data_markers(&definition[inner_start..inner_end], mark_data),
+            );
             for ch in definition[inner_end..end].chars() {
                 blank(out, ch);
             }
         } else {
+            let opening = out.len();
             for ch in definition[at..end].chars() {
                 blank(out, ch);
+            }
+            if mark_data {
+                out.replace_range(opening..opening + 1, "'");
             }
         }
         end
@@ -3358,6 +3389,40 @@ mod code_only_tests {
                 "{definition}"
             );
         }
+    }
+
+    #[test]
+    fn literal_markers_preserve_data_boundaries_after_decoding_bodies() {
+        for (definition, markers) in [
+            (
+                "SELECT numeric(10,2) 'hidden', \"numeric\"(1,2), $$hidden$$",
+                2,
+            ),
+            (
+                "() RETURNS int AS 'SELECT numeric(10,2) ''hidden'', \"numeric\"(1,2)' LANGUAGE sql",
+                1,
+            ),
+            (
+                "() RETURNS int AS E'SELECT numeric(10,2) \\'hidden\\', \"numeric\"(1,2)' LANGUAGE sql",
+                1,
+            ),
+            (
+                "() RETURNS int AS $$SELECT numeric(10,2) 'hidden', \"numeric\"(1,2)$$ LANGUAGE sql",
+                1,
+            ),
+            ("() RETURNS int AS 'hidden', 'hidden' LANGUAGE c", 2),
+        ] {
+            let marked = PG.code_only_with_literal_markers(definition);
+            assert_eq!(marked.matches('\'').count(), markers, "{marked}");
+            assert!(!marked.contains("hidden"), "{marked}");
+            assert_eq!(marked.replace('\'', " "), PG.code_only(definition));
+            assert_eq!(marked.len(), definition.len());
+        }
+        let definition = "SELECT N'hidden', \"visible'identifier\"";
+        let marked = MSSQL.code_only_with_literal_markers(definition);
+        assert!(!marked.contains("hidden"));
+        assert!(marked.contains("\"visible'identifier\""));
+        assert_eq!(marked.len(), definition.len());
     }
 
     #[test]

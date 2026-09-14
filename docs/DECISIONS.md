@@ -12021,3 +12021,156 @@ SPEC is in sync with all of these.
      known metadata. Row-projection failures do not suppress this independent
      check. Live tests compare 25 collation pairs with actual constraint DDL
      and cover renames, new columns, created tables, retypes and missing objects.
+
+477. **The rebind scan distinguishes routine calls from relation mentions
+     (issue #230).** Refine 307's name-and-write-path test by the arriving
+     module's reference form: a routine requires `(` as the next non-trivia
+     character, while a view requires another character or the end of the
+     definition. The dialect blanks comments and string data first, and the
+     existing name scan retains its qualification, reserved-word and identifier
+     boundary rules. It considers every occurrence, so a non-call mention does
+     not hide a later call of the same name. Triggers still have no referenced
+     name and cannot capture anything.
+
+     A name immediately after the `INTO` token remains a relation mention
+     even when followed by `(`: `INSERT INTO orders (id)` introduces a target
+     column list, not a call. Ignoring that lexical context skipped a required
+     writer rebuild. Measured with a parsed SQL procedure: after an updatable
+     view arrives earlier on the path, an insert still reaches the shared
+     table until the typed plan rebuilds the procedure; subsequent writes
+     then reach the arrived view's table. Qualified and quoted targets keep
+     the same rule, and a target occurrence does not hide a later routine call.
+
+     PostgreSQL also names a routine without call parentheses in a function's
+     `SUPPORT` clause. PostgreSQL locates that option in the raw function
+     header, skips quoted data and other option operands, and stops at a
+     parsed SQL body. Only the actual operand is matched as a routine and
+     excluded from ordinary relation matching; the shared model has no
+     engine-specific keyword policy. Measured with internal aliases of
+     `array_append` and its matching
+     support function: adding the support routine earlier on the path leaves
+     the old `prosupport` OID until the typed plan rebuilds the function. A view
+     of the operand's name cannot change that OID and causes no rebuild.
+
+     A word anywhere outside parentheses is not sufficient: `support` is
+     unreserved and may name a column, type, language or setting value.
+     Measured with both bare and quoted `support` columns: an output alias
+     after that column cannot bind an arriving routine. Views and parsed SQL
+     functions with unmanaged dependents keep working after the arrival;
+     inventing rebuilds for those aliases refuses a valid plan. Header items
+     preserve quoted names and consume complete string values, including
+     continued escape strings, without reading their contents as options.
+
+     Inside a parameter list or `RETURNS TABLE` list, `support` can also be an
+     ordinary parameter name; the following row type stays a relation mention.
+     Measured with `OUT support orders`: the routine's identity stays `f()`,
+     but a view arriving earlier on its path requires a rebuild to move the
+     result from the shared view's row shape to the new view's row shape.
+
+     Measured on PostgreSQL: a view reading the shared `orders` relation keeps
+     that binding when `app.orders()` arrives. A parsed routine calling the
+     shared `orders()` keeps its old binding until recreated, then calls the
+     new function. Creating the `app.orders` view cannot change that routine
+     call; recreating the original view does bind the newly arrived relation.
+     The two catalog namespaces can coexist. Inventing a view rebuild for the
+     function arrival can refuse a valid plan when the view has an unmanaged
+     dependent, although its relation binding could not move.
+
+     CTE and relation-alias column lists also use parentheses without calling
+     a routine. The PostgreSQL rebind scan masks the declared alias and column
+     names for either arriving kind: stripping only their parentheses would
+     invent view references instead. Balanced groups identify `name(columns) AS (body)`
+     and aliases of FROM items, including derived relations, table functions,
+     joins and ordinalities. Calls inside those groups remain visible, and no
+     subsequent use is resolved to an alias. Measured with unmanaged view
+     dependents, these declarations keep returning the same value after a
+     routine arrival and need no rebuild. Companion live cases put a real
+     same-named call inside the CTE, derived relation, function argument or
+     aliased query: each still rebuilds and binds the arriving routine.
+
+     A record-returning table function can also spell `name(args) AS (columns)`.
+     CTE candidates must therefore follow WITH, its RECURSIVE modifier, or a
+     comma outside a relation list. ROWS FROM starts its own relation-list
+     scope; later members remain calls too. Live views and parsed routines
+     cover direct, lateral, comma-separated and ROWS FROM calls, each changing
+     from the shared routine to the arriving routine after the typed rebuild.
+     USING may name a single relation or alias, but does not open a FROM list:
+     the same keyword also ends a CTE's CYCLE clause before its next item.
+     Record column definitions after AS may omit the alias altogether; their
+     column names are still declarations, including in ROWS FROM. The types
+     following those names remain references, including path-resolved modified
+     types. Ordinary alias/CTE column lists and RETURNS TABLE follow the same
+     rule. Live views with unmanaged dependents retain their bindings when a
+     same-named view arrives. INSERT target lists are read directly rather than
+     as FROM argument groups, keeping later VALUES calls visible.
+
+     Type modifiers are another non-call use of parentheses. Routine arrivals
+     exclude modified type names in parameter and return declarations,
+     transform operands, casts, record column definitions and typed literals.
+     Parameter defaults and cast operands remain expressions. The dialect
+     lexer offers an opt-in datum marker after decoding quoted routine bodies:
+     `numeric(10, 2) '7'` stays distinguishable from a call without exposing
+     string contents or confusing decoded offsets with the original source.
+     Only CAST and XMLSERIALIZE groups introduce AS type operands; routine
+     bodies and materialized CTEs keep their calls visible. Relation aliases
+     still come from their relation context, including INSERT target aliases.
+     PostgreSQL array brackets remain grouping punctuation rather than the
+     shared scanner's identifier quotes, so calls in array defaults survive.
+     Live cases with unmanaged dependents need only the routine arrival;
+     companion defaults and cast operands still rebuild and switch bindings.
+
+     Procedural DECLARE statements also contain type positions. Their type
+     portion ends before DEFAULT, assignment or a cursor's FOR query; BEGIN
+     ends the declaration block. Balanced groups keep parameters and nested
+     expressions out of that scan. Cursor argument types are included without
+     turning CURSOR itself into a type reference. Live PL/pgSQL cases cover
+     nested blocks, constants, both assignment spellings, real unmanaged
+     dependents and calls in defaults, cursor queries and the executable body.
+
+     An OPEN statement's parenthesized arguments belong to a bound cursor,
+     not a routine call. Outside declaration and expression groups, mask only
+     that cursor operand. Its argument expressions, the cursor query and later
+     calls remain visible. Live cases with quoted names, comments, scroll
+     options and nested blocks retain their unmanaged dependents without a
+     rebuild; real calls in cursor arguments and queries still switch to the
+     arriving routine. A parameter or local named open keeps its type reference.
+     The cursor declaration name is excluded with its CURSOR keyword so that
+     blanking the keyword cannot attach its parameter list to that name.
+
+     ANALYZE/ANALYSE and COPY utility targets also accept column lists. Their
+     target column groups are blanked, keeping the names as relation mentions
+     rather than calls. ANALYZE options and multiple targets, its VERBOSE form,
+     and COPY's legacy BINARY form are measured on both PostgreSQL versions.
+     A COPY query starts with its own group and keeps all real calls visible.
+     Live procedural cases with unmanaged dependents need only the arriving
+     routine; its pg_proc entry cannot capture these utility relation targets.
+     CREATE INDEX targets also remain relations, including UNIQUE and ONLY
+     forms. Their opening parenthesis becomes a separator in the scan-only
+     text, rather than blanking the group: index expressions and predicates
+     must keep their routine calls. A space is insufficient when the first
+     index expression starts with another parenthesis. Live procedural index
+     creation with unmanaged dependents accepts the routine arrival alone;
+     expression and predicate controls retain real calls in the rebind scan.
+     An explicit USING access method binds pg_am, not pg_proc or pg_class.
+     Mask that operand for either arrival kind while keeping the following
+     expression list and predicates visible. Live plain, quoted and expression
+     indexes keep their unmanaged dependents when a btree routine arrives;
+     genuine btree calls inside index expressions remain rebind candidates.
+
+     View arrivals retain path-resolved modified type names: a view creates a
+     same-named composite type. Only the modifier group is removed for this
+     relation-form scan. Measured with a numeric-layout base type using the
+     engine's numeric type-modifier functions: a parsed routine keeps its old
+     result after the view arrives, but recreating its declaration refuses
+     because the composite type cannot accept that modifier. Omitting the
+     rebuild would record a declaration whose binding no longer matches.
+     Unquoted built-in type keywords bind pg_catalog directly in the grammar;
+     their modifiers remain excluded even for view arrivals. A same-named view
+     does not stop a newly compiled NUMERIC local from working. Quoted type
+     names retain path resolution and are not given that exception.
+
+     This is a lexical refinement, not SQL parsing or overload resolution.
+     Fully qualified mentions and every overload of a mentioned routine name
+     remain conservative rebind candidates on the effective write path.
+     The general caller report and creation-order name scan keep their existing
+     behavior; the rebind caller explicitly opts into the reference-form scan.

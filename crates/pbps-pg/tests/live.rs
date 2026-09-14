@@ -8860,6 +8860,1483 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_arrival_cannot_capture_a_relation_and_a_view_cannot_capture_a_call() {
+    let mut db = TestDb::create("arrival_kind230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+         CREATE TABLE shared.orders (id integer); INSERT INTO shared.orders VALUES (7);
+         CREATE FUNCTION shared.orders() RETURNS int LANGUAGE sql AS $$ SELECT 9 $$;
+         SET search_path = app, shared;
+         CREATE VIEW app.v AS SELECT * FROM orders;
+         CREATE FUNCTION app.caller() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT orders(); END;
+         CREATE VIEW app.external_dependent AS SELECT * FROM app.v;",
+        )
+        .await
+        .unwrap();
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        "app.v".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT * FROM orders"),
+    );
+    declared.modules.insert(
+        "app.caller()".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT orders(); END",
+        ),
+    );
+    assert_eq!(number(&mut db.conn, "SELECT id FROM app.v").await, 7);
+    assert_eq!(number(&mut db.conn, "SELECT app.caller()").await, 9);
+
+    db.conn
+        .execute("CREATE FUNCTION app.orders() RETURNS int LANGUAGE sql AS $$ SELECT 42 $$")
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT id FROM app.v").await,
+        7,
+        "a pg_proc arrival cannot move the view's pg_class binding"
+    );
+    assert_eq!(number(&mut db.conn, "SELECT app.caller()").await, 9);
+    db.conn.execute("CREATE OR REPLACE FUNCTION app.caller() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT orders(); END").await.unwrap();
+    assert_eq!(number(&mut db.conn, "SELECT app.caller()").await, 42);
+
+    db.conn
+        .execute("CREATE VIEW app.orders AS SELECT 99 AS id")
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT app.caller()").await,
+        42,
+        "a pg_class arrival cannot move the routine call's pg_proc binding"
+    );
+    assert_eq!(number(&mut db.conn, "SELECT id FROM app.v").await, 7);
+    db.conn
+        .execute("CREATE OR REPLACE VIEW app.v AS SELECT * FROM orders")
+        .await
+        .unwrap();
+    assert_eq!(number(&mut db.conn, "SELECT id FROM app.v").await, 99);
+
+    in_a_transaction(&mut db.conn).await;
+    let view = "app.v".parse().unwrap();
+    let dependents =
+        pbps_pg::modules::dependents(&mut db.conn, &view, pbps_model::ModuleKind::View)
+            .await
+            .unwrap();
+    rollback(&mut db.conn).await;
+    let routine_rebound = pbps_pg::modules::rebound_by_this_plan(
+        &declared,
+        &[],
+        &["app.orders()".parse().unwrap()],
+        &Default::default(),
+    );
+    let view_rebound = pbps_pg::modules::rebound_by_this_plan(
+        &declared,
+        &[],
+        &["app.orders".parse().unwrap()],
+        &Default::default(),
+    );
+    db.drop().await;
+    assert!(
+        pbps_pg::modules::unmanaged_refusal(&view, &dependents, &declared).is_some(),
+        "an unnecessary view rebuild would refuse the routine-only arrival"
+    );
+    assert_eq!(
+        routine_rebound,
+        vec![pbps_pg::modules::Rebound {
+            module: "app.caller()".parse().unwrap(),
+            arriving: "app.orders()".parse().unwrap()
+        }]
+    );
+    assert_eq!(
+        view_rebound,
+        vec![pbps_pg::modules::Rebound {
+            module: view,
+            arriving: "app.orders".parse().unwrap()
+        }]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_target_column_list_rebinds_for_a_view_arrival_but_not_a_routine() {
+    let mut db = TestDb::create("insert_target230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+             CREATE TABLE shared.orders (id integer);
+             CREATE TABLE app.storage (id integer);",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let writer: pbps_model::ModuleId = "app.store(integer)".parse().unwrap();
+    let mut a = Schema::default();
+    a.modules.insert(
+        writer.clone(),
+        module(
+            pbps_model::ModuleKind::Procedure,
+            "(n integer) LANGUAGE sql BEGIN ATOMIC \
+             INSERT INTO orders /* columns */ (id) VALUES (n); END",
+        ),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders()".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql AS $$ SELECT 42 $$",
+        ),
+    );
+    let routine_plan = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = routine_plan.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    db.conn.execute("CALL app.store(1)").await.unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT sum(id)::int FROM shared.orders").await,
+        1
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM app.storage").await,
+        0
+    );
+
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT id FROM app.storage"),
+    );
+    let view_plan = plan(&b, &ids, &c, &ids);
+    let mut arrival_only = view_plan.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    db.conn.execute("CALL app.store(2)").await.unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT sum(id)::int FROM shared.orders").await,
+        3
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM app.storage").await,
+        0
+    );
+
+    // The first two writes measure the old binding. Only the typed plan's
+    // rebuild may move the third write onto the newly arrived view.
+    let mut rebuild = view_plan.clone();
+    rebuild
+        .changes
+        .retain(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &rebuild).await;
+    db.conn.execute("CALL app.store(3)").await.unwrap();
+    let shared_sum = number(&mut db.conn, "SELECT sum(id)::int FROM shared.orders").await;
+    let arrived_sum = number(
+        &mut db.conn,
+        "SELECT coalesce(sum(id), 0)::int FROM app.storage",
+    )
+    .await;
+    db.drop().await;
+    assert_eq!((shared_sum, arrived_sum), (3, 3));
+    assert_eq!(routine_plan.changes.len(), 1, "{routine_plan:#?}");
+    assert_eq!(view_plan.changes.len(), 2, "{view_plan:#?}");
+    assert!(matches!(&view_plan.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &writer));
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_support_operand_rebinds_to_an_arriving_routine_without_call_parentheses() {
+    let mut db = TestDb::create("support_target230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+             CREATE FUNCTION shared.planner_support(internal) RETURNS internal
+             LANGUAGE internal AS 'array_append_support';",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let target: pbps_model::ModuleId = "app.uses_support(anycompatiblearray,anycompatible)"
+        .parse()
+        .unwrap();
+    let mut a = Schema::default();
+    a.modules.insert(
+        target.clone(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(anycompatiblearray,anycompatible) RETURNS anycompatiblearray \
+             LANGUAGE internal AS 'array_append' SUPPORT /* operand */ planner_support",
+        ),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    let binding = |schema| {
+        format!(
+            "SELECT (prosupport = '{schema}.planner_support(internal)'::regprocedure)::int \
+         FROM pg_proc WHERE oid = \
+         'app.uses_support(anycompatiblearray,anycompatible)'::regprocedure"
+        )
+    };
+    assert_eq!(number(&mut db.conn, &binding("shared")).await, 1);
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.planner_support(internal)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(internal) RETURNS internal LANGUAGE internal AS 'array_append_support'",
+        ),
+    );
+    let routine_plan = plan(&a, &ids, &b, &ids);
+    apply(&mut db.conn, &pg, &routine_plan).await;
+    let after_routine = number(&mut db.conn, &binding("app")).await;
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.planner_support".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS id"),
+    );
+    let view_plan = plan(&b, &ids, &c, &ids);
+    apply(&mut db.conn, &pg, &view_plan).await;
+    let after_view = number(&mut db.conn, &binding("app")).await;
+    db.drop().await;
+    assert_eq!(
+        after_routine, 1,
+        "the typed plan must replace the old support OID"
+    );
+    assert_eq!(after_view, 1);
+    assert_eq!(routine_plan.changes.len(), 2, "{routine_plan:#?}");
+    assert!(matches!(&routine_plan.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &target));
+    assert_eq!(view_plan.changes.len(), 1, "{view_plan:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_out_parameter_named_support_rebinds_its_row_type_for_a_view_arrival() {
+    let mut db = TestDb::create("support_parameter230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+             CREATE VIEW shared.orders AS SELECT 0 AS old_field;",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let target: pbps_model::ModuleId = "app.f()".parse().unwrap();
+    let mut a = Schema::default();
+    a.modules.insert(
+        target.clone(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(OUT support orders) LANGUAGE sql AS 'SELECT 7'",
+        ),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    assert_eq!(
+        text(&mut db.conn, "SELECT to_json(app.f())::text").await,
+        "{\"old_field\":7}"
+    );
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        ),
+    );
+    let routine_plan = plan(&a, &ids, &b, &ids);
+    apply(&mut db.conn, &pg, &routine_plan).await;
+    assert_eq!(
+        text(&mut db.conn, "SELECT to_json(app.f())::text").await,
+        "{\"old_field\":7}"
+    );
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 0 AS new_field"),
+    );
+    let view_plan = plan(&b, &ids, &c, &ids);
+    apply(&mut db.conn, &pg, &view_plan).await;
+    let result = text(&mut db.conn, "SELECT to_json(app.f())::text").await;
+    db.drop().await;
+    assert_eq!(result, "{\"new_field\":7}");
+    assert_eq!(routine_plan.changes.len(), 1, "{routine_plan:#?}");
+    assert_eq!(view_plan.changes.len(), 2, "{view_plan:#?}");
+    assert!(matches!(&view_plan.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &target));
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_support_column_alias_does_not_rebuild_modules_with_unmanaged_dependents() {
+    let mut db = TestDb::create("support_alias230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE TABLE app.source (support integer); \
+             INSERT INTO app.source VALUES (7)",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::new();
+    let mut a = Schema::default();
+    for (suffix, column) in [("bare", "support"), ("quoted", "\"support\"")] {
+        a.modules.insert(
+            format!("app.view_{suffix}").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::View,
+                &format!("SELECT {column} planner_support FROM app.source"),
+            ),
+        );
+        a.modules.insert(
+            format!("app.fn_{suffix}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!(
+                    "() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                     SELECT {column} planner_support FROM app.source; END"
+                ),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for suffix in ["bare", "quoted"] {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external_{suffix} AS SELECT \
+                 app.fn_{suffix}() AS value, planner_support FROM app.view_{suffix}"
+            ))
+            .await
+            .unwrap();
+    }
+    // These dependents make an invented rebuild a refused valid plan, not
+    // just an extra statement. Neither alias can bind an arriving routine.
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.planner_support(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival_plan = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival_plan.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for suffix in ["bare", "quoted"] {
+        assert_eq!(
+            number(
+                &mut db.conn,
+                &format!("SELECT value + planner_support FROM app.external_{suffix}")
+            )
+            .await,
+            14
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival_plan.changes.len(), 1, "{arrival_plan:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn cte_and_relation_alias_column_lists_cannot_capture_an_arriving_routine() {
+    let mut db = TestDb::create("column_alias230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+         CREATE TABLE shared.source (id integer); INSERT INTO shared.source VALUES (7); \
+         CREATE FUNCTION shared.rows_fn() RETURNS SETOF integer LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let definitions = [
+        "WITH orders(id) AS (VALUES (7)) SELECT id FROM orders",
+        "WITH seed AS (VALUES (7)), orders(id) AS (SELECT * FROM seed) SELECT id FROM orders",
+        "WITH RECURSIVE orders(id) AS (VALUES (7)) SELECT id FROM orders",
+        "WITH orders(id) AS MATERIALIZED (VALUES (7)) SELECT id FROM orders",
+        "WITH orders(id) AS NOT MATERIALIZED (VALUES (7)) SELECT id FROM orders",
+        "SELECT id FROM shared.source AS orders(id)",
+        "SELECT id FROM shared.source orders(id)",
+        "SELECT id FROM (VALUES (7)) orders(id)",
+        "SELECT id FROM shared.rows_fn() orders(id)",
+        "SELECT orders.id FROM shared.source seed, shared.source orders(id)",
+        "SELECT orders.id FROM shared.source seed CROSS JOIN LATERAL shared.rows_fn() orders(id)",
+        "SELECT id FROM ROWS FROM (shared.rows_fn()) orders(id)",
+        "SELECT id FROM shared.rows_fn() WITH ORDINALITY orders(id, ordinal)",
+        "SELECT id FROM ONLY (shared.source) orders(id)",
+        "WITH RECURSIVE seed(id) AS (VALUES (7) UNION ALL SELECT id + 1 FROM seed WHERE id < 7) \
+         SEARCH DEPTH FIRST BY id SET seq CYCLE id SET cycle USING path, \
+         orders(id) AS (SELECT id FROM seed) SELECT id FROM orders",
+        "SELECT id FROM shared.source AS U&\"or!0064ers\" UESCAPE '!' (id)",
+    ];
+    let pg = Postgres::new();
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT id FROM app.v{i}"
+            ))
+            .await
+            .unwrap();
+    }
+    // A spurious AlterModule would refuse the otherwise valid arrival: the
+    // dependent is real and unmanaged, and the declaration cannot bind a call.
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT id FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn alias_declarations_leave_real_calls_available_for_rebinding() {
+    let mut db = TestDb::create("alias_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+         CREATE TABLE shared.source (id integer); INSERT INTO shared.source VALUES (7); \
+         CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'; \
+         CREATE FUNCTION shared.echo(n integer) RETURNS int LANGUAGE sql AS 'SELECT n'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        "WITH orders(id) AS (SELECT orders(7)) SELECT id FROM orders",
+        "SELECT id FROM (SELECT orders(7)) orders(id)",
+        "SELECT id FROM shared.echo(orders(7)) orders(id)",
+        "SELECT orders(id) AS id FROM shared.source orders(id)",
+        "SELECT id FROM orders(7) orders(id)",
+        "SELECT orders.id FROM shared.source s, LATERAL orders(s.id) orders(id)",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT id FROM app.v{i}")).await,
+            7
+        );
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT id FROM app.v{i}")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn type_modifiers_cannot_capture_an_arriving_routine() {
+    let mut db = TestDb::create("typmods230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE FUNCTION app.record_source() RETURNS record LANGUAGE sql AS 'SELECT 7::numeric'").await.unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        (
+            "app.param(numeric)",
+            "(n numeric(10, 2)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "SELECT app.param(7)::int AS value",
+        ),
+        (
+            "app.result()",
+            "() RETURNS numeric(10, 2) LANGUAGE sql AS 'SELECT 7'",
+            "SELECT app.result()::int AS value",
+        ),
+        (
+            "app.out_param()",
+            "(OUT n numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "SELECT app.out_param()::int AS value",
+        ),
+        (
+            "app.table_result()",
+            "() RETURNS TABLE(n numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "SELECT n::int AS value FROM app.table_result()",
+        ),
+        (
+            "app.cast_type()",
+            "() RETURNS int LANGUAGE sql RETURN (7::numeric(10, 2))::int",
+            "SELECT app.cast_type() AS value",
+        ),
+        (
+            "app.cast_as()",
+            "() RETURNS int LANGUAGE sql RETURN CAST(7 AS numeric(10, 2))::int",
+            "SELECT app.cast_as() AS value",
+        ),
+        (
+            "app.literal_plain()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT numeric(10, 2) ''7''::int'",
+            "SELECT app.literal_plain() AS value",
+        ),
+        (
+            "app.literal_dollar()",
+            "() RETURNS int LANGUAGE sql AS $$SELECT numeric(10, 2) '7'::int$$",
+            "SELECT app.literal_dollar() AS value",
+        ),
+        (
+            "app.literal_escape()",
+            "() RETURNS int LANGUAGE sql AS E'SELECT numeric(10, 2) \\'7\\'::int'",
+            "SELECT app.literal_escape() AS value",
+        ),
+        (
+            "app.record_alias()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT n::int FROM app.record_source() AS t(n numeric(10, 2))'",
+            "SELECT app.record_alias() AS value",
+        ),
+        (
+            "app.implicit_record_alias()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT n::int FROM app.record_source() t(n numeric(10, 2))'",
+            "SELECT app.implicit_record_alias() AS value",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (id, definition, _) in definitions {
+        a.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for (i, (_, _, query)) in definitions.iter().enumerate() {
+        db.conn
+            .execute(&format!("CREATE VIEW app.external{i} AS {query}"))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn type_modifiers_do_not_hide_calls_in_defaults_or_cast_operands() {
+    let mut db = TestDb::create("typmod_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+        CREATE FUNCTION shared.numeric(integer,integer) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        (
+            "app.defaulted(numeric)",
+            "(n numeric(10, 2) DEFAULT \"numeric\"(1, 2)) RETURNS int LANGUAGE sql RETURN n::int",
+            "SELECT app.defaulted()",
+        ),
+        (
+            "app.equals_default(numeric)",
+            "(n numeric(10, 2) = \"numeric\"(1, 2)) RETURNS int LANGUAGE sql RETURN n::int",
+            "SELECT app.equals_default()",
+        ),
+        (
+            "app.array_default(numeric[])",
+            "(n numeric(10, 2)[] DEFAULT ARRAY[\"numeric\"(1, 2)]) RETURNS int LANGUAGE sql RETURN n[1]::int",
+            "SELECT app.array_default()",
+        ),
+        (
+            "app.body()",
+            "() RETURNS numeric(10, 2) LANGUAGE sql BEGIN ATOMIC SELECT \"numeric\"(1, 2); END",
+            "SELECT app.body()::int",
+        ),
+        (
+            "app.cast_call()",
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT CAST(\"numeric\"(1, 2) AS numeric(10, 2))::int; END",
+            "SELECT app.cast_call()",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (id, definition, _) in definitions {
+        a.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for (_, _, query) in definitions {
+        assert_eq!(number(&mut db.conn, query).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    for (_, _, query) in definitions {
+        assert_eq!(number(&mut db.conn, query).await, 42);
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn procedural_local_type_modifiers_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("local_types230").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS 'DECLARE amount numeric(10,2) = 7; BEGIN RETURN amount::int; END'",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE amount CONSTANT numeric(10,2) NOT NULL DEFAULT 7; BEGIN RETURN amount::int; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS $$BEGIN DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE c CURSOR(n numeric(10,2)) FOR SELECT n; BEGIN RETURN 7; END$$",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.numeric".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let view_arrival = plan(&b, &ids, &c, &ids);
+    let mut view_only = view_arrival.clone();
+    view_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &view_only).await;
+    // Unquoted NUMERIC is a grammar-bound system type. Even recompiling after
+    // the view arrives still accepts its modifier, unlike a path-bound type.
+    db.conn
+        .execute(&format!(
+            "CREATE OR REPLACE FUNCTION app.f0{}",
+            definitions[0]
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.external0").await,
+        7
+    );
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+    assert_eq!(view_arrival.changes.len(), 1, "{view_arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn procedural_defaults_and_cursor_queries_still_rebind_real_calls() {
+    let mut db = TestDb::create("local_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+        CREATE FUNCTION shared.numeric(integer,integer) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "DECLARE n numeric(10,2) DEFAULT \"numeric\"(1,2); BEGIN RETURN n::int; END",
+        "DECLARE n numeric(10,2) := \"numeric\"(1,2); BEGIN RETURN n::int; END",
+        "DECLARE n numeric(10,2) = \"numeric\"(1,2); BEGIN RETURN n::int; END",
+        "DECLARE n numeric(10,2); c CURSOR(arg numeric(10,2)) FOR SELECT \"numeric\"(arg::int,2); BEGIN OPEN c(1); FETCH c INTO n; CLOSE c; RETURN n::int; END",
+        "DECLARE n numeric(10,2) := 7; BEGIN RETURN \"numeric\"(n::int,2); END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    // Emitted DDL resets the session path; procedural expressions bind when
+    // executed, so restore the application's path before calling them.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn bound_cursor_opens_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("cursor_names230").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let pg = Postgres::new();
+    let bodies = [
+        "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "DECLARE \"orders\" NO SCROLL CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN /* cursor */ \"orders\" /* arguments */ (7); FETCH \"orders\" INTO result; CLOSE \"orders\"; RETURN result; END",
+        "DECLARE OrDeRs SCROLL CURSOR(n int) FOR SELECT n; result int; BEGIN IF true THEN OPEN ORDERS(7); END IF; FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "BEGIN DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN result; END; END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..bodies.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn bound_cursor_arguments_and_queries_keep_real_routine_calls() {
+    let mut db = TestDb::create("cursor_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+             CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(orders(7)); FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "DECLARE orders CURSOR(n int) FOR SELECT orders(n); result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN orders(result); END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn record_returning_from_calls_rebind_in_views_and_parsed_routines() {
+    let mut db = TestDb::create("record_calls230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE FUNCTION shared.orders(integer) RETURNS record LANGUAGE sql AS 'SELECT 7'")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let queries = [
+        "SELECT x FROM orders(7) AS (x integer)",
+        "SELECT x FROM ROWS FROM(orders(7) AS (x integer))",
+        "SELECT x FROM ROWS FROM(generate_series(1,1), orders(7) AS (x integer))",
+        "SELECT x FROM (VALUES (1)) seed(n), orders(7) AS (x integer)",
+        "SELECT x FROM (VALUES (1)) seed(n) CROSS JOIN LATERAL orders(7) AS (x integer)",
+        "WITH seed(n) AS (VALUES (1)) SELECT x FROM seed CROSS JOIN orders(7) AS (x integer)",
+    ];
+    let mut a = Schema::default();
+    for (i, query) in queries.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, query),
+        );
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE sql BEGIN ATOMIC {query}; END"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..queries.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT x FROM app.v{i}")).await,
+            7
+        );
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS record LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let change_count = arrival.changes.len();
+    apply(&mut db.conn, &pg, &arrival).await;
+    let mut results = Vec::new();
+    for i in 0..queries.len() {
+        results.push(number(&mut db.conn, &format!("SELECT x FROM app.v{i}")).await);
+        results.push(number(&mut db.conn, &format!("SELECT app.f{i}()")).await);
+    }
+    db.drop().await;
+    assert_eq!(change_count, queries.len() * 2 + 1, "{arrival:#?}");
+    assert_eq!(results, vec![42; queries.len() * 2]);
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn utility_target_column_lists_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("utility_names230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.orders(id int); INSERT INTO shared.orders VALUES (7); CREATE TABLE shared.source(id int)")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "ANALYZE orders(id)",
+        "ANALYSE VERBOSE orders(id)",
+        "ANALYZE (VERBOSE false) source(id), orders(id)",
+        "ANALYZE shared . \"orders\" /* columns */ (id)",
+        "COPY orders(id) TO '/dev/null'",
+        "COPY BINARY orders(id) TO '/dev/null'",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn index_target_column_lists_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("index_names230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.orders(id int); INSERT INTO shared.orders VALUES (7); CREATE TABLE shared.source(id int)")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "CREATE INDEX ix_basic ON orders(id)",
+        "CREATE UNIQUE INDEX ix_unique ON ONLY orders(id)",
+        "CREATE INDEX ix_method ON orders USING btree (id)",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn index_access_methods_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("index_methods230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.orders(id int); INSERT INTO shared.orders VALUES (7); CREATE TABLE shared.source(id int)")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "CREATE INDEX ix_basic ON orders USING btree (id)",
+        "CREATE UNIQUE INDEX ix_unique ON ONLY orders USING \"btree\" (id)",
+        "CREATE INDEX ix_expression ON shared.orders USING btree ((abs(id)))",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.btree(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn record_column_names_cannot_capture_an_arriving_view() {
+    let mut db = TestDb::create("record_names230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE FUNCTION shared.record_source() RETURNS record LANGUAGE sql AS 'SELECT 7'; CREATE TABLE shared.source(id int); INSERT INTO shared.source VALUES (7)")
+        .await
+        .unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        "SELECT 1 AS value FROM shared.record_source() AS (orders integer)",
+        "SELECT 1 AS value FROM shared.record_source() AS t(orders integer)",
+        "SELECT 1 AS value FROM shared.record_source() t(orders integer)",
+        "SELECT 1 AS value FROM ROWS FROM(shared.record_source() AS (orders integer))",
+        "SELECT 1 AS value FROM ROWS FROM(generate_series(1,1), shared.record_source() AS (orders integer))",
+        "SELECT 1 AS value FROM shared.source AS t(orders)",
+        "WITH t(orders) AS (VALUES (7)) SELECT 1 AS value FROM t",
+        "SELECT 1 AS value FROM (SELECT 7) AS t(orders)",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT value FROM app.v{i}"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            1
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_arrival_must_recheck_a_modified_type_binding() {
+    let mut db = TestDb::create("type_view230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; \
+        CREATE TYPE shared.geometry; \
+        CREATE FUNCTION shared.geometry_in(cstring,oid,integer) RETURNS shared.geometry AS 'numeric_in' LANGUAGE internal IMMUTABLE STRICT; \
+        CREATE FUNCTION shared.geometry_out(shared.geometry) RETURNS cstring AS 'numeric_out' LANGUAGE internal IMMUTABLE STRICT; \
+        CREATE TYPE shared.geometry (INPUT=shared.geometry_in,OUTPUT=shared.geometry_out,TYPMOD_IN=numerictypmodin,TYPMOD_OUT=numerictypmodout,INTERNALLENGTH=VARIABLE,ALIGNMENT=int4,STORAGE=main)").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definition =
+        "(OUT result geometry(10,2)) LANGUAGE sql BEGIN ATOMIC SELECT '7'::geometry(10,2); END";
+    let mut a = Schema::default();
+    a.modules.insert(
+        "app.f()".parse().unwrap(),
+        module(pbps_model::ModuleKind::Function, definition),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    assert_eq!(text(&mut db.conn, "SELECT app.f()::text").await, "7");
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.geometry".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    assert_eq!(text(&mut db.conn, "SELECT app.f()::text").await, "7");
+    // The parsed routine still has its old type, but the same declaration now
+    // resolves a composite type that refuses the modifier. A successful plan
+    // cannot record that source without rechecking the routine's binding.
+    in_a_transaction(&mut db.conn).await;
+    db.conn
+        .execute("SET LOCAL search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    let refused = db
+        .conn
+        .execute(&format!("CREATE OR REPLACE FUNCTION app.f{definition}"))
+        .await
+        .unwrap_err();
+    rollback(&mut db.conn).await;
+    db.drop().await;
+    assert_eq!(refused.server_error_code().as_deref(), Some("42601"));
+    assert_eq!(arrival.changes.len(), 2, "{arrival:#?}");
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**
