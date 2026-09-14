@@ -2442,6 +2442,9 @@ fn ddl_reference_spans(
         }
         let mut target = at + 1;
         if create {
+            if token_is(tokens, target, "or") && token_is(tokens, target + 1, "replace") {
+                target += 2;
+            }
             while [
                 "global",
                 "local",
@@ -2449,6 +2452,8 @@ fn ddl_reference_spans(
                 "temporary",
                 "unlogged",
                 "foreign",
+                "recursive",
+                "materialized",
             ]
             .iter()
             .any(|word| token_is(tokens, target, word))
@@ -2458,7 +2463,8 @@ fn ddl_reference_spans(
         }
         let composite = token_is(tokens, target, "type");
         let domain = create && token_is(tokens, target, "domain");
-        if !token_is(tokens, target, "table") && !composite && !domain {
+        let view = create && token_is(tokens, target, "view");
+        if !token_is(tokens, target, "table") && !composite && !domain && !view {
             at += 1;
             continue;
         }
@@ -2494,9 +2500,15 @@ fn ddl_reference_spans(
             }
             if let Some(after) = after_group(tokens, item) {
                 if !composite {
-                    // CREATE TABLE's target precedes declarations, not call
-                    // arguments. Keep all defaults/constraints in that group.
+                    // CREATE TABLE/VIEW targets precede declarations, not
+                    // call arguments. Query/default expressions remain code.
                     separators.push(tokens[item].offset);
+                }
+                if view {
+                    // View column lists contain names alone. Their AS query
+                    // is not a table column/type declaration list (477).
+                    at += 1;
+                    continue;
                 }
                 let close = after - 1;
                 item += 1;
@@ -4121,6 +4133,44 @@ mod tests {
                 1,
                 "{statement}"
             );
+        }
+    }
+
+    #[test]
+    fn create_view_targets_keep_the_query_calls_and_relation_mentions() {
+        for create in [
+            "CREATE VIEW",
+            "CREATE TEMP VIEW",
+            "CREATE OR REPLACE VIEW",
+            "CREATE OR REPLACE TEMPORARY VIEW",
+            "CREATE RECURSIVE VIEW",
+            "CREATE OR REPLACE TEMP RECURSIVE VIEW",
+            "CREATE MATERIALIZED VIEW",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS",
+        ] {
+            for target in ["orders", "app . \"orders\""] {
+                for (query, calls) in [("SELECT 7", 0), ("SELECT orders(7)", 1)] {
+                    let mut declared = Schema::default();
+                    declared.modules.insert(id("app.f()"), module(&format!("() RETURNS void LANGUAGE plpgsql AS $$ BEGIN {create} {target} /* columns */ (id) AS {query}; END $$")));
+                    assert_eq!(
+                        rebound_by_this_plan(
+                            &declared,
+                            &[],
+                            &[id("app.orders(integer)")],
+                            &BTreeSet::new()
+                        )
+                        .len(),
+                        calls,
+                        "{create} {target}: {query}"
+                    );
+                    assert_eq!(
+                        rebound_by_this_plan(&declared, &[], &[id("app.orders")], &BTreeSet::new())
+                            .len(),
+                        1,
+                        "{create} {target}: {query}"
+                    );
+                }
+            }
         }
     }
 

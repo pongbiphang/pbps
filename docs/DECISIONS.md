@@ -12234,6 +12234,13 @@ SPEC is in sync with all of these.
      Live temporary, conditional, ordinary, unlogged and CREATE AS forms retain
      unmanaged dependents without false routine-arrival rebuilds; a genuine
      default call inside the table declaration still rebuilds and switches.
+     CREATE VIEW and CREATE MATERIALIZED VIEW targets use the same separator.
+     OR REPLACE, temporary, recursive and conditional forms still introduce a
+     relation target, and the optional column list contains names alone. Keep
+     every AS-query expression outside declaration-type scanning. Live routines
+     with unmanaged dependents create and drop these views after a same-named
+     routine arrives; actual query calls still receive typed rebuilds and then
+     resolve to the arriving routine.
      CREATE DOMAIN base types and CREATE/ALTER TYPE composite attributes use
      those same prefixes, including optional AS and ADD/ALTER ATTRIBUTE forms.
      Domain defaults and checks remain expressions. Live domain and composite
