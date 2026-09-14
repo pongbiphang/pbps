@@ -8506,12 +8506,28 @@ async fn continued_routine_bodies_create_the_callee_first_and_ignore_string_data
             "() RETURNS int LANGUAGE sql AS 'SELECT app.'\n'z()'",
         ),
         (
+            "app.a_escape()",
+            "() RETURNS int LANGUAGE sql AS E'SELECT app.\\172()'",
+        ),
+        (
+            "app.a_escape_continued()",
+            "() RETURNS int LANGUAGE sql AS E'SELECT app.'\n'\\x7a()'",
+        ),
+        (
+            "app.a_unicode()",
+            "() RETURNS int LANGUAGE sql AS U&'SELECT app.!007a()' UESCAPE '!'",
+        ),
+        (
             "app.b_cr()",
             "() RETURNS int AS 'SELECT app.' -- continued\r 'z()' LANGUAGE sql",
         ),
         (
             "app.c_data()",
             "() RETURNS text LANGUAGE sql AS 'SELECT ''app.'\n'z()'''",
+        ),
+        (
+            "app.d_escaped_data()",
+            "() RETURNS text LANGUAGE sql AS E'SELECT \\'app.z()\\''",
         ),
     ] {
         declared.modules.insert(
@@ -8529,7 +8545,11 @@ async fn continued_routine_bodies_create_the_callee_first_and_ignore_string_data
             }
         }
         db.conn
-            .query("SELECT (app.a_lf() = 1 AND app.b_cr() = 1 AND app.c_data() = 'app.z()')::int AS ok")
+            .query(
+                "SELECT (app.a_lf() = 1 AND app.b_cr() = 1 AND app.a_escape() = 1
+                AND app.a_escape_continued() = 1 AND app.a_unicode() = 1
+                AND app.c_data() = 'app.z()' AND app.d_escaped_data() = 'app.z()')::int AS ok",
+            )
             .await
     }
     .await;
@@ -8539,7 +8559,14 @@ async fn continued_routine_bodies_create_the_callee_first_and_ignore_string_data
     assert_eq!(rows[0].try_get::<i32>("ok").unwrap(), Some(1));
     assert_eq!(
         callers,
-        ["app.a_lf()", "app.b_cr()"].map(|id| id.parse().unwrap())
+        [
+            "app.a_escape()",
+            "app.a_escape_continued()",
+            "app.a_lf()",
+            "app.a_unicode()",
+            "app.b_cr()"
+        ]
+        .map(|id| id.parse().unwrap())
     );
 }
 
@@ -8572,7 +8599,19 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
         ),
         (
             "app.internal_unicode(integer, integer)",
-            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE U&\"intern!0061l\" UESCAPE '!' STRICT",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE U&\"intern!0061l\" UESCAPE /* character */ E'!' STRICT",
+        ),
+        (
+            "app.c_escape_language(text, text)",
+            "(a text, b text) RETURNS real LANGUAGE E'\\x63' STRICT AS '$libdir/pg_trgm', 'similarity'",
+        ),
+        (
+            "app.internal_unicode_language(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE U&'intern!0061l' UESCAPE '!' STRICT",
+        ),
+        (
+            "app.internal_dollar_language(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE $lang$internal$lang$ STRICT",
         ),
     ] {
         let id: pbps_model::ModuleId = id.parse().unwrap();
@@ -8584,7 +8623,7 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
             .modules
             .insert(id, module(pbps_model::ModuleKind::Function, definition));
     }
-    for name in ["c_before", "c_after", "c_unicode"] {
+    for name in ["c_before", "c_after", "c_unicode", "c_escape_language"] {
         assert_eq!(
             number(
                 &mut db.conn,
@@ -8594,7 +8633,13 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
             1
         );
     }
-    for name in ["internal_before", "internal_after", "internal_unicode"] {
+    for name in [
+        "internal_before",
+        "internal_after",
+        "internal_unicode",
+        "internal_unicode_language",
+        "internal_dollar_language",
+    ] {
         assert_eq!(
             number(&mut db.conn, &format!("SELECT app.{name}(1, 2)")).await,
             3
