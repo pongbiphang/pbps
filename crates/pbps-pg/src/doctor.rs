@@ -419,7 +419,7 @@ fn spelled(part: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gap {
     pub permission: &'static str,
-    pub why: &'static str,
+    pub why: String,
     /// Where it is missing, already spelled the way a `GRANT` names it.
     pub securable: Securable,
 }
@@ -655,8 +655,9 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
 
     held.declaration_gaps
         .extend(data::missing(conn, ask.data).await?);
-    held.declaration_gaps
-        .extend(grants::missing(conn, ask.granted).await?);
+    let grants = grants::missing(conn, ask).await?;
+    held.declaration_gaps.extend(grants.gaps);
+    held.absent_schemas.extend(grants.absent_schemas);
     Ok(held)
 }
 
@@ -756,7 +757,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     if !rights.holds(r.name) {
                         out.push(Gap {
                             permission: r.name,
-                            why: r.why,
+                            why: r.why.to_owned(),
                             securable: Securable::Schema(schema.clone()),
                         });
                     }
@@ -767,7 +768,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     if !rights.owned {
                         out.push(Gap {
                             permission: r.name,
-                            why: r.why,
+                            why: r.why.to_owned(),
                             securable: Securable::Object(object.clone()),
                         });
                     }
@@ -778,7 +779,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     if !rights.privileges.contains(r.name) {
                         out.push(Gap {
                             permission: r.name,
-                            why: r.why,
+                            why: r.why.to_owned(),
                             securable: Securable::Object(object.clone()),
                         });
                     }
@@ -798,7 +799,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 {
                     out.push(Gap {
                         permission: r.name,
-                        why: r.why,
+                        why: r.why.to_owned(),
                         securable: Securable::Schema(LEDGER_SCHEMA.to_owned()),
                     });
                 }
@@ -812,7 +813,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 {
                     out.push(Gap {
                         permission: r.name,
-                        why: r.why,
+                        why: r.why.to_owned(),
                         securable: Securable::Object(state.clone()),
                     });
                 }
@@ -826,7 +827,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 {
                     out.push(Gap {
                         permission: r.name,
-                        why: r.why,
+                        why: r.why.to_owned(),
                         securable: Securable::Schema(LEDGER_SCHEMA.to_owned()),
                     });
                 }
@@ -836,7 +837,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     if !rights.privileges.contains(r.name) {
                         out.push(Gap {
                             permission: r.name,
-                            why: r.why,
+                            why: r.why.to_owned(),
                             securable: Securable::Object(object.clone()),
                         });
                     }
@@ -860,7 +861,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     if !column_covered {
                         out.push(Gap {
                             permission: r.name,
-                            why: r.why,
+                            why: r.why.to_owned(),
                             securable: Securable::Object(object.clone()),
                         });
                     }
@@ -871,7 +872,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     if !rights.holds(r.name) {
                         out.push(Gap {
                             permission: r.name,
-                            why: r.why,
+                            why: r.why.to_owned(),
                             securable: Securable::Schema(schema.clone()),
                         });
                     }

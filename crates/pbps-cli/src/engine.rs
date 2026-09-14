@@ -733,7 +733,7 @@ pub async fn permission_support(
 pub struct PermissionGap {
     pub permission: &'static str,
     pub securable: String,
-    pub why: &'static str,
+    pub why: String,
 }
 
 /// What `doctor` learns about the connected account.
@@ -777,7 +777,7 @@ pub async fn permissions(
                     .map(|g| PermissionGap {
                         permission: g.permission,
                         securable: g.securable(),
-                        why: g.why,
+                        why: g.why.into(),
                     })
                     .collect(),
                 absent_schemas: held.absent_schemas,

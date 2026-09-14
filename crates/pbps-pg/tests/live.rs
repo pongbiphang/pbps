@@ -6352,7 +6352,7 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
          CREATE TABLE shared.owner_defaults(id integer); \
          ALTER TABLE shared.owner_defaults OWNER TO {recipient}; \
          GRANT USAGE ON SCHEMA shared TO {deployer}; \
-         GRANT SELECT ON shared.f TO {deployer}, {recipient}; \
+         GRANT SELECT ON shared.f TO {deployer}; \
          GRANT EXECUTE ON FUNCTION shared.f(text) TO {deployer} WITH GRANT OPTION; \
          GRANT CREATE ON SCHEMA public TO {deployer}"
         ))
@@ -6408,8 +6408,13 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
     }
     let adopted = pbps_db::doctor::GrantTargets {
         roles: vec![recipient.clone()],
+        managed_modules: ["shared.f".parse().unwrap()].into_iter().collect(),
         ..Default::default()
     };
+    db.conn
+        .execute(&format!("GRANT SELECT ON shared.f TO {recipient}"))
+        .await
+        .unwrap();
     let catalog_only = doctor::Ask {
         granted: &adopted,
         ..ask
@@ -6425,6 +6430,10 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         "a grant removed from declarations remains a REVOKE demand: {gaps:?}"
     );
     assert_eq!(gaps[0].securable(), "TABLE \"shared\".\"f\"");
+    db.conn
+        .execute(&format!("REVOKE SELECT ON shared.f FROM {recipient}"))
+        .await
+        .unwrap();
     db.conn
         .execute(&format!(
             "GRANT USAGE ON SCHEMA shared TO {authority} WITH GRANT OPTION; \
@@ -6471,6 +6480,9 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         3,
         "membership removal revokes effective grant authority: {gaps:?}"
     );
+    for role in [&recipient, &deployer, &authority] {
+        cleanup_role(&mut db, role).await;
+    }
     db.drop().await;
 }
 
@@ -24481,4 +24493,398 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
         .await
     );
     db.drop().await;
+}
+
+async fn grant_diagnosis(conn: &mut Conn, granted: &pbps_db::doctor::GrantTargets) -> doctor::Held {
+    doctor::permissions(
+        conn,
+        &doctor::Ask {
+            managed_schemas: &[],
+            managed_tables: &[],
+            referenced: &[],
+            referenced_columns: &Default::default(),
+            granted,
+            data: &Default::default(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn grant_deployer(db: &mut TestDb, tag: &str) -> (String, Conn) {
+    let role = least_privilege_role(db, tag).await;
+    db.conn
+        .execute(&format!("GRANT CREATE ON SCHEMA public TO {role}"))
+        .await
+        .unwrap();
+    let mut conn = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .unwrap();
+    state::ensure_tables(&mut conn).await.unwrap();
+    (role, conn)
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_adopted_revoke_requires_the_original_grantor() {
+    let mut db = TestDb::create("doctor_grantor329").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "grantor329_d").await;
+    let first = least_privilege_role(&mut db, "grantor329_a").await;
+    let second = least_privilege_role(&mut db, "grantor329_b").await;
+    let recipient = least_privilege_role(&mut db, "grantor329_r").await;
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.t(id integer);
+         GRANT SELECT ON public.t TO {first}, {second} WITH GRANT OPTION;
+         SET ROLE {first}; GRANT SELECT ON public.t TO {recipient}; RESET ROLE;
+         SET ROLE {second}; GRANT SELECT ON public.t TO {deployer} WITH GRANT OPTION; RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    let grants = pbps_db::doctor::GrantTargets {
+        roles: vec![recipient.clone()],
+        managed_tables: ["public.t".parse().unwrap()].into_iter().collect(),
+        ..Default::default()
+    };
+    let before = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    let acl = format!(
+        "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
+        WHERE c.oid = 'public.t'::regclass AND a.grantee = '{recipient}'::regrole
+          AND a.grantor = '{first}'::regrole AND a.privilege_type = 'SELECT')"
+    );
+    theirs
+        .execute(&format!("REVOKE SELECT ON public.t FROM {recipient}"))
+        .await
+        .unwrap();
+    let unrelated_left_acl = truth(&mut db.conn, &acl).await;
+    // Even ownership does not make an independently issued ACL the owner's.
+    let owner = doctor::missing(&grant_diagnosis(&mut db.conn, &grants).await);
+    db.conn
+        .execute(&format!(
+            "REVOKE SELECT ON public.t FROM {recipient}; GRANT {first} TO {deployer}"
+        ))
+        .await
+        .unwrap();
+    let owner_left_acl = truth(&mut db.conn, &acl).await;
+    let competing = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    // Remove the direct competing option: inherited authority now selects the
+    // original grantor, which an actual REVOKE must confirm by its ACL effect.
+    db.conn
+        .execute(&format!(
+            "SET ROLE {second}; REVOKE SELECT ON public.t FROM {deployer}; RESET ROLE"
+        ))
+        .await
+        .unwrap();
+    let inherited = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    theirs
+        .execute(&format!("REVOKE SELECT ON public.t FROM {recipient}"))
+        .await
+        .unwrap();
+    let inherited_removed_acl = !truth(&mut db.conn, &acl).await;
+    // An owner-issued ACL has the ordinary ownership positive control.
+    db.conn
+        .execute(&format!("GRANT SELECT ON public.t TO {recipient}"))
+        .await
+        .unwrap();
+    let owner_issued = doctor::missing(&grant_diagnosis(&mut db.conn, &grants).await);
+    db.conn
+        .execute(&format!("REVOKE SELECT ON public.t FROM {recipient}"))
+        .await
+        .unwrap();
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.batched(id integer);
+         GRANT SELECT ON public.batched TO {first} WITH GRANT OPTION;
+         GRANT UPDATE ON public.batched TO {second} WITH GRANT OPTION;
+         GRANT {second} TO {deployer};
+         SET ROLE {first}; GRANT SELECT ON public.batched TO {recipient}; RESET ROLE;
+         SET ROLE {second}; GRANT UPDATE ON public.batched TO {recipient}; RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    let batched_grants = pbps_db::doctor::GrantTargets {
+        managed_tables: ["public.batched".parse().unwrap()].into_iter().collect(),
+        ..grants
+    };
+    let batched = doctor::missing(&grant_diagnosis(&mut theirs, &batched_grants).await);
+    theirs
+        .execute(&format!(
+            "REVOKE SELECT, UPDATE ON public.batched FROM {recipient}"
+        ))
+        .await
+        .unwrap();
+    let batched_left_acl = truth(
+        &mut db.conn,
+        &format!(
+            "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
+         WHERE c.oid = 'public.batched'::regclass AND a.grantee = '{recipient}'::regrole)"
+        ),
+    )
+    .await;
+    for role in [&recipient, &deployer, &first, &second] {
+        cleanup_role(&mut db, role).await;
+    }
+    db.drop().await;
+    for gaps in [&before, &owner, &competing] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.securable() == "TABLE \"public\".\"t\"" && g.why.contains(&first)),
+            "{gaps:?}"
+        );
+    }
+    assert!(unrelated_left_acl && owner_left_acl);
+    assert!(inherited.is_empty(), "{inherited:?}");
+    assert!(inherited_removed_acl);
+    assert!(owner_issued.is_empty(), "{owner_issued:?}");
+    assert!(
+        !batched.is_empty(),
+        "separate grantors cannot jointly authorize one REVOKE"
+    );
+    assert!(batched_left_acl);
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_routine_grants_use_canonical_types_and_restore_the_search_path() {
+    let mut db = TestDb::create("doctor_types330").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "types330_d").await;
+    db.conn.execute(&format!(
+        "CREATE SCHEMA other;
+         CREATE TYPE public.argument AS ENUM ('x'); CREATE TYPE other.argument AS ENUM ('x');
+         CREATE FUNCTION public.f(public.argument) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION public.f(other.argument) RETURNS integer LANGUAGE sql AS 'SELECT 2';
+         CREATE FUNCTION public.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT 3';
+         REVOKE EXECUTE ON FUNCTION public.f(public.argument), public.f(other.argument), public.f(integer) FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION public.f(other.argument), public.f(integer) TO {deployer} WITH GRANT OPTION;"
+    )).await.unwrap();
+    let grants = pbps_db::doctor::GrantTargets {
+        permissions: [(
+            "public.f(public.argument)".parse().unwrap(),
+            [pbps_model::Permission::Execute].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    theirs
+        .execute("SET search_path = public, other")
+        .await
+        .unwrap();
+    let path = text(&mut theirs, "SHOW search_path").await;
+    let visible = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    let restored = text(&mut theirs, "SHOW search_path").await == path;
+    theirs
+        .execute("BEGIN; SET LOCAL search_path = other, public")
+        .await
+        .unwrap();
+    let local_path = text(&mut theirs, "SHOW search_path").await;
+    let inside = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    let local_restored = text(&mut theirs, "SHOW search_path").await == local_path;
+    let still_in_transaction = pbps_pg::catalog::in_transaction(&mut theirs).await.unwrap();
+    theirs.execute("ROLLBACK").await.unwrap();
+    db.conn
+        .execute(&format!(
+            "GRANT EXECUTE ON FUNCTION public.f(public.argument) TO {deployer} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    let authorized = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    cleanup_role(&mut db, &deployer).await;
+    db.drop().await;
+    for gaps in [&visible, &inside] {
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "EXECUTE WITH GRANT OPTION");
+        assert_eq!(
+            gaps[0].securable(),
+            "ROUTINE \"public\".\"f\"(public.argument)"
+        );
+    }
+    assert!(restored && local_restored && still_in_transaction);
+    assert!(authorized.is_empty(), "{authorized:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets() {
+    let mut db = TestDb::create("doctor_scope332").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "scope332_d").await;
+    let recipient = least_privilege_role(&mut db, "scope332_r").await;
+    db.conn.execute(&format!(
+        "CREATE SCHEMA shared;
+         CREATE TABLE public.t(id integer); CREATE TABLE public.foreign_t(id integer);
+         CREATE VIEW public.v AS SELECT 1 AS id; CREATE VIEW public.foreign_v AS SELECT 1 AS id;
+         CREATE FUNCTION public.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION public.f(text) RETURNS integer LANGUAGE sql AS 'SELECT 2';
+         CREATE TABLE public.f(id integer);
+         GRANT SELECT ON public.t, public.foreign_t, public.v, public.foreign_v, public.f TO {recipient};
+         GRANT EXECUTE ON FUNCTION public.f(integer), public.f(text) TO {recipient};
+         GRANT USAGE ON SCHEMA shared TO {recipient};
+         ALTER TABLE public.t OWNER TO {deployer}; ALTER VIEW public.v OWNER TO {deployer};
+         ALTER FUNCTION public.f(integer) OWNER TO {deployer};"
+    )).await.unwrap();
+    // Ownership changes rewrite these ACLs' original grantors as well.
+    let grants = pbps_db::doctor::GrantTargets {
+        roles: vec![recipient.clone()],
+        managed_tables: ["public.t".parse().unwrap()].into_iter().collect(),
+        managed_modules: [
+            "public.v".parse().unwrap(),
+            "public.f(integer)".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let before = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    let mut from_ask = grants.clone();
+    from_ask.managed_tables.clear();
+    let ask_tables = doctor::missing(
+        &doctor::permissions(
+            &mut theirs,
+            &doctor::Ask {
+                managed_schemas: &[],
+                managed_tables: &["public.t".parse().unwrap()],
+                referenced: &[],
+                referenced_columns: &Default::default(),
+                granted: &from_ask,
+                data: &Default::default(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn).await.unwrap();
+    let mut ids = IdsFile::default();
+    ids.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "public.t".parse().unwrap(),
+    );
+    ids.roles.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Role),
+        recipient.clone(),
+    );
+    let scoped = pbps_diff::scope(&pulled.schema, &ids, &grants.managed_modules);
+    let scoped_targets: Vec<_> = scoped.schema.roles[&recipient]
+        .grants
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    let mut desired = scoped.schema.clone();
+    desired.roles.get_mut(&recipient).unwrap().grants.clear();
+    let plan = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &scoped.schema,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &ids,
+        },
+        &Postgres::new(),
+        &Default::default(),
+    )
+    .unwrap();
+    let revoke_targets: Vec<_> = plan
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let pbps_model::Change::Revoke { target, .. } = &c.change {
+                Some(target.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Only the recorded identities supply the scope after declarations vanish.
+    let recorded = StateSnapshot::new(StateKind::Baseline, scoped.schema.clone(), ids, "live-test");
+    state::record(&mut theirs, &recorded).await.unwrap();
+    let recorded_only = doctor::missing(&grant_diagnosis(&mut theirs, &Default::default()).await);
+    db.conn.execute("ALTER TABLE public.t OWNER TO postgres; ALTER VIEW public.v OWNER TO postgres; ALTER FUNCTION public.f(integer) OWNER TO postgres").await.unwrap();
+    let removed = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    cleanup_role(&mut db, &recipient).await;
+    cleanup_role(&mut db, &deployer).await;
+    db.drop().await;
+    for gaps in [&before, &ask_tables, &recorded_only] {
+        assert!(
+            gaps.iter().all(|g| g.securable() == "SCHEMA \"shared\""),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == "USAGE WITH GRANT OPTION"),
+            "{gaps:?}"
+        );
+    }
+    assert_eq!(
+        scoped_targets,
+        [
+            "public.t",
+            "public.v",
+            "public.f(integer)",
+            "schema::shared"
+        ]
+    );
+    assert_eq!(revoke_targets.len(), 4, "{plan:?}");
+    assert!(
+        revoke_targets.iter().all(|t| scoped_targets.contains(t)),
+        "{plan:?}"
+    );
+    for name in [
+        "TABLE \"public\".\"t\"",
+        "TABLE \"public\".\"v\"",
+        "ROUTINE \"public\".\"f\"(integer)",
+    ] {
+        assert!(removed.iter().any(|g| g.securable() == name), "{removed:?}");
+    }
+    assert!(
+        !removed.iter().any(|g| g.securable().contains("foreign_")
+            || g.securable() == "TABLE \"public\".\"f\""
+            || g.securable().contains("(text)")),
+        "{removed:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_reports_absent_external_schema_grant_targets_before_authority() {
+    let mut db = TestDb::create("doctor_absent333").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "absent333_d").await;
+    db.conn
+        .execute("CREATE TABLE public.external(id integer)")
+        .await
+        .unwrap();
+    let grants = pbps_db::doctor::GrantTargets {
+        permissions: [(
+            "schema::external".parse().unwrap(),
+            [pbps_model::Permission::Usage].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let absent = grant_diagnosis(&mut theirs, &grants).await;
+    db.conn.execute("CREATE SCHEMA external").await.unwrap();
+    let present = grant_diagnosis(&mut theirs, &grants).await;
+    db.conn
+        .execute(&format!(
+            "GRANT USAGE ON SCHEMA external TO {deployer} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    let authorized = grant_diagnosis(&mut theirs, &grants).await;
+    cleanup_role(&mut db, &deployer).await;
+    db.drop().await;
+    assert_eq!(
+        absent.absent_schemas,
+        ["external".to_owned()].into_iter().collect()
+    );
+    assert!(doctor::missing(&absent).is_empty(), "{absent:?}");
+    assert!(present.absent_schemas.is_empty());
+    let gaps = doctor::missing(&present);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].securable(), "SCHEMA \"external\"");
+    assert_eq!(gaps[0].permission, "USAGE WITH GRANT OPTION");
+    assert!(authorized.absent_schemas.is_empty());
+    assert!(doctor::missing(&authorized).is_empty(), "{authorized:?}");
 }

@@ -7821,3 +7821,125 @@ CREATE EVENT TRIGGER deny_recovery ON ddl_command_start WHEN TAG IN ('DROP INDEX
     );
     succeeds(d.run(&["verify", "--db", connection]));
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_json_reports_external_schema_absence_before_grant_authority() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for role in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {role}"));
+            }
+        }
+    }
+    let server = server();
+    let roles = Roles(
+        server.clone(),
+        vec![
+            format!("pbps_doctor_ext333_d_{}", std::process::id()),
+            format!("pbps_doctor_ext333_r_{}", std::process::id()),
+        ],
+    );
+    let deployer = &roles.1[0];
+    let reader = &roles.1[1];
+    let own = OwnDatabase::new(&server, "doctor-external333");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN PASSWORD 'doctor-test'; CREATE ROLE {reader};
+         GRANT CREATE ON SCHEMA public TO {deployer};
+         CREATE SCHEMA app AUTHORIZATION {deployer};
+         CREATE TABLE app.t (id bigint NOT NULL PRIMARY KEY); ALTER TABLE app.t OWNER TO {deployer};
+         CREATE TABLE public.\"External Space\"(id integer)"
+        ),
+    );
+    let login = format!(
+        "{} user={deployer} password=doctor-test",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let d = Demo::new("doctor-external333");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_FLOW_PG_DEV\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  'schema::External Space': [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let diagnose = || {
+        let out = d.run_with_env(
+            &["doctor", "--format", "json"],
+            &[("PBPS_FLOW_PG_DEV", login.as_str())],
+        );
+        let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        (code(&out), value)
+    };
+    let (exit, absent) = diagnose();
+    assert_eq!(exit, 2, "{absent}");
+    assert_eq!(
+        absent["data"]["environments"][0]["absent_schemas"],
+        serde_json::json!(["External Space"])
+    );
+    let finding = absent["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "schema.absent")
+        .unwrap();
+    assert_eq!(finding["remedy"], "CREATE SCHEMA \"External Space\";");
+    assert_eq!(
+        absent["data"]["environments"][0]["missing_permissions"],
+        serde_json::json!([])
+    );
+    on_server(connection, "CREATE SCHEMA \"External Space\"");
+    let (_, present) = diagnose();
+    assert!(
+        present["data"]["environments"][0]
+            .get("absent_schemas")
+            .is_none(),
+        "{present}"
+    );
+    assert!(
+        !present["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "schema.absent")
+    );
+    let gaps = present["data"]["environments"][0]["missing_permissions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(gaps.len(), 1, "{present}");
+    assert!(
+        gaps[0]
+            .as_str()
+            .unwrap()
+            .starts_with("USAGE WITH GRANT OPTION on SCHEMA \"External Space\"")
+    );
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA \"External Space\" TO {deployer} WITH GRANT OPTION"),
+    );
+    let (_, authorized) = diagnose();
+    assert!(
+        authorized["data"]["environments"][0]
+            .get("absent_schemas")
+            .is_none(),
+        "{authorized}"
+    );
+    assert_eq!(
+        authorized["data"]["environments"][0]["missing_permissions"],
+        serde_json::json!([])
+    );
+}
