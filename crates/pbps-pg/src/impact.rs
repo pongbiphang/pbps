@@ -165,7 +165,7 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
 }
 
 /// Every routine in this database whose body the engine keeps as **text**,
-/// with the body, for the ones that mention a given string anywhere.
+/// with the body so [`mentions`] can match identifier tokens.
 ///
 /// `prosqlbody IS NULL` is the whole test, and it is the engine's own record of
 /// which bodies it parsed — measured, a `BEGIN ATOMIC` SQL function has one and
@@ -174,45 +174,11 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
 /// both sides of the line, and a procedural language installed later is not on
 /// any list written today.
 ///
-/// `strpos` and not a regular expression: an identifier is user text and would
-/// have to be escaped into a pattern, and getting that wrong is a report that
-/// silently matches nothing. This is the cheap filter; [`mentions`] is the
-/// exact one, and it runs here where the rules are testable without a server.
-///
-/// The case-insensitive half of the filter folds under
-/// `COLLATE pg_catalog."C"` explicitly, on both sides, rather than trusting
-/// the unqualified `lower()` this query used to call (DECISIONS 448).
-/// `prosrc` is plain `text`, so an unqualified `lower()` runs under the
-/// *database's* default collation, and that is measurably the wrong fold: on
-/// a database created with Turkish casing rules, `lower('I')` is dotless `ı`
-/// while `lower('i')` stays `i`, so `strpos(lower('SELECT I FROM t'),
-/// lower('i'))` is `0` where the ASCII fold gives `8` — a routine naming the
-/// target with a bare, differently-cased letter would have been excluded
-/// here before [`mentions`] ever saw it, which is the exact silence #260
-/// exists to remove.
-///
-/// `COLLATE "C"`, unqualified, is not enough: it is a name, resolved through
-/// `search_path` like any other, and a schema on the path can hold its own
-/// collation named `"C"` — measured, with one created as
-/// `CREATE COLLATION shad."C" (provider = icu, locale = 'tr-TR', …)` and
-/// `search_path = shad, pg_catalog`, `lower('I' COLLATE "C")` is the same
-/// hijacked `ı`, one level down from the defect this fold exists to fix.
-/// `pg_catalog."C"` is schema-qualified and cannot be shadowed, which is what
-/// makes it locale-independent in fact and not only in the common case — and
-/// it matches every other name in this query, all of them already qualified
-/// (`pg_catalog.strpos`, `pg_catalog.lower`, `pg_catalog.pg_proc`,
-/// `pg_catalog.pg_depend`): the collation was the one unqualified name in a
-/// query whose whole style is that nothing resolves through the path.
-///
-/// With the collation pinned, this half of the filter is a strict superset
-/// of what [`mentions`] accepts by construction, not by hope: an ASCII,
-/// per-byte fold cannot turn a real occurrence of `$1` into a string that no
-/// longer contains it, whatever `$1`, the body, or the session's
-/// `search_path` hold. That is also why there is only one test here and not
-/// two — an exact quoted-spelling test beside this one was kept in an
-/// earlier revision as a hedge against the fold's locale dependence, and
-/// there is nothing left for it to hedge against once the fold itself is
-/// exact: an exact match is a special case of a fold that cannot lose it.
+/// A raw substring filter is not a superset of identifier matching: the
+/// catalog name `a"b` is spelled `"a""b"` inside `prosrc`, so even a correctly
+/// folded substring search loses it before the lexer sees it (DECISIONS 477).
+/// Keep the lexical rule in Rust, using the dialect's existing literal and
+/// quoting rules, rather than implementing a second lexer in this query.
 ///
 /// **Every schema the tool did not rule out**, and not only the managed ones:
 /// an undeclared `plpgsql` function that reads a managed table is exactly the
@@ -239,7 +205,6 @@ SELECT n.nspname AS schema_name,
    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                     WHERE d.classid = 'pg_catalog.pg_proc'::regclass
                       AND d.objid = p.oid AND d.deptype = 'e')
-   AND pg_catalog.strpos(pg_catalog.lower(p.prosrc COLLATE pg_catalog.\"C\"), pg_catalog.lower($1 COLLATE pg_catalog.\"C\")) > 0
  ORDER BY n.nspname, p.proname";
 
 /// Everything the catalog holds an edge to, described in the engine's own
@@ -351,10 +316,7 @@ pub async fn rename_impact(
     // What breaks: a body the engine never parsed, which still spells the old
     // name.
     let needle = target.column().unwrap_or(&target.table().name);
-    for row in conn
-        .query_with(TEXT_BODIED_ROUTINES, &[needle.into()])
-        .await?
-    {
+    for row in conn.query(TEXT_BODIED_ROUTINES).await? {
         let body = text(&row, "body")?;
         if !mentions(&body, needle) {
             continue;
@@ -439,111 +401,57 @@ fn text(row: &Row, column: &str) -> Result<String, DbError> {
     Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
 }
 
-/// Whether a stored body names this object.
+/// Whether a stored body contains an identifier naming this object.
 ///
-/// Bounded by the characters around it, so that `amount` does not match
-/// `amount_paid` — a prefix match would flag every routine that mentions a
-/// similarly named column and train the operator to skip the report. The
-/// quoted spelling counts too: `"amount"` is the same name written the other
-/// way, and a body that quotes it breaks just the same.
+/// Literals and comments carry data, and a quoted identifier is one whole
+/// token even when its contents look like several bare words (DECISIONS 477).
+/// Use the dialect's literal scanner and emitter's quoting rule so embedded
+/// quotes and PostgreSQL string forms cannot disagree with emitted SQL.
 ///
-/// A dollar sign is an identifier character here and `@` and `#` are not, which
-/// is where this parts company with the SQL Server rule it is otherwise the
-/// same as.
+/// Unquoted names fold ASCII only (DECISIONS 230, 313, 448). A catalog name
+/// with an ASCII uppercase letter can only have been created quoted; bare
+/// spellings therefore cannot name it. Non-ASCII uppercase letters remain
+/// unchanged by the engine and must not disable the ASCII fold.
 ///
-/// # Unquoted folds, quoted does not (DECISIONS 448)
-///
-/// The engine downcases an *unquoted* identifier before it is stored
-/// (DECISIONS 230, 313), so a bare `EMAIL` in a routine body names the same
-/// column as `email`. A *quoted* identifier is stored exactly as written, so
-/// `"EMAIL"` and `"email"` are two different columns, and folding the quoted
-/// form too would report a routine that does not actually break — the trap
-/// this scan exists to avoid, not the one it should fall into.
-///
-/// This is why the fold only ever runs when `name` itself has no **ASCII**
-/// uppercase letter left in it. A name that does can only be in the catalog
-/// because it was created quoted: no unquoted spelling folds to it, so a bare
-/// mention that happens to share its letters case-insensitively is always
-/// naming a *different*, lower-spelled column, not this one. The test is
-/// ASCII-only on purpose and not "any uppercase letter": measured (DECISIONS
-/// 230), an unquoted `CREATE TABLE AÄ` still makes the relation `aÄ`, so a
-/// non-ASCII uppercase letter does not block the fold — only an ASCII one,
-/// which the engine's own downcasing would always have removed, does.
-///
-/// The fold is ASCII-only, [`str::to_ascii_lowercase`] rather than
-/// [`str::to_lowercase`], for the same reason `RoutineArg` and the reference
-/// scan both are (DECISIONS 230, 313): the engine downcases an unquoted
-/// identifier byte by byte and leaves the high bit alone, where Rust's
-/// Unicode fold turns one character into a name the engine never produces.
-/// `to_ascii_lowercase` also never changes a string's byte length or its char
-/// boundaries, which is what keeps the stepping rule below correct on the
-/// folded body without change.
-///
-/// # Why the step is a character and not a byte
-///
-/// A rejected match is stepped over by the width of the name's **first
-/// character**, because `body[from..]` is a string slice and Rust refuses one
-/// that starts inside a character. Stepping by one byte is the obvious way to
-/// write this and it panics: scanning `xä` for `ä` finds it at byte 1, rejects
-/// it because `x` is an identifier byte before it, and a one-byte step lands on
-/// byte 2 — the middle of the two bytes `ä` occupies. Identifiers here are not
-/// ASCII-only, deliberately: `is_ident_byte` counts every non-ASCII byte as
-/// part of a name, and the quoting rule admits any character a `"…"` can hold
-/// (DECISIONS 408).
+/// A reserved word is a name only when quoted or following a dot. Whitespace
+/// and masked comments can separate that dot from its identifier. Advancing
+/// by complete characters keeps non-ASCII names intact (DECISIONS 408).
 fn mentions(body: &str, name: &str) -> bool {
-    // No name is no scan. `find("")` matches at every position, so an empty
-    // needle would report that every body in the database mentions it — and
-    // with the step below it would still terminate, which makes the wrong
-    // answer the quiet one.
-    let Some(first) = name.chars().next() else {
+    let Ok(quoted_name) = crate::quote(name) else {
         return false;
     };
-    if body.contains(&format!("\"{name}\"")) {
-        return true;
-    }
-    if bounded_match(body, name, first, false) {
-        return true;
-    }
-    // See "Unquoted folds, quoted does not" above: a name with an ASCII
-    // uppercase letter could only exist quoted, so no unquoted spelling ever
-    // names it and the fold below must not run.
-    if name != name.to_ascii_lowercase() {
-        return false;
-    }
-    bounded_match(&body.to_ascii_lowercase(), name, first, true)
-}
-
-/// One scan for a stand-alone occurrence of `name` in `body`, shared by the
-/// exact-case pass and the case-folded one.
-///
-/// `reject_quoted` is what keeps them from stepping on each other: a match
-/// immediately bounded by `"` on both sides is a quoted identifier, whose
-/// exactness is the earlier `"{name}"` check's job alone. The exact-case pass
-/// leaves it in (a same-case quoted match is also caught here, harmlessly,
-/// same as before this function existed); the case-folded pass must reject
-/// it, or `"EMAIL"` would count as the same column as `email`.
-fn bounded_match(body: &str, name: &str, first: char, reject_quoted: bool) -> bool {
-    let bytes = body.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = body[from..].find(name) {
-        let start = from + offset;
-        let end = start + name.len();
-        let before = start == 0 || !is_ident_byte(bytes[start - 1]);
-        let after = end == bytes.len() || !is_ident_byte(bytes[end]);
-        if before && after {
-            let quoted =
-                start > 0 && bytes[start - 1] == b'"' && end < bytes.len() && bytes[end] == b'"';
-            if !(reject_quoted && quoted) {
+    let code = crate::LEXICON.code_only(body);
+    let bare_name = name == name.to_ascii_lowercase();
+    let reserved = crate::types::is_reserved(name);
+    let mut rest = code.as_str();
+    let mut after_dot = false;
+    while let Some(ch) = rest.chars().next() {
+        if ch == '"' {
+            let Some(len) = crate::types::quoted_len(rest) else {
+                break;
+            };
+            if rest[..len] == quoted_name {
                 return true;
             }
+            rest = &rest[len..];
+            after_dot = false;
+        } else if pbps_dialect::continues_ident(ch) {
+            let len = rest
+                .find(|c| !pbps_dialect::continues_ident(c))
+                .unwrap_or(rest.len());
+            if bare_name && (!reserved || after_dot) && rest[..len].eq_ignore_ascii_case(name) {
+                return true;
+            }
+            rest = &rest[len..];
+            after_dot = false;
+        } else {
+            if !(ch.is_ascii() && ch.is_whitespace()) {
+                after_dot = ch == '.';
+            }
+            rest = &rest[ch.len_utf8()..];
         }
-        from = start + first.len_utf8();
     }
     false
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || !b.is_ascii()
 }
 
 #[cfg(test)]
@@ -649,6 +557,65 @@ mod tests {
         assert_eq!(RenameTarget::Table(tname("app.customer")).column(), None);
     }
 
+    #[test]
+    fn embedded_quotes_in_impact_names_use_the_emitters_spelling() {
+        assert!(mentions(r#"SELECT "a""b" FROM t"#, "a\"b"));
+        assert!(!mentions(r#"SELECT "ab" FROM t"#, "a\"b"));
+        assert!(!mentions(r#"SELECT "a""""b" FROM t"#, "a\"b"));
+    }
+
+    #[test]
+    fn bare_reserved_words_are_not_impact_references() {
+        for body in ["select 1", "SELECT 1", "SELECT other FROM t"] {
+            assert!(!mentions(body, "select"), "{body}");
+        }
+        for body in [
+            r#"SELECT "select" FROM t"#,
+            "SELECT t.select FROM t",
+            "SELECT t . SELECT FROM t",
+            "SELECT t /* gap */ . select FROM t",
+            "SELECT t .\u{000b}select FROM t",
+        ] {
+            assert!(mentions(body, "select"), "{body}");
+        }
+    }
+
+    #[test]
+    fn quoted_impact_references_match_only_the_complete_identifier() {
+        for body in [
+            r#"SELECT "other email" FROM t"#,
+            r#"SELECT "other EMAIL" FROM t"#,
+            r#"SELECT "email other" FROM t"#,
+            r#"SELECT "other ""email""" FROM t"#,
+        ] {
+            assert!(!mentions(body, "email"), "{body}");
+        }
+        assert!(mentions(r#"SELECT "email" FROM t"#, "email"));
+        assert!(mentions(r#"SELECT "other email", email FROM t"#, "email"));
+        assert!(!mentions(r#"SELECT "unfinished email"#, "email"));
+    }
+
+    #[test]
+    fn impact_references_ignore_literals_and_comments() {
+        for body in [
+            "RAISE NOTICE 'email';",
+            "RAISE NOTICE 'EMAIL';",
+            r"SELECT E'quote\' EMAIL';",
+            "SELECT $$email$$;",
+            "SELECT $message$EMAIL$message$;",
+            r"SELECT U&'email';",
+            "-- email\nSELECT 1",
+            "/* email /* EMAIL */ email */ SELECT 1",
+        ] {
+            assert!(!mentions(body, "email"), "{body}");
+        }
+        assert!(mentions(
+            "SELECT email FROM t; RAISE NOTICE 'unrelated';",
+            "email"
+        ));
+        assert!(mentions("-- email\nSELECT EMAIL FROM t", "email"));
+    }
+
     /// The trap this function exists for: a prefix match would report every
     /// routine that mentions a similarly named column.
     #[test]
@@ -710,10 +677,8 @@ mod tests {
         // name, not this one, whatever the case.
         assert!(!mentions("SELECT EMAILX FROM t", "email"));
 
-        // The regression this refactor could have introduced: a same-case
-        // quoted mention is caught by the exact `"name"` check before the
-        // case-folded scan ever runs, so its `reject_quoted` must never be
-        // allowed to shadow that earlier, unconditional acceptance.
+        // A same-case quoted spelling still names the target, independently
+        // of the separate rule for folding bare identifiers.
         assert!(mentions("SELECT \"email\" FROM customer", "email"));
 
         // The other side of the ASCII-only line (DECISIONS 230): an
@@ -739,38 +704,6 @@ mod tests {
             TEXT_BODIED_ROUTINES.contains("d.deptype = 'e'"),
             "extensions"
         );
-        // DECISIONS 448: an unqualified `lower()` runs under the database's
-        // default collation, and on a Turkish one it folds `I` to dotless
-        // `ı`, not `i` — measured, `strpos(lower('SELECT I FROM t'),
-        // lower('i'))` is `0` where the ASCII fold gives `8`, excluding a
-        // routine that really does mention the target before `mentions` ever
-        // sees it. `COLLATE "C"` on both sides is what makes the fold ASCII
-        // and locale-independent, matching the engine's own identifier fold
-        // rather than approximating it — but only the *schema-qualified*
-        // spelling: `"C"` alone is a name resolved through `search_path`, and
-        // a schema on the path can hold its own collation named `"C"`.
-        // Measured, `CREATE COLLATION shad."C" (provider = icu, locale =
-        // 'tr-TR', …)` with `search_path = shad, pg_catalog` hijacks
-        // `lower('I' COLLATE "C")` back to `ı` — the identical defect one
-        // schema-lookup away. `pg_catalog."C"` cannot be shadowed. This
-        // cannot be exercised against the live suite's own database without
-        // creating a shadowing collation there, so it is pinned here
-        // instead, the way the repo pins other spellings it cannot exercise
-        // end to end; an assertion that accepted the unqualified spelling
-        // would have passed the hijackable version, which is exactly why
-        // this one requires the qualifier.
-        for side in [
-            "p.prosrc COLLATE pg_catalog.\"C\"",
-            "$1 COLLATE pg_catalog.\"C\"",
-        ] {
-            assert!(
-                TEXT_BODIED_ROUTINES.contains(side),
-                "the case-insensitive fold must run under the schema-qualified \
-                 C collation on both sides, or a same-named collation earlier \
-                 on `search_path` folds it differently from the engine's own \
-                 identifier rule: {side}"
-            );
-        }
         assert!(
             CARRIED.contains("d.deptype <> 'i'"),
             "an internal edge is the object's own parts"

@@ -1723,7 +1723,7 @@ fn as_the_engine_spells(element: &str) -> String {
 
 /// The length of the `"…"` at the front of `text`, a doubled quote being a
 /// quote inside the name; `None` where it never closes.
-fn quoted_len(text: &str) -> Option<usize> {
+pub(crate) fn quoted_len(text: &str) -> Option<usize> {
     let mut at = 1;
     loop {
         let close = at + text[at..].find('"')?;

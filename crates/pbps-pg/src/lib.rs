@@ -265,9 +265,8 @@ impl Postgres {
 
 /// Quotes one identifier, or refuses a string that cannot be one.
 ///
-/// A free function because two callers need it and only one of them has a
-/// `Postgres` to hand: [`Dialect::quote_ident`] is this, and the emitter is
-/// this without having to build a dialect value to ask.
+/// Shared by [`Dialect::quote_ident`], the emitter and the impact scanner:
+/// matching a stored spelling must use the same escaping as writing it.
 fn quote(ident: &str) -> Result<String, DialectError> {
     // A double quote inside an identifier is doubled; a NUL cannot be in
     // one at all, and the engine's own limit is bytes, not characters.
