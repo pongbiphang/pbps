@@ -424,7 +424,10 @@ gap is not small. **Measured** on 100,000 rows through `pg_stat_user_tables`:
 
 | Statement | Rebuilt | Rows read |
 |---|---|---|
-| `ALTER COLUMN v SET NOT NULL` | no | **100,000** |
+| `ALTER COLUMN v SET NOT NULL`, without a validated CHECK proof | no | **100,000** |
+| `SET NOT NULL` with a surviving validated `CHECK (v IS NOT NULL)` | no | **0** |
+| `SET NOT NULL` with that CHECK declared `NOT VALID` | no | **100,000** |
+| Widen `varchar(10)` to `varchar(20)` and `SET NOT NULL` together | no | **100,000** |
 | `ALTER COLUMN w TYPE varchar(20)` (from `varchar(10)`) | no | **0** |
 | `ADD CONSTRAINT … CHECK` | no | 100,000 |
 | `ADD CONSTRAINT … UNIQUE` / `PRIMARY KEY` | no | 100,000 |
@@ -432,9 +435,27 @@ gap is not small. **Measured** on 100,000 rows through `pg_stat_user_tables`:
 | `ADD COLUMN`, with or without a literal default | no | 0 |
 | `DROP COLUMN` | no | 0 |
 
-Carried as one fact the first two rows are the same change, and one of them is
-free. So the estimate holds them apart, and `SET NOT NULL` — the example the
-Limits section names — is the row that proves it has to.
+Carried as one fact, ordinary `SET NOT NULL` and a plain widening look the
+same, and one of them is free. So the estimate holds them apart, and
+`SET NOT NULL` — the example the Limits section names — is the row that proves
+it has to. The standalone and
+folded widening cases are pinned by
+[`a_change_that_rebuilds_nothing_may_still_read_every_row`](../crates/pbps-pg/tests/live.rs).
+
+The CHECK exception is measured by
+[`a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown`](../crates/pbps-pg/tests/live.rs):
+ordinary / validated proof / NOT VALID read 100,000 / 0 / 100,000 rows. A
+validated CHECK covering the column is only a possible proof: `v <> ''` also
+permits NULL, and the tool must not interpret arbitrary expressions (SPEC §8.2).
+The connected estimate therefore changes **Reads only** to unknown, retaining
+the known rewrite and lock. The same rule applies when tightening is folded
+into a type change (DECISIONS 479).
+
+Only a CHECK surviving until that statement can supply its catalog proof.
+[`nullability_estimates_use_only_checks_surviving_to_the_statement`](../crates/pbps-pg/tests/live.rs)
+measures the ordered removal/replacement cases at 100,000 rows, while a
+surviving proof still reads zero. Earlier removals are excluded before selecting
+a candidate CHECK; later drops and removals on other tables do not hide it.
 
 ### The locks, measured rather than recalled
 

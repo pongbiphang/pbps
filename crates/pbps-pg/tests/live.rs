@@ -21033,8 +21033,8 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
     let s = probe_schema_9("scan");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
-        "CREATE TABLE {s}.t (id integer, v integer, w varchar(10));
-         INSERT INTO {s}.t SELECT g, g, g::text FROM generate_series(1, 100000) g;"
+        "CREATE TABLE {s}.t (id integer, v integer, w varchar(10), x varchar(10));
+         INSERT INTO {s}.t SELECT g, g, g::text, g::text FROM generate_series(1, 100000) g;"
     ))
     .await
     .expect("the fixture");
@@ -21060,6 +21060,15 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         to_nullable: true,
     };
 
+    let folded = Change::AlterColumnType {
+        uid: "c_cccccc".parse().unwrap(),
+        column: column.column("x"),
+        from: ty("varchar(10)"),
+        to: ty("varchar(20)"),
+        from_nullable: true,
+        to_nullable: false,
+    };
+
     for (change, expected_reads, sql) in [
         (
             &tighten,
@@ -21070,6 +21079,13 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
             &widen,
             Reads::Nothing,
             format!("ALTER TABLE {s}.t ALTER COLUMN w TYPE character varying(20)"),
+        ),
+        (
+            &folded,
+            Reads::EveryRow,
+            format!(
+                "ALTER TABLE {s}.t ALTER COLUMN x TYPE character varying(20), ALTER COLUMN x SET NOT NULL"
+            ),
         ),
     ] {
         let ours = one_estimate(change, Strategy::default()).expect("an estimate");
@@ -21211,6 +21227,225 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+}
+
+/// Measure only the statement under discussion: a replacement CHECK's later
+/// validation also scans, and must not be mistaken for the nullability scan.
+async fn nullability_scan(conn: &mut Conn, table: &TableName, sql: &str) -> (i32, bool) {
+    let relation = table.to_string();
+    let stat = format!(
+        "SELECT seq_tup_read::int FROM pg_stat_user_tables WHERE relid = '{relation}'::regclass"
+    );
+    let node = format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{relation}'::regclass");
+    conn.execute("SELECT pg_stat_force_next_flush()")
+        .await
+        .unwrap();
+    let before = number(conn, &stat).await;
+    let node_before = number(conn, &node).await;
+    conn.execute(sql).await.unwrap();
+    conn.execute("SELECT pg_stat_force_next_flush()")
+        .await
+        .unwrap();
+    (
+        number(conn, &stat).await - before,
+        number(conn, &node).await != node_before,
+    )
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Reads, Rewrite, against};
+    let mut db = TestDb::create("folded_check271").await;
+    db.execute("CREATE TABLE public.t (v varchar(10), CONSTRAINT nonempty CHECK (v <> '')) WITH (autovacuum_enabled = false); INSERT INTO public.t SELECT g::text FROM generate_series(1,100000) g").await.unwrap();
+    let change = Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().unwrap(),
+        column: "public.t.v".parse().unwrap(),
+        from: ty("varchar(10)"),
+        to: ty("varchar(20)"),
+        from_nullable: true,
+        to_nullable: false,
+    };
+    let mut ours = one_estimate(&change, Strategy::default()).unwrap();
+    against(&mut db, &mut ours).await.unwrap();
+    let sql = Postgres::new().emit(&change, Strategy::default()).unwrap();
+    assert_eq!(sql.len(), 1);
+    let measured = nullability_scan(&mut db, &TableName::new("public", "t"), &sql[0].sql).await;
+    db.drop().await;
+    assert_eq!(
+        measured,
+        (100000, false),
+        "this CHECK permits NULL and cannot prove it away"
+    );
+    assert_eq!(ours.rewrite, Rewrite::No);
+    assert!(
+        matches!(&ours.reads, Reads::Unknown(why) if why.contains("nonempty")),
+        "{ours:#?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    use pbps_pg::estimate::{Lock, Reads, Rewrite, against, planned_estimates};
+    let check = "a_removed\"check";
+    for case in [
+        "removed",
+        "replaced",
+        "surviving",
+        "later_drop",
+        "other_table",
+        "renamed",
+    ] {
+        let mut db = TestDb::create(&format!("check_lifecycle291_{case}")).await;
+        let old = TableName::new("public", "t");
+        let other = TableName::new("public", "other");
+        let mut t = Table::default();
+        t.columns.insert("v".into(), Column::new(ty("integer")));
+        t.checks.insert(
+            check.into(),
+            CheckConstraint {
+                expression: "v IS NOT NULL".into(),
+            },
+        );
+        if case == "surviving" {
+            t.checks.insert(
+                "z_surviving".into(),
+                CheckConstraint {
+                    expression: "v IS NOT NULL".into(),
+                },
+            );
+        }
+        let mut base = Schema::default();
+        base.tables.insert(old.clone(), t.clone());
+        if case == "other_table" {
+            base.tables.insert(other.clone(), t);
+        }
+        let ids = mint_ids(&base, &IdsFile::default(), &[]);
+        apply(
+            &mut db,
+            &Postgres::new(),
+            &plan(&Schema::default(), &IdsFile::default(), &base, &ids),
+        )
+        .await;
+        db.execute("ALTER TABLE public.t SET (autovacuum_enabled = false); INSERT INTO public.t SELECT g FROM generate_series(1,100000) g").await.unwrap();
+        let mut declared = base.clone();
+        let target = if case == "renamed" {
+            TableName::new("public", "renamed")
+        } else {
+            old.clone()
+        };
+        if target != old {
+            let t = declared.tables.remove(&old).unwrap();
+            declared.tables.insert(target.clone(), t);
+        }
+        let table = declared.tables.get_mut(&target).unwrap();
+        table.columns.get_mut("v").unwrap().nullable = false;
+        if case != "other_table" {
+            table.checks.remove(check);
+        }
+        if case == "replaced" {
+            table.checks.insert(
+                check.into(),
+                CheckConstraint {
+                    expression: "v > 0".into(),
+                },
+            );
+        }
+        if case == "other_table" {
+            declared
+                .tables
+                .get_mut(&other)
+                .unwrap()
+                .checks
+                .remove(check);
+        }
+        let intents = if case == "renamed" {
+            vec![Intent::RenameTable {
+                from: old.clone(),
+                to: target.clone(),
+            }]
+        } else {
+            vec![]
+        };
+        let next_ids = mint_ids(&declared, &ids, &intents);
+        let mut cs = plan(&base, &ids, &declared, &next_ids);
+        if case == "later_drop" {
+            let i = cs
+                .changes
+                .iter()
+                .position(|p| matches!(&p.change, Change::DropCheck { .. }))
+                .unwrap();
+            let drop = cs.changes.remove(i);
+            cs.changes.push(drop);
+        }
+        let tighten = cs
+            .changes
+            .iter()
+            .position(|p| matches!(&p.change, Change::AlterColumnNullability { .. }))
+            .unwrap();
+        let drop = cs
+            .changes
+            .iter()
+            .position(|p| matches!(&p.change, Change::DropCheck { .. }))
+            .unwrap();
+        assert_eq!(drop < tighten, case != "later_drop", "{case}: {cs:#?}");
+        if case == "replaced" {
+            assert!(
+                cs.changes
+                    .iter()
+                    .position(|p| matches!(&p.change, Change::AddCheck { .. }))
+                    .unwrap()
+                    > tighten
+            );
+        }
+        let mut es = planned_estimates(&cs);
+        for (_, e) in &mut es {
+            against(&mut db, e).await.unwrap();
+        }
+        let mut measured = None;
+        for (i, p) in cs.changes.iter().enumerate() {
+            if i == tighten {
+                let sql = Postgres::new().emit(&p.change, p.strategy).unwrap();
+                assert_eq!(sql.len(), 1);
+                measured = Some(nullability_scan(&mut db, &target, &sql[0].sql).await);
+            } else {
+                apply(
+                    &mut db,
+                    &Postgres::new(),
+                    &ChangeSet {
+                        changes: vec![PlannedChange::new(p.change.clone())],
+                    },
+                )
+                .await;
+            }
+        }
+        db.drop().await;
+        let e = &es.iter().find(|(i, _)| *i == tighten).unwrap().1;
+        let survives = ["surviving", "later_drop", "other_table"].contains(&case);
+        assert_eq!(
+            measured.unwrap(),
+            (if survives { 0 } else { 100000 }, false),
+            "{case}"
+        );
+        assert_eq!(e.rewrite, Rewrite::No);
+        assert_eq!(e.lock, Lock::AccessExclusive);
+        if survives {
+            let expected = if case == "surviving" {
+                "z_surviving"
+            } else {
+                check
+            };
+            assert!(
+                matches!(&e.reads, Reads::Unknown(why) if why.contains(expected)),
+                "{case}: {e:#?}"
+            );
+        } else {
+            assert_eq!(e.reads, Reads::EveryRow, "{case}: {e:#?}");
+        }
+    }
 }
 
 /// The locks one statement holds on one relation, read from inside the

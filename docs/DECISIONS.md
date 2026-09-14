@@ -12068,3 +12068,29 @@ SPEC is in sync with all of these.
      estimates stay outside correctness risk, saved artifacts and checksums.
      Index-expression coverage, CHECK lifecycle and other cost refinements
      remain their own questions; no expression is parsed to infer a proof.
+
+479. **Nullability scans follow the statement and its surviving CHECKs.**
+     A type change can carry a nullability tightening in the same ALTER TABLE
+     (ADR-0011 Amendment 1). Its `SET NOT NULL` still scans when the type's
+     widening rewrites nothing: the live regression measures 100,000 rows
+     beside a plain widening's zero, with both relfilenodes unchanged (#271).
+
+     A validated CHECK covering that column is a possible proof, not an
+     expression this tool interprets (SPEC §8.2). The existing named regression
+     `a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown`
+     measures ordinary / validated proof / NOT VALID at 100,000 / 0 / 100,000
+     rows. Only Reads becomes unknown; known Rewrite and Lock answers survive.
+     A non-proving CHECK beside a folded tightening also stays unknown (#292).
+
+     CHECK lifetime is the executed plan prefix, unlike the whole-plan catalog
+     spelling map (478). Estimates carry earlier CHECK removals through table
+     renames and keep newly created identities separate. The connected query
+     excludes those names before selecting a candidate, so another surviving
+     CHECK remains visible; a future drop or another table's drop cannot hide
+     it. The canonical replacement plan adds its new CHECK after tightening,
+     so the old catalog CHECK cannot supply that statement's proof (#291).
+
+     Constraint names travel as a bound JSON array, preserving arbitrary
+     identifier spelling without a separator convention or SQL interpolation.
+     This refines advisory estimates only: 399/430's correctness-risk, approval
+     and saved-artifact/checksum boundaries remain intact.

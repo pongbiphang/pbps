@@ -650,7 +650,16 @@ whole catalogue rather than §3's eleven hand-measured rows: every ordered pair,
 re-measures it and holds the dialect to all of them (400, ADR-0012 Amendment 2).
 Whether the table is rebuilt and whether every row is read are kept as two
 facts, because `SET NOT NULL` rewrites nothing and reads all hundred thousand
-rows while `varchar(10) -> varchar(20)` rewrites nothing and reads none (401). A
+rows while `varchar(10) -> varchar(20)` rewrites nothing and reads none (401).
+A widening that also tightens nullability retains the scan. A surviving
+validated CHECK covering that column makes only the read estimate unknown:
+the engine may prove NOT NULL from it, but pbps does not parse the expression
+(SPEC §8.2, DECISIONS 479). The named regression
+`a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown`
+measures 100,000 / 0 / 100,000 rows for ordinary / validated proof / NOT VALID.
+Earlier CHECK removals or replacements cannot lend their old catalog proof to
+the later statement; surviving checks retain uncertainty. Rewrite, lock,
+correctness risk and saved-plan checksum behavior remain separate. A
 foreign key is the one statement that locks a table nobody named — measured,
 `ShareRowExclusiveLock` on the referenced table too, and no exclusive lock
 anywhere (402). And where the answer is not a function of the declaration the
