@@ -12136,6 +12136,12 @@ SPEC is in sync with all of these.
      arriving routine. A parameter or local named open keeps its type reference.
      The cursor declaration name is excluded with its CURSOR keyword so that
      blanking the keyword cannot attach its parameter list to that name.
+     Argument-free bound cursors follow the same rule for view arrivals: their
+     declaration and OPEN, FETCH, MOVE and CLOSE operands name variables, not
+     relations. FETCH/MOVE are recognized at procedural statement boundaries,
+     leaving SQL's FETCH FIRST expression intact. Direction/count expressions
+     and cursor queries stay code. Live cases cover argument-free, quoted,
+     scroll and nested cursors with unmanaged dependents and no false rebuild.
 
      ANALYZE/ANALYSE and COPY utility targets also accept column lists. Their
      target column groups are blanked, keeping the names as relation mentions
@@ -12156,6 +12162,15 @@ SPEC is in sync with all of these.
      expression list and predicates visible. Live plain, quoted and expression
      indexes keep their unmanaged dependents when a btree routine arrives;
      genuine btree calls inside index expressions remain rebind candidates.
+
+     Procedural CREATE TABLE column declarations and ALTER TABLE ADD/TYPE
+     operands also contain type modifiers. Mark only the lexical type prefix,
+     including quoted types and multiple columns/actions. Table constraints,
+     defaults, generated expressions and ALTER's USING expression remain code;
+     path-resolved type names still count for view arrivals. Live CREATE and
+     ALTER variants with unmanaged dependents require only the routine arrival.
+     Companion default, generated-column and conversion expressions keep their
+     real calls, rebuild and switch from the shared routine to the arriving one.
 
      View arrivals retain path-resolved modified type names: a view creates a
      same-named composite type. Only the modifier group is removed for this

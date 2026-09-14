@@ -2091,11 +2091,30 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
         } else if token.word("begin") {
             statement = None;
         } else if statement.is_none()
-            && token.word("open")
+            && (token.word("open") || token.word("close"))
             && tokens.get(at + 1).is_some_and(RebindToken::name)
-            && after_group(tokens, at + 2).is_some()
         {
             cursors.push(at + 1);
+        } else if statement.is_none()
+            && (token.word("fetch") || token.word("move"))
+            && at > 0
+            && [";", "begin", "then", "else", "loop"]
+                .iter()
+                .any(|word| token_is(tokens, at - 1, word))
+        {
+            // FETCH's operand ends before INTO; MOVE's ends at the statement.
+            // Direction/count expressions precede it and remain code. Requiring
+            // a statement boundary keeps SQL's FETCH FIRST clause out of here.
+            let mut end = at + 1;
+            while end < tokens.len()
+                && !token_is(tokens, end, "into")
+                && !token_is(tokens, end, ";")
+            {
+                end = tokens[end].close.map_or(end + 1, |close| close + 1);
+            }
+            if end > at + 1 && tokens[end - 1].name() {
+                cursors.push(end - 1);
+            }
         } else if token.text == ";"
             && let Some(start) = statement
         {
@@ -2111,11 +2130,11 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
                         break;
                     }
                     if item.word("cursor") {
+                        // With or without arguments, the declared cursor is
+                        // a variable rather than a relation on the write path.
+                        cursors.extend([start, end]);
                         if let Some(after) = after_group(tokens, end + 1) {
                             spans.push(tokens[end + 1].offset..tokens[after - 1].offset);
-                            // Blanking CURSOR must not attach its argument
-                            // list to the declared variable's name instead.
-                            cursors.extend([start, end]);
                         }
                         ty = at;
                         break;
@@ -2231,6 +2250,143 @@ fn index_reference_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
     (methods, separators)
 }
 
+/// DDL column types have the same modifier syntax as routine declarations.
+/// Locate only their type prefix: defaults, constraints, generated expressions
+/// and ALTER's USING expression may call routines and must remain visible.
+fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut mark_type = |at: usize| {
+        if let Some(token) = tokens.get(at)
+            && let Some(prefix) = crate::emit::type_prefix(&code[token.offset..])
+        {
+            spans.push(token.offset..token.offset + prefix.len());
+        }
+    };
+    let column = |at: usize| {
+        tokens.get(at).is_some_and(RebindToken::name)
+            && ![
+                "constraint",
+                "check",
+                "unique",
+                "primary",
+                "foreign",
+                "exclude",
+                "like",
+            ]
+            .iter()
+            .any(|word| token_is(tokens, at, word))
+    };
+    let mut at = 0;
+    while at < tokens.len() {
+        if let Some(close) = tokens[at].close {
+            at = close + 1;
+            continue;
+        }
+        let create = tokens[at].word("create");
+        if !create && !tokens[at].word("alter") {
+            at += 1;
+            continue;
+        }
+        let mut target = at + 1;
+        if create {
+            while [
+                "global",
+                "local",
+                "temp",
+                "temporary",
+                "unlogged",
+                "foreign",
+            ]
+            .iter()
+            .any(|word| token_is(tokens, target, word))
+            {
+                target += 1;
+            }
+        }
+        if !token_is(tokens, target, "table") {
+            at += 1;
+            continue;
+        }
+        target += 1;
+        if token_is(tokens, target, "if") {
+            target += 1;
+            if create && token_is(tokens, target, "not") {
+                target += 1;
+            }
+            if token_is(tokens, target, "exists") {
+                target += 1;
+            }
+        }
+        if !create && token_is(tokens, target, "only") {
+            target += 1;
+        }
+        if !tokens.get(target).is_some_and(RebindToken::name) {
+            at += 1;
+            continue;
+        }
+        let mut item = target + 1;
+        if create {
+            if let Some(after) = after_group(tokens, item) {
+                let close = after - 1;
+                item += 1;
+                while item < close {
+                    if column(item) {
+                        mark_type(item + 1);
+                    }
+                    while item < close && !token_is(tokens, item, ",") {
+                        item = tokens[item].close.map_or(item + 1, |end| end + 1);
+                    }
+                    item += 1;
+                }
+            }
+        } else {
+            if token_is(tokens, item, "*") {
+                item += 1;
+            }
+            while item < tokens.len() && !token_is(tokens, item, ";") {
+                let add = token_is(tokens, item, "add");
+                if add || token_is(tokens, item, "alter") {
+                    let mut name = item + 1;
+                    if token_is(tokens, name, "column") {
+                        name += 1;
+                    }
+                    if add
+                        && token_is(tokens, name, "if")
+                        && token_is(tokens, name + 1, "not")
+                        && token_is(tokens, name + 2, "exists")
+                    {
+                        name += 3;
+                    }
+                    if column(name) {
+                        let mut ty = name + 1;
+                        if add {
+                            mark_type(ty);
+                        } else {
+                            if token_is(tokens, ty, "set") && token_is(tokens, ty + 1, "data") {
+                                ty += 2;
+                            }
+                            if token_is(tokens, ty, "type") {
+                                mark_type(ty + 1);
+                            }
+                        }
+                    }
+                }
+                while item < tokens.len()
+                    && !token_is(tokens, item, ",")
+                    && !token_is(tokens, item, ";")
+                {
+                    item = tokens[item].close.map_or(item + 1, |end| end + 1);
+                }
+                if token_is(tokens, item, ",") {
+                    item += 1;
+                }
+            }
+        }
+        at += 1;
+    }
+    spans
+}
+
 /// CTE and relation alias column lists declare names; they cannot call an
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
@@ -2276,6 +2432,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     if routine {
         let (locals, cursors) = procedural_type_spans(&tokens);
         type_spans.extend(locals);
+        type_spans.extend(ddl_type_spans(&code, &tokens));
         declarations.extend(cursors);
     }
     // Parenthesis/bracket scopes keep commas in arguments, subqueries and
@@ -3253,6 +3410,117 @@ mod tests {
                     &declared,
                     &[],
                     &[id("app.btree(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_operands_are_not_view_mentions_but_cursor_queries_remain_code() {
+        for body in [
+            "DECLARE orders CURSOR FOR SELECT 7; BEGIN OPEN orders; END",
+            "DECLARE orders CURSOR FOR SELECT 7; n int; BEGIN OPEN orders; FETCH orders INTO n; CLOSE orders; END",
+            "DECLARE \"orders\" SCROLL CURSOR FOR SELECT 7; n int; BEGIN OPEN \"orders\"; MOVE NEXT FROM \"orders\"; FETCH NEXT IN \"orders\" INTO n; CLOSE \"orders\"; END",
+            "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH FROM orders INTO result; CLOSE orders; END",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!("() RETURNS void LANGUAGE plpgsql AS $${body}$$")),
+            );
+            for arrival in ["app.orders", "app.orders(integer)"] {
+                assert!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new())
+                        .is_empty(),
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for (body, arrival) in [
+            (
+                "DECLARE orders CURSOR FOR SELECT * FROM orders; BEGIN OPEN orders; END",
+                "app.orders",
+            ),
+            (
+                "DECLARE orders CURSOR FOR SELECT orders(7); BEGIN OPEN orders; END",
+                "app.orders(integer)",
+            ),
+            (
+                "DECLARE c SCROLL CURSOR FOR SELECT 7; BEGIN OPEN c; MOVE ABSOLUTE orders(7) FROM c; END",
+                "app.orders(integer)",
+            ),
+            (
+                "BEGIN PERFORM 1 FROM source FETCH FIRST orders(7) ROWS ONLY; END",
+                "app.orders(integer)",
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!("() RETURNS void LANGUAGE plpgsql AS $${body}$$")),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                1,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn ddl_column_type_modifiers_preserve_type_references_and_expression_calls() {
+        for statement in [
+            "CREATE TEMP TABLE t (g geometry(10,2))",
+            "CREATE TEMPORARY TABLE IF NOT EXISTS t (g \"geometry\"(10,2), h geometry(5,1))",
+            "CREATE UNLOGGED TABLE t (g geometry(10,2), CHECK (g IS NOT NULL))",
+            "CREATE FOREIGN TABLE t (g geometry(10,2)) SERVER remote",
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS g geometry(10,2)",
+            "ALTER TABLE ONLY t ALTER COLUMN g TYPE geometry(10,2)",
+            "ALTER TABLE IF EXISTS t ALTER g SET DATA TYPE geometry(10,2)",
+            "ALTER TABLE t * ADD g geometry(10,2), ADD h geometry(5,1)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            for (arrival, count) in [("app.geometry(integer,integer)", 0), ("app.geometry", 1)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+        for statement in [
+            "CREATE TABLE t (g geometry(10,2) DEFAULT geometry(1,2))",
+            "CREATE TABLE t (g geometry(10,2), CONSTRAINT checked CHECK (geometry(1,2) > 0))",
+            "CREATE TABLE t (g int GENERATED ALWAYS AS (geometry(1,2)) STORED)",
+            "CREATE TABLE t AS SELECT geometry(1,2)",
+            "ALTER TABLE t ADD g geometry(10,2) DEFAULT geometry(1,2)",
+            "ALTER TABLE t ADD CONSTRAINT checked CHECK (geometry(1,2) > 0)",
+            "ALTER TABLE t ALTER g TYPE geometry(10,2) USING geometry(1,2)",
+            "ALTER TABLE t ALTER g SET DEFAULT geometry(1,2)",
+            "CREATE TABLE t (g geometry(10,2)); PERFORM geometry(1,2)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.geometry(integer,integer)")],
                     &BTreeSet::new()
                 )
                 .len(),
