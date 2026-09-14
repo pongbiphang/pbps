@@ -2178,7 +2178,9 @@ fn utility_target_columns(tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range<usi
 
 /// An index target's opening parenthesis is a relation separator. Keep its
 /// contents: index expressions and predicates may still call arriving routines.
-fn index_target_separators(tokens: &[RebindToken<'_>]) -> Vec<usize> {
+/// Access methods bind pg_am, so neither arrival kind can capture that operand.
+fn index_reference_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
+    let mut methods = Vec::new();
     let mut separators = Vec::new();
     let mut at = 0;
     while at < tokens.len() {
@@ -2210,17 +2212,23 @@ fn index_target_separators(tokens: &[RebindToken<'_>]) -> Vec<usize> {
                     if token_is(tokens, target, "only") {
                         target += 1;
                     }
-                    if tokens.get(target).is_some_and(RebindToken::name)
-                        && after_group(tokens, target + 1).is_some()
-                    {
-                        separators.push(tokens[target + 1].offset);
+                    if tokens.get(target).is_some_and(RebindToken::name) {
+                        if after_group(tokens, target + 1).is_some() {
+                            separators.push(tokens[target + 1].offset);
+                        } else if token_is(tokens, target + 1, "using")
+                            && tokens.get(target + 2).is_some_and(RebindToken::name)
+                            && after_group(tokens, target + 3).is_some()
+                        {
+                            let method = &tokens[target + 2];
+                            methods.push(method.offset..method.offset + method.text.len());
+                        }
                     }
                 }
             }
         }
         at += 1;
     }
-    separators
+    (methods, separators)
 }
 
 /// CTE and relation alias column lists declare names; they cannot call an
@@ -2418,10 +2426,10 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
             }
         }
     }
-    let index_separators = if routine {
-        index_target_separators(&tokens)
+    let (index_methods, index_separators) = if routine {
+        index_reference_spans(&tokens)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let ranges: Vec<_> = declarations
         .into_iter()
@@ -2430,6 +2438,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
             t.offset..t.offset + t.text.len()
         })
         .chain(modifier_ranges)
+        .chain(index_methods)
         .chain(
             routine
                 .then(|| utility_target_columns(&tokens))
@@ -3195,6 +3204,55 @@ mod tests {
                     &declared,
                     &[],
                     &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_access_methods_are_not_module_references_but_their_expressions_are() {
+        for statement in [
+            "CREATE INDEX ix ON orders USING btree (id)",
+            "CREATE UNIQUE INDEX ix ON ONLY orders USING \"btree\" (id)",
+            "CREATE INDEX IF NOT EXISTS ix ON app.orders USING btree ((abs(id)))",
+            "CREATE INDEX ON orders USING btree (id)",
+            "CREATE INDEX ix ON orders USING U&\"btr!0065e\" UESCAPE '!' (id)",
+        ] {
+            let body = format!("() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$");
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(&body));
+            for (arrival, count) in [
+                ("app.btree(integer)", 0),
+                ("app.btree", 0),
+                ("app.orders", 1),
+            ] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+        for statement in [
+            "CREATE INDEX ix ON orders USING btree (btree(id))",
+            "CREATE INDEX ix ON orders USING btree ((btree(id)))",
+            "CREATE INDEX ix ON orders USING btree (id) WHERE btree(id) > 0",
+            "CREATE INDEX ix ON orders USING btree (id); PERFORM btree(7)",
+            "EXECUTE statement USING btree(7)",
+            "SELECT 1 FROM orders JOIN other USING (btree); PERFORM btree(7)",
+        ] {
+            let body = format!("() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$");
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(&body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.btree(integer)")],
                     &BTreeSet::new()
                 )
                 .len(),

@@ -12151,6 +12151,11 @@ SPEC is in sync with all of these.
      index expression starts with another parenthesis. Live procedural index
      creation with unmanaged dependents accepts the routine arrival alone;
      expression and predicate controls retain real calls in the rebind scan.
+     An explicit USING access method binds pg_am, not pg_proc or pg_class.
+     Mask that operand for either arrival kind while keeping the following
+     expression list and predicates visible. Live plain, quoted and expression
+     indexes keep their unmanaged dependents when a btree routine arrives;
+     genuine btree calls inside index expressions remain rebind candidates.
 
      View arrivals retain path-resolved modified type names: a view creates a
      same-named composite type. Only the modifier group is removed for this
