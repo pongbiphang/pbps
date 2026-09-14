@@ -9616,6 +9616,223 @@ async fn type_modifiers_do_not_hide_calls_in_defaults_or_cast_operands() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn procedural_local_type_modifiers_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("local_types230").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS 'DECLARE amount numeric(10,2) = 7; BEGIN RETURN amount::int; END'",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE amount CONSTANT numeric(10,2) NOT NULL DEFAULT 7; BEGIN RETURN amount::int; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS $$BEGIN DECLARE amount numeric(10,2) := 7; BEGIN RETURN amount::int; END; END$$",
+        "() RETURNS int LANGUAGE plpgsql AS $$DECLARE c CURSOR(n numeric(10,2)) FOR SELECT n; BEGIN RETURN 7; END$$",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.numeric".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let view_arrival = plan(&b, &ids, &c, &ids);
+    let mut view_only = view_arrival.clone();
+    view_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &view_only).await;
+    // Unquoted NUMERIC is a grammar-bound system type. Even recompiling after
+    // the view arrives still accepts its modifier, unlike a path-bound type.
+    db.conn
+        .execute(&format!(
+            "CREATE OR REPLACE FUNCTION app.f0{}",
+            definitions[0]
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        number(&mut db.conn, "SELECT value FROM app.external0").await,
+        7
+    );
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+    assert_eq!(view_arrival.changes.len(), 1, "{view_arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn procedural_defaults_and_cursor_queries_still_rebind_real_calls() {
+    let mut db = TestDb::create("local_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+        CREATE FUNCTION shared.numeric(integer,integer) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "DECLARE n numeric(10,2) DEFAULT \"numeric\"(1,2); BEGIN RETURN n::int; END",
+        "DECLARE n numeric(10,2) := \"numeric\"(1,2); BEGIN RETURN n::int; END",
+        "DECLARE n numeric(10,2) = \"numeric\"(1,2); BEGIN RETURN n::int; END",
+        "DECLARE n numeric(10,2); c CURSOR(arg numeric(10,2)) FOR SELECT \"numeric\"(arg::int,2); BEGIN OPEN c(1); FETCH c INTO n; CLOSE c; RETURN n::int; END",
+        "DECLARE n numeric(10,2) := 7; BEGIN RETURN \"numeric\"(n::int,2); END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    // Emitted DDL resets the session path; procedural expressions bind when
+    // executed, so restore the application's path before calling them.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_arrival_must_recheck_a_modified_type_binding() {
+    let mut db = TestDb::create("type_view230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; \
+        CREATE TYPE shared.geometry; \
+        CREATE FUNCTION shared.geometry_in(cstring,oid,integer) RETURNS shared.geometry AS 'numeric_in' LANGUAGE internal IMMUTABLE STRICT; \
+        CREATE FUNCTION shared.geometry_out(shared.geometry) RETURNS cstring AS 'numeric_out' LANGUAGE internal IMMUTABLE STRICT; \
+        CREATE TYPE shared.geometry (INPUT=shared.geometry_in,OUTPUT=shared.geometry_out,TYPMOD_IN=numerictypmodin,TYPMOD_OUT=numerictypmodout,INTERNALLENGTH=VARIABLE,ALIGNMENT=int4,STORAGE=main)").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definition =
+        "(OUT result geometry(10,2)) LANGUAGE sql BEGIN ATOMIC SELECT '7'::geometry(10,2); END";
+    let mut a = Schema::default();
+    a.modules.insert(
+        "app.f()".parse().unwrap(),
+        module(pbps_model::ModuleKind::Function, definition),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    assert_eq!(text(&mut db.conn, "SELECT app.f()::text").await, "7");
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.geometry".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    assert_eq!(text(&mut db.conn, "SELECT app.f()::text").await, "7");
+    // The parsed routine still has its old type, but the same declaration now
+    // resolves a composite type that refuses the modifier. A successful plan
+    // cannot record that source without rechecking the routine's binding.
+    in_a_transaction(&mut db.conn).await;
+    db.conn
+        .execute("SET LOCAL search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    let refused = db
+        .conn
+        .execute(&format!("CREATE OR REPLACE FUNCTION app.f{definition}"))
+        .await
+        .unwrap_err();
+    rollback(&mut db.conn).await;
+    db.drop().await;
+    assert_eq!(refused.server_error_code().as_deref(), Some("42601"));
+    assert_eq!(arrival.changes.len(), 2, "{arrival:#?}");
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

@@ -1910,7 +1910,7 @@ pub struct Rebound {
 /// column list remains a relation mention and a `SUPPORT` operand names a
 /// routine without call parentheses. A pg_proc arrival cannot
 /// capture a pg_class reference; this refinement still does not parse SQL
-/// expressions or resolve overloads (DECISIONS 307, 476).
+/// expressions or resolve overloads (DECISIONS 307, 477).
 ///
 /// `pg_catalog` is not a schema a write path may list (DECISIONS 277), so
 /// nothing this plan creates can arrive there and it is not considered.
@@ -1934,13 +1934,8 @@ const LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
 };
 
 const REBIND_LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
-    code_only: &rebind_code_only,
+    code_only: &str::to_owned,
     ..LEXIS
-};
-
-const ROUTINE_REBIND_LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
-    code_only: &routine_rebind_code_only,
-    ..REBIND_LEXIS
 };
 
 struct RebindToken<'a> {
@@ -2010,24 +2005,91 @@ fn relation_column_alias(tokens: &[RebindToken<'_>], mut at: usize) -> Option<us
     (tokens.get(at)?.name() && after_group(tokens, at + 1).is_some()).then_some(at)
 }
 
+/// These unquoted type keywords bind pg_catalog directly in PostgreSQL's
+/// grammar. Quoted and generic type names still resolve through the path.
+fn fixed_type_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
+    match tokens[at].text.to_ascii_lowercase().as_str() {
+        "int" | "integer" | "smallint" | "bigint" | "real" | "float" | "decimal" | "dec"
+        | "numeric" | "boolean" | "bit" | "character" | "char" | "varchar" | "nchar"
+        | "timestamp" | "time" | "interval" => true,
+        "varying" => {
+            at > 0
+                && ["bit", "character", "char", "nchar"]
+                    .iter()
+                    .any(|word| token_is(tokens, at - 1, word))
+        }
+        "second" => {
+            at > 0 && (token_is(tokens, at - 1, "interval") || token_is(tokens, at - 1, "to"))
+        }
+        "precision" => at > 0 && token_is(tokens, at - 1, "double"),
+        _ => false,
+    }
+}
+
+/// PL/pgSQL declaration statements end at semicolons before BEGIN. Only
+/// their type portion is marked: defaults, assignments and cursor queries
+/// remain expressions. Skipping balanced groups avoids treating a parameter
+/// named declare, or a nested SQL expression, as a declaration block.
+fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
+    let mut spans = Vec::new();
+    let mut cursors = Vec::new();
+    let mut statement = None;
+    let mut at = 0;
+    while at < tokens.len() {
+        let token = &tokens[at];
+        if let Some(close) = token.close {
+            at = close + 1;
+            continue;
+        }
+        if token.word("declare") && tokens.get(at + 1).is_some_and(RebindToken::name) {
+            statement = Some(at + 1);
+        } else if token.word("begin") {
+            statement = None;
+        } else if token.text == ";"
+            && let Some(start) = statement
+        {
+            if tokens.get(start).is_some_and(RebindToken::name) {
+                let mut ty = start + 1;
+                if token_is(tokens, ty, "constant") {
+                    ty += 1;
+                }
+                let mut end = ty;
+                while end < at {
+                    let item = &tokens[end];
+                    if item.word("default") || item.word("for") || matches!(item.text, "=" | ":") {
+                        break;
+                    }
+                    if item.word("cursor") {
+                        if let Some(after) = after_group(tokens, end + 1) {
+                            spans.push(tokens[end + 1].offset..tokens[after - 1].offset);
+                            cursors.push(end);
+                        }
+                        ty = at;
+                        break;
+                    }
+                    end = item.close.map_or(end + 1, |close| close + 1);
+                }
+                if ty < end && ty < at {
+                    spans.push(tokens[ty].offset..tokens[end].offset);
+                }
+            }
+            statement = Some(at + 1);
+        }
+        at += 1;
+    }
+    (spans, cursors)
+}
+
 /// CTE and relation alias column lists declare names; they cannot call an
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
-/// No name is resolved to an alias: later uses remain conservative (476).
-fn rebind_code_only(definition: &str) -> String {
-    rebind_code(definition, false)
-}
-
-fn routine_rebind_code_only(definition: &str) -> String {
-    rebind_code(definition, true)
-}
-
-fn rebind_code(definition: &str, routine: bool) -> String {
+/// No name is resolved to an alias: later uses remain conservative (477).
+fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> String {
     let mut code = crate::LEXICON.code_only_with_literal_markers(definition);
-    let (mut type_spans, body_as) = if routine {
+    let mut type_spans = if routine {
         crate::emit::routine_type_spans(definition)
     } else {
-        (Vec::new(), None)
+        Vec::new()
     };
     let mut tokens: Vec<RebindToken<'_>> = Vec::new();
     let mut groups: Vec<usize> = Vec::new();
@@ -2060,9 +2122,15 @@ fn rebind_code(definition: &str, routine: bool) -> String {
         at += text.len();
     }
     let mut declarations = Vec::new();
+    if routine {
+        let (locals, cursors) = procedural_type_spans(&tokens);
+        type_spans.extend(locals);
+        declarations.extend(cursors);
+    }
     // Parenthesis/bracket scopes keep commas in arguments, subqueries and
     // arrays from introducing another item in the outer FROM list.
     let mut from = vec![false];
+    let mut open_groups: Vec<usize> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
         // PostgreSQL brackets delimit arrays, never identifiers. The shared
         // name scanner also supports bracket quoting, so retain the group for
@@ -2073,9 +2141,13 @@ fn rebind_code(definition: &str, routine: bool) -> String {
         // AS also introduces cast types and record column definitions. A
         // parenthesized query after AS is not a type prefix. The :: spelling
         // has two punctuation tokens, not a keyword subject to quote folding.
-        if (token.word("as") && Some(token.offset) != body_as)
-            || (token.text == ":" && token_is(&tokens, i + 1, ":"))
-        {
+        let cast_type = token.word("as")
+            && open_groups.last().is_some_and(|&open| {
+                open > 0
+                    && (token_is(&tokens, open - 1, "cast")
+                        || token_is(&tokens, open - 1, "xmlserialize"))
+            });
+        if cast_type || (token.text == ":" && token_is(&tokens, i + 1, ":")) {
             let end = if token.text == ":" {
                 tokens[i + 1].offset + 1
             } else {
@@ -2088,8 +2160,6 @@ fn rebind_code(definition: &str, routine: bool) -> String {
         if token.name()
             && let Some(after) = after_group(&tokens, i + 1)
         {
-            let explicit_alias =
-                i > 0 && token_is(&tokens, i - 1, "as") && Some(tokens[i - 1].offset) != body_as;
             let mut body = after + 1;
             if token_is(&tokens, body, "not") {
                 body += 1;
@@ -2100,7 +2170,7 @@ fn rebind_code(definition: &str, routine: bool) -> String {
             // name(columns) AS [NOT MATERIALIZED] (body) identifies each
             // CTE independently, including after SEARCH/CYCLE clauses.
             let cte = token_is(&tokens, after, "as") && after_group(&tokens, body).is_some();
-            if explicit_alias || cte {
+            if cte {
                 declarations.push(i);
             }
             let close = &tokens[after - 1];
@@ -2111,10 +2181,14 @@ fn rebind_code(definition: &str, routine: bool) -> String {
             }
         }
         match token.text.to_ascii_lowercase().as_str() {
-            "(" | "[" => from.push(false),
+            "(" | "[" => {
+                from.push(false);
+                open_groups.push(i);
+            }
             ")" | "]" => {
                 if from.len() > 1 {
                     from.pop();
+                    open_groups.pop();
                 }
             }
             "from" | "join" | "using" => {
@@ -2123,6 +2197,12 @@ fn rebind_code(definition: &str, routine: bool) -> String {
                     declarations.push(alias);
                     let end = tokens[tokens[alias + 1].close.unwrap()].offset;
                     type_spans.push(tokens[alias].offset..end);
+                }
+            }
+            "into" => {
+                // INSERT's AS alias precedes the target column list too.
+                if let Some(alias) = relation_column_alias(&tokens, i + 1) {
+                    declarations.push(alias);
                 }
             }
             "," if *from.last().unwrap() => {
@@ -2139,12 +2219,21 @@ fn rebind_code(definition: &str, routine: bool) -> String {
             _ => {}
         }
     }
+    let mut modifier_ranges = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
         if token.name()
-            && after_group(&tokens, i + 1).is_some()
+            && let Some(after) = after_group(&tokens, i + 1)
             && type_spans.iter().any(|span| span.contains(&token.offset))
+            && !declarations.contains(&i)
         {
-            declarations.push(i);
+            if arriving_routine || fixed_type_keyword(&tokens, i) {
+                declarations.push(i);
+            } else {
+                // A same-named view creates a composite type. Preserve the
+                // type reference while removing its non-call modifier group.
+                let close = &tokens[after - 1];
+                modifier_ranges.push(tokens[i + 1].offset..close.offset + close.text.len());
+            }
         }
     }
     let ranges: Vec<_> = declarations
@@ -2153,6 +2242,7 @@ fn rebind_code(definition: &str, routine: bool) -> String {
             let t = &tokens[i];
             t.offset..t.offset + t.text.len()
         })
+        .chain(modifier_ranges)
         .collect();
     for range in ranges {
         code.replace_range(range.clone(), &" ".repeat(range.len()));
@@ -2181,14 +2271,10 @@ pub fn rebound_by_this_plan(
             // out of the ordinary non-call (relation/type) scan as well.
             ordinary.replace_range(operand.clone(), " ");
         }
-        let lexis = if matches!(
+        let routine = matches!(
             definition.kind,
             ModuleKind::Function | ModuleKind::Procedure
-        ) {
-            &ROUTINE_REBIND_LEXIS
-        } else {
-            &REBIND_LEXIS
-        };
+        );
         for new in arriving {
             if new == module {
                 continue;
@@ -2216,7 +2302,9 @@ pub fn rebound_by_this_plan(
                         )
                     })
                 });
-            if support_matches || pbps_model::module::references_module_with(&ordinary, new, lexis)
+            let code = rebind_code(&ordinary, routine, matches!(new, ModuleId::Routine(_)));
+            if support_matches
+                || pbps_model::module::references_module_with(&code, new, &REBIND_LEXIS)
             {
                 out.push(Rebound {
                     module: module.clone(),
@@ -2924,7 +3012,7 @@ mod tests {
                 .len(),
                 1,
                 "{body}: {}",
-                routine_rebind_code_only(body)
+                rebind_code(body, true, true)
             );
         }
         let mut declared = Schema::default();
@@ -2959,6 +3047,90 @@ mod tests {
             declared.modules.insert(id("app.caller()"), module(body));
             assert!(
                 rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn modified_path_types_remain_references_for_view_arrivals() {
+        for body in [
+            "(OUT result geometry(10,2)) LANGUAGE sql AS 'SELECT NULL'",
+            "() RETURNS geometry(10,2) LANGUAGE sql AS 'SELECT NULL'",
+            "() RETURNS TABLE(n geometry(10,2)) LANGUAGE sql AS 'SELECT NULL'",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n geometry(10,2); BEGIN RETURN 7; END$$",
+            "SELECT CAST('7' AS geometry(10,2))",
+            "SELECT '7'::geometry(10,2)",
+            "SELECT geometry(10,2) '7'",
+            "SELECT * FROM source() AS t(n geometry(10,2))",
+            "SELECT * FROM source() t(n geometry(10,2))",
+            "WITH x AS MATERIALIZED (SELECT '7'::geometry(10,2)) SELECT * FROM x",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            for (arrival, count) in [("app.geometry", 1), ("app.geometry(integer,integer)", 0)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for body in [
+            "(n numeric(10,2)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n numeric(10,2); BEGIN RETURN 7; END$$",
+        ] {
+            for (definition, count) in [
+                (body.to_owned(), 0),
+                (body.replace("numeric", "\"numeric\""), 1),
+            ] {
+                let mut declared = Schema::default();
+                declared.modules.insert(id("app.f()"), module(&definition));
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id("app.numeric")], &BTreeSet::new())
+                        .len(),
+                    count,
+                    "{definition}"
+                );
+            }
+        }
+        let mut declared = Schema::default();
+        declared.modules.insert(
+            id("app.f()"),
+            module("SELECT * FROM source() AS geometry(n shape(10,2))"),
+        );
+        assert!(
+            rebound_by_this_plan(&declared, &[], &[id("app.geometry")], &BTreeSet::new())
+                .is_empty()
+        );
+        assert_eq!(
+            rebound_by_this_plan(&declared, &[], &[id("app.shape")], &BTreeSet::new()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn procedural_type_scans_preserve_defaults_and_cursor_queries() {
+        for body in [
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n numeric(10,2) DEFAULT \"numeric\"(1,2); BEGIN RETURN n; END$$",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n numeric(10,2) := \"numeric\"(1,2); BEGIN RETURN n; END$$",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n numeric(10,2) = \"numeric\"(1,2); BEGIN RETURN n; END$$",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE c CURSOR(n numeric(10,2)) FOR SELECT \"numeric\"(1,2); BEGIN RETURN 7; END$$",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE n numeric(10,2) := 7; BEGIN RETURN \"numeric\"(1,2); END$$",
+            "(declare numeric(10,2) DEFAULT \"numeric\"(1,2)) RETURNS int LANGUAGE sql RETURN declare::int",
+            "SELECT declare, \"numeric\"(1,2) FROM source",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.numeric(integer,integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
                 "{body}"
             );
         }

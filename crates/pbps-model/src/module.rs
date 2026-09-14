@@ -947,7 +947,7 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
 /// parentheses introduce a column list. Named relations match the remaining
 /// mentions; triggers have no reference form. This does not resolve aliases
 /// or overloads. Callers opt into the refinement instead of changing every
-/// name report and creation-order edge (DECISIONS 476).
+/// name report and creation-order edge (DECISIONS 477).
 pub fn references_module_with(definition: &str, module: &ModuleId, lexis: &Lexis<'_>) -> bool {
     let Some(name) = module.referenced_name() else {
         return false;

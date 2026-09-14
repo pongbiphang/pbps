@@ -1427,7 +1427,7 @@ pub(crate) fn qualified_name_at(text: &str) -> Option<&str> {
 /// `support` is unreserved: a parameter, return type, language, setting value
 /// or SQL-body column of that name does not introduce a routine reference.
 /// Only header items are inspected; the SQL body stays with the ordinary
-/// reference scanner, and quoted AS bodies remain opaque (DECISIONS 476).
+/// reference scanner, and quoted AS bodies remain opaque (DECISIONS 477).
 pub(crate) fn support_operand(definition: &str) -> Option<std::ops::Range<usize>> {
     let mut rest = after_the_gap(definition).0;
     let list = parameter_list(rest)?;
@@ -1521,12 +1521,10 @@ pub(crate) fn type_prefix(text: &str) -> Option<&str> {
 
 /// Parameter defaults remain expressions. Everything before each default,
 /// and the return/transform type operands, can contain modifiers but no calls.
-/// The AS offset distinguishes a decoded routine body from a cast or alias.
-pub(crate) fn routine_type_spans(definition: &str) -> (Vec<std::ops::Range<usize>>, Option<usize>) {
+pub(crate) fn routine_type_spans(definition: &str) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
-    let mut body_as = None;
     let Some(list) = parameter_list(definition) else {
-        return (spans, body_as);
+        return spans;
     };
     let mut rest = after_the_gap(definition).0;
     let list_start = definition.len() - rest.len() + 1;
@@ -1544,7 +1542,6 @@ pub(crate) fn routine_type_spans(definition: &str) -> (Vec<std::ops::Range<usize
         match item.to_ascii_lowercase().as_str() {
             "begin" | "return" => break,
             "as" => {
-                body_as = Some(definition.len() - rest.len() - item.len());
                 header_item(&mut rest);
             }
             "returns" => {
@@ -1575,7 +1572,7 @@ pub(crate) fn routine_type_spans(definition: &str) -> (Vec<std::ops::Range<usize
             _ => {}
         }
     }
-    (spans, body_as)
+    spans
 }
 
 /// One header item without decoding it. Reuse the emitter's literal, quoted

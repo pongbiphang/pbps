@@ -12088,19 +12088,40 @@ SPEC is in sync with all of these.
      same-named call inside the CTE, derived relation, function argument or
      aliased query: each still rebuilds and binds the arriving routine.
 
-     Type modifiers are another non-call use of parentheses. The rebind scan
-     excludes modified type names in parameter and return declarations,
+     Type modifiers are another non-call use of parentheses. Routine arrivals
+     exclude modified type names in parameter and return declarations,
      transform operands, casts, record column definitions and typed literals.
      Parameter defaults and cast operands remain expressions. The dialect
      lexer offers an opt-in datum marker after decoding quoted routine bodies:
      `numeric(10, 2) '7'` stays distinguishable from a call without exposing
      string contents or confusing decoded offsets with the original source.
-     The raw header's AS position keeps a decoded VALUES body out of the type
-     scan. Nested CTE bodies likewise stay outside a type modifier span.
+     Only CAST and XMLSERIALIZE groups introduce AS type operands; routine
+     bodies and materialized CTEs keep their calls visible. Relation aliases
+     still come from their relation context, including INSERT target aliases.
      PostgreSQL array brackets remain grouping punctuation rather than the
      shared scanner's identifier quotes, so calls in array defaults survive.
      Live cases with unmanaged dependents need only the routine arrival;
      companion defaults and cast operands still rebuild and switch bindings.
+
+     Procedural DECLARE statements also contain type positions. Their type
+     portion ends before DEFAULT, assignment or a cursor's FOR query; BEGIN
+     ends the declaration block. Balanced groups keep parameters and nested
+     expressions out of that scan. Cursor argument types are included without
+     turning CURSOR itself into a type reference. Live PL/pgSQL cases cover
+     nested blocks, constants, both assignment spellings, real unmanaged
+     dependents and calls in defaults, cursor queries and the executable body.
+
+     View arrivals retain path-resolved modified type names: a view creates a
+     same-named composite type. Only the modifier group is removed for this
+     relation-form scan. Measured with a numeric-layout base type using the
+     engine's numeric type-modifier functions: a parsed routine keeps its old
+     result after the view arrives, but recreating its declaration refuses
+     because the composite type cannot accept that modifier. Omitting the
+     rebuild would record a declaration whose binding no longer matches.
+     Unquoted built-in type keywords bind pg_catalog directly in the grammar;
+     their modifiers remain excluded even for view arrivals. A same-named view
+     does not stop a newly compiled NUMERIC local from working. Quoted type
+     names retain path resolution and are not given that exception.
 
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
