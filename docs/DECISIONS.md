@@ -12130,6 +12130,14 @@ SPEC is in sync with all of these.
      The cursor declaration name is excluded with its CURSOR keyword so that
      blanking the keyword cannot attach its parameter list to that name.
 
+     ANALYZE/ANALYSE and COPY utility targets also accept column lists. Their
+     target column groups are blanked, keeping the names as relation mentions
+     rather than calls. ANALYZE options and multiple targets, its VERBOSE form,
+     and COPY's legacy BINARY form are measured on both PostgreSQL versions.
+     A COPY query starts with its own group and keeps all real calls visible.
+     Live procedural cases with unmanaged dependents need only the arriving
+     routine; its pg_proc entry cannot capture these utility relation targets.
+
      View arrivals retain path-resolved modified type names: a view creates a
      same-named composite type. Only the modifier group is removed for this
      relation-form scan. Measured with a numeric-layout base type using the

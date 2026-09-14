@@ -2090,6 +2090,49 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
     (spans, cursors)
 }
 
+/// Utility target parentheses contain column names, not call arguments.
+/// Remove only those groups so the target keeps its relation-reference form.
+/// A COPY query is a leading group rather than a target and stays untouched.
+fn utility_target_columns(tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range<usize>> {
+    let mut columns = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        if let Some(close) = tokens[at].close {
+            at = close + 1;
+            continue;
+        }
+        let analyze = tokens[at].word("analyze") || tokens[at].word("analyse");
+        if analyze || tokens[at].word("copy") {
+            let mut target = at + 1;
+            if analyze {
+                if token_is(tokens, target, "verbose") {
+                    target += 1;
+                }
+                if let Some(after) = after_group(tokens, target) {
+                    target = after;
+                }
+            } else if token_is(tokens, target, "binary") {
+                target += 1;
+            }
+            while tokens.get(target).is_some_and(RebindToken::name) {
+                target += 1;
+                if let Some(after) = after_group(tokens, target) {
+                    let close = &tokens[after - 1];
+                    columns.push(tokens[target].offset..close.offset + close.text.len());
+                    target = after;
+                }
+                if analyze && token_is(tokens, target, ",") {
+                    target += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        at += 1;
+    }
+    columns
+}
+
 /// CTE and relation alias column lists declare names; they cannot call an
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
@@ -2273,6 +2316,12 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
             t.offset..t.offset + t.text.len()
         })
         .chain(modifier_ranges)
+        .chain(
+            routine
+                .then(|| utility_target_columns(&tokens))
+                .into_iter()
+                .flatten(),
+        )
         .collect();
     for range in ranges {
         code.replace_range(range.clone(), &" ".repeat(range.len()));
@@ -3252,6 +3301,49 @@ mod tests {
                     "{arrival}: {body}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn utility_column_lists_keep_relation_references_and_query_calls() {
+        for body in [
+            "BEGIN ANALYZE orders(id); END",
+            "BEGIN ANALYSE VERBOSE orders(id); END",
+            "BEGIN ANALYZE (VERBOSE false) source(id), orders(id); END",
+            "BEGIN ANALYZE app . \"orders\" /* columns */ (id); END",
+            "BEGIN COPY orders(id) TO '/dev/null'; END",
+            "BEGIN COPY BINARY orders(id) TO '/dev/null'; END",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            for (arrival, count) in [("app.orders(integer)", 0), ("app.orders", 1)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for body in [
+            "BEGIN COPY (SELECT orders(7)) TO '/dev/null'; END",
+            "BEGIN COPY (SELECT * FROM orders(7)) TO '/dev/null'; END",
+            "BEGIN ANALYZE orders(id); RETURN orders(7); END",
+            "SELECT copy(orders(7))",
+            "SELECT copy, orders(7) FROM source",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{body}"
+            );
         }
     }
 

@@ -9979,6 +9979,86 @@ async fn record_returning_from_calls_rebind_in_views_and_parsed_routines() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn utility_target_column_lists_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("utility_names230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.orders(id int); INSERT INTO shared.orders VALUES (7); CREATE TABLE shared.source(id int)")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "ANALYZE orders(id)",
+        "ANALYSE VERBOSE orders(id)",
+        "ANALYZE (VERBOSE false) source(id), orders(id)",
+        "ANALYZE shared . \"orders\" /* columns */ (id)",
+        "COPY orders(id) TO '/dev/null'",
+        "COPY BINARY orders(id) TO '/dev/null'",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_arrival_must_recheck_a_modified_type_binding() {
     let mut db = TestDb::create("type_view230").await;
     db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; \
