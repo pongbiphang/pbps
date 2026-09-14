@@ -7943,3 +7943,80 @@ fn doctor_json_reports_external_schema_absence_before_grant_authority() {
         serde_json::json!([])
     );
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn doctor_json_follows_recorded_table_and_column_ids_before_pending_renames() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_doctor_data331_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "doctor-data331");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} LOGIN PASSWORD 'doctor-test'; GRANT CREATE ON SCHEMA public TO {}; CREATE SCHEMA app AUTHORIZATION {}",
+            role.1, role.1, role.1
+        ),
+    );
+    let login = format!(
+        "{} user={} password=doctor-test",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+    let d = Demo::new("doctor-data331");
+    d.table("table: app.old_name\ncolumns:\n  id: {type: integer, nullable: false}\n  old_label: {type: text, default: \"'seed'\"}\nprimary_key: [id]\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &login]));
+    d.table("table: app.new_name\nrenamed_from: app.old_name\ncolumns:\n  id: {type: integer, nullable: false}\n  label: {type: text, default: \"'seed'\", renamed_from: old_label}\nprimary_key: [id]\ndata:\n  mode: ensure\n  rows:\n    1: {}\n");
+    succeeds(d.run(&["plan"]));
+    on_server(
+        connection,
+        &format!(
+            "REVOKE INSERT, UPDATE ON app.old_name FROM {}; GRANT INSERT(id), UPDATE(old_label) ON app.old_name TO {}",
+            role.1, role.1
+        ),
+    );
+    let diagnose = || {
+        let out = d.run(&["doctor", "--db", &login, "--format", "json"]);
+        let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        (code(&out), value)
+    };
+    let (ok_code, covered) = diagnose();
+    assert_eq!(ok_code, 0, "{covered}");
+    assert_eq!(
+        covered["data"]["environments"][0]["missing_permissions"],
+        serde_json::json!([])
+    );
+    on_server(
+        connection,
+        &format!("REVOKE UPDATE(old_label) ON app.old_name FROM {}", role.1),
+    );
+    let (gap_code, missing) = diagnose();
+    assert_eq!(gap_code, 2, "{missing}");
+    let gaps = missing["data"]["environments"][0]["missing_permissions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(gaps.len(), 1, "{missing}");
+    let gap = gaps[0].as_str().unwrap();
+    assert!(gap.contains("UPDATE") && gap.contains("old_name"), "{gap}");
+    assert!(!gap.contains("new_name"), "{gap}");
+    on_server(
+        connection,
+        &format!("GRANT UPDATE(old_label) ON app.old_name TO {}", role.1),
+    );
+    assert_eq!(diagnose().0, 0);
+}

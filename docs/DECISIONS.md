@@ -12201,3 +12201,41 @@ SPEC is in sync with all of these.
      Live controls assert ACL effects, overload and scope negatives, recorded
      targets and schema-presence transitions; CLI JSON retains the quoted
      CREATE SCHEMA remedy.
+
+484. **Doctor resolves data permissions by identity and predicts new-table ACLs.**
+     The connected demand keeps INSERT's union of explicitly supplied cells
+     separate from UPDATE and full data readback (#331). A missing cell uses
+     its default or NULL without demanding INSERT on that column. Explicit
+     NULL is still a supplied cell; mixed rows demand the union. Ensure/exact
+     and key-only statement rules remain unchanged.
+
+     PostgreSQL receives the same project ids already supplied to SQL Server.
+     Table and column uids resolve against this environment's recorded mapping
+     before permission queries (#334, #335, #382). An unrelated object at the
+     declared destination cannot supply the old identity's ACL. A new identity
+     reusing a recorded name cannot borrow the departing object's rights.
+     Diagnostics name the current securable so a grant can be applied before
+     the rename. The same table resolution covers managed ownership/SELECT,
+     explicit object grants and adopted ACL scope; recorded grant demands
+     already name current objects and are retained unchanged.
+
+     Missing recorded objects report unknown authority rather than falling
+     through to new-table defaults. Unreadable recorded identities propagate
+     an error; no ledger and an empty ledger retain their existing diagnoses.
+     No identity intent is inferred, and neither saved formats nor execution
+     rules change. This remains SPEC 14.1's read-only readiness report.
+
+     Truly new data tables use the current deployment role's global default
+     table ACL, or PostgreSQL's built-in ACL when no global entry exists, plus
+     that role's schema-specific additions (#336). A membership's own default
+     ACL does not apply to objects this role creates; ACL grants to inherited
+     roles and PUBLIC still supply effective ordinary rights. Ownership keeps
+     grant options but does not restore self-revoked ordinary DML privileges.
+     PostgreSQL 18 and 16 measurements and emitted INSERT controls pin the
+     revoked-global, additive-schema, inherited-recipient and PUBLIC cases.
+
+     Separate live regressions pin each issue, including same-name decoys,
+     missing recorded objects and names freed for new identities. CLI JSON
+     tests mint pending table/column ids through plan and verify both covered
+     column grants and a revoked UPDATE. Managed-table catalog-wide SELECT
+     coverage (#392) remains a separate demand from declared data readback.
