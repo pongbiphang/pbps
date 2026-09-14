@@ -1443,7 +1443,7 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
 pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
     let (element, array) = peel_array(arg.as_str());
     let canonical = identity_element(element);
-    let spelled = if array {
+    let spelled = if array && !canonical.ends_with("[]") {
         format!("{canonical}[]")
     } else {
         canonical
@@ -2254,6 +2254,9 @@ mod tests {
             ("s.Ätype[]", "s.\"Ätype\"[]"),
             // The catalog's own name for a built-in's array type, measured.
             ("_int4", "integer[]"),
+            // PostgreSQL 18.6 refuses `_int4[]` with 42704, so this is a
+            // total-fold regression, not an accepted live spelling (#233).
+            ("_int4[]", "integer[]"),
             ("pg_catalog._int4", "integer[]"),
             ("\"_int4\"", "integer[]"),
             ("_INT4", "integer[]"),
@@ -2350,6 +2353,8 @@ mod tests {
         for text in [
             "varchar(10)",
             "int4",
+            "_int4[]",
+            "integer[]",
             "text[][]",
             "\"char\"",
             "m2.money_amount",
