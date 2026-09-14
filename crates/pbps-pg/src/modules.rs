@@ -2235,6 +2235,19 @@ fn procedural_type_spans(
             at = close + 1;
             continue;
         }
+        if token.word("<")
+            && token_is(tokens, at + 1, "<")
+            && tokens.get(at + 2).is_some_and(RebindToken::name)
+            && token_is(tokens, at + 3, ">")
+            && token_is(tokens, at + 4, ">")
+            && procedural_statement_boundary(tokens, at, body_start)
+        {
+            // Labels name local blocks. Requiring a boundary keeps shift
+            // operands visible to the relation scan (477).
+            declarations.push(at + 2);
+            at += 5;
+            continue;
+        }
         if token.word("declare")
             && tokens.get(at + 1).is_some_and(RebindToken::name)
             && declaration_block_start(tokens, at, body_start)
@@ -2242,6 +2255,19 @@ fn procedural_type_spans(
             statement = Some(at + 1);
         } else if token.word("begin") {
             statement = None;
+        } else if statement.is_none()
+            && (token.word("end") || token.word("exit") || token.word("continue"))
+            && procedural_statement_boundary(tokens, at, body_start)
+        {
+            let mut label = at + 1;
+            if token.word("end") && token_is(tokens, label, "loop") {
+                label += 1;
+            }
+            if tokens.get(label).is_some_and(RebindToken::name) {
+                // Only the label is local; EXIT/CONTINUE WHEN expressions
+                // retain their routine and relation references.
+                declarations.push(label);
+            }
         } else if statement.is_none() && procedural_keyword(tokens, at) {
             // Parenthesized operands do not turn statement keywords into calls.
             // Mask the whole keyword chain so a removed EXECUTE cannot attach
@@ -2307,6 +2333,16 @@ fn procedural_type_spans(
     (spans, declarations)
 }
 
+fn procedural_statement_boundary(
+    tokens: &[RebindToken<'_>],
+    at: usize,
+    body_start: Option<usize>,
+) -> bool {
+    statement_boundary(tokens, at)
+        || body_start
+            .is_some_and(|start| at >= start && statement_boundary(&tokens[start..], at - start))
+}
+
 /// DECLARE is also a SQL column or alias. A procedural declaration block must
 /// start at a statement boundary (including the actual quoted body's start)
 /// and lead into BEGIN. A SQL DECLARE cursor has no such block (477).
@@ -2315,10 +2351,7 @@ fn declaration_block_start(
     at: usize,
     body_start: Option<usize>,
 ) -> bool {
-    if !statement_boundary(tokens, at)
-        && !body_start
-            .is_some_and(|start| at >= start && statement_boundary(&tokens[start..], at - start))
-    {
+    if !procedural_statement_boundary(tokens, at, body_start) {
         return false;
     }
     let mut next = at + 1;
@@ -2861,6 +2894,15 @@ fn rebind_code(
             grouping_element_declarations(&tokens, element, tokens.len(), &mut declarations);
         }
         if sql_expression_keyword(&tokens, i, version) {
+            declarations.push(i);
+        }
+        if routine
+            && token.word("key")
+            && i > 0
+            && (token_is(&tokens, i - 1, "primary") || token_is(&tokens, i - 1, "foreign"))
+        {
+            // KEY is constraint grammar, with or without a table-level
+            // column group. Defaults, checks and referenced targets stay code.
             declarations.push(i);
         }
         if routine
@@ -4313,6 +4355,116 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn constraint_key_grammar_keeps_expression_and_target_references() {
+        for (body, arrival, count) in [
+            (
+                "CREATE TABLE child(id int PRIMARY KEY)",
+                "app.key(integer)",
+                0,
+            ),
+            ("CREATE TABLE child(id int PRIMARY KEY)", "app.key", 0),
+            (
+                "CREATE TABLE child(id int, PRIMARY KEY(id))",
+                "app.key(integer)",
+                0,
+            ),
+            ("CREATE TABLE child(id int, PRIMARY KEY(id))", "app.key", 0),
+            (
+                "ALTER TABLE child ADD CONSTRAINT guard FOREIGN KEY(id) REFERENCES parent(id)",
+                "app.key(integer)",
+                0,
+            ),
+            (
+                "ALTER TABLE child ADD CONSTRAINT guard FOREIGN KEY(id) REFERENCES parent(id)",
+                "app.key",
+                0,
+            ),
+            (
+                "CREATE TABLE child(id int DEFAULT key(1), PRIMARY KEY(id))",
+                "app.key(integer)",
+                1,
+            ),
+            (
+                "CREATE TABLE child(id int, PRIMARY KEY(id), CHECK(key(id)>0))",
+                "app.key(integer)",
+                1,
+            ),
+            (
+                "CREATE TABLE child(id int, FOREIGN KEY(id) REFERENCES orders(id))",
+                "app.orders",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS int LANGUAGE plpgsql AS $$BEGIN {body}; RETURN 7; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{body}: {arrival}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_labels_are_local_but_body_and_when_operands_are_references() {
+        for (body, arrival, count) in [
+            ("<<orders>> BEGIN RETURN 7; END orders", "app.orders", 0),
+            (
+                "BEGIN <<orders>> LOOP EXIT orders WHEN true; END LOOP orders; RETURN 7; END",
+                "app.orders",
+                0,
+            ),
+            (
+                "BEGIN <<\"orders\">> FOR i IN 1..1 LOOP CONTINUE \"orders\"; END LOOP \"orders\"; RETURN 7; END",
+                "app.orders",
+                0,
+            ),
+            (
+                "<<orders>> BEGIN RETURN orders(1); END orders",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "<<orders>> DECLARE result int; BEGIN SELECT value INTO result FROM orders; RETURN result; END orders",
+                "app.orders",
+                1,
+            ),
+            (
+                "DECLARE counter int := 0; BEGIN <<orders>> LOOP counter := counter+1; EXIT orders WHEN counter>=orders(1); END LOOP orders; RETURN counter; END",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "DECLARE result int := 0; BEGIN <<orders>> FOR i IN 1..50 LOOP CONTINUE orders WHEN i>orders(1); result := result+1; END LOOP orders; RETURN result; END",
+                "app.orders(integer)",
+                1,
+            ),
+            ("BEGIN RETURN (1 << orders >> 1); END", "app.orders", 1),
+            (
+                "BEGIN RETURN CASE WHEN true THEN orders ELSE 0 END; END",
+                "app.orders",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!("() RETURNS int LANGUAGE plpgsql AS $${body}$$")),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{body}: {arrival}"
             );
         }
     }

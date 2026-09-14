@@ -12377,6 +12377,18 @@ SPEC is in sync with all of these.
      relation queries still rebuild, with separate plans selecting only the
      actual caller of each arriving kind.
 
+     PRIMARY KEY and FOREIGN KEY use KEY as constraint grammar, including
+     inline primary keys without a column group. Exclude only that keyword;
+     defaults, checks and referenced relations keep their module references.
+     Live CREATE/ALTER forms keep unmanaged dependents, while default values
+     and CHECK expression dependencies switch to the arriving key routine.
+     PL/pgSQL opening labels require a complete <<name>> at a statement or
+     actual body boundary. Closing END/END LOOP and EXIT/CONTINUE label
+     operands also name local blocks; exclude those names but retain WHEN
+     expressions. Ordinary shift operands remain references. Live root,
+     nested, quoted and loop labels avoid spurious view rebuilds; actual body
+     and WHEN calls and queries still switch bindings after typed rebuilding.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.
