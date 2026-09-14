@@ -12044,3 +12044,27 @@ SPEC is in sync with all of these.
      This is still SPEC 7.4's advisory name scan: it does not resolve which
      same-named object a routine uses or interpret dynamically assembled SQL.
      No plan gate, recorded state or dependency ordering changes.
+
+478. **Connected PostgreSQL estimates own their catalog provenance.** The
+     operator reads the plan's table and column names; catalog shape queries
+     must read the original names. The old table-only translation left the
+     column caller-supplied, so renaming and retyping an indexed column, or
+     tightening one with a validated CHECK, lost its unknown estimate
+     (issues #267 and #347). Collect the whole plan's column renames by UID
+     before estimating, and remove the column argument from `against`.
+     The CLI consumes this same representation without reconstructing names;
+     original change indices and per-statement strategies remain intact.
+
+     A created table has a distinct source variant with no catalog name to
+     query (issue #296). Resolve table provenance by UID before associating
+     declared names with it: a new table can reuse an existing table's old
+     name, but the existing table's rename still measures its own UID. A
+     rename followed by creation in declaration history, deployed together,
+     demonstrates the difference on the engine. Missing existing objects
+     remain unknown; created objects retain their static cost with no row
+     count, because intervening planned inserts need not leave them empty.
+
+     This extends 409's name separation without changing 399/430's boundary:
+     estimates stay outside correctness risk, saved artifacts and checksums.
+     Index-expression coverage, CHECK lifecycle and other cost refinements
+     remain their own questions; no expression is parsed to infer a proof.

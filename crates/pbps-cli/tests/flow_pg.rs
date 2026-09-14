@@ -766,6 +766,141 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
     assert!(stderr(&applied).contains("--allow"), "{}", stderr(&applied));
 }
 
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
+    use pbps_model::Change;
+    for move_table in [false, true] {
+        let slug = if move_table {
+            "cost_renamed_table347"
+        } else {
+            "cost_renamed_column347"
+        };
+        let own = OwnDatabase::new(&server(), slug);
+        let connection = own.connection();
+        let before = "table: app.t\ncolumns:\n  v: {type: integer}\n  n: {type: integer}\n  plain: {type: integer}\nindexes:\n  ix_v: {columns: [v]}\nchecks:\n  ck_n: n > 0\n";
+        let d = bootstrapped_demo(connection, slug, before);
+        on_server(
+            connection,
+            "INSERT INTO app.t SELECT g,g,g FROM generate_series(1,20) g; ANALYZE app.t",
+        );
+        let after = before
+            .replace(
+                "  v: {type: integer}",
+                "  amount: {type: bigint, renamed_from: v}",
+            )
+            .replace(
+                "  n: {type: integer}",
+                "  required: {type: integer, nullable: false, renamed_from: n}",
+            )
+            .replace("plain: {type: integer}", "plain: {type: bigint}")
+            .replace("columns: [v]", "columns: [amount]")
+            .replace("ck_n: n > 0", "ck_n: required > 0");
+        let after = if move_table {
+            after.replace("table: app.t", "table: app.renamed\nrenamed_from: app.t")
+        } else {
+            after
+        };
+        d.table(&after);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("rename-cost.json");
+        let out = succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--format",
+            "json",
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        let saved_text = std::fs::read_to_string(&path).unwrap();
+        let saved: pbps_model::SavedPlan = serde_json::from_str(&saved_text).unwrap();
+        let saved_json: serde_json::Value = serde_json::from_str(&saved_text).unwrap();
+        assert!(saved_json.get("cost").is_none());
+        let costs = report["data"]["cost"]["changes"].as_array().unwrap();
+        assert_eq!(costs.len(), saved.changes.changes.len());
+        let mut verified = 0;
+        for (i, p) in saved.changes.changes.iter().enumerate() {
+            let c = &costs[i];
+            assert_eq!(c["change_index"], i);
+            if let Change::AlterColumnType { column, .. } = &p.change
+                && column.name == "amount"
+            {
+                assert_eq!(c["rewrite"]["value"], "unknown", "{report:#}");
+                assert!(c["rewrite"]["reason"].as_str().unwrap().contains("index"));
+                assert_eq!(c["rows"]["count"], 20);
+                verified += 1;
+            }
+            if let Change::AlterColumnNullability { column, .. } = &p.change
+                && column.name == "required"
+            {
+                // CHECK lifecycle is #291's separate scope. Here the
+                // connected lookup must first find its old catalog column.
+                assert_eq!(c["reads"]["value"], "unknown", "{report:#}");
+                assert!(c["reads"]["reason"].as_str().unwrap().contains("ck_n"));
+                assert_eq!(c["rewrite"]["value"], "no");
+                verified += 1;
+            }
+            if let Change::AlterColumnType { column, .. } = &p.change
+                && column.name == "plain"
+            {
+                assert_eq!(c["rewrite"]["value"], "yes");
+                assert_eq!(c["reads"]["value"], "every_row");
+                verified += 1;
+            }
+        }
+        assert_eq!(verified, 3);
+        let human = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        let cost_text = human.split_once("Operational cost estimate").unwrap().1;
+        for text in [
+            "index is built over the column",
+            "validated check constraint ck_n",
+            "approximately 20",
+            "amount",
+            "required",
+        ] {
+            assert!(cost_text.contains(text), "{cost_text}");
+        }
+        let risks: Vec<_> = saved.changes.risks().iter().map(|r| r.as_str()).collect();
+        assert_eq!(report["data"]["risks"], serde_json::json!(risks));
+        on_server(
+            connection,
+            "INSERT INTO app.t VALUES (21,21,21); ANALYZE app.t",
+        );
+        let again = d.dir.join("rename-cost-again.json");
+        let second = succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--format",
+            "json",
+            "--out",
+            again.to_str().unwrap(),
+        ]));
+        let second: serde_json::Value = serde_json::from_str(&stdout(&second)).unwrap();
+        assert!(
+            second["data"]["cost"]["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["rows"]["count"] == 21)
+        );
+        let mut next: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&again).unwrap()).unwrap();
+        next.created_at = saved.created_at.clone();
+        assert_eq!(
+            next.checksum(),
+            saved.checksum(),
+            "changed advisory statistics cannot alter the saved plan apart from its timestamp"
+        );
+        let denied = apply_plan(&d, connection, &path, false);
+        assert_ne!(code(&denied), 0);
+        assert!(stderr(&denied).contains("--allow"));
+    }
+}
+
 fn apply_plan(d: &Demo, connection: &str, plan: &std::path::Path, staged: bool) -> Output {
     let checksum = plan_checksum(plan);
     let mut args = vec![

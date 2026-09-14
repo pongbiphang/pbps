@@ -63,7 +63,7 @@ pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::C
             use pbps_pg::estimate as pg;
             let mut estimates = pg::planned_estimates(cs).into_iter().peekable();
             let mut changes = Vec::with_capacity(cs.changes.len());
-            for (change_index, p) in cs.changes.iter().enumerate() {
+            for change_index in 0..cs.changes.len() {
                 let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index) else {
                     changes.push(ChangeCost::Unavailable {
                         change_index,
@@ -71,40 +71,7 @@ pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::C
                     });
                     continue;
                 };
-                let column = match &p.change {
-                    pbps_model::Change::AlterColumnType { column, .. }
-                    | pbps_model::Change::AlterColumnNullability { column, .. } => Some(column.name.as_str()),
-                    pbps_model::Change::CreateTable { .. }
-                    | pbps_model::Change::DropTable { .. }
-                    | pbps_model::Change::RenameTable { .. }
-                    | pbps_model::Change::AddColumn { .. }
-                    | pbps_model::Change::DropColumn { .. }
-                    | pbps_model::Change::RenameColumn { .. }
-                    | pbps_model::Change::AlterColumnDefault { .. }
-                    | pbps_model::Change::SetColumnDeprecated { .. }
-                    | pbps_model::Change::SetPrimaryKey { .. }
-                    | pbps_model::Change::AddUnique { .. }
-                    | pbps_model::Change::DropUnique { .. }
-                    | pbps_model::Change::AddForeignKey { .. }
-                    | pbps_model::Change::DropForeignKey { .. }
-                    | pbps_model::Change::AddCheck { .. }
-                    | pbps_model::Change::DropCheck { .. }
-                    | pbps_model::Change::AddIndex { .. }
-                    | pbps_model::Change::DropIndex { .. }
-                    | pbps_model::Change::InsertRow { .. }
-                    | pbps_model::Change::UpdateRow { .. }
-                    | pbps_model::Change::DeleteRow { .. }
-                    | pbps_model::Change::SetDataMode { .. }
-                    | pbps_model::Change::CreateModule { .. }
-                    | pbps_model::Change::AlterModule { .. }
-                    | pbps_model::Change::DropModule { .. }
-                    | pbps_model::Change::CreateRole { .. }
-                    | pbps_model::Change::DropRole { .. }
-                    | pbps_model::Change::RenameRole { .. }
-                    | pbps_model::Change::Grant { .. }
-                    | pbps_model::Change::Revoke { .. } => None,
-                };
-                if let Err(error) = pg::against(conn, &mut e, column).await {
+                if let Err(error) = pg::against(conn, &mut e).await {
                     changes.push(ChangeCost::Unavailable {
                         change_index,
                         reason: format!("operational_cost could not read PostgreSQL catalog context: {error}"),

@@ -56,7 +56,7 @@
 //! to be *measured* under the one the catalog still has, and only something
 //! holding the whole plan can know the difference (DECISIONS 409).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use pbps_db::{Conn, DbError};
 use pbps_model::{Change, ChangeSet, ColumnType, Strategy, TableName};
@@ -146,19 +146,10 @@ pub struct Estimate {
     /// one the operator reads, and after a rename in the same plan it is the
     /// name the table will have by the time the statement runs.
     pub table: TableName,
-    /// The same table as the **catalog** has it *now*, which is the only name
-    /// [`against`] can ask about — a plan that renames the table describes one
-    /// the database does not have yet, and the query would find nothing and
-    /// report a rename as "no such table" (DECISIONS 409).
-    ///
-    /// Private, and the reason is the whole design: `Estimate` has no public
-    /// constructor, so the only way to hold one is through [`estimates`], which
-    /// is the only function that can see the rest of the plan.
-    stored: TableName,
-    /// Whether the catalog row is absent because this plan creates the table.
-    /// Kept private for the same reason as `stored`: only the whole plan can
-    /// supply this provenance.
-    created: bool,
+    /// The catalog identity, supplied only by the whole plan. A created
+    /// identity has no catalog name to query, even when it reuses a name a
+    /// different identity vacates (DECISIONS 478).
+    source: CatalogSource,
     pub rewrite: Rewrite,
     pub reads: Reads,
     pub lock: Lock,
@@ -172,12 +163,25 @@ pub struct Estimate {
     pub rows_unknown: Option<String>,
 }
 
+/// A new table cannot carry a queryable catalog name. The column belongs to
+/// the stored table, never to a caller's post-rename spelling (DECISIONS 478).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogSource {
+    Stored {
+        table: TableName,
+        column: Option<String>,
+    },
+    Created,
+}
+
 impl Estimate {
     fn new(about: String, table: TableName, rewrite: Rewrite, reads: Reads, lock: Lock) -> Self {
         Self {
             about,
-            stored: table.clone(),
-            created: false,
+            source: CatalogSource::Stored {
+                table: table.clone(),
+                column: None,
+            },
             table,
             rewrite,
             reads,
@@ -313,7 +317,7 @@ pub fn estimates(changes: &ChangeSet, strategy: Strategy) -> Vec<Estimate> {
 
 /// Estimate the strategy each planned statement will actually use. Indices
 /// refer to the original change set: unmeasured changes must not shift the
-/// column supplied to the connected half (DECISIONS 430).
+/// reported cost onto another statement (DECISIONS 430).
 pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
     estimates_with(changes, |p| p.strategy)
 }
@@ -322,17 +326,35 @@ fn estimates_with(
     changes: &ChangeSet,
     strategy: impl Fn(&pbps_model::PlannedChange) -> Strategy,
 ) -> Vec<(usize, Estimate)> {
-    // Built over the whole plan before anything is estimated, because the
-    // order that puts a table rename ahead of what follows it is `order_key`'s
-    // guarantee and not this function's to lean on.
-    let mut stored: BTreeMap<&TableName, &TableName> = BTreeMap::new();
-    let mut created: BTreeSet<&TableName> = BTreeSet::new();
+    // Names describe the final plan; UIDs distinguish an existing table's
+    // rename from a new table reusing its source name. Collect the whole plan
+    // first because these facts may follow the statement being estimated.
+    let mut identities = BTreeMap::new();
     for p in &changes.changes {
-        if let Change::RenameTable { from, to, .. } = &p.change {
-            stored.insert(to, from);
+        if let Change::CreateTable { uid, .. } = &p.change {
+            identities.insert(uid, CatalogSource::Created);
         }
-        if let Change::CreateTable { name, .. } = &p.change {
-            created.insert(name);
+    }
+    let mut columns = BTreeMap::new();
+    for p in &changes.changes {
+        if let Change::RenameTable { uid, from, .. } = &p.change {
+            identities
+                .entry(uid)
+                .or_insert_with(|| CatalogSource::Stored {
+                    table: from.clone(),
+                    column: None,
+                });
+        }
+        if let Change::RenameColumn { uid, from, .. } = &p.change {
+            columns.entry(uid).or_insert(from);
+        }
+    }
+    let mut tables = BTreeMap::new();
+    for p in &changes.changes {
+        if let Change::CreateTable { uid, name, .. } | Change::RenameTable { uid, to: name, .. } =
+            &p.change
+        {
+            tables.insert(name, &identities[uid]);
         }
     }
     changes
@@ -341,10 +363,25 @@ fn estimates_with(
         .enumerate()
         .filter_map(|(index, p)| {
             let mut e = estimate(&p.change, strategy(p))?;
-            if let Some(catalog) = stored.get(&e.table) {
-                e.stored = (*catalog).clone();
+            let source = if let Change::RenameTable { uid, .. } = &p.change {
+                // Its label is the old name, which may now name a different
+                // planned table. Only its own UID selects the right source.
+                identities.get(uid)
+            } else {
+                tables.get(&e.table).copied()
+            };
+            if let Some(source) = source {
+                e.source = source.clone();
             }
-            e.created = created.contains(&e.table);
+            if let CatalogSource::Stored {
+                column: stored_column,
+                ..
+            } = &mut e.source
+                && let Change::AlterColumnType { uid, column, .. }
+                | Change::AlterColumnNullability { uid, column, .. } = &p.change
+            {
+                *stored_column = Some(columns.get(uid).copied().unwrap_or(&column.name).clone());
+            }
             Some((index, e))
         })
         .collect()
@@ -617,16 +654,22 @@ SELECT c.relkind::text AS relkind,
 /// Fills in what only a connection knows, and takes the answer back where the
 /// table is a shape ADR-0012 did not measure.
 ///
-/// `column` is the target of a type or nullability change, or empty for other
-/// changes. An indexed type change can rebuild the index too; a validated
-/// check on a column being tightened may let the engine skip the scan, but
-/// deciding that from its expression would violate SPEC §8.2.
-pub async fn against(
-    conn: &mut Conn,
-    estimate: &mut Estimate,
-    column: Option<&str>,
-) -> Result<(), DbError> {
-    let relation = match crate::emit::qualified(&estimate.stored) {
+/// The estimate owns the stored table and column names. An indexed type
+/// change may rebuild the index too; a validated check on a tightened column
+/// may avoid a scan, but parsing its expression would violate SPEC §8.2.
+pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbError> {
+    let CatalogSource::Stored { table, column } = &estimate.source else {
+        // The plan may insert rows before this statement, so a new identity
+        // has no measured row count, not an assumed zero. Never ask a current
+        // object that merely shares its future name (DECISIONS 478).
+        estimate.rows = None;
+        estimate.rows_unknown = Some(
+            "this plan creates this table, so the database has no row count for it yet".to_owned(),
+        );
+        return Ok(());
+    };
+    let has_column = column.is_some();
+    let relation = match crate::emit::qualified(table) {
         Ok(name) => name,
         // A name this dialect cannot write is not a table with no rows in it.
         Err(_) => {
@@ -637,23 +680,16 @@ pub async fn against(
     let rows = conn
         .query_with(
             SHAPE,
-            &[relation.as_str().into(), column.unwrap_or_default().into()],
+            &[
+                relation.as_str().into(),
+                column.as_deref().unwrap_or_default().into(),
+            ],
         )
         .await?;
     let Some(row) = rows.first() else {
-        if estimate.created {
-            // Static cost is a property of the statement and remains known.
-            // The plan may insert rows before this statement, though, so its
-            // provenance is not permission to claim an estimated zero.
-            estimate.rows_unknown = Some(
-                "this plan creates this table, so the database has no row count for it yet"
-                    .to_owned(),
-            );
-        } else {
-            let why = "this database has no table by that name to measure";
-            estimate.rows_unknown = Some(why.to_owned());
-            estimate.unknown(why);
-        }
+        let why = "this database has no table by that name to measure";
+        estimate.rows_unknown = Some(why.to_owned());
+        estimate.unknown(why);
         return Ok(());
     };
     estimate.rows_unknown = None;
@@ -678,7 +714,7 @@ pub async fn against(
     // Only where the change was going to rebuild the table anyway: that is
     // what drags the index along with it. A change already answered `unknown`
     // keeps the reason it was given, which is more specific than this one.
-    if column.is_some()
+    if has_column
         && estimate.rewrite == Rewrite::Yes
         && row.try_get::<bool>("column_is_indexed")?.unwrap_or(false)
     {
@@ -690,7 +726,7 @@ pub async fn against(
     // Of column type/nullability changes, only tightening nullability reads
     // every row without a rewrite. A validated check is a possible proof, not
     // one we can interpret: keep the known rewrite and lock answers intact.
-    if column.is_some()
+    if has_column
         && estimate.rewrite == Rewrite::No
         && estimate.reads == Reads::EveryRow
         && let Some(name) = row.try_get::<&str>("validated_column_check")?
@@ -809,7 +845,12 @@ mod tests {
         };
         let got: Vec<(String, String)> = estimates(&cs, Strategy::default())
             .iter()
-            .map(|e| (e.table.to_string(), e.stored.to_string()))
+            .map(|e| {
+                let CatalogSource::Stored { table, .. } = &e.source else {
+                    panic!("no table in this plan is new");
+                };
+                (e.table.to_string(), table.to_string())
+            })
             .collect();
         assert_eq!(
             got,
@@ -823,6 +864,139 @@ mod tests {
             ],
             "the plan's name to read, the catalog's name to measure"
         );
+    }
+
+    #[test]
+    fn renamed_columns_keep_the_catalog_spelling_and_the_plan_label() {
+        use pbps_model::PlannedChange;
+        let alter = |uid: &str, column| {
+            PlannedChange::new(Change::AlterColumnType {
+                uid: uid.parse().unwrap(),
+                column: cref(column),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+            })
+        };
+        let cs = ChangeSet {
+            changes: vec![
+                alter("c_aaaaaa", "app.customer.amount"),
+                alter("c_bbbbbb", "app.other.amount"),
+                PlannedChange::new(Change::AlterColumnNullability {
+                    uid: "c_cccccc".parse().unwrap(),
+                    column: cref("app.customer.required"),
+                    ty: ty("integer"),
+                    to_nullable: false,
+                }),
+                PlannedChange::new(Change::RenameColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: tname("app.customer"),
+                    from: "v".into(),
+                    to: "amount".into(),
+                }),
+                PlannedChange::new(Change::RenameColumn {
+                    uid: "c_cccccc".parse().unwrap(),
+                    table: tname("app.customer"),
+                    from: "n".into(),
+                    to: "required".into(),
+                }),
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: tname("app.client"),
+                    to: tname("app.customer"),
+                }),
+            ],
+        };
+        let es = estimates(&cs, Strategy::default());
+        for (index, table, column) in [
+            (0, "app.client", "v"),
+            (1, "app.other", "amount"),
+            (2, "app.client", "n"),
+        ] {
+            assert_eq!(
+                es[index].source,
+                CatalogSource::Stored {
+                    table: tname(table),
+                    column: Some(column.into())
+                }
+            );
+        }
+        assert_eq!(es[0].table, tname("app.customer"));
+        assert!(es[0].about.contains("amount"));
+        assert!(es[2].about.contains("required"));
+    }
+
+    #[test]
+    fn reused_table_names_do_not_merge_created_and_stored_identities() {
+        use pbps_model::PlannedChange;
+        let index = |table| {
+            PlannedChange::new(Change::AddIndex {
+                table: tname(table),
+                name: "ix".into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "v".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: None,
+                }),
+            })
+        };
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: tname("app.t"),
+                    to: tname("app.kept"),
+                }),
+                PlannedChange::new(Change::CreateTable {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    name: tname("app.t"),
+                    table: Box::default(),
+                }),
+                index("app.t"),
+                index("app.kept"),
+                index("app.other"),
+            ],
+        };
+        let es = planned_estimates(&cs);
+        assert_eq!(es.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 2, 3, 4]);
+        let original = CatalogSource::Stored {
+            table: tname("app.t"),
+            column: None,
+        };
+        assert_eq!(
+            es[0].1.source, original,
+            "the rename still describes the old UID"
+        );
+        assert_eq!(es[1].1.source, CatalogSource::Created);
+        assert_eq!(
+            es[2].1.source, original,
+            "the renamed table still owns its old statistics"
+        );
+        assert_eq!(
+            es[3].1.source,
+            CatalogSource::Stored {
+                table: tname("app.other"),
+                column: None
+            }
+        );
+        // Even a new table subsequently renamed has no stored identity.
+        let mut renamed = cs;
+        renamed
+            .changes
+            .push(PlannedChange::new(Change::RenameTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                from: tname("app.t"),
+                to: tname("app.fresh"),
+            }));
+        renamed.changes.push(index("app.fresh"));
+        let es = planned_estimates(&renamed);
+        assert_eq!(es[es.len() - 2].1.source, CatalogSource::Created);
+        assert_eq!(es.last().unwrap().1.source, CatalogSource::Created);
     }
 
     /// The rule the measured matrix draws: a rewrite is avoided only where the

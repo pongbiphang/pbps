@@ -21165,7 +21165,7 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
         };
         let mut ours =
             one_estimate(&tighten("v", false), Strategy::default()).expect("an estimate");
-        against(&mut conn, &mut ours, Some("v"))
+        against(&mut conn, &mut ours)
             .await
             .expect("the connected estimate");
         assert_eq!(ours.rewrite, Rewrite::No, "{name}: {ours:#?}");
@@ -21185,7 +21185,7 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
         {
             let mut other =
                 one_estimate(&tighten(column, nullable), Strategy::default()).expect("an estimate");
-            against(&mut conn, &mut other, Some(column))
+            against(&mut conn, &mut other)
                 .await
                 .expect("the other estimate");
             assert_eq!(other.reads, expected, "{name}: {other:#?}");
@@ -21422,7 +21422,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         ("plain", true),
     ] {
         let mut e = one_estimate(&widen(table), Strategy::default()).expect("an estimate");
-        against(&mut conn, &mut e, Some("v"))
+        against(&mut conn, &mut e)
             .await
             .expect("read the table's shape");
         assert_eq!(
@@ -21436,25 +21436,19 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     // A table nobody has analyzed answers `-1`, and reading that as a row
     // count says the change is free on the largest table in the database.
     let mut e = one_estimate(&widen("indexed"), Strategy::default()).expect("an estimate");
-    against(&mut conn, &mut e, None)
-        .await
-        .expect("read the shape");
+    against(&mut conn, &mut e).await.expect("read the shape");
     assert_eq!(e.rows, Some(Rows::NeverAnalyzed), "{e:#?}");
 
     conn.execute(&format!("ANALYZE {s}.plain"))
         .await
         .expect("analyze");
     let mut e = one_estimate(&widen("plain"), Strategy::default()).expect("an estimate");
-    against(&mut conn, &mut e, None)
-        .await
-        .expect("read the shape");
+    against(&mut conn, &mut e).await.expect("read the shape");
     assert_eq!(e.rows, Some(Rows::Estimated(1000)), "{e:#?}");
 
     // A table this plan is about to create is not a table with no rows either.
     let mut e = one_estimate(&widen("not_there"), Strategy::default()).expect("an estimate");
-    against(&mut conn, &mut e, None)
-        .await
-        .expect("read the shape");
+    against(&mut conn, &mut e).await.expect("read the shape");
     assert!(matches!(e.rewrite, Rewrite::Unknown(_)), "{e:#?}");
     assert_eq!(e.rows, None, "{e:#?}");
 
@@ -21534,7 +21528,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
         .iter_mut()
         .find(|e| e.about == "adding the foreign key child_parent")
         .expect("the split-out foreign key has an estimate");
-    against(&mut conn, key, None)
+    against(&mut conn, key)
         .await
         .expect("the absent catalog row has plan provenance");
     assert_eq!(key.rewrite, Rewrite::No, "{key:#?}");
@@ -21563,7 +21557,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
     let mut absent = estimates(&missing, Strategy::default())
         .pop()
         .expect("the key has an estimate");
-    against(&mut conn, &mut absent, None)
+    against(&mut conn, &mut absent)
         .await
         .expect("absence is an estimate answer, not a query error");
     assert!(
@@ -21715,6 +21709,209 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
         .expect("drop");
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    use pbps_pg::estimate::{Reads, Rewrite, Rows, against, planned_estimates};
+    let mut db = TestDb::create("estimate_rename267").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE TABLE app.t (v integer, n integer, plain integer, CONSTRAINT ck_n CHECK (n IS NOT NULL)); CREATE INDEX ix_v ON app.t(v); INSERT INTO app.t SELECT g,g,g FROM generate_series(1,20) g; ANALYZE app.t").await.unwrap();
+    let index_before = number(
+        &mut db.conn,
+        "SELECT relfilenode::int FROM pg_class WHERE oid = 'app.ix_v'::regclass",
+    )
+    .await;
+    let old = TableName::new("app", "t");
+    let new = TableName::new("app", "renamed");
+    let cs = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: old,
+                to: new.clone(),
+            }),
+            PlannedChange::new(Change::RenameColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: new.clone(),
+                from: "v".into(),
+                to: "amount".into(),
+            }),
+            PlannedChange::new(Change::RenameColumn {
+                uid: "c_bbbbbb".parse().unwrap(),
+                table: new.clone(),
+                from: "n".into(),
+                to: "required".into(),
+            }),
+            PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: new.column("amount"),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+            }),
+            PlannedChange::new(Change::AlterColumnNullability {
+                uid: "c_bbbbbb".parse().unwrap(),
+                column: new.column("required"),
+                ty: ty("integer"),
+                to_nullable: false,
+            }),
+            PlannedChange::new(Change::AlterColumnType {
+                uid: "c_cccccc".parse().unwrap(),
+                column: new.column("plain"),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+            }),
+        ],
+    };
+    let mut es = planned_estimates(&cs);
+    for (_, e) in &mut es {
+        against(&mut db.conn, e).await.unwrap();
+    }
+    apply(&mut db.conn, &Postgres::new(), &cs).await;
+    let index_after = number(
+        &mut db.conn,
+        "SELECT relfilenode::int FROM pg_class WHERE oid = 'app.ix_v'::regclass",
+    )
+    .await;
+    let required = number(&mut db.conn, "SELECT count(*)::int FROM pg_constraint k JOIN pg_attribute a ON a.attrelid=k.conrelid AND a.attnum=ANY(k.conkey) WHERE k.conrelid='app.renamed'::regclass AND k.conname='ck_n' AND a.attname='required'").await;
+    db.drop().await;
+    let changed = |index| &es.iter().find(|(i, _)| *i == index).unwrap().1;
+    assert!(
+        matches!(&changed(3).rewrite, Rewrite::Unknown(why) if why.contains("index")),
+        "{es:#?}"
+    );
+    assert!(
+        matches!(&changed(4).reads, Reads::Unknown(why) if why.contains("ck_n")),
+        "{es:#?}"
+    );
+    assert_eq!(changed(4).rewrite, Rewrite::No);
+    assert_eq!(
+        changed(5).rewrite,
+        Rewrite::Yes,
+        "another column stays measured"
+    );
+    for index in [3, 4, 5] {
+        assert_eq!(changed(index).rows, Some(Rows::Estimated(20)));
+        assert_eq!(changed(index).table, new);
+    }
+    assert!(changed(3).about.contains("amount"));
+    assert!(changed(4).about.contains("required"));
+    assert_ne!(
+        index_before, index_after,
+        "the real indexed retype rebuilds its index"
+    );
+    assert_eq!(
+        required, 1,
+        "the engine carries the CHECK to the renamed column"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Reads, Rewrite, Rows, against, planned_estimates};
+    let mut db = TestDb::create("estimate_created296").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let old = TableName::new("app", "t");
+    let kept = TableName::new("app", "kept");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    table.primary_key = Some(PrimaryKey {
+        name: Some("pk_original".into()),
+        columns: vec!["id".into()],
+    });
+    let mut base = Schema::default();
+    base.tables.insert(old.clone(), table.clone());
+    let ids = mint_ids(&base, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &base, &ids),
+    )
+    .await;
+    db.conn
+        .execute("INSERT INTO app.t SELECT g FROM generate_series(1,20) g; ANALYZE app.t")
+        .await
+        .unwrap();
+    let mut declared = Schema::default();
+    declared.tables.insert(kept.clone(), table);
+    // Record the rename before reusing its old spelling, as two declaration
+    // revisions deployed together against the original database.
+    let renamed_ids = mint_ids(
+        &declared,
+        &ids,
+        &[Intent::RenameTable {
+            from: old.clone(),
+            to: kept.clone(),
+        }],
+    );
+    let mut fresh = Table::default();
+    fresh
+        .columns
+        .insert("parent_id".into(), Column::new(ty("integer")));
+    fresh.foreign_keys.insert(
+        "fresh_parent".into(),
+        ForeignKey {
+            columns: vec!["parent_id".into()],
+            references_table: kept.clone(),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    declared.tables.insert(old.clone(), fresh);
+    let declared_ids = mint_ids(&declared, &renamed_ids, &[]);
+    let cs = plan(&base, &ids, &declared, &declared_ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|p| matches!(&p.change,Change::CreateTable{name,..} if name==&old)),
+        "{cs:#?}"
+    );
+    let mut es = planned_estimates(&cs);
+    for (_, e) in &mut es {
+        against(&mut db.conn, e).await.unwrap();
+    }
+    apply(&mut db.conn, &Postgres::new(), &cs).await;
+    let old_rows = number(&mut db.conn, "SELECT count(*)::int FROM app.kept").await;
+    let new_rows = number(&mut db.conn, "SELECT count(*)::int FROM app.t").await;
+    db.drop().await;
+    let key = &es
+        .iter()
+        .find(|(_, e)| e.about == "adding the foreign key fresh_parent")
+        .unwrap()
+        .1;
+    assert_eq!(
+        key.rows, None,
+        "a new identity cannot borrow the old table's statistics: {es:#?}"
+    );
+    assert!(
+        key.rows_unknown
+            .as_deref()
+            .is_some_and(|why| why.contains("this plan creates this table")),
+        "{key:#?}"
+    );
+    assert_eq!(key.rewrite, Rewrite::No);
+    assert_eq!(key.reads, Reads::EveryRow);
+    let rename = &es
+        .iter()
+        .find(|(i, _)| matches!(&cs.changes[*i].change, Change::RenameTable { .. }))
+        .unwrap()
+        .1;
+    assert_eq!(
+        rename.rows,
+        Some(Rows::Estimated(20)),
+        "the existing identity still has its statistics: {rename:#?}"
+    );
+    assert_eq!((old_rows, new_rows), (20, 0));
+}
+
 /// DECISIONS 409: an estimate for a table this plan also renames is measured
 /// against the table the catalog still has.
 ///
@@ -21767,7 +21964,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
         TableName::new(&s, "customer"),
         "the operator reads the name the table will have"
     );
-    against(&mut conn, alter, Some("v"))
+    against(&mut conn, alter)
         .await
         .expect("read the table's shape");
     assert_eq!(
