@@ -890,7 +890,7 @@ pub fn diff_partial(
             // `sp_rename` with `Msg 15335, The new name 'note' is already in
             // use as a COLUMN name and would cause a duplicate that is not
             // permitted`, PostgreSQL with `column "note" of relation "s"
-            // already exists` (DECISIONS 473, issue #398).
+            // already exists` (DECISIONS 474, issue #398).
             //
             // Only the drop that frees a claimed name moves. A rename into a
             // name nothing here gives up is refused by `resolve` as an
@@ -6047,7 +6047,7 @@ mod tests {
              column drop before the rename of a column of its own table — \
              `doomed` claims nothing `new` wants here, and moves anyway, \
              because which spellings are one name is the target database's \
-             collation to say and not this plan's (DECISIONS 473)"
+             collation to say and not this plan's (DECISIONS 474)"
         );
     }
 
