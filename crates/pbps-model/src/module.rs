@@ -947,88 +947,20 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
 /// parentheses introduce a column list. Named relations match the remaining
 /// mentions; triggers have no reference form. This does not resolve aliases
 /// or overloads. Callers opt into the refinement instead of changing every
-/// name report and creation-order edge (DECISIONS 473).
-/// `routine_operands` supplies the dialect's lower-case keywords whose next
-/// name outside parentheses is a routine reference without call parentheses.
-pub fn references_module_with(
-    definition: &str,
-    module: &ModuleId,
-    lexis: &Lexis<'_>,
-    routine_operands: &[&str],
-) -> bool {
+/// name report and creation-order edge (DECISIONS 476).
+pub fn references_module_with(definition: &str, module: &ModuleId, lexis: &Lexis<'_>) -> bool {
     let Some(name) = module.referenced_name() else {
         return false;
     };
-    let code = (lexis.code_only)(definition);
-    let scan = |code: &str, routine_operands: &[&str]| {
-        references_in(
-            code,
-            &name,
-            Case::Folded,
-            lexis.continues_ident,
-            lexis.reserved,
-            true,
-            Some(ReferenceForm {
-                routine: matches!(module, ModuleId::Routine(_)),
-                routine_operands,
-            }),
-        )
-    };
-    if routine_operands.is_empty() {
-        return scan(&code, &[]);
-    }
-    // A parameter named `support` does not introduce an option operand.
-    // Separate levels before removing identifier quotes: a `)` inside a
-    // quoted parameter name must not close its parameter list (473).
-    let (outer, nested) = reference_levels(&code);
-    scan(&outer, routine_operands) || scan(&nested, &[])
-}
-
-/// Code outside and inside parentheses, with both copies retaining structural
-/// parentheses so a name's following call delimiter survives the partition.
-/// The dialect has already hidden string data and comments. Standard quoted
-/// identifiers stay whole, including doubled quotes and parenthesis bytes.
-fn reference_levels(code: &str) -> (String, String) {
-    let mut outer = String::with_capacity(code.len());
-    let mut nested = String::with_capacity(code.len());
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut doubled = false;
-    for (at, ch) in code.char_indices() {
-        let paren = !quoted && matches!(ch, '(' | ')');
-        for (out, visible) in [(&mut outer, depth == 0), (&mut nested, depth > 0)] {
-            if visible || paren || matches!(ch, '\n' | '\r') {
-                out.push(ch);
-            } else {
-                out.push(' ');
-            }
-        }
-        if quoted {
-            if doubled {
-                doubled = false;
-            } else if ch == '"' {
-                if code.as_bytes().get(at + 1) == Some(&b'"') {
-                    doubled = true;
-                } else {
-                    quoted = false;
-                }
-            }
-        } else {
-            match ch {
-                '"' => quoted = true,
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-    }
-    (outer, nested)
-}
-
-#[derive(Clone, Copy)]
-struct ReferenceForm<'a> {
-    routine: bool,
-    routine_operands: &'a [&'a str],
+    references_in(
+        &(lexis.code_only)(definition),
+        &name,
+        Case::Folded,
+        lexis.continues_ident,
+        lexis.reserved,
+        true,
+        Some(matches!(module, ModuleId::Routine(_))),
+    )
 }
 
 /// How the scan compares letters, narrowest last.
@@ -1088,13 +1020,13 @@ fn references_in(
     continues: fn(char) -> bool,
     reserved: fn(&str) -> bool,
     bare: bool,
-    form: Option<ReferenceForm<'_>>,
+    call: Option<bool>,
 ) -> bool {
     let haystack = scannable_code(code, case, continues, false);
 
     // The qualified form first — a word after a dot is a name whatever it
     // is: measured, `FROM app.select` is accepted on PostgreSQL.
-    if contains_word(&haystack, &qualified(name, case), continues, form) {
+    if contains_word(&haystack, &qualified(name, case), continues, call) {
         return true;
     }
     // A bare name resolves through the engine's lookup path and nowhere
@@ -1112,9 +1044,9 @@ fn references_in(
     let bare = cased(&name.name, case);
     if reserved(&name.name.to_ascii_lowercase()) {
         let quoted = scannable_code(code, case, continues, true);
-        contains_word(&quoted, &format!("\"{bare}\""), continues, form)
+        contains_word(&quoted, &format!("\"{bare}\""), continues, call)
     } else {
-        contains_word(&haystack, &bare, continues, form)
+        contains_word(&haystack, &bare, continues, call)
     }
 }
 
@@ -1428,7 +1360,7 @@ fn contains_word(
     haystack: &str,
     needle: &str,
     continues: fn(char) -> bool,
-    form: Option<ReferenceForm<'_>>,
+    call: Option<bool>,
 ) -> bool {
     let mut from = 0;
     while let Some(at) = haystack[from..].find(needle) {
@@ -1436,23 +1368,16 @@ fn contains_word(
         let end = start + needle.len();
         if !is_ident_char(haystack[..start].chars().next_back(), continues)
             && !is_ident_char(haystack[end..].chars().next(), continues)
-            && form.is_none_or(|form| {
+            && call.is_none_or(|wanted| {
                 let next = haystack[end..].chars().find(|c| !is_a_gap(*c, continues));
                 // INSERT INTO orders (id) names a relation, even with a
                 // column list. Treating that parenthesis as a call skipped
                 // the rebuild that moves a parsed writer to an arriving view.
                 let before = haystack[..start].trim_end_matches(|c| is_a_gap(c, continues));
-                let follows = |keyword| {
-                    before
-                        .strip_suffix(keyword)
-                        .is_some_and(|prefix| !is_ident_char(prefix.chars().next_back(), continues))
-                };
-                let routine = (next == Some('(') && !follows("into"))
-                    || form
-                        .routine_operands
-                        .iter()
-                        .any(|keyword| follows(*keyword));
-                routine == form.routine
+                let into_target = before
+                    .strip_suffix("into")
+                    .is_some_and(|prefix| !is_ident_char(prefix.chars().next_back(), continues));
+                (next == Some('(') && !into_target) == wanted
             })
         {
             return true;

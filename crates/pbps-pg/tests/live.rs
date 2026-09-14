@@ -9191,6 +9191,92 @@ async fn an_out_parameter_named_support_rebinds_its_row_type_for_a_view_arrival(
         pbps_model::Change::AlterModule { id, .. } if id == &target));
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_support_column_alias_does_not_rebuild_modules_with_unmanaged_dependents() {
+    let mut db = TestDb::create("support_alias230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE TABLE app.source (support integer); \
+             INSERT INTO app.source VALUES (7)",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::new();
+    let mut a = Schema::default();
+    for (suffix, column) in [("bare", "support"), ("quoted", "\"support\"")] {
+        a.modules.insert(
+            format!("app.view_{suffix}").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::View,
+                &format!("SELECT {column} planner_support FROM app.source"),
+            ),
+        );
+        a.modules.insert(
+            format!("app.fn_{suffix}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!(
+                    "() RETURNS int LANGUAGE sql BEGIN ATOMIC \
+                     SELECT {column} planner_support FROM app.source; END"
+                ),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for suffix in ["bare", "quoted"] {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external_{suffix} AS SELECT \
+                 app.fn_{suffix}() AS value, planner_support FROM app.view_{suffix}"
+            ))
+            .await
+            .unwrap();
+    }
+    // These dependents make an invented rebuild a refused valid plan, not
+    // just an extra statement. Neither alias can bind an arriving routine.
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.planner_support(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival_plan = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival_plan.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for suffix in ["bare", "quoted"] {
+        assert_eq!(
+            number(
+                &mut db.conn,
+                &format!("SELECT value + planner_support FROM app.external_{suffix}")
+            )
+            .await,
+            14
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival_plan.changes.len(), 1, "{arrival_plan:#?}");
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

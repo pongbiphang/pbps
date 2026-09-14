@@ -1423,6 +1423,127 @@ fn qualified_name_at(text: &str) -> Option<&str> {
     Some(&text[..at])
 }
 
+/// The actual SUPPORT option's operand, before interpreting identifier quotes.
+/// `support` is unreserved: a parameter, return type, language, setting value
+/// or SQL-body column of that name does not introduce a routine reference.
+/// Only header items are inspected; the SQL body stays with the ordinary
+/// reference scanner, and quoted AS bodies remain opaque (DECISIONS 476).
+pub(crate) fn support_operand(definition: &str) -> Option<std::ops::Range<usize>> {
+    let mut rest = after_the_gap(definition).0;
+    let list = parameter_list(rest)?;
+    rest = &rest[list.len() + 2..];
+    while let Some(item) = header_item(&mut rest) {
+        match item.to_ascii_lowercase().as_str() {
+            "support" => {
+                let operand = qualified_name_at(after_the_gap(rest).0)?;
+                let start = definition.len() - after_the_gap(rest).0.len();
+                return Some(start..start + operand.len());
+            }
+            "begin" | "return" => return None,
+            // Consume names in other header positions before looking for an
+            // option. Quoted names and parenthesized lists are single items.
+            "returns" => {
+                if header_item(&mut rest)?.eq_ignore_ascii_case("setof") {
+                    header_item(&mut rest)?;
+                }
+            }
+            "language" | "parallel" | "reset" => {
+                header_item(&mut rest)?;
+            }
+            "for" => {
+                // Every transform type starts with FOR TYPE, including later
+                // comma-separated entries and types with modifiers or arrays.
+                if take_header_item(&mut rest, "type") {
+                    take_header_item(&mut rest, "setof");
+                    header_item(&mut rest)?;
+                }
+            }
+            "set" => skip_function_setting(&mut rest)?,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One header item without decoding it. Reuse the emitter's literal, quoted
+/// name and balanced-list readers so data cannot become an option keyword.
+fn header_item<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    let text = after_the_gap(rest).0;
+    let len = if let Some(mut len) = skip_datum(text) {
+        // In a continued E string, the initial prefix also governs later
+        // plain-quoted pieces. Keep the whole AS value opaque to this scan.
+        if !text.starts_with('$') {
+            let escapes = starts_with_ignoring_ascii_case(text, "e'");
+            loop {
+                let (tail, newline) = after_the_gap(&text[len..]);
+                let Some(piece) = tail.strip_prefix('\'').filter(|_| newline) else {
+                    break;
+                };
+                len = text.len() - piece.len() + end_of_literal(piece, escapes)?;
+            }
+        }
+        len
+    } else if text.starts_with('(') {
+        parameter_list(text)?.len() + 2
+    } else if let Some(name) = qualified_name_at(text) {
+        name.len()
+    } else {
+        text.chars().next()?.len_utf8()
+    };
+    *rest = &text[len..];
+    Some(&text[..len])
+}
+
+fn take_header_item(rest: &mut &str, expected: &str) -> bool {
+    let mut next = *rest;
+    if header_item(&mut next).is_some_and(|item| item.eq_ignore_ascii_case(expected)) {
+        *rest = next;
+        true
+    } else {
+        false
+    }
+}
+
+/// SET's generic and SQL-standard spellings consume identifier values too.
+/// In particular, `SET custom.flag TO support SUPPORT app.helper` has only
+/// one SUPPORT option. This only skips the setting, never evaluates its value.
+fn skip_function_setting(rest: &mut &str) -> Option<()> {
+    let name = header_item(rest)?;
+    if take_header_item(rest, "to") || take_header_item(rest, "=") || take_header_item(rest, "from")
+    {
+        loop {
+            // A signed numeric value has a punctuation item before its value.
+            if !take_header_item(rest, "+") {
+                take_header_item(rest, "-");
+            }
+            header_item(rest)?;
+            if !take_header_item(rest, ",") {
+                break;
+            }
+        }
+    } else {
+        match name.to_ascii_lowercase().as_str() {
+            "time" | "session" | "xml" | "transaction" => {
+                header_item(rest)?;
+                header_item(rest)?;
+            }
+            "schema" | "catalog" | "role" => {
+                header_item(rest)?;
+            }
+            "names" => {
+                let next = after_the_gap(rest).0;
+                if skip_datum(next).is_some() {
+                    header_item(rest)?;
+                } else {
+                    take_header_item(rest, "default");
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
 /// The length of a `UESCAPE 'x'` clause at the front of `text`, or `None`.
 ///
 /// The engine takes any single character but a quote, a hex digit, `+` or

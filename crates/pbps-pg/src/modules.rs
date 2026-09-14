@@ -1910,7 +1910,7 @@ pub struct Rebound {
 /// column list remains a relation mention and a `SUPPORT` operand names a
 /// routine without call parentheses. A pg_proc arrival cannot
 /// capture a pg_class reference; this refinement still does not parse SQL
-/// positions or resolve overloads (DECISIONS 307, 473).
+/// expressions or resolve overloads (DECISIONS 307, 476).
 ///
 /// `pg_catalog` is not a schema a write path may list (DECISIONS 277), so
 /// nothing this plan creates can arrive there and it is not considered.
@@ -1945,6 +1945,15 @@ pub fn rebound_by_this_plan(
         if already_changed.contains(module) {
             continue;
         }
+        let support = (definition.kind == ModuleKind::Function)
+            .then(|| crate::emit::support_operand(&definition.definition))
+            .flatten();
+        let mut ordinary = definition.definition.clone();
+        if let Some(operand) = &support {
+            // The actual option is a routine reference, so keep its operand
+            // out of the ordinary non-call (relation/type) scan as well.
+            ordinary.replace_range(operand.clone(), " ");
+        }
         for new in arriving {
             if new == module {
                 continue;
@@ -1962,12 +1971,18 @@ pub fn rebound_by_this_plan(
             // Tested by `object_name`, a trigger `app.orders.audit` rebuilt
             // every caller of `audit()` for a binding that cannot move, and
             // the rebuild of a caller with dependents is a refusal (307).
-            if pbps_model::module::references_module_with(
-                &definition.definition,
-                new,
-                &LEXIS,
-                &["support"],
-            ) {
+            let support_matches = matches!(new, ModuleId::Routine(_))
+                && support.as_ref().is_some_and(|operand| {
+                    new.referenced_name().is_some_and(|name| {
+                        pbps_model::module::references_with(
+                            &definition.definition[operand.clone()],
+                            &name,
+                            &LEXIS,
+                        )
+                    })
+                });
+            if support_matches || pbps_model::module::references_module_with(&ordinary, new, &LEXIS)
+            {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2603,6 +2618,11 @@ mod tests {
             "SELECT 'SUPPORT planner_support'",
             "SELECT supports planner_support",
             "SELECT app.support planner_support",
+            "SELECT support planner_support",
+            "SELECT \"support\" planner_support",
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT support planner_support; END",
+            "() RETURNS int LANGUAGE sql AS 'SELECT \"support\" planner_support'",
+            "() RETURNS int RETURN (SELECT \"support\" planner_support)",
         ] {
             let mut declared = Schema::default();
             declared.modules.insert(id("app.data()"), module(body));
@@ -2616,6 +2636,54 @@ mod tests {
                 .is_empty(),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn only_the_function_option_introduces_a_support_operand() {
+        for header in [
+            "() RETURNS support LANGUAGE sql",
+            "() RETURNS SETOF support LANGUAGE sql",
+            "() RETURNS TABLE (support orders) LANGUAGE sql",
+            "(OUT support orders) LANGUAGE sql",
+            "() RETURNS int LANGUAGE support",
+            "() RETURNS int LANGUAGE \"support\"",
+            "() RETURNS int LANGUAGE 'support'",
+            "() RETURNS int TRANSFORM FOR TYPE support, FOR TYPE app.support LANGUAGE sql",
+            "() RETURNS int TRANSFORM FOR TYPE SETOF support LANGUAGE sql",
+            "() RETURNS int TRANSFORM FOR TYPE numeric(10, 2), FOR TYPE support[] LANGUAGE sql",
+            "() RETURNS int LANGUAGE sql SET custom.flag TO support",
+            "() RETURNS int LANGUAGE sql SET custom.flag = language, support",
+            "() RETURNS int LANGUAGE sql SET support FROM CURRENT",
+            "() RETURNS int LANGUAGE sql SET ROLE support",
+            "() RETURNS int LANGUAGE sql SET SESSION AUTHORIZATION support",
+            "() RETURNS int LANGUAGE sql SET SCHEMA 'support'",
+            "() RETURNS int LANGUAGE sql SET NAMES",
+            "() RETURNS int LANGUAGE sql SET NAMES 'UTF8'",
+            "() RETURNS int LANGUAGE sql SET TIME ZONE INTERVAL '1' HOUR",
+            "() RETURNS int LANGUAGE sql RESET support",
+        ] {
+            let definition = format!("{header} SUPPORT /* option */ app . \"planner_support\"");
+            let operand = crate::emit::support_operand(&definition).unwrap();
+            assert_eq!(
+                &definition[operand], "app . \"planner_support\"",
+                "{header}"
+            );
+            let definition =
+                format!("{header} BEGIN ATOMIC SELECT \"support\" planner_support; END");
+            assert_eq!(crate::emit::support_operand(&definition), None, "{header}");
+        }
+        for body in [
+            "'SELECT ''support planner_support'''",
+            "$$SELECT 'support planner_support'$$",
+            "E'SELECT '\n'\\'support planner_support\\''",
+            "U&'SELECT ''support planner_support''' UESCAPE '!'",
+        ] {
+            let definition = format!("() RETURNS int AS {body} LANGUAGE sql");
+            assert_eq!(crate::emit::support_operand(&definition), None, "{body}");
+            let definition = format!("{definition} SUPPORT planner_support");
+            let operand = crate::emit::support_operand(&definition).unwrap();
+            assert_eq!(&definition[operand], "planner_support", "{body}");
         }
     }
 

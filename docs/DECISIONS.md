@@ -12042,18 +12042,27 @@ SPEC is in sync with all of these.
      the same rule, and a target occurrence does not hide a later routine call.
 
      PostgreSQL also names a routine without call parentheses in a function's
-     `SUPPORT` clause. The dialect supplies that operand keyword to the shared
-     scanner; the model owns the matching mechanism, not the engine's keyword
-     policy. Measured with internal aliases of `array_append` and its matching
+     `SUPPORT` clause. PostgreSQL locates that option in the raw function
+     header, skips quoted data and other option operands, and stops at a
+     parsed SQL body. Only the actual operand is matched as a routine and
+     excluded from ordinary relation matching; the shared model has no
+     engine-specific keyword policy. Measured with internal aliases of
+     `array_append` and its matching
      support function: adding the support routine earlier on the path leaves
      the old `prosupport` OID until the typed plan rebuilds the function. A view
      of the operand's name cannot change that OID and causes no rebuild.
 
-     The option keyword applies outside parentheses. Inside a parameter list
-     or `RETURNS TABLE` list, `support` can be an ordinary parameter name, and
-     the following row type remains a relation reference. The scan partitions
-     the already lexed code by parenthesis depth before unquoting identifiers,
-     preserving call delimiters and ignoring parentheses inside quoted names.
+     A word anywhere outside parentheses is not sufficient: `support` is
+     unreserved and may name a column, type, language or setting value.
+     Measured with both bare and quoted `support` columns: an output alias
+     after that column cannot bind an arriving routine. Views and parsed SQL
+     functions with unmanaged dependents keep working after the arrival;
+     inventing rebuilds for those aliases refuses a valid plan. Header items
+     preserve quoted names and consume complete string values, including
+     continued escape strings, without reading their contents as options.
+
+     Inside a parameter list or `RETURNS TABLE` list, `support` can also be an
+     ordinary parameter name; the following row type stays a relation mention.
      Measured with `OUT support orders`: the routine's identity stays `f()`,
      but a view arriving earlier on its path requires a rebuild to move the
      result from the shared view's row shape to the new view's row shape.
