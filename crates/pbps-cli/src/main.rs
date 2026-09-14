@@ -2823,6 +2823,17 @@ pub(crate) fn validate_saved_plan(
     plan: &pbps_model::SavedPlan,
     dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {
+    // A matching checksum approves these bytes, not a broader execution mode
+    // than the planner accepts. Count logical changes, since one rename may
+    // emit a schema transfer and a rename (ADR-0003, decision 2).
+    if plan.mode.is_staged() && plan.changes.changes.len() != 1 {
+        bail!(
+            "a staged plan must contain exactly one logical change; this artifact has {}.\n\
+             Regenerate it with `pbps plan --db --staged`, isolating the change in its own \
+             revision; use a transactional plan for multiple changes.",
+            plan.changes.changes.len()
+        );
+    }
     plan.ids
         .validate()
         .context("the plan's post-apply identity mapping is inconsistent")?;

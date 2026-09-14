@@ -4956,12 +4956,14 @@ async fn apply_staged_under_lock(
 /// The movement check a staged run can make: each read compared with the one
 /// before it, over everything this plan does not touch.
 ///
-/// Exempting what the *whole* plan touches rather than only the statement just
-/// run is deliberate. It is the conservative direction — an object a later
-/// statement will change is simply not compared yet — and this guard has been
-/// wrong four times in the other one, inventing movement rather than missing
-/// it (152 to 158). What it costs is a change to an object the plan touches
-/// later; what it buys is that no correct staged apply is ever stopped by it.
+/// A split table rename uses the current statement's exact endpoints at each
+/// checkpoint (DECISIONS 436). Its intermediate name is still compared for
+/// unchanged shape, rows and incoming references. Other change shapes retain
+/// the logical plan's exemptions: a later statement of that change must not
+/// be demanded at an earlier checkpoint (152 to 158, 161). The closing read
+/// retains the full logical postconditions and checks the vacated rename
+/// endpoints, including intermediate names, under SPEC §7.6.
+///
 /// Which read of a staged run is being compared with the one before it.
 ///
 /// The two are told apart because the remedy differs. A change found at a
@@ -5032,7 +5034,9 @@ fn removed_table_names(
 /// A schema transfer followed by a rename has an intermediate name absent
 /// from the plan's endpoints. Compare the exact move the emitter recorded so
 /// that table's disappearance is not mistaken for another writer's DROP,
-/// and its unchanged columns, rows and incoming references remain compared.
+/// and its unchanged columns, rows and incoming references remain compared
+/// (DECISIONS 436). The saved-plan boundary admits one logical change, even
+/// when the emitter needs more than one statement for it (ADR-0003).
 fn staged_statement_changes(
     changes: &pbps_model::ChangeSet,
     statement: &pbps_dialect::Statement,
