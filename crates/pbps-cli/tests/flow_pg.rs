@@ -3504,6 +3504,123 @@ fn indirect_constraint_trigger_effects_are_settled_before_recording() {
 
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn nonordinary_trigger_modes_are_reported_instead_of_recorded() {
+    use pbps_db::catalog::LimitationTarget;
+    let own = OwnDatabase::new(&server(), "constraint_trigger229_modes");
+    let connection = own.connection();
+    let d = bootstrapped_demo(
+        connection,
+        "constraint-trigger229-modes",
+        CONSTRAINT_TRIGGER_TABLE,
+    );
+    on_server(
+        connection,
+        "CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+        CREATE TRIGGER ordinary BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.fire();
+        CREATE CONSTRAINT TRIGGER deferred AFTER INSERT ON app.t
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.fire()",
+    );
+    adopt_constraint_trigger_modules(connection, &d);
+    let before = latest_snapshot(connection);
+    for (mode, flag, reason) in [
+        ("DISABLE", "D", "disabled"),
+        ("ENABLE REPLICA", "R", "replica"),
+        ("ENABLE ALWAYS", "A", "always"),
+    ] {
+        on_server(
+            connection,
+            &format!(
+                "ALTER TABLE app.t {mode} TRIGGER ordinary; ALTER TABLE app.t {mode} TRIGGER deferred"
+            ),
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                &format!(
+                    "SELECT count(*) FROM pg_trigger WHERE tgrelid='app.t'::regclass AND NOT tgisinternal AND tgenabled='{flag}'"
+                )
+            ),
+            2
+        );
+        let pulled = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                    .await
+                    .unwrap();
+                pbps_pg::catalog::introspect(&mut conn).await.unwrap()
+            });
+        assert!(pulled.schema.tables.contains_key(&"app.t".parse().unwrap()));
+        assert!(
+            !pulled
+                .limitations
+                .iter()
+                .any(|l| l.target == LimitationTarget::Relation("app.t".parse().unwrap())),
+            "{:?}",
+            pulled.limitations
+        );
+        for name in ["deferred", "ordinary"] {
+            let id = format!("app.t.{name}").parse().unwrap();
+            assert!(
+                !pulled.schema.modules.contains_key(&id),
+                "{mode}: {name} was recorded as an ordinary trigger"
+            );
+            let target = LimitationTarget::Module(id);
+            let notes: Vec<_> = pulled
+                .limitations
+                .iter()
+                .filter(|l| l.target == target)
+                .collect();
+            assert_eq!(notes.len(), 1, "{mode}: {notes:?}");
+            assert!(notes[0].detail.contains(reason), "{}", notes[0].detail);
+            assert!(pulled.unmanaged_modules.iter().any(|m| m.target == target));
+        }
+        let verification = d.run(&["verify", "--db", connection]);
+        assert_eq!(
+            code(&verification),
+            2,
+            "{}{}",
+            stdout(&verification),
+            stderr(&verification)
+        );
+        let refused = d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "do not erase an enable mode",
+        ]);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert_eq!(latest_snapshot(connection).schema, before.schema);
+        let fresh = Demo::new(&format!("constraint-trigger229-pull-{flag}"));
+        let output = succeeds(fresh.run(&["pull", "--db", connection]));
+        assert!(stderr(&output).contains(reason), "{}", stderr(&output));
+        let loaded = pbps_load::load_schema_dir(&fresh.dir.join("schema")).unwrap();
+        assert_eq!(
+            loaded.schema.modules.len(),
+            1,
+            "{:?}",
+            loaded.schema.modules
+        );
+    }
+    // Restoring ordinary mode restores the same module definitions and clean state.
+    on_server(
+        connection,
+        "ALTER TABLE app.t ENABLE TRIGGER ordinary; ALTER TABLE app.t ENABLE TRIGGER deferred",
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
     use pbps_dialect::{Dialect, RowOperation, RowWrite};
     let own = OwnDatabase::new(&server(), "constraint_trigger229_guard");

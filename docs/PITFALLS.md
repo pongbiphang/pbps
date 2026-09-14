@@ -2200,3 +2200,10 @@ constraint trigger there. A flush conditioned on seeing the constraint trigger
 in the direct-DML/FK-action closure missed that work and recorded stale rows.
 Flush every PostgreSQL transactional apply; routine side effects are not an
 inventory the closure claims to enumerate (DECISIONS 473).
+
+`pg_get_triggerdef` also omits `tgenabled`. Disabled, replica-only and always
+modes all return the same CREATE text as ordinary enabled mode, so a body-only
+pull would rebuild different behavior. Hold ordinary mode only and name the
+other modes as module limitations, for both ordinary and constraint triggers;
+keep the parent table manageable and exclude internal FK triggers (DECISIONS
+473).

@@ -166,6 +166,10 @@ const DEFAULT_VIEW_OPTIONS: &str = "NOT EXISTS (
                          THEN opt.option_value::boolean
                          ELSE true END) IS DISTINCT FROM false)";
 
+/// `pg_get_triggerdef` cannot encode DISABLE, REPLICA or ALWAYS. Only ordinary
+/// mode survives CREATE; share the rule with the omission inventory (473).
+const DEFAULT_TRIGGER_MODE: &str = "tg.tgenabled = 'O'";
+
 /// Whether the relation `c` a trigger is on is one the pull reads back — a
 /// view, or a table [`tables_query`] holds.
 ///
@@ -267,6 +271,7 @@ fn modules_query() -> String {
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE NOT tg.tgisinternal
+            AND {DEFAULT_TRIGGER_MODE}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
             AND {held}
@@ -355,6 +360,22 @@ fn unheld_modules_query() -> String {
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
             AND NOT {held}
+          UNION ALL
+         SELECT n.nspname, tg.tgname,
+                CASE tg.tgenabled WHEN 'D' THEN 'a trigger that is disabled'
+                                  WHEN 'R' THEN 'a trigger that fires only on a replica'
+                                  WHEN 'A' THEN 'a trigger that fires always, replica or not'
+                                  ELSE 'a trigger with an unknown enable mode' END
+                  || ' (`pg_trigger.tgenabled` = ' || tg.tgenabled::text || ')',
+                't', tg.oid::int8, c.relname
+           FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT tg.tgisinternal
+            AND NOT ({DEFAULT_TRIGGER_MODE})
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {trigger_not_extension}
+            AND {held}
           ORDER BY 1, 2"
     )
 }

@@ -11839,3 +11839,17 @@ SPEC is in sync with all of these.
      transactional apply, including an apply without a directly reachable
      constraint trigger. Remove the obsolete guard flag instead of extending
      a lexical scan into a promise about routine effects.
+
+     **A deparsed trigger body does not carry its enable mode.** Second draft
+     review found that omitting the companion also removed its warning about
+     a disabled, replica-only or always-enabled constraint trigger. Measured,
+     `pg_get_triggerdef` has the same CREATE text in all four modes; pulling a
+     non-ordinary mode as a module would recreate an ordinary enabled trigger.
+     The same shape applies to ordinary user triggers, so the module reader
+     now holds only `tgenabled = 'O'` and the omission inventory names every
+     other mode on a held parent. This is a module limitation, not a duplicate
+     table constraint. Internal FK triggers remain excluded and extension-owned
+     triggers retain their existing exclusion. A managed non-ordinary trigger
+     makes verify report drift and baseline refuse to erase the distinction;
+     restoring ordinary mode makes the original record verify clean again.
+     ADR-0009's rebuild guard still checks carried enable state under its lock.
