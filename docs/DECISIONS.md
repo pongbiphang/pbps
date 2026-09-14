@@ -12021,3 +12021,26 @@ SPEC is in sync with all of these.
      known metadata. Row-projection failures do not suppress this independent
      check. Live tests compare 25 collation pairs with actual constraint DDL
      and cover renames, new columns, created tables, retypes and missing objects.
+
+477. **PostgreSQL rename-impact advisories match complete identifier tokens
+     after masking literals and comments.** A raw text match reports a
+     reserved keyword such as `SELECT` as the column `select`, a fragment of
+     `"other EMAIL"` as `email`, and literal or comment contents as references
+     (issues #421, #425, #427). The dialect's existing `code_only` scanner
+     removes data regions; quoted tokens compare exactly using the emitter's
+     escaping, and bare tokens retain 448's ASCII-only fold. The existing
+     reserved-word rule applies to bare names but permits a name after a dot.
+     Measured on PostgreSQL 18.6, `t.select` names the quoted column `select`.
+
+     This supersedes 448's SQL substring prefilter: even its locale-independent
+     fold cannot find catalog name `a"b` in the stored spelling `"a""b"`
+     (issue #264). Read eligible text bodies without a name predicate and
+     apply the lexical rule once in Rust. Maintaining a second SQL lexer or
+     spelling approximation would create another way to silently lose a body.
+     Catalog, internal-language and extension exclusions remain in the query.
+     Live regressions read `prosrc`, compare actual rename failures with the
+     advisory list, and retain unaffected routines as negative cases.
+
+     This is still SPEC 7.4's advisory name scan: it does not resolve which
+     same-named object a routine uses or interpret dynamically assembled SQL.
+     No plan gate, recorded state or dependency ordering changes.

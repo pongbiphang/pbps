@@ -20503,6 +20503,207 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
         .expect("drop");
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn impact_lexer_keeps_the_engine_spelling_of_embedded_quotes() {
+    use pbps_pg::impact::{RenameTarget, rename_impact};
+    let mut db = TestDb::create("impact_quotes264").await;
+    db.conn
+        .execute(
+            r#"
+        CREATE SCHEMA app;
+        CREATE TABLE app.t ("a""b" integer, ab integer);
+        CREATE FUNCTION app.f_actual() RETURNS integer LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT "a""b" FROM app.t LIMIT 1); END $fn$;
+        CREATE FUNCTION app.f_other() RETURNS integer LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT ab FROM app.t LIMIT 1); END $fn$;
+    "#,
+        )
+        .await
+        .unwrap();
+    let stored = text(
+        &mut db.conn,
+        "SELECT prosrc FROM pg_proc WHERE oid = 'app.f_actual()'::regprocedure",
+    )
+    .await;
+    let report = rename_impact(
+        &mut db.conn,
+        &RenameTarget::Column(TableName::new("app", "t").column("a\"b")),
+    )
+    .await;
+    db.conn
+        .execute(r#"ALTER TABLE app.t RENAME COLUMN "a""b" TO renamed"#)
+        .await
+        .unwrap();
+    let broken = db.conn.query("SELECT app.f_actual()").await;
+    let unaffected = db.conn.query("SELECT app.f_other()").await;
+    db.drop().await;
+    assert!(stored.contains(r#""a""b""#), "{stored}");
+    let report = report.unwrap();
+    assert!(
+        report.advisory.iter().any(|r| r.name == "app.f_actual()"),
+        "{report:#?}"
+    );
+    assert!(
+        report.advisory.iter().all(|r| r.name != "app.f_other()"),
+        "{report:#?}"
+    );
+    assert_eq!(
+        sqlstate(&broken.err().expect("the renamed column breaks the routine")),
+        "42703"
+    );
+    assert!(unaffected.is_ok());
+    assert!(report.blocking.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn impact_lexer_distinguishes_a_reserved_word_from_its_qualified_name() {
+    use pbps_pg::impact::{RenameTarget, rename_impact};
+    let mut db = TestDb::create("impact_reserved421").await;
+    db.conn
+        .execute(
+            r#"
+        CREATE SCHEMA app;
+        CREATE TABLE app.t ("select" integer);
+        INSERT INTO app.t VALUES (7);
+        CREATE FUNCTION app.f_keyword() RETURNS integer LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT 1); END $fn$;
+        CREATE FUNCTION app.f_quoted() RETURNS integer LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT "select" FROM app.t LIMIT 1); END $fn$;
+        CREATE FUNCTION app.f_qualified() RETURNS integer LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT t.select FROM app.t AS t LIMIT 1); END $fn$;
+    "#,
+        )
+        .await
+        .unwrap();
+    let qualified_value = number(&mut db.conn, "SELECT app.f_qualified()").await;
+    let report = rename_impact(
+        &mut db.conn,
+        &RenameTarget::Column(TableName::new("app", "t").column("select")),
+    )
+    .await;
+    db.drop().await;
+    assert_eq!(
+        qualified_value, 7,
+        "the engine accepts a reserved column after a dot"
+    );
+    let report = report.unwrap();
+    for name in ["app.f_quoted()", "app.f_qualified()"] {
+        assert!(
+            report.advisory.iter().any(|r| r.name == name),
+            "{report:#?}"
+        );
+    }
+    assert!(
+        report.advisory.iter().all(|r| r.name != "app.f_keyword()"),
+        "{report:#?}"
+    );
+    assert!(report.blocking.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn impact_lexer_keeps_longer_quoted_identifiers_whole() {
+    use pbps_pg::impact::{RenameTarget, rename_impact};
+    let mut db = TestDb::create("impact_whole425").await;
+    db.conn
+        .execute(
+            r#"
+        CREATE SCHEMA app;
+        CREATE TABLE app.t (email text, "other EMAIL" text);
+        INSERT INTO app.t VALUES ('a', 'b');
+        CREATE FUNCTION app.f_exact() RETURNS text LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT "email" FROM app.t LIMIT 1); END $fn$;
+        CREATE FUNCTION app.f_longer() RETURNS text LANGUAGE plpgsql AS
+            $fn$ BEGIN RETURN (SELECT "other EMAIL" FROM app.t LIMIT 1); END $fn$;
+    "#,
+        )
+        .await
+        .unwrap();
+    let report = rename_impact(
+        &mut db.conn,
+        &RenameTarget::Column(TableName::new("app", "t").column("email")),
+    )
+    .await;
+    db.conn
+        .execute("ALTER TABLE app.t RENAME COLUMN email TO contact_email")
+        .await
+        .unwrap();
+    let unaffected = text(&mut db.conn, "SELECT app.f_longer()").await;
+    let broken = db.conn.query("SELECT app.f_exact()").await;
+    db.drop().await;
+    let report = report.unwrap();
+    assert!(
+        report.advisory.iter().any(|r| r.name == "app.f_exact()"),
+        "{report:#?}"
+    );
+    assert!(
+        report.advisory.iter().all(|r| r.name != "app.f_longer()"),
+        "{report:#?}"
+    );
+    assert_eq!(unaffected, "b");
+    assert_eq!(
+        sqlstate(&broken.err().expect("the renamed column breaks the routine")),
+        "42703"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn impact_lexer_ignores_literal_and_comment_contents() {
+    use pbps_pg::impact::{RenameTarget, rename_impact};
+    let mut db = TestDb::create("impact_literal427").await;
+    db.conn
+        .execute(
+            r#"
+        CREATE SCHEMA app;
+        CREATE TABLE app.t (email text);
+        CREATE FUNCTION app.f_literals() RETURNS text LANGUAGE plpgsql AS
+            $fn$ BEGIN RAISE NOTICE 'EMAIL'; RETURN $value$email$value$; END $fn$;
+        CREATE FUNCTION app.f_comment() RETURNS text LANGUAGE plpgsql AS
+            $fn$ BEGIN /* email */ RETURN 'unchanged'; END $fn$;
+        CREATE FUNCTION app.f_reference() RETURNS text LANGUAGE plpgsql AS
+            $fn$ BEGIN RAISE NOTICE 'unrelated'; RETURN (SELECT email FROM app.t LIMIT 1); END $fn$;
+    "#,
+        )
+        .await
+        .unwrap();
+    let report = rename_impact(
+        &mut db.conn,
+        &RenameTarget::Column(TableName::new("app", "t").column("email")),
+    )
+    .await;
+    db.conn
+        .execute("ALTER TABLE app.t RENAME COLUMN email TO contact_email")
+        .await
+        .unwrap();
+    let literal_value = text(&mut db.conn, "SELECT app.f_literals()").await;
+    let comment_value = text(&mut db.conn, "SELECT app.f_comment()").await;
+    let broken = db.conn.query("SELECT app.f_reference()").await;
+    db.drop().await;
+    let report = report.unwrap();
+    assert!(
+        report
+            .advisory
+            .iter()
+            .any(|r| r.name == "app.f_reference()"),
+        "{report:#?}"
+    );
+    for name in ["app.f_literals()", "app.f_comment()"] {
+        assert!(
+            report.advisory.iter().all(|r| r.name != name),
+            "{report:#?}"
+        );
+    }
+    assert_eq!(literal_value, "email");
+    assert_eq!(comment_value, "unchanged");
+    assert_eq!(
+        sqlstate(&broken.err().expect("the renamed column breaks the routine")),
+        "42703"
+    );
+}
+
 /// Issue #260: an unquoted identifier is folded to lower case by the engine
 /// before it is stored, so a text-bodied routine spelling `EMAIL` unquoted
 /// names the same column as `email`, and the advisory scan has to find it
