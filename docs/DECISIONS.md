@@ -12041,6 +12041,14 @@ SPEC is in sync with all of these.
      then reach the arrived view's table. Qualified and quoted targets keep
      the same rule, and a target occurrence does not hide a later routine call.
 
+     PostgreSQL also names a routine without call parentheses in a function's
+     `SUPPORT` clause. The dialect supplies that operand keyword to the shared
+     scanner; the model owns the matching mechanism, not the engine's keyword
+     policy. Measured with internal aliases of `array_append` and its matching
+     support function: adding the support routine earlier on the path leaves
+     the old `prosupport` OID until the typed plan rebuilds the function. A view
+     of the operand's name cannot change that OID and causes no rebuild.
+
      Measured on PostgreSQL: a view reading the shared `orders` relation keeps
      that binding when `app.orders()` arrives. A parsed routine calling the
      shared `orders()` keeps its old binding until recreated, then calls the

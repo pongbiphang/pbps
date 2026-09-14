@@ -9058,6 +9058,77 @@ async fn a_target_column_list_rebinds_for_a_view_arrival_but_not_a_routine() {
         pbps_model::Change::AlterModule { id, .. } if id == &writer));
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_support_operand_rebinds_to_an_arriving_routine_without_call_parentheses() {
+    let mut db = TestDb::create("support_target230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared;
+             CREATE FUNCTION shared.planner_support(internal) RETURNS internal
+             LANGUAGE internal AS 'array_append_support';",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let target: pbps_model::ModuleId = "app.uses_support(anycompatiblearray,anycompatible)"
+        .parse()
+        .unwrap();
+    let mut a = Schema::default();
+    a.modules.insert(
+        target.clone(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(anycompatiblearray,anycompatible) RETURNS anycompatiblearray \
+             LANGUAGE internal AS 'array_append' SUPPORT /* operand */ planner_support",
+        ),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    let binding = |schema| {
+        format!(
+            "SELECT (prosupport = '{schema}.planner_support(internal)'::regprocedure)::int \
+         FROM pg_proc WHERE oid = \
+         'app.uses_support(anycompatiblearray,anycompatible)'::regprocedure"
+        )
+    };
+    assert_eq!(number(&mut db.conn, &binding("shared")).await, 1);
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.planner_support(internal)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(internal) RETURNS internal LANGUAGE internal AS 'array_append_support'",
+        ),
+    );
+    let routine_plan = plan(&a, &ids, &b, &ids);
+    apply(&mut db.conn, &pg, &routine_plan).await;
+    let after_routine = number(&mut db.conn, &binding("app")).await;
+    let mut c = b.clone();
+    c.modules.insert(
+        "app.planner_support".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS id"),
+    );
+    let view_plan = plan(&b, &ids, &c, &ids);
+    apply(&mut db.conn, &pg, &view_plan).await;
+    let after_view = number(&mut db.conn, &binding("app")).await;
+    db.drop().await;
+    assert_eq!(
+        after_routine, 1,
+        "the typed plan must replace the old support OID"
+    );
+    assert_eq!(after_view, 1);
+    assert_eq!(routine_plan.changes.len(), 2, "{routine_plan:#?}");
+    assert!(matches!(&routine_plan.changes[1].change,
+        pbps_model::Change::AlterModule { id, .. } if id == &target));
+    assert_eq!(view_plan.changes.len(), 1, "{view_plan:#?}");
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**

@@ -1907,7 +1907,8 @@ pub struct Rebound {
 /// effective write path, and the module's text mentions that object's bare
 /// name in the arrival's lexical reference form: followed by `(` for a
 /// routine, and not followed by `(` for a view, except an `INTO` target's
-/// column list remains a relation mention. A pg_proc arrival cannot
+/// column list remains a relation mention and a `SUPPORT` operand names a
+/// routine without call parentheses. A pg_proc arrival cannot
 /// capture a pg_class reference; this refinement still does not parse SQL
 /// positions or resolve overloads (DECISIONS 307, 473).
 ///
@@ -1961,7 +1962,12 @@ pub fn rebound_by_this_plan(
             // Tested by `object_name`, a trigger `app.orders.audit` rebuilt
             // every caller of `audit()` for a binding that cannot move, and
             // the rebuild of a caller with dependents is a refusal (307).
-            if pbps_model::module::references_module_with(&definition.definition, new, &LEXIS) {
+            if pbps_model::module::references_module_with(
+                &definition.definition,
+                new,
+                &LEXIS,
+                &["support"],
+            ) {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2567,6 +2573,48 @@ mod tests {
                 .len(),
                 1,
                 "a target must not hide a later call: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn support_operands_are_routine_mentions_without_parentheses() {
+        for target in ["planner_support", "app . \"planner_support\""] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.target(integer)"),
+                module(&format!(
+                    "(integer) RETURNS int LANGUAGE sql AS 'SELECT 1' \
+                     SUPPORT /* operand */ {target}"
+                )),
+            );
+            for (arrival, count) in [
+                ("app.planner_support(internal)", 1),
+                ("app.planner_support", 0),
+            ] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{target}: {arrival}"
+                );
+            }
+        }
+        for body in [
+            "SELECT 'SUPPORT planner_support'",
+            "SELECT supports planner_support",
+            "SELECT app.support planner_support",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.data()"), module(body));
+            assert!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.planner_support(internal)")],
+                    &BTreeSet::new()
+                )
+                .is_empty(),
+                "{body}"
             );
         }
     }

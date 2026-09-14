@@ -948,7 +948,14 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
 /// mentions; triggers have no reference form. This does not resolve aliases
 /// or overloads. Callers opt into the refinement instead of changing every
 /// name report and creation-order edge (DECISIONS 473).
-pub fn references_module_with(definition: &str, module: &ModuleId, lexis: &Lexis<'_>) -> bool {
+/// `routine_operands` supplies the dialect's lower-case keywords whose next
+/// name is a routine reference without call parentheses.
+pub fn references_module_with(
+    definition: &str,
+    module: &ModuleId,
+    lexis: &Lexis<'_>,
+    routine_operands: &[&str],
+) -> bool {
     let Some(name) = module.referenced_name() else {
         return false;
     };
@@ -959,8 +966,17 @@ pub fn references_module_with(definition: &str, module: &ModuleId, lexis: &Lexis
         lexis.continues_ident,
         lexis.reserved,
         true,
-        Some(matches!(module, ModuleId::Routine(_))),
+        Some(ReferenceForm {
+            routine: matches!(module, ModuleId::Routine(_)),
+            routine_operands,
+        }),
     )
+}
+
+#[derive(Clone, Copy)]
+struct ReferenceForm<'a> {
+    routine: bool,
+    routine_operands: &'a [&'a str],
 }
 
 /// How the scan compares letters, narrowest last.
@@ -1020,13 +1036,13 @@ fn references_in(
     continues: fn(char) -> bool,
     reserved: fn(&str) -> bool,
     bare: bool,
-    call: Option<bool>,
+    form: Option<ReferenceForm<'_>>,
 ) -> bool {
     let haystack = scannable_code(code, case, continues, false);
 
     // The qualified form first — a word after a dot is a name whatever it
     // is: measured, `FROM app.select` is accepted on PostgreSQL.
-    if contains_word(&haystack, &qualified(name, case), continues, call) {
+    if contains_word(&haystack, &qualified(name, case), continues, form) {
         return true;
     }
     // A bare name resolves through the engine's lookup path and nowhere
@@ -1044,9 +1060,9 @@ fn references_in(
     let bare = cased(&name.name, case);
     if reserved(&name.name.to_ascii_lowercase()) {
         let quoted = scannable_code(code, case, continues, true);
-        contains_word(&quoted, &format!("\"{bare}\""), continues, call)
+        contains_word(&quoted, &format!("\"{bare}\""), continues, form)
     } else {
-        contains_word(&haystack, &bare, continues, call)
+        contains_word(&haystack, &bare, continues, form)
     }
 }
 
@@ -1360,7 +1376,7 @@ fn contains_word(
     haystack: &str,
     needle: &str,
     continues: fn(char) -> bool,
-    call: Option<bool>,
+    form: Option<ReferenceForm<'_>>,
 ) -> bool {
     let mut from = 0;
     while let Some(at) = haystack[from..].find(needle) {
@@ -1368,16 +1384,23 @@ fn contains_word(
         let end = start + needle.len();
         if !is_ident_char(haystack[..start].chars().next_back(), continues)
             && !is_ident_char(haystack[end..].chars().next(), continues)
-            && call.is_none_or(|wanted| {
+            && form.is_none_or(|form| {
                 let next = haystack[end..].chars().find(|c| !is_a_gap(*c, continues));
                 // INSERT INTO orders (id) names a relation, even with a
                 // column list. Treating that parenthesis as a call skipped
                 // the rebuild that moves a parsed writer to an arriving view.
                 let before = haystack[..start].trim_end_matches(|c| is_a_gap(c, continues));
-                let into_target = before
-                    .strip_suffix("into")
-                    .is_some_and(|prefix| !is_ident_char(prefix.chars().next_back(), continues));
-                (next == Some('(') && !into_target) == wanted
+                let follows = |keyword| {
+                    before
+                        .strip_suffix(keyword)
+                        .is_some_and(|prefix| !is_ident_char(prefix.chars().next_back(), continues))
+                };
+                let routine = (next == Some('(') && !follows("into"))
+                    || form
+                        .routine_operands
+                        .iter()
+                        .any(|keyword| follows(*keyword));
+                routine == form.routine
             })
         {
             return true;
