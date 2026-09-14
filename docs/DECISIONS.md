@@ -12111,6 +12111,16 @@ SPEC is in sync with all of these.
      nested blocks, constants, both assignment spellings, real unmanaged
      dependents and calls in defaults, cursor queries and the executable body.
 
+     An OPEN statement's parenthesized arguments belong to a bound cursor,
+     not a routine call. Outside declaration and expression groups, mask only
+     that cursor operand. Its argument expressions, the cursor query and later
+     calls remain visible. Live cases with quoted names, comments, scroll
+     options and nested blocks retain their unmanaged dependents without a
+     rebuild; real calls in cursor arguments and queries still switch to the
+     arriving routine. A parameter or local named open keeps its type reference.
+     The cursor declaration name is excluded with its CURSOR keyword so that
+     blanking the keyword cannot attach its parameter list to that name.
+
      View arrivals retain path-resolved modified type names: a view creates a
      same-named composite type. Only the modifier group is removed for this
      relation-form scan. Measured with a numeric-layout base type using the

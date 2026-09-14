@@ -2030,6 +2030,8 @@ fn fixed_type_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
 /// their type portion is marked: defaults, assignments and cursor queries
 /// remain expressions. Skipping balanced groups avoids treating a parameter
 /// named declare, or a nested SQL expression, as a declaration block.
+/// Outside declarations, OPEN's argument list belongs to its cursor operand,
+/// not a routine call. Only that operand is excluded; its arguments stay code.
 fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
     let mut spans = Vec::new();
     let mut cursors = Vec::new();
@@ -2045,6 +2047,12 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
             statement = Some(at + 1);
         } else if token.word("begin") {
             statement = None;
+        } else if statement.is_none()
+            && token.word("open")
+            && tokens.get(at + 1).is_some_and(RebindToken::name)
+            && after_group(tokens, at + 2).is_some()
+        {
+            cursors.push(at + 1);
         } else if token.text == ";"
             && let Some(start) = statement
         {
@@ -2062,7 +2070,9 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
                     if item.word("cursor") {
                         if let Some(after) = after_group(tokens, end + 1) {
                             spans.push(tokens[end + 1].offset..tokens[after - 1].offset);
-                            cursors.push(end);
+                            // Blanking CURSOR must not attach its argument
+                            // list to the declared variable's name instead.
+                            cursors.extend([start, end]);
                         }
                         ty = at;
                         break;
@@ -3130,6 +3140,71 @@ mod tests {
                     &BTreeSet::new()
                 )
                 .len(),
+                1,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_cursor_operands_stay_outside_routine_call_matching() {
+        for cursor in [
+            "orders",
+            "ORDERS",
+            "\"orders\"",
+            "U&\"ord!0065rs\" UESCAPE '!'",
+            "outer_block.orders",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS int LANGUAGE plpgsql AS $$DECLARE orders CURSOR(n int) FOR SELECT n; BEGIN OPEN /* cursor */ {cursor} /* arguments */ (7); RETURN 7; END$$"
+                )),
+            );
+            assert!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .is_empty(),
+                "{cursor}: {}",
+                rebind_code(&declared.modules[&id("app.f()")].definition, true, true)
+            );
+        }
+        for body in [
+            "BEGIN OPEN orders(orders(7)); END",
+            "BEGIN OPEN orders(7); RETURN orders(7); END",
+            "DECLARE orders CURSOR(n int) FOR SELECT orders(n); BEGIN OPEN orders(7); END",
+            "SELECT open, orders(7) FROM source",
+            "SELECT open(orders(7))",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{body}"
+            );
+        }
+        // A parameter or local named open still has a path-resolved type.
+        // Its following modifier group must not be mistaken for cursor args.
+        for body in [
+            "(open orders(10,2)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE open orders(10,2); BEGIN RETURN 7; END$$",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id("app.orders")], &BTreeSet::new()).len(),
                 1,
                 "{body}"
             );

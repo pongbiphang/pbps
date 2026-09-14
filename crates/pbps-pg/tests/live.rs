@@ -9779,6 +9779,140 @@ async fn procedural_defaults_and_cursor_queries_still_rebind_real_calls() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn bound_cursor_opens_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("cursor_names230").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let pg = Postgres::new();
+    let bodies = [
+        "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "DECLARE \"orders\" NO SCROLL CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN /* cursor */ \"orders\" /* arguments */ (7); FETCH \"orders\" INTO result; CLOSE \"orders\"; RETURN result; END",
+        "DECLARE OrDeRs SCROLL CURSOR(n int) FOR SELECT n; result int; BEGIN IF true THEN OPEN ORDERS(7); END IF; FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "BEGIN DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN result; END; END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..bodies.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn bound_cursor_arguments_and_queries_keep_real_routine_calls() {
+    let mut db = TestDb::create("cursor_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+             CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(orders(7)); FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "DECLARE orders CURSOR(n int) FOR SELECT orders(n); result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN result; END",
+        "DECLARE orders CURSOR(n int) FOR SELECT n; result int; BEGIN OPEN orders(7); FETCH orders INTO result; CLOSE orders; RETURN orders(result); END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_catalog")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_arrival_must_recheck_a_modified_type_binding() {
     let mut db = TestDb::create("type_view230").await;
     db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; \
