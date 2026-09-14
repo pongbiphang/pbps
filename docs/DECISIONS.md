@@ -12114,6 +12114,17 @@ SPEC is in sync with all of these.
      Type modifiers are another non-call use of parentheses. Routine arrivals
      exclude modified type names in parameter and return declarations,
      transform operands, casts, record column definitions and typed literals.
+     Parameter declaration names are excluded separately from their types.
+     IN/OUT/INOUT/VARIADIC modes may precede or follow the name; quotes,
+     Unicode escapes and trivia do not change that distinction. An unnamed
+     multiword catalog type, or a type followed by ARRAY, is kept whole.
+     Procedural variable and bound-cursor parameter declarations likewise
+     mask their names while retaining types, defaults and cursor queries.
+     Later uses remain conservative; this does not resolve variable scope.
+     Live routines with unmanaged dependents need only the same-named view
+     arrival; actual OUT, return and local composite types still rebuild and
+     adopt the arriving view's row type.
+
      Parameter defaults and cast operands remain expressions. The dialect
      lexer offers an opt-in datum marker after decoding quoted routine bodies:
      `numeric(10, 2) '7'` stays distinguishable from a call without exposing
@@ -12172,6 +12183,16 @@ SPEC is in sync with all of these.
      partition/order/frame expressions. Live views with unmanaged dependents
      need only the arriving view; a relation subquery inside a named window
      still rebuilds and changes its row ordering when that view arrives.
+
+     ROLLUP/CUBE and GROUPING SETS are excluded only at grouping-element
+     positions after GROUP BY (including ALL/DISTINCT) or inside GROUPING
+     SETS. Constructor operands remain expressions. In particular, an extra
+     pair of parentheses makes GROUP BY (rollup(id)) an ordinary call; adding
+     those parentheses must not hide it. Nested grouping sets, real nested
+     calls and subqueries are measured on both PostgreSQL versions. Views
+     with unmanaged dependents need only grammar-name routine arrivals;
+     actual calls keep their previous grouping until rebuilt, then produce
+     the groups selected by the new routine.
 
      ANALYZE/ANALYSE and COPY utility targets also accept column lists. Their
      target column groups are blanked, keeping the names as relation mentions

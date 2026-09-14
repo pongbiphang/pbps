@@ -1532,6 +1532,46 @@ pub(crate) fn type_prefix(text: &str) -> Option<&str> {
     Some(&text[..text.len() - rest.len()])
 }
 
+/// Parameter declaration names bind arguments, not relations. Preserve the
+/// type and default expression, including an unnamed multiword built-in type:
+/// the existing identity gate makes the same whole-type choice (477).
+pub(crate) fn routine_parameter_names(definition: &str) -> Vec<std::ops::Range<usize>> {
+    let Some(list) = parameter_list(definition) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut at = definition.len() - after_the_gap(definition).0.len() + 1;
+    for parameter in parameters(list) {
+        let start = at + definition[at..].find(parameter).unwrap();
+        at = start + parameter.len();
+        let declaration = before_the_default(parameter);
+        let mut rest = after_the_gap(declaration).0;
+        let Some(first) = qualified_name_at(rest) else {
+            continue;
+        };
+        if is_a_mode(first) {
+            rest = after_the_gap(&rest[first.len()..]).0;
+        }
+        // Catalogued multiword spellings have no optional-name reading.
+        if without_trailing_trivia(rest)
+            .parse::<RoutineArg>()
+            .ok()
+            .is_some_and(|ty| types::catalogued(&ty))
+        {
+            continue;
+        }
+        let Some(name) = qualified_name_at(rest) else {
+            continue;
+        };
+        let tail = after_the_gap(&rest[name.len()..]).0;
+        if qualified_name_at(tail).is_some_and(|next| !next.eq_ignore_ascii_case("array")) {
+            let offset = start + declaration.len() - rest.len();
+            names.push(offset..offset + name.len());
+        }
+    }
+    names
+}
+
 /// Parameter defaults remain expressions. Everything before each default,
 /// and the return/transform type operands, can contain modifiers but no calls.
 pub(crate) fn routine_type_spans(definition: &str) -> Vec<std::ops::Range<usize>> {

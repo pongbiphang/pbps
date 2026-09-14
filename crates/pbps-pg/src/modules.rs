@@ -2267,6 +2267,7 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
             && let Some(start) = statement
         {
             if tokens.get(start).is_some_and(RebindToken::name) {
+                declarations.push(start);
                 let mut ty = start + 1;
                 if token_is(tokens, ty, "constant") {
                     ty += 1;
@@ -2280,9 +2281,9 @@ fn procedural_type_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
                     if item.word("cursor") {
                         // With or without arguments, the declared cursor is
                         // a variable rather than a relation on the write path.
-                        declarations.extend([start, end]);
-                        if let Some(after) = after_group(tokens, end + 1) {
-                            spans.push(tokens[end + 1].offset..tokens[after - 1].offset);
+                        declarations.push(end);
+                        if after_group(tokens, end + 1).is_some() {
+                            column_declarations(tokens, end + 1, &mut declarations, &mut spans);
                         }
                         ty = at;
                         break;
@@ -2607,6 +2608,56 @@ fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize, version: Option
     }
 }
 
+/// Only grouping elements give ROLLUP/CUBE and GROUPING SETS their special
+/// meaning. Parenthesized ordinary expressions and constructor operands keep
+/// their calls; GROUPING SETS alone nests another grouping-element list (477).
+fn grouping_element_declarations(
+    tokens: &[RebindToken<'_>],
+    mut at: usize,
+    end: usize,
+    declarations: &mut Vec<usize>,
+) {
+    while at < end {
+        if (token_is(tokens, at, "rollup") || token_is(tokens, at, "cube"))
+            && let Some(after) = after_group(tokens, at + 1)
+        {
+            declarations.push(at);
+            at = after;
+        } else if token_is(tokens, at, "grouping")
+            && token_is(tokens, at + 1, "sets")
+            && let Some(after) = after_group(tokens, at + 2)
+        {
+            declarations.extend([at, at + 1]);
+            grouping_element_declarations(tokens, at + 3, after - 1, declarations);
+            at = after;
+        }
+        // Move to the next element without entering an expression's groups.
+        while at < end && !token_is(tokens, at, ",") {
+            if [
+                ")",
+                ";",
+                "having",
+                "window",
+                "order",
+                "limit",
+                "offset",
+                "fetch",
+                "for",
+                "union",
+                "intersect",
+                "except",
+            ]
+            .iter()
+            .any(|word| token_is(tokens, at, word))
+            {
+                return;
+            }
+            at = tokens[at].close.map_or(at + 1, |close| close + 1);
+        }
+        at += 1;
+    }
+}
+
 /// CTE and relation alias column lists declare names; they cannot call an
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
@@ -2669,6 +2720,13 @@ fn rebind_code(
     let mut from = vec![false];
     let mut open_groups: Vec<usize> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
+        if token.word("group") && token_is(&tokens, i + 1, "by") {
+            let mut element = i + 2;
+            if token_is(&tokens, element, "all") || token_is(&tokens, element, "distinct") {
+                element += 1;
+            }
+            grouping_element_declarations(&tokens, element, tokens.len(), &mut declarations);
+        }
         if sql_expression_keyword(&tokens, i, version) {
             declarations.push(i);
         }
@@ -2860,6 +2918,12 @@ fn rebind_code(
             let t = &tokens[i];
             t.offset..t.offset + t.text.len()
         })
+        .chain(
+            routine
+                .then(|| crate::emit::routine_parameter_names(definition))
+                .into_iter()
+                .flatten(),
+        )
         .chain(modifier_ranges)
         .chain(referenced_columns)
         .chain(index_methods)
@@ -4799,6 +4863,121 @@ mod tests {
                 rebound_by_this_plan(&declared, &[], &[id("app.support")], &BTreeSet::new()).len(),
                 1,
                 "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouping_elements_exclude_only_their_grammar_names() {
+        for (group, calls) in [
+            ("ROLLUP(id)", false),
+            ("CUBE(id)", false),
+            ("GROUPING SETS (ROLLUP(id), CUBE(id), ())", false),
+            (
+                "DISTINCT GROUPING SETS (GROUPING SETS ((id)), CUBE(id))",
+                false,
+            ),
+            ("(rollup(id))", true),
+            ("1 + cube(id)", true),
+            ("sets(id)", true),
+            ("GROUPING SETS ((rollup(id)))", true),
+            ("ROLLUP(cube(id))", true),
+            ("CUBE(sets(id))", true),
+            ("ROLLUP((SELECT cube(id)))", true),
+            ("\"rollup\"(id)", true),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.v"),
+                module(&format!("SELECT count(*) FROM app.source GROUP BY {group}")),
+            );
+            let found = rebound_by_this_plan(
+                &declared,
+                &[],
+                &[
+                    id("app.rollup(integer)"),
+                    id("app.cube(integer)"),
+                    id("app.sets(integer)"),
+                ],
+                &BTreeSet::new(),
+            );
+            assert_eq!(!found.is_empty(), calls, "{group}");
+        }
+    }
+
+    #[test]
+    fn parameter_names_exclude_declarations_but_keep_default_calls() {
+        for parameter in [
+            "orders integer",
+            "IN orders integer",
+            "orders IN integer",
+            "OUT orders integer",
+            "orders OUT integer",
+            "VARIADIC orders integer[]",
+            "\"orders\" numeric(10,2)",
+            "U&\"!006frders\" UESCAPE '!' integer",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "({parameter}) RETURNS int LANGUAGE sql AS 'SELECT 7'"
+                )),
+            );
+            assert!(
+                rebound_by_this_plan(&declared, &[], &[id("app.orders")], &BTreeSet::new())
+                    .is_empty(),
+                "{parameter}"
+            );
+        }
+        for default in ["DEFAULT", "="] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "(orders integer {default} orders(1)) RETURNS int LANGUAGE sql AS 'SELECT 7'"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{default}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_names_keep_unnamed_and_named_type_references() {
+        for header in [
+            "orders",
+            "orders[]",
+            "orders ARRAY",
+            "orders ARRAY[3]",
+            "OUT orders",
+            "OUT orders ARRAY",
+            "OUT value orders",
+            "value OUT orders",
+            "orders orders",
+            "IN orders orders",
+            "value orders DEFAULT NULL",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "({header}) RETURNS int LANGUAGE sql AS 'SELECT 7'"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id("app.orders")], &BTreeSet::new()).len(),
+                1,
+                "{header}"
             );
         }
     }
