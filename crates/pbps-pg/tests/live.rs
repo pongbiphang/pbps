@@ -7794,8 +7794,12 @@ async fn wait_until_queued_for(conn: &mut Conn, relation: i64) {
 /// queues behind B's; B commits, and A's lock lands on the replacement. That is
 /// the window, held open on purpose.
 ///
-/// Beside it, the negative case: with nothing concurrent the answer is
-/// `Serialized::By` exactly as before.
+/// Three answers are asserted: the negative case, where nothing is concurrent
+/// and the answer is `Serialized::By` exactly as before; the replacement, where
+/// another view stands under the name; and the name taken by a *table*, where
+/// the lock is perfectly valid and reaches no view at all — a different
+/// sentence, because the lock is on whatever took the name rather than on
+/// nothing.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized() {
@@ -7859,7 +7863,7 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
     let refused = answered.expect_err("the lock landed on the replacement");
     let said = format!("{refused}");
     assert!(
-        said.contains("was replaced between this rebuild's read and its lock"),
+        said.contains("moved between this rebuild's read and its lock"),
         "{said}"
     );
     // Both objects, and by more than a name they now share.
@@ -7875,6 +7879,45 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
     .await;
     assert_ne!(original, replacement, "the race never happened");
     assert!(said.contains(&format!("oid {replacement}")), "{said}");
+
+    // The other shape of the same window: the name is taken by something that
+    // is not a view at all. `LOCK TABLE` is happy to lock a table, and the
+    // second resolve then reaches no view — which the refusal has to say as
+    // that, rather than as a lock on nothing. The original is gone by now, so
+    // this also exercises the words for an oid the catalog no longer holds.
+    let taken = oid(
+        &mut a,
+        &format!(
+            "SELECT c.oid::int8 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 'v'"
+        ),
+    )
+    .await;
+    b.execute("BEGIN").await.expect("the other session's own");
+    for sql in [
+        format!("DROP VIEW {s}.v"),
+        format!("CREATE TABLE {s}.v (id int primary key)"),
+    ] {
+        b.execute(&sql).await.expect("drop and take the name");
+    }
+    in_a_transaction(&mut a).await;
+    let (answered, committed) = tokio::join!(
+        pbps_pg::modules::before_a_rebuild(&mut a, &id, pbps_model::ModuleKind::View, &no_changes),
+        async {
+            wait_until_queued_for(&mut b, taken).await;
+            b.execute("COMMIT").await
+        }
+    );
+    committed.expect("the other session commits");
+    rollback(&mut a).await;
+    let refused = answered.expect_err("the lock landed on a table wearing the view's name");
+    let said = format!("{refused}");
+    assert!(said.contains("reaches no view at all"), "{said}");
+    assert!(
+        said.contains(&format!("oid {taken}, which is no longer in the catalog")),
+        "{said}"
+    );
 
     drop_schema(&mut a, &s).await;
 }
@@ -7970,7 +8013,7 @@ async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than
     let refused = answered.expect_err("the lock landed on the replacement's parent");
     let said = format!("{refused}");
     assert!(
-        said.contains("was replaced between this rebuild's read and its lock"),
+        said.contains("moved between this rebuild's read and its lock"),
         "{said}"
     );
     assert!(said.contains(&format!("oid {original}")), "{said}");

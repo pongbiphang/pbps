@@ -393,19 +393,24 @@ async fn locked_what_the_reads_describe(
     }
     let catalog = catalog_of(kind);
     let reads_describe = described(conn, catalog, oid).await?;
-    let lock_holds = match now {
-        Some(now) => described(conn, catalog, now).await?,
-        None => format!("nothing this read can name — `{id}` matches no catalog entry now"),
+    // What the name means *now* is the whole answer, and its two shapes are
+    // two different sentences: another object of this kind stands under the
+    // name, or the name no longer reaches one at all. Saying "the lock is on
+    // nothing" for the second would name the wrong cause — the lock is on
+    // whatever took the name; what is gone is the object the reads describe.
+    let now_means = match now {
+        Some(now) => format!("means {}", described(conn, catalog, now).await?),
+        None => format!("reaches no {} at all", kind.as_str()),
     };
     Err(DbError::Refused(format!(
-        "`{id}` was replaced between this rebuild's read and its lock: the reads that say what \
-         a rebuild would destroy are keyed to {reads_describe}, and the `ACCESS EXCLUSIVE` lock \
-         this transaction now holds is on {lock_holds}. Another session renamed the object away \
-         and created a replacement under its name in between, and a `LOCK TABLE` resolves its \
-         name when it runs.\nNothing is reported rather than an answer about one object beside \
-         a lock on another: the `DROP` that follows goes by name, so it would destroy the \
-         replacement — an object no plan approved over. Run the deploy again once the other \
-         session has finished."
+        "`{id}` moved between this rebuild's read and its lock: the reads that say what a \
+         rebuild would destroy are keyed to {reads_describe}, and with the `ACCESS EXCLUSIVE` \
+         lock held that name {now_means}. Another session renamed or dropped the object and \
+         gave its name away in between, and a `LOCK TABLE` resolves its name when it runs — so \
+         the lock is held on something other than what the reads describe.\nNothing is \
+         reported rather than an answer about one object beside a lock on another: the `DROP` \
+         that follows goes by name, so it would destroy whatever stands under it — an object \
+         no plan approved over. Run the deploy again once the other session has finished."
     )))
 }
 
