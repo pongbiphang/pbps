@@ -12299,6 +12299,22 @@ SPEC is in sync with all of these.
      seven old-server routine names, current-server expression constructs with
      unmanaged dependents, and missing-rebuild refusal in both apply modes.
 
+     OVERLAPS between period rows is grammar, while an ordinary overlaps(...)
+     call remains a routine reference. Only the binary operator keyword is
+     excluded; both periods retain their expression calls. Live operands keep
+     the old overlap result until rebuilt against the arriving routine.
+     Positioned DML's WHERE CURRENT OF operand is a cursor, just like its
+     OPEN/FETCH/CLOSE operands. Exclude only that cursor name; UPDATE/DELETE
+     targets, SET expressions and RETURNING expressions stay visible. Live
+     positioned writes with unmanaged dependents retain the cursor, while real
+     relation and routine references inside SET still rebuild and switch.
+     Index and table-constraint INCLUDE follows a key group and holds only
+     column names. Exclude that whole clause so its list boundary cannot invent
+     a call. Index expressions and predicates still retain their real calls;
+     live catalog dependencies switch from the old routine to the arriving one
+     after the typed rebuild. PostgreSQL rejects inline column-constraint
+     INCLUDE, so no rule is inferred from that rejected spelling.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

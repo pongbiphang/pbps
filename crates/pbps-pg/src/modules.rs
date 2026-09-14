@@ -2742,6 +2742,37 @@ fn rebind_code(
         if sql_expression_keyword(&tokens, i, version) {
             declarations.push(i);
         }
+        if token.word("overlaps")
+            && i > 0
+            && token_is(&tokens, i - 1, ")")
+            && after_group(&tokens, i + 1).is_some()
+        {
+            // OVERLAPS between period rows is a grammar operator. Its two
+            // operands still contain ordinary expressions and calls (477).
+            declarations.push(i);
+        }
+        if routine
+            && token.word("where")
+            && token_is(&tokens, i + 1, "current")
+            && token_is(&tokens, i + 2, "of")
+            && tokens.get(i + 3).is_some_and(RebindToken::name)
+        {
+            // Positioned DML names a cursor here; its target and SET/RETURNING
+            // expressions remain ordinary relation/routine references (477).
+            declarations.push(i + 3);
+        }
+        if routine
+            && token.word("include")
+            && i > 0
+            && token_is(&tokens, i - 1, ")")
+            && let Some(after) = after_group(&tokens, i + 1)
+        {
+            // Index and table-constraint INCLUDE follows its key group and
+            // contains column names only. Remove the whole clause so its
+            // boundary cannot attach a new call to a preceding name (477).
+            let close = &tokens[after - 1];
+            referenced_columns.push(token.offset..close.offset + close.text.len());
+        }
         if i > 0 && tokens[i - 1].text == ")" {
             if token.word("over") {
                 if after_group(&tokens, i + 1).is_some() {
@@ -4131,6 +4162,109 @@ mod tests {
                 )
                 .len(),
                 1,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlaps_operators_keep_their_operand_calls() {
+        for (query, calls) in [
+            ("SELECT (1,2) OVERLAPS (3,4)", 0),
+            ("SELECT ROW(1,2) OVERLAPS (3,4)", 0),
+            ("SELECT overlaps(1)", 1),
+            ("SELECT \"overlaps\"(1)", 1),
+            ("SELECT app.overlaps(1)", 1),
+            ("SELECT (overlaps(1),2) OVERLAPS (3,4)", 1),
+            ("SELECT (1,2) OVERLAPS (overlaps(3),4)", 1),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(query));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.overlaps(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                calls,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_of_masks_only_the_cursor_operand() {
+        for (statement, views, calls) in [
+            ("UPDATE target SET id=7 WHERE CURRENT OF orders", 0, 0),
+            ("DELETE FROM target WHERE CURRENT OF \"orders\"", 0, 0),
+            ("UPDATE orders SET id=7 WHERE CURRENT OF cursor_name", 1, 0),
+            (
+                "UPDATE target SET id=(SELECT id FROM orders) WHERE CURRENT OF orders",
+                1,
+                0,
+            ),
+            (
+                "UPDATE target SET id=orders(7) WHERE CURRENT OF orders",
+                0,
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$ BEGIN {statement}; END $$"
+                )),
+            );
+            for (arrival, count) in [("app.orders", views), ("app.orders(integer)", calls)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn include_column_lists_keep_index_expression_calls() {
+        for (statement, calls) in [
+            ("CREATE INDEX ix ON target(id) INCLUDE(extra)", 0),
+            (
+                "CREATE INDEX ix ON target USING btree (id) INCLUDE(extra)",
+                0,
+            ),
+            (
+                "CREATE TABLE t(id int, extra int, PRIMARY KEY(id) INCLUDE(extra))",
+                0,
+            ),
+            ("ALTER TABLE t ADD UNIQUE(id) INCLUDE(extra)", 0),
+            ("CREATE INDEX ix ON target(include(id)) INCLUDE(extra)", 1),
+            (
+                "CREATE INDEX ix ON target(id) INCLUDE(extra) WHERE include(id)>0",
+                1,
+            ),
+            ("PERFORM include(1)", 1),
+            ("PERFORM \"include\"(1)", 1),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$ BEGIN {statement}; END $$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.include(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                calls,
                 "{statement}"
             );
         }
