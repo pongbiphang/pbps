@@ -407,7 +407,7 @@ fn cut(
         eprintln!("warning: {what}");
         scoped.unexpressible.push(what.to_owned());
     }
-    report_unmanaged(&scoped, unreadable, modules, unmanaged)?;
+    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
     Ok(scoped)
 }
 
@@ -899,24 +899,21 @@ pub(crate) fn managed_limitations(
     pulled
         .limitations
         .iter()
-        .filter(|limitation| match &limitation.target {
-            pbps_db::catalog::LimitationTarget::Relation(name) => {
-                managed_tables.contains(name) || modules.contains(&ModuleId::Named(name.clone()))
-            }
-            target @ pbps_db::catalog::LimitationTarget::SharedModule(_) => {
-                modules.iter().any(|id| target.matches_module(id))
-            }
-            pbps_db::catalog::LimitationTarget::Module(id) => modules.contains(id),
-            pbps_db::catalog::LimitationTarget::UnnameableModule(_) => false,
-        })
+        .filter(|limitation| omission_is_managed(&limitation.target, &managed_tables, modules))
         .map(|limitation| limitation.detail.clone())
         .chain(
             pulled
                 .unmanaged_modules
                 .iter()
-                // The inventory preserves the same namespaces as limitations;
-                // matching only the base name would capture another overload.
-                .filter(|m| modules.iter().any(|id| m.target.matches_module(id)))
+                .filter(|m| omission_is_managed(&m.target, &managed_tables, modules))
+                // The catalog keeps both inventories for different consumers
+                // (DECISIONS 426). Only this exact fact supersedes the fallback;
+                // matching by target alone would discard another limitation.
+                .filter(|m| {
+                    !pulled.limitations.iter().any(|limitation| {
+                        limitation.target == m.target && limitation.detail == m.why
+                    })
+                })
                 .map(|m| {
                     format!(
                         "{} {} is in the managed set, but {}",
@@ -925,6 +922,18 @@ pub(crate) fn managed_limitations(
                 }),
         )
         .collect()
+}
+
+/// Omitted relations still belong to identity-file tables even when absent
+/// from the pulled schema. Routine arguments and trigger parents retain their
+/// own namespaces; a table identity must not capture either (DECISIONS 425).
+fn omission_is_managed(
+    target: &pbps_db::catalog::LimitationTarget,
+    tables: &BTreeSet<&TableName>,
+    modules: &BTreeSet<ModuleId>,
+) -> bool {
+    matches!(target, pbps_db::catalog::LimitationTarget::Relation(name) if tables.contains(name))
+        || modules.iter().any(|id| target.matches_module(id))
 }
 
 /// The unexpressible permissions that are this project's business.
@@ -1136,8 +1145,10 @@ pub(crate) fn unreadable_modules(
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+    ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
+    let managed_tables = ids.tables.values().collect();
     scoped
         .unmanaged
         .iter()
@@ -1149,14 +1160,16 @@ pub(crate) fn unmanaged_objects(
         // declare, and an undeclared role is one of those (ADR-0005).
         .chain(scoped.unmanaged_roles.iter().map(|r| format!("role {r}")))
         // Unreadable modules are absent from `scoped.schema`, but they are
-        // still catalog objects. If their name is outside the supplied module
+        // still catalog objects. If their target is outside the supplied managed
         // set, the unmanaged policy applies exactly as it does to a readable
         // module. Without this half, encryption was an accidental escape from
         // `unmanaged: error`.
         .chain(
             unreadable
                 .iter()
-                .filter(|(name, _)| !managed_modules.iter().any(|id| name.matches_module(id)))
+                .filter(|(target, _)| {
+                    !omission_is_managed(target, &managed_tables, managed_modules)
+                })
                 .map(|(_, description)| description.clone()),
         )
         .collect()
@@ -1167,10 +1180,11 @@ pub(crate) fn unmanaged_objects(
 fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+    ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
-    let names = unmanaged_objects(scoped, unreadable, managed_modules);
+    let names = unmanaged_objects(scoped, unreadable, ids, managed_modules);
     apply_unmanaged_policy(&names, policy)
 }
 
@@ -2713,8 +2727,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // has only this one typed failure, but preserve any future operational
         // error as an inability to answer rather than misclassifying it as a
         // policy finding.
-        let unmanaged_inventory =
-            unmanaged_objects(&scoped, &managed.unreadable, &recorded_modules);
+        let unmanaged_inventory = unmanaged_objects(
+            &scoped,
+            &managed.unreadable,
+            &recorded_ids,
+            &recorded_modules,
+        );
         let unmanaged_refusal =
             match apply_unmanaged_policy(&unmanaged_inventory, project.config.unmanaged) {
                 Ok(()) => None,
@@ -3521,6 +3539,7 @@ pub fn cmd_plan_db(
         report_unmanaged(
             &for_policy,
             &managed.unreadable,
+            &recorded_ids,
             &recorded_modules,
             project.config.unmanaged,
         )?;
@@ -9204,11 +9223,117 @@ mod tests {
         let unreadable = unreadable_modules(&pulled.unmanaged_modules);
 
         let limited = managed_limitations(&pulled, &IdsFile::default(), &modules);
-        let unmanaged = unmanaged_objects(&scoped, &unreadable, &modules);
+        let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &modules);
         assert!(limited.iter().any(|l| l.contains("dbo.declared_secret")));
         assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
         assert!(unmanaged.iter().any(|u| u.contains("dbo.stray_secret")));
         assert!(!unmanaged.iter().any(|u| u.contains("dbo.declared_secret")));
+    }
+
+    #[test]
+    fn managed_omission_fallbacks_only_yield_to_the_same_target_and_detail() {
+        use pbps_db::catalog::LimitationTarget;
+        let mut pulled = pulled();
+        pulled.limitations.clear();
+        pulled.unmanaged_modules.clear();
+        let target = LimitationTarget::module("app.f(integer)".parse().unwrap());
+        let other = LimitationTarget::module("app.f(bigint)".parse().unwrap());
+        let modules = ["app.f(integer)", "app.f(bigint)"]
+            .into_iter()
+            .map(|name| name.parse().unwrap())
+            .collect();
+        for detail in ["omitted aggregate", "another unsupported property"] {
+            pulled.limitations.push(Limitation {
+                target: target.clone(),
+                detail: detail.into(),
+            });
+        }
+        for (target, why) in [
+            (target.clone(), "omitted aggregate"),
+            (target, "inventory-only fact"),
+            (other, "omitted aggregate"),
+        ] {
+            pulled.unmanaged_modules.push(UnmanagedModule {
+                kind: "aggregate",
+                target,
+                why: why.into(),
+            });
+        }
+        let before = pulled.unmanaged_modules.clone();
+        let facts = managed_limitations(&pulled, &IdsFile::default(), &modules);
+        assert_eq!(facts.len(), 4, "{facts:?}");
+        assert_eq!(facts[0], "omitted aggregate");
+        assert_eq!(facts[1], "another unsupported property");
+        assert!(facts[2].contains("app.f(integer)") && facts[2].contains("inventory-only fact"));
+        assert!(facts[3].contains("app.f(bigint)") && facts[3].contains("omitted aggregate"));
+        assert_eq!(pulled.unmanaged_modules, before);
+        assert_eq!(pulled.limitations.len(), 2);
+        assert!(managed_limitations(&pulled, &IdsFile::default(), &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn managed_omission_table_identities_do_not_capture_other_namespaces() {
+        use pbps_db::catalog::LimitationTarget;
+        let ids = ids();
+        let mut pulled = pulled();
+        pulled.limitations.clear();
+        pulled.unmanaged_modules.clear();
+        let managed = LimitationTarget::Relation("dbo.managed".parse().unwrap());
+        let targets = [
+            managed.clone(),
+            LimitationTarget::Relation("dbo.theirs".parse().unwrap()),
+            LimitationTarget::module("dbo.managed(integer)".parse().unwrap()),
+            LimitationTarget::module("dbo.t.managed".parse().unwrap()),
+            LimitationTarget::UnnameableModule("dbo.managed".parse().unwrap()),
+        ];
+        for target in targets {
+            let why = format!("omitted {target:?}");
+            pulled.limitations.push(Limitation {
+                target: target.clone(),
+                detail: why.clone(),
+            });
+            pulled.unmanaged_modules.push(UnmanagedModule {
+                kind: "module",
+                target,
+                why,
+            });
+        }
+        let modules = BTreeSet::new();
+        // The identity remains authoritative even though no table was pulled.
+        let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules);
+        assert!(scoped.schema.tables.is_empty());
+        let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+        let outside = unmanaged_objects(&scoped, &unreadable, &ids, &modules);
+        assert_eq!(outside.len(), 4, "{outside:?}");
+        for item in pulled.unmanaged_modules.iter().skip(1) {
+            assert!(
+                outside.iter().any(|fact| fact.contains(&item.why)),
+                "{outside:?}"
+            );
+        }
+        assert!(
+            !outside
+                .iter()
+                .any(|fact| fact.contains(&pulled.limitations[0].detail))
+        );
+        assert_eq!(
+            managed_limitations(&pulled, &ids, &modules),
+            [pulled.limitations[0].detail.clone()]
+        );
+
+        // Inventory-only fallback has the same membership even without a
+        // typed limitation; SQL Server's shared-module fallback is tested above.
+        pulled.limitations.clear();
+        let facts = managed_limitations(&pulled, &ids, &modules);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(facts[0].contains("dbo.managed is in the managed set"));
+        let empty = IdsFile::default();
+        let unscoped = pbps_diff::scope(&pulled.schema, &empty, &modules);
+        assert_eq!(
+            unmanaged_objects(&unscoped, &unreadable, &empty, &modules).len(),
+            5
+        );
+        assert!(managed_limitations(&pulled, &empty, &modules).is_empty());
     }
 
     #[test]
@@ -9247,7 +9372,7 @@ mod tests {
             .collect();
         let scoped = pbps_diff::scope(&pulled.schema, &IdsFile::default(), &held);
         let unreadable = unreadable_modules(&pulled.unmanaged_modules);
-        let unmanaged = unmanaged_objects(&scoped, &unreadable, &held);
+        let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &held);
         assert_eq!(unmanaged.len(), 3, "{unmanaged:?}");
         assert!(unmanaged.iter().any(|s| s.contains("app.f(bigint)")));
         assert!(unmanaged.iter().any(|s| s.contains("app.other.audit")));

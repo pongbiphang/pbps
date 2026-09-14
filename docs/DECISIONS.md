@@ -12148,3 +12148,25 @@ SPEC is in sync with all of these.
      string-to-engine factory in `explain`. Unknown names retain their existing
      explanation error and `plan.unsupported-dialect` envelope. A future
      configured name requires a deliberate answer in both exhaustive selectors.
+
+482. **Omitted catalog objects have one managed scope and one fact per omission.**
+     The CLI projects both inventories retained by 425–426 without changing
+     either catalog collection. A typed limitation supersedes an inventory
+     fallback only when both its target and detail match (#326). Another fact
+     on the same target, or the same wording on another target, stays visible;
+     SQL Server inventory-only unreadable modules retain their refusal.
+
+     Both managed limitations and unmanaged policy use the declared table
+     identities plus module identities (#327). An omitted relation replacing
+     an identity-file table remains managed even though absent from the pulled
+     schema. Routine signatures, trigger parents and SQL Server shared-module
+     names retain their existing namespace rules. Every caller supplies the
+     same ids used for its catalog scope, including verify and status's recorded
+     identities. No saved artifact, declaration model or engine boundary changes.
+
+     Unit controls preserve distinct facts and namespaces. PostgreSQL CLI tests
+     replace a managed function with an aggregate and a table with a materialized
+     view: verify and status report one managed omission under warn/error, while
+     unrelated omitted relations and same-name routines remain unmanaged. Plan,
+     baseline and snapshot still refuse the omitted managed state without adding
+     a ledger entry; restoring the original objects restores clean verification.
