@@ -11969,3 +11969,53 @@ SPEC is in sync with all of these.
      foreign-key drops as well, which is the reordering 467 records as unsafe
      while a pinned one is present. Filed as issue #536 rather than widened into
      this one.
+
+475. **A module rebuild re-resolves its name once the lock is held (issue
+     #232).** `before_a_rebuild` resolves the module's oid **once** and keys
+     every carried-state read by it — deliberately, because two independent
+     name matches are two chances to disagree and the direction they fail in is
+     the one that waves a rebuild through. But the lock that serializes those
+     reads is taken by **name**: `LOCK TABLE <schema>.<view> IN ACCESS
+     EXCLUSIVE MODE` for a view, and its parent table's for a trigger. A name
+     is not an object, and PostgreSQL resolves a `LOCK TABLE`'s name when it
+     runs the statement. **Measured** on 18.6, A being the rebuild and B
+     another session:
+
+     ```text
+     A: BEGIN;  -- module_oid resolves m.v to 16389
+     B: ALTER VIEW m.v RENAME TO v_old;  CREATE VIEW m.v AS …   -- 16393
+     A: LOCK TABLE m.v IN ACCESS EXCLUSIVE MODE;   -- LOCK TABLE
+        pg_locks: A holds ACCESS EXCLUSIVE on 16393
+     ```
+
+     So the answer said `Serialized::By("the view's own ACCESS EXCLUSIVE
+     lock")` while the lock was on the replacement and every read described the
+     original — and the `DROP VIEW` that follows goes by name, so it would have
+     destroyed the replacement. The same window is one relation over for a
+     trigger, measured the same way: rename the parent table away, create a
+     replacement, and the lock lands on a table whose trigger is not the one
+     the reads are keyed to.
+
+     **The fix is the second resolve, not a second lock.** With the lock held,
+     the name is asked once more and has to still mean the same object;
+     nothing can move it in between, because a rename needs the lock this
+     transaction now has. This is the device `data_triggers::lock_by_oid`
+     already uses for the mirror-image problem — there the *oid* is known and
+     the name read for the lock, here the name is known and the oid read for
+     the reads — and 445 records why it is enough: once the lock is on the
+     intended relation, it keeps it that way.
+
+     **Refused, not retried.** The caller is inside the apply's transaction
+     (ADR-0009 §3), and what the refusal buys over SPEC §7.6's read-back is not
+     safety but a message: §7.6 catches this at the end of the apply, as two
+     unrelated-looking surprises — an object appearing that the plan does not
+     touch, and a change to one it never approved over — where this says which
+     two objects, one statement after the cause. The message names both by oid
+     beside `pg_describe_object`'s words for them, because by then they share a
+     name and "view m.v" twice would say nothing; an oid that is no longer in
+     the catalog is said as that, since an object dropped rather than renamed
+     aside is exactly as much of a mismatch.
+
+     The routine arm needs none of this: its lock is `SELECT … FROM pg_proc
+     WHERE p.oid = $1 FOR UPDATE`, taken by oid, with no name between the two
+     statements to move.
