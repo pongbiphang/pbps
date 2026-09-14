@@ -12237,6 +12237,24 @@ SPEC is in sync with all of these.
      views arrive. Qualified project types and distinct quoted mixed-case names
      retain their references, as do generic non-catalog types.
 
+     The SUPPORT option keyword and its operand are excluded together from
+     ordinary relation matching; the operand separately retains its routine
+     binding check. Other occurrences of support in types or bodies stay code.
+     A live supported function with an unmanaged dependent remains bound to
+     its original support OID when a view named support arrives.
+
+     Bare SQL expression keywords such as COALESCE/NULLIF, min/max expressions,
+     SQL/XML and SQL/JSON constructors either form special expression nodes or
+     bind catalog routines directly. Exclude their keywords while retaining
+     expression contents and quoted/qualified routine calls. This follows the
+     PostgreSQL grammar's func_expr_common_subexpr productions; do not infer it
+     from the identifier-quoting keyword table. SUBSTRING/OVERLAY also support
+     ordinary calls: only their top-level FROM/FOR or PLACING forms are excluded.
+     Nested groups cannot supply those syntax markers to an outer call. Live
+     views with unmanaged dependents retain their results after same-named
+     routines arrive; explicit calls and ordinary substring/overlay calls keep
+     the old binding until rebuilt, then change from 7 to 42.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

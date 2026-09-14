@@ -1423,21 +1423,34 @@ pub(crate) fn qualified_name_at(text: &str) -> Option<&str> {
     Some(&text[..at])
 }
 
-/// The actual SUPPORT option's operand, before interpreting identifier quotes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SupportOption {
+    pub keyword: std::ops::Range<usize>,
+    pub operand: std::ops::Range<usize>,
+}
+
+/// The actual SUPPORT option and operand, before interpreting identifier quotes.
 /// `support` is unreserved: a parameter, return type, language, setting value
 /// or SQL-body column of that name does not introduce a routine reference.
 /// Only header items are inspected; the SQL body stays with the ordinary
 /// reference scanner, and quoted AS bodies remain opaque (DECISIONS 477).
-pub(crate) fn support_operand(definition: &str) -> Option<std::ops::Range<usize>> {
+pub(crate) fn support_option(definition: &str) -> Option<SupportOption> {
     let mut rest = after_the_gap(definition).0;
     let list = parameter_list(rest)?;
     rest = &rest[list.len() + 2..];
-    while let Some(item) = header_item(&mut rest) {
+    loop {
+        let keyword_start = definition.len() - after_the_gap(rest).0.len();
+        let Some(item) = header_item(&mut rest) else {
+            break;
+        };
         match item.to_ascii_lowercase().as_str() {
             "support" => {
                 let operand = qualified_name_at(after_the_gap(rest).0)?;
                 let start = definition.len() - after_the_gap(rest).0.len();
-                return Some(start..start + operand.len());
+                return Some(SupportOption {
+                    keyword: keyword_start..keyword_start + item.len(),
+                    operand: start..start + operand.len(),
+                });
             }
             "begin" | "return" => return None,
             // Consume names in other header positions before looking for an

@@ -2557,6 +2557,37 @@ fn ddl_reference_spans(
     (spans, separators)
 }
 
+/// Bare SQL expression keywords either build dedicated expression nodes or
+/// bind catalog routines directly (477). SUBSTRING/OVERLAY additionally allow
+/// ordinary calls, so only their keyword-argument forms are excluded.
+fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
+    let Some(after) = after_group(tokens, at + 1) else {
+        return false;
+    };
+    match tokens[at].text.to_ascii_lowercase().as_str() {
+        "coalesce" | "nullif" | "greatest" | "least" | "extract" | "normalize" | "position"
+        | "trim" | "cast" | "treat" | "grouping" | "xmlconcat" | "xmlelement" | "xmlattributes"
+        | "xmlforest" | "xmlparse" | "xmlpi" | "xmlroot" | "xmlserialize" | "xmlexists"
+        | "xmltable" | "xmlnamespaces" | "json" | "json_array" | "json_object"
+        | "json_arrayagg" | "json_objectagg" | "json_scalar" | "json_serialize" | "json_query"
+        | "json_exists" | "json_value" | "json_table" | "merge_action" => true,
+        "substring" | "overlay" => {
+            let mut i = at + 2;
+            while i < after - 1 {
+                if (tokens[at].word("substring")
+                    && (token_is(tokens, i, "from") || token_is(tokens, i, "for")))
+                    || (tokens[at].word("overlay") && token_is(tokens, i, "placing"))
+                {
+                    return true;
+                }
+                i = tokens[i].close.map_or(i + 1, |close| close + 1);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// CTE and relation alias column lists declare names; they cannot call an
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
@@ -2614,6 +2645,9 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     let mut from = vec![false];
     let mut open_groups: Vec<usize> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
+        if sql_expression_keyword(&tokens, i) {
+            declarations.push(i);
+        }
         if i > 0 && tokens[i - 1].text == ")" {
             if token.word("over") {
                 if after_group(&tokens, i + 1).is_some() {
@@ -2836,13 +2870,13 @@ pub fn rebound_by_this_plan(
             continue;
         }
         let support = (definition.kind == ModuleKind::Function)
-            .then(|| crate::emit::support_operand(&definition.definition))
+            .then(|| crate::emit::support_option(&definition.definition))
             .flatten();
         let mut ordinary = definition.definition.clone();
-        if let Some(operand) = &support {
-            // The actual option is a routine reference, so keep its operand
-            // out of the ordinary non-call (relation/type) scan as well.
-            ordinary.replace_range(operand.clone(), " ");
+        if let Some(option) = &support {
+            // The option keyword is grammar and its operand is handled as a
+            // routine reference below. Neither belongs in the relation scan.
+            ordinary.replace_range(option.keyword.start..option.operand.end, " ");
         }
         let routine = matches!(
             definition.kind,
@@ -2866,10 +2900,10 @@ pub fn rebound_by_this_plan(
             // every caller of `audit()` for a binding that cannot move, and
             // the rebuild of a caller with dependents is a refusal (307).
             let support_matches = matches!(new, ModuleId::Routine(_))
-                && support.as_ref().is_some_and(|operand| {
+                && support.as_ref().is_some_and(|option| {
                     new.referenced_name().is_some_and(|name| {
                         pbps_model::module::references_with(
-                            &definition.definition[operand.clone()],
+                            &definition.definition[option.operand.clone()],
                             &name,
                             &LEXIS,
                         )
@@ -4619,6 +4653,7 @@ mod tests {
             for (arrival, count) in [
                 ("app.planner_support(internal)", 1),
                 ("app.planner_support", 0),
+                ("app.support", 0),
             ] {
                 assert_eq!(
                     rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
@@ -4653,6 +4688,130 @@ mod tests {
     }
 
     #[test]
+    fn support_options_leave_real_same_named_relation_mentions_visible() {
+        for body in [
+            "() RETURNS support LANGUAGE sql AS 'SELECT 7' SUPPORT planner_support",
+            "() RETURNS int LANGUAGE sql AS 'SELECT value FROM support' SUPPORT planner_support",
+            "(OUT result support) LANGUAGE sql AS 'SELECT 7' SUPPORT planner_support",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id("app.support")], &BTreeSet::new()).len(),
+                1,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_keywords_keep_explicit_calls_and_expression_operands() {
+        for name in [
+            "coalesce",
+            "nullif",
+            "greatest",
+            "least",
+            "extract",
+            "normalize",
+            "position",
+            "trim",
+            "cast",
+            "treat",
+            "grouping",
+            "xmlconcat",
+            "xmlelement",
+            "xmlattributes",
+            "xmlforest",
+            "xmlparse",
+            "xmlpi",
+            "xmlroot",
+            "xmlserialize",
+            "xmlexists",
+            "xmltable",
+            "xmlnamespaces",
+            "json",
+            "json_array",
+            "json_object",
+            "json_arrayagg",
+            "json_objectagg",
+            "json_scalar",
+            "json_serialize",
+            "json_query",
+            "json_exists",
+            "json_value",
+            "json_table",
+            "merge_action",
+        ] {
+            for body in [
+                format!("SELECT \"{name}\"(7)"),
+                format!("SELECT app.{name}(7)"),
+                format!("SELECT {name}(\"{name}\"(7))"),
+            ] {
+                let mut declared = Schema::default();
+                declared.modules.insert(id("app.v"), module(&body));
+                assert_eq!(
+                    rebound_by_this_plan(
+                        &declared,
+                        &[],
+                        &[id(&format!("app.{name}(integer)"))],
+                        &BTreeSet::new()
+                    )
+                    .len(),
+                    1,
+                    "{body}"
+                );
+            }
+            let mut declared = Schema::default();
+            declared
+                .modules
+                .insert(id("app.v"), module(&format!("SELECT {name}(7)")));
+            assert!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id(&format!("app.{name}(integer)"))],
+                    &BTreeSet::new()
+                )
+                .is_empty(),
+                "{name}"
+            );
+        }
+        for (name, body, count) in [
+            ("substring", "SELECT substring(value FROM 1)", 0),
+            ("substring", "SELECT substring(value FOR 1)", 0),
+            ("overlay", "SELECT overlay(value PLACING 'x' FROM 1)", 0),
+            ("substring", "SELECT substring(value, 1)", 1),
+            ("overlay", "SELECT overlay(value, 'x', 1)", 1),
+            (
+                "substring",
+                "SELECT substring((SELECT value FROM source))",
+                1,
+            ),
+            ("overlay", "SELECT overlay((SELECT placing FROM source))", 1),
+            ("substring", "SELECT substring(substring(7) FROM 1)", 1),
+            (
+                "overlay",
+                "SELECT overlay(overlay(7) PLACING 'x' FROM 1)",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id(&format!("app.{name}(integer)"))],
+                    &BTreeSet::new()
+                )
+                .len(),
+                count,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
     fn only_the_function_option_introduces_a_support_operand() {
         for header in [
             "() RETURNS support LANGUAGE sql",
@@ -4677,14 +4836,16 @@ mod tests {
             "() RETURNS int LANGUAGE sql RESET support",
         ] {
             let definition = format!("{header} SUPPORT /* option */ app . \"planner_support\"");
-            let operand = crate::emit::support_operand(&definition).unwrap();
+            let option = crate::emit::support_option(&definition).unwrap();
+            assert_eq!(&definition[option.keyword], "SUPPORT");
+            let operand = option.operand;
             assert_eq!(
                 &definition[operand], "app . \"planner_support\"",
                 "{header}"
             );
             let definition =
                 format!("{header} BEGIN ATOMIC SELECT \"support\" planner_support; END");
-            assert_eq!(crate::emit::support_operand(&definition), None, "{header}");
+            assert_eq!(crate::emit::support_option(&definition), None, "{header}");
         }
         for body in [
             "'SELECT ''support planner_support'''",
@@ -4693,9 +4854,11 @@ mod tests {
             "U&'SELECT ''support planner_support''' UESCAPE '!'",
         ] {
             let definition = format!("() RETURNS int AS {body} LANGUAGE sql");
-            assert_eq!(crate::emit::support_operand(&definition), None, "{body}");
+            assert_eq!(crate::emit::support_option(&definition), None, "{body}");
             let definition = format!("{definition} SUPPORT planner_support");
-            let operand = crate::emit::support_operand(&definition).unwrap();
+            let option = crate::emit::support_option(&definition).unwrap();
+            assert_eq!(&definition[option.keyword], "SUPPORT");
+            let operand = option.operand;
             assert_eq!(&definition[operand], "planner_support", "{body}");
         }
     }

@@ -9131,6 +9131,302 @@ async fn a_support_operand_rebinds_to_an_arriving_routine_without_call_parenthes
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn support_option_keywords_do_not_rebuild_for_view_arrivals() {
+    let mut db = TestDb::create("support_keyword230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE FUNCTION shared.planner_support(internal) RETURNS internal LANGUAGE internal AS 'textlike_support'").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let mut a = Schema::default();
+    let target: pbps_model::ModuleId = "app.f(text,text)".parse().unwrap();
+    a.modules.insert(target.clone(), module(pbps_model::ModuleKind::Function, "(text,text) RETURNS boolean LANGUAGE internal AS 'textlike' SUPPORT /* option operand */ planner_support"));
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("CREATE VIEW app.external AS SELECT app.f('seven','sev%')::text AS value")
+        .await
+        .unwrap();
+    in_a_transaction(&mut db.conn).await;
+    let dependents =
+        pbps_pg::modules::dependents(&mut db.conn, &target, pbps_model::ModuleKind::Function)
+            .await
+            .unwrap();
+    rollback(&mut db.conn).await;
+    assert!(pbps_pg::modules::unmanaged_refusal(&target, &dependents, &a).is_some());
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.support".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS id"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    assert_eq!(
+        text(&mut db.conn, "SELECT value FROM app.external").await,
+        "true"
+    );
+    assert_eq!(number(&mut db.conn, "SELECT (prosupport = 'shared.planner_support(internal)'::regprocedure)::int FROM pg_proc WHERE oid='app.f(text,text)'::regprocedure").await, 1);
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
+    let mut db = TestDb::create("pseudo_names230").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let pg = Postgres::new();
+    let mut definitions = vec![
+        ("coalesce", "SELECT coalesce(NULL::int, 7)::text AS value"),
+        ("nullif", "SELECT nullif(7, 0)::text AS value"),
+        ("greatest", "SELECT greatest(7, 0)::text AS value"),
+        ("least", "SELECT least(7, 9)::text AS value"),
+        (
+            "extract",
+            "SELECT extract(year FROM DATE '2007-01-01')::text AS value",
+        ),
+        ("normalize", "SELECT normalize('7', NFC)::text AS value"),
+        ("position", "SELECT position('7' IN '7')::text AS value"),
+        ("trim", "SELECT trim(BOTH ' ' FROM ' 7 ')::text AS value"),
+        (
+            "substring",
+            "SELECT substring('17' FROM 2 FOR 1)::text AS value",
+        ),
+        (
+            "overlay",
+            "SELECT overlay('0' PLACING '7' FROM 1)::text AS value",
+        ),
+        (
+            "xmlconcat",
+            "SELECT xmlconcat('<r>7</r>'::xml)::text AS value",
+        ),
+        ("xmlelement", "SELECT xmlelement(NAME r, 7)::text AS value"),
+        (
+            "xmlattributes",
+            "SELECT xmlelement(NAME r, xmlattributes(7 AS value))::text AS value",
+        ),
+        ("xmlforest", "SELECT xmlforest(7 AS r)::text AS value"),
+        (
+            "xmlparse",
+            "SELECT xmlparse(DOCUMENT '<r>7</r>')::text AS value",
+        ),
+        ("xmlpi", "SELECT xmlpi(NAME r, '7')::text AS value"),
+        (
+            "xmlroot",
+            "SELECT xmlroot('<r>7</r>'::xml, VERSION '1.0')::text AS value",
+        ),
+        (
+            "xmlserialize",
+            "SELECT xmlserialize(DOCUMENT '<r>7</r>'::xml AS text) AS value",
+        ),
+        (
+            "xmlexists",
+            "SELECT xmlexists('/r' PASSING ('<r>7</r>'::xml))::text AS value",
+        ),
+        (
+            "xmltable",
+            "SELECT value::text FROM xmltable('/r' PASSING '<r>7</r>' COLUMNS value int PATH '.')",
+        ),
+        (
+            "xmlnamespaces",
+            "SELECT value::text FROM xmltable(xmlnamespaces('urn:r' AS x), '/x:r' PASSING '<r xmlns=\"urn:r\">7</r>' COLUMNS value int PATH '.')",
+        ),
+        ("json", "SELECT json('{\"r\":7}')::text AS value"),
+        ("json_array", "SELECT json_array(7)::text AS value"),
+        (
+            "json_object",
+            "SELECT json_object('r' VALUE 7)::text AS value",
+        ),
+        (
+            "json_arrayagg",
+            "SELECT json_arrayagg(value)::text AS value FROM (VALUES (7)) source(value)",
+        ),
+        (
+            "json_objectagg",
+            "SELECT json_objectagg('r' VALUE value)::text AS value FROM (VALUES (7)) source(value)",
+        ),
+        (
+            "grouping",
+            "SELECT grouping(value)::text AS value FROM (VALUES (7)) source(value) GROUP BY GROUPING SETS ((value))",
+        ),
+    ];
+    let server = number(
+        &mut db.conn,
+        "SELECT current_setting('server_version_num')::int",
+    )
+    .await;
+    if server >= 170000 {
+        definitions.extend([
+            ("json_scalar", "SELECT json_scalar(7)::text AS value"),
+            ("json_serialize", "SELECT json_serialize('{\"r\":7}')::text AS value"),
+            ("json_query", "SELECT json_query('{\"r\":[7]}', '$.r')::text AS value"),
+            ("json_exists", "SELECT json_exists('{\"r\":7}', '$.r')::text AS value"),
+            ("json_value", "SELECT json_value('{\"r\":7}', '$.r')::text AS value"),
+            ("json_table", "SELECT value::text FROM json_table('{\"r\":7}', '$' COLUMNS(value int PATH '$.r')) source"),
+        ]);
+    }
+    let mut a = Schema::default();
+    for (i, (_, definition)) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    let mut before = Vec::new();
+    for i in 0..definitions.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT value FROM app.v{i}"
+            ))
+            .await
+            .unwrap();
+        before.push(text(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await);
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    for (name, _) in &definitions {
+        b.modules.insert(
+            format!("app.{name}(integer)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for (i, value) in before.iter().enumerate() {
+        assert_eq!(
+            &text(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            value
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), definitions.len(), "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn sql_expression_keywords_keep_quoted_and_ordinary_calls() {
+    let mut db = TestDb::create("pseudo_calls230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared")
+        .await
+        .unwrap();
+    let names = [
+        "coalesce",
+        "nullif",
+        "greatest",
+        "least",
+        "substring",
+        "overlay",
+    ];
+    for name in names {
+        db.conn
+            .execute(&format!(
+                "CREATE FUNCTION shared.\"{name}\"(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'"
+            ))
+            .await
+            .unwrap();
+    }
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let mut a = Schema::default();
+    let definitions = [
+        "SELECT coalesce(\"coalesce\"(1), 0) AS value",
+        "SELECT nullif(\"nullif\"(1), 0) AS value",
+        "SELECT greatest(\"greatest\"(1), 0) AS value",
+        "SELECT least(\"least\"(1), 99) AS value",
+        "SELECT substring(1) AS value",
+        "SELECT overlay(1) AS value",
+        "SELECT substring(substring(1)::text FROM 1)::int AS value",
+        "SELECT overlay(overlay(1)::text PLACING '' FROM 1 FOR 0)::int AS value",
+    ];
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            7
+        );
+    }
+    let mut b = a.clone();
+    for name in names {
+        b.modules.insert(
+            format!("app.{name}(integer)").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(
+        arrival.changes.len(),
+        names.len() + definitions.len(),
+        "{arrival:#?}"
+    );
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            7
+        );
+    }
+    let mut rebuilds = arrival;
+    rebuilds
+        .changes
+        .retain(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &rebuilds).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_out_parameter_named_support_rebinds_its_row_type_for_a_view_arrival() {
     let mut db = TestDb::create("support_parameter230").await;
     db.conn
