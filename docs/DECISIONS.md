@@ -12177,6 +12177,12 @@ SPEC is in sync with all of these.
      ALTER variants with unmanaged dependents require only the routine arrival.
      Companion default, generated-column and conversion expressions keep their
      real calls, rebuild and switch from the shared routine to the arriving one.
+     A CREATE TABLE target immediately before its declaration group also stays
+     outside call matching. The scan-only separator used for index targets keeps
+     the table target and every column/default/constraint expression visible.
+     Live temporary, conditional, ordinary, unlogged and CREATE AS forms retain
+     unmanaged dependents without false routine-arrival rebuilds; a genuine
+     default call inside the table declaration still rebuilds and switches.
      CREATE DOMAIN base types and CREATE/ALTER TYPE composite attributes use
      those same prefixes, including optional AS and ADD/ALTER ATTRIBUTE forms.
      Domain defaults and checks remain expressions. Live domain and composite

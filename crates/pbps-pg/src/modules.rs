@@ -2286,8 +2286,12 @@ fn index_reference_spans(tokens: &[RebindToken<'_>]) -> (Vec<std::ops::Range<usi
 /// DDL column types have the same modifier syntax as routine declarations.
 /// Locate only their type prefix: defaults, constraints, generated expressions
 /// and ALTER's USING expression may call routines and must remain visible.
-fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range<usize>> {
+fn ddl_reference_spans(
+    code: &str,
+    tokens: &[RebindToken<'_>],
+) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
     let mut spans = Vec::new();
+    let mut separators = Vec::new();
     let mut mark_type = |at: usize| {
         if let Some(token) = tokens.get(at)
             && let Some(prefix) = crate::emit::type_prefix(&code[token.offset..])
@@ -2373,6 +2377,11 @@ fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range
                 item += 1;
             }
             if let Some(after) = after_group(tokens, item) {
+                if !composite {
+                    // CREATE TABLE's target precedes declarations, not call
+                    // arguments. Keep all defaults/constraints in that group.
+                    separators.push(tokens[item].offset);
+                }
                 let close = after - 1;
                 item += 1;
                 while item < close {
@@ -2430,7 +2439,7 @@ fn ddl_type_spans(code: &str, tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range
         }
         at += 1;
     }
-    spans
+    (spans, separators)
 }
 
 /// CTE and relation alias column lists declare names; they cannot call an
@@ -2476,10 +2485,13 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     }
     let mut declarations = Vec::new();
     let mut referenced_columns = Vec::new();
+    let mut target_separators = Vec::new();
     if routine {
         let (locals, cursors) = procedural_type_spans(&tokens);
         type_spans.extend(locals);
-        type_spans.extend(ddl_type_spans(&code, &tokens));
+        let (ddl_types, separators) = ddl_reference_spans(&code, &tokens);
+        type_spans.extend(ddl_types);
+        target_separators.extend(separators);
         declarations.extend(cursors);
     }
     // Parenthesis/bracket scopes keep commas in arguments, subqueries and
@@ -2645,6 +2657,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     } else {
         (Vec::new(), Vec::new())
     };
+    target_separators.extend(index_separators);
     let ranges: Vec<_> = declarations
         .into_iter()
         .map(|i| {
@@ -2664,7 +2677,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
     for range in ranges {
         code.replace_range(range.clone(), &" ".repeat(range.len()));
     }
-    for at in index_separators {
+    for at in target_separators {
         // A space would still attach the target to an expression's opening
         // parenthesis in ON target((call())). This text is scanned, not emitted.
         code.replace_range(at..at + 1, ",");
@@ -3759,6 +3772,59 @@ mod tests {
             "ALTER TABLE child ADD FOREIGN KEY(id) REFERENCES orders(id), ADD CHECK (orders(id) > 0)",
             "CREATE TABLE child(id int REFERENCES orders(id)); PERFORM orders(7)",
             "SELECT \"references\", orders(7)",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_targets_are_not_calls_but_their_expressions_remain_code() {
+        for statement in [
+            "CREATE TEMP TABLE IF NOT EXISTS orders(id int)",
+            "CREATE TEMPORARY TABLE \"orders\" (id int)",
+            "CREATE UNLOGGED TABLE app.orders(id int)",
+            "CREATE FOREIGN TABLE orders(id int) SERVER remote",
+            "CREATE TABLE orders(id) AS SELECT 7",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            for (arrival, count) in [("app.orders(integer)", 0), ("app.orders", 1)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+        for statement in [
+            "CREATE TABLE orders(id int DEFAULT orders(7))",
+            "CREATE TABLE orders(id int CHECK (orders(id) > 0))",
+            "CREATE TABLE orders(id int, CHECK (orders(id) > 0))",
+            "CREATE TABLE orders(id) AS SELECT orders(7)",
+            "CREATE TABLE orders(id int GENERATED ALWAYS AS (orders(7)) STORED)",
+            "CREATE TABLE orders(id int); PERFORM orders(7)",
         ] {
             let mut declared = Schema::default();
             declared.modules.insert(
