@@ -1972,10 +1972,13 @@ fn after_group(tokens: &[RebindToken<'_>], at: usize) -> Option<usize> {
         .map(|i| i + 1)
 }
 
-/// Return an optional alias and its column-list group after one FROM item.
+/// Return the independently optional alias and column list after a FROM item.
 /// Record column definitions can also follow AS with no alias at all.
 /// Argument and body groups remain available for the ordinary call scan.
-fn relation_columns(tokens: &[RebindToken<'_>], mut at: usize) -> Option<(Option<usize>, usize)> {
+fn relation_columns(
+    tokens: &[RebindToken<'_>],
+    mut at: usize,
+) -> Option<(Option<usize>, Option<usize>)> {
     if token_is(tokens, at, "lateral") {
         at += 1;
     }
@@ -2003,10 +2006,13 @@ fn relation_columns(tokens: &[RebindToken<'_>], mut at: usize) -> Option<(Option
     if token_is(tokens, at, "as") {
         at += 1;
         if after_group(tokens, at).is_some() {
-            return Some((None, at));
+            return Some((None, Some(at)));
         }
     }
-    (tokens.get(at)?.name() && after_group(tokens, at + 1).is_some()).then_some((Some(at), at + 1))
+    tokens
+        .get(at)?
+        .name()
+        .then_some((Some(at), after_group(tokens, at + 1).map(|_| at + 1)))
 }
 
 /// Column names are declarations, while an optional following type can still
@@ -2044,7 +2050,9 @@ fn relation_column_declarations(
 ) {
     if let Some((alias, open)) = relation_columns(tokens, at) {
         declarations.extend(alias);
-        column_declarations(tokens, open, declarations, type_spans);
+        if let Some(open) = open {
+            column_declarations(tokens, open, declarations, type_spans);
+        }
     }
 }
 
@@ -5540,6 +5548,74 @@ mod tests {
                 rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
                 1,
                 "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_alias_declarations_keep_real_and_later_references_visible() {
+        for (definition, arrival, count) in [
+            ("SELECT 7 FROM shared.source AS orders", "app.orders", 0),
+            ("SELECT 7 FROM shared.source orders", "app.orders", 0),
+            ("SELECT 7 FROM shared.source \"orders\"", "app.orders", 0),
+            ("SELECT 7 FROM (SELECT 7) orders", "app.orders", 0),
+            ("SELECT 7 FROM shared.rows_fn() orders", "app.orders", 0),
+            (
+                "SELECT 7 FROM ROWS FROM(shared.rows_fn()) orders",
+                "app.orders",
+                0,
+            ),
+            (
+                "SELECT 7 FROM shared.rows_fn() WITH ORDINALITY orders",
+                "app.orders",
+                0,
+            ),
+            ("SELECT 7 FROM ONLY(shared.source) orders", "app.orders", 0),
+            (
+                "SELECT 7 FROM shared.source seed JOIN shared.source orders ON true",
+                "app.orders",
+                0,
+            ),
+            (
+                "SELECT orders(7) FROM shared.source orders",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "SELECT 7 FROM shared.echo(orders(7)) orders",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "SELECT id FROM shared.source orders WHERE id=orders(7)",
+                "app.orders(integer)",
+                1,
+            ),
+            ("SELECT 7 FROM orders AS orders", "app.orders", 1),
+            (
+                "SELECT 7 FROM shared.source orders CROSS JOIN orders actual",
+                "app.orders",
+                1,
+            ),
+            (
+                "SELECT 7 FROM shared.source AS orders WHERE orders IS NOT NULL",
+                "app.orders",
+                1,
+            ),
+            (
+                "SELECT 7 FROM shared.rows_fn() AS (value orders)",
+                "app.orders",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            let mut view = module(definition);
+            view.kind = ModuleKind::View;
+            declared.modules.insert(id("app.v"), view);
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{definition}: {arrival}"
             );
         }
     }

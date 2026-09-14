@@ -9905,6 +9905,149 @@ async fn procedural_into_destinations_do_not_rebuild_for_view_arrivals() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn bare_relation_aliases_do_not_rebuild_for_view_arrivals() {
+    let mut db = TestDb::create("bare_alias_names230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.source(id int); INSERT INTO shared.source VALUES(7); CREATE FUNCTION shared.rows_fn() RETURNS SETOF int LANGUAGE sql AS 'SELECT 7'").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source AS orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM (SELECT 7 AS id) AS orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM (VALUES(7)) orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.rows_fn() AS orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.rows_fn() orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM ROWS FROM(shared.rows_fn()) orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.rows_fn() WITH ORDINALITY orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM ONLY(shared.source) orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source * orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source seed JOIN shared.source orders ON true",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source seed, shared.source orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source seed CROSS JOIN LATERAL (SELECT 7) orders",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source AS \"orders\"",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source AS U&\"or!0064ers\" UESCAPE '!'",
+        ),
+        (
+            pbps_model::ModuleKind::View,
+            "SELECT 7 AS value FROM shared.source orders TABLESAMPLE SYSTEM(100)",
+        ),
+        (
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 7 FROM shared.source AS orders; END",
+        ),
+        (
+            pbps_model::ModuleKind::Function,
+            "() RETURNS int LANGUAGE plpgsql AS $$DECLARE result int; BEGIN SELECT 7 INTO result FROM shared.source orders; RETURN result; END$$",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (i, (kind, definition)) in definitions.iter().enumerate() {
+        let suffix = if *kind == pbps_model::ModuleKind::View {
+            ""
+        } else {
+            "()"
+        };
+        a.modules.insert(
+            format!("app.f{i}{suffix}").parse().unwrap(),
+            module(*kind, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for (i, (kind, _)) in definitions.iter().enumerate() {
+        let query = if *kind == pbps_model::ModuleKind::View {
+            format!("SELECT value FROM app.f{i}")
+        } else {
+            format!("SELECT app.f{i}() AS value")
+        };
+        db.conn
+            .execute(&format!("CREATE VIEW app.external{i} AS {query}"))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn collate_operands_do_not_rebuild_for_view_arrivals() {
     let mut db = TestDb::create("collate_names230").await;
     db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE COLLATION shared.orders FROM pg_catalog.\"C\"").await.unwrap();
@@ -12348,6 +12491,88 @@ async fn cte_and_relation_alias_column_lists_cannot_capture_an_arriving_routine(
     }
     db.drop().await;
     assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn bare_relation_aliases_keep_real_calls_and_relation_mentions() {
+    let mut db = TestDb::create("bare_alias_calls230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.source(id int); INSERT INTO shared.source VALUES(7); CREATE TABLE shared.choices(id int); INSERT INTO shared.choices VALUES(7),(42); CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'; CREATE FUNCTION shared.echo(n integer) RETURNS TABLE(value int) LANGUAGE sql AS 'SELECT n'; CREATE VIEW shared.orders AS SELECT 7 AS id").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        "SELECT orders(id) AS value FROM shared.source AS orders",
+        "SELECT value FROM shared.echo(orders(7)) orders",
+        "SELECT id AS value FROM shared.choices orders WHERE id=orders(7)",
+        "SELECT id AS value FROM orders AS orders",
+        "SELECT (SELECT id FROM orders) AS value FROM shared.source orders",
+        "SELECT src.id AS value FROM shared.source orders CROSS JOIN orders src",
+    ];
+    let mut a = Schema::default();
+    for (i, definition) in definitions.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            7
+        );
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    b.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS id"),
+    );
+    for (name, indices) in [
+        ("app.orders(integer)", vec![0, 1, 2]),
+        ("app.orders", vec![3, 4, 5]),
+    ] {
+        let arrival_id: pbps_model::ModuleId = name.parse().unwrap();
+        let mut one = a.clone();
+        one.modules
+            .insert(arrival_id.clone(), b.modules[&arrival_id].clone());
+        let one_arrival = plan(&a, &ids, &one, &ids);
+        assert_eq!(
+            one_arrival.changes.len(),
+            indices.len() + 1,
+            "{one_arrival:#?}"
+        );
+        for i in indices {
+            let caller: pbps_model::ModuleId = format!("app.v{i}").parse().unwrap();
+            assert!(
+                one_arrival.changes.iter().any(
+                    |p| matches!(&p.change,pbps_model::Change::AlterModule{id,..} if id==&caller)
+                ),
+                "{one_arrival:#?}"
+            );
+        }
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 2, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.v{i}")).await,
+            42
+        );
+    }
+    db.drop().await;
 }
 
 #[tokio::test]

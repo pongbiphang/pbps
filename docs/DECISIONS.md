@@ -12403,6 +12403,16 @@ SPEC is in sync with all of these.
      PL/pgSQL and view definitions keep dependents after a same-named view
      arrives; genuine surrounding routine calls and relations still rebuild.
 
+     A relation alias declares a local name even without a column list.
+     Locate the alias and optional column group independently for FROM/JOIN
+     items, including derived relations, functions, ROWS FROM, ordinality,
+     inheritance and LATERAL forms. Only the declaration is excluded; later
+     mentions and real relation/call operands stay visible. Live aliases keep
+     unmanaged dependents after a same-named view arrives, while separate
+     arrival plans select actual calls and source relations whose bindings
+     change after the typed rebuild. Record column definitions without an
+     alias still retain their type references.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.
