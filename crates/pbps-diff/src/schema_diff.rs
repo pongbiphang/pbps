@@ -768,14 +768,145 @@ pub fn diff_partial(
             | Change::Revoke { .. } => false,
         }
     };
+    // The tables a `RenameColumn` in this plan claims a column name on. Both
+    // this and the drops below carry `declared_table_name` (`diff_columns`),
+    // so the two spellings meet.
+    //
+    // The *table*, and not the name, because the name is a question this
+    // cannot answer. On SQL Server what makes two spellings one column name is
+    // the database's collation, which a plan computed offline does not have
+    // (SPEC 7.3) — and `Mssql::fold_ident` returns the identity for exactly
+    // that reason. **Measured** on the pinned image, each in a database of the
+    // named collation:
+    //
+    //     SQL_Latin1_General_CP1_CI_AS   note  vs Note  ->  one name, Msg 15335
+    //     SQL_Latin1_General_CP1_CI_AI   café  vs cafe  ->  one name, Msg 15335
+    //     Latin1_General_CS_AS           note  vs Note  ->  two names, both kept
+    //
+    // Case, then accents; width and kana sensitivity are two more flags on the
+    // same collation name, and a binary collation is another answer again.
+    // Folding the name here would be guessing at which of those the target
+    // database chose, and each guess that comes up short refuses a valid plan
+    // at the engine — the defect this is here to fix, one collation further
+    // out. So the question asked is the one that is true under every
+    // collation: a rename can only collide with a column of its own table.
+    //
+    // The cost is that a drop of a column nothing claims moves too, and
+    // nothing between its old class and its new one can notice: a `Revoke`
+    // names no column, and a column this plan drops is never a rename's
+    // source, since the two come from different uids and no two baseline
+    // columns share a name.
+    let tables_claiming_a_column_name: BTreeSet<TableName> = planned
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameColumn { table, .. } => Some(table.clone()),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        })
+        .collect();
+    // Whether this drop can be what frees a name a `RenameColumn` above is
+    // waiting for. A column drop and nothing else: no other change gives up a
+    // column name.
+    let frees_a_renamed_column = |c: &Change| -> bool {
+        match c {
+            Change::DropColumn { column, .. } => {
+                tables_claiming_a_column_name.contains(&column.table)
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => false,
+        }
+    };
+    // The class, and a rank inside it, so a change can sit between two
+    // classes without a new ordinal shifting every one below it — the cost
+    // `order_key`'s own doc names.
+    let sort_class = |c: &Change| -> (u8, u8) {
+        if moves_ahead_of_the_rename(c) {
+            // Ahead of the table rename whose name it frees, and ahead of
+            // everything else that class holds.
+            (1, 0)
+        } else if frees_a_renamed_column(c) {
+            // Between the constraint and index drops of class 2 — a column a
+            // check or an index names cannot be dropped while they stand —
+            // and the `RenameColumn` of class 3 that is waiting for its name.
+            //
+            // Measured on the pinned images, this is the difference between a
+            // reviewed plan and one the engine refuses: SQL Server answers
+            // `sp_rename` with `Msg 15335, The new name 'note' is already in
+            // use as a COLUMN name and would cause a duplicate that is not
+            // permitted`, PostgreSQL with `column "note" of relation "s"
+            // already exists` (DECISIONS 474, issue #398).
+            //
+            // Only the drop that frees a claimed name moves. A rename into a
+            // name nothing here gives up is refused by `resolve` as an
+            // occupied target and never reaches this sort, which is the
+            // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
+            // holds.
+            (2, 2)
+        } else {
+            (order_key(c), 1)
+        }
+    };
     planned.sort_by_key(|p| {
+        let (class, within) = sort_class(&p.change);
         (
-            if moves_ahead_of_the_rename(&p.change) {
-                1
-            } else {
-                order_key(&p.change)
-            },
-            u8::from(!moves_ahead_of_the_rename(&p.change)),
+            class,
+            within,
             dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank),
             p.change.subject(),
             format!("{:?}", p.change),
@@ -3682,6 +3813,272 @@ mod tests {
         );
     }
 
+    /// The same two revisions, and the order the engine needs.
+    ///
+    /// `order_key` puts `RenameColumn` at 3 and `DropColumn` at 5, so the plan
+    /// reached the engine with the rename first — into a name the doomed
+    /// column still held. **Measured** on the pinned images: SQL Server 2025
+    /// answers `sp_rename` with `Msg 15335, The new name 'note' is already in
+    /// use as a COLUMN name and would cause a duplicate that is not
+    /// permitted`, and PostgreSQL 18.6 answers `ALTER TABLE s RENAME COLUMN
+    /// label TO note` with `column "note" of relation "s" already exists`.
+    /// Both take the two statements in the other order.
+    ///
+    /// The drop that frees the name moves, and only that one: a rename into a
+    /// name nothing in this plan gives up is still refused outright rather
+    /// than implicitly dropped, which is
+    /// `a_single_revision_cannot_rename_into_an_occupied_baseline_name`.
+    #[test]
+    fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "note".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
+        };
+        let drop_at =
+            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note"));
+        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to == "note"));
+        assert!(
+            drop_at < rename_at,
+            "the drop must free the name first: {:?}",
+            kinds(&cs)
+        );
+    }
+
+    /// And where the two names are one name only to the database.
+    ///
+    /// `fold_ident` is the dialect's answer to "are these one name", and on
+    /// SQL Server it is the identity — because the answer there belongs to the
+    /// *database's* collation, which a plan computed offline does not have.
+    /// **Measured** on the pinned image, each in a database of the named
+    /// collation:
+    ///
+    /// ```text
+    /// SQL_Latin1_General_CP1_CI_AS   note vs Note  ->  one name, Msg 15335
+    /// SQL_Latin1_General_CP1_CI_AI   café vs cafe  ->  one name, Msg 15335
+    /// Latin1_General_CS_AS           note vs Note  ->  two names, both kept
+    /// ```
+    ///
+    /// Case here; the accent case is the same fixture with the same answer,
+    /// and width and kana sensitivity are two more flags on the same collation
+    /// name. The ordering does not fold at all — see
+    /// `every_column_drop_on_a_renamed_columns_table_runs_first` for the rule
+    /// that makes all of them one case.
+    #[test]
+    fn a_dropped_columns_name_is_free_before_a_rename_that_differs_only_by_case() {
+        let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+        base_table
+            .columns
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
+        base_table
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("old"))
+            .unwrap()
+            .0
+            .insert("note".into(), Value::Text("dropped".into()));
+        let base = schema_of("dbo.s", base_table);
+        let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let mut declared_table = lookup(DataMode::Exact, &[]);
+        let label = declared_table.columns.shift_remove("label").unwrap();
+        declared_table.columns.insert("Note".into(), label);
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "Note".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
+        };
+        let drop_at =
+            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note"));
+        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to == "Note"));
+        assert!(
+            drop_at < rename_at,
+            "the engine reads one name where the model reads two: {:?}",
+            kinds(&cs)
+        );
+    }
+
+    /// The rule the two cases above are instances of, stated where it can be
+    /// broken: on a table this plan renames a column of, **every** column drop
+    /// runs first — including one whose name nothing claims.
+    ///
+    /// Narrowing it to a name comparison is what the two cases above each
+    /// refuted in turn, one collation further out every time. Which spellings
+    /// are one column name is the target database's to say, and a plan is
+    /// computed offline (SPEC 7.3), so the only question that is true under
+    /// every collation is "same table". The over-match is free: nothing
+    /// between the drop's old class and its new one can notice, because a
+    /// `Revoke` names no column and a column this plan drops is never a
+    /// rename's source.
+    #[test]
+    fn every_column_drop_on_a_renamed_columns_table_runs_first() {
+        let base = schema_of(
+            "dbo.t",
+            table(&[
+                ("old", Column::new(ty("int"))),
+                ("unrelated", Column::new(ty("int"))),
+            ]),
+        );
+        let declared = schema_of("dbo.t", table(&[("new", Column::new(ty("int")))]));
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameColumn {
+                    table: "dbo.t".parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                Intent::DropColumn {
+                    column: "dbo.t.unrelated".parse().unwrap(),
+                    reason: "no longer in use".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropColumn", "RenameColumn"],
+            "`unrelated` claims nothing `new` wants, and still goes first: {cs:?}"
+        );
+
+        // And a drop on *another* table stays where it was: the rename can
+        // collide with a column of its own table and no other.
+        let mut base = base;
+        base.tables.insert(
+            "dbo.other".parse().unwrap(),
+            table(&[("gone", Column::new(ty("int")))]),
+        );
+        let mut declared = declared;
+        declared
+            .tables
+            .insert("dbo.other".parse().unwrap(), table(&[]));
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameColumn {
+                    table: "dbo.t".parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                Intent::DropColumn {
+                    column: "dbo.t.unrelated".parse().unwrap(),
+                    reason: "no longer in use".into(),
+                },
+                Intent::DropColumn {
+                    column: "dbo.other.gone".parse().unwrap(),
+                    reason: "no longer in use".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropColumn", "RenameColumn", "DropColumn"],
+            "only the renamed table's own drops move: {cs:?}"
+        );
+    }
+
     #[test]
     fn a_single_revision_cannot_rename_into_an_occupied_baseline_name() {
         let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
@@ -5645,11 +6042,12 @@ mod tests {
 
         assert_eq!(
             kinds(&cs),
-            ["DropIndex", "RenameColumn", "DropColumn"],
-            "an index must be dropped before the column it references, and the \
-             whole drop class now runs before the column renames — this index \
-             blocks neither, which is the point: the ordering is uniform, not \
-             conditional on what a constraint happens to name"
+            ["DropIndex", "DropColumn", "RenameColumn"],
+            "an index must be dropped before the column it references, and a \
+             column drop before the rename of a column of its own table — \
+             `doomed` claims nothing `new` wants here, and moves anyway, \
+             because which spellings are one name is the target database's \
+             collation to say and not this plan's (DECISIONS 474)"
         );
     }
 

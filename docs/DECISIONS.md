@@ -11853,3 +11853,119 @@ SPEC is in sync with all of these.
      makes verify report drift and baseline refuse to erase the distinction;
      restoring ordinary mode makes the original record verify clean again.
      ADR-0009's rebuild guard still checks carried enable state under its lock.
+474. **The column drop that frees a name sorts before the rename that claims
+     it.** A deploy can skip a revision: `note` dropped in one, `label` renamed
+     into the name it gave up in the next, and the plan is the difference
+     between the deployed baseline and the last of them. `resolve` accepts both
+     revisions and the differ accepts the diff — correctly, because the
+     occupant is going — and then `order_key` handed the engine the rename
+     first, at class 3, with the drop behind it at class 5. **Measured** on
+     both pinned images, with the doomed column still in place:
+
+     ```text
+     EXEC sp_rename N'[dbo].[s].[label]', N'note', 'COLUMN'
+       ->  Msg 15335: The new name 'note' is already in use as a COLUMN name
+           and would cause a duplicate that is not permitted
+     ALTER TABLE s RENAME COLUMN label TO note
+       ->  ERROR: column "note" of relation "s" already exists
+     ```
+
+     Both take the two statements in the other order. So this was a valid,
+     reviewed plan neither engine would perform, with no declaration the user
+     could write to fix it — the shape 174 records for a check constraint
+     blocking `sp_rename`, one namespace down.
+
+     **The drop moves, not the class.** `order_key`'s own doc says why a new
+     ordinal is expensive: the numbers are quoted in prose that justifies
+     behaviour, and inserting one means renumbering all of it in the same
+     commit. The sort key carries a rank *inside* the class instead, so the
+     freeing drop sits between class 2 and class 3 without moving anything
+     else: after the constraint and index drops, because a column a check or
+     an index names cannot be dropped while they stand, and before the rename
+     that is waiting for its name. The existing reorder of a freeing index
+     drop ahead of a table rename (176, 467) becomes the first rank of class 1
+     under the same scheme, unchanged in effect.
+
+     **The drops that move are a table's, not a name's**, and two review
+     rounds are why. The first version asked `Dialect::fold_ident` whether the
+     dropped name was the one the rename claims. On SQL Server that is the
+     identity function, and correctly so: what makes two spellings one column
+     name there is the *database's* collation, which a plan computed offline
+     does not have (SPEC 7.3). **Measured** on the pinned image, each in a
+     database of the named collation:
+
+     ```text
+     SQL_Latin1_General_CP1_CI_AS   note vs Note  ->  one name, Msg 15335
+     SQL_Latin1_General_CP1_CI_AI   café vs cafe  ->  one name, Msg 15335
+     Latin1_General_CS_AS           note vs Note  ->  two names, both kept
+     ```
+
+     Lowercasing on top of the fold answered the first line and the review
+     produced the second; width and kana sensitivity are two more flags on the
+     same collation name, and a binary collation is another answer again. Each
+     fold that comes up short refuses a valid plan at the engine, which is the
+     defect this entry exists to fix, one collation further out. So the
+     question asked is the one that is true under every collation: **a rename
+     can only collide with a column of its own table**, so on a table this plan
+     renames a column of, every column drop runs first.
+
+     The over-match is free, which is what makes the wide answer the right one
+     rather than the lazy one. Nothing between the drop's old class and its new
+     one can notice it: a `Revoke` names no column, and a column this plan
+     drops is never a rename's source, since the two come from different uids
+     and no two baseline columns share a name. A drop on another table does not
+     move at all. A rename into a
+     name nothing in the plan gives up never reaches this sort at all —
+     `resolve` refuses it as an occupied target, which is what keeps the
+     reorder from reading as an implicit drop.
+
+     **And the closing guard has to know the name belongs to two columns.**
+     Found in review, and it is the other half of the same fact: with the
+     ordering fixed the engine performs the plan, and then
+     `refuse_unplanned_movement` refused it. That comparison is keyed by name;
+     the baseline holds both spellings, so the rename rewind is skipped (the
+     ambiguity rule of 189), and the entry the baseline has under `note` is the
+     doomed column while the entry the read-back has is the survivor. Comparing
+     them reads the rename as a retype of a column nobody touched — invisible
+     while the two happen to share a definition, and `note int` against `label
+     nvarchar(50)` is a difference `ColumnField::Whole` does not excuse. A
+     valid plan, refused at its own checkpoint after the engine had already
+     performed it. The `was` side now falls through to the rename's source
+     whenever this plan drops the occupant of the name, which is the branch
+     that already existed for the ordinary rename. The doomed column is not
+     left uncompared: its absence is what `columns_after` holds the plan to,
+     and in `order_key` order the rename's `Present` is the net promise about
+     the name (280) — which is the ordering above, once more, doing the work.
+
+     **And the fall-through only across the rename itself** — the earlier read
+     holding the source and the later one not. Two more review rounds, one for
+     each half, and both are the same mistake: a fix for a false refusal that
+     opens a false acceptance is the worse trade, and neither half was visible
+     from the read the fix was written for.
+
+     Without the first half, a staged run's closing check — which compares two
+     checkpoints, by then both holding the survivor and neither holding the
+     source — fell through to nothing, and the rename's own `Whole` excused the
+     resulting `None` as a one-sided column. A concurrent retype between the
+     last checkpoint and the closing read would have been recorded as this
+     plan's result. Without the second, a checkpoint spanning the *drop* alone
+     did the same when another session put the name back before the read: the
+     source is still there, so the rename has not run, and what stands under
+     the claimed name is a replacement rather than the survivor. SPEC 7.6
+     promises to catch both.
+
+     **The sweep this closes, and the one it does not.** Every other pair
+     where one change gives up a name another claims already ran in the right
+     order: a column drop before an add (5 before 8), an index or constraint
+     drop before its re-add (2 before 13), a role drop before a role rename (0
+     before 1), a module drop before a module create (0 before 14), a table
+     drop before a table create (6 before 7). One pair is wrong the same way
+     and is **not** fixed here: `DropTable` at 6 against `RenameTable` at 1,
+     where a table dropped in one revision gives its name to a table renamed
+     in the next. Measured, both engines refuse that too (`Msg 15335`,
+     `42P07`), but the drop cannot take the same trip: it has to run after the
+     `DropForeignKey` of every child still referencing it, and those are class
+     2, already behind the rename — so freeing the name means moving the
+     foreign-key drops as well, which is the reordering 467 records as unsafe
+     while a pinned one is present. Filed as issue #536 rather than widened into
+     this one.

@@ -1468,6 +1468,10 @@ fn refuse_unplanned_movement(
     // another after, and the shape comparison follows it rather than
     // excusing both ends (DECISIONS 189).
     let mut renamed_columns: BTreeMap<(&TableName, &str), &str> = BTreeMap::new();
+    // And the columns it drops, because one name can belong to two of them
+    // across one plan: the occupant this plan removes and the column it
+    // renames into the name that leaves (DECISIONS 474).
+    let mut dropped_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
     // The permissions this plan moves, keyed by the role it moves them on and
     // the target they sit on. A role can be both granted and revoked on one
@@ -1527,6 +1531,12 @@ fn refuse_unplanned_movement(
         } = &p.change
         {
             renamed_columns.insert((table, to), from);
+        }
+        if let pbps_model::Change::DropColumn { column, .. } = &p.change {
+            dropped_columns
+                .entry(&column.table)
+                .or_default()
+                .insert(column.name.as_str());
         }
         if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
@@ -1919,7 +1929,45 @@ fn refuse_unplanned_movement(
                 // every later read of a staged run as well (DECISIONS 189).
                 // The old name itself is then the one-sided entry below.
                 let from = renamed_columns.get(&(now_name, column.as_str())).copied();
-                let was_c = was.columns.get(column).or_else(|| {
+                // One name, two columns. When this plan *drops* the column
+                // that held the name and renames another into it, the entry
+                // the baseline has under that name is the doomed one and the
+                // entry the read-back has is the survivor: comparing them
+                // reports the rename as a retype of a column nobody touched,
+                // and refuses a valid plan at its own checkpoint after the
+                // engine has already performed it (DECISIONS 474). The
+                // survivor's own baseline is under `from`, which is where the
+                // rename branch below already looks — so the name the plan
+                // gives up stops answering for the name it claims.
+                //
+                // The doomed column is not left uncompared: its absence is
+                // what `columns_after` holds this plan to, and the plan is in
+                // `order_key` order, so the rename's `Present` is the net
+                // promise about the name (DECISIONS 280).
+                //
+                // Only across the rename itself: the earlier read still has
+                // the source and the later one does not. That is the one
+                // arrangement in which the entry under this name really is the
+                // doomed column on one side and the survivor on the other.
+                //
+                // Both halves were a review finding of their own. Without the
+                // first, a staged run's closing read — compared against the
+                // checkpoint the last statement left, where neither side holds
+                // the source — fell through to nothing, and the rename's
+                // `Whole` excused the `None` as a one-sided column, so a
+                // concurrent retype between that checkpoint and the closing
+                // read passed. Without the second, a checkpoint spanning the
+                // *drop* alone did the same when another session put the name
+                // back before the read: the source is still there, the rename
+                // has not run, and what stands under the claimed name is a
+                // replacement rather than the survivor. Either way SPEC 7.6
+                // promises to catch it, so neither read may take this branch.
+                let given_up = from.is_some_and(|from| {
+                    was.columns.contains_key(from) && !now.columns.contains_key(from)
+                }) && dropped_columns
+                    .get(now_name)
+                    .is_some_and(|d| d.contains(column.as_str()));
+                let was_c = was.columns.get(column).filter(|_| !given_up).or_else(|| {
                     let from = from?;
                     if now.columns.contains_key(from) {
                         return None;
@@ -6564,6 +6612,121 @@ mod tests {
         )
         .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// A name that belongs to two columns across one plan: the one this plan
+    /// drops, and the one it renames into the name that leaves.
+    ///
+    /// The shape comparison is keyed by name, and the baseline holds both
+    /// spellings, so the rename rewind is skipped (the ambiguity rule above)
+    /// and `note` on the two sides was compared as one column — the dropped
+    /// occupant against the renamed survivor. Identical definitions hid it;
+    /// `note int` against `label nvarchar(50)` is a type difference no change
+    /// of this plan excuses, and a valid plan was refused at its own
+    /// checkpoint after the engine had already performed it (issue #398).
+    #[test]
+    fn a_column_renamed_into_a_dropped_columns_name_is_not_movement() {
+        let table = |columns: &[(&str, &str)]| {
+            let mut t = pbps_model::Table::default();
+            for (name, spec) in columns {
+                t.columns.insert(
+                    (*name).to_owned(),
+                    pbps_model::Column::new(spec.parse().unwrap()),
+                );
+            }
+            let mut s = Schema::default();
+            s.tables.insert("dbo.s".parse().unwrap(), t);
+            s
+        };
+        let named: TableName = "dbo.s".parse().unwrap();
+        // `order_key` order: the drop frees the name, then the rename claims
+        // it (DECISIONS 474).
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::DropColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: named.column("note"),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::RenameColumn {
+                    uid: "c_bbbbbb".parse().unwrap(),
+                    table: named.clone(),
+                    from: "label".to_owned(),
+                    to: "note".to_owned(),
+                }),
+            ],
+        };
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &table(&[
+                ("code", "varchar(20)"),
+                ("label", "nvarchar(50)"),
+                ("note", "int"),
+            ]),
+            &table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the dropped occupant and the renamed survivor are two columns");
+
+        // And the negative case: a column nothing in the plan touches, whose
+        // type moved under it, is still movement.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &table(&[
+                ("code", "varchar(20)"),
+                ("label", "nvarchar(50)"),
+                ("note", "int"),
+            ]),
+            &table(&[("code", "int"), ("note", "nvarchar(50)")]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a column the plan never names is answerable for itself");
+        assert!(format!("{e:#}").contains("`code`"), "{e:#}");
+
+        // A staged run's closing read: the checkpoint it is compared against
+        // is the one the last statement left, so both sides already hold the
+        // survivor under the claimed name and neither holds the source. The
+        // fallback must not fire there — with nothing to fall back to it
+        // returns `None`, the rename's `Whole` excuses the one-sided entry,
+        // and a concurrent retype between the last checkpoint and the closing
+        // read is recorded as this plan's own result (SPEC 7.6).
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]),
+            &table(&[("code", "varchar(20)"), ("note", "int")]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("once both reads hold the survivor, they are compared directly");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
+
+        // A checkpoint spanning the drop alone, with another session putting
+        // the name back before the read: the source is still there, so the
+        // rename has not run and what stands under the claimed name is not the
+        // survivor. Falling through there compared the baseline's doomed
+        // column with nothing at all and let the replacement past.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &changes,
+            &table(&[
+                ("code", "varchar(20)"),
+                ("label", "nvarchar(50)"),
+                ("note", "int"),
+            ]),
+            &table(&[
+                ("code", "varchar(20)"),
+                ("label", "nvarchar(50)"),
+                ("note", "bigint"),
+            ]),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("a name put back before the rename claims it is not the survivor");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
     }
 
     /// A touched table is exempt down to the columns and constraints the plan

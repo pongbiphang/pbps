@@ -757,6 +757,42 @@ plan as a list of promises — a collector that was correct under "one change,
 one promise" is a contradiction under two, and it fails *after* the statements
 have run, which is the most expensive place to find out (DECISIONS 280).
 
+## A precondition another change in the same plan is supposed to discharge
+
+`resolve` refuses a rename whose target name is still held by something that
+survives. When the occupant is being dropped in the same plan, that refusal
+correctly lifts — and nothing then made the drop run first. The rename went to
+the engine at `order_key` class 3 with the drop behind it at class 5, and both
+engines refused it: `Msg 15335` on SQL Server, `column "note" of relation "s"
+already exists` on PostgreSQL.
+
+The validator and the sorter were each right on their own. The validator's
+answer was "this is fine, because another change fixes it", which is an
+*ordering obligation*, and it was recorded nowhere the sorter could read.
+
+And a second shape came out of fixing it. The ordering first asked *which
+name* the drop frees, through the dialect's identifier fold. Review answered
+with a case-insensitive collation; a lowercase on top of the fold answered
+that, and review answered with an accent-insensitive one — both measured, both
+`Msg 15335`. Width and kana sensitivity are two more flags on the same
+collation name. **A guess about the target database, made offline, can only be
+refuted one round at a time**: the question "are these one name" belongs to a
+collation this tool does not have, so the ordering stopped asking it and asked
+the one that holds under every collation instead — a rename can only collide
+with a column of its own table. Reach for the closed question when the open one
+is somebody else's to answer, and check what the wide answer costs: here,
+nothing.
+
+The shape: **when a check passes because of something else in the same plan,
+the ordering now owes that something a place.** Whenever a refusal is lifted by
+the presence of another change, go and look at where that change sorts — and
+then sweep every other pair in the same namespace, because the reason the check
+was written for one pair is rarely a reason it is true for the rest. Here the
+sweep found five pairs already in the right order by accident of their class
+numbers, and one more wrong the same way (`DropTable` against `RenameTable`)
+that could not take the same fix, because its drop owes a debt of its own to
+the foreign-key drops behind it.
+
 ## An accidental order that was load-bearing
 
 `order_key` puts a column's type change and its default change in the same

@@ -12264,6 +12264,124 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
     );
 }
 
+/// A deploy that skips a revision: `note` was dropped in one, and the next
+/// renamed `label` into the name it gave up. The differ has to hand the engine
+/// the drop first, and the engine is what says so (issue #398).
+///
+/// Both orders are run here, on one table: the reversed one inside a
+/// transaction that rolls back, so its refusal is evidence rather than debris,
+/// and the planned one for real. Reverting the ordering fix makes the planned
+/// order the reversed one, and this test fails on the engine's own message.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
+    let table = |columns: &[(&str, &str)]| {
+        let mut t = Table::default();
+        for (name, spec) in columns {
+            let column = Column::new(ty(spec));
+            t.columns.insert(
+                (*name).to_owned(),
+                if *name == "code" {
+                    column.not_null()
+                } else {
+                    column
+                },
+            );
+        }
+        // Named, so the introspected key is comparable with the declared
+        // one: an unnamed key comes back wearing the engine's own
+        // `PK__s__357D4CF8…`.
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_s".to_owned()),
+            columns: vec!["code".to_owned()],
+        });
+        t
+    };
+    let named = TableName::new("dbo", "s");
+    let schema_of = |t: Table| {
+        let mut s = Schema::default();
+        s.tables.insert(named.clone(), t);
+        s
+    };
+    // The three declarations of the history: the deployed one, the revision
+    // nobody deployed, and the one this plan is for.
+    // The two columns differ on purpose: identical ones would let the closing
+    // apply guard's own half of this pass for the wrong reason, with nothing
+    // for its comparison to disagree about (DECISIONS 474).
+    let base = schema_of(table(&[
+        ("code", "varchar(20)"),
+        ("label", "nvarchar(50)"),
+        ("note", "int"),
+    ]));
+    let intermediate = schema_of(table(&[("code", "varchar(20)"), ("label", "nvarchar(50)")]));
+    let declared = schema_of(table(&[("code", "varchar(20)"), ("note", "nvarchar(50)")]));
+
+    let base_ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let intermediate_ids = mint_ids(
+        &intermediate,
+        &base_ids,
+        &[Intent::DropColumn {
+            column: named.column("note"),
+            reason: "gone".into(),
+        }],
+    );
+    let declared_ids = mint_ids(
+        &declared,
+        &intermediate_ids,
+        &[Intent::RenameColumn {
+            table: named.clone(),
+            from: "label".into(),
+            to: "note".into(),
+        }],
+    );
+
+    let mut db = TestDb::create("reused_column_name398").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &base, &base_ids),
+    )
+    .await;
+    let state = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the baseline");
+
+    let migration = plan(&state.schema, &base_ids, &declared, &declared_ids);
+    let at = |f: fn(&pbps_model::Change) -> bool| {
+        migration
+            .changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{migration:?}"))
+    };
+    let drop_at =
+        at(|c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note"));
+    let rename_at =
+        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to == "note"));
+    assert!(
+        drop_at < rename_at,
+        "the drop must free the name first: {migration:?}"
+    );
+
+    // The order the differ used to emit, refused by the engine and rolled
+    // back: `Msg 15335`, measured here rather than quoted.
+    let mut reversed = migration.clone();
+    reversed.changes.reverse();
+    let refused = try_apply(&mut db.conn, &reversed)
+        .await
+        .expect_err("the engine must refuse the rename while the old column holds the name");
+    assert!(
+        refused.contains("already in use as a COLUMN name"),
+        "{refused}"
+    );
+
+    apply(&mut db.conn, &migration).await;
+    let after = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the result");
+    db.drop().await;
+    assert_eq!(after.schema, normalized(&declared));
+}
+
 #[path = "live/row_security.rs"]
 mod row_security;
 
