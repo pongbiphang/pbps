@@ -56,6 +56,7 @@ impl Dialect for Mssql {
     /// opener of a money literal (`$1.00`), never a dollar-quote tag.
     fn lexicon(&self) -> Lexicon {
         Lexicon {
+            whitespace_is_ascii: false,
             quoted_identifiers: &[('[', ']'), ('"', '"')],
             escape_strings: false,
             dollar_quoted_strings: false,
@@ -238,6 +239,12 @@ mod tests {
     /// a name or the front of a money literal.
     #[test]
     fn a_bracket_holds_a_name_and_the_postgres_string_syntaxes_are_ordinary_code() {
+        // Measured on 17.0.4075.5: non-ASCII White_Space separates tokens,
+        // unlike PostgreSQL's identifier-byte rule (DECISIONS 475).
+        assert_eq!(
+            Mssql.normalize_definition("\u{85}SELECT\u{a0}1 AS x\u{3000}"),
+            "SELECT 1 AS x"
+        );
         assert_ne!(
             Mssql.normalize_definition("SELECT [a  b] FROM t"),
             Mssql.normalize_definition("SELECT [a b] FROM t")

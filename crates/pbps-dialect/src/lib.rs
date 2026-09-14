@@ -398,6 +398,11 @@ impl Unchecked {
 /// abstraction worth having is the one two implementations draw (ADR-0014).
 #[derive(Clone, Copy, Debug)]
 pub struct Lexicon {
+    /// Whether definition layout is limited to ASCII whitespace. PostgreSQL
+    /// keeps every non-ASCII byte in an identifier; SQL Server accepts Unicode
+    /// White_Space as token separators (measured in DECISIONS 475).
+    pub whitespace_is_ascii: bool,
+
     /// Every opener of a quoted identifier, with the character that closes it.
     ///
     /// This is where the two engines part company over a character they both
@@ -479,6 +484,7 @@ impl Lexicon {
     /// quotes a string. The honest description for a dialect that is not any
     /// real database.
     pub const ANSI: Self = Self {
+        whitespace_is_ascii: false,
         quoted_identifiers: &[('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
@@ -540,7 +546,7 @@ impl Lexicon {
         // The one thing a `char_indices` loop cannot do is consume more than
         // one character: an opening `$tag$` and a doubled quote both do.
         let mut consumed_to = 0usize;
-        let text = definition.trim();
+        let text = definition.trim_matches(|ch| self.is_definition_whitespace(ch));
         let bytes = text.as_bytes();
 
         for (i, ch) in text.char_indices() {
@@ -654,7 +660,7 @@ impl Lexicon {
                     }
                 }
                 At::Code => {
-                    if ch.is_whitespace() {
+                    if self.is_definition_whitespace(ch) {
                         in_space = true;
                         continue;
                     }
@@ -708,6 +714,12 @@ impl Lexicon {
             }
         }
         out
+    }
+
+    fn is_definition_whitespace(&self, ch: char) -> bool {
+        // Both measured engines accept vertical tab. is_ascii_whitespace
+        // omits it, so intersect Unicode's class with ASCII instead (475).
+        ch.is_whitespace() && (!self.whitespace_is_ascii || ch.is_ascii())
     }
 }
 
@@ -2323,6 +2335,7 @@ mod tests {
     /// SQL Server's lexis, as `pbps-mssql` states it. Kept here so the scanner
     /// can be exercised against both shapes; each crate pins its own answers.
     const T_SQL: Lexicon = Lexicon {
+        whitespace_is_ascii: false,
         quoted_identifiers: &[('[', ']'), ('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
@@ -2334,6 +2347,7 @@ mod tests {
 
     /// PostgreSQL's, as `pbps-pg` states it.
     const PG: Lexicon = Lexicon {
+        whitespace_is_ascii: true,
         quoted_identifiers: &[('"', '"')],
         escape_strings: true,
         dollar_quoted_strings: true,
@@ -2342,6 +2356,57 @@ mod tests {
         reserved: never_reserved,
         unicode_identifiers: true,
     };
+
+    #[test]
+    fn definition_layout_uses_the_engines_whitespace_class() {
+        // Measured on PostgreSQL 18.6 and SQL Server 17.0.4075.5: all of
+        // Unicode White_Space outside ASCII are identifier bytes on the
+        // former and token separators on the latter (475).
+        for ch in [
+            '\u{85}', '\u{a0}', '\u{1680}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}',
+            '\u{3000}',
+        ]
+        .into_iter()
+        .chain('\u{2000}'..='\u{200a}')
+        {
+            for (wide, narrow) in [
+                (format!("SELECT 1 AS x{ch}"), "SELECT 1 AS x"),
+                (format!("SELECT 1 AS {ch}x"), "SELECT 1 AS x"),
+                (format!("SELECT a{ch}b"), "SELECT a b"),
+            ] {
+                assert_ne!(
+                    PG.normalize_definition(&wide),
+                    PG.normalize_definition(narrow),
+                    "{wide:?}"
+                );
+                assert_eq!(
+                    T_SQL.normalize_definition(&wide),
+                    T_SQL.normalize_definition(narrow),
+                    "{wide:?}"
+                );
+            }
+            // Quoting makes the same character data on both engines.
+            for lexicon in [PG, T_SQL] {
+                for wide in [format!("SELECT 'a{ch}b'"), format!("SELECT \"a{ch}b\"")] {
+                    assert_eq!(lexicon.normalize_definition(&wide), wide);
+                    assert_ne!(
+                        lexicon.normalize_definition(&wide),
+                        lexicon.normalize_definition(&wide.replace(ch, " "))
+                    );
+                }
+            }
+        }
+        // Both engines accept all six ASCII separators, including vertical
+        // tab, which Rust's is_ascii_whitespace omits.
+        for ch in [' ', '\t', '\n', '\r', '\x0b', '\x0c'] {
+            for lexicon in [PG, T_SQL] {
+                assert_eq!(
+                    lexicon.normalize_definition(&format!("{ch}SELECT{ch}{ch}1{ch}")),
+                    "SELECT 1"
+                );
+            }
+        }
+    }
 
     /// The row of ADR-0011 Amendment 2's table that points the other way from
     /// the rest: one character, opposite meanings, and a shared default could
@@ -3098,6 +3163,7 @@ mod code_only_tests {
     use super::*;
 
     const PG: Lexicon = Lexicon {
+        whitespace_is_ascii: true,
         quoted_identifiers: &[('"', '"')],
         escape_strings: true,
         dollar_quoted_strings: true,
@@ -3107,6 +3173,7 @@ mod code_only_tests {
         unicode_identifiers: true,
     };
     const MSSQL: Lexicon = Lexicon {
+        whitespace_is_ascii: false,
         quoted_identifiers: &[('[', ']'), ('"', '"')],
         escape_strings: false,
         dollar_quoted_strings: false,
