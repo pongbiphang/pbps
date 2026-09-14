@@ -727,15 +727,71 @@ impl Lexicon {
     /// emitted in name order, and `CREATE VIEW es.a` failed inside the plan's
     /// own transaction (DECISIONS 315).
     ///
-    /// A dollar-quoted string is a literal, blanked — except a routine's
-    /// body, which is one on the engine that has them, and which the name
-    /// scans exist to read: the string after the word `AS` is lexed as code
-    /// by these same rules, and every other one is a datum (see
-    /// `dollar_quoted_string`). This is the one place this scan and
+    /// On the engine with dollar quoting, a routine's body can also be a
+    /// plain single-quoted string. The body after `AS` at depth zero is lexed
+    /// as code, with doubled quotes decoded first for the single-quoted form;
+    /// its own literals still contain data. This is the one place this scan and
     /// [`normalize_definition`] part company on purpose.
     ///
     /// [`normalize_definition`]: Lexicon::normalize_definition
     pub fn code_only(&self, definition: &str) -> String {
+        // LANGUAGE may follow AS. Inspect the header with every string blanked
+        // first, so body text cannot masquerade as a language clause. Native
+        // routines store library/symbol names in AS, not SQL source to scan.
+        let native = self.dollar_quoted_strings
+            && self.has_native_language(definition, &self.code_only_inner(definition, false));
+        self.code_only_inner(definition, !native)
+    }
+
+    fn has_native_language(&self, definition: &str, header: &str) -> bool {
+        let mut cursor = 0;
+        let mut depth = 0usize;
+        while cursor < header.len() {
+            let rest = &header[cursor..];
+            let ch = rest.chars().next().unwrap();
+            if ch == '"' {
+                cursor += quoted_identifier_len(rest).unwrap_or(rest.len());
+            } else if (self.identifier_continues)(ch) {
+                let len = rest
+                    .find(|c| !(self.identifier_continues)(c))
+                    .unwrap_or(rest.len());
+                cursor += len;
+                if depth == 0 && rest[..len].eq_ignore_ascii_case("language") {
+                    let name = after_string_gap(&definition[cursor..]).0;
+                    let name = if let Some(literal) = sql_string(name, 0) {
+                        literal.contents
+                    } else {
+                        // The header already decodes Unicode identifiers and
+                        // pads their span, so this offset also covers U&"…".
+                        let name = &header[definition.len() - name.len()..];
+                        if name.starts_with('"') {
+                            quoted_identifier_len(name)
+                                .map(|end| name[1..end - 1].replace("\"\"", "\""))
+                                .unwrap_or_default()
+                        } else {
+                            let end = name
+                                .find(|c| !(self.identifier_continues)(c))
+                                .unwrap_or(name.len());
+                            name[..end].to_ascii_lowercase()
+                        }
+                    };
+                    if matches!(name.as_str(), "c" | "internal") {
+                        return true;
+                    }
+                }
+            } else {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                cursor += ch.len_utf8();
+            }
+        }
+        false
+    }
+
+    fn code_only_inner(&self, definition: &str, scan_bodies: bool) -> String {
         enum At {
             Code,
             /// Inside `'…'`: a doubled quote is a quote *inside* the
@@ -767,6 +823,7 @@ impl Lexicon {
         let bytes = definition.as_bytes();
         let mut at = At::Code;
         let mut consumed_to = 0usize;
+        let mut paren_depth = 0usize;
         for (i, ch) in definition.char_indices() {
             if i < consumed_to {
                 continue;
@@ -881,7 +938,10 @@ impl Lexicon {
                         && !continues_identifier(definition, i)
                         && let Some(len) = dollar_tag(&definition[i..])
                     {
-                        consumed_to = self.dollar_quoted_string(definition, i, len, &mut out);
+                        let body = scan_bodies
+                            && paren_depth == 0
+                            && follows_the_word_as(&out, self.identifier_continues);
+                        consumed_to = self.dollar_quoted_string(definition, i, len, body, &mut out);
                         continue;
                     }
                     match (ch, next) {
@@ -895,6 +955,35 @@ impl Lexicon {
                         }
                         ('\'', _) => {
                             let prefix = self.blank_string_prefix(&mut out);
+                            if scan_bodies
+                                && self.dollar_quoted_strings
+                                && prefix.is_none_or(|p| {
+                                    p.eq_ignore_ascii_case("e") || p.eq_ignore_ascii_case("u&")
+                                })
+                                && paren_depth == 0
+                                && follows_the_word_as(&out, self.identifier_continues)
+                                && let Some(end) = self.quoted_body(
+                                    definition,
+                                    i,
+                                    prefix.map_or(0, str::len),
+                                    &mut out,
+                                )
+                            {
+                                consumed_to = end;
+                                continue;
+                            }
+                            if self.dollar_quoted_strings
+                                && let Some(literal) =
+                                    sql_string(definition, i - prefix.map_or(0, str::len))
+                            {
+                                // A datum carries its continuations and
+                                // UESCAPE clause too; none of it is source.
+                                for ch in definition[i..literal.end].chars() {
+                                    blank(&mut out, ch);
+                                }
+                                consumed_to = literal.end;
+                                continue;
+                            }
                             at = if self.escape_strings && opens_escape_string(definition, i) {
                                 At::Escape {
                                     after_backslash: false,
@@ -905,6 +994,14 @@ impl Lexicon {
                                 }
                             };
                             blank(&mut out, ch);
+                        }
+                        ('(', _) => {
+                            paren_depth += 1;
+                            out.push(ch);
+                        }
+                        (')', _) => {
+                            paren_depth = paren_depth.saturating_sub(1);
+                            out.push(ch);
                         }
                         _ => {
                             if ch == '"'
@@ -962,30 +1059,7 @@ impl Lexicon {
         }
         let close = quoted_identifier_len(&definition[at..])?;
         let inner = definition[at + 1..at + close - 1].replace("\"\"", "\"");
-        let mut end = at + close;
-        let mut escape = '\\';
-        // `UESCAPE 'x'`, after ASCII whitespace: the engine's whitespace.
-        let after = definition[end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if after.len() > 7
-            && after.is_char_boundary(7)
-            && after[..7].eq_ignore_ascii_case("uescape")
-            && after[7..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_whitespace() || c == '\'')
-        {
-            let clause = after[7..].trim_start_matches(|c: char| c.is_ascii_whitespace());
-            let mut chars = clause.chars();
-            if let (Some('\''), Some(e), Some('\'')) = (chars.next(), chars.next(), chars.next())
-                && e != '\''
-                && e != '+'
-                && !e.is_ascii_hexdigit()
-                && !e.is_whitespace()
-            {
-                escape = e;
-                end = definition.len() - clause.len() + 2 + e.len_utf8();
-            }
-        }
+        let (escape, end) = unicode_escape_clause(definition, at + close)?;
         let decoded = pbps_model::module::decode_unicode_escapes(&inner, escape)?;
         out.truncate(n - 2);
         let spelled = format!("\"{}\"", decoded.replace('"', "\"\""));
@@ -1001,6 +1075,25 @@ impl Lexicon {
         Some(end)
     }
 
+    /// Decode the SQL string before scanning the source it contains. Padding
+    /// retains subsequent clause offsets without splitting names in the body.
+    fn quoted_body(
+        &self,
+        definition: &str,
+        at: usize,
+        prefix_len: usize,
+        out: &mut String,
+    ) -> Option<usize> {
+        let literal = sql_string(definition, at - prefix_len)?;
+        blank(out, '\'');
+        out.push_str(&self.code_only(&literal.contents));
+        for _ in out.len() + literal.breaks.len()..literal.end {
+            out.push(' ');
+        }
+        out.push_str(&literal.breaks);
+        Some(literal.end)
+    }
+
     /// Reads the dollar-quoted string that opens at `at` with a tag of `len`
     /// bytes, and returns the offset the code after it resumes at.
     ///
@@ -1013,8 +1106,9 @@ impl Lexicon {
     /// (DECISIONS 315). The two are told apart by what precedes the string:
     /// a body follows the word `AS`, and a datum never does — measured, `AS
     /// $x$` where a view's alias would go is a syntax error, so a
-    /// dollar-quoted string after `AS` in a definition the engine accepts can
-    /// only be a body. The body is lexed as code by the same rules: its own
+    /// dollar-quoted string after `AS` is a body unless LANGUAGE identifies
+    /// a native library/symbol (checked before this scan). The body is lexed
+    /// as code by the same rules: its own
     /// literals and comments are blanked, an `E'…'` by the escape rule, and a
     /// dollar-quoted datum inside it by this one. Its tags are blanked too:
     /// a delimiter is not a name, and one that read as code matched a module
@@ -1024,6 +1118,7 @@ impl Lexicon {
         definition: &str,
         at: usize,
         len: usize,
+        body: bool,
         out: &mut String,
     ) -> usize {
         let tag = &definition[at..at + len];
@@ -1034,7 +1129,7 @@ impl Lexicon {
             // scan reads it the way the engine's lexer would have, to its end.
             None => (definition.len(), definition.len()),
         };
-        if follows_the_word_as(out, self.identifier_continues) {
+        if body {
             // The tags are delimiters, not code: `$a$` is never a name, and
             // kept, it matched a module named `$a$` and drew an edge from
             // every routine delimited by it.
@@ -1051,6 +1146,241 @@ impl Lexicon {
             }
         }
         end
+    }
+}
+
+struct SqlString {
+    contents: String,
+    end: usize,
+    breaks: String,
+}
+
+/// PostgreSQL's Sconst forms, shared by routine bodies and language names.
+/// B/X/N prefixes are not accepted in those grammar positions.
+fn sql_string(definition: &str, at: usize) -> Option<SqlString> {
+    let text = &definition[at..];
+    if text.starts_with('$')
+        && let Some(len) = dollar_tag(text)
+    {
+        let tag = &text[..len];
+        let close = len + text[len..].find(tag)?;
+        return Some(SqlString {
+            contents: text[len..close].to_owned(),
+            end: at + close + len,
+            breaks: String::new(),
+        });
+    }
+    let escape = text.starts_with("E'") || text.starts_with("e'");
+    let unicode = text.starts_with("U&'") || text.starts_with("u&'");
+    let prefix = if escape {
+        1
+    } else if unicode {
+        2
+    } else {
+        0
+    };
+    if !text[prefix..].starts_with('\'') {
+        return None;
+    }
+    let mut contents = Vec::new();
+    let mut high_surrogate = None;
+    let mut breaks = String::new();
+    let mut cursor = at + prefix + 1;
+    loop {
+        let mut piece = String::new();
+        loop {
+            let ch = definition[cursor..].chars().next()?;
+            cursor += ch.len_utf8();
+            if ch == '\'' {
+                if definition[cursor..].starts_with('\'') {
+                    piece.push('\'');
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            } else {
+                piece.push(ch);
+                if escape && ch == '\\' {
+                    // An escaped quote is data, not this piece's terminator.
+                    let escaped = definition[cursor..].chars().next()?;
+                    piece.push(escaped);
+                    cursor += escaped.len_utf8();
+                }
+            }
+        }
+        if escape {
+            // E escapes are read within each piece: E'\x' ⏎ '63' is x63,
+            // not c. The prefix still applies to every continued piece.
+            escape_piece(&piece, &mut contents, &mut high_surrogate)?;
+        } else {
+            contents.extend_from_slice(piece.as_bytes());
+        }
+        let (after, continues) = after_string_gap(&definition[cursor..]);
+        if !continues || !after.starts_with('\'') {
+            break;
+        }
+        let next = definition.len() - after.len();
+        breaks.extend(
+            definition[cursor..next]
+                .chars()
+                .filter(|c| matches!(c, '\r' | '\n')),
+        );
+        cursor = next + 1;
+    }
+    if high_surrogate.is_some() {
+        return None;
+    }
+    let mut contents = String::from_utf8(contents).ok()?;
+    if unicode {
+        let (escape, end) = unicode_escape_clause(definition, cursor)?;
+        breaks.extend(
+            definition[cursor..end]
+                .chars()
+                .filter(|c| matches!(c, '\r' | '\n')),
+        );
+        cursor = end;
+        contents = pbps_model::module::decode_unicode_escapes(&contents, escape)?;
+    }
+    if contents.contains('\0') {
+        return None;
+    }
+    Some(SqlString {
+        contents,
+        end: cursor,
+        breaks,
+    })
+}
+
+/// Byte escapes may form one UTF-8 character across continued pieces; decode
+/// to bytes first and validate UTF-8 only after the complete constant is read.
+fn escape_piece(piece: &str, out: &mut Vec<u8>, high: &mut Option<u32>) -> Option<()> {
+    let bytes = piece.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        cursor += 1;
+        if byte != b'\\' {
+            if high.is_some() {
+                return None;
+            }
+            out.push(byte);
+            continue;
+        }
+        let escaped = *bytes.get(cursor)?;
+        cursor += 1;
+        if matches!(escaped, b'u' | b'U') {
+            let digits = if escaped == b'u' { 4 } else { 8 };
+            let mut code = 0u32;
+            for _ in 0..digits {
+                code = code
+                    .checked_mul(16)?
+                    .checked_add((*bytes.get(cursor)? as char).to_digit(16)?)?;
+                cursor += 1;
+            }
+            let code = match (high.take(), code) {
+                (None, 0xD800..=0xDBFF) => {
+                    *high = Some(code);
+                    continue;
+                }
+                (Some(h), 0xDC00..=0xDFFF) => 0x10000 + ((h - 0xD800) << 10) + (code - 0xDC00),
+                (None, code) => code,
+                (Some(_), _) => return None,
+            };
+            let mut encoded = [0; 4];
+            out.extend_from_slice(char::from_u32(code)?.encode_utf8(&mut encoded).as_bytes());
+            continue;
+        }
+        if high.is_some() {
+            return None;
+        }
+        let value = if escaped == b'x' || matches!(escaped, b'0'..=b'7') {
+            let (radix, limit, mut value, mut digits) = if escaped == b'x' {
+                (16, 2, 0u32, 0)
+            } else {
+                (8, 3, u32::from(escaped - b'0'), 1)
+            };
+            while digits < limit {
+                let Some(digit) = bytes.get(cursor).and_then(|b| (*b as char).to_digit(radix))
+                else {
+                    break;
+                };
+                value = value * radix + digit;
+                cursor += 1;
+                digits += 1;
+            }
+            if digits == 0 { escaped } else { value as u8 }
+        } else {
+            match escaped {
+                b'b' => 8,
+                b'f' => 12,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                other => other,
+            }
+        };
+        out.push(value);
+    }
+    Some(())
+}
+
+/// Past PostgreSQL's whitespace and comments following one piece of a string
+/// constant, and whether what they separate can still be a *continuation* of
+/// it.
+///
+/// **Measured**, and neither half is the obvious one:
+///
+/// ```text
+/// '01/02/' -- c ⏎ '2026'     -> 01/02/2026     a line comment is part of the
+/// '01/02/' -- /* x ⏎ '2026'  -> 01/02/2026     gap, and the newline that ends
+///                                              it is the newline a
+///                                              continuation needs
+/// '01/02/' /* c */ ⏎ '2026'  -> syntax error   a block comment ends the
+/// '01/02/' ⏎ /* c */ '2026'  -> syntax error   possibility of a continuation,
+/// '01/02/' /* -- x ⏎ */ '2026' -> syntax error wherever the newline stands
+/// '01/02/2026' -- c          -> 01/02/2026     after the last piece either
+/// '01/02/2026' /* c */       -> 01/02/2026     comment is only trailing text
+/// ```
+///
+/// So the two comment forms are not interchangeable here, which is why they
+/// are scanned rather than skipped together: the engine's `{whitespace}` rule
+/// counts a `--` comment among the things a continuation may be written
+/// across, and does not count a `/* … */` one (DECISIONS 278).
+pub fn after_string_gap(mut text: &str) -> (&str, bool) {
+    let mut newline = false;
+    let mut blocked = false;
+    loop {
+        let trimmed = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        newline |= text[..text.len() - trimmed.len()].contains(['\r', '\n']);
+        text = trimmed;
+        if let Some(comment) = text.strip_prefix("--") {
+            let Some(end) = comment.find(['\r', '\n']) else {
+                return ("", newline);
+            };
+            newline = true;
+            text = &comment[end + 1..];
+        } else if let Some(comment) = text.strip_prefix("/*") {
+            let mut depth = 1usize;
+            let mut cursor = 0;
+            while cursor < comment.len() && depth > 0 {
+                if comment[cursor..].starts_with("/*") {
+                    depth += 1;
+                    cursor += 2;
+                } else if comment[cursor..].starts_with("*/") {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += comment[cursor..].chars().next().unwrap().len_utf8();
+                }
+            }
+            if depth != 0 {
+                return (text, false);
+            }
+            blocked = true;
+            text = &comment[cursor..];
+        } else {
+            return (text, newline && !blocked);
+        }
     }
 }
 
@@ -1142,27 +1472,33 @@ impl Lexicon {
 /// matter to a literal whose contents are blanked either way; that the clause
 /// is not code does.
 fn uescape_clause_len(text: &str) -> Option<usize> {
-    let after_gap = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    if after_gap.len() < 8
-        || !after_gap.is_char_boundary(7)
-        || !after_gap[..7].eq_ignore_ascii_case("uescape")
+    let (_, end) = unicode_escape_clause(text, 0)?;
+    (end > 0).then_some(end)
+}
+
+/// Both Unicode identifiers and strings carry this clause. Its character is
+/// itself an SQL string, so E'!' and dollar quoting must use the same decoder.
+fn unicode_escape_clause(definition: &str, at: usize) -> Option<(char, usize)> {
+    let after = after_string_gap(&definition[at..]).0;
+    if !after
+        .get(..7)
+        .is_some_and(|word| word.eq_ignore_ascii_case("uescape"))
+        || after[7..].chars().next().is_some_and(continues_ident)
+    {
+        return Some(('\\', at));
+    }
+    let operand = after_string_gap(&after[7..]).0;
+    let clause = sql_string(definition, definition.len() - operand.len())?;
+    let mut chars = clause.contents.chars();
+    let escape = chars.next()?;
+    if chars.next().is_some()
+        || escape.is_ascii_hexdigit()
+        || escape.is_whitespace()
+        || matches!(escape, '+' | '\'' | '"')
     {
         return None;
     }
-    // A word of its own: `uescapes` is a name, and so is `uescape2`.
-    let tail = &after_gap[7..];
-    if !tail.starts_with(|c: char| c.is_ascii_whitespace() || c == '\'') {
-        return None;
-    }
-    let clause = tail.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let mut chars = clause.chars();
-    let (Some('\''), Some(escape), Some('\'')) = (chars.next(), chars.next(), chars.next()) else {
-        return None;
-    };
-    if escape == '\'' || escape == '+' || escape.is_ascii_hexdigit() || escape.is_whitespace() {
-        return None;
-    }
-    Some(text.len() - clause.len() + 2 + escape.len_utf8())
+    Some((escape, clause.end))
 }
 
 /// The length in bytes of the `$tag$` that `s` opens with, if it opens with one.
@@ -2858,6 +3194,164 @@ mod code_only_tests {
         assert_eq!(PG.code_only("SELECT $1.00 FROM t"), "SELECT $1.00 FROM t");
         // SQL Server has no dollar quoting: the text is code.
         assert_eq!(MSSQL.code_only(datum), datum);
+    }
+
+    #[test]
+    fn a_plain_routine_body_decodes_quotes_without_exposing_its_data() {
+        let definition = "(arg text DEFAULT 'app.default_data()') RETURNS text
+            AS /* body */ 'SELECT app.\"a''b\"(), ''app.inner_data()'';'
+            LANGUAGE sql";
+        let code = PG.code_only(definition);
+        assert!(code.contains("app.\"a'b\"()"), "{code}");
+        assert!(!code.contains("default_data"), "{code}");
+        assert!(!code.contains("inner_data"), "{code}");
+        assert_eq!(code.len(), definition.len());
+        assert_eq!(code.find("LANGUAGE"), definition.find("LANGUAGE"));
+        assert_eq!(code.matches('\n').count(), definition.matches('\n').count());
+        assert!(!MSSQL.code_only(definition).contains("a'b"));
+
+        for datum in [
+            "SELECT 'app.datum()' AS value",
+            "SELECT as\u{a0} 'app.datum()' AS value",
+            "AS $$ SELECT 'app.datum()' $$",
+            "AS 'SELECT $$app.datum()$$'",
+        ] {
+            assert!(!PG.code_only(datum).contains("app.datum"), "{datum}");
+        }
+    }
+
+    #[test]
+    fn native_language_operands_are_data_on_either_side_of_the_body() {
+        for language in [
+            "c",
+            "internal",
+            "C",
+            "INTERNAL",
+            "\"c\"",
+            "'internal'",
+            "U&\"c\"",
+            "U&\"\\0063\"",
+            "U&\"intern!0061l\" UESCAPE '!'",
+            "E'\\x63'",
+            "U&'intern!0061l' UESCAPE /* gap */ E'!'",
+            "$lang$internal$lang$",
+            "U&\"intern!0061l\" UESCAPE /* gap */ E'!'",
+            "/* outer /* nested */ end */ c",
+            "-- language name\r\ninternal",
+        ] {
+            for body in ["'app.native_symbol'", "$$app.native_symbol$$"] {
+                for definition in [
+                    format!("() RETURNS int LANGUAGE {language} AS {body}"),
+                    format!("() RETURNS int AS {body} LANGUAGE {language}"),
+                ] {
+                    let code = PG.code_only(&definition);
+                    assert!(!code.contains("native_symbol"), "{definition}: {code}");
+                    assert_eq!(code.len(), definition.len());
+                }
+            }
+        }
+        for definition in [
+            "() RETURNS int AS 'SELECT app.f(), ''LANGUAGE internal''' LANGUAGE sql",
+            "() RETURNS int LANGUAGE sql AS $$ SELECT app.f(), 'LANGUAGE c' $$",
+            "(language internal) RETURNS int LANGUAGE sql AS 'SELECT app.f()'",
+            "() RETURNS int LANGUAGE sql AS 'SELECT app.f()' /* LANGUAGE c */",
+            "() RETURNS int LANGUAGE sql AS 'SELECT app.f()' SET \"language\" = 'c'",
+            "() RETURNS int LANGUAGE \"INTERNAL\" AS 'SELECT app.f()'",
+            "() RETURNS int LANGUAGE 'C' AS 'SELECT app.f()'",
+            "() RETURNS int LANGUAGE U&\"s!0071l\" UESCAPE '!' AS 'SELECT app.f()'",
+        ] {
+            assert!(PG.code_only(definition).contains("app.f()"), "{definition}");
+        }
+        // An unfinished declaration should still be safe to scan.
+        assert_eq!(PG.code_only("LANGUAGE \""), "LANGUAGE \"");
+    }
+
+    #[test]
+    fn continued_body_pieces_form_one_source_before_its_literals_are_blanked() {
+        for gap in ["\n", "\r", "\r\n", " -- comment\n", " -- /* comment\r "] {
+            let definition = format!(
+                "() RETURNS text AS 'SELECT app.'{gap}'f(), ''app.'{gap}'datum()''' LANGUAGE sql"
+            );
+            let code = PG.code_only(&definition);
+            assert!(code.contains("app.f()"), "{code}");
+            assert!(!code.contains("datum()"), "{code}");
+            assert_eq!(code.len(), definition.len());
+            assert_eq!(code.find("LANGUAGE"), definition.find("LANGUAGE"));
+            for newline in ['\n', '\r'] {
+                assert_eq!(
+                    code.matches(newline).count(),
+                    definition.matches(newline).count()
+                );
+            }
+        }
+        for gap in [" ", "\t", " /* x */\n", "\n/* x */", "\u{a0}\n"] {
+            let definition = format!("AS 'SELECT app.'{gap}'f()'");
+            assert!(
+                !PG.code_only(&definition).contains("app.f()"),
+                "{definition}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_bodies_decode_source_before_blanking_its_string_data() {
+        for body in [
+            r"E'SELECT app.\146(), \'app.datum()\''",
+            r"E'SELECT app.\x66(), ''app.datum()'''",
+            r"E'SELECT app.\u0066(), ''app.datum()'''",
+            r"E'SELECT app.\U00000066(), ''app.datum()'''",
+            "E'SELECT app.'\n'\\x66(), ''app.datum()'''",
+            r"U&'SELECT app.\0066(), ''app.datum()'''",
+            r"U&'SELECT app.!0066(), ''app.datum()''' UESCAPE /* gap */ E'!'",
+        ] {
+            let definition = format!("() RETURNS text AS {body} LANGUAGE sql");
+            let code = PG.code_only(&definition);
+            assert!(code.contains("app.f()"), "{definition}: {code}");
+            assert!(!code.contains("datum()"), "{code}");
+            assert_eq!(code.len(), definition.len());
+            assert_eq!(code.find("LANGUAGE"), definition.find("LANGUAGE"));
+        }
+        // A decoded newline ends the body's comment even though its outer
+        // spelling contains no physical newline.
+        assert!(
+            PG.code_only(r"AS E'-- comment\nSELECT app.f()'")
+                .contains("app.f()")
+        );
+        let data = "AS $$ SELECT U&'app.'\n'f()' UESCAPE /* data clause */ E'!' $$";
+        let code = PG.code_only(data);
+        assert!(!code.contains("app."), "{code}");
+        assert!(!code.contains("UESCAPE"), "{code}");
+        assert_eq!(code.len(), data.len());
+    }
+
+    #[test]
+    fn escape_decoding_preserves_bytes_piece_boundaries_and_unicode_pairs() {
+        for (spelling, value) in [
+            (r"E'\b\f\n\r\t\\\'\q'", "\u{8}\u{c}\n\r\t\\'q"),
+            ("E'\\x'\n'63'", "x63"),
+            ("E'\\xc3'\n'\\xa9'", "é"),
+            (r"E'\uD83D\uDE00'", "😀"),
+            (r"E'\U0001F600'", "😀"),
+            (r"U&'!D83D!DE00' UESCAPE '!'", "😀"),
+        ] {
+            let literal = super::sql_string(spelling, 0).unwrap();
+            assert_eq!(literal.contents, value, "{spelling}");
+            assert_eq!(literal.end, spelling.len());
+        }
+        for invalid in [
+            r"E'\x00'",
+            r"E'\xff'",
+            r"E'\uD800'",
+            r"E'\uDC00'",
+            r"E'\UFFFFFFFF'",
+            r"U&'\0000'",
+            r"U&'a' UESCAPE 'ab'",
+            "E'unclosed",
+            "B'0101'",
+            "N'source'",
+        ] {
+            assert!(super::sql_string(invalid, 0).is_none(), "{invalid}");
+        }
     }
 
     #[test]

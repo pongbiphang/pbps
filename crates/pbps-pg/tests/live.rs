@@ -8426,6 +8426,263 @@ async fn a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_
     drop_schema(&mut conn, &s).await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn quoted_routine_bodies_report_calls_but_not_their_string_data() {
+    let mut db = TestDb::create("quoted_callers228").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let mut declared = Schema::default();
+    for (name, definition) in [
+        ("g", "(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        (
+            "dollar",
+            "() RETURNS int LANGUAGE sql AS $$ SELECT app.g(1) $$",
+        ),
+        ("plain", "() RETURNS int LANGUAGE sql AS 'SELECT app.g(1)'"),
+        (
+            "escaped_quotes",
+            "() RETURNS int LANGUAGE plpgsql AS 'BEGIN PERFORM ''app.g(1)''; RETURN app.g(1); END'",
+        ),
+        (
+            "dollar_data",
+            "() RETURNS text LANGUAGE sql AS $$ SELECT 'app.g(1)' $$",
+        ),
+        (
+            "plain_data",
+            "() RETURNS text LANGUAGE sql AS 'SELECT ''app.g(1)'''",
+        ),
+    ] {
+        db.conn
+            .execute(&format!("CREATE FUNCTION app.{name}{definition}"))
+            .await
+            .unwrap();
+        let id = if name == "g" {
+            "app.g(integer)".to_owned()
+        } else {
+            format!("app.{name}()")
+        };
+        // The report reads declarations, whose body quoting need not match
+        // the dollar-quoted definition pg_get_functiondef returns later.
+        declared.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    for name in ["dollar", "plain", "escaped_quotes"] {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.{name}()")).await,
+            1
+        );
+    }
+    let target = "app.g(integer)".parse().unwrap();
+    in_a_transaction(&mut db.conn).await;
+    let edges =
+        pbps_pg::modules::dependents(&mut db.conn, &target, pbps_model::ModuleKind::Function)
+            .await
+            .unwrap();
+    rollback(&mut db.conn).await;
+    let callers = pbps_pg::modules::callers_by_name(&declared, &target);
+    db.drop().await;
+    assert!(
+        edges.is_empty(),
+        "literal routine bodies have no catalog edge: {edges:?}"
+    );
+    assert_eq!(
+        callers,
+        ["app.dollar()", "app.escaped_quotes()", "app.plain()"].map(|id| id.parse().unwrap())
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn continued_routine_bodies_create_the_callee_first_and_ignore_string_data() {
+    let mut db = TestDb::create("continued_callers228").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let mut declared = Schema::default();
+    for (id, definition) in [
+        ("app.z()", "() RETURNS int LANGUAGE sql AS 'SELECT 1'"),
+        (
+            "app.a_lf()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT app.'\n'z()'",
+        ),
+        (
+            "app.a_escape()",
+            "() RETURNS int LANGUAGE sql AS E'SELECT app.\\172()'",
+        ),
+        (
+            "app.a_escape_continued()",
+            "() RETURNS int LANGUAGE sql AS E'SELECT app.'\n'\\x7a()'",
+        ),
+        (
+            "app.a_unicode()",
+            "() RETURNS int LANGUAGE sql AS U&'SELECT app.!007a()' UESCAPE '!'",
+        ),
+        (
+            "app.b_cr()",
+            "() RETURNS int AS 'SELECT app.' -- continued\r 'z()' LANGUAGE sql",
+        ),
+        (
+            "app.c_data()",
+            "() RETURNS text LANGUAGE sql AS 'SELECT ''app.'\n'z()'''",
+        ),
+        (
+            "app.d_escaped_data()",
+            "() RETURNS text LANGUAGE sql AS E'SELECT \\'app.z()\\''",
+        ),
+    ] {
+        declared.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let changes = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let pg = Postgres::new();
+    let applied = async {
+        for change in &changes.changes {
+            for statement in pg.emit(&change.change, change.strategy).unwrap() {
+                db.conn.execute(&statement.sql).await?;
+            }
+        }
+        db.conn
+            .query(
+                "SELECT (app.a_lf() = 1 AND app.b_cr() = 1 AND app.a_escape() = 1
+                AND app.a_escape_continued() = 1 AND app.a_unicode() = 1
+                AND app.c_data() = 'app.z()' AND app.d_escaped_data() = 'app.z()')::int AS ok",
+            )
+            .await
+    }
+    .await;
+    let callers = pbps_pg::modules::callers_by_name(&declared, &"app.z()".parse().unwrap());
+    db.drop().await;
+    let rows = applied.expect("the plan creates the callee before either continued caller");
+    assert_eq!(rows[0].try_get::<i32>("ok").unwrap(), Some(1));
+    assert_eq!(
+        callers,
+        [
+            "app.a_escape()",
+            "app.a_escape_continued()",
+            "app.a_lf()",
+            "app.a_unicode()",
+            "app.b_cr()"
+        ]
+        .map(|id| id.parse().unwrap())
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
+    let mut db = TestDb::create("native_callers228").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let mut declared = Schema::default();
+    for (id, definition) in [
+        (
+            "app.c_before(text, text)",
+            "(a text, b text) RETURNS real LANGUAGE c STRICT AS '$libdir/pg_trgm', 'similarity'",
+        ),
+        (
+            "app.c_after(text, text)",
+            "(a text, b text) RETURNS real AS '$libdir/pg_trgm', 'similarity' LANGUAGE \"c\" STRICT",
+        ),
+        (
+            "app.internal_before(integer, integer)",
+            "(a int, b int) RETURNS int LANGUAGE internal STRICT AS 'int4pl'",
+        ),
+        (
+            "app.internal_after(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE /* name */ 'internal' STRICT",
+        ),
+        (
+            "app.c_unicode(text, text)",
+            "(a text, b text) RETURNS real LANGUAGE U&\"\\0063\" STRICT AS '$libdir/pg_trgm', 'similarity'",
+        ),
+        (
+            "app.internal_unicode(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE U&\"intern!0061l\" UESCAPE /* character */ E'!' STRICT",
+        ),
+        (
+            "app.c_escape_language(text, text)",
+            "(a text, b text) RETURNS real LANGUAGE E'\\x63' STRICT AS '$libdir/pg_trgm', 'similarity'",
+        ),
+        (
+            "app.internal_unicode_language(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE U&'intern!0061l' UESCAPE '!' STRICT",
+        ),
+        (
+            "app.internal_dollar_language(integer, integer)",
+            "(a int, b int) RETURNS int AS 'int4pl' LANGUAGE $lang$internal$lang$ STRICT",
+        ),
+    ] {
+        let id: pbps_model::ModuleId = id.parse().unwrap();
+        db.conn
+            .execute(&format!("CREATE FUNCTION {}{definition}", id.object_name()))
+            .await
+            .unwrap();
+        declared
+            .modules
+            .insert(id, module(pbps_model::ModuleKind::Function, definition));
+    }
+    for name in ["c_before", "c_after", "c_unicode", "c_escape_language"] {
+        assert_eq!(
+            number(
+                &mut db.conn,
+                &format!("SELECT (app.{name}('abc', 'abc') = 1)::int")
+            )
+            .await,
+            1
+        );
+    }
+    for name in [
+        "internal_before",
+        "internal_after",
+        "internal_unicode",
+        "internal_unicode_language",
+        "internal_dollar_language",
+    ] {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.{name}(1, 2)")).await,
+            3
+        );
+    }
+    db.conn
+        .execute("CREATE VIEW app.external_dependent AS SELECT app.c_before('abc', 'abc')")
+        .await
+        .unwrap();
+    in_a_transaction(&mut db.conn).await;
+    let dependent = pbps_pg::modules::dependents(
+        &mut db.conn,
+        &"app.c_before(text, text)".parse().unwrap(),
+        pbps_model::ModuleKind::Function,
+    )
+    .await
+    .unwrap();
+    rollback(&mut db.conn).await;
+    db.drop().await;
+    assert!(
+        pbps_pg::modules::unmanaged_refusal(
+            &"app.c_before(text, text)".parse().unwrap(),
+            &dependent,
+            &declared
+        )
+        .is_some()
+    );
+
+    let arriving = ["app.pg_trgm()", "app.int4pl(integer)"].map(|id| id.parse().unwrap());
+    for id in &arriving {
+        assert!(
+            pbps_pg::modules::callers_by_name(&declared, id).is_empty(),
+            "{id}"
+        );
+    }
+    let rebound =
+        pbps_pg::modules::rebound_by_this_plan(&declared, &[], &arriving, &Default::default());
+    assert!(
+        rebound.is_empty(),
+        "native symbols cannot be captured: {rebound:?}"
+    );
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**
