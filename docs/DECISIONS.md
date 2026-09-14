@@ -12367,6 +12367,16 @@ SPEC is in sync with all of these.
      select only the actual enum/range routine callers. Quoted kind keywords
      are rejected by the engine, so no extra syntax is inferred from them.
 
+     CREATE COLLATION's target, options and FROM copy source bind pg_collation
+     or supply option text. A function-shaped locale value is still text:
+     measured, locale=orders('und') stores the locale "orders" without executing
+     an orders(text) function that would raise an exception. Exclude that
+     declaration prefix and options, including copied collation names, while
+     retaining later ordinary statements. Live ICU/libc and copy forms keep
+     unmanaged dependents after routine/view arrivals; following calls and
+     relation queries still rebuild, with separate plans selecting only the
+     actual caller of each arriving kind.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

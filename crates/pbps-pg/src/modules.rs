@@ -2497,9 +2497,12 @@ fn ddl_reference_spans(
                 target += 1;
             }
         }
-        if create && token_is(tokens, target, "statistics") {
-            // The keyword, optional object name and kinds belong to
-            // pg_statistic_ext. ON expressions and FROM targets stay code.
+        let statistics = token_is(tokens, target, "statistics");
+        let collation = token_is(tokens, target, "collation");
+        if create && (statistics || collation) {
+            // These declarations bind pg_statistic_ext or pg_collation. Their
+            // options are constants, including function-shaped locale values;
+            // statistics ON expressions and FROM relations stay code (477).
             declarations.push(target);
             let mut options = target + 1;
             if token_is(tokens, options, "if")
@@ -2514,6 +2517,12 @@ fn ddl_reference_spans(
             }
             if let Some(after) = after_group(tokens, options) {
                 declarations.extend(options..after);
+            } else if collation
+                && token_is(tokens, options, "from")
+                && tokens.get(options + 1).is_some_and(RebindToken::name)
+            {
+                // A collation copy names another collation, not a relation.
+                declarations.push(options + 1);
             }
             at += 1;
             continue;
@@ -4304,6 +4313,67 @@ mod tests {
                 .len(),
                 1,
                 "{statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn collation_declarations_keep_real_references_in_following_statements() {
+        for (statement, arrival, count) in [
+            (
+                "CREATE COLLATION orders(provider=icu,locale='und')",
+                "app.orders(integer)",
+                0,
+            ),
+            (
+                "CREATE COLLATION orders(provider=icu,locale='und')",
+                "app.orders",
+                0,
+            ),
+            (
+                "CREATE COLLATION IF NOT EXISTS \"orders\"(lc_collate='C',lc_ctype='C')",
+                "app.orders(integer)",
+                0,
+            ),
+            (
+                "CREATE COLLATION orders(provider=icu,locale='und')",
+                "app.icu",
+                0,
+            ),
+            (
+                "CREATE COLLATION orders(provider=icu,locale='und')",
+                "app.locale",
+                0,
+            ),
+            ("CREATE COLLATION child FROM orders", "app.orders", 0),
+            ("CREATE COLLATION child FROM app.orders", "app.orders", 0),
+            (
+                "CREATE COLLATION child(provider=icu,locale=orders('und'))",
+                "app.orders(text)",
+                0,
+            ),
+            (
+                "CREATE COLLATION orders(provider=icu,locale='und'); PERFORM orders(1)",
+                "app.orders(integer)",
+                1,
+            ),
+            (
+                "CREATE COLLATION orders FROM source; PERFORM value FROM orders",
+                "app.orders",
+                1,
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            assert_eq!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                count,
+                "{statement}: {arrival}"
             );
         }
     }

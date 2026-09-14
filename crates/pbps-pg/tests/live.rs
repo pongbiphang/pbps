@@ -9734,6 +9734,199 @@ async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn collation_declarations_keep_following_call_and_relation_references() {
+    let mut db = TestDb::create("collation_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+             CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'; CREATE VIEW shared.orders AS SELECT 7 AS value; CREATE TABLE shared.target(id integer); INSERT INTO shared.target VALUES (7)",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "BEGIN CREATE COLLATION orders(provider=icu,locale='und'); EXECUTE 'DROP COLLATION orders'; RETURN orders(1); END",
+        "DECLARE result int; BEGIN CREATE COLLATION orders FROM pg_catalog.\"C\"; SELECT value INTO result FROM orders; EXECUTE 'DROP COLLATION orders'; RETURN result; END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    b.modules.insert(
+        "app.orders".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    for (name, i) in [("app.orders(integer)", 0), ("app.orders", 1)] {
+        let arrival_id: pbps_model::ModuleId = name.parse().unwrap();
+        let mut one = a.clone();
+        one.modules
+            .insert(arrival_id.clone(), b.modules[&arrival_id].clone());
+        let one_arrival = plan(&a, &ids, &one, &ids);
+        assert_eq!(one_arrival.changes.len(), 2, "{one_arrival:#?}");
+        let caller: pbps_model::ModuleId = format!("app.f{i}()").parse().unwrap();
+        assert!(
+            one_arrival
+                .changes
+                .iter()
+                .any(|p| matches!(&p.change,pbps_model::Change::AlterModule{id,..} if id==&caller)),
+            "{one_arrival:#?}"
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 2, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn collation_declarations_do_not_rebuild_for_module_arrivals() {
+    let mut db = TestDb::create("collation_names230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE COLLATION shared.orders FROM pg_catalog.\"C\"; CREATE FUNCTION shared.und(text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'option executed'; END$$").await.unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        (
+            "CREATE COLLATION orders(provider=icu,locale='und')",
+            "orders",
+        ),
+        (
+            "CREATE COLLATION orders(provider=libc,locale='C')",
+            "orders",
+        ),
+        (
+            "CREATE COLLATION IF NOT EXISTS orders(lc_collate='C',lc_ctype='C')",
+            "orders",
+        ),
+        (
+            "CREATE COLLATION \"orders\" FROM pg_catalog.\"C\"",
+            "orders",
+        ),
+        ("CREATE COLLATION child FROM orders", "child"),
+        (
+            "CREATE COLLATION child(provider=icu,locale=und('und'))",
+            "child",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (i, (statement, target)) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; EXECUTE 'DROP COLLATION {target}'; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    for name in [
+        "orders",
+        "collation",
+        "provider",
+        "icu",
+        "locale",
+        "lc_collate",
+        "lc_ctype",
+        "libc",
+        "und",
+    ] {
+        b.modules.insert(
+            format!("app.{name}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+        );
+        let argument = if name == "und" { "text" } else { "integer" };
+        b.modules.insert(
+            format!("app.{name}({argument})").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("({argument}) RETURNS int LANGUAGE sql AS 'SELECT 42'"),
+            ),
+        );
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 18, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn statistics_declarations_keep_their_expression_calls() {
     let mut db = TestDb::create("statistics_calls230").await;
     db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE shared.source(a int,b int); CREATE FUNCTION shared.orders(integer) RETURNS int LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN $1; END'").await.unwrap();
