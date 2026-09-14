@@ -103,8 +103,10 @@ pub struct DataDemand {
     /// — the question a column-level grant makes different from the
     /// object-level one.
     row_columns: Vec<String>,
-    /// The key and writable cells used by INSERT and data readback.
+    /// The key and writable cells used by data readback.
     data_columns: Vec<String>,
+    /// The key and cells explicitly supplied by at least one declared row.
+    insert_columns: Vec<String>,
 }
 
 impl DataDemand {
@@ -127,6 +129,14 @@ impl DataDemand {
             .map(|(name, _)| name.clone())
             .collect();
         let demand = Self {
+            insert_columns: std::iter::once(key_column.to_owned())
+                .chain(
+                    row_columns
+                        .iter()
+                        .filter(|name| data.rows.values().any(|row| row.0.contains_key(*name)))
+                        .cloned(),
+                )
+                .collect(),
             data_columns: std::iter::once(key_column.to_owned())
                 .chain(row_columns.iter().cloned())
                 .collect(),
@@ -169,10 +179,16 @@ impl DataDemand {
         &self.row_columns
     }
 
-    /// Columns named by an inserted row and its subsequent readback.
+    /// Columns named by data readback, including omitted defaulted cells.
     #[must_use]
     pub fn data_columns(&self) -> &[String] {
         &self.data_columns
+    }
+
+    /// Columns an INSERT can explicitly name; omitted cells use their defaults.
+    #[must_use]
+    pub fn insert_columns(&self) -> &[String] {
+        &self.insert_columns
     }
 }
 
@@ -182,3 +198,46 @@ impl DataDemand {
 /// table, and a grant a careful DBA puts there is invisible to a schema-scoped
 /// question.
 pub type DataTables = BTreeMap<ObjectName, DataDemand>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{Column, DataMode, PrimaryKey, Row, TableData, Value};
+
+    #[test]
+    fn insert_demand_keeps_explicit_cells_separate_from_full_readback() {
+        let mut table = Table::default();
+        for name in ["id", "label", "note"] {
+            table
+                .columns
+                .insert(name.into(), Column::new("integer".parse().unwrap()));
+        }
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        table.data = Some(TableData {
+            mode: DataMode::Ensure,
+            rows: [("1".into(), Row::default())].into(),
+        });
+        let omitted = DataDemand::of(&table).unwrap();
+        assert_eq!(omitted.insert_columns(), ["id"]);
+        assert_eq!(omitted.data_columns(), ["id", "label", "note"]);
+        assert_eq!(omitted.row_columns(), ["label", "note"]);
+        let rows = &mut table.data.as_mut().unwrap().rows;
+        rows.insert("2".into(), Row([("note".into(), Value::Null)].into()));
+        rows.insert("3".into(), Row([("label".into(), Value::Int(3))].into()));
+        assert_eq!(
+            DataDemand::of(&table).unwrap().insert_columns(),
+            ["id", "label", "note"]
+        );
+        table.data.as_mut().unwrap().rows.clear();
+        assert!(
+            DataDemand::of(&table).is_none(),
+            "empty ensure has no statement demand"
+        );
+        table.data.as_mut().unwrap().mode = DataMode::Exact;
+        let exact = DataDemand::of(&table).unwrap();
+        assert!(!exact.inserts() && !exact.corrects() && exact.removes());
+    }
+}

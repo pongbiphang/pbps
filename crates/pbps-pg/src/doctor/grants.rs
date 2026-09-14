@@ -5,7 +5,11 @@ use std::collections::BTreeSet;
 use pbps_db::{Conn, DbError, Param, doctor::Ask};
 use pbps_model::{GrantTarget, ModuleId, ObjectName, Permission};
 
-use super::{Gap, Securable, flag, text};
+use super::{
+    Gap, Securable, flag,
+    identity::{Identity, Table},
+    text,
+};
 
 const WHY: &str =
     "changing a managed role's grant needs ownership or this privilege with grant option";
@@ -32,11 +36,41 @@ pub(super) struct Read {
     pub absent_schemas: BTreeSet<String>,
 }
 
-pub(super) async fn missing(conn: &mut Conn, ask: &Ask<'_>) -> Result<Read, DbError> {
+pub(super) async fn missing(
+    conn: &mut Conn,
+    ask: &Ask<'_>,
+    identities: &Identity<'_>,
+) -> Result<Read, DbError> {
     let granted = ask.granted;
-    let mut demands = granted.permissions.clone();
-    let mut managed_tables = granted.managed_tables.clone();
-    managed_tables.extend(ask.managed_tables.iter().cloned());
+    let mut demands = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
+    let mut recorded_targets = BTreeSet::new();
+    for (target, permissions) in &granted.permissions {
+        let target = if let GrantTarget::Object(name) = target {
+            match identities.table(name) {
+                Table::Recorded(current) => {
+                    recorded_targets.insert(GrantTarget::Object(current.clone()));
+                    GrantTarget::Object(current)
+                }
+                // The old occupant belongs to another identity. The new
+                // table's creator retains grant options even after revoking
+                // ordinary DML from themselves; never inspect that occupant.
+                Table::Future => continue,
+                Table::Unrecorded(_) => target.clone(),
+            }
+        } else {
+            target.clone()
+        };
+        demands
+            .entry(target)
+            .or_default()
+            .extend(permissions.iter().copied());
+    }
+    let mut managed_tables: BTreeSet<_> = granted
+        .managed_tables
+        .iter()
+        .chain(ask.managed_tables)
+        .filter_map(|name| identities.table(name).name().cloned())
+        .collect();
     let mut managed_modules = granted.managed_modules.clone();
     let mut roles: BTreeSet<String> = granted.roles.iter().cloned().collect();
     // Removed declarations still produce REVOKE statements. As in the other
@@ -76,7 +110,15 @@ pub(super) async fn missing(conn: &mut Conn, ask: &Ask<'_>) -> Result<Read, DbEr
                 });
                 continue;
             }
-            for row in crate::catalog::canonical_query(conn, &query, &params).await? {
+            let rows = crate::catalog::canonical_query(conn, &query, &params).await?;
+            if rows.is_empty() && recorded_targets.contains(target) {
+                gaps.push(Gap {
+                    permission,
+                    why: "the recorded grant target is absent; its grant authority cannot be established".to_owned(),
+                    securable: securable.clone(),
+                });
+            }
+            for row in rows {
                 if let GrantTarget::Schema(schema) = target
                     && !flag(&row, "present")?
                 {

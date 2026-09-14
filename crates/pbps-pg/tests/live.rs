@@ -6133,7 +6133,7 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read what this role holds");
 
@@ -6181,7 +6181,7 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
     state::ensure_tables(&mut theirs)
         .await
         .expect("the role can now create the ledger it was told it could not");
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read again");
     assert_eq!(
@@ -6240,7 +6240,11 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         ))
         .await
         .unwrap();
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &demanded).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &demanded, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert!(
         gaps.iter()
             .any(|g| g.permission == "INSERT" && g.securable() == "TABLE \"app\".\"customer\""),
@@ -6279,7 +6283,11 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         ))
         .await
         .unwrap();
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &demanded).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &demanded, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert!(
         gaps.is_empty(),
         "column grants cover exactly the data writes, and the view grant can be delegated: {gaps:?}"
@@ -6291,7 +6299,11 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         ))
         .await
         .unwrap();
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &demanded).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &demanded, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         gaps.len(),
         1,
@@ -6310,7 +6322,11 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         data: &empty_exact,
         ..demanded
     };
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask_exact).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &ask_exact, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         gaps.len(),
         1,
@@ -6323,7 +6339,11 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         ))
         .await
         .unwrap();
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask_exact).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &ask_exact, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         gaps.len(),
         1,
@@ -6393,7 +6413,11 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         granted: &granted,
         data: &Default::default(),
     };
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         gaps.len(),
         3,
@@ -6420,7 +6444,7 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         ..ask
     };
     let gaps = doctor::missing(
-        &doctor::permissions(&mut theirs, &catalog_only)
+        &doctor::permissions(&mut theirs, &catalog_only, &IdsFile::default())
             .await
             .unwrap(),
     );
@@ -6443,7 +6467,11 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         ))
         .await
         .unwrap();
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert!(
         gaps.is_empty(),
         "inherited grant authority is effective: {gaps:?}"
@@ -6474,7 +6502,11 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         .execute(&format!("REVOKE {authority} FROM {deployer}"))
         .await
         .unwrap();
-    let gaps = doctor::missing(&doctor::permissions(&mut theirs, &ask).await.unwrap());
+    let gaps = doctor::missing(
+        &doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+            .await
+            .unwrap(),
+    );
     assert_eq!(
         gaps.len(),
         3,
@@ -6512,7 +6544,9 @@ async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() 
                 Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
                     .await
                     .unwrap();
-            let held = doctor::permissions(&mut hidden, &ask).await.unwrap();
+            let held = doctor::permissions(&mut hidden, &ask, &IdsFile::default())
+                .await
+                .unwrap();
             assert!(
                 held.ledger_migration_needed,
                 "world-readable metadata still proves the columns are absent"
@@ -6552,7 +6586,9 @@ async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() 
             Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
                 .await
                 .unwrap();
-        let held = doctor::permissions(&mut theirs, &ask).await.unwrap();
+        let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+            .await
+            .unwrap();
         assert_eq!(held.ledger_migration_needed, !migrated);
         let gaps = doctor::missing(&held);
         if !owner && !migrated {
@@ -6579,7 +6615,9 @@ async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() 
     let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
         .await
         .unwrap();
-    let error = doctor::permissions(&mut theirs, &ask).await.unwrap_err();
+    let error = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+        .await
+        .unwrap_err();
     assert_eq!(sqlstate(&error), "42501", "{error:?}");
     db.drop().await;
 }
@@ -6659,7 +6697,7 @@ async fn a_role_that_may_write_the_ledger_and_not_create_it_deploys() {
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read permissions");
     assert_eq!(doctor::missing(&held), Vec::new(), "{held:?}");
@@ -6704,7 +6742,7 @@ async fn a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read permissions");
     // The premise: the table privileges really do read as held.
@@ -6776,7 +6814,7 @@ async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_nee
         referenced: std::slice::from_ref(&parent),
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read permissions");
     // The premise: the target is seen at all. Read at `r` alone it was absent,
@@ -6806,7 +6844,7 @@ async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_nee
         ))
         .await
         .expect("grant what the report named");
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read again");
     let gaps = doctor::missing(&held);
@@ -6899,7 +6937,7 @@ async fn a_column_grant_covering_exactly_the_keys_columns_reports_no_gap() {
         referenced: std::slice::from_ref(&parent),
         referenced_columns: &referenced_columns,
     };
-    let held = doctor::permissions(&mut theirs, &ask)
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
         .expect("read permissions");
     let gaps = doctor::missing(&held);
@@ -6936,7 +6974,7 @@ async fn a_managed_schema_that_is_absent_is_reported_as_absent_and_not_as_a_gap(
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
     };
-    let held = doctor::permissions(&mut db.conn, &ask)
+    let held = doctor::permissions(&mut db.conn, &ask, &IdsFile::default())
         .await
         .expect("read permissions");
     assert!(held.absent_schemas.contains("not_here"), "{held:?}");
@@ -24506,6 +24544,7 @@ async fn grant_diagnosis(conn: &mut Conn, granted: &pbps_db::doctor::GrantTarget
             granted,
             data: &Default::default(),
         },
+        &IdsFile::default(),
     )
     .await
     .unwrap()
@@ -24748,6 +24787,7 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
                 granted: &from_ask,
                 data: &Default::default(),
             },
+            &IdsFile::default(),
         )
         .await
         .unwrap(),
@@ -24887,4 +24927,485 @@ async fn doctor_reports_absent_external_schema_grant_targets_before_authority() 
     assert_eq!(gaps[0].permission, "USAGE WITH GRANT OPTION");
     assert!(authorized.absent_schemas.is_empty());
     assert!(doctor::missing(&authorized).is_empty(), "{authorized:?}");
+}
+
+fn doctor_data_table(rows: &[(&str, Row)]) -> Table {
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut label = Column::new("text".parse().unwrap());
+    label.default = Some("'seed'".into());
+    table.columns.insert("label".into(), label);
+    table.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    with_data(&mut table, DataMode::Ensure, rows);
+    table
+}
+
+async fn doctor_data_diagnosis(
+    conn: &mut Conn,
+    name: &str,
+    table: &Table,
+    ids: &IdsFile,
+) -> Vec<doctor::Gap> {
+    let data = [(
+        name.parse().unwrap(),
+        pbps_db::doctor::DataDemand::of(table).unwrap(),
+    )]
+    .into_iter()
+    .collect();
+    doctor::permissions(
+        conn,
+        &doctor::Ask {
+            managed_schemas: &[],
+            managed_tables: &[],
+            referenced: &[],
+            referenced_columns: &Default::default(),
+            granted: &Default::default(),
+            data: &data,
+        },
+        ids,
+    )
+    .await
+    .unwrap()
+    .declaration_gaps
+}
+
+fn doctor_data_insert(name: &str, key: &str, row: Row) -> pbps_model::Change {
+    pbps_model::Change::InsertRow {
+        table: name.parse().unwrap(),
+        key_column: "id".into(),
+        identity_key: false,
+        key: key.into(),
+        row,
+        defaults: [("label".into(), "'seed'".into())].into(),
+        types: [("label".into(), "text".parse().unwrap())].into(),
+    }
+}
+
+async fn doctor_execute_change(
+    conn: &mut Conn,
+    change: &pbps_model::Change,
+) -> Result<(), DbError> {
+    for statement in Postgres::new().emit(change, Default::default()).unwrap() {
+        conn.execute(&statement.sql).await?;
+    }
+    Ok(())
+}
+
+async fn doctor_record_ids(conn: &mut Conn, ids: &IdsFile) {
+    state::record(
+        conn,
+        &StateSnapshot::new(
+            StateKind::Baseline,
+            Schema::default(),
+            ids.clone(),
+            "doctor-live",
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_data_insert_demands_only_the_union_of_explicit_cells() {
+    let mut db = TestDb::create("doctor_data331").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "data331").await;
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.t(id integer PRIMARY KEY, label text DEFAULT 'seed');
+        GRANT SELECT, UPDATE ON public.t TO {role}; GRANT INSERT(id) ON public.t TO {role}"
+        ))
+        .await
+        .unwrap();
+    let omitted = doctor_data_table(&[("1", Row::default())]);
+    let explicit_row = row(&[("label", Value::Text("written".into()))]);
+    let explicit = doctor_data_table(&[("2", explicit_row.clone())]);
+    let mixed = doctor_data_table(&[("1", Row::default()), ("2", explicit_row.clone())]);
+    let before =
+        doctor_data_diagnosis(&mut theirs, "public.t", &omitted, &IdsFile::default()).await;
+    let explicit_gap =
+        doctor_data_diagnosis(&mut theirs, "public.t", &explicit, &IdsFile::default()).await;
+    let mixed_gap =
+        doctor_data_diagnosis(&mut theirs, "public.t", &mixed, &IdsFile::default()).await;
+    let insert_omitted = doctor_execute_change(
+        &mut theirs,
+        &doctor_data_insert("public.t", "1", Row::default()),
+    )
+    .await;
+    let insert_explicit = doctor_execute_change(
+        &mut theirs,
+        &doctor_data_insert("public.t", "2", explicit_row.clone()),
+    )
+    .await;
+    db.conn
+        .execute(&format!("GRANT INSERT(label) ON public.t TO {role}"))
+        .await
+        .unwrap();
+    let restored =
+        doctor_data_diagnosis(&mut theirs, "public.t", &mixed, &IdsFile::default()).await;
+    let written = doctor_execute_change(
+        &mut theirs,
+        &doctor_data_insert("public.t", "2", explicit_row),
+    )
+    .await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    assert!(before.is_empty(), "{before:?}");
+    for gaps in [explicit_gap, mixed_gap] {
+        assert_eq!(
+            gaps.iter().map(|g| g.permission).collect::<Vec<_>>(),
+            ["INSERT"]
+        );
+    }
+    assert!(insert_omitted.is_ok(), "{insert_omitted:?}");
+    assert_eq!(sqlstate(&insert_explicit.unwrap_err()), "42501");
+    assert!(restored.is_empty(), "{restored:?}");
+    assert!(written.is_ok(), "{written:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_data_column_acl_follows_recorded_identity_not_a_reused_name() {
+    let mut db = TestDb::create("doctor_data334").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "data334").await;
+    db.conn.execute(&format!("CREATE TABLE public.t(id integer PRIMARY KEY, old_label text DEFAULT 'seed', label text);
+        ALTER TABLE public.t OWNER TO {role}; REVOKE INSERT, UPDATE ON public.t FROM {role};
+        GRANT INSERT(id, old_label), UPDATE(old_label) ON public.t TO {role}")).await.unwrap();
+    let tuid = pbps_model::Uid::generate(pbps_model::UidKind::Table);
+    let cuid = pbps_model::Uid::generate(pbps_model::UidKind::Column);
+    let mut recorded = IdsFile::default();
+    recorded.tables.insert(tuid, "public.t".parse().unwrap());
+    recorded.columns.insert(
+        cuid.clone(),
+        pbps_model::ColumnRef {
+            table: "public.t".parse().unwrap(),
+            name: "old_label".into(),
+        },
+    );
+    doctor_record_ids(&mut theirs, &recorded).await;
+    let mut project = recorded.clone();
+    project.columns.get_mut(&cuid).unwrap().name = "label".into();
+    let cells = row(&[("label", Value::Text("written".into()))]);
+    let declared = doctor_data_table(&[("1", cells.clone())]);
+    let before = doctor_data_diagnosis(&mut theirs, "public.t", &declared, &project).await;
+    db.conn
+        .execute(&format!(
+            "REVOKE INSERT(old_label), UPDATE(old_label) ON public.t FROM {role};
+        GRANT INSERT(label), UPDATE(label) ON public.t TO {role}"
+        ))
+        .await
+        .unwrap();
+    let decoy = doctor_data_diagnosis(&mut theirs, "public.t", &declared, &project).await;
+    db.conn.execute(&format!("GRANT INSERT(old_label), UPDATE(old_label) ON public.t TO {role}; ALTER TABLE public.t DROP COLUMN label")).await.unwrap();
+    let restored = doctor_data_diagnosis(&mut theirs, "public.t", &declared, &project).await;
+    let rename = doctor_execute_change(
+        &mut theirs,
+        &pbps_model::Change::RenameColumn {
+            uid: cuid,
+            table: "public.t".parse().unwrap(),
+            from: "old_label".into(),
+            to: "label".into(),
+        },
+    )
+    .await;
+    let inserted =
+        doctor_execute_change(&mut theirs, &doctor_data_insert("public.t", "1", cells)).await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    assert!(before.is_empty(), "{before:?}");
+    assert_eq!(
+        decoy.iter().map(|g| g.permission).collect::<Vec<_>>(),
+        ["INSERT", "UPDATE"]
+    );
+    assert!(restored.is_empty(), "{restored:?}");
+    assert!(rename.is_ok(), "{rename:?}");
+    assert!(inserted.is_ok(), "{inserted:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_data_table_acl_follows_recorded_identity_and_retains_missing_objects() {
+    let mut db = TestDb::create("doctor_data335").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "data335").await;
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.old_name(id integer PRIMARY KEY, label text DEFAULT 'seed');
+        CREATE TABLE public.new_name(LIKE public.old_name INCLUDING ALL);
+        ALTER TABLE public.old_name OWNER TO {role}; ALTER TABLE public.new_name OWNER TO {role};
+        REVOKE INSERT ON public.old_name FROM {role}"
+        ))
+        .await
+        .unwrap();
+    let uid = pbps_model::Uid::generate(pbps_model::UidKind::Table);
+    let mut recorded = IdsFile::default();
+    recorded
+        .tables
+        .insert(uid.clone(), "public.old_name".parse().unwrap());
+    doctor_record_ids(&mut theirs, &recorded).await;
+    let mut project = recorded.clone();
+    project
+        .tables
+        .insert(uid.clone(), "public.new_name".parse().unwrap());
+    let declared = doctor_data_table(&[("1", Row::default())]);
+    let before = doctor_data_diagnosis(&mut theirs, "public.new_name", &declared, &project).await;
+    let refused = theirs
+        .execute("INSERT INTO public.old_name(id) VALUES(1)")
+        .await;
+    let absent = doctor_data_diagnosis(&mut theirs, "public.future", &declared, &project).await;
+    db.conn
+        .execute(&format!(
+            "GRANT INSERT ON public.old_name TO {role}; DROP TABLE public.new_name"
+        ))
+        .await
+        .unwrap();
+    let restored = doctor_data_diagnosis(&mut theirs, "public.new_name", &declared, &project).await;
+    let rename = doctor_execute_change(
+        &mut theirs,
+        &pbps_model::Change::RenameTable {
+            uid,
+            from: "public.old_name".parse().unwrap(),
+            to: "public.new_name".parse().unwrap(),
+        },
+    )
+    .await;
+    let inserted = doctor_execute_change(
+        &mut theirs,
+        &doctor_data_insert("public.new_name", "1", Row::default()),
+    )
+    .await;
+    // The ledger still records old_name. Its unexpected absence must not turn
+    // into a future table with harmless default ACLs.
+    let missing = doctor_data_diagnosis(&mut theirs, "public.new_name", &declared, &project).await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    assert_eq!(
+        before
+            .iter()
+            .map(|g| (g.permission, g.securable()))
+            .collect::<Vec<_>>(),
+        [("INSERT", "TABLE \"public\".\"old_name\"".into())]
+    );
+    assert_eq!(sqlstate(&refused.unwrap_err()), "42501");
+    assert!(absent.is_empty(), "{absent:?}");
+    assert!(restored.is_empty(), "{restored:?}");
+    assert!(rename.is_ok(), "{rename:?}");
+    assert!(inserted.is_ok(), "{inserted:?}");
+    assert_eq!(missing.len(), 3, "{missing:?}");
+    assert!(
+        missing
+            .iter()
+            .all(|g| g.why.contains("recorded data table is absent"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_data_future_tables_use_current_role_global_and_schema_defaults() {
+    let mut db = TestDb::create("doctor_data336").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "data336").await;
+    let parent = least_privilege_role(&mut db, "data336_parent").await;
+    db.conn.execute(&format!("CREATE SCHEMA app; CREATE SCHEMA other; GRANT USAGE, CREATE ON SCHEMA app, other TO {role};
+        GRANT {parent} TO {role}; ALTER DEFAULT PRIVILEGES FOR ROLE {parent} REVOKE INSERT ON TABLES FROM {parent}")).await.unwrap();
+    let declared = doctor_data_table(&[("1", Row::default())]);
+    let untouched =
+        doctor_data_diagnosis(&mut theirs, "app.untouched", &declared, &IdsFile::default()).await;
+    theirs
+        .execute(&format!(
+            "ALTER DEFAULT PRIVILEGES REVOKE INSERT ON TABLES FROM {role}"
+        ))
+        .await
+        .unwrap();
+    let revoked =
+        doctor_data_diagnosis(&mut theirs, "app.revoked", &declared, &IdsFile::default()).await;
+    theirs
+        .execute("CREATE TABLE app.revoked(id integer PRIMARY KEY, label text DEFAULT 'seed')")
+        .await
+        .unwrap();
+    let refused = doctor_execute_change(
+        &mut theirs,
+        &doctor_data_insert("app.revoked", "1", Row::default()),
+    )
+    .await;
+    theirs
+        .execute(&format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT INSERT ON TABLES TO {parent}"
+        ))
+        .await
+        .unwrap();
+    let inherited =
+        doctor_data_diagnosis(&mut theirs, "app.inherited", &declared, &IdsFile::default()).await;
+    let other = doctor_data_diagnosis(
+        &mut theirs,
+        "other.uncovered",
+        &declared,
+        &IdsFile::default(),
+    )
+    .await;
+    theirs
+        .execute("CREATE TABLE app.inherited(id integer PRIMARY KEY, label text DEFAULT 'seed')")
+        .await
+        .unwrap();
+    let inserted = doctor_execute_change(
+        &mut theirs,
+        &doctor_data_insert("app.inherited", "1", Row::default()),
+    )
+    .await;
+    theirs
+        .execute(&format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE INSERT ON TABLES FROM {parent};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT INSERT ON TABLES TO PUBLIC"
+        ))
+        .await
+        .unwrap();
+    let public = doctor_data_diagnosis(
+        &mut theirs,
+        "app.public_right",
+        &declared,
+        &IdsFile::default(),
+    )
+    .await;
+    // Reusing the physical name of a departing identity still needs the new
+    // table's default ACL, even while an older table at that name allows DML.
+    theirs
+        .execute("CREATE TABLE other.reused(id integer PRIMARY KEY, label text DEFAULT 'seed')")
+        .await
+        .unwrap();
+    db.conn
+        .execute(&format!("GRANT INSERT ON other.reused TO {role}"))
+        .await
+        .unwrap();
+    let uid = pbps_model::Uid::generate(pbps_model::UidKind::Table);
+    let mut recorded = IdsFile::default();
+    recorded
+        .tables
+        .insert(uid.clone(), "other.reused".parse().unwrap());
+    doctor_record_ids(&mut theirs, &recorded).await;
+    let mut project = recorded.clone();
+    project.tables.insert(uid, "other.moved".parse().unwrap());
+    project.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "other.reused".parse().unwrap(),
+    );
+    let reused = doctor_data_diagnosis(&mut theirs, "other.reused", &declared, &project).await;
+    theirs
+        .execute(&format!(
+            "ALTER DEFAULT PRIVILEGES GRANT INSERT ON TABLES TO {role}"
+        ))
+        .await
+        .unwrap();
+    let restored = doctor_data_diagnosis(&mut theirs, "other.restored", &declared, &project).await;
+    cleanup_role(&mut db, &parent).await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    for gaps in [untouched, inherited, public, restored] {
+        assert!(gaps.is_empty(), "{gaps:?}");
+    }
+    for gaps in [revoked, other, reused] {
+        assert_eq!(
+            gaps.iter().map(|g| g.permission).collect::<Vec<_>>(),
+            ["INSERT"],
+            "{gaps:?}"
+        );
+    }
+    assert_eq!(sqlstate(&refused.unwrap_err()), "42501");
+    assert!(inserted.is_ok(), "{inserted:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_data_grant_targets_resolve_the_same_pending_table_identity() {
+    let mut db = TestDb::create("doctor_data382").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "data382").await;
+    let recipient = least_privilege_role(&mut db, "data382_reader").await;
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.old_name(id integer); CREATE TABLE public.new_name(id integer);
+        GRANT SELECT ON public.new_name TO {role} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    let uid = pbps_model::Uid::generate(pbps_model::UidKind::Table);
+    let mut recorded = IdsFile::default();
+    recorded
+        .tables
+        .insert(uid.clone(), "public.old_name".parse().unwrap());
+    doctor_record_ids(&mut theirs, &recorded).await;
+    let mut project = recorded.clone();
+    project
+        .tables
+        .insert(uid, "public.new_name".parse().unwrap());
+    let grants = pbps_db::doctor::GrantTargets {
+        permissions: [(
+            "public.new_name".parse().unwrap(),
+            [pbps_model::Permission::Select].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        referenced_columns: &Default::default(),
+        granted: &grants,
+        data: &Default::default(),
+    };
+    let before = doctor::permissions(&mut theirs, &ask, &project)
+        .await
+        .unwrap()
+        .declaration_gaps;
+    let refused = theirs.query("SELECT * FROM public.old_name").await;
+    db.conn.execute(&format!("GRANT SELECT ON public.old_name TO {role} WITH GRANT OPTION; DROP TABLE public.new_name")).await.unwrap();
+    let restored = doctor::permissions(&mut theirs, &ask, &project)
+        .await
+        .unwrap()
+        .declaration_gaps;
+    db.conn
+        .execute("ALTER TABLE public.old_name RENAME TO new_name")
+        .await
+        .unwrap();
+    theirs
+        .execute(&format!("GRANT SELECT ON public.new_name TO {recipient}"))
+        .await
+        .unwrap();
+    let granted = truth(
+        &mut db,
+        &format!("SELECT has_table_privilege('{recipient}', 'public.new_name', 'SELECT')"),
+    )
+    .await;
+    let missing = doctor::permissions(&mut theirs, &ask, &project)
+        .await
+        .unwrap()
+        .declaration_gaps;
+    cleanup_role(&mut db, &recipient).await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    assert_eq!(
+        before
+            .iter()
+            .map(|g| (g.permission, g.securable()))
+            .collect::<Vec<_>>(),
+        [(
+            "SELECT WITH GRANT OPTION",
+            "TABLE \"public\".\"old_name\"".into()
+        )]
+    );
+    assert_eq!(
+        sqlstate(&refused.err().expect("SELECT must be refused")),
+        "42501"
+    );
+    assert!(restored.is_empty(), "{restored:?}");
+    assert!(granted);
+    assert!(
+        missing
+            .iter()
+            .any(|g| g.why.contains("recorded grant target is absent")),
+        "{missing:?}"
+    );
 }

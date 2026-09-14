@@ -54,6 +54,7 @@ use crate::state::{LEDGER_SCHEMA, LOCK_TABLE, STATE_TABLE};
 
 mod data;
 mod grants;
+mod identity;
 mod referenced;
 
 pub use pbps_db::doctor::Ask;
@@ -581,8 +582,37 @@ fn values_list(rows: usize, columns: usize) -> String {
 ///
 /// Reads the schemas, managed and ledger tables, referenced targets, and the
 /// declaration-specific data and grant demands. Every requested name is bound.
-pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError> {
+/// Project ids connect pending table/column names to this environment's last
+/// recorded identities; permission gaps name the current grantable securable
+/// (DECISIONS 484). A freed name belongs to a future table, not its old occupant.
+pub async fn permissions(
+    conn: &mut Conn,
+    ask: &Ask<'_>,
+    project_ids: &pbps_model::IdsFile,
+) -> Result<Held, DbError> {
     let mut held = Held::default();
+    // Without project identities there is nothing to resolve. When they are
+    // present, an unreadable recorded mapping must not become a new-table ACL.
+    let recorded_ids = if project_ids.tables.is_empty() && project_ids.columns.is_empty() {
+        pbps_model::IdsFile::default()
+    } else {
+        match crate::state::latest(conn).await {
+            Ok(recorded) => recorded.map(|state| state.snapshot.ids).unwrap_or_default(),
+            Err(pbps_db::ledger::LedgerError::NotInitialized) => pbps_model::IdsFile::default(),
+            Err(pbps_db::ledger::LedgerError::Db(error)) => {
+                return Err(error.context("cannot read recorded identities for doctor"));
+            }
+            Err(error) => {
+                return Err(DbError::BadRow(format!(
+                    "cannot resolve doctor identities from the recorded state: {error}"
+                )));
+            }
+        }
+    };
+    let identities = identity::Identity {
+        project: project_ids,
+        recorded: &recorded_ids,
+    };
 
     // The ledger's schema is asked about alongside the managed ones and kept
     // apart in the answer: a project that manages `public` needs both answers,
@@ -619,7 +649,17 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
     }
 
     let ledger = ledger_tables();
-    let mut tables: Vec<ObjectName> = ask.managed_tables.to_vec();
+    held.absent_tables.extend(
+        ask.managed_tables
+            .iter()
+            .filter(|name| matches!(identities.table(name), identity::Table::Future))
+            .cloned(),
+    );
+    let mut tables: Vec<ObjectName> = ask
+        .managed_tables
+        .iter()
+        .filter_map(|name| identities.table(name).name().cloned())
+        .collect();
     tables.extend(ledger.iter().cloned());
     for (object, present, rights) in read_tables(conn, &tables, &MANAGED_KINDS).await? {
         let is_ledger = ledger.contains(&object);
@@ -654,8 +694,8 @@ pub async fn permissions(conn: &mut Conn, ask: &Ask<'_>) -> Result<Held, DbError
     referenced::fill(conn, &mut held.referenced_objects, ask.referenced_columns).await?;
 
     held.declaration_gaps
-        .extend(data::missing(conn, ask.data).await?);
-    let grants = grants::missing(conn, ask).await?;
+        .extend(data::missing(conn, ask.data, &identities).await?);
+    let grants = grants::missing(conn, ask, &identities).await?;
     held.declaration_gaps.extend(grants.gaps);
     held.absent_schemas.extend(grants.absent_schemas);
     Ok(held)

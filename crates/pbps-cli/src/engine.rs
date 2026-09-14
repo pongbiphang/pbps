@@ -751,9 +751,8 @@ pub struct Permissions {
 /// and the report offers each as the securable a `GRANT` names.
 ///
 /// `project_ids` is the project's own identity mapping — every name in `ask`
-/// is the declared one, and only SQL Server's own permission questions (see
-/// `pbps_mssql::doctor::permissions`) need to resolve it against a pending
-/// rename this environment may not have caught up to yet (issue #133).
+/// is the declared one. Both engines resolve it against this environment's
+/// recorded mapping before asking about a pending rename's current object.
 pub async fn permissions(
     conn: &mut Conn,
     project_ids: &IdsFile,
@@ -784,7 +783,7 @@ pub async fn permissions(
             })
         }
         Driver::Postgres => {
-            let held = pbps_pg::doctor::permissions(conn, ask).await?;
+            let held = pbps_pg::doctor::permissions(conn, ask, project_ids).await?;
             Ok(Permissions {
                 gaps: pbps_pg::doctor::missing(&held)
                     .into_iter()
