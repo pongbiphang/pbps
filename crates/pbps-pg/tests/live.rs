@@ -7144,6 +7144,56 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
     conn.drop().await;
 }
 
+/// A non-ASCII separator to Rust is an identifier byte to PostgreSQL. A
+/// declaration edit must restate the view instead of silently retaining its
+/// old output column, in both directions (issue #231).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn non_ascii_identifier_edits_plan_and_apply_a_module_change() {
+    let s = emit_schema("definition_whitespace");
+    let id: pbps_model::ModuleId = format!("{s}.v").parse().unwrap();
+    let pg = Postgres::new();
+    let mut conn = TestDb::create("definition_whitespace").await;
+    fresh(&mut conn, &s).await;
+    let mut before = Schema::default();
+    before.modules.insert(
+        id.clone(),
+        module(pbps_model::ModuleKind::View, "SELECT 1 AS x"),
+    );
+    let ids = mint_ids(&before, &IdsFile::default(), &[]);
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &before, &ids),
+    )
+    .await;
+
+    for alias in ["x\u{a0}", "x", "a\u{a0}b", "\u{2003}x", "x\u{2028}", "x"] {
+        let mut after = before.clone();
+        after.modules.get_mut(&id).unwrap().definition = format!("SELECT 1 AS {alias}");
+        let changes = plan(&before, &ids, &after, &ids);
+        assert!(
+            matches!(changes.changes.as_slice(), [change]
+            if matches!(&change.change, pbps_model::Change::AlterModule { id: changed, .. } if changed == &id)),
+            "the declaration changed the output column to {alias:?}: {:?}",
+            changes.changes
+        );
+        apply(&mut conn, &pg, &changes).await;
+        assert_eq!(text(&mut conn, &format!(
+            "SELECT attname::text FROM pg_catalog.pg_attribute WHERE attrelid = '{s}.v'::regclass AND attnum = 1"
+        )).await, alias);
+        assert_eq!(number(&mut conn, &format!("SELECT * FROM {s}.v")).await, 1);
+        assert!(plan(&after, &ids, &after, &ids).changes.is_empty());
+        before = after;
+    }
+    // Real layout remains a no-op, including the engine's vertical tab.
+    let mut layout = before.clone();
+    layout.modules.get_mut(&id).unwrap().definition = "\tSELECT\x0b1\r\nAS  x\x0c".into();
+    assert!(plan(&before, &ids, &layout, &ids).changes.is_empty());
+    drop_schema(&mut conn, &s).await;
+    conn.drop().await;
+}
+
 /// ADR-0009 §1's whole reason for a typed `ModuleId`: on this engine a name is
 /// not an identity. Two overloads are declared, applied and read back as **two**
 /// objects, and each `DROP` names exactly one of them.

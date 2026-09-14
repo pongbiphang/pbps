@@ -46,6 +46,7 @@ mod emit;
 /// `"` quotes an identifier and `[` does not, `E'…'` is an escape string and
 /// `$tag$…$tag$` a literal closed only by its own tag.
 pub(crate) const LEXICON: Lexicon = Lexicon {
+    whitespace_is_ascii: true,
     quoted_identifiers: &[('"', '"')],
     escape_strings: true,
     dollar_quoted_strings: true,

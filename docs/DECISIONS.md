@@ -11969,3 +11969,37 @@ SPEC is in sync with all of these.
      foreign-key drops as well, which is the reordering 467 records as unsafe
      while a pinned one is present. Filed as issue #536 rather than widened into
      this one.
+
+475. **Definition layout follows the engine's whitespace class.** The shared
+     normalizer used Unicode trim and collapse for both engines. PostgreSQL
+     treats the non-ASCII characters in Unicode White_Space as identifier
+     bytes: changing `SELECT 1 AS x` to `SELECT 1 AS x\u{a0}` changes the view's
+     output column, and folding the suffix away made the differ emit no
+     `AlterModule` (issue #231). The reverse edit was missed too.
+
+     Measured on PostgreSQL 18.6 and SQL Server 17.0.4075.5, for every character
+     in Unicode White_Space: the six ASCII separators (space, tab, CR, LF, FF
+     and VT) separate tokens on both engines. Every non-ASCII member remains
+     part of a PostgreSQL alias, including at its end; SQL Server treats every
+     tested member as a separator. `SELECT 1 AS a<character>b` is one alias on
+     PostgreSQL for those non-ASCII characters, while SQL Server refuses the
+     two aliases. Result-column metadata pins the actual name, rather than a
+     display that could hide trailing spaces. PostgreSQL rejects those same
+     characters between `1` and `+2`; SQL Server accepts them.
+
+     `Lexicon` (formerly `ScanSettings`) therefore carries
+     `whitespace_is_ascii`: true for PostgreSQL, false for SQL Server. The
+     normalizer uses it for the outer trim and code-region collapse. The
+     predicate intersects Unicode White_Space with ASCII when required;
+     `is_ascii_whitespace` alone omits VT, which both engines accepted in the
+     measurement. The synthetic ANSI lexicon retains its previous whitespace
+     behavior. No lexical-name scan or creation/rebind ordering changes here.
+
+     Inside literals and quoted identifiers, whitespace remains data. Inside
+     comments, the existing layout collapse remains safe and unchanged; the
+     CR/LF line terminator and nested-block structure still decide where code
+     resumes. This is a comparison rule, not a rewrite of the emitted body.
+     A live view regression plans and applies identifier edits in both
+     directions, verifies the actual output name, and leaves real indentation
+     changes as an empty plan. The shared unit test pins both engine settings
+     across the measured character set and preserves quoted negative cases.

@@ -862,6 +862,15 @@ attempt will differ from your first.
 
 ## The host language's whitespace, standing in for the engine's
 
+The module differ had the same character-class mistake in its shared definition
+normalizer. `SELECT 1 AS x` and `SELECT 1 AS x\u{a0}` compared equal after
+Unicode trim, so editing the declaration did not plan an `AlterModule` and the
+view retained its old output-column name. PostgreSQL keeps that byte in the
+identifier; SQL Server treats it as a separator. Measure each engine before
+choosing a shared character class, and apply the answer to both the outer trim
+and the code-region collapse. Rust's narrower `is_ascii_whitespace` is not the
+whole PostgreSQL answer either: the engine also accepts vertical tab (475).
+
 The same shape as the section above, one guard along. The unresolved-default
 guard asks whether a declared default is one bare literal, and a string
 constant may be *continued*: two quoted pieces separated by whitespace with a
