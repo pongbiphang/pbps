@@ -2858,13 +2858,71 @@ fn every_plan_opens_with_a_summary_of_its_size_and_risks() {
     assert!(out.contains("2 change(s) across 1 table(s)"), "{out}");
     assert!(out.contains("destructive"), "{out}");
     assert!(
-        out.contains("data is lost, and no plan brings it back"),
+        out.contains("data can be lost"),
         "the class must be explained, not just named: {out}"
     );
     // The summary comes before the change list, or it is not a summary.
     let summary_at = out.find("2 change(s) across").unwrap();
     let list_at = out.find("drop column pii").unwrap();
     assert!(summary_at < list_at, "{out}");
+}
+
+#[test]
+fn dropping_a_unique_constraint_explains_data_and_uniqueness_risks() {
+    let d = Demo::new("unique-risk-explanation");
+    d.table(&format!("{ONE_COLUMN}unique:\n  uq_id: [id]\n"));
+    let first = d.run(&["plan"]);
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    d.commit();
+    d.table(ONE_COLUMN);
+    let path = d.dir.join("unique-drop.json");
+    let plan = d.run(&["plan", "--out", path.to_str().unwrap()]);
+    assert_eq!(code(&plan), 0, "{}", stderr(&plan));
+    let out = stdout(&plan);
+    assert!(out.contains("1 change(s)"), "{out}");
+    assert!(out.contains("- unique constraint uq_id"), "{out}");
+    assert!(out.contains("--allow destructive"), "{out}");
+    let summary = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("destructive"))
+        .expect("the destructive class is explained in the summary");
+    let advice = out
+        .lines()
+        .find(|line| line.contains("Some of them are destructive"))
+        .expect("the approval advice explains the destructive risk");
+    for explanation in [summary, advice] {
+        assert!(explanation.contains("data"), "{explanation}");
+        assert!(
+            explanation.contains("uniqueness guarantee"),
+            "{explanation}"
+        );
+        assert!(!explanation.contains("will lose data"), "{explanation}");
+        assert!(!explanation.contains("data is lost"), "{explanation}");
+    }
+    let explained = d.run(&["explain", "--plan", path.to_str().unwrap()]);
+    assert_eq!(code(&explained), 0, "{}", stderr(&explained));
+    assert!(
+        stdout(&explained).contains("uniqueness guarantee"),
+        "{}",
+        stdout(&explained)
+    );
+    let json = d.run(&[
+        "explain",
+        "--plan",
+        path.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&json), 0, "{}", stderr(&json));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    let risks = v["data"]["risks"].as_array().unwrap();
+    assert_eq!(risks.len(), 1, "{v}");
+    assert_eq!(risks[0]["class"], "destructive");
+    let why = risks[0]["why"].as_str().unwrap();
+    assert!(
+        why.contains("data can be lost") && why.contains("uniqueness guarantee"),
+        "{why}"
+    );
 }
 
 /// A plan with nothing risky in it must say so, rather than leaving the reader
@@ -2882,6 +2940,7 @@ fn a_plan_with_no_risk_says_it_needs_no_allow() {
     let out = stdout(&d.run(&["plan"]));
     assert!(out.contains("needs no --allow"), "{out}");
     assert!(!out.contains("needs approval to apply"), "{out}");
+    assert!(!out.contains("uniqueness guarantee"), "{out}");
 }
 
 /// `explain` is for the reviewer at the deployment gate: no checkout, no
@@ -2897,7 +2956,7 @@ fn explain_answers_the_reviewers_questions_without_a_connection() {
 
     // What, why, how, and the exact command that approves it.
     assert!(out.contains("drop column pii"), "{out}");
-    assert!(out.contains("data is lost"), "{out}");
+    assert!(out.contains("data can be lost"), "{out}");
     assert!(
         out.contains("one transaction, all or nothing"),
         "the execution mode must be stated: {out}"
@@ -4933,7 +4992,7 @@ fn explain_still_explains_when_the_environment_variable_is_unset() {
     let out = stdout(&o);
     // The explanation is all there.
     assert!(out.contains("drop column pii"), "{out}");
-    assert!(out.contains("data is lost"), "{out}");
+    assert!(out.contains("data can be lost"), "{out}");
     // And the target is reported as what it is, not silently omitted.
     assert!(out.contains("unconfigured"), "{out}");
     assert!(out.contains("PBPS_EXPLAIN_UNSET"), "{out}");

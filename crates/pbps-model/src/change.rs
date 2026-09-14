@@ -107,7 +107,7 @@ impl RiskClass {
             RiskClass::Rename => {
                 "the old name disappears: views, procedures and any application still using it break"
             }
-            RiskClass::Destructive => "data is lost, and no plan brings it back",
+            RiskClass::Destructive => "data can be lost or a uniqueness guarantee removed",
             RiskClass::Narrowing => {
                 "converting to the new type can change stored values: values may be changed by padding, truncated, or the statement rejected if conversion fails"
             }
@@ -2060,6 +2060,17 @@ mod tests {
         assert_eq!(
             drop_unique().intrinsic_risks(),
             BTreeSet::from([RiskClass::Destructive])
+        );
+    }
+
+    #[test]
+    fn destructive_rationale_covers_data_and_uniqueness_loss() {
+        let why = RiskClass::Destructive.why();
+        assert!(why.contains("data can be lost"), "{why}");
+        assert!(why.contains("uniqueness guarantee"), "{why}");
+        assert!(
+            !why.contains("data is lost"),
+            "a constraint drop need not lose data: {why}"
         );
     }
 
