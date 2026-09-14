@@ -3272,6 +3272,85 @@ fn orphan_probe(
     )])
 }
 
+/// The collation the emitted column definition will have. Renames preserve
+/// the stored OID; ADD and ALTER TYPE without COLLATE use the type's default.
+/// In particular, text COLLATE ci -> varchar resets to the default collation
+/// rather than retaining ci (DECISIONS 476).
+fn planned_collation(names: &AsStored, column: &ColumnRef) -> Result<String, DialectError> {
+    let declared = names
+        .retyped
+        .get(column)
+        .or_else(|| names.columns_added.get(column).map(|added| &added.ty))
+        .or_else(|| {
+            names
+                .created
+                .contains(&column.table)
+                .then(|| names.column_types.get(column))
+                .flatten()
+        });
+    if let Some(ty) = declared {
+        return Ok(format!(
+            "(SELECT t.typcollation FROM pg_catalog.pg_type t \
+             WHERE t.oid = pg_catalog.to_regtype({}))",
+            value_literal(&crate::types::normalize(ty)?.to_string())
+        ));
+    }
+    let Some(stored) = names.column(column) else {
+        return Ok("NULL::oid".into());
+    };
+    Ok(format!(
+        "(SELECT a.attcollation FROM pg_catalog.pg_attribute a \
+         WHERE a.attrelid = pg_catalog.to_regclass({}) \
+         AND a.attname = {} AND a.attnum > 0 AND NOT a.attisdropped)",
+        value_literal(&qualified(&stored.table)?),
+        value_literal(&stored.name)
+    ))
+}
+
+/// A key can reject even an empty child table: different collation OIDs are
+/// incompatible when either is nondeterministic. Row probes cannot ask this
+/// question, and a staged apply would discover it after earlier commits.
+fn key_collation_probe(
+    names: &AsStored,
+    table: &TableName,
+    name: &str,
+    constraint: &pbps_model::ForeignKey,
+) -> Result<Probe, DialectError> {
+    let mut pairs = Vec::new();
+    for (child, parent) in constraint
+        .columns
+        .iter()
+        .zip(&constraint.references_columns)
+    {
+        pairs.push(format!(
+            "({}, {})",
+            planned_collation(names, &table.column(child))?,
+            planned_collation(names, &constraint.references_table.column(parent))?
+        ));
+    }
+    // Validation rejects malformed keys; do not turn an incomplete tuple into
+    // a clean answer even when preflight is called directly on one.
+    if pairs.is_empty() || constraint.columns.len() != constraint.references_columns.len() {
+        pairs = vec!["(NULL::oid, NULL::oid)".into()];
+    }
+    Ok(Probe::new(
+        format!("foreign keys with incompatible collations for {table}.{name}"),
+        format!(
+            "SELECT CASE \
+             WHEN bool_or(k.child <> k.parent AND \
+               (NOT c.collisdeterministic OR NOT p.collisdeterministic)) THEN 1 \
+             WHEN bool_or(k.child IS NULL OR k.parent IS NULL \
+               OR (k.child <> 0 AND c.oid IS NULL) \
+               OR (k.parent <> 0 AND p.oid IS NULL)) THEN NULL \
+             ELSE 0 END::int AS n \
+             FROM (VALUES {}) AS k(child, parent) \
+             LEFT JOIN pg_catalog.pg_collation c ON c.oid = k.child \
+             LEFT JOIN pg_catalog.pg_collation p ON p.oid = k.parent;",
+            pairs.join(", ")
+        ),
+    ))
+}
+
 /// Every probe this dialect asks before a plan runs.
 ///
 /// Per `DeleteRow`, the count of what still references the row and the
@@ -3291,6 +3370,57 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
         match build(&p.change, &names, &mut unchecked) {
             Ok(probes) => out.extend(probes),
             Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
+        }
+        // Metadata compatibility remains checkable when the row projection
+        // is unchecked. Include keys carried by a created table as well.
+        let keys: Vec<_> = match &p.change {
+            Change::AddForeignKey {
+                table,
+                name,
+                constraint,
+            } => {
+                vec![(table, name, constraint.as_ref())]
+            }
+            Change::CreateTable { name, table, .. } => table
+                .foreign_keys
+                .iter()
+                .map(|(key, constraint)| (name, key, constraint))
+                .collect(),
+            Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        };
+        for (table, name, constraint) in keys {
+            match key_collation_probe(&names, table, name, constraint) {
+                Ok(probe) => out.push(probe),
+                Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
+            }
         }
         if let Change::DeleteRow {
             table,
@@ -3482,17 +3612,18 @@ mod tests {
             ])
         };
         let asked = probes(&plan(column.clone()));
-        // Four: the orphan count the key itself asks for, and then the three
+        // Five: the orphan count and collation compatibility, then the three
         // the delete asks — the count, whether it could be complete, and the
         // key this plan adds over a column it also adds.
-        assert_eq!(asked.len(), 4, "{asked:#?}");
+        assert_eq!(asked.len(), 5, "{asked:#?}");
         assert!(
             asked[0]
                 .description
                 .contains("no matching parent for the new foreign key child_status_fkey"),
             "{asked:#?}"
         );
-        let asked = asked[1..].to_vec();
+        assert!(asked[1].description.contains("incompatible collations"));
+        let asked = asked[2..].to_vec();
         // Every probe answers in the runner's width, and a count past it
         // is the width's maximum rather than an out-of-range error the
         // runner would read as unchecked (DECISIONS 342, 343).
@@ -3536,10 +3667,10 @@ mod tests {
         // reaches.
         column.default = Some("lower('OLD')".to_owned());
         let asked = probes(&plan(column.clone()));
-        assert_eq!(asked.len(), 4, "{asked:#?}");
+        assert_eq!(asked.len(), 5, "{asked:#?}");
         assert!(
-            asked[3].description.contains("cannot evaluate")
-                && asked[3]
+            asked[4].description.contains("cannot evaluate")
+                && asked[4]
                     .description
                     .contains("status of app.child (its default, backfilled"),
             "{asked:#?}"
@@ -3549,11 +3680,11 @@ mod tests {
         // the refusal is not.
         column.default = None;
         let asked = probes(&plan(column));
-        assert_eq!(asked.len(), 4, "{asked:#?}");
+        assert_eq!(asked.len(), 5, "{asked:#?}");
         assert!(
-            asked[3].sql.contains("AND p.\"code\" = NULL"),
+            asked[4].sql.contains("AND p.\"code\" = NULL"),
             "{}",
-            asked[3].sql
+            asked[4].sql
         );
         // The key's own orphan count is still asked, and every stored row
         // holds NULL in the column it spans — a tuple that references nothing
