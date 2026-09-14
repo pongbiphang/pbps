@@ -132,9 +132,9 @@ enum Command {
         #[arg(long)]
         dev: Option<String>,
 
-        /// human (default) or json. Not accepted with --db/--env: a connected
-        /// plan's typed form is the plan file itself (--out), read back with
-        /// `pbps explain --plan`
+        /// human (default) or json. With --db/--env, JSON reports change counts,
+        /// connected checks and findings. --out writes the separate saved plan
+        /// accepted by apply; inspect it with `pbps explain --plan`
         #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
@@ -716,19 +716,20 @@ fn run() -> anyhow::Result<()> {
                     "environment.unconfigured",
                     target.resolve(&project),
                 )?;
-                return output::or_unanswerable(
-                    "plan",
+                let planned = deploy::cmd_plan_db(
+                    &project,
+                    &target,
+                    out.as_deref(),
+                    sql.as_deref(),
+                    staged,
                     json,
-                    "plan.failed",
-                    deploy::cmd_plan_db(
-                        &project,
-                        &target,
-                        out.as_deref(),
-                        sql.as_deref(),
-                        staged,
-                        json,
-                    ),
                 );
+                // A typed refusal already emitted its findings envelope. Only
+                // operational failures need the unanswerable wrapper (DECISIONS 485).
+                if planned.as_ref().is_err_and(|e| e.is::<Found>()) {
+                    return planned;
+                }
+                return output::or_unanswerable("plan", json, "plan.failed", planned);
             }
             if staged {
                 // Staged execution is a property of a plan that is going to be

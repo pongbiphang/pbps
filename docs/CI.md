@@ -68,7 +68,11 @@ counts, connected capability checks, and operational cost estimates;
 `--out plan.json` writes the separate,
 checksum-pinned artifact that `apply` accepts. Use `pbps explain --plan plan.json
 --format json` to inspect that artifact's full change list. A connection or
-planning failure produces an `unanswerable` envelope and exits `1`.
+operational planning failure produces an `unanswerable` envelope and exits `1`.
+Error-policy or unresolved-identity findings retain their stable IDs and remedies,
+report `findings`, exit `2`, and withhold both plan and SQL artifacts. Warnings
+remain in the JSON envelope without duplicate policy/edition prose on stderr;
+a warning-only plan exits `0`.
 
 ## Credentials
 

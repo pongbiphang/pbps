@@ -12239,3 +12239,20 @@ SPEC is in sync with all of these.
      tests mint pending table/column ids through plan and verify both covered
      column grants and a revoked UPDATE. Managed-table catalog-wide SELECT
      coverage (#392) remains a separate demand from declared data readback.
+
+485. **Connected JSON refusals retain the finding that answered the question.**
+    A policy error and unresolved rename/drop intent already have typed findings;
+    neither is an operational failure to be flattened into `plan.failed`.
+    Connected planning emits those fields through the ordinary findings envelope
+    before either artifact can be written. Its caller passes the reported
+    `Found` result through unchanged, so the operational-error wrapper cannot
+    emit a second envelope or misclassify the refusal. Genuine connection/read
+    errors still use `unanswerable` and exit 1; finding refusals use exit 2.
+
+    JSON policy and edition warnings live only in the envelope. Human output
+    keeps its existing prose and refusal behavior. The connected count/check
+    summary and help/SPEC contract follow decision 429; they do not replace the
+    checksum-pinned saved plan, change policy or identity decisions, or grant
+    any new execution authority. CLI regressions compare human and JSON paths,
+    warning/error and unresolved/resolved cases, refused artifact preservation,
+    operational errors, and real SQL Server edition warnings (#338–#341).
