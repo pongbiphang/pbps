@@ -600,6 +600,144 @@ fn bootstrapped_demo(connection: &str, slug: &str, table: &str) -> Demo {
 }
 
 #[test]
+#[ignore = "needs live PostgreSQL"]
+fn narrowing_projection_refuses_constraint_failures_before_the_first_statement() {
+    for fk in [false, true] {
+        let slug = if fk { "projection424" } else { "projection281" };
+        let own = OwnDatabase::new(&server(), slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(slug);
+        let (from, to) = if fk {
+            ("numeric(20,0)", "integer")
+        } else {
+            ("numeric(5,2)", "numeric(5,1)")
+        };
+        let before = format!(
+            "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  first: {{type: integer}}\n  v: {{type: '{from}'}}\nprimary_key: {{name: pk_t, columns: [id]}}\n"
+        );
+        d.table(&before);
+        if fk {
+            std::fs::write(d.dir.join("schema/app.parent.yml"), "table: app.parent\ncolumns:\n  v: {type: integer, nullable: false}\nprimary_key: {name: pk_parent, columns: [v]}\n").unwrap();
+        }
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        if fk {
+            on_server(connection, "INSERT INTO app.parent VALUES (1)");
+        }
+        on_server(
+            connection,
+            &format!(
+                "INSERT INTO app.t VALUES (1,NULL,{})",
+                if fk { "1" } else { "1.04" }
+            ),
+        );
+        let added = if fk {
+            "foreign_keys:\n  fk_projection:\n    columns: [v]\n    references: app.parent(v)\n"
+        } else {
+            "unique:\n  uq_projection: [v]\n"
+        };
+        d.table(&format!(
+            "{}{added}",
+            before.replace(from, to).replace(
+                "first: {type: integer}",
+                "preflight_marker: {type: integer}\n  first: {type: integer}"
+            )
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
+        let addition = saved
+            .changes
+            .changes
+            .iter()
+            .position(|p| matches!(&p.change, pbps_model::Change::AddColumn { .. }))
+            .unwrap();
+        let retype = saved
+            .changes
+            .changes
+            .iter()
+            .position(|p| matches!(&p.change, pbps_model::Change::AlterColumnType { .. }))
+            .unwrap();
+        assert!(
+            addition < retype,
+            "the benign statement really precedes the retype"
+        );
+        on_server(
+            connection,
+            &format!(
+                "INSERT INTO app.t VALUES (2,NULL,{})",
+                if fk { "2" } else { "1.00" }
+            ),
+        );
+        // Sequence calls survive rollback: zero proves preflight stopped DDL,
+        // and the successful retry below proves this witness was active.
+        on_server(
+            connection,
+            r#"
+            CREATE SCHEMA witness;
+            CREATE SEQUENCE witness.executed;
+            CREATE FUNCTION witness.count_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF EXISTS (SELECT FROM pg_event_trigger_ddl_commands() WHERE objid = 'app.t'::regclass) THEN
+                PERFORM nextval('witness.executed');
+              END IF;
+            END $$;
+            CREATE EVENT TRIGGER count_projection_ddl ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.count_ddl();
+        "#,
+        );
+        let expected = if fk {
+            "1 rows with no matching parent for the new foreign key fk_projection"
+        } else {
+            "2 rows that would collide under the new unique constraint uq_projection"
+        };
+        // Planning records the approved change; data probes run at apply.
+        succeeds(d.run(&["plan", "--db", connection]));
+        let refused = approved_apply(
+            &d,
+            connection,
+            &artifact,
+            &["--allow", "narrowing,constraint"],
+        );
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains(expected)
+                && stderr(&refused).contains("nothing has been changed"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM witness.executed"
+            ),
+            0
+        );
+        on_server(connection, "DELETE FROM app.t WHERE id = 2");
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &artifact,
+            &["--allow", "narrowing,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+        assert!(
+            scalar(
+                connection,
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM witness.executed"
+            ) > 0
+        );
+    }
+}
+
+#[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
     let own = OwnDatabase::new(&server(), "cost");

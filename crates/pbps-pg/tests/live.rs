@@ -13919,6 +13919,302 @@ async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_who
     conn.drop().await;
 }
 
+fn narrowing_projection_change(column: &str, from: &str, to: &str) -> pbps_model::Change {
+    pbps_model::Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().unwrap(),
+        column: column.parse().unwrap(),
+        from: ty(from),
+        to: ty(to),
+        from_nullable: true,
+        to_nullable: true,
+    }
+}
+
+fn narrowing_projection_plan(changes: Vec<pbps_model::Change>) -> pbps_model::ChangeSet {
+    pbps_model::ChangeSet {
+        changes: changes
+            .into_iter()
+            .map(pbps_model::PlannedChange::new)
+            .collect(),
+    }
+}
+
+async fn narrowing_projection_verdict(db: &mut Conn, cs: &pbps_model::ChangeSet) -> Option<String> {
+    db.execute("BEGIN").await.unwrap();
+    let mut error = None;
+    'changes: for p in &cs.changes {
+        for sql in Postgres::new().emit(&p.change, p.strategy).unwrap() {
+            if let Err(e) = db.execute(&sql.sql).await {
+                error = Some(sqlstate(&e).to_owned());
+                break 'changes;
+            }
+        }
+    }
+    db.execute("ROLLBACK").await.unwrap();
+    error
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() {
+    use pbps_model::Change;
+    // Duplicate probes count affected rows, not collision groups (375).
+    for (to, extra, kind, duplicates, nulls, conversion, verdict) in [
+        ("numeric(5,1)", "", "unique", 2, 0, 0, Some("23505")),
+        (
+            "numeric(4,1)",
+            ",(999.99)",
+            "unique",
+            2,
+            0,
+            1,
+            Some("22003"),
+        ),
+        ("numeric(5,1)", "", "index", 2, 0, 0, Some("23505")),
+        (
+            "numeric(4,1)",
+            ",(999.99)",
+            "primary",
+            2,
+            1,
+            1,
+            Some("22003"),
+        ),
+        ("numeric(6,2)", "", "unique", 0, 0, 0, None),
+    ] {
+        let mut db = TestDb::create("projection281_keys").await;
+        db.execute(&format!("CREATE TABLE public.t (v numeric(5,2)); INSERT INTO public.t VALUES (1.04),(1.00),(NULL){extra}")).await.unwrap();
+        let table = TableName::new("public", "t");
+        let constraint = match kind {
+            "unique" => Change::AddUnique {
+                table,
+                name: "uq_projection".into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: vec!["v".into()],
+                },
+            },
+            "index" => Change::AddIndex {
+                table,
+                name: "uq_projection".into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "v".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: true,
+                    filter: None,
+                }),
+            },
+            _ => Change::SetPrimaryKey {
+                table,
+                from: None,
+                to: Some(PrimaryKey {
+                    name: Some("uq_projection".into()),
+                    columns: vec!["v".into()],
+                }),
+            },
+        };
+        let cs = narrowing_projection_plan(vec![
+            narrowing_projection_change("public.t.v", "numeric(5,2)", to),
+            constraint,
+        ]);
+        let report = Postgres::new().preflight(&cs);
+        let mut counts = Vec::new();
+        for p in &report.probes {
+            counts.push((p.description.clone(), counted(&mut db, &p.sql).await));
+        }
+        let actual = narrowing_projection_verdict(&mut db, &cs).await;
+        db.drop().await;
+        assert_eq!(actual.as_deref(), verdict, "{to}/{kind}");
+        assert_eq!(
+            one(&counts, "rows that would collide"),
+            duplicates,
+            "{counts:#?}"
+        );
+        assert_eq!(
+            counts
+                .iter()
+                .filter(|(d, _)| d.contains("existing NULLs"))
+                .map(|(_, n)| n)
+                .sum::<i64>(),
+            nulls,
+            "{counts:#?}"
+        );
+        assert_eq!(
+            counts
+                .iter()
+                .filter(|(d, _)| d.contains("cannot become"))
+                .map(|(_, n)| n)
+                .sum::<i64>(),
+            conversion,
+            "{counts:#?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() {
+    use pbps_model::Change;
+    for (side, mixed, orphan, renamed) in [
+        ("child", false, true, false),
+        ("child", true, true, false),
+        ("parent", false, true, false),
+        ("parent", true, true, false),
+        ("child", false, false, false),
+        ("parent", false, false, false),
+        ("child", true, true, true),
+    ] {
+        let mut db = TestDb::create("projection424_fk").await;
+        let parent_type = if side == "parent" {
+            "numeric(20,0)"
+        } else {
+            "integer"
+        };
+        let child_type = if side == "child" {
+            "numeric(20,0)"
+        } else {
+            "integer"
+        };
+        db.execute(&format!("CREATE TABLE public.parent (v {parent_type} PRIMARY KEY); CREATE TABLE public.child (v {child_type}); INSERT INTO public.parent VALUES (1),(2); INSERT INTO public.child VALUES (1),({}), (NULL)", if orphan {3} else {2})).await.unwrap();
+        if mixed {
+            db.execute(&format!("INSERT INTO public.{side} VALUES (5000000000)"))
+                .await
+                .unwrap();
+        }
+        let mut changes = Vec::new();
+        let child = TableName::new("public", if renamed { "renamed" } else { "child" });
+        let child_column = if renamed { "renamed_v" } else { "v" };
+        if renamed {
+            changes.push(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: TableName::new("public", "child"),
+                to: child.clone(),
+            });
+            changes.push(Change::RenameColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: child.clone(),
+                from: "v".into(),
+                to: child_column.into(),
+            });
+        }
+        let column = if side == "child" {
+            child.column(child_column).to_string()
+        } else {
+            "public.parent.v".to_owned()
+        };
+        changes.push(narrowing_projection_change(
+            &column,
+            "numeric(20,0)",
+            "integer",
+        ));
+        changes.push(Change::AddForeignKey {
+            table: child,
+            name: "fk_projection".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec![child_column.into()],
+                references_table: TableName::new("public", "parent"),
+                references_columns: vec!["v".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        });
+        let cs = narrowing_projection_plan(changes);
+        let report = Postgres::new().preflight(&cs);
+        let mut counts = Vec::new();
+        for p in &report.probes {
+            counts.push((p.description.clone(), counted(&mut db, &p.sql).await));
+        }
+        let actual = narrowing_projection_verdict(&mut db, &cs).await;
+        db.drop().await;
+        assert_eq!(
+            one(&counts, "no matching parent for the new foreign key"),
+            i64::from(orphan),
+            "{side}/{mixed}/{renamed}: {counts:#?}"
+        );
+        assert_eq!(
+            one(&counts, "cannot become"),
+            i64::from(mixed),
+            "{counts:#?}"
+        );
+        assert_eq!(
+            actual.as_deref(),
+            if mixed {
+                Some("22003")
+            } else if orphan {
+                Some("23503")
+            } else {
+                None
+            }
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys() {
+    use pbps_model::{Cell, Change};
+    for overflow in [false, true] {
+        let mut db = TestDb::create("projection281_writes").await;
+        db.execute(&format!("CREATE TABLE public.t (code text PRIMARY KEY, v numeric(5,2), tag integer); INSERT INTO public.t VALUES ('a',{},0),('b',1.00,1)", if overflow {"999.99"} else {"1.04"})).await.unwrap();
+        let table = TableName::new("public", "t");
+        let cs = narrowing_projection_plan(vec![
+            narrowing_projection_change("public.t.v", "numeric(5,2)", "numeric(4,1)"),
+            Change::UpdateRow {
+                table: table.clone(),
+                key_column: "code".into(),
+                key: "a".into(),
+                columns: [(
+                    "tag".into(),
+                    (Cell::Value(Value::Int(0)), Cell::Value(Value::Int(1))),
+                )]
+                .into(),
+                unchanged: Default::default(),
+                types: [("tag".into(), ty("integer"))].into(),
+                after_types: Default::default(),
+            },
+            Change::InsertRow {
+                table: table.clone(),
+                key_column: "code".into(),
+                identity_key: false,
+                key: "c".into(),
+                row: row(&[("v", Value::Text("1.0".into())), ("tag", Value::Int(1))]),
+                defaults: Default::default(),
+                types: [
+                    ("v".into(), ty("numeric(4,1)")),
+                    ("tag".into(), ty("integer")),
+                ]
+                .into(),
+            },
+            Change::AddUnique {
+                table,
+                name: "uq_projection".into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: vec!["v".into(), "tag".into()],
+                },
+            },
+        ]);
+        let report = Postgres::new().preflight(&cs);
+        let mut counts = Vec::new();
+        for p in &report.probes {
+            counts.push((p.description.clone(), counted(&mut db, &p.sql).await));
+        }
+        let actual = narrowing_projection_verdict(&mut db, &cs).await;
+        db.drop().await;
+        assert_eq!(
+            one(&counts, "rows that would collide"),
+            if overflow { 2 } else { 3 },
+            "{counts:#?}"
+        );
+        assert_eq!(one(&counts, "cannot become"), i64::from(overflow));
+        assert_eq!(
+            actual.as_deref(),
+            Some(if overflow { "22003" } else { "23505" })
+        );
+    }
+}
+
 /// A foreign key this plan adds on a column it also adds is counted through
 /// the value that column is added with.
 ///

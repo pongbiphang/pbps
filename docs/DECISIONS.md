@@ -12094,3 +12094,36 @@ SPEC is in sync with all of these.
      identifier spelling without a separator convention or SQL interpolation.
      This refines advisory estimates only: 399/430's correctness-risk, approval
      and saved-artifact/checksum boundaries remain intact.
+
+480. **Narrowing projections exclude unconvertible rows, not whole keys.**
+     `rows_after` supplies the post-plan rows to UNIQUE, unique-index, primary-key
+     and added-FK probes. Its old `TypeChangeRisk::Safe` gate lost all of those
+     questions when a column narrowed, including fitting rows and conversions
+     that only round (#281, #424). The narrower type-level predicate originally
+     proposed for #281 would still lose fitting rows of a pair that can raise;
+     #424's updated row-level design and 449's `cannot_become` predicate keep
+     those rows testable without adding another type catalogue.
+
+     Stored branches and unchanged cells in updated rows carry an exclusion
+     over the same raw value the projection casts. Inserted and explicitly
+     updated cells already have their final declared type; they keep their
+     ordinary projection. A predicate that is unknown on NULL is not a failed
+     conversion: `IS NOT TRUE` retains that row for the primary-key NULL probe.
+     No excluded value is replaced by a fabricated NULL. The existing type
+     conversion probe still counts and names values the ALTER cannot accept.
+
+     The exclusion alone is not an evaluation barrier. Live duplicate, orphan
+     and updated-row probes all raised with a flat WHERE: PostgreSQL pushed the
+     outer NULL test or key comparison beside the guard. An `OFFSET 0` fence
+     around each guarded projection branch keeps that comparison above the
+     exclusion. Unguarded and literal branches need no fence. This is confined
+     to `rows_after`; #435's separate `planned_key_probes` aliases remain their
+     own issue.
+
+     The live matrix measures rounding collisions, fitting and overflowing
+     rows on each FK side, NULLs, composite keys, planned inserts/updates and
+     renamed catalog spellings. Duplicate counts name affected rows (375):
+     `1.04` and `1.00` becoming `1.0` count two rows, not one group. The connected
+     CLI regression uses a sequence-backed DDL witness, whose increments
+     survive rollback, to prove refusal before statement one and successful
+     reuse of the approved plan after the offending row is removed.
