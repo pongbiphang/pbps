@@ -117,13 +117,25 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
     if let Change::InsertRow { defaults, .. } = &mut row {
         defaults.insert("value".into(), "unpredictable()".into());
     }
-    for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect,
-        &pbps_pg::Postgres::new(),
+    for (dialect, checks_collations) in [
+        (&pbps_mssql::Mssql as &dyn Dialect, false),
+        (&pbps_pg::Postgres::new(), true),
     ] {
         for constraint in &constraints {
             let report = dialect.preflight(&plan(vec![row.clone(), constraint.clone()]));
-            assert!(report.probes.is_empty(), "{constraint:?}: {report:?}");
+            // Unknown row values do not hide PostgreSQL's independent
+            // metadata check for a planned foreign key.
+            let expected = usize::from(
+                checks_collations && matches!(constraint, Change::AddForeignKey { .. }),
+            );
+            assert_eq!(report.probes.len(), expected, "{constraint:?}: {report:?}");
+            assert!(
+                report
+                    .probes
+                    .iter()
+                    .all(|p| p.description.contains("incompatible collations")),
+                "{report:?}"
+            );
             assert_eq!(report.unchecked.len(), 1, "{constraint:?}: {report:?}");
             assert!(!report.unchecked[0].reason.is_empty());
         }

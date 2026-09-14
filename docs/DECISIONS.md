@@ -12003,3 +12003,21 @@ SPEC is in sync with all of these.
      directions, verifies the actual output name, and leaves real indentation
      changes as an empty plan. The shared unit test pins both engine settings
      across the measured character set and preserves quoted negative cases.
+
+476. **A planned PostgreSQL key gets a collation compatibility probe even when
+     its row values cannot be projected.** A foreign key between different
+     collation OIDs is rejected when either collation is nondeterministic,
+     including an empty child table and two separate collation objects with
+     identical provider and locale settings. Orphan counts cannot detect this
+     metadata condition (issue #234); SPEC 7.5 asks before the first statement.
+
+     The probe covers every column pair in both `AddForeignKey` and a created
+     table's keys. Stored columns use `pg_attribute` under their pre-rename
+     names. Created, added and retyped columns use `pg_type.typcollation`:
+     measured on PostgreSQL 18.6, `ALTER COLUMN ... TYPE varchar(20)` resets a
+     text column's explicit collation to the type default. Retaining the old
+     OID would refuse valid plans. Missing catalog metadata returns an unreadable
+     count, distinct from compatibility; a noncollatable column's OID zero is
+     known metadata. Row-projection failures do not suppress this independent
+     check. Live tests compare 25 collation pairs with actual constraint DDL
+     and cover renames, new columns, created tables, retypes and missing objects.

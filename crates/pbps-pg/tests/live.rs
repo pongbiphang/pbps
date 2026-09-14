@@ -17553,6 +17553,220 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
     conn.drop().await;
 }
 
+/// Collation compatibility is a property of the key, even with no child rows.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn planned_key_collation_guards_match_the_engine_for_every_collation_pair() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    let mut conn = TestDb::create("key_collation_pairs").await;
+    let s = data_schema("key_collation_pairs");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE COLLATION {s}.ci_copy (provider = icu, locale = 'und-u-ks-level2', deterministic = false);"
+    )).await.unwrap();
+    let collations = [
+        "pg_catalog.\"default\"".to_owned(),
+        "pg_catalog.\"C\"".to_owned(),
+        "pg_catalog.\"en_US.utf8\"".to_owned(),
+        format!("{s}.ci"),
+        format!("{s}.ci_copy"),
+    ];
+    for (p, parent_collation) in collations.iter().enumerate() {
+        for (c, child_collation) in collations.iter().enumerate() {
+            conn.execute(&format!(
+                "CREATE TABLE {s}.parent (id integer, code text COLLATE {parent_collation}, PRIMARY KEY (id, code));
+                 CREATE TABLE {s}.child (id integer, ref text COLLATE {child_collation});"
+            )).await.unwrap();
+            let cs = ChangeSet {
+                changes: vec![PlannedChange::new(Change::AddForeignKey {
+                    table: TableName::new(&s, "child"),
+                    name: "fk_collations".into(),
+                    constraint: Box::new(ForeignKey {
+                        columns: vec!["id".into(), "ref".into()],
+                        references_table: TableName::new(&s, "parent"),
+                        references_columns: vec!["id".into(), "code".into()],
+                        on_delete: ReferentialAction::NoAction,
+                        on_update: ReferentialAction::NoAction,
+                    }),
+                })],
+            };
+            let report = Postgres::new().preflight(&cs);
+            let probe = report
+                .probes
+                .iter()
+                .find(|p| p.description.contains("incompatible collations"))
+                .expect("every planned key gets a collation compatibility guard");
+            let incompatible = p != c && (p >= 3 || c >= 3);
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                i64::from(incompatible),
+                "{parent_collation} / {child_collation}: {}",
+                probe.sql
+            );
+            let sql = &Postgres::new()
+                .emit(&cs.changes[0].change, Strategy::default())
+                .unwrap()[0]
+                .sql;
+            let result = conn.execute(sql).await;
+            if incompatible {
+                assert_eq!(sqlstate(&result.unwrap_err()), "42P21");
+            } else {
+                result.expect("compatible collations accept the key");
+            }
+            conn.execute(&format!("DROP TABLE {s}.child, {s}.parent"))
+                .await
+                .unwrap();
+        }
+    }
+    conn.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_columns() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    let mut conn = TestDb::create("key_collation_projection").await;
+    let s = data_schema("key_collation_projection");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);"
+    )).await.unwrap();
+    for parent_collation in [format!("{s}.ci"), "pg_catalog.\"C\"".into()] {
+        for mode in ["rename", "add", "add_default", "create", "retype"] {
+            conn.execute(&format!(
+                "CREATE TABLE {s}.parent (code text COLLATE {parent_collation} PRIMARY KEY);"
+            ))
+            .await
+            .unwrap();
+            if mode != "create" {
+                conn.execute(&format!(
+                    "CREATE TABLE {s}.child (ref text COLLATE {s}.ci);"
+                ))
+                .await
+                .unwrap();
+            }
+            let mut changes = Vec::new();
+            let mut child = TableName::new(&s, "child");
+            let column = if matches!(mode, "rename" | "add" | "add_default") {
+                "new_ref"
+            } else {
+                "ref"
+            };
+            let fk = ForeignKey {
+                columns: vec![column.into()],
+                references_table: TableName::new(&s, "parent"),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            };
+            match mode {
+                "rename" => {
+                    child = TableName::new(&s, "renamed");
+                    changes.push(Change::RenameTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        from: TableName::new(&s, "child"),
+                        to: child.clone(),
+                    });
+                    changes.push(Change::RenameColumn {
+                        uid: "c_aaaaaa".parse().unwrap(),
+                        table: child.clone(),
+                        from: "ref".into(),
+                        to: column.into(),
+                    });
+                }
+                "add" | "add_default" => {
+                    let mut added = Column::new(ty("text"));
+                    if mode == "add_default" {
+                        added.default = Some("lower('PARENT'::text)".into());
+                    }
+                    changes.push(Change::AddColumn {
+                        uid: "c_bbbbbb".parse().unwrap(),
+                        table: child.clone(),
+                        name: column.into(),
+                        column: Box::new(added),
+                    });
+                }
+                "create" => {
+                    let mut table = Table::default();
+                    table.columns.insert(column.into(), Column::new(ty("text")));
+                    table
+                        .foreign_keys
+                        .insert("fk_collations".into(), fk.clone());
+                    changes.push(Change::CreateTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: child.clone(),
+                        table: Box::new(table),
+                    });
+                }
+                "retype" => changes.push(Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: child.column(column),
+                    from: ty("text"),
+                    to: ty("varchar(20)"),
+                    from_nullable: true,
+                    to_nullable: true,
+                }),
+                _ => unreachable!(),
+            }
+            if mode != "create" {
+                changes.push(Change::AddForeignKey {
+                    table: child.clone(),
+                    name: "fk_collations".into(),
+                    constraint: Box::new(fk),
+                });
+            }
+            let cs = ChangeSet {
+                changes: changes.into_iter().map(PlannedChange::new).collect(),
+            };
+            let report = Postgres::new().preflight(&cs);
+            if mode == "add_default" {
+                assert!(
+                    report
+                        .unchecked
+                        .iter()
+                        .any(|p| p.reason.contains("foreign-key values")),
+                    "{report:?}"
+                );
+            }
+            let probe = report
+                .probes
+                .iter()
+                .find(|p| p.description.contains("incompatible collations"))
+                .expect("the planned key has a collation guard");
+            // A rename preserves ci; added, created and retyped columns use the
+            // declared type's default collation, including text -> varchar.
+            let incompatible = (mode == "rename") != parent_collation.ends_with(".ci");
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                i64::from(incompatible),
+                "{mode} / {parent_collation}: {}",
+                probe.sql
+            );
+            if !incompatible {
+                apply(&mut conn, &Postgres::new(), &cs).await;
+            }
+            let actual_child = if !incompatible {
+                child.name.as_str()
+            } else {
+                "child"
+            };
+            if mode != "create" || !incompatible {
+                conn.execute(&format!("DROP TABLE {s}.{actual_child}"))
+                    .await
+                    .unwrap();
+            }
+            conn.execute(&format!("DROP TABLE {s}.parent"))
+                .await
+                .unwrap();
+            // A disappeared column is unreadable metadata, never a zero count.
+            let rows = conn.query(&probe.sql).await.unwrap();
+            assert_eq!(rows[0].try_get_at::<i32>(0).unwrap(), None);
+        }
+    }
+    conn.drop().await;
+}
+
 /// A parent whose referenced columns the session cannot read is one whose
 /// children it cannot count, whatever it may read on the children.
 ///
