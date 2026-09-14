@@ -1972,9 +1972,10 @@ fn after_group(tokens: &[RebindToken<'_>], at: usize) -> Option<usize> {
         .map(|i| i + 1)
 }
 
-/// Return only the alias occurrence after one FROM item. Argument and body
-/// groups are skipped here, but remain in the text for the ordinary call scan.
-fn relation_column_alias(tokens: &[RebindToken<'_>], mut at: usize) -> Option<usize> {
+/// Return an optional alias and its column-list group after one FROM item.
+/// Record column definitions can also follow AS with no alias at all.
+/// Argument and body groups remain available for the ordinary call scan.
+fn relation_columns(tokens: &[RebindToken<'_>], mut at: usize) -> Option<(Option<usize>, usize)> {
     if token_is(tokens, at, "lateral") {
         at += 1;
     }
@@ -2001,8 +2002,50 @@ fn relation_column_alias(tokens: &[RebindToken<'_>], mut at: usize) -> Option<us
     }
     if token_is(tokens, at, "as") {
         at += 1;
+        if after_group(tokens, at).is_some() {
+            return Some((None, at));
+        }
     }
-    (tokens.get(at)?.name() && after_group(tokens, at + 1).is_some()).then_some(at)
+    (tokens.get(at)?.name() && after_group(tokens, at + 1).is_some()).then_some((Some(at), at + 1))
+}
+
+/// Column names are declarations, while an optional following type can still
+/// bind a view's composite type. Never blank the whole definition list.
+fn column_declarations(
+    tokens: &[RebindToken<'_>],
+    open: usize,
+    declarations: &mut Vec<usize>,
+    type_spans: &mut Vec<std::ops::Range<usize>>,
+) {
+    let Some(close) = tokens[open].close else {
+        return;
+    };
+    let mut at = open + 1;
+    while at < close {
+        let start = at;
+        while at < close && tokens[at].text != "," {
+            at = tokens[at].close.map_or(at + 1, |end| end + 1);
+        }
+        if tokens[start].name() {
+            declarations.push(start);
+            if start + 1 < at {
+                type_spans.push(tokens[start + 1].offset..tokens[at].offset);
+            }
+        }
+        at += 1;
+    }
+}
+
+fn relation_column_declarations(
+    tokens: &[RebindToken<'_>],
+    at: usize,
+    declarations: &mut Vec<usize>,
+    type_spans: &mut Vec<std::ops::Range<usize>>,
+) {
+    if let Some((alias, open)) = relation_columns(tokens, at) {
+        declarations.extend(alias);
+        column_declarations(tokens, open, declarations, type_spans);
+    }
 }
 
 /// These unquoted type keywords bind pg_catalog directly in PostgreSQL's
@@ -2133,6 +2176,53 @@ fn utility_target_columns(tokens: &[RebindToken<'_>]) -> Vec<std::ops::Range<usi
     columns
 }
 
+/// An index target's opening parenthesis is a relation separator. Keep its
+/// contents: index expressions and predicates may still call arriving routines.
+fn index_target_separators(tokens: &[RebindToken<'_>]) -> Vec<usize> {
+    let mut separators = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        if let Some(close) = tokens[at].close {
+            at = close + 1;
+            continue;
+        }
+        if tokens[at].word("create") {
+            let mut target = at + 1;
+            if token_is(tokens, target, "unique") {
+                target += 1;
+            }
+            if token_is(tokens, target, "index") {
+                target += 1;
+                if token_is(tokens, target, "concurrently") {
+                    target += 1;
+                }
+                if token_is(tokens, target, "if")
+                    && token_is(tokens, target + 1, "not")
+                    && token_is(tokens, target + 2, "exists")
+                {
+                    target += 3;
+                }
+                if tokens.get(target).is_some_and(RebindToken::name) {
+                    target += 1;
+                }
+                if token_is(tokens, target, "on") {
+                    target += 1;
+                    if token_is(tokens, target, "only") {
+                        target += 1;
+                    }
+                    if tokens.get(target).is_some_and(RebindToken::name)
+                        && after_group(tokens, target + 1).is_some()
+                    {
+                        separators.push(tokens[target + 1].offset);
+                    }
+                }
+            }
+        }
+        at += 1;
+    }
+    separators
+}
+
 /// CTE and relation alias column lists declare names; they cannot call an
 /// arriving routine. Mask the declaration itself for either arrival kind so
 /// removing its parentheses does not invent a relation reference instead.
@@ -2235,6 +2325,7 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
                 && after_group(&tokens, body).is_some();
             if cte {
                 declarations.push(i);
+                column_declarations(&tokens, i + 1, &mut declarations, &mut type_spans);
             }
             let close = &tokens[after - 1];
             let end = close.offset + close.text.len();
@@ -2253,6 +2344,14 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
                     && token_is(&tokens, i - 2, "rows");
                 from.push(rows_from);
                 open_groups.push(i);
+                if rows_from {
+                    relation_column_declarations(
+                        &tokens,
+                        i + 1,
+                        &mut declarations,
+                        &mut type_spans,
+                    );
+                }
             }
             ")" | "]" => {
                 if from.len() > 1 {
@@ -2266,24 +2365,34 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
                 if !token.word("using") {
                     *from.last_mut().unwrap() = true;
                 }
-                if let Some(alias) = relation_column_alias(&tokens, i + 1) {
-                    declarations.push(alias);
-                    let end = tokens[tokens[alias + 1].close.unwrap()].offset;
-                    type_spans.push(tokens[alias].offset..end);
-                }
+                relation_column_declarations(&tokens, i + 1, &mut declarations, &mut type_spans);
             }
             "into" => {
-                // INSERT's AS alias precedes the target column list too.
-                if let Some(alias) = relation_column_alias(&tokens, i + 1) {
-                    declarations.push(alias);
+                // INSERT's target group is already a column list, not the
+                // argument group a FROM item may have. Do not consume it and
+                // mistake a following VALUES expression for an alias list.
+                if tokens.get(i + 1).is_some_and(RebindToken::name) {
+                    let mut columns = i + 2;
+                    if token_is(&tokens, columns, "as")
+                        && tokens.get(columns + 1).is_some_and(RebindToken::name)
+                    {
+                        declarations.push(columns + 1);
+                        columns += 2;
+                    }
+                    if after_group(&tokens, columns).is_some() {
+                        column_declarations(&tokens, columns, &mut declarations, &mut type_spans);
+                    }
                 }
             }
             "," if *from.last().unwrap() => {
-                if let Some(alias) = relation_column_alias(&tokens, i + 1) {
-                    declarations.push(alias);
-                    let end = tokens[tokens[alias + 1].close.unwrap()].offset;
-                    type_spans.push(tokens[alias].offset..end);
-                }
+                relation_column_declarations(&tokens, i + 1, &mut declarations, &mut type_spans);
+            }
+            "returns"
+                if routine
+                    && token_is(&tokens, i + 1, "table")
+                    && after_group(&tokens, i + 2).is_some() =>
+            {
+                column_declarations(&tokens, i + 2, &mut declarations, &mut type_spans);
             }
             "where" | "group" | "having" | "order" | "limit" | "offset" | "fetch" | "for"
             | "union" | "intersect" | "except" | "window" | "returning" | ";" => {
@@ -2309,6 +2418,11 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
             }
         }
     }
+    let index_separators = if routine {
+        index_target_separators(&tokens)
+    } else {
+        Vec::new()
+    };
     let ranges: Vec<_> = declarations
         .into_iter()
         .map(|i| {
@@ -2325,6 +2439,11 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
         .collect();
     for range in ranges {
         code.replace_range(range.clone(), &" ".repeat(range.len()));
+    }
+    for at in index_separators {
+        // A space would still attach the target to an expression's opening
+        // parenthesis in ON target((call())). This text is scanned, not emitted.
+        code.replace_range(at..at + 1, ",");
     }
     code
 }
@@ -2988,6 +3107,100 @@ mod tests {
                 &"app.orders".parse().unwrap(),
                 &LEXIS
             ));
+        }
+    }
+
+    #[test]
+    fn record_columns_are_declarations_but_their_types_and_source_calls_remain() {
+        for body in [
+            "SELECT 1 FROM source() AS (orders integer)",
+            "SELECT 1 FROM source() AS t(orders integer)",
+            "SELECT 1 FROM source() t(orders integer)",
+            "SELECT 1 FROM ROWS FROM(source() AS (orders integer))",
+            "SELECT 1 FROM ROWS FROM(generate_series(1, 1), source() AS (orders integer))",
+            "SELECT 1 FROM shared.source AS t(orders)",
+            "SELECT 1 FROM (VALUES(7)) AS t(orders)",
+            "WITH t(orders) AS (VALUES(7)) SELECT 1 FROM t",
+            "() RETURNS TABLE(orders integer) LANGUAGE sql AS 'SELECT 7'",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            for arrival in ["app.orders", "app.orders(integer)"] {
+                assert!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new())
+                        .is_empty(),
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for body in [
+            "SELECT 1 FROM source() AS (orders geometry(10, 2))",
+            "SELECT 1 FROM source() AS t(orders geometry(10, 2))",
+            "SELECT 1 FROM source() t(orders \"geometry\"(10, 2))",
+            "SELECT 1 FROM ROWS FROM(source() AS (orders geometry(10, 2)))",
+            "SELECT 1 FROM ROWS FROM(generate_series(1, 1), source() AS (orders geometry))",
+            "() RETURNS TABLE(orders geometry(10, 2)) LANGUAGE sql AS 'SELECT source()'",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            for (arrival, count) in [
+                ("app.orders", 0),
+                ("app.geometry", 1),
+                ("app.geometry(integer,integer)", 0),
+                ("app.source()", 1),
+            ] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn index_targets_are_relations_while_index_expressions_remain_calls() {
+        for statement in [
+            "CREATE INDEX ix ON orders(id)",
+            "CREATE UNIQUE INDEX ix ON ONLY orders(id)",
+            "CREATE INDEX IF NOT EXISTS ix ON app.\"orders\" (id)",
+            "CREATE INDEX ON orders(id)",
+            "CREATE INDEX CONCURRENTLY ix ON orders(id)",
+            "CREATE INDEX ix ON orders USING btree (id)",
+        ] {
+            let body = format!("() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$");
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(&body));
+            for (arrival, count) in [("app.orders", 1), ("app.orders(integer)", 0)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {statement}"
+                );
+            }
+        }
+        for statement in [
+            "CREATE INDEX ix ON orders((orders(id)))",
+            "CREATE INDEX ix ON source((orders(id)))",
+            "CREATE INDEX ix ON source(orders(id))",
+            "CREATE INDEX ix ON source USING btree ((orders(id)))",
+            "CREATE INDEX ix ON source(id) WHERE orders(id) > 0",
+            "SELECT 1 FROM source JOIN other ON orders(id) > 0",
+        ] {
+            let body = format!("() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$");
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(&body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.orders(integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{statement}"
+            );
         }
     }
 

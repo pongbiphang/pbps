@@ -12077,9 +12077,9 @@ SPEC is in sync with all of these.
      dependent, although its relation binding could not move.
 
      CTE and relation-alias column lists also use parentheses without calling
-     a routine. The PostgreSQL rebind scan masks only the declaration's name,
-     for either arriving kind: stripping its parentheses would invent a view
-     reference instead. Balanced groups identify `name(columns) AS (body)`
+     a routine. The PostgreSQL rebind scan masks the declared alias and column
+     names for either arriving kind: stripping only their parentheses would
+     invent view references instead. Balanced groups identify `name(columns) AS (body)`
      and aliases of FROM items, including derived relations, table functions,
      joins and ordinalities. Calls inside those groups remain visible, and no
      subsequent use is resolved to an alias. Measured with unmanaged view
@@ -12096,6 +12096,13 @@ SPEC is in sync with all of these.
      from the shared routine to the arriving routine after the typed rebuild.
      USING may name a single relation or alias, but does not open a FROM list:
      the same keyword also ends a CTE's CYCLE clause before its next item.
+     Record column definitions after AS may omit the alias altogether; their
+     column names are still declarations, including in ROWS FROM. The types
+     following those names remain references, including path-resolved modified
+     types. Ordinary alias/CTE column lists and RETURNS TABLE follow the same
+     rule. Live views with unmanaged dependents retain their bindings when a
+     same-named view arrives. INSERT target lists are read directly rather than
+     as FROM argument groups, keeping later VALUES calls visible.
 
      Type modifiers are another non-call use of parentheses. Routine arrivals
      exclude modified type names in parameter and return declarations,
@@ -12137,6 +12144,13 @@ SPEC is in sync with all of these.
      A COPY query starts with its own group and keeps all real calls visible.
      Live procedural cases with unmanaged dependents need only the arriving
      routine; its pg_proc entry cannot capture these utility relation targets.
+     CREATE INDEX targets also remain relations, including UNIQUE and ONLY
+     forms. Their opening parenthesis becomes a separator in the scan-only
+     text, rather than blanking the group: index expressions and predicates
+     must keep their routine calls. A space is insufficient when the first
+     index expression starts with another parenthesis. Live procedural index
+     creation with unmanaged dependents accepts the routine arrival alone;
+     expression and predicate controls retain real calls in the rebind scan.
 
      View arrivals retain path-resolved modified type names: a view creates a
      same-named composite type. Only the modifier group is removed for this
