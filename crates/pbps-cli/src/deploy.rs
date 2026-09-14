@@ -1470,7 +1470,7 @@ fn refuse_unplanned_movement(
     let mut renamed_columns: BTreeMap<(&TableName, &str), &str> = BTreeMap::new();
     // And the columns it drops, because one name can belong to two of them
     // across one plan: the occupant this plan removes and the column it
-    // renames into the name that leaves (DECISIONS 472).
+    // renames into the name that leaves (DECISIONS 473).
     let mut dropped_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
     // The permissions this plan moves, keyed by the role it moves them on and
@@ -1935,7 +1935,7 @@ fn refuse_unplanned_movement(
                 // entry the read-back has is the survivor: comparing them
                 // reports the rename as a retype of a column nobody touched,
                 // and refuses a valid plan at its own checkpoint after the
-                // engine has already performed it (DECISIONS 472). The
+                // engine has already performed it (DECISIONS 473). The
                 // survivor's own baseline is under `from`, which is where the
                 // rename branch below already looks — so the name the plan
                 // gives up stops answering for the name it claims.
@@ -6640,7 +6640,7 @@ mod tests {
         };
         let named: TableName = "dbo.s".parse().unwrap();
         // `order_key` order: the drop frees the name, then the rename claims
-        // it (DECISIONS 472).
+        // it (DECISIONS 473).
         let changes = pbps_model::ChangeSet {
             changes: vec![
                 pbps_model::PlannedChange::new(pbps_model::Change::DropColumn {
