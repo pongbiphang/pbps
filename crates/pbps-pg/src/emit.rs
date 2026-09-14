@@ -1063,6 +1063,7 @@ const fn keyword(kind: ModuleKind) -> &'static str {
 /// | view | `CREATE VIEW <name> AS` | the `SELECT` |
 /// | function, procedure | `CREATE FUNCTION <name>` | the parameter list |
 /// | trigger | `CREATE TRIGGER <name>` | `AFTER INSERT ON <table> …` |
+/// | constraint trigger | `CREATE CONSTRAINT TRIGGER <name>` | `CONSTRAINT AFTER INSERT ON <table> …` (473) |
 ///
 /// **A trigger is the one that differs from the SQL Server side, and it is the
 /// grammar that decides it.** T-SQL writes `CREATE TRIGGER x ON t AFTER
@@ -1110,7 +1111,26 @@ fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statem
             keyword(module.kind),
             qualified(&id.object_name())?
         ),
-        ModuleKind::Trigger => format!("CREATE TRIGGER {}\n{body}", quote(id.name())?),
+        ModuleKind::Trigger => {
+            // The leading marker is declaration syntax, retained by the pull
+            // because it cannot be derived from the trigger's identity (473).
+            // Read one bare token; comments, quotes and identifier continuations
+            // must not turn an ordinary body into a constraint trigger.
+            let start = after_the_gap(body).0;
+            let end = start
+                .find(|c: char| !pbps_dialect::continues_ident(c))
+                .unwrap_or(start.len());
+            if start[..end].eq_ignore_ascii_case("constraint") {
+                let leading = &body[..body.len() - start.len()];
+                let rest = &start[end..];
+                format!(
+                    "CREATE CONSTRAINT TRIGGER {}\n{leading}{rest}",
+                    quote(id.name())?
+                )
+            } else {
+                format!("CREATE TRIGGER {}\n{body}", quote(id.name())?)
+            }
+        }
     };
     // The terminator on a line of its own, because the line before it is the
     // user's: a definition ending in `-- note` would otherwise swallow it, and
@@ -3918,6 +3938,46 @@ mod tests {
             "ON app.t",
         ] {
             assert_eq!(uescape_len(not_one), None, "{not_one}");
+        }
+    }
+
+    #[test]
+    fn constraint_trigger_markers_preserve_body_trivia_and_table_validation() {
+        let pg = Postgres::new();
+        for marker in [
+            "CONSTRAINT ",
+            "constraint\n",
+            "/* leading */ ConStraInt/* gap */ ",
+        ] {
+            let body = format!(
+                "{marker}AFTER INSERT ON app.t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.trf()"
+            );
+            let m = module(ModuleKind::Trigger, &body);
+            assert!(pg.validate_module(&id("app.t.audit"), &m).is_empty());
+            let sql = create_module(&pg, &id("app.t.audit"), &m).unwrap().sql;
+            assert!(sql.contains("CREATE CONSTRAINT TRIGGER \"audit\""), "{sql}");
+            if marker.contains("/*") {
+                assert!(sql.contains("/* leading */ /* gap */ "), "{sql}");
+            }
+            let wrong = module(
+                ModuleKind::Trigger,
+                &body.replace("ON app.t", "ON app.other"),
+            );
+            assert!(!pg.validate_module(&id("app.t.audit"), &wrong).is_empty());
+        }
+        for prefix in [
+            "/* CONSTRAINT */ ",
+            "CONSTRAINT$ ",
+            "CONSTRAINT\u{a0} ",
+            "\"CONSTRAINT\" ",
+        ] {
+            let m = module(
+                ModuleKind::Trigger,
+                &format!("{prefix}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()"),
+            );
+            let sql = create_module(&pg, &id("app.t.audit"), &m).unwrap().sql;
+            assert!(sql.contains("CREATE TRIGGER \"audit\""), "{sql}");
+            assert!(!sql.contains("CREATE CONSTRAINT TRIGGER"), "{sql}");
         }
     }
 

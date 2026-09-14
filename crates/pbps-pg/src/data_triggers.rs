@@ -74,7 +74,7 @@ pub async fn prepare(
             }
             let matches_record = baseline.modules.get(&id).is_some_and(|m| {
                 m.kind == ModuleKind::Trigger
-                    && crate::introspect::after_the_name(&trigger.definition, "CREATE TRIGGER ")
+                    && crate::introspect::trigger_definition(&trigger.definition).as_deref()
                         == Some(m.definition.as_str())
             });
             if !matches_record || !trigger.trusted_owner {
@@ -84,6 +84,17 @@ pub async fn prepare(
         }
     }
     Ok(guard)
+}
+
+/// Finish deferred trigger work before recording a transactional apply (473).
+/// The caller compares managed state before and after this flush: committing
+/// first would let a trigger mutate rows after their success record was read.
+/// No later plan write may run after this point. The authentication closure
+/// cannot decide whether work is pending: an ordinary trigger's routine can
+/// queue a deferred trigger on another table outside that closure (473).
+pub async fn settle(conn: &mut Conn) -> Result<(), DbError> {
+    conn.execute("SET CONSTRAINTS ALL IMMEDIATE").await?;
+    Ok(())
 }
 
 /// Recheck immediately before each row statement, including on a newly created

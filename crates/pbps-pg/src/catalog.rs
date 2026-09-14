@@ -166,6 +166,10 @@ const DEFAULT_VIEW_OPTIONS: &str = "NOT EXISTS (
                          THEN opt.option_value::boolean
                          ELSE true END) IS DISTINCT FROM false)";
 
+/// `pg_get_triggerdef` cannot encode DISABLE, REPLICA or ALWAYS. Only ordinary
+/// mode survives CREATE; share the rule with the omission inventory (473).
+const DEFAULT_TRIGGER_MODE: &str = "tg.tgenabled = 'O'";
+
 /// Whether the relation `c` a trigger is on is one the pull reads back — a
 /// view, or a table [`tables_query`] holds.
 ///
@@ -267,6 +271,7 @@ fn modules_query() -> String {
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE NOT tg.tgisinternal
+            AND {DEFAULT_TRIGGER_MODE}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
             AND {held}
@@ -355,6 +360,22 @@ fn unheld_modules_query() -> String {
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
             AND NOT {held}
+          UNION ALL
+         SELECT n.nspname, tg.tgname,
+                CASE tg.tgenabled WHEN 'D' THEN 'a trigger that is disabled'
+                                  WHEN 'R' THEN 'a trigger that fires only on a replica'
+                                  WHEN 'A' THEN 'a trigger that fires always, replica or not'
+                                  ELSE 'a trigger with an unknown enable mode' END
+                  || ' (`pg_trigger.tgenabled` = ' || tg.tgenabled::text || ')',
+                't', tg.oid::int8, c.relname
+           FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT tg.tgisinternal
+            AND NOT ({DEFAULT_TRIGGER_MODE})
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {trigger_not_extension}
+            AND {held}
           ORDER BY 1, 2"
     )
 }
@@ -505,6 +526,9 @@ fn columns_query() -> String {
 /// path that fires when `pg_get_constraintdef` comes back `NULL` needs a name
 /// an operator can read, and the two joins that produce it are already here.
 fn constraints_query() -> String {
+    // A contype='t' row has an internal pg_depend edge (deptype='i') to its
+    // user constraint trigger: DROP TRIGGER removes both. The module holds
+    // its definition; listing the companion again invents a limitation (473).
     // These flags arrived in PostgreSQL 18. JSON field lookup can represent
     // their absence on older catalogs without making the SQL fail to parse;
     // pre-18 constraints are enforced and have no temporal period (424).
@@ -532,6 +556,7 @@ fn constraints_query() -> String {
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
+        AND con.contype <> 't'
         AND {NOT_A_PROJECTS_SCHEMA}
       ORDER BY con.conrelid, con.conname"
     )

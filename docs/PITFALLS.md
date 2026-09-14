@@ -2173,3 +2173,37 @@ Exclude exactly the current row on its own table, identified by the plan's
 key rather than the foreign key's referenced columns. A second row through
 the same foreign key survives and still counts. Equal key spelling in another
 table identifies another row and must never receive that exclusion.
+
+
+## A companion catalog row is not a second object to declare
+
+PostgreSQL user constraint triggers appear in both `pg_trigger` and
+`pg_constraint`, but the `contype = 't'` constraint belongs to the trigger
+through an internal dependency. Inventorying both as independent objects
+reported two limitations for one trigger. Accepting the new deparser prefix
+alone would also have lost `CONSTRAINT` during emission, and leaving the
+reference-data guard's old prefix reader behind would have refused the now
+managed trigger. Keep the marker in its opaque definition, share the readback
+conversion with that guard, and exclude the internally owned companion row
+(DECISIONS 473). The internal triggers implementing an FK have the opposite
+ownership direction and remain excluded as modules; the FK itself stays held.
+
+A deferred trigger also makes “the statement finished” different from “all its
+work finished”. Measured, a deferred trigger rewrote a declared label after
+`apply` had read and recorded it, at `COMMIT`. Complete the deferred work after
+every planned row exists and compare the settled managed state before recording
+success; completing it per row would reject valid multirow constraints.
+
+The trigger authentication closure cannot tell whether deferred work is queued.
+An ordinary trigger's routine can write another managed table and queue a
+constraint trigger there. A flush conditioned on seeing the constraint trigger
+in the direct-DML/FK-action closure missed that work and recorded stale rows.
+Flush every PostgreSQL transactional apply; routine side effects are not an
+inventory the closure claims to enumerate (DECISIONS 473).
+
+`pg_get_triggerdef` also omits `tgenabled`. Disabled, replica-only and always
+modes all return the same CREATE text as ordinary enabled mode, so a body-only
+pull would rebuild different behavior. Hold ordinary mode only and name the
+other modes as module limitations, for both ordinary and constraint triggers;
+keep the parent table manageable and exclude internal FK triggers (DECISIONS
+473).
