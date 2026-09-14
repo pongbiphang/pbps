@@ -12246,7 +12246,10 @@ SPEC is in sync with all of these.
      Bare SQL expression keywords such as COALESCE/NULLIF, min/max expressions,
      SQL/XML and SQL/JSON constructors either form special expression nodes or
      bind catalog routines directly. Exclude their keywords while retaining
-     expression contents and quoted/qualified routine calls. This follows the
+     expression contents and quoted/qualified routine calls. ROW, EXISTS and
+     VALUES constructors and precision-bearing CURRENT_TIME/TIMESTAMP and
+     LOCALTIME/TIMESTAMP forms follow the same rule; a same-named routine cannot
+     capture those grammar constructs. This follows the
      PostgreSQL grammar's func_expr_common_subexpr productions; do not infer it
      from the identifier-quoting keyword table. SUBSTRING/OVERLAY also support
      ordinary calls: only their top-level FROM/FOR or PLACING forms are excluded.

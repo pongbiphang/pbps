@@ -2565,12 +2565,13 @@ fn sql_expression_keyword(tokens: &[RebindToken<'_>], at: usize) -> bool {
         return false;
     };
     match tokens[at].text.to_ascii_lowercase().as_str() {
-        "coalesce" | "nullif" | "greatest" | "least" | "extract" | "normalize" | "position"
-        | "trim" | "cast" | "treat" | "grouping" | "xmlconcat" | "xmlelement" | "xmlattributes"
-        | "xmlforest" | "xmlparse" | "xmlpi" | "xmlroot" | "xmlserialize" | "xmlexists"
-        | "xmltable" | "xmlnamespaces" | "json" | "json_array" | "json_object"
-        | "json_arrayagg" | "json_objectagg" | "json_scalar" | "json_serialize" | "json_query"
-        | "json_exists" | "json_value" | "json_table" | "merge_action" => true,
+        "row" | "exists" | "values" | "current_time" | "current_timestamp" | "localtime"
+        | "localtimestamp" | "coalesce" | "nullif" | "greatest" | "least" | "extract"
+        | "normalize" | "position" | "trim" | "cast" | "treat" | "grouping" | "xmlconcat"
+        | "xmlelement" | "xmlattributes" | "xmlforest" | "xmlparse" | "xmlpi" | "xmlroot"
+        | "xmlserialize" | "xmlexists" | "xmltable" | "xmlnamespaces" | "json" | "json_array"
+        | "json_object" | "json_arrayagg" | "json_objectagg" | "json_scalar" | "json_serialize"
+        | "json_query" | "json_exists" | "json_value" | "json_table" | "merge_action" => true,
         "substring" | "overlay" => {
             let mut i = at + 2;
             while i < after - 1 {
@@ -4707,6 +4708,13 @@ mod tests {
     #[test]
     fn expression_keywords_keep_explicit_calls_and_expression_operands() {
         for name in [
+            "row",
+            "exists",
+            "values",
+            "current_time",
+            "current_timestamp",
+            "localtime",
+            "localtimestamp",
             "coalesce",
             "nullif",
             "greatest",

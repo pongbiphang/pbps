@@ -9183,6 +9183,28 @@ async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
     db.conn.execute("CREATE SCHEMA app").await.unwrap();
     let pg = Postgres::new();
     let mut definitions = vec![
+        ("row", "SELECT ROW(7)::text || ROW()::text AS value"),
+        ("exists", "SELECT EXISTS(SELECT 7)::text AS value"),
+        (
+            "values",
+            "SELECT value::text FROM (VALUES (7)) source(value)",
+        ),
+        (
+            "current_time",
+            "SELECT (current_time(0) IS NOT NULL)::text AS value",
+        ),
+        (
+            "current_timestamp",
+            "SELECT (current_timestamp(0) IS NOT NULL)::text AS value",
+        ),
+        (
+            "localtime",
+            "SELECT (localtime(0) IS NOT NULL)::text AS value",
+        ),
+        (
+            "localtimestamp",
+            "SELECT (localtimestamp(0) IS NOT NULL)::text AS value",
+        ),
         ("coalesce", "SELECT coalesce(NULL::int, 7)::text AS value"),
         ("nullif", "SELECT nullif(7, 0)::text AS value"),
         ("greatest", "SELECT greatest(7, 0)::text AS value"),
@@ -9338,6 +9360,13 @@ async fn sql_expression_keywords_keep_quoted_and_ordinary_calls() {
         .await
         .unwrap();
     let names = [
+        "row",
+        "exists",
+        "values",
+        "current_time",
+        "current_timestamp",
+        "localtime",
+        "localtimestamp",
         "coalesce",
         "nullif",
         "greatest",
@@ -9356,6 +9385,13 @@ async fn sql_expression_keywords_keep_quoted_and_ordinary_calls() {
     let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
     let mut a = Schema::default();
     let definitions = [
+        "SELECT (ROW(\"row\"(1))).f1 AS value",
+        "SELECT \"exists\"(1) AS value WHERE EXISTS(SELECT 7)",
+        "SELECT \"values\"(1) AS value FROM (VALUES (0)) source(value)",
+        "SELECT \"current_time\"(1) AS value",
+        "SELECT \"current_timestamp\"(1) AS value",
+        "SELECT \"localtime\"(1) AS value",
+        "SELECT \"localtimestamp\"(1) AS value",
         "SELECT coalesce(\"coalesce\"(1), 0) AS value",
         "SELECT nullif(\"nullif\"(1), 0) AS value",
         "SELECT greatest(\"greatest\"(1), 0) AS value",
