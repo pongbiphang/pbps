@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{GrantTarget, ObjectName, Permission, Table};
+use pbps_model::{GrantTarget, ModuleId, ObjectName, Permission, Table};
 
 /// Everything the declarations say the deployment will need rights on.
 ///
@@ -70,6 +70,12 @@ pub struct GrantTargets {
     /// plan will write, and the securable it names is where the right to
     /// revoke has to be held; the declarations alone cannot see it.
     pub roles: Vec<String>,
+    /// Declared and ids-recorded tables whose adopted ACLs the plan manages.
+    /// PostgreSQL adds the environment's recorded tables before inspecting ACLs.
+    pub managed_tables: BTreeSet<ObjectName>,
+    /// Declared module identities, including exact routine overloads. Recorded
+    /// modules join these at the connected boundary, as in the differ's scope.
+    pub managed_modules: BTreeSet<ModuleId>,
 }
 
 /// What one table's declaration could have done to its rows (ADR-0004).

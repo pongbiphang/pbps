@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use pbps_db::{Conn, DbError, Param, doctor::GrantTargets};
-use pbps_model::{GrantTarget, ObjectName, Permission};
+use pbps_db::{Conn, DbError, Param, doctor::Ask};
+use pbps_model::{GrantTarget, ModuleId, ObjectName, Permission};
 
 use super::{Gap, Securable, flag, text};
 
@@ -27,12 +27,24 @@ fn permission(word: &str) -> Option<&'static str> {
     })
 }
 
-pub(super) async fn missing(conn: &mut Conn, granted: &GrantTargets) -> Result<Vec<Gap>, DbError> {
+pub(super) struct Read {
+    pub gaps: Vec<Gap>,
+    pub absent_schemas: BTreeSet<String>,
+}
+
+pub(super) async fn missing(conn: &mut Conn, ask: &Ask<'_>) -> Result<Read, DbError> {
+    let granted = ask.granted;
     let mut demands = granted.permissions.clone();
+    let mut managed_tables = granted.managed_tables.clone();
+    managed_tables.extend(ask.managed_tables.iter().cloned());
+    let mut managed_modules = granted.managed_modules.clone();
     let mut roles: BTreeSet<String> = granted.roles.iter().cloned().collect();
     // Removed declarations still produce REVOKE statements. As in the other
     // engine, an unreadable ledger is reported by the ledger diagnosis itself.
     if let Ok(Some(recorded)) = crate::state::latest(conn).await {
+        managed_tables.extend(recorded.snapshot.ids.tables.into_values());
+        managed_tables.extend(recorded.snapshot.schema.tables.into_keys());
+        managed_modules.extend(recorded.snapshot.schema.modules.into_keys());
         for (name, role) in recorded.snapshot.schema.roles {
             roles.insert(name);
             for (target, permissions) in role.grants {
@@ -41,6 +53,7 @@ pub(super) async fn missing(conn: &mut Conn, granted: &GrantTargets) -> Result<V
         }
     }
     let mut gaps = Vec::new();
+    let mut absent_schemas = BTreeSet::new();
     for (target, permissions) in &demands {
         for right in permissions {
             let Ok(word) = crate::emit::permission_sql(*right) else {
@@ -58,13 +71,25 @@ pub(super) async fn missing(conn: &mut Conn, granted: &GrantTargets) -> Result<V
             {
                 gaps.push(Gap {
                     permission,
-                    why: "MAINTAIN requires PostgreSQL 17 or later",
+                    why: "MAINTAIN requires PostgreSQL 17 or later".to_owned(),
                     securable,
                 });
                 continue;
             }
-            for row in conn.query_with(&query, &params).await? {
-                add_gap(&mut gaps, &row, permission, securable.clone())?;
+            for row in crate::catalog::canonical_query(conn, &query, &params).await? {
+                if let GrantTarget::Schema(schema) = target
+                    && !flag(&row, "present")?
+                {
+                    absent_schemas.insert(schema.clone());
+                    continue;
+                }
+                add_gap(
+                    &mut gaps,
+                    &row,
+                    permission,
+                    securable.clone(),
+                    WHY.to_owned(),
+                )?;
             }
         }
     }
@@ -74,7 +99,7 @@ pub(super) async fn missing(conn: &mut Conn, granted: &GrantTargets) -> Result<V
         let values = super::values_list(roles.len(), 1);
         let query = catalog_question(&values);
         let params: Vec<_> = roles.iter().map(|r| Param::Str(r)).collect();
-        for row in conn.query_with(&query, &params).await? {
+        for row in crate::catalog::canonical_query(conn, &query, &params).await? {
             let Some(permission) = permission(&text(&row, "privilege")?) else {
                 continue;
             };
@@ -87,10 +112,25 @@ pub(super) async fn missing(conn: &mut Conn, granted: &GrantTargets) -> Result<V
                 ),
                 _ => Securable::Object(ObjectName::new(schema, text(&row, "object_name")?)),
             };
-            add_gap(&mut gaps, &row, permission, securable)?;
+            if !manages(&securable, &managed_tables, &managed_modules) {
+                continue;
+            }
+            let grantor = super::spelled(&text(&row, "grantor")?);
+            add_gap(
+                &mut gaps,
+                &row,
+                permission,
+                securable,
+                format!(
+                    "revoking this ACL needs its original grantor {grantor}; select that role explicitly when inherited grant paths compete"
+                ),
+            )?;
         }
     }
-    Ok(gaps)
+    Ok(Read {
+        gaps,
+        absent_schemas,
+    })
 }
 
 fn add_gap(
@@ -98,11 +138,12 @@ fn add_gap(
     row: &pbps_db::Row,
     permission: &'static str,
     securable: Securable,
+    why: String,
 ) -> Result<(), DbError> {
     if !flag(row, "held")? {
         let gap = Gap {
             permission,
-            why: WHY,
+            why,
             securable: securable.clone(),
         };
         if !gaps.contains(&gap) {
@@ -116,7 +157,7 @@ fn add_gap(
         };
         let gap = Gap {
             permission: "USAGE",
-            why: "a role grant must be able to resolve its securable's schema",
+            why: "a role grant must be able to resolve its securable's schema".to_owned(),
             securable: Securable::Schema(schema),
         };
         if !gaps.contains(&gap) {
@@ -126,12 +167,37 @@ fn add_gap(
     Ok(())
 }
 
+// The same namespace boundary as pbps_diff::scope: a managed overload never
+// adopts a same-named relation, and schema ACLs remain declarable everywhere.
+fn manages(
+    securable: &Securable,
+    tables: &BTreeSet<ObjectName>,
+    modules: &BTreeSet<ModuleId>,
+) -> bool {
+    match securable {
+        Securable::Schema(_) => true,
+        Securable::Object(o) => {
+            tables.contains(o)
+                || modules.iter().any(|id| {
+                    !matches!(id, ModuleId::Routine(_)) && id.referenced_name().as_ref() == Some(o)
+                })
+        }
+        Securable::Routine(o, Some(signature)) => modules.iter().any(|id| {
+            matches!(id, ModuleId::Routine(r) if &r.name == o &&
+                r.args.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ") == *signature)
+        }),
+        Securable::Routine(_, None) => false,
+    }
+}
+
 fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<Param<'_>>) {
     match target {
         GrantTarget::Schema(schema) => (
             Securable::Schema(schema.clone()),
-            "SELECT pg_catalog.has_schema_privilege(n.oid, $2) AS held, true AS usage_ok
-               FROM pg_catalog.pg_namespace n WHERE n.nspname = $1"
+            "SELECT n.oid IS NOT NULL AS present,
+                    pg_catalog.has_schema_privilege(n.oid, $2) AS held, true AS usage_ok
+               FROM (SELECT $1::text AS name) wanted
+               LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = wanted.name"
                 .to_owned(),
             vec![Param::Str(schema)],
         ),
@@ -197,41 +263,59 @@ fn routine_question() -> String {
 }
 
 fn catalog_question(values: &str) -> String {
-    // Match introspection's zero point: built-in defaults and an owner's
-    // own ACL entries are not grants the declarative role set manages.
+    // An effective grant option answers GRANT, not REVOKE. PostgreSQL only
+    // changes ACLs attributed to its selected grantor. Owner/superuser act as
+    // owner; otherwise the current role wins when it has a direct option.
+    // A unique inherited option is also sufficient. Competing inherited paths
+    // need explicit role selection. Require one original grantor per grantee
+    // and target too: separate grantors cannot jointly revoke a privilege list
+    // (DECISIONS 483). Checking each privilege preserves partial-removal demands.
     format!(
         "WITH managed AS (
             SELECT r.oid FROM pg_catalog.pg_roles r
             JOIN (VALUES {values}) AS wanted(name) ON r.rolname = wanted.name
+        ), targets AS (
+            SELECT n.nspname AS schema_name, c.relname AS object_name,
+                   'table' AS kind, '' AS signature, c.relowner AS owner, c.relacl AS acl,
+                   pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
+              FROM pg_catalog.pg_class c
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relkind IN ('r', 'v')
+            UNION ALL
+            SELECT n.nspname, p.proname, 'routine',
+                   COALESCE((SELECT pg_catalog.string_agg(pg_catalog.format_type(u.ty, NULL), ', ' ORDER BY u.pos)
+                       FROM pg_catalog.unnest(p.proargtypes) WITH ORDINALITY u(ty, pos)), ''),
+                   p.proowner, p.proacl, pg_catalog.has_schema_privilege(n.oid, 'USAGE')
+              FROM pg_catalog.pg_proc p
+              JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+             WHERE p.prokind IN ('f', 'p')
+            UNION ALL
+            SELECT n.nspname, '', 'schema', '', n.nspowner, n.nspacl, true
+              FROM pg_catalog.pg_namespace n
         )
-        SELECT n.nspname AS schema_name, c.relname AS object_name,
-               'table' AS kind, '' AS signature, a.privilege_type AS privilege,
-               pg_catalog.has_table_privilege(c.oid, a.privilege_type || ' WITH GRANT OPTION') AS held,
-               pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
-          FROM pg_catalog.pg_class c
-          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-          CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
+        SELECT t.schema_name, t.object_name, t.kind, t.signature,
+               a.privilege_type AS privilege, pg_catalog.pg_get_userbyid(a.grantor) AS grantor,
+               COALESCE(a.grantor = CASE
+                   WHEN me.rolsuper OR me.oid = t.owner THEN t.owner
+                   WHEN EXISTS (SELECT FROM pg_catalog.aclexplode(t.acl) own
+                       WHERE own.grantee = me.oid AND own.is_grantable
+                         AND own.privilege_type = a.privilege_type) THEN me.oid
+                   ELSE (SELECT min(candidate.oid::bigint)::oid FROM (
+                       SELECT t.owner AS oid WHERE pg_catalog.pg_has_role(me.oid, t.owner, 'USAGE')
+                       UNION
+                       SELECT opt.grantee FROM pg_catalog.aclexplode(t.acl) opt
+                        WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
+                          AND opt.grantee <> 0
+                          AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
+                   ) candidate HAVING count(*) = 1)
+               END, false) AND (SELECT count(DISTINCT grantor)
+                   FROM pg_catalog.aclexplode(t.acl) WHERE grantee = a.grantee) = 1 AS held,
+               t.usage_ok
+          FROM targets t
+          CROSS JOIN LATERAL pg_catalog.aclexplode(t.acl) a
           JOIN managed m ON m.oid = a.grantee
-         WHERE c.relkind IN ('r', 'v') AND a.grantee <> c.relowner
-        UNION ALL
-        SELECT n.nspname, p.proname, 'routine',
-               COALESCE((SELECT pg_catalog.string_agg(pg_catalog.format_type(u.ty, NULL), ', ' ORDER BY u.pos)
-                   FROM pg_catalog.unnest(p.proargtypes) WITH ORDINALITY u(ty, pos)), ''),
-               a.privilege_type,
-               pg_catalog.has_function_privilege(p.oid, a.privilege_type || ' WITH GRANT OPTION'),
-               pg_catalog.has_schema_privilege(n.oid, 'USAGE')
-          FROM pg_catalog.pg_proc p
-          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-          CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) a
-          JOIN managed m ON m.oid = a.grantee
-         WHERE p.prokind IN ('f', 'p') AND a.grantee <> p.proowner
-        UNION ALL
-        SELECT n.nspname, '', 'schema', '', a.privilege_type,
-               pg_catalog.has_schema_privilege(n.oid, a.privilege_type || ' WITH GRANT OPTION'), true
-          FROM pg_catalog.pg_namespace n
-          CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a
-          JOIN managed m ON m.oid = a.grantee
-         WHERE a.grantee <> n.nspowner
-        ORDER BY 1, 2, 3, 4, 5"
+          CROSS JOIN pg_catalog.pg_roles me
+         WHERE me.rolname = current_user AND a.grantee <> t.owner
+         ORDER BY 1, 2, 3, 4, 5, 6"
     )
 }

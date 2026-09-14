@@ -12170,3 +12170,34 @@ SPEC is in sync with all of these.
      unrelated omitted relations and same-name routines remain unmanaged. Plan,
      baseline and snapshot still refuse the omitted managed state without adding
      a ledger entry; restoring the original objects restores clean verification.
+
+483. **Doctor distinguishes grant options from adopted ACL revocation authority.**
+     The PostgreSQL diagnostic retains each catalog ACL's original grantor
+     (#329). An unrelated grant option authorizes a new GRANT but cannot revoke
+     that ACL. Measured on PostgreSQL 18 and 16, even the owner/superuser's
+     REVOKE leaves an independent grantor's entry intact. An inherited original
+     grantor works when no competing direct option selects the deploying role.
+
+     Each possible removed privilege needs the same original grantor selected
+     by the connected role. Owner/superuser selection, direct grant options and
+     a unique effective inherited grantor are recognized. Competing inherited
+     choices are reported with the original grantor named and explicit role
+     selection advised: PostgreSQL does not promise which inherited path wins.
+     Multiple original grantors on one grantee/target remain a gap because one
+     emitted REVOKE cannot combine their authority. This is a read-only readiness
+     diagnosis (SPEC 14.1), not a grantor addition to the declaration or plan.
+
+     Adopted object ACLs use the differ's managed boundary: declared and ids-file
+     tables, declared modules and the environment's recorded identities (#332).
+     Exact routine signatures stay separate from relations; schema ACLs remain
+     declarable outside that object scope. Declared/recorded explicit grants
+     still demand their own authority. An absent external schema grant target
+     joins the existing schema-absence diagnosis before any privilege gap (#333).
+
+     Routine lookups and adopted signatures use introspection's canonical
+     settings (#330). The existing transaction/savepoint scope restores the
+     caller's search path on success and error. A visible user-defined type
+     therefore cannot hide its routine's grant demand by losing qualification.
+     Live controls assert ACL effects, overload and scope negatives, recorded
+     targets and schema-presence transitions; CLI JSON retains the quoted
+     CREATE SCHEMA remedy.

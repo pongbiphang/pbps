@@ -554,6 +554,14 @@ fn grant_targets(project: &Project, ids: &pbps_model::IdsFile) -> pbps_db::docto
         objects: objects.into_iter().collect(),
         schemas: schemas.into_iter().collect(),
         roles: roles.into_iter().collect(),
+        managed_tables: loaded
+            .schema
+            .tables
+            .keys()
+            .chain(ids.tables.values())
+            .cloned()
+            .collect(),
+        managed_modules: loaded.schema.modules.keys().cloned().collect(),
     }
 }
 
@@ -996,6 +1004,66 @@ fn render(report: &output::Report<Diagnosis>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopted_grant_scope_keeps_ids_tables_and_exact_declared_modules() {
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-doctor-scope332-{}",
+            pbps_model::Uid::generate(pbps_model::UidKind::Table)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("schema")).unwrap();
+        std::fs::write(dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        for (file, declaration) in [
+            ("t.yml", "table: app.t\ncolumns:\n  id: {type: integer}\n"),
+            ("v.yml", "view: app.v\ndefinition: SELECT 1 AS id\n"),
+            (
+                "f.yml",
+                "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS 'SELECT n'\n",
+            ),
+            (
+                "r.yml",
+                "role: reader\ngrants:\n  other.unmanaged: [select]\n",
+            ),
+        ] {
+            std::fs::write(dir.join("schema").join(file), declaration).unwrap();
+        }
+        let project = Project::load(&dir.join("pbps.yml")).unwrap();
+        let mut ids = pbps_model::IdsFile::default();
+        ids.tables.insert(
+            pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            "app.removed".parse().unwrap(),
+        );
+        let grant = grant_targets(&project, &ids);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            grant.managed_tables,
+            ["app.t".parse().unwrap(), "app.removed".parse().unwrap()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            grant.managed_modules,
+            ["app.v".parse().unwrap(), "app.f(integer)".parse().unwrap()]
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            grant
+                .permissions
+                .contains_key(&"other.unmanaged".parse().unwrap())
+        );
+        assert!(
+            !grant
+                .managed_tables
+                .contains(&"other.unmanaged".parse().unwrap())
+        );
+        assert!(
+            !grant
+                .managed_modules
+                .contains(&"app.f(text)".parse().unwrap())
+        );
+    }
 
     fn absent(schema: &str) -> EnvDiagnosis {
         EnvDiagnosis {

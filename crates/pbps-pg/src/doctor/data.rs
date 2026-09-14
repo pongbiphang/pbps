@@ -50,7 +50,7 @@ pub(super) async fn missing(conn: &mut Conn, data: &DataTables) -> Result<Vec<Ga
                 if !flag(&row, "held")? {
                     gaps.push(Gap {
                         permission,
-                        why: "the declared data block needs this privilege for its writes and readback",
+                        why: "the declared data block needs this privilege for its writes and readback".to_owned(),
                         securable: Securable::Object(table.clone()),
                     });
                 }

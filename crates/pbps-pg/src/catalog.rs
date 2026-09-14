@@ -1640,6 +1640,28 @@ async fn close<T>(
     }
 }
 
+/// A permission query that compares catalog-rendered routine types must use
+/// the same spelling as introspection. Reuse its transaction/savepoint scope
+/// so both successful and failed reads restore the caller's settings (#330).
+pub(crate) async fn canonical_query(
+    conn: &mut Conn,
+    sql: &str,
+    params: &[Param<'_>],
+) -> Result<Vec<Row>, DbError> {
+    let scope = if in_transaction(conn).await? {
+        Scope::CallersTransaction
+    } else {
+        Scope::Own
+    };
+    open(conn, scope).await?;
+    let outcome = async {
+        conn.query(CANONICAL_PATH).await?;
+        conn.query_with(sql, params).await
+    }
+    .await;
+    close(conn, scope, outcome).await
+}
+
 /// The one failure the snapshot cannot prevent, named so that it does not
 /// arrive as a mystery.
 ///
@@ -2204,6 +2226,41 @@ fn quote_for_regclass(part: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+    async fn a_failed_canonical_permission_query_restores_both_transaction_scopes() {
+        let connection = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let mut conn = Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        conn.execute("SET search_path = public, pg_catalog")
+            .await
+            .unwrap();
+        for caller_owned in [false, true] {
+            if caller_owned {
+                conn.execute("BEGIN; SET LOCAL search_path = pg_catalog, public")
+                    .await
+                    .unwrap();
+            }
+            let before = conn.query("SHOW search_path").await.unwrap();
+            let error = canonical_query(&mut conn, "SELECT 1 / 0", &[])
+                .await
+                .err()
+                .expect("division by zero must fail");
+            let after = conn.query("SHOW search_path").await.unwrap();
+            let still_in_transaction = in_transaction(&mut conn).await.unwrap();
+            if caller_owned {
+                conn.execute("ROLLBACK").await.unwrap();
+            }
+            assert_eq!(error.server_error_code().as_deref(), Some("22012"));
+            assert_eq!(
+                before[0].try_get::<&str>("search_path").unwrap(),
+                after[0].try_get::<&str>("search_path").unwrap()
+            );
+            assert_eq!(still_in_transaction, caller_owned);
+        }
+    }
+
     use super::*;
 
     #[test]
