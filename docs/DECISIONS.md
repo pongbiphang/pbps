@@ -12088,6 +12088,15 @@ SPEC is in sync with all of these.
      same-named call inside the CTE, derived relation, function argument or
      aliased query: each still rebuilds and binds the arriving routine.
 
+     A record-returning table function can also spell `name(args) AS (columns)`.
+     CTE candidates must therefore follow WITH, its RECURSIVE modifier, or a
+     comma outside a relation list. ROWS FROM starts its own relation-list
+     scope; later members remain calls too. Live views and parsed routines
+     cover direct, lateral, comma-separated and ROWS FROM calls, each changing
+     from the shared routine to the arriving routine after the typed rebuild.
+     USING may name a single relation or alias, but does not open a FROM list:
+     the same keyword also ends a CTE's CYCLE clause before its next item.
+
      Type modifiers are another non-call use of parentheses. Routine arrivals
      exclude modified type names in parameter and return declarations,
      transform operands, casts, record column definitions and typed literals.

@@ -9913,6 +9913,72 @@ async fn bound_cursor_arguments_and_queries_keep_real_routine_calls() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn record_returning_from_calls_rebind_in_views_and_parsed_routines() {
+    let mut db = TestDb::create("record_calls230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE FUNCTION shared.orders(integer) RETURNS record LANGUAGE sql AS 'SELECT 7'")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let queries = [
+        "SELECT x FROM orders(7) AS (x integer)",
+        "SELECT x FROM ROWS FROM(orders(7) AS (x integer))",
+        "SELECT x FROM ROWS FROM(generate_series(1,1), orders(7) AS (x integer))",
+        "SELECT x FROM (VALUES (1)) seed(n), orders(7) AS (x integer)",
+        "SELECT x FROM (VALUES (1)) seed(n) CROSS JOIN LATERAL orders(7) AS (x integer)",
+        "WITH seed(n) AS (VALUES (1)) SELECT x FROM seed CROSS JOIN orders(7) AS (x integer)",
+    ];
+    let mut a = Schema::default();
+    for (i, query) in queries.iter().enumerate() {
+        a.modules.insert(
+            format!("app.v{i}").parse().unwrap(),
+            module(pbps_model::ModuleKind::View, query),
+        );
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE sql BEGIN ATOMIC {query}; END"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..queries.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT x FROM app.v{i}")).await,
+            7
+        );
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.orders(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS record LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let change_count = arrival.changes.len();
+    apply(&mut db.conn, &pg, &arrival).await;
+    let mut results = Vec::new();
+    for i in 0..queries.len() {
+        results.push(number(&mut db.conn, &format!("SELECT x FROM app.v{i}")).await);
+        results.push(number(&mut db.conn, &format!("SELECT app.f{i}()")).await);
+    }
+    db.drop().await;
+    assert_eq!(change_count, queries.len() * 2 + 1, "{arrival:#?}");
+    assert_eq!(results, vec![42; queries.len() * 2]);
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_arrival_must_recheck_a_modified_type_binding() {
     let mut db = TestDb::create("type_view230").await;
     db.conn.execute("CREATE SCHEMA app; CREATE SCHEMA shared; \

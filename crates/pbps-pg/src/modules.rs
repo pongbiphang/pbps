@@ -2177,9 +2177,19 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
             if token_is(&tokens, body, "materialized") {
                 body += 1;
             }
-            // name(columns) AS [NOT MATERIALIZED] (body) identifies each
-            // CTE independently, including after SEARCH/CYCLE clauses.
-            let cte = token_is(&tokens, after, "as") && after_group(&tokens, body).is_some();
+            // The same shape in FROM can be a real record-returning call
+            // followed by column definitions. CTE items start after WITH,
+            // RECURSIVE, or a comma outside a relation list; SEARCH/CYCLE
+            // tails do not change that final comma's context.
+            let cte_position = i > 0
+                && (token_is(&tokens, i - 1, "with")
+                    || (token_is(&tokens, i - 1, "recursive")
+                        && i > 1
+                        && token_is(&tokens, i - 2, "with"))
+                    || (tokens[i - 1].text == "," && !from.last().unwrap()));
+            let cte = cte_position
+                && token_is(&tokens, after, "as")
+                && after_group(&tokens, body).is_some();
             if cte {
                 declarations.push(i);
             }
@@ -2192,7 +2202,13 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
         }
         match token.text.to_ascii_lowercase().as_str() {
             "(" | "[" => {
-                from.push(false);
+                // ROWS FROM contains another relation list, so its commas
+                // cannot introduce CTE declarations either.
+                let rows_from = token.text == "("
+                    && i > 1
+                    && token_is(&tokens, i - 1, "from")
+                    && token_is(&tokens, i - 2, "rows");
+                from.push(rows_from);
                 open_groups.push(i);
             }
             ")" | "]" => {
@@ -2202,7 +2218,11 @@ fn rebind_code(definition: &str, routine: bool, arriving_routine: bool) -> Strin
                 }
             }
             "from" | "join" | "using" => {
-                *from.last_mut().unwrap() = true;
+                // USING also terminates a CTE's CYCLE clause. It can name
+                // one relation/alias, but does not itself start a FROM list.
+                if !token.word("using") {
+                    *from.last_mut().unwrap() = true;
+                }
                 if let Some(alias) = relation_column_alias(&tokens, i + 1) {
                     declarations.push(alias);
                     let end = tokens[tokens[alias + 1].close.unwrap()].offset;
@@ -2883,6 +2903,7 @@ mod tests {
             "WITH orders(id) AS (VALUES (7)) SELECT 7",
             "WITH seed AS (VALUES (7)), orders(id) AS (SELECT * FROM seed) SELECT 7",
             "WITH RECURSIVE orders(id) AS NOT MATERIALIZED (VALUES (7)) SELECT 7",
+            "WITH RECURSIVE seed(id) AS (VALUES (7) UNION ALL SELECT id + 1 FROM seed WHERE id < 7) SEARCH DEPTH FIRST BY id SET seq CYCLE id SET cycle USING path, orders(id) AS (SELECT id FROM seed) SELECT 7",
             "WITH orders(id) AS MATERIALIZED (VALUES (7)) SELECT 7",
             "SELECT id FROM shared.source AS orders(id)",
             "SELECT id FROM shared.source orders(id)",
@@ -3208,6 +3229,29 @@ mod tests {
                 1,
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn record_column_definitions_do_not_turn_calls_into_cte_names() {
+        for body in [
+            "SELECT x FROM orders(7) AS (x integer)",
+            "SELECT x FROM ROWS FROM(orders(7) AS (x integer))",
+            "SELECT x FROM ROWS FROM(generate_series(1,1), orders(7) AS (x integer))",
+            "SELECT x FROM source, orders(7) AS (x integer)",
+            "SELECT x FROM source CROSS JOIN LATERAL orders(7) AS (x integer)",
+            "WITH seed(n) AS (VALUES (1)) SELECT x FROM seed CROSS JOIN orders(7) AS (x integer)",
+            "SELECT x FROM ROWS FROM(seed(1), \"orders\" /* call */ (7) AS (x integer))",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.f()"), module(body));
+            for (arrival, count) in [("app.orders(integer)", 1), ("app.orders", 0)] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).len(),
+                    count,
+                    "{arrival}: {body}"
+                );
+            }
         }
     }
 
