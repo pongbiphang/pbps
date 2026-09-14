@@ -2193,3 +2193,10 @@ work finished”. Measured, a deferred trigger rewrote a declared label after
 `apply` had read and recorded it, at `COMMIT`. Complete the deferred work after
 every planned row exists and compare the settled managed state before recording
 success; completing it per row would reject valid multirow constraints.
+
+The trigger authentication closure cannot tell whether deferred work is queued.
+An ordinary trigger's routine can write another managed table and queue a
+constraint trigger there. A flush conditioned on seeing the constraint trigger
+in the direct-DML/FK-action closure missed that work and recorded stale rows.
+Flush every PostgreSQL transactional apply; routine side effects are not an
+inventory the closure claims to enumerate (DECISIONS 473).

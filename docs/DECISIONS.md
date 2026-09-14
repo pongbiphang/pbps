@@ -11812,13 +11812,13 @@ SPEC is in sync with all of these.
      internal FK exclusion and enforcement, and the guard's acceptance of the
      exact record and refusal of an ordinary or absent one.
 
-     **The success record must also precede no deferred trigger work.** The
+     **All deferred trigger work must finish before the success record.** The
      first implementation passed the inventory round trip but, measured on
      18.6, a managed `INITIALLY DEFERRED` trigger could rewrite an inserted
      label at `COMMIT`: `apply` reported success and `verify` immediately
      reported drift. That is a wrong recording with a single deployer, so it
-     is part of this fix under the review rule. A transactional apply reaching
-     a managed constraint trigger now flushes `SET CONSTRAINTS ALL IMMEDIATE`
+     is part of this fix under the review rule. Every PostgreSQL transactional
+     apply now flushes `SET CONSTRAINTS ALL IMMEDIATE`
      after all plan statements, while its locks and transaction still hold,
      then rereads the managed state. A change from the state that passed the
      row statements' checks rolls back the entire apply. Only the settled
@@ -11828,3 +11828,14 @@ SPEC is in sync with all of these.
      negative fixture rewrites a label after the ordinary statement check.
      Staged row writes already commit before their checkpoint read, so they
      have no pre-commit success snapshot to settle by this rule.
+
+     **The authentication closure is not a pending-work inventory.** Draft
+     review measured an approved ordinary trigger inserting into another
+     managed table, whose deferred constraint trigger then rewrote the first
+     table's declared row. The direct-DML and FK-action closure authenticated
+     the ordinary trigger but never reached the second table through its
+     routine; conditioning the flush on a constraint trigger in that closure
+     therefore committed a stale record. Flush on every PostgreSQL
+     transactional apply, including an apply without a directly reachable
+     constraint trigger. Remove the obsolete guard flag instead of extending
+     a lexical scan into a promise about routine effects.

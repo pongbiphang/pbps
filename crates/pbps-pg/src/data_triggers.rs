@@ -29,7 +29,6 @@ const UPDATE: i16 = 16;
 #[derive(Default)]
 pub struct Guard {
     approved: BTreeMap<i64, i64>,
-    constraint_trigger: bool,
 }
 
 /// What the plan takes away before its row statements run, in the spelling the
@@ -82,8 +81,6 @@ pub async fn prepare(
                 return Err(refused(&trigger, &write.table));
             }
             guard.approved.insert(trigger.oid, trigger.function_oid);
-            guard.constraint_trigger |=
-                trigger.definition.starts_with("CREATE CONSTRAINT TRIGGER ");
         }
     }
     Ok(guard)
@@ -92,13 +89,12 @@ pub async fn prepare(
 /// Finish deferred trigger work before recording a transactional apply (473).
 /// The caller compares managed state before and after this flush: committing
 /// first would let a trigger mutate rows after their success record was read.
-/// No later plan write may run after this point.
-pub async fn settle(conn: &mut Conn, guard: &Guard) -> Result<bool, DbError> {
-    if !guard.constraint_trigger {
-        return Ok(false);
-    }
+/// No later plan write may run after this point. The authentication closure
+/// cannot decide whether work is pending: an ordinary trigger's routine can
+/// queue a deferred trigger on another table outside that closure (473).
+pub async fn settle(conn: &mut Conn) -> Result<(), DbError> {
     conn.execute("SET CONSTRAINTS ALL IMMEDIATE").await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Recheck immediately before each row statement, including on a newly created

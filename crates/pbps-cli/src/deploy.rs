@@ -4340,7 +4340,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // its effects inside this transaction, after every planned write: an
         // earlier flush can refuse a constraint that the full plan satisfies,
         // while a later one records rows that the commit then changes (473).
-        if crate::engine::settle_data_writes(conn, &data_guard).await? {
+        if crate::engine::settle_data_writes(conn).await? {
             let settled = managed_state(
                 conn,
                 &plan.ids,

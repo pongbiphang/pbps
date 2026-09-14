@@ -3355,6 +3355,11 @@ fn adopted_constraint_trigger(connection: &str, slug: &str, function_body: &str)
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.late()"
         ),
     );
+    adopt_constraint_trigger_modules(connection, &d);
+    d
+}
+
+fn adopt_constraint_trigger_modules(connection: &str, d: &Demo) {
     let modules = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3369,20 +3374,19 @@ fn adopted_constraint_trigger(connection: &str, slug: &str, function_body: &str)
                 .schema
                 .modules
         });
-    for (id, module) in modules {
+    for (index, (id, module)) in modules.into_iter().enumerate() {
         let body = module
             .definition
             .lines()
             .map(|line| format!("  {line}\n"))
             .collect::<String>();
         let kind = module.kind.as_str();
-        let identity = if kind == "trigger" {
-            "app.late\non: app.t".to_owned()
-        } else {
-            id.to_string()
+        let identity = match &id {
+            pbps_model::ModuleId::Trigger { on, name } => format!("{}.{name}\non: {on}", on.schema),
+            pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Routine(_) => id.to_string(),
         };
         std::fs::write(
-            d.dir.join(format!("schema/late-{kind}.yml")),
+            d.dir.join(format!("schema/adopted-{index}.yml")),
             format!("{kind}: {identity}\ndefinition: |-\n{body}"),
         )
         .unwrap();
@@ -3396,7 +3400,6 @@ fn adopted_constraint_trigger(connection: &str, slug: &str, function_body: &str)
         "--reason",
         "adopt a deferred trigger",
     ]));
-    d
 }
 
 #[test]
@@ -3445,6 +3448,58 @@ fn constraint_trigger_effects_cannot_arrive_after_the_recorded_row_check() {
     );
     assert_eq!(scalar(connection, "SELECT count(*) FROM app.t"), 0);
     succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn indirect_constraint_trigger_effects_are_settled_before_recording() {
+    let own = OwnDatabase::new(&server(), "constraint_trigger229_indirect");
+    let connection = own.connection();
+    let d = bootstrapped_demo(
+        connection,
+        "constraint-trigger229-indirect",
+        CONSTRAINT_TRIGGER_TABLE,
+    );
+    on_server(
+        connection,
+        "CREATE TABLE app.side (code varchar(20));
+        CREATE FUNCTION app.forward() RETURNS trigger LANGUAGE plpgsql AS
+            $$BEGIN INSERT INTO app.side VALUES (NEW.code); RETURN NEW; END$$;
+        CREATE TRIGGER forward AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.forward();
+        CREATE FUNCTION app.late() RETURNS trigger LANGUAGE plpgsql AS
+            $$BEGIN UPDATE app.t SET label='rewritten' WHERE code=NEW.code; RETURN NEW; END$$;
+        CREATE CONSTRAINT TRIGGER late AFTER INSERT ON app.side
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.late()",
+    );
+    std::fs::write(
+        d.dir.join("schema/side.yml"),
+        "table: app.side\ncolumns:\n  code: {type: varchar(20)}\n",
+    )
+    .unwrap();
+    adopt_constraint_trigger_modules(connection, &d);
+    d.table(&format!(
+        "{CONSTRAINT_TRIGGER_TABLE}data:\n  mode: exact\n  rows:\n    first: {{label: Expected}}\n"
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let outcome = approved_apply(&d, connection, &plan, &[]);
+    let verification = d.run(&["verify", "--db", connection]);
+    assert_eq!(
+        code(&outcome),
+        1,
+        "{}{}; verify: {}{}",
+        stdout(&outcome),
+        stderr(&outcome),
+        stdout(&verification),
+        stderr(&verification)
+    );
+    assert!(
+        stderr(&outcome).contains("deferred constraint triggers changed"),
+        "{}",
+        stderr(&outcome)
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.t"), 0);
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.side"), 0);
+    succeeds(verification);
 }
 
 #[test]
