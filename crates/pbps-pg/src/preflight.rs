@@ -2498,15 +2498,14 @@ enum Applies<'a> {
 /// - a cell this plan writes to a default that is not a literal, which has no
 ///   value until it runs (DECISIONS 124's shape, and 117's on the other
 ///   dialect);
-/// - a column of the key whose type this plan *narrows*, because projecting the
-///   stored value through the new type means a `CAST` that can raise, and a
-///   probe that raises is reported as **unchecked** while the apply proceeds.
-///   The row that would raise cannot survive the `ALTER COLUMN … TYPE` either,
-///   and that change's own conversion probe is what counts it and names the
-///   column;
 /// - a table this plan creates whose declared rows cannot all be spelled,
 ///   because "this table will hold rows I cannot spell" is not "this table will
 ///   be empty", and calling it empty makes every matching child an orphan.
+///
+/// A narrowing keeps its projection. Only stored values the conversion probe
+/// would refuse are excluded from their own branch (DECISIONS 480); a fitting
+/// value still participates even when another value of its type can raise.
+/// NULL is retained for a primary key's separate nullability question.
 ///
 /// A created table that declares *no* rows is a different answer: it will hold
 /// none, and none is an answer. It comes back as the empty relation rather than
@@ -2557,14 +2556,11 @@ fn rows_after(
             names.retyped.get(&reference),
         ) {
             (Some(from), Some(to)) => {
-                let from = crate::types::normalize(from).ok()?;
+                crate::types::normalize(from).ok()?;
                 let to = crate::types::normalize(to).ok()?;
-                // Only a widening is written out. A narrowing `CAST` raises on
-                // the row that cannot make the trip, and takes the probe with
-                // it; `TypeChangeRisk::Safe` is by its own definition the class
-                // that cannot fail, so this cast cannot either.
-                (crate::types::change_risk(&from, &to) == pbps_dialect::TypeChangeRisk::Safe)
-                    .then(|| format!("CAST({sql} AS {to}) AS k{i}"))
+                // Exclusion belongs to the raw stored row, not to its value:
+                // manufacturing NULL would change what a key means (449).
+                Some(format!("CAST({sql} AS {to}) AS k{i}"))
             }
             _ => Some(format!("{sql} AS k{i}")),
         }
@@ -2579,6 +2575,7 @@ fn rows_after(
 
     if let Some(stored) = names.table(table) {
         let mut selected = Vec::new();
+        let mut wheres = Vec::new();
         for (i, column) in columns.iter().enumerate() {
             let reference = table.column(column);
             // A column this plan *adds* is not there for the probe to read —
@@ -2602,6 +2599,11 @@ fn rows_after(
                     }
                 },
             };
+            if let Some(guard) = names.raise_guard(&reference, &read) {
+                // An unknown predicate on NULL is not a failed conversion.
+                // Keep it so the primary-key probe can still count the NULL.
+                wheres.push(format!("({guard}) IS NOT TRUE"));
+            }
             match projected(i, column, read) {
                 Some(sql) => selected.push(sql),
                 None => {
@@ -2611,12 +2613,12 @@ fn rows_after(
             }
         }
         if !unspellable && !selected.is_empty() {
+            let guarded = !wheres.is_empty();
             let mut sql = format!(
                 "SELECT {} FROM {} AS {alias}",
                 selected.join(", "),
                 qualified(&stored)?
             );
-            let mut wheres = Vec::new();
             // Parenthesised: the predicate is the user's text, and an `OR` in
             // it would otherwise bind looser than the exclusion below.
             if let Some(predicate) = filter {
@@ -2652,7 +2654,14 @@ fn rows_after(
             if !wheres.is_empty() {
                 sql.push_str(&format!(" WHERE {}", wheres.join(" AND ")));
             }
-            branches.push(sql);
+            // Without the fence, the outer NULL test or key comparison can
+            // be pushed beside the exclusion and evaluate the cast first.
+            // Measured on both duplicate and orphan probes (480).
+            branches.push(if guarded {
+                format!("({sql} OFFSET 0)")
+            } else {
+                sql
+            });
         }
     }
 
@@ -2711,6 +2720,12 @@ fn rows_after(
                 continue;
             };
             let mut values = Vec::new();
+            let mut guarded = false;
+            let mut wheres = vec![format!(
+                "{alias}.{} = {}",
+                quote(&key_column.name)?,
+                value_literal(key.as_str())
+            )];
             for (i, column) in columns.iter().enumerate() {
                 // The cells this update writes, and the table's own for the
                 // rest: an update names only what changes, and the columns it
@@ -2725,7 +2740,14 @@ fn rows_after(
                     // is about to leave.
                     Some(None) => "NULL".to_owned(),
                     None => match names.column(&table.column(column)) {
-                        Some(c) => format!("{alias}.{}", quote(&c.name)?),
+                        Some(c) => {
+                            let raw = format!("{alias}.{}", quote(&c.name)?);
+                            if let Some(guard) = names.raise_guard(&table.column(column), &raw) {
+                                guarded = true;
+                                wheres.push(format!("({guard}) IS NOT TRUE"));
+                            }
+                            raw
+                        }
                         None => {
                             unspellable = true;
                             break;
@@ -2743,13 +2765,17 @@ fn rows_after(
             if unspellable {
                 break;
             }
-            branches.push(format!(
-                "SELECT {} FROM {} AS {alias} WHERE {alias}.{} = {}",
+            let sql = format!(
+                "SELECT {} FROM {} AS {alias} WHERE {}",
                 values.join(", "),
                 qualified(&stored)?,
-                quote(&key_column.name)?,
-                value_literal(key.as_str())
-            ));
+                wheres.join(" AND ")
+            );
+            branches.push(if guarded {
+                format!("({sql} OFFSET 0)")
+            } else {
+                sql
+            });
         }
     }
 
@@ -3483,6 +3509,80 @@ mod tests {
         super::probes(changes).probes
     }
     use pbps_model::{Change, PlannedChange};
+
+    #[test]
+    fn narrowing_projection_reports_each_constraint_instead_of_unchecked() {
+        let table: TableName = "app.t".parse().unwrap();
+        let retype = Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column("v"),
+            from: "numeric(5,2)".parse().unwrap(),
+            to: "numeric(4,1)".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+        };
+        let columns = vec!["v".to_owned()];
+        let constraints = [
+            Change::AddUnique {
+                table: table.clone(),
+                name: "uq".into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: columns.clone(),
+                },
+            },
+            Change::AddIndex {
+                table: table.clone(),
+                name: "ix".into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "v".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: true,
+                    filter: None,
+                }),
+            },
+            Change::SetPrimaryKey {
+                table: table.clone(),
+                from: None,
+                to: Some(pbps_model::PrimaryKey {
+                    name: None,
+                    columns: columns.clone(),
+                }),
+            },
+            Change::AddForeignKey {
+                table,
+                name: "fk".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns,
+                    references_table: "app.parent".parse().unwrap(),
+                    references_columns: vec!["v".into()],
+                    on_delete: pbps_model::ReferentialAction::NoAction,
+                    on_update: pbps_model::ReferentialAction::NoAction,
+                }),
+            },
+        ];
+        for constraint in constraints {
+            let report = super::probes(&set(vec![retype.clone(), constraint]));
+            assert!(report.unchecked.is_empty(), "{report:#?}");
+            assert!(
+                report
+                    .probes
+                    .iter()
+                    .any(|p| p.description.contains("would collide")
+                        || p.description.contains("no matching parent")),
+                "{report:#?}"
+            );
+            assert!(
+                report
+                    .probes
+                    .iter()
+                    .any(|p| p.description.contains("cannot become")),
+                "the conversion keeps responsibility for excluded rows: {report:#?}"
+            );
+        }
+    }
 
     fn planned(change: Change) -> PlannedChange {
         PlannedChange::new(change)
