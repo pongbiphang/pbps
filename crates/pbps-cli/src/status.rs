@@ -431,7 +431,7 @@ fn record_catalog_findings(
 
     let unreadable = crate::deploy::unreadable_modules(&pulled.unmanaged_modules);
     let unmanaged_objects =
-        crate::deploy::unmanaged_objects(scoped, &unreadable, &recorded_modules);
+        crate::deploy::unmanaged_objects(scoped, &unreadable, recorded_ids, &recorded_modules);
     if unmanaged != pbps_config::Unmanaged::Ignore && !unmanaged_objects.is_empty() {
         record_status_issue(
             row,

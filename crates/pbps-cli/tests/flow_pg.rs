@@ -2428,6 +2428,178 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     );
 }
 
+fn omission_policy(d: &Demo, policy: &str) {
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: postgres\nunmanaged: {policy}\nenvironments:\n  dev:\n    url_env: PBPS_OMISSION_DB\n"),
+    )
+    .unwrap();
+    d.commit();
+}
+
+fn omission_report(d: &Demo, connection: &str, command: &str) -> serde_json::Value {
+    let args = if command == "verify" {
+        vec!["verify", "--db", connection, "--format", "json"]
+    } else {
+        vec!["status", "--format", "json"]
+    };
+    let result = d.run_with_env(&args, &[("PBPS_OMISSION_DB", connection)]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&result)).unwrap();
+    assert_eq!(
+        code(&result),
+        if command == "verify" { 2 } else { 0 },
+        "{report}: {}",
+        stderr(&result)
+    );
+    if command == "verify" {
+        let facts = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "state.drift-unexpressible")
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "{report}");
+        assert!(
+            facts[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("which this model does not hold"),
+            "{report}"
+        );
+    } else {
+        let row = &report["data"][0];
+        assert_eq!(row["state"], "drift", "{report}");
+        let detail = row["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("1 fact(s) inside the managed set"),
+            "{report}"
+        );
+        let managed = detail
+            .split(" — ")
+            .find(|part| part.contains("fact(s) inside the managed set"))
+            .unwrap();
+        assert_eq!(
+            managed.matches("which this model does not hold").count(),
+            1,
+            "{report}"
+        );
+    }
+    report
+}
+
+fn omitted_state_cannot_be_recorded(d: &Demo, connection: &str) {
+    // Ignore unrelated cluster roles here so only the managed omission can
+    // explain the refusal. No command may replace the previous good snapshot.
+    omission_policy(d, "ignore");
+    let before = scalar(connection, "SELECT count(*) FROM public.__pbps_state");
+    for args in [
+        vec!["plan", "--db", connection],
+        vec![
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "must refuse omission",
+        ],
+        vec!["snapshot", "--db", connection, "--force"],
+    ] {
+        let result = d.run(&args);
+        assert_eq!(code(&result), 1, "{}{}", stdout(&result), stderr(&result));
+        assert!(
+            stderr(&result).contains("1 fact(s) inside the managed set cannot be represented"),
+            "{}",
+            stderr(&result)
+        );
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM public.__pbps_state"),
+            before
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn managed_omission_reports_each_catalog_fact_once_and_keeps_recording_refusals() {
+    let own = OwnDatabase::new(&server(), "omission-facts");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("omission-facts");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$\n").unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(
+        connection,
+        "DROP FUNCTION app.f(integer); CREATE AGGREGATE app.f(integer) (SFUNC = int4pl, STYPE = integer, INITCOND = '0')",
+    );
+    for policy in ["warn", "error"] {
+        omission_policy(&d, policy);
+        for command in ["verify", "status"] {
+            let report = omission_report(&d, connection, command);
+            assert!(
+                !report.to_string().contains("aggregate app.f(integer) ("),
+                "{report}"
+            );
+        }
+    }
+    omitted_state_cannot_be_recorded(&d, connection);
+    on_server(
+        connection,
+        "DROP AGGREGATE app.f(integer); CREATE FUNCTION app.f(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$",
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn managed_omission_relations_stay_out_of_unmanaged_policy_with_absent_tables() {
+    let own = OwnDatabase::new(&server(), "omission-relations");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("omission-relations");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    on_server(
+        connection,
+        "DROP TABLE app.t; CREATE MATERIALIZED VIEW app.t AS SELECT 1::bigint AS id",
+    );
+    for has_unmanaged in [false, true] {
+        if has_unmanaged {
+            on_server(
+                connection,
+                "CREATE MATERIALIZED VIEW app.other AS SELECT 1 AS id; CREATE AGGREGATE app.t(integer) (SFUNC = int4pl, STYPE = integer, INITCOND = '0')",
+            );
+        }
+        for policy in ["warn", "error"] {
+            omission_policy(&d, policy);
+            for command in ["verify", "status"] {
+                let report = omission_report(&d, connection, command);
+                let rendered = report.to_string();
+                assert!(!rendered.contains("materialized view app.t ("), "{report}");
+                // Table identity must not hide an unrelated relation or the
+                // same-named routine, even when their kind is also omitted.
+                for name in [
+                    "materialized view app.other (",
+                    "aggregate app.t(integer) (",
+                ] {
+                    assert_eq!(rendered.contains(name), has_unmanaged, "{report}");
+                }
+            }
+        }
+    }
+    omitted_state_cannot_be_recorded(&d, connection);
+    on_server(
+        connection,
+        "DROP MATERIALIZED VIEW app.t; DROP MATERIALIZED VIEW app.other; DROP AGGREGATE app.t(integer); CREATE TABLE app.t (id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id))",
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
