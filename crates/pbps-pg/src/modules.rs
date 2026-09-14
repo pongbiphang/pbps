@@ -2462,9 +2462,15 @@ fn ddl_reference_spans(
                 target += 1;
             }
         }
+        let altered_materialized_view = !create
+            && token_is(tokens, target, "materialized")
+            && token_is(tokens, target + 1, "view");
+        if altered_materialized_view {
+            target += 1;
+        }
         let composite = token_is(tokens, target, "type");
         let domain = create && token_is(tokens, target, "domain");
-        let view = create && token_is(tokens, target, "view");
+        let view = (create || altered_materialized_view) && token_is(tokens, target, "view");
         if !token_is(tokens, target, "table") && !composite && !domain && !view {
             at += 1;
             continue;
@@ -2487,7 +2493,7 @@ fn ddl_reference_spans(
             continue;
         }
         let mut item = target + 1;
-        if create && !view && !domain && !composite {
+        if create && !domain && !composite {
             // PARTITION BY in a table header names a strategy. Stop at AS:
             // a CREATE TABLE AS query may partition a window by a real call.
             // Skipping groups preserves partition expressions and bounds (477).
@@ -2496,12 +2502,20 @@ fn ddl_reference_spans(
                 && !token_is(tokens, clause, ";")
                 && !token_is(tokens, clause, "as")
             {
-                if token_is(tokens, clause, "partition")
+                if !view
+                    && token_is(tokens, clause, "partition")
                     && token_is(tokens, clause + 1, "by")
                     && tokens.get(clause + 2).is_some_and(RebindToken::name)
                     && after_group(tokens, clause + 3).is_some()
                 {
                     declarations.push(clause + 2);
+                }
+                if token_is(tokens, clause, "using")
+                    && tokens.get(clause + 1).is_some_and(RebindToken::name)
+                {
+                    // Table/materialized-view methods live in pg_am, not the
+                    // relation namespace; AS queries and defaults stay code.
+                    declarations.push(clause + 1);
                 }
                 clause = tokens[clause].close.map_or(clause + 1, |close| close + 1);
             }
@@ -2547,6 +2561,16 @@ fn ddl_reference_spans(
                 item += 1;
             }
             while item < tokens.len() && !token_is(tokens, item, ";") {
+                if !composite
+                    && token_is(tokens, item, "set")
+                    && token_is(tokens, item + 1, "access")
+                    && token_is(tokens, item + 2, "method")
+                    && tokens.get(item + 3).is_some_and(RebindToken::name)
+                {
+                    // ALTER's method operand is not its TYPE ... USING
+                    // expression, which must retain ordinary references.
+                    declarations.push(item + 3);
+                }
                 let add = token_is(tokens, item, "add");
                 if add || token_is(tokens, item, "alter") {
                     let mut name = item + 1;
@@ -4203,6 +4227,84 @@ mod tests {
                 1,
                 "{statement}"
             );
+        }
+    }
+
+    #[test]
+    fn table_access_methods_keep_only_real_relation_and_routine_references() {
+        for (statement, relations, routines) in [
+            ("CREATE TABLE child(id int) USING heap", 0, 0),
+            ("CREATE TEMP TABLE child(id int) USING \"heap\"", 0, 0),
+            (
+                "CREATE TABLE child PARTITION OF parent FOR VALUES FROM(0) TO(10) USING heap",
+                0,
+                0,
+            ),
+            ("CREATE TABLE child USING heap AS SELECT 7", 0, 0),
+            (
+                "CREATE MATERIALIZED VIEW child(value) USING heap AS SELECT 7",
+                0,
+                0,
+            ),
+            ("ALTER TABLE target SET ACCESS METHOD heap", 0, 0),
+            ("ALTER TABLE ONLY target SET ACCESS METHOD \"heap\"", 0, 0),
+            (
+                "ALTER MATERIALIZED VIEW target SET ACCESS METHOD heap",
+                0,
+                0,
+            ),
+            (
+                "ALTER TABLE target ADD COLUMN value int, SET ACCESS METHOD heap",
+                0,
+                0,
+            ),
+            ("CREATE TABLE child USING heap AS TABLE heap", 1, 0),
+            (
+                "CREATE MATERIALIZED VIEW child USING heap AS SELECT value FROM heap",
+                1,
+                0,
+            ),
+            ("CREATE TABLE child OF heap USING heap", 1, 0),
+            (
+                "CREATE TABLE child(value int DEFAULT heap(1)) USING heap",
+                0,
+                1,
+            ),
+            ("CREATE TABLE child USING heap AS SELECT heap(1)", 0, 1),
+            (
+                "CREATE MATERIALIZED VIEW child USING heap AS SELECT heap(1)",
+                0,
+                1,
+            ),
+            (
+                "ALTER TABLE target ALTER value TYPE int USING heap(value)",
+                0,
+                1,
+            ),
+            (
+                "ALTER TABLE target SET ACCESS METHOD heap, ALTER value TYPE int USING heap(value)",
+                0,
+                1,
+            ),
+            ("ALTER TABLE target ALTER value TYPE heap", 1, 0),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(
+                id("app.f()"),
+                module(&format!(
+                    "() RETURNS void LANGUAGE plpgsql AS $$BEGIN {statement}; END$$"
+                )),
+            );
+            for (arriving, expected) in [
+                (id("app.heap"), relations),
+                (id("app.heap(integer)"), routines),
+            ] {
+                assert_eq!(
+                    rebound_by_this_plan(&declared, &[], &[arriving], &BTreeSet::new()).len(),
+                    expected,
+                    "{statement}"
+                );
+            }
         }
     }
 

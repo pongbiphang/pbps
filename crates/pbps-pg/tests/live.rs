@@ -9734,6 +9734,183 @@ async fn sql_expression_keywords_do_not_rebuild_for_routine_arrivals() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn table_access_methods_keep_query_and_expression_references() {
+    let mut db = TestDb::create("table_method_refs230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+             CREATE FUNCTION shared.heap(integer) RETURNS int LANGUAGE sql AS 'SELECT 7'; CREATE VIEW shared.heap AS SELECT 7 AS value; CREATE TABLE shared.target(id integer); INSERT INTO shared.target VALUES (7)",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let bodies = [
+        "DECLARE result int; BEGIN CREATE TEMP TABLE child USING heap AS SELECT value FROM heap; SELECT value INTO result FROM child; DROP TABLE child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE MATERIALIZED VIEW child USING heap AS SELECT value FROM heap; SELECT value INTO result FROM child; DROP MATERIALIZED VIEW child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE TEMP TABLE child(value int DEFAULT heap(1)) USING heap; INSERT INTO child DEFAULT VALUES; SELECT value INTO result FROM child; DROP TABLE child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE TEMP TABLE child USING heap AS SELECT heap(1) AS value; SELECT value INTO result FROM child; DROP TABLE child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE MATERIALIZED VIEW child USING heap AS SELECT heap(1) AS value; SELECT value INTO result FROM child; DROP MATERIALIZED VIEW child; RETURN result; END",
+        "DECLARE result int; BEGIN CREATE TEMP TABLE child(value int) USING heap; INSERT INTO child VALUES(7); ALTER TABLE child SET ACCESS METHOD heap; ALTER TABLE child ALTER value TYPE int USING heap(value); SELECT value INTO result FROM child; DROP TABLE child; RETURN result; END",
+    ];
+    let mut a = Schema::default();
+    for (i, body) in bodies.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body${body}$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(number(&mut db.conn, &format!("SELECT app.f{i}()")).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.heap(integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    b.modules.insert(
+        "app.heap".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    // Each arriving kind must rebuild only its own callers; the method names
+    // cannot make the routine-only cases look like relation references.
+    for routine in [false, true] {
+        let name: pbps_model::ModuleId = if routine {
+            "app.heap(integer)"
+        } else {
+            "app.heap"
+        }
+        .parse()
+        .unwrap();
+        let mut one = a.clone();
+        one.modules.insert(name.clone(), b.modules[&name].clone());
+        let one_arrival = plan(&a, &ids, &one, &ids);
+        assert_eq!(
+            one_arrival.changes.len(),
+            if routine { 5 } else { 3 },
+            "{one_arrival:#?}"
+        );
+        for i in 0..bodies.len() {
+            let caller: pbps_model::ModuleId = format!("app.f{i}()").parse().unwrap();
+            assert_eq!(one_arrival.changes.iter().any(|p| matches!(&p.change, pbps_model::Change::AlterModule { id, .. } if id == &caller)), (i >= 2) == routine, "{caller}: {one_arrival:#?}");
+        }
+    }
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), bodies.len() + 2, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..bodies.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT app.f{i}()")).await,
+            42
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn table_access_methods_do_not_rebuild_for_view_arrivals() {
+    let mut db = TestDb::create("table_methods230").await;
+    db.conn
+        .execute("CREATE SCHEMA app; CREATE SCHEMA shared; CREATE TABLE app.parent(id int) PARTITION BY RANGE(id); CREATE TABLE app.target(id int); CREATE MATERIALIZED VIEW app.mv AS SELECT 7 AS id")
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let statements = [
+        "CREATE TABLE child(id int) USING heap; DROP TABLE child",
+        "CREATE TEMP TABLE child(id int) USING \"heap\"; DROP TABLE child",
+        "CREATE UNLOGGED TABLE child(id int) USING heap; DROP TABLE child",
+        "CREATE TABLE IF NOT EXISTS child(id int) USING heap; DROP TABLE child",
+        "CREATE TABLE child PARTITION OF parent FOR VALUES FROM(0) TO(10) USING heap; DROP TABLE child",
+        "CREATE TABLE child USING heap AS SELECT 7 AS id; DROP TABLE child",
+        "CREATE MATERIALIZED VIEW child USING heap AS SELECT 7 AS id; DROP MATERIALIZED VIEW child",
+        "CREATE TABLE child(LIKE target INCLUDING ALL) USING \"heap\"; DROP TABLE child",
+        "ALTER TABLE target SET ACCESS METHOD heap",
+        "ALTER TABLE ONLY target SET ACCESS METHOD \"heap\"",
+        "ALTER MATERIALIZED VIEW mv SET ACCESS METHOD heap",
+    ];
+    let mut a = Schema::default();
+    for (i, statement) in statements.iter().enumerate() {
+        a.modules.insert(
+            format!("app.f{i}()").parse().unwrap(),
+            module(
+                pbps_model::ModuleKind::Function,
+                &format!("() RETURNS int LANGUAGE plpgsql AS $body$BEGIN {statement}; RETURN 7; END$body$"),
+            ),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for i in 0..statements.len() {
+        db.conn
+            .execute(&format!(
+                "CREATE VIEW app.external{i} AS SELECT app.f{i}() AS value"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.heap".parse().unwrap(),
+        module(pbps_model::ModuleKind::View, "SELECT 42 AS value"),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    // Utility statements inside PL/pgSQL bind on execution after emitted DDL
+    // has reset the path, just like other procedural SQL expressions.
+    db.conn
+        .execute("SET search_path = app, shared, pg_temp")
+        .await
+        .unwrap();
+    for i in 0..statements.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn partition_strategy_expressions_keep_real_calls() {
     let mut db = TestDb::create("partition_calls230").await;
     db.conn

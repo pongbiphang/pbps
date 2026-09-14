@@ -12315,6 +12315,15 @@ SPEC is in sync with all of these.
      after the typed rebuild. PostgreSQL rejects inline column-constraint
      INCLUDE, so no rule is inferred from that rejected spelling.
 
+     Table and materialized-view USING operands name pg_am methods, as do
+     ALTER TABLE/MATERIALIZED VIEW SET ACCESS METHOD operands. Exclude only
+     those names so an arriving view cannot invent a rebuild and refuse a
+     valid plan through unmanaged dependents. The CREATE header ends at AS;
+     its query, column defaults, typed-table row type and ALTER TYPE ... USING
+     expression retain ordinary references. Live CREATE/ALTER variants keep
+     unmanaged dependents, while separate relation/routine arrival plans
+     select only their actual callers and the resulting values switch.
+
      A CREATE TABLE header's PARTITION BY RANGE/LIST/HASH names the partition
      strategy, including quoted/mixed-case spellings accepted by the engine.
      Exclude only that name and keep the key expressions visible.
