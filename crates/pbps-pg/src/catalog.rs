@@ -35,8 +35,8 @@ pub use pbps_db::catalog::Spellings;
 
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
-    RawDefaultAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg, RawOtherGrant,
-    RawRole, RawSharedDependency, RawTable, assemble,
+    RawDefaultAcl, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg,
+    RawOtherGrant, RawRole, RawSharedDependency, RawTable, assemble,
 };
 
 /// The emitter quotes both parts of every table name. PostgreSQL compares
@@ -806,6 +806,7 @@ fn batch_query() -> String {
         ("module_args", module_args_query(), "oid, pos"),
         ("roles", ROLES.to_owned(), "name"),
         ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
+        ("empty_routine_acls", empty_routine_acls_query(), "schema_name, name, oid"),
         ("routine_args", grant_routine_args_query(), "oid, pos"),
         ("other_acls", OTHER_ACLS.to_owned(), "class, name, grantee, privilege_type"),
         ("held_elsewhere", HELD_ELSEWHERE.to_owned(), "role_name, in_database, deptype"),
@@ -1090,6 +1091,16 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         });
     }
     for row in batch
+        .get("empty_routine_acls")
+        .ok_or_else(|| missing("empty_routine_acls"))?
+    {
+        raw.empty_routine_acls.push(RawEmptyRoutineAcl {
+            schema: text(row, "schema_name")?,
+            name: text(row, "name")?,
+            routine_oid: number(row, "oid")?,
+        });
+    }
+    for row in batch
         .get("routine_args")
         .ok_or_else(|| missing("routine_args"))?
     {
@@ -1110,6 +1121,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             permission: text(row, "privilege_type")?,
             grantable: flag(row, "is_grantable")?,
             owner: optional_text(row, "owner")?,
+            defaulted: flag(row, "defaulted")?,
         });
     }
     for row in batch
@@ -1313,6 +1325,22 @@ fn grants_query() -> String {
     )
 }
 
+/// Empty ACLs have no rows for `aclexplode`, so retain their routine identity
+/// separately in the same statement snapshot (#250). `cardinality`, not array
+/// equality: measured, REVOKE creates an empty ACL with dimensions `[1:0]`,
+/// which compares unequal to `'{}'::aclitem[]` despite having no entries.
+fn empty_routine_acls_query() -> String {
+    format!(
+        "SELECT n.nspname AS schema_name, p.proname AS name, p.oid::int8 AS oid
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE p.prokind IN ('f', 'p')
+            AND pg_catalog.cardinality(p.proacl) = 0
+            AND {NOT_A_PROJECTS_SCHEMA}
+          ORDER BY 1, 2, 3"
+    )
+}
+
 /// The `pg_class` rows that can carry a grant at all.
 ///
 /// An index and a TOAST table cannot: they have no `GRANT` of their own, and
@@ -1377,12 +1405,21 @@ fn grant_routine_args_query() -> String {
 /// `{ot_owner=U/ot_owner}`. Read as a grant, that entry says a managed role
 /// holds something unnameable and refuses every plan connected to it, where
 /// nothing was granted at all.
+///
+/// Each privilege also carries whether the engine's `acldefault` contains it.
+/// An explicit PUBLIC entry can be either materialized default access or a
+/// new exposure; ACL nullness alone cannot distinguish the two (#258).
 const OTHER_ACLS: &str = "\
 SELECT 'a type' AS class, pg_catalog.format_type(t.oid, NULL) AS name,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
        a.privilege_type, a.is_grantable,
-       pg_catalog.pg_get_userbyid(t.typowner) AS owner
+       pg_catalog.pg_get_userbyid(t.typowner) AS owner,
+       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(
+                   pg_catalog.acldefault('T'::\"char\", t.typowner)) AS dflt
+                WHERE dflt.grantee = a.grantee
+                  AND dflt.privilege_type = a.privilege_type
+                  AND dflt.is_grantable = a.is_grantable) AS defaulted
   FROM pg_catalog.pg_type t
   CROSS JOIN LATERAL pg_catalog.aclexplode(t.typacl) AS a
  UNION ALL
@@ -1390,7 +1427,12 @@ SELECT 'a procedural language', l.lanname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
        a.privilege_type, a.is_grantable,
-       pg_catalog.pg_get_userbyid(l.lanowner)
+       pg_catalog.pg_get_userbyid(l.lanowner),
+       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(
+                   pg_catalog.acldefault('l'::\"char\", l.lanowner)) AS dflt
+                WHERE dflt.grantee = a.grantee
+                  AND dflt.privilege_type = a.privilege_type
+                  AND dflt.is_grantable = a.is_grantable)
   FROM pg_catalog.pg_language l
   CROSS JOIN LATERAL pg_catalog.aclexplode(l.lanacl) AS a
  UNION ALL
@@ -1398,7 +1440,12 @@ SELECT 'a foreign data wrapper', w.fdwname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
        a.privilege_type, a.is_grantable,
-       pg_catalog.pg_get_userbyid(w.fdwowner)
+       pg_catalog.pg_get_userbyid(w.fdwowner),
+       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(
+                   pg_catalog.acldefault('F'::\"char\", w.fdwowner)) AS dflt
+                WHERE dflt.grantee = a.grantee
+                  AND dflt.privilege_type = a.privilege_type
+                  AND dflt.is_grantable = a.is_grantable)
   FROM pg_catalog.pg_foreign_data_wrapper w
   CROSS JOIN LATERAL pg_catalog.aclexplode(w.fdwacl) AS a
  UNION ALL
@@ -1406,7 +1453,12 @@ SELECT 'a foreign server', s.srvname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
        a.privilege_type, a.is_grantable,
-       pg_catalog.pg_get_userbyid(s.srvowner)
+       pg_catalog.pg_get_userbyid(s.srvowner),
+       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(
+                   pg_catalog.acldefault('S'::\"char\", s.srvowner)) AS dflt
+                WHERE dflt.grantee = a.grantee
+                  AND dflt.privilege_type = a.privilege_type
+                  AND dflt.is_grantable = a.is_grantable)
   FROM pg_catalog.pg_foreign_server s
   CROSS JOIN LATERAL pg_catalog.aclexplode(s.srvacl) AS a
  UNION ALL
@@ -1416,7 +1468,7 @@ SELECT 'a configuration parameter', p.parname,
        a.privilege_type, a.is_grantable,
        -- `pg_parameter_acl` has no owner column: a configuration parameter
        -- belongs to nobody, so no entry in it can be the zero point.
-       NULL::name
+       NULL::name, false
   FROM pg_catalog.pg_parameter_acl p
   CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a
  UNION ALL
@@ -1424,7 +1476,12 @@ SELECT 'a large object', m.oid::text,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
        a.privilege_type, a.is_grantable,
-       pg_catalog.pg_get_userbyid(m.lomowner)
+       pg_catalog.pg_get_userbyid(m.lomowner),
+       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(
+                   pg_catalog.acldefault('L'::\"char\", m.lomowner)) AS dflt
+                WHERE dflt.grantee = a.grantee
+                  AND dflt.privilege_type = a.privilege_type
+                  AND dflt.is_grantable = a.is_grantable)
   FROM pg_catalog.pg_largeobject_metadata m
   CROSS JOIN LATERAL pg_catalog.aclexplode(m.lomacl) AS a
  UNION ALL
@@ -1432,7 +1489,12 @@ SELECT 'this database', d.datname,
        CASE WHEN a.grantee = 0 THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
        a.privilege_type, a.is_grantable,
-       pg_catalog.pg_get_userbyid(d.datdba)
+       pg_catalog.pg_get_userbyid(d.datdba),
+       EXISTS (SELECT 1 FROM pg_catalog.aclexplode(
+                   pg_catalog.acldefault('d'::\"char\", d.datdba)) AS dflt
+                WHERE dflt.grantee = a.grantee
+                  AND dflt.privilege_type = a.privilege_type
+                  AND dflt.is_grantable = a.is_grantable)
   FROM pg_catalog.pg_database d
   CROSS JOIN LATERAL pg_catalog.aclexplode(d.datacl) AS a
  WHERE d.datname = pg_catalog.current_database()
@@ -2195,6 +2257,7 @@ mod tests {
             "roles",
             "grants",
             "routine_args",
+            "empty_routine_acls",
             "other_acls",
             "held_elsewhere",
             "default_acls",
@@ -2203,6 +2266,55 @@ mod tests {
             batch.insert(part.to_owned(), Vec::new());
         }
         batch
+    }
+
+    #[test]
+    fn empty_acl_inventory_cannot_read_missing_or_malformed_as_empty() {
+        let mut batch = empty_catalog_batch();
+        assert!(
+            decode_batch(&batch)
+                .unwrap()
+                .0
+                .empty_routine_acls
+                .is_empty()
+        );
+        batch.remove("empty_routine_acls");
+        assert!(decode_batch(&batch).is_err());
+        let row = serde_json::json!({"schema_name": "app", "name": "closed", "oid": 42});
+        batch.insert("empty_routine_acls".to_owned(), vec![row.clone()]);
+        assert_eq!(
+            decode_batch(&batch).unwrap().0.empty_routine_acls,
+            vec![RawEmptyRoutineAcl {
+                schema: "app".to_owned(),
+                name: "closed".to_owned(),
+                routine_oid: 42,
+            }]
+        );
+        for key in ["schema_name", "name", "oid"] {
+            let mut broken = row.clone();
+            broken.as_object_mut().unwrap().remove(key);
+            batch.insert("empty_routine_acls".to_owned(), vec![broken]);
+            assert!(decode_batch(&batch).is_err(), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn an_other_acl_default_requires_a_boolean_catalog_fact() {
+        let mut batch = empty_catalog_batch();
+        let row = serde_json::json!({"grantee": null, "class": "a type", "name": "app.t",
+            "privilege_type": "USAGE", "is_grantable": false, "owner": "deploy", "defaulted": true});
+        batch.insert("other_acls".to_owned(), vec![row.clone()]);
+        assert!(decode_batch(&batch).unwrap().0.other_grants[0].defaulted);
+        for value in [serde_json::Value::Null, serde_json::json!("false")] {
+            let mut broken = row.clone();
+            broken["defaulted"] = value;
+            batch.insert("other_acls".to_owned(), vec![broken]);
+            assert!(decode_batch(&batch).is_err());
+        }
+        let mut missing = row;
+        missing.as_object_mut().unwrap().remove("defaulted");
+        batch.insert("other_acls".to_owned(), vec![missing]);
+        assert!(decode_batch(&batch).is_err());
     }
 
     /// A whole, otherwise-valid constraint row — every column

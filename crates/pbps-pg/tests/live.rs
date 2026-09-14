@@ -19031,6 +19031,176 @@ async fn a_null_acl_is_the_engines_default_and_is_reported_rather_than_compared(
     db.drop().await;
 }
 
+/// An explicitly empty ACL has no grant rows to expand, but still closes
+/// the routine to PUBLIC. Report both routine kinds and their signatures.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn empty_routine_acls_still_report_revoked_public_execute() {
+    let mut db = TestDb::create("empty_public_acl250").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app;
+         CREATE FUNCTION app.closed(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1';
+         CREATE PROCEDURE app.closed(text) LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION app.open() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         REVOKE ALL ON FUNCTION app.closed(integer) FROM PUBLIC, CURRENT_USER;
+         REVOKE ALL ON PROCEDURE app.closed(text) FROM PUBLIC, CURRENT_USER;",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int4 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'app' AND p.proname = 'closed' AND cardinality(p.proacl) = 0"
+        )
+        .await,
+        2
+    );
+    assert!(
+        truth(
+            &mut db.conn,
+            "SELECT proacl IS NULL FROM pg_proc WHERE oid = 'app.open()'::regprocedure"
+        )
+        .await
+    );
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn).await;
+    db.drop().await;
+    let pulled = pulled.unwrap();
+    let revoked: Vec<_> = pulled
+        .warnings
+        .iter()
+        .filter(|w| w.contains("revoked from PUBLIC"))
+        .collect();
+    assert_eq!(revoked.len(), 1, "{:?}", pulled.warnings);
+    assert!(revoked[0].contains("2 routines"), "{}", revoked[0]);
+    for name in ["app.closed(integer)", "app.closed(text)"] {
+        assert!(revoked[0].contains(name), "{}", revoked[0]);
+    }
+    assert!(!revoked[0].contains("app.open()"), "{}", revoked[0]);
+    let open = pulled
+        .warnings
+        .iter()
+        .find(|w| w.contains("PUBLIC can execute"))
+        .unwrap();
+    assert!(open.contains("app.open()"), "{open}");
+    assert!(!open.contains("app.closed("), "{open}");
+    assert!(
+        pulled.unexpressible.is_empty(),
+        "{:?}",
+        pulled.unexpressible
+    );
+    assert!(pulled.schema.roles.values().all(|r| r.grants.is_empty()));
+}
+
+/// Explicit PUBLIC exposure outside the declaration model is context; an
+/// explicitly materialized engine default is not additional exposure.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn nondefault_public_grants_are_reported_without_reporting_materialized_defaults() {
+    let mut db = TestDb::create("public_other_acl258").await;
+    // Parameter ACLs are cluster-wide. Roll back this transaction before any
+    // assertion about the pull, so this fixture never publishes that grant.
+    db.conn.execute("BEGIN").await.unwrap();
+    let probe_role = format!("pbps_public_acl258_{}", std::process::id());
+    db.conn
+        .execute(&format!(
+            "CREATE ROLE {probe_role};
+         CREATE SCHEMA app;
+         CREATE TYPE app.default_type AS ENUM ('a');
+         CREATE FOREIGN DATA WRAPPER public_acl258_wrapper NO HANDLER;
+         CREATE SERVER public_acl258_a FOREIGN DATA WRAPPER public_acl258_wrapper;
+         CREATE SERVER public_acl258_b FOREIGN DATA WRAPPER public_acl258_wrapper;
+         GRANT SET ON PARAMETER log_statement TO {probe_role};"
+        ))
+        .await
+        .unwrap();
+    let large_object = text(&mut db.conn, "SELECT lo_create(0)::text").await;
+    // Materialize the parameter ACL's administrator entries before comparing:
+    // those existing role diagnostics are independent of PUBLIC's new access.
+    let before_public = pbps_pg::catalog::introspect_within_transaction(&mut db.conn).await;
+    db.conn
+        .execute(&format!(
+            "GRANT USAGE ON TYPE app.default_type TO PUBLIC;
+         GRANT USAGE ON LANGUAGE plpgsql TO PUBLIC;
+         GRANT USAGE ON FOREIGN DATA WRAPPER public_acl258_wrapper TO PUBLIC;
+         GRANT USAGE ON FOREIGN SERVER public_acl258_a, public_acl258_b TO PUBLIC;
+         GRANT SET ON PARAMETER log_statement TO PUBLIC;
+         GRANT CREATE ON DATABASE {} TO PUBLIC;
+         GRANT SELECT ON LARGE OBJECT {large_object} TO PUBLIC;",
+            db.name
+        ))
+        .await
+        .unwrap();
+    let measured = truth(
+        &mut db.conn,
+        "SELECT typacl IS NOT NULL AND EXISTS (
+             SELECT 1 FROM aclexplode(typacl) a WHERE a.grantee = 0 AND a.privilege_type = 'USAGE')
+         FROM pg_type WHERE oid = 'app.default_type'::regtype",
+    )
+    .await;
+    let pulled = pbps_pg::catalog::introspect_within_transaction(&mut db.conn).await;
+    db.conn.execute("ROLLBACK").await.unwrap();
+    let db_name = db.name.clone();
+    db.drop().await;
+    assert!(
+        measured,
+        "the negative case must contain an explicit default PUBLIC entry"
+    );
+    let pulled = pulled.unwrap();
+    let warnings: Vec<_> = pulled
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("PUBLIC holds "))
+        .collect();
+    for (permission, class, name) in [
+        ("USAGE", "a foreign data wrapper", "public_acl258_wrapper"),
+        ("USAGE", "a foreign server", "public_acl258_a"),
+        ("USAGE", "a foreign server", "public_acl258_b"),
+        ("SET", "a configuration parameter", "log_statement"),
+        ("SELECT", "a large object", large_object.as_str()),
+        ("CREATE", "this database", db_name.as_str()),
+    ] {
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(permission) && w.contains(class) && w.contains(name)),
+            "missing {permission} on {class} {name}: {warnings:?}"
+        );
+    }
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("on a foreign server"))
+            .count(),
+        1,
+        "same class/permission must be grouped: {warnings:?}"
+    );
+    for name in [
+        "app.default_type",
+        "plpgsql",
+        "PUBLIC holds CONNECT",
+        "PUBLIC holds TEMPORARY",
+    ] {
+        assert!(warnings.iter().all(|w| !w.contains(name)), "{warnings:?}");
+    }
+    let before_public = before_public.unwrap();
+    // Other live tests create cluster roles concurrently, so pin this
+    // fixture's role and the PUBLIC reporting boundary.
+    let role = pulled.schema.roles.get(&probe_role).expect("fixture role");
+    assert_eq!(Some(role), before_public.schema.roles.get(&probe_role));
+    assert!(!pulled.schema.roles.contains_key("PUBLIC"));
+    let own_findings = |p: &pbps_db::catalog::Pulled| {
+        p.unexpressible
+            .iter()
+            .filter(|u| u.role == probe_role)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(own_findings(&pulled), own_findings(&before_public));
+    assert!(pulled.unexpressible.iter().all(|u| u.role != "PUBLIC"));
+}
+
 /// ADR-0010 §2. `ALTER DEFAULT PRIVILEGES` is scoped to the role that creates
 /// the object, so two declarations that read identically mean different
 /// things and the difference is who runs the plan — which is why a `schema::`
