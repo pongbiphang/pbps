@@ -1938,6 +1938,11 @@ const REBIND_LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lex
     ..LEXIS
 };
 
+const ROUTINE_REBIND_LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
+    code_only: &routine_rebind_code_only,
+    ..REBIND_LEXIS
+};
+
 struct RebindToken<'a> {
     text: &'a str,
     offset: usize,
@@ -2010,7 +2015,20 @@ fn relation_column_alias(tokens: &[RebindToken<'_>], mut at: usize) -> Option<us
 /// removing its parentheses does not invent a relation reference instead.
 /// No name is resolved to an alias: later uses remain conservative (476).
 fn rebind_code_only(definition: &str) -> String {
-    let mut code = code_only(definition);
+    rebind_code(definition, false)
+}
+
+fn routine_rebind_code_only(definition: &str) -> String {
+    rebind_code(definition, true)
+}
+
+fn rebind_code(definition: &str, routine: bool) -> String {
+    let mut code = crate::LEXICON.code_only_with_literal_markers(definition);
+    let (mut type_spans, body_as) = if routine {
+        crate::emit::routine_type_spans(definition)
+    } else {
+        (Vec::new(), None)
+    };
     let mut tokens: Vec<RebindToken<'_>> = Vec::new();
     let mut groups: Vec<usize> = Vec::new();
     let mut at = 0;
@@ -2046,10 +2064,32 @@ fn rebind_code_only(definition: &str) -> String {
     // arrays from introducing another item in the outer FROM list.
     let mut from = vec![false];
     for (i, token) in tokens.iter().enumerate() {
+        // PostgreSQL brackets delimit arrays, never identifiers. The shared
+        // name scanner also supports bracket quoting, so retain the group for
+        // this pass and blank its punctuation before handing names to it.
+        if matches!(token.text, "[" | "]") {
+            declarations.push(i);
+        }
+        // AS also introduces cast types and record column definitions. A
+        // parenthesized query after AS is not a type prefix. The :: spelling
+        // has two punctuation tokens, not a keyword subject to quote folding.
+        if (token.word("as") && Some(token.offset) != body_as)
+            || (token.text == ":" && token_is(&tokens, i + 1, ":"))
+        {
+            let end = if token.text == ":" {
+                tokens[i + 1].offset + 1
+            } else {
+                token.offset + token.text.len()
+            };
+            if let Some(ty) = crate::emit::type_prefix(&code[end..]) {
+                type_spans.push(end..end + ty.len());
+            }
+        }
         if token.name()
             && let Some(after) = after_group(&tokens, i + 1)
         {
-            let explicit_alias = i > 0 && token_is(&tokens, i - 1, "as");
+            let explicit_alias =
+                i > 0 && token_is(&tokens, i - 1, "as") && Some(tokens[i - 1].offset) != body_as;
             let mut body = after + 1;
             if token_is(&tokens, body, "not") {
                 body += 1;
@@ -2063,6 +2103,12 @@ fn rebind_code_only(definition: &str) -> String {
             if explicit_alias || cte {
                 declarations.push(i);
             }
+            let close = &tokens[after - 1];
+            let end = close.offset + close.text.len();
+            if token_is(&tokens, after, "'") {
+                // numeric(10, 2) '7' is a typed literal, not a function call.
+                type_spans.push(token.offset..end);
+            }
         }
         match token.text.to_ascii_lowercase().as_str() {
             "(" | "[" => from.push(false),
@@ -2075,11 +2121,15 @@ fn rebind_code_only(definition: &str) -> String {
                 *from.last_mut().unwrap() = true;
                 if let Some(alias) = relation_column_alias(&tokens, i + 1) {
                     declarations.push(alias);
+                    let end = tokens[tokens[alias + 1].close.unwrap()].offset;
+                    type_spans.push(tokens[alias].offset..end);
                 }
             }
             "," if *from.last().unwrap() => {
                 if let Some(alias) = relation_column_alias(&tokens, i + 1) {
                     declarations.push(alias);
+                    let end = tokens[tokens[alias + 1].close.unwrap()].offset;
+                    type_spans.push(tokens[alias].offset..end);
                 }
             }
             "where" | "group" | "having" | "order" | "limit" | "offset" | "fetch" | "for"
@@ -2087,6 +2137,14 @@ fn rebind_code_only(definition: &str) -> String {
                 *from.last_mut().unwrap() = false;
             }
             _ => {}
+        }
+    }
+    for (i, token) in tokens.iter().enumerate() {
+        if token.name()
+            && after_group(&tokens, i + 1).is_some()
+            && type_spans.iter().any(|span| span.contains(&token.offset))
+        {
+            declarations.push(i);
         }
     }
     let ranges: Vec<_> = declarations
@@ -2123,6 +2181,14 @@ pub fn rebound_by_this_plan(
             // out of the ordinary non-call (relation/type) scan as well.
             ordinary.replace_range(operand.clone(), " ");
         }
+        let lexis = if matches!(
+            definition.kind,
+            ModuleKind::Function | ModuleKind::Procedure
+        ) {
+            &ROUTINE_REBIND_LEXIS
+        } else {
+            &REBIND_LEXIS
+        };
         for new in arriving {
             if new == module {
                 continue;
@@ -2150,8 +2216,7 @@ pub fn rebound_by_this_plan(
                         )
                     })
                 });
-            if support_matches
-                || pbps_model::module::references_module_with(&ordinary, new, &REBIND_LEXIS)
+            if support_matches || pbps_model::module::references_module_with(&ordinary, new, lexis)
             {
                 out.push(Rebound {
                     module: module.clone(),
@@ -2792,6 +2857,108 @@ mod tests {
                 )
                 .len(),
                 1,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_modifier_positions_are_not_calls_but_default_and_body_calls_remain() {
+        for body in [
+            "(n numeric(10, 2)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "(OUT n numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "(n OUT numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "(numeric(10, 2), numeric(5, 1)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS numeric(10, 2) LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS TABLE(n numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS SETOF numeric(10, 2) LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS int TRANSFORM FOR TYPE numeric(10, 2) LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS int LANGUAGE sql RETURN (7::numeric(10, 2))::int",
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT CAST(7 AS numeric(10, 2))::int; END",
+            "() RETURNS int LANGUAGE sql AS 'SELECT numeric(10, 2) ''7''::int'",
+            "() RETURNS int LANGUAGE sql AS $$SELECT numeric(10, 2) '7'::int$$",
+            "() RETURNS int LANGUAGE sql AS E'SELECT numeric(10, 2) \\'7\\'::int'",
+            "SELECT (7::numeric(10, 2))::int",
+            "SELECT numeric(10, 2) '7'::int",
+            "SELECT numeric(10, 2) E'7'::int",
+            "SELECT numeric(10, 2) $$7$$::int",
+            "SELECT * FROM source() AS t(n numeric(10, 2))",
+            "SELECT * FROM source() t(n numeric(10, 2))",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            for arrival in ["app.numeric", "app.numeric(integer,integer)"] {
+                assert!(
+                    rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new())
+                        .is_empty(),
+                    "{arrival}: {body}"
+                );
+            }
+        }
+        for body in [
+            "(n numeric(10, 2) DEFAULT \"numeric\"(1, 2)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "(n numeric(10, 2) = (\"numeric\"(1, 2))) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "(n numeric(10, 2)[] DEFAULT ARRAY[\"numeric\"(1, 2)]) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "() RETURNS numeric(10, 2) LANGUAGE sql RETURN \"numeric\"(1, 2)",
+            "() RETURNS int LANGUAGE sql AS 'SELECT \"numeric\"(1, 2)'",
+            "() RETURNS int AS 'SELECT \"numeric\"(1, 2)' LANGUAGE 'sql'",
+            "() RETURNS int LANGUAGE sql AS $$VALUES (\"numeric\"(1, 2))$$",
+            "() RETURNS int LANGUAGE sql AS E'SELECT ''é'', \"numeric\"(1, 2)'",
+            "SELECT \"numeric\"(1, 2)::numeric(10, 2)",
+            "SELECT CAST(\"numeric\"(1, 2) AS numeric(10, 2))",
+            "SELECT * FROM source(\"numeric\"(1, 2)) AS t(n numeric(10, 2))",
+            "SELECT numeric(10, 2) '7', \"numeric\"(1, 2)",
+            "WITH source AS MATERIALIZED (SELECT \"numeric\"(1, 2)) SELECT * FROM source",
+            "WITH source(n) AS MATERIALIZED (VALUES (\"numeric\"(1, 2))) SELECT * FROM source",
+            "WITH source AS NOT MATERIALIZED (SELECT \"numeric\"(1, 2)) SELECT * FROM source",
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            assert_eq!(
+                rebound_by_this_plan(
+                    &declared,
+                    &[],
+                    &[id("app.numeric(integer,integer)")],
+                    &BTreeSet::new()
+                )
+                .len(),
+                1,
+                "{body}: {}",
+                routine_rebind_code_only(body)
+            );
+        }
+        let mut declared = Schema::default();
+        let mut view = module("(SELECT \"numeric\"(1, 2))");
+        view.kind = ModuleKind::View;
+        declared.modules.insert(id("app.v"), view);
+        assert_eq!(
+            rebound_by_this_plan(
+                &declared,
+                &[],
+                &[id("app.numeric(integer,integer)")],
+                &BTreeSet::new()
+            )
+            .len(),
+            1
+        );
+        for (body, arrival) in [
+            (
+                "() RETURNS character varying(10) LANGUAGE sql AS 'SELECT 7'",
+                "app.varying(integer)",
+            ),
+            (
+                "SELECT CAST('7' AS character varying(10))",
+                "app.varying(integer)",
+            ),
+            (
+                "SELECT CAST('7 seconds' AS interval day to second(2))",
+                "app.second(integer)",
+            ),
+        ] {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.caller()"), module(body));
+            assert!(
+                rebound_by_this_plan(&declared, &[], &[id(arrival)], &BTreeSet::new()).is_empty(),
                 "{body}"
             );
         }

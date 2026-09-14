@@ -12088,6 +12088,20 @@ SPEC is in sync with all of these.
      same-named call inside the CTE, derived relation, function argument or
      aliased query: each still rebuilds and binds the arriving routine.
 
+     Type modifiers are another non-call use of parentheses. The rebind scan
+     excludes modified type names in parameter and return declarations,
+     transform operands, casts, record column definitions and typed literals.
+     Parameter defaults and cast operands remain expressions. The dialect
+     lexer offers an opt-in datum marker after decoding quoted routine bodies:
+     `numeric(10, 2) '7'` stays distinguishable from a call without exposing
+     string contents or confusing decoded offsets with the original source.
+     The raw header's AS position keeps a decoded VALUES body out of the type
+     scan. Nested CTE bodies likewise stay outside a type modifier span.
+     PostgreSQL array brackets remain grouping punctuation rather than the
+     shared scanner's identifier quotes, so calls in array defaults survive.
+     Live cases with unmanaged dependents need only the routine arrival;
+     companion defaults and cast operands still rebuild and switch bindings.
+
      This is a lexical refinement, not SQL parsing or overload resolution.
      Fully qualified mentions and every overload of a mentioned routine name
      remain conservative rebind candidates on the effective write path.

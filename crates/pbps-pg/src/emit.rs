@@ -1465,6 +1465,119 @@ pub(crate) fn support_operand(definition: &str) -> Option<std::ops::Range<usize>
     None
 }
 
+/// The lexical type prefix, including modifier groups and multiword built-in
+/// spellings. This locates declarations; it never resolves or validates types.
+pub(crate) fn type_prefix(text: &str) -> Option<&str> {
+    let start = after_the_gap(text).0;
+    let name = qualified_name_at(start)?;
+    if crate::types::is_reserved(&name.to_ascii_lowercase()) {
+        return None;
+    }
+    let mut rest = &start[name.len()..];
+    if name.eq_ignore_ascii_case("setof") {
+        let next = after_the_gap(rest).0;
+        rest = &next[qualified_name_at(next)?.len()..];
+    }
+    loop {
+        let mut next = rest;
+        let Some(item) = header_item(&mut next) else {
+            break;
+        };
+        // A modifier accepts constants or identifiers, never an executed
+        // call. Leave nested groups outside this span: AS MATERIALIZED can
+        // precede a CTE body containing calls, and is not a type declaration.
+        // The leading type name is already included even when its modifier
+        // uses redundant parentheses around a constant.
+        if item.starts_with('(') && item[1..].contains('(') {
+            break;
+        }
+        if item.starts_with('(')
+            || matches!(
+                item.to_ascii_lowercase().as_str(),
+                "varying"
+                    | "precision"
+                    | "with"
+                    | "without"
+                    | "time"
+                    | "zone"
+                    | "year"
+                    | "month"
+                    | "day"
+                    | "hour"
+                    | "minute"
+                    | "second"
+                    | "to"
+                    | "character"
+                    | "char"
+            )
+        {
+            rest = next;
+        } else {
+            break;
+        }
+    }
+    Some(&text[..text.len() - rest.len()])
+}
+
+/// Parameter defaults remain expressions. Everything before each default,
+/// and the return/transform type operands, can contain modifiers but no calls.
+/// The AS offset distinguishes a decoded routine body from a cast or alias.
+pub(crate) fn routine_type_spans(definition: &str) -> (Vec<std::ops::Range<usize>>, Option<usize>) {
+    let mut spans = Vec::new();
+    let mut body_as = None;
+    let Some(list) = parameter_list(definition) else {
+        return (spans, body_as);
+    };
+    let mut rest = after_the_gap(definition).0;
+    let list_start = definition.len() - rest.len() + 1;
+    let mut parameter_at = list_start;
+    for parameter in parameters(list) {
+        // Each borrowed parameter is found from the previous one, so repeated
+        // spellings and commas inside type modifiers keep their own offsets.
+        let start = parameter_at + definition[parameter_at..].find(parameter).unwrap();
+        let ty = before_the_default(parameter);
+        spans.push(start..start + ty.len());
+        parameter_at = start + parameter.len();
+    }
+    rest = &rest[list.len() + 2..];
+    while let Some(item) = header_item(&mut rest) {
+        match item.to_ascii_lowercase().as_str() {
+            "begin" | "return" => break,
+            "as" => {
+                body_as = Some(definition.len() - rest.len() - item.len());
+                header_item(&mut rest);
+            }
+            "returns" => {
+                if take_header_item(&mut rest, "table") {
+                    let start = definition.len() - rest.len();
+                    if header_item(&mut rest).is_some() {
+                        spans.push(start..definition.len() - rest.len());
+                    }
+                    continue;
+                }
+                if let Some(ty) = type_prefix(rest) {
+                    let start = definition.len() - rest.len();
+                    spans.push(start..start + ty.len());
+                    rest = &rest[ty.len()..];
+                }
+            }
+            "for" if take_header_item(&mut rest, "type") => {
+                if let Some(ty) = type_prefix(rest) {
+                    let start = definition.len() - rest.len();
+                    spans.push(start..start + ty.len());
+                    rest = &rest[ty.len()..];
+                }
+            }
+            "language" | "parallel" | "reset" | "support" => {
+                header_item(&mut rest);
+            }
+            "set" if skip_function_setting(&mut rest).is_none() => break,
+            _ => {}
+        }
+    }
+    (spans, body_as)
+}
+
 /// One header item without decoding it. Reuse the emitter's literal, quoted
 /// name and balanced-list readers so data cannot become an option keyword.
 fn header_item<'a>(rest: &mut &'a str) -> Option<&'a str> {

@@ -9428,6 +9428,194 @@ async fn alias_declarations_leave_real_calls_available_for_rebinding() {
     db.drop().await;
 }
 
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn type_modifiers_cannot_capture_an_arriving_routine() {
+    let mut db = TestDb::create("typmods230").await;
+    db.conn.execute("CREATE SCHEMA app; CREATE FUNCTION app.record_source() RETURNS record LANGUAGE sql AS 'SELECT 7::numeric'").await.unwrap();
+    let pg = Postgres::new();
+    let definitions = [
+        (
+            "app.param(numeric)",
+            "(n numeric(10, 2)) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+            "SELECT app.param(7)::int AS value",
+        ),
+        (
+            "app.result()",
+            "() RETURNS numeric(10, 2) LANGUAGE sql AS 'SELECT 7'",
+            "SELECT app.result()::int AS value",
+        ),
+        (
+            "app.out_param()",
+            "(OUT n numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "SELECT app.out_param()::int AS value",
+        ),
+        (
+            "app.table_result()",
+            "() RETURNS TABLE(n numeric(10, 2)) LANGUAGE sql AS 'SELECT 7'",
+            "SELECT n::int AS value FROM app.table_result()",
+        ),
+        (
+            "app.cast_type()",
+            "() RETURNS int LANGUAGE sql RETURN (7::numeric(10, 2))::int",
+            "SELECT app.cast_type() AS value",
+        ),
+        (
+            "app.cast_as()",
+            "() RETURNS int LANGUAGE sql RETURN CAST(7 AS numeric(10, 2))::int",
+            "SELECT app.cast_as() AS value",
+        ),
+        (
+            "app.literal_plain()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT numeric(10, 2) ''7''::int'",
+            "SELECT app.literal_plain() AS value",
+        ),
+        (
+            "app.literal_dollar()",
+            "() RETURNS int LANGUAGE sql AS $$SELECT numeric(10, 2) '7'::int$$",
+            "SELECT app.literal_dollar() AS value",
+        ),
+        (
+            "app.literal_escape()",
+            "() RETURNS int LANGUAGE sql AS E'SELECT numeric(10, 2) \\'7\\'::int'",
+            "SELECT app.literal_escape() AS value",
+        ),
+        (
+            "app.record_alias()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT n::int FROM app.record_source() AS t(n numeric(10, 2))'",
+            "SELECT app.record_alias() AS value",
+        ),
+        (
+            "app.implicit_record_alias()",
+            "() RETURNS int LANGUAGE sql AS 'SELECT n::int FROM app.record_source() t(n numeric(10, 2))'",
+            "SELECT app.implicit_record_alias() AS value",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (id, definition, _) in definitions {
+        a.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for (i, (_, _, query)) in definitions.iter().enumerate() {
+        db.conn
+            .execute(&format!("CREATE VIEW app.external{i} AS {query}"))
+            .await
+            .unwrap();
+    }
+    for (id, definition) in &a.modules {
+        in_a_transaction(&mut db.conn).await;
+        let dependents = pbps_pg::modules::dependents(&mut db.conn, id, definition.kind)
+            .await
+            .unwrap();
+        rollback(&mut db.conn).await;
+        assert!(pbps_pg::modules::unmanaged_refusal(id, &dependents, &a).is_some());
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    let mut arrival_only = arrival.clone();
+    arrival_only
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    apply(&mut db.conn, &pg, &arrival_only).await;
+    for i in 0..definitions.len() {
+        assert_eq!(
+            number(&mut db.conn, &format!("SELECT value FROM app.external{i}")).await,
+            7
+        );
+    }
+    db.drop().await;
+    assert_eq!(arrival.changes.len(), 1, "{arrival:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn type_modifiers_do_not_hide_calls_in_defaults_or_cast_operands() {
+    let mut db = TestDb::create("typmod_calls230").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app; CREATE SCHEMA shared; \
+        CREATE FUNCTION shared.numeric(integer,integer) RETURNS int LANGUAGE sql AS 'SELECT 7'",
+        )
+        .await
+        .unwrap();
+    let pg = Postgres::with_write_path_extras(vec!["shared".into()]);
+    let definitions = [
+        (
+            "app.defaulted(numeric)",
+            "(n numeric(10, 2) DEFAULT \"numeric\"(1, 2)) RETURNS int LANGUAGE sql RETURN n::int",
+            "SELECT app.defaulted()",
+        ),
+        (
+            "app.equals_default(numeric)",
+            "(n numeric(10, 2) = \"numeric\"(1, 2)) RETURNS int LANGUAGE sql RETURN n::int",
+            "SELECT app.equals_default()",
+        ),
+        (
+            "app.array_default(numeric[])",
+            "(n numeric(10, 2)[] DEFAULT ARRAY[\"numeric\"(1, 2)]) RETURNS int LANGUAGE sql RETURN n[1]::int",
+            "SELECT app.array_default()",
+        ),
+        (
+            "app.body()",
+            "() RETURNS numeric(10, 2) LANGUAGE sql BEGIN ATOMIC SELECT \"numeric\"(1, 2); END",
+            "SELECT app.body()::int",
+        ),
+        (
+            "app.cast_call()",
+            "() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT CAST(\"numeric\"(1, 2) AS numeric(10, 2))::int; END",
+            "SELECT app.cast_call()",
+        ),
+    ];
+    let mut a = Schema::default();
+    for (id, definition, _) in definitions {
+        a.modules.insert(
+            id.parse().unwrap(),
+            module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut db.conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    for (_, _, query) in definitions {
+        assert_eq!(number(&mut db.conn, query).await, 7);
+    }
+    let mut b = a.clone();
+    b.modules.insert(
+        "app.numeric(integer,integer)".parse().unwrap(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(integer, integer) RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        ),
+    );
+    let arrival = plan(&a, &ids, &b, &ids);
+    assert_eq!(arrival.changes.len(), definitions.len() + 1, "{arrival:#?}");
+    apply(&mut db.conn, &pg, &arrival).await;
+    for (_, _, query) in definitions {
+        assert_eq!(number(&mut db.conn, query).await, 42);
+    }
+    db.drop().await;
+}
+
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
 /// introduced earlier on the path by the same plan must rebuild the module
 /// once, rather than one plan late.**
