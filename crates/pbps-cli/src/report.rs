@@ -200,7 +200,9 @@ fn one_blocker(b: &Blocker) -> String {
             s
         }
         Blocker::RenameTargetExists { target } => format!(
-            "  rename target {target} already exists in the declarations; choose a different target or remove the existing declaration\n"
+            "  rename target {target} already exists in the declarations\n\n    \
+             to keep the existing declaration, remove or correct the `renamed_from:` annotation or rename intent; \
+             to reuse that name for the source, first free the occupied target in an earlier revision\n"
         ),
         // No command fixes this one: unlike an ambiguous rename or a drop
         // missing a reason, the object itself has a name this tool's own
@@ -1235,6 +1237,17 @@ mod tests {
             text.contains("already exists in the declarations"),
             "{text}"
         );
+        assert!(text.contains("keep the existing declaration"), "{text}");
+        assert!(
+            text.contains("remove or correct the `renamed_from:` annotation or rename intent"),
+            "{text}"
+        );
+        assert!(text.contains("reuse that name for the source"), "{text}");
+        assert!(
+            text.contains("free the occupied target in an earlier revision"),
+            "{text}"
+        );
+        assert!(!text.contains("remove the existing declaration"), "{text}");
 
         let finding = blocker_finding(&blocker);
         assert_eq!(finding.id, "identity.rename-target-exists");
@@ -1243,6 +1256,26 @@ mod tests {
             "{finding:?}"
         );
         assert!(!finding.message.contains("likely a typo"), "{finding:?}");
+    }
+
+    #[test]
+    fn a_rename_target_collision_keeps_guidance_in_the_remedy() {
+        for target in ["dbo.customer", "dbo.customer.full_name", "reader"] {
+            let finding = blocker_finding(&Blocker::RenameTargetExists {
+                target: target.into(),
+            });
+            assert_eq!(finding.id, "identity.rename-target-exists");
+            assert_eq!(
+                finding.message,
+                format!("rename target {target} already exists in the declarations")
+            );
+            let remedy = finding
+                .remedy
+                .as_deref()
+                .expect("occupied-target guidance must have a dedicated remedy");
+            assert!(!remedy.is_empty());
+            assert!(!remedy.contains("already exists in the declarations"));
+        }
     }
 
     /// A column pbps cannot mint an identity for (issue #108) must name the
