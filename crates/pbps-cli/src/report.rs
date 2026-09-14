@@ -470,7 +470,10 @@ pub fn plan(cs: &ChangeSet) -> String {
                 .join(",")
         ));
         if risks.contains(&RiskClass::Destructive) {
-            out.push_str("  Some of them are destructive and will lose data.\n");
+            out.push_str(&format!(
+                "  Some of them are destructive: {}.\n",
+                RiskClass::Destructive.why()
+            ));
         }
     }
     if cs.risks().contains(&RiskClass::GrantWiden) {
