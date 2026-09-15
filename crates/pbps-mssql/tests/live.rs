@@ -1330,6 +1330,71 @@ async fn pull_reports_the_source_default_once_when_character_columns_exist() {
 
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn non_schema_bound_functions_defer_missing_table_resolution() {
+    let mut db = TestDb::create("deferred_functions").await;
+    for definition in [
+        "CREATE FUNCTION dbo.fn_deferred() RETURNS int
+         AS BEGIN RETURN (SELECT MAX(id) FROM dbo.absent_table); END;",
+        "CREATE FUNCTION dbo.tf_deferred() RETURNS @rows TABLE (id int)
+         AS BEGIN INSERT @rows SELECT id FROM dbo.absent_table; RETURN; END;",
+    ] {
+        db.conn
+            .execute(definition)
+            .await
+            .expect("non-schema-bound FN and TF defer an absent table");
+    }
+    for definition in [
+        "CREATE FUNCTION dbo.fn_bound() RETURNS int WITH SCHEMABINDING
+         AS BEGIN RETURN (SELECT MAX(id) FROM dbo.absent_table); END;",
+        "CREATE FUNCTION dbo.tf_bound() RETURNS @rows TABLE (id int)
+         WITH SCHEMABINDING AS BEGIN
+         INSERT @rows SELECT id FROM dbo.absent_table; RETURN; END;",
+    ] {
+        assert!(
+            db.conn.execute(definition).await.is_err(),
+            "schema binding must require the missing table: {definition}"
+        );
+    }
+    let objects = db
+        .conn
+        .query(
+            "SELECT o.name, RTRIM(o.type), m.is_schema_bound
+             FROM sys.objects o JOIN sys.sql_modules m ON m.object_id = o.object_id
+             WHERE o.name IN ('fn_deferred', 'tf_deferred', 'fn_bound', 'tf_bound')
+             ORDER BY o.name;",
+        )
+        .await
+        .expect("read actual function catalog objects");
+    assert_eq!(objects.len(), 2);
+    for (row, (name, kind)) in objects
+        .iter()
+        .zip([("fn_deferred", "FN"), ("tf_deferred", "TF")])
+    {
+        assert_eq!(row.try_get_at::<&str>(0).unwrap(), Some(name));
+        assert_eq!(row.try_get_at::<&str>(1).unwrap(), Some(kind));
+        assert_eq!(row.try_get_at::<bool>(2).unwrap(), Some(false));
+    }
+    let absent: i32 = db
+        .conn
+        .query("SELECT CASE WHEN OBJECT_ID(N'dbo.absent_table') IS NULL THEN 1 ELSE 0 END;")
+        .await
+        .unwrap()[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(absent, 1, "the fixture never creates the referenced table");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect functions with deferred references");
+    db.drop().await;
+    assert_eq!(pulled.schema.modules.len(), 2);
+    for name in ["dbo.fn_deferred", "dbo.tf_deferred"] {
+        assert!(pulled.schema.modules.contains_key(&name.parse().unwrap()));
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
     let mut db = TestDb::create("temporal").await;
     db.conn
