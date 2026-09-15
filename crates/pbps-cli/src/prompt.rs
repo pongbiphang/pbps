@@ -383,6 +383,109 @@ mod tests {
     }
 
     #[test]
+    fn conflicted_rename_sources_are_not_offered_beside_unrelated_names() {
+        use std::collections::BTreeSet;
+
+        use pbps_model::{Column, IdsFile, Role, Schema, Table};
+
+        let schema = |names: &[&str]| {
+            let mut schema = Schema::default();
+            let mut columns = Table::default();
+            for name in names {
+                schema
+                    .tables
+                    .insert(TableName::new("dbo", *name), Table::default());
+                columns
+                    .columns
+                    .insert((*name).into(), Column::new("int".parse().unwrap()));
+                schema.roles.insert((*name).into(), Role::default());
+            }
+            schema.tables.insert(table(), columns);
+            schema
+        };
+        let ctx = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-09-15".into(),
+        };
+        let intents: Vec<Intent> = ["old1", "old2"]
+            .into_iter()
+            .flat_map(|from| {
+                [
+                    Intent::RenameTable {
+                        from: TableName::new("dbo", from),
+                        to: TableName::new("dbo", "new"),
+                    },
+                    Intent::RenameColumn {
+                        table: table(),
+                        from: from.into(),
+                        to: "new".into(),
+                    },
+                    Intent::RenameRole {
+                        from: from.into(),
+                        to: "new".into(),
+                    },
+                ]
+            })
+            .collect();
+        for unrelated_source in [false, true] {
+            let mut before = vec!["old1", "old2"];
+            if unrelated_source {
+                before.push("other");
+            }
+            let ids = pbps_diff::resolve(&schema(&before), &IdsFile::default(), &[], &ctx)
+                .unwrap()
+                .ids;
+            let expected = if unrelated_source {
+                vec![
+                    Blocker::AmbiguousTables {
+                        disappeared: vec![TableName::new("dbo", "other")],
+                        appeared: vec![TableName::new("dbo", "spare")],
+                    },
+                    Blocker::AmbiguousColumns {
+                        table: table(),
+                        disappeared: vec!["other".into()],
+                        appeared: vec!["spare".into()],
+                    },
+                    Blocker::AmbiguousRoles {
+                        disappeared: vec!["other".into()],
+                        appeared: vec!["spare".into()],
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            for reversed in [false, true] {
+                let mut ordered = intents.clone();
+                if reversed {
+                    ordered.reverse();
+                }
+                let blockers = pbps_diff::resolve(&schema(&["new", "spare"]), &ids, &ordered, &ctx)
+                    .unwrap_err();
+                let mut conflicts = BTreeSet::new();
+                let remaining: Vec<Blocker> = blockers
+                    .iter()
+                    .filter_map(|blocker| {
+                        if let Blocker::ConflictingRenameIntents { side, intents, .. } = blocker {
+                            assert_eq!(*side, pbps_diff::RenameSide::Target);
+                            conflicts.extend(intents.iter().cloned());
+                            None
+                        } else {
+                            Some(blocker.clone())
+                        }
+                    })
+                    .collect();
+                assert_eq!(blockers.len(), 3 + expected.len(), "{blockers:?}");
+                assert_eq!(conflicts, intents.iter().cloned().collect());
+                assert_eq!(remaining, expected, "reversed={reversed}");
+                let offered: Vec<Choice> = blockers.iter().flat_map(choices).collect();
+                let expected_choices: Vec<Choice> = expected.iter().flat_map(choices).collect();
+                assert_eq!(offered, expected_choices, "reversed={reversed}");
+                assert_eq!(offered.len(), if unrelated_source { 6 } else { 0 });
+            }
+        }
+    }
+
+    #[test]
     fn provisional_questions_wait_for_identity_to_be_resolved_again() {
         let ordinary = Blocker::AmbiguousColumns {
             table: table(),
