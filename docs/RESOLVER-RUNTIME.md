@@ -16,6 +16,15 @@ engine service's process tree. A configured PID bounds inspection; it does
 not assert identity. Database names, credentials and aliases do not establish
 instance separation.
 
+Systemd socket activation (`dockerd -H fd://`) is supported with its protected
+`/run/docker.pid`. Listener credentials name systemd in this case, so that PID
+file supplies only a candidate: kernel Unix socket diagnostics must bind the
+actual accepted peer inode to a descriptor held by the root-installed dockerd
+process. The client socket's kernel cookie, the peer descriptor and process
+lease are checked throughout ordinary API traffic and attach streams. Passing
+a protected PID file or plausible Docker replies through a proxy cannot qualify
+its socket. Missing or unreadable socket diagnostics refuse admission.
+
 The initial fixed layouts are the tested PostgreSQL 18 and Linux SQL Server
 images used by the fixture scripts. The selected image must be explicitly
 trusted. Missing images obey `never`/`if_missing`; registry credentials stay

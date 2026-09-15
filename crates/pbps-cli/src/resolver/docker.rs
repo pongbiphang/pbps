@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::resolver::native::ProcessLease;
+use crate::resolver::native::DaemonLease;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::client::conn::http1::SendRequest;
@@ -226,7 +226,7 @@ pub struct LocalApi {
     sender: Option<SendRequest<Full<Bytes>>>,
     driver: tokio::task::JoinHandle<()>,
     peer: (u32, i32),
-    native_daemon: Option<ProcessLease>,
+    native_daemon: Option<DaemonLease>,
 }
 
 impl Drop for LocalApi {
@@ -261,7 +261,9 @@ impl LocalApi {
     /// this direct-daemon path merely by returning plausible Docker metadata.
     pub async fn connect_native(socket_path: &Path) -> Result<Self, Error> {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-        let mut api = Self::connect(socket_path).await?;
+        if !socket_path.is_absolute() {
+            return Err(Error::SocketPath);
+        }
         let metadata = std::fs::metadata(socket_path).map_err(|_| Error::NativeDaemon)?;
         if !metadata.file_type().is_socket() || metadata.uid() != 0 || metadata.mode() & 0o007 != 0
         {
@@ -273,20 +275,18 @@ impl LocalApi {
                 return Err(Error::NativeDaemon);
             }
         }
-        let lease = ProcessLease::capture(api.peer.1.try_into().map_err(|_| Error::NativeDaemon)?)
-            .map_err(|_| Error::NativeDaemon)?;
-        if lease
-            .executable_path()
-            .file_name()
-            .is_none_or(|name| name != "dockerd")
-        {
-            return Err(Error::NativeDaemon);
-        }
-        api.native_daemon = Some(lease);
-        Ok(api)
+        Self::connect_profile(socket_path, 0, true).await
     }
 
     async fn connect_peer(socket_path: &Path, required_uid: u32) -> Result<Self, Error> {
+        Self::connect_profile(socket_path, required_uid, false).await
+    }
+
+    async fn connect_profile(
+        socket_path: &Path,
+        required_uid: u32,
+        native: bool,
+    ) -> Result<Self, Error> {
         let stream = tokio::time::timeout(REQUEST_BUDGET, UnixStream::connect(socket_path))
             .await
             .map_err(|_| Error::ControlLost)?
@@ -295,6 +295,15 @@ impl LocalApi {
         if peer.uid() != required_uid || peer.pid().is_none_or(|pid| pid <= 0) {
             return Err(Error::Peer);
         }
+        let native_daemon = if native {
+            Some(
+                DaemonLease::capture(&stream)
+                    .await
+                    .map_err(|_| Error::NativeDaemon)?,
+            )
+        } else {
+            None
+        };
         let (sender, connection) = tokio::time::timeout(
             REQUEST_BUDGET,
             hyper::client::conn::http1::handshake(TokioIo::new(stream)),
@@ -313,7 +322,7 @@ impl LocalApi {
             sender: Some(sender),
             driver,
             peer: (peer.uid(), peer.pid().ok_or(Error::Peer)?),
-            native_daemon: None,
+            native_daemon,
         })
     }
 

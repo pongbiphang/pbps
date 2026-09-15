@@ -2,7 +2,7 @@
 //! run ownership, the private forwarder and its backend need admission too.
 
 use super::{API, Error, LocalApi, REQUEST_BUDGET, RequestGuard};
-use crate::resolver::native::ProcessLease;
+use crate::resolver::native::DaemonLease;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Request, StatusCode};
@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// peer-identity failure. It does not grant a resolver admission capability.
 pub struct AttachStream {
     io: FramedIo<TokioIo<hyper::upgrade::Upgraded>>,
-    daemon: Option<ProcessLease>,
+    daemon: Option<DaemonLease>,
 }
 
 impl LocalApi {

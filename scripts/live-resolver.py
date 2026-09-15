@@ -47,6 +47,8 @@ def main():
     for image in {IMAGES[args.engine], IMAGES["pg"]}:
         subprocess.run(["docker", "--host", f"unix://{socket}", "image", "inspect", image],
                        check=True, stdout=subprocess.DEVNULL)
+    subprocess.run([sys.executable, "scripts/resolver-daemon-fixture.py"], check=True,
+                   env=dict(env, DOCKER_HOST=f"unix://{socket}", DOCKER_CONTEXT=""))
     for test in TESTS:
         command = ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored",
                    "--exact", "resolver::" + test, "--nocapture"]

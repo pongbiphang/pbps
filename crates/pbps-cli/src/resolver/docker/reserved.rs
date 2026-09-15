@@ -90,10 +90,15 @@ impl ReservedSession {
                 .map_err(|_| Error::ControlLost)?;
             bootstrap.flush().await.map_err(|_| Error::ControlLost)?;
             let mut ready = [0; b"pbps-bootstrap-ready-v1\n".len()];
-            bootstrap
-                .read_exact(&mut ready)
-                .await
-                .map_err(|_| Error::Start)?;
+            bootstrap.read_exact(&mut ready).await.map_err(|error| {
+                #[cfg(test)]
+                eprintln!(
+                    "private startup stage=bootstrap-greeting, io_kind={:?}",
+                    error.kind()
+                );
+                let _ = error;
+                Error::Start
+            })?;
             if &ready != b"pbps-bootstrap-ready-v1\n" {
                 return Err(Error::Start);
             }

@@ -288,6 +288,11 @@ async fn create_start(
         .request(Method::POST, &format!("{API}/containers/{id}/start"))
         .await?;
     if status != StatusCode::NO_CONTENT {
+        #[cfg(test)]
+        eprintln!(
+            "private startup stage=container-start, http_status={}",
+            status.as_u16()
+        );
         return Err(Error::Start);
     }
     let state = inspect(api, id).await?.ok_or(Error::Start)?;

@@ -12707,3 +12707,19 @@ SPEC is in sync with all of these.
     steps. See [the runtime boundary and measured fixtures](RESOLVER-RUNTIME.md)
     for supported premises and the distinction between component fixtures and
     complete admission on a disposable native Linux runner.
+
+498. **Authenticate socket-activated Docker through its accepted Unix peer,
+    not the listener creator's credentials.** Linux `SO_PEERCRED` preserves
+    the creator of a listener inherited by `dockerd -H fd://`, so requiring
+    that PID to be dockerd rejects the standard systemd installation. A
+    protected `/run/docker.pid` supplies the candidate only when the listener
+    creator is native PID 1 running root-installed systemd. Root process and
+    executable checks still apply. One exact `NETLINK_SOCK_DIAG` query binds
+    the client inode and kernel cookie to the accepted peer inode; dockerd
+    must hold that peer descriptor. Hold and recheck the process/socket binding
+    across API requests and attach traffic. Never accept arbitrary root
+    proxies, trust Docker response metadata as peer proof, dump every host
+    socket or reconnect to recover admission. The existing Rustix dependency
+    supplies safe Linux socket calls without project-local unsafe code.
+    An inherited-listener fixture measures the creator/acceptor distinction
+    and rejects unrelated owners, cookie substitution and lost continuity.

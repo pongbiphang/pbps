@@ -1320,6 +1320,7 @@ dependencies = [
  "pbps-ui",
  "rand",
  "regex-lite",
+ "rustix",
  "rustls",
  "schemars",
  "serde",

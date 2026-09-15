@@ -186,10 +186,24 @@ impl CandidateSession {
             let mut connection =
                 StreamConn::connect(driver, stream, engine::login(driver, password))
                     .await
-                    .map_err(|_| Error::Start)?;
-            let identity = engine::identity(&mut connection)
-                .await
-                .map_err(|_| Error::Start)?;
+                    .map_err(|error| {
+                        #[cfg(test)]
+                        eprintln!(
+                            "private startup stage=protocol, driver_code={:?}",
+                            error.server_error_code()
+                        );
+                        let _ = error;
+                        Error::Start
+                    })?;
+            let identity = engine::identity(&mut connection).await.map_err(|error| {
+                #[cfg(test)]
+                eprintln!(
+                    "private startup stage=identity, driver_code={:?}",
+                    error.server_error_code()
+                );
+                let _ = error;
+                Error::Start
+            })?;
             control.check().await?;
             workload.check().await?;
             Ok((connection, identity))

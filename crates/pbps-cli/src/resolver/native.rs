@@ -13,9 +13,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+mod daemon;
 mod execution;
 mod private_channel;
 mod target;
+pub(crate) use daemon::DaemonLease;
 pub(crate) use execution::{ExecutionLease, ExecutionProfile};
 pub(crate) use private_channel::{PrivateChannelLease, PrivateChannelProfile, awaiting_engine};
 pub(crate) use target::TargetWitness;
