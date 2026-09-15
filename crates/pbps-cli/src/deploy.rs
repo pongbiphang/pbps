@@ -1533,7 +1533,25 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
-    for p in &changes.changes {
+    // A freeing drop can now run before its owner's table rename. Its typed
+    // address is the one that exists at execution; shape exclusions and net
+    // postconditions must follow only the subsequent renames (DECISIONS 496).
+    // Following the suffix also keeps a later re-add under the final name in
+    // the same net outcome, without confusing an already-renamed address.
+    fn part_table_after<'a>(
+        mut table: &'a TableName,
+        remaining: &'a [pbps_model::PlannedChange],
+    ) -> &'a TableName {
+        for p in remaining {
+            if let pbps_model::Change::RenameTable { from, to, .. } = &p.change
+                && table == from
+            {
+                table = to;
+            }
+        }
+        table
+    }
+    for (index, p) in changes.changes.iter().enumerate() {
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
             renamed.insert(from, to);
         }
@@ -1577,23 +1595,24 @@ fn refuse_unplanned_movement(
                 .insert(field);
         }
         if let Some(part) = p.change.constraints() {
+            let table = part_table_after(part.table, &changes.changes[index + 1..]);
             if part.after.presence() == pbps_model::Presence::Present
                 && let Some(n) = part.name
             {
                 added_parts
-                    .entry(part.table)
+                    .entry(table)
                     .or_default()
                     .insert((part.part(), n));
             }
             match part.name {
                 Some(name) => {
                     constraints
-                        .entry(part.table)
+                        .entry(table)
                         .or_default()
                         .insert((part.part(), name));
                 }
                 None => {
-                    keys.insert(part.table);
+                    keys.insert(table);
                 }
             }
         }
@@ -2277,13 +2296,14 @@ fn refuse_unplanned_movement(
             (pbps_model::ColumnRef, pbps_model::ColumnField),
             pbps_model::ColumnPromise<'_>,
         > = BTreeMap::new();
-        for p in &changes.changes {
+        for (index, p) in changes.changes.iter().enumerate() {
             expected_columns.extend(p.change.columns_after());
             for (column, promise) in p.change.columns_promised() {
                 expected_promises.insert((column, promise.field()), promise);
             }
             if let Some(part) = p.change.constraints() {
-                expected_parts.insert((part.table, part.part(), part.name), part.after);
+                let table = part_table_after(part.table, &changes.changes[index + 1..]);
+                expected_parts.insert((table, part.part(), part.name), part.after);
             }
         }
         for (column, expected) in expected_columns {
@@ -8325,6 +8345,189 @@ mod tests {
         )
         .expect_err("the drop did not take");
         assert!(format!("{e:#}").contains("ix_note"), "{e:#}");
+    }
+
+    #[test]
+    fn early_part_drops_follow_their_table_and_still_enforce_absence() {
+        use pbps_model::{
+            Change, ChangeSet, ForeignKey, Index, IndexColumn, PlannedChange, PrimaryKey, Table,
+            UniqueConstraint,
+        };
+        for target in ["dbo.new", "moved.new"] {
+            for kind in ["index", "unique", "foreign key", "primary key"] {
+                let source: TableName = "dbo.old".parse().unwrap();
+                let destination: TableName = target.parse().unwrap();
+                let mut original = Table::default();
+                let change = match kind {
+                    "index" => {
+                        original.indexes.insert(
+                            "gone".into(),
+                            Index {
+                                columns: vec![IndexColumn {
+                                    name: "id".into(),
+                                    descending: false,
+                                }],
+                                include: vec![],
+                                unique: false,
+                                filter: None,
+                            },
+                        );
+                        Change::DropIndex {
+                            table: source.clone(),
+                            name: "gone".into(),
+                        }
+                    }
+                    "unique" => {
+                        original.unique.insert(
+                            "gone".into(),
+                            UniqueConstraint {
+                                columns: vec!["id".into()],
+                            },
+                        );
+                        Change::DropUnique {
+                            table: source.clone(),
+                            name: "gone".into(),
+                        }
+                    }
+                    "foreign key" => {
+                        original.foreign_keys.insert(
+                            "gone".into(),
+                            ForeignKey {
+                                columns: vec!["id".into()],
+                                references_table: "dbo.parent".parse().unwrap(),
+                                references_columns: vec!["id".into()],
+                                on_delete: Default::default(),
+                                on_update: Default::default(),
+                            },
+                        );
+                        Change::DropForeignKey {
+                            table: source.clone(),
+                            name: "gone".into(),
+                        }
+                    }
+                    "primary key" => {
+                        let key = PrimaryKey {
+                            name: Some("gone".into()),
+                            columns: vec!["id".into()],
+                        };
+                        original.primary_key = Some(key.clone());
+                        Change::SetPrimaryKey {
+                            table: source.clone(),
+                            from: Some(key),
+                            to: None,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                let before = Schema {
+                    tables: [(source.clone(), original.clone())].into(),
+                    ..Schema::default()
+                };
+                let after = Schema {
+                    tables: [(destination.clone(), Table::default())].into(),
+                    ..Schema::default()
+                };
+                let changes = ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(change),
+                        PlannedChange::new(Change::RenameTable {
+                            uid: "t_aaaaaa".parse().unwrap(),
+                            from: source,
+                            to: destination.clone(),
+                        }),
+                    ],
+                };
+                for settled in [Settled::Whole, Settled::Closing] {
+                    refuse_unplanned_movement(
+                        &pbps_pg::Postgres::new(),
+                        &changes,
+                        &before,
+                        &after,
+                        "prod",
+                        settled,
+                    )
+                    .unwrap();
+                    let recreated = Schema {
+                        tables: [(destination.clone(), original.clone())].into(),
+                        ..Schema::default()
+                    };
+                    let error = refuse_unplanned_movement(
+                        &pbps_pg::Postgres::new(),
+                        &changes,
+                        &before,
+                        &recreated,
+                        "prod",
+                        settled,
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains("still there"), "{kind}: {error}");
+                }
+                if kind == "index" {
+                    let mut rebuilding = changes.clone();
+                    rebuilding
+                        .changes
+                        .push(PlannedChange::new(Change::AddIndex {
+                            table: destination.clone(),
+                            name: "gone".into(),
+                            index: Box::new(original.indexes["gone"].clone()),
+                        }));
+                    let mut restored = Schema {
+                        tables: [(destination.clone(), original.clone())].into(),
+                        ..Schema::default()
+                    };
+                    refuse_unplanned_movement(
+                        &pbps_pg::Postgres::new(),
+                        &rebuilding,
+                        &before,
+                        &restored,
+                        "prod",
+                        Settled::Whole,
+                    )
+                    .unwrap();
+                    restored
+                        .tables
+                        .get_mut(&destination)
+                        .unwrap()
+                        .indexes
+                        .get_mut("gone")
+                        .unwrap()
+                        .unique = true;
+                    assert!(
+                        refuse_unplanned_movement(
+                            &pbps_pg::Postgres::new(),
+                            &rebuilding,
+                            &before,
+                            &restored,
+                            "prod",
+                            Settled::Whole
+                        )
+                        .unwrap_err()
+                        .to_string()
+                        .contains("not the one")
+                    );
+                }
+                let mut changed = after.clone();
+                changed.tables.get_mut(&destination).unwrap().unique.insert(
+                    "unplanned".into(),
+                    UniqueConstraint {
+                        columns: vec!["id".into()],
+                    },
+                );
+                assert!(
+                    refuse_unplanned_movement(
+                        &pbps_pg::Postgres::new(),
+                        &changes,
+                        &before,
+                        &changed,
+                        "prod",
+                        Settled::Whole
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unplanned")
+                );
+            }
+        }
     }
 
     /// A staged checkpoint cannot be asked what the plan achieved: most of it

@@ -35,6 +35,9 @@ fn resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence() {
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 
+#[path = "support/rename_order_pg.rs"]
+mod rename_order_pg;
+
 #[test]
 #[ignore = "needs live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine() {

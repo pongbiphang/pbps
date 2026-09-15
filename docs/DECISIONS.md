@@ -12628,3 +12628,44 @@ SPEC is in sync with all of these.
      actual runtime provider, including local private channels and run binding,
      before scratch DDL or evidence acceptance. No admission capability or
      binding path is enabled by this primitive alone (ADR-0016 decisions 4–5).
+
+496. **Table renames and the drops that release their names form specific
+    dependencies, and a moved drop carries its execution address.** On PostgreSQL,
+    a table rename may claim the schema-wide name of another table's index or
+    candidate key, including the intermediate name of a cross-schema transfer.
+    A flat promotion class cannot put a constraint drop after its owner's rename
+    and before a different claimant's rename. Replace that promotion with a
+    deterministic graph over the plan's table renames, freeing index/key drops,
+    and only the foreign-key drops whose baseline references match those keys.
+    Compare referenced column sets conservatively: the offline differ cannot
+    identify which of several equivalent candidate indexes backs a foreign key.
+    An unrelated foreign-key drop remains after its owner's rename.
+
+    Preserve the preferred owner-rename-before-drop edge whenever it is acyclic.
+    If the drop is itself a prerequisite of that rename, use the original table
+    and schema in the typed drop instead. This lets a table's own index release
+    its cross-schema destination, or its foreign key precede the key that releases
+    its rename target. The initial dependency graph is FK -> key -> rename;
+    checking each preferred owner edge before adding it keeps the graph acyclic,
+    including mutually blocking owner preferences. Stable original sort positions
+    break ties. This group stays after module drops and before other table work;
+    column, data, authorization and module ordering retain their existing classes.
+    Dialects with table-scoped index names retain ordinary ordering.
+
+    No emitter may silently rename an address or reorder the reviewed changes.
+    The existing typed changes, saved order and checksum carry the choice, without
+    new model fields or a plan-format change. Declared expression/binding records
+    consume that same order, removing an early dropped filter before rekeying its
+    table. The apply movement check follows a part's subsequent table renames for
+    shape exclusions and net postconditions; an early drop and a later re-add must
+    answer together under the final table name. The dropped object reappearing,
+    a wrong re-add definition, and untouched-part movement still refuse the plan.
+
+    Measured on PostgreSQL 16 and 18: the original order fails with 42P07 for the
+    pinned foreign-key, cross-schema self-index and two-owner constraint cases;
+    the typed dependency order executes and preserves rows. Unit, generated-SQL,
+    connected blocker, saved-plan/apply and recorded-state tests cover unrelated
+    foreign keys, same/cross-schema names, unique and primary keys, filtered-index
+    retention, and absence/definition negatives. Historical table-name reuse and
+    column rename chains remain separate scopes (#536 and #541); this graph adds
+    no implicit drop or rename intent and no connected I/O to the differ.

@@ -1,0 +1,203 @@
+//! Order table renames against the particular drops that release their names.
+//!
+//! The ordinary classes still order the rest of the plan. This small graph
+//! runs after module drops and before other table work; it cannot move a column,
+//! row, grant or module across its existing boundary (DECISIONS 496).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use pbps_dialect::Dialect;
+use pbps_model::{Change, PlannedChange, Renames, TableName};
+
+use crate::Side;
+
+pub(crate) fn order(
+    planned: &mut Vec<PlannedChange>,
+    base: Side<'_>,
+    renames: &Renames,
+    dialect: &dyn Dialect,
+) {
+    if !dialect.indexes_share_namespace_with_tables() {
+        return;
+    }
+    let mut owners = BTreeMap::new();
+    let mut claims: BTreeMap<TableName, BTreeSet<usize>> = BTreeMap::new();
+    for (i, p) in planned.iter().enumerate() {
+        if let Change::RenameTable { from, to, .. } = &p.change {
+            owners.insert(to.clone(), (i, from.clone()));
+            claims.entry(to.clone()).or_default().insert(i);
+            // SET SCHEMA precedes RENAME TO in the PostgreSQL emitter.
+            if from.schema != to.schema {
+                claims
+                    .entry(TableName::new(to.schema.clone(), from.name.clone()))
+                    .or_default()
+                    .insert(i);
+            }
+        }
+    }
+    if owners.is_empty() {
+        return;
+    }
+    let original_name = |table: &TableName| {
+        owners
+            .get(table)
+            .map_or_else(|| table.clone(), |(_, from)| from.clone())
+    };
+    let before = |table: &TableName| {
+        let original = original_name(table);
+        base.schema
+            .tables
+            .get(&original)
+            .map(|t| renames.apply(t, &original))
+    };
+    let mut edges = vec![BTreeSet::new(); planned.len()];
+    let mut drops = BTreeSet::new();
+    let mut keys = Vec::new();
+    for (i, p) in planned.iter().enumerate() {
+        let Some((table, name)) = dropped_relation(&p.change) else {
+            continue;
+        };
+        // A carried index may occupy the source schema now and the destination
+        // schema after its owner's rename. Either can block a claimant.
+        let source = original_name(table);
+        for schema in [&table.schema, &source.schema] {
+            if let Some(waiting) = claims.get(&TableName::new(schema.clone(), name)) {
+                drops.insert(i);
+                edges[i].extend(waiting);
+            }
+        }
+        if drops.contains(&i)
+            && let Some(t) = before(table)
+        {
+            let columns = if let Change::DropUnique { name, .. } = &p.change {
+                t.unique.get(name).map(|u| u.columns.clone())
+            } else if let Change::SetPrimaryKey { from: Some(pk), .. } = &p.change {
+                Some(pk.columns.clone())
+            } else if let Change::DropIndex { name, .. } = &p.change {
+                t.indexes
+                    .get(name)
+                    .filter(|index| index.unique && index.filter.is_none())
+                    .map(|index| index.columns.iter().map(|c| c.name.clone()).collect())
+            } else {
+                None
+            };
+            if let Some(columns) = columns {
+                keys.push((
+                    i,
+                    table.clone(),
+                    columns.into_iter().collect::<BTreeSet<_>>(),
+                ));
+            }
+        }
+    }
+    if drops.is_empty() {
+        return;
+    }
+    for (i, p) in planned.iter().enumerate() {
+        if let Change::DropForeignKey { table, name } = &p.change
+            && let Some(t) = before(table)
+            && let Some(fk) = t.foreign_keys.get(name)
+        {
+            // Catalog binding is unavailable to this pure differ. A matching
+            // column set may back the FK even if another equivalent key stays.
+            let columns = fk
+                .references_columns
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for (key, parent, key_columns) in &keys {
+                if &fk.references_table == parent && &columns == key_columns {
+                    drops.insert(i);
+                    edges[i].insert(*key);
+                }
+            }
+        }
+    }
+    let mut selected = drops.clone();
+    selected.extend(owners.values().map(|(i, _)| *i));
+    for &drop in &drops {
+        let table = planned[drop].change.table().expect("a relation or FK drop");
+        if let Some((rename, _)) = owners.get(table) {
+            // Prefer the declared spelling, allowing a drop between two
+            // specific renames. If its own rename needs this drop first, use
+            // the source spelling instead; adding the reverse edge would
+            // create a cycle. The prerequisite graph starts FK -> key ->
+            // rename, and each added edge is checked, so it remains acyclic.
+            if !reaches(&edges, drop, *rename) {
+                edges[*rename].insert(drop);
+            }
+        }
+    }
+    let mut remaining = selected.clone();
+    let mut ordered = Vec::new();
+    while !remaining.is_empty() {
+        // Original stable sort position is the tie-breaker among ready nodes.
+        let next = *remaining
+            .iter()
+            .find(|next| !remaining.iter().any(|i| edges[*i].contains(next)))
+            .expect("only acyclic owner edges were added");
+        remaining.remove(&next);
+        ordered.push(next);
+    }
+    let positions: BTreeMap<_, _> = ordered.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    for &drop in &drops {
+        let table = planned[drop].change.table().expect("a relation or FK drop");
+        if let Some((rename, source)) = owners.get(table)
+            && positions[&drop] < positions[rename]
+        {
+            // The address is part of the typed, checksummed change, not a
+            // hidden emitter rewrite. Declared::advance also consumes this
+            // execution order and removes an old filter before rekeying it.
+            if let Change::DropIndex { table, .. }
+            | Change::DropUnique { table, .. }
+            | Change::DropForeignKey { table, .. }
+            | Change::SetPrimaryKey {
+                table, to: None, ..
+            } = &mut planned[drop].change
+            {
+                *table = source.clone();
+            }
+        }
+    }
+    let first = *selected.first().expect("there is a freeing drop");
+    let mut pending: Vec<_> = std::mem::take(planned).into_iter().map(Some).collect();
+    for i in 0..pending.len() {
+        if i == first {
+            for &n in &ordered {
+                planned.push(pending[n].take().expect("selected once"));
+            }
+        }
+        if !selected.contains(&i) {
+            planned.push(pending[i].take().expect("not selected"));
+        }
+    }
+}
+
+fn dropped_relation(change: &Change) -> Option<(&TableName, &str)> {
+    if let Change::DropIndex { table, name } | Change::DropUnique { table, name } = change {
+        Some((table, name))
+    } else if let Change::SetPrimaryKey {
+        table,
+        from: Some(pk),
+        to: None,
+    } = change
+    {
+        pk.name.as_deref().map(|name| (table, name))
+    } else {
+        None
+    }
+}
+
+fn reaches(edges: &[BTreeSet<usize>], from: usize, target: usize) -> bool {
+    let mut pending = vec![from];
+    let mut seen = BTreeSet::new();
+    while let Some(i) = pending.pop() {
+        if i == target {
+            return true;
+        }
+        if seen.insert(i) {
+            pending.extend(&edges[i]);
+        }
+    }
+    false
+}
