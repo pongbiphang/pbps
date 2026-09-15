@@ -118,6 +118,11 @@ has been verified and no binding evidence is produced. See
 [the staged delivery plan](RESOLVER-DELIVERY.md) for #595, completed discovery
 #597, and ordered implementation steps #606–#621.
 
+The library has a separate peer-verified TLS connection primitive (#607), tested
+against both engines with disposable trust and an intercepting relay. It does
+not enable resolver analysis or certify instance separation, proxy backend hops
+or local private channels; those require the runtime profiles in #608/#609.
+
 Delivery is split into three stages:
 
 1. Environment discovery, trusted candidate suggestions and compatibility

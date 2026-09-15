@@ -12602,3 +12602,29 @@ SPEC is in sync with all of these.
      existing flag-error convention. Schema set 12 archives the new config and
      optional summary data without changing the envelope wire version or any
      saved-plan format.
+
+495. **Peer-verified TLS is a connection primitive, not resolver admission.**
+     #607 introduces a separate constructor that yields an opaque connection
+     only after the driver's verified TLS handshake succeeds. PostgreSQL
+     requires explicit `sslmode=require`; SQL Server requires encryption and
+     refuses certificate-validation bypasses. Both use native trust roots, and
+     SQL Server also retains its explicit CA-file support. The existing
+     ordinary constructors keep their defaults; #311 is separate.
+
+     The connection owns an opaque random identity minted after authentication.
+     It exposes neither reconnect nor mutable access to its inner connection,
+     so replacement cannot retain the old identity. It is not serializable
+     plan evidence or a server/cluster identity. Engine SQL remains in the
+     engine crates. SQL Server's driver does not expose effective trust getters;
+     inspect only the security keys using the same `connection-string` parser
+     as the driver, including escaping and duplicate-key precedence. Avoid a
+     second connection-string grammar or trust flags supplied by callers.
+
+     Real PostgreSQL and SQL Server TLS fixtures demonstrate verified queries,
+     wrong-name/untrusted-root refusal, replacement identities and rejection of
+     encrypted replies altered by a controlled relay. A successful TLS hop
+     cannot prove the protection of a proxy's backend hop or actual instance
+     separation. Consequently #608/#609 must qualify those premises with the
+     actual runtime provider, including local private channels and run binding,
+     before scratch DDL or evidence acceptance. No admission capability or
+     binding path is enabled by this primitive alone (ADR-0016 decisions 4–5).

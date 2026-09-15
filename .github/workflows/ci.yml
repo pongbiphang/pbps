@@ -121,6 +121,7 @@ jobs:
           docker logs "$id" >&2 2>&1 || true
           exit 1
       - run: cargo test -p pbps-mssql --test live -- --ignored
+      - run: python3 scripts/live-transport.py mssql
       # Phase 3.1's onboarding path and the optional dev rehearsal both cross
       # the CLI/database boundary, so the dialect-only suite cannot exercise
       # them. Keep these ignored in ordinary jobs and run them here against the
@@ -195,6 +196,7 @@ jobs:
       # purpose: a firewall that drops rather than refuses is a category of its
       # own, and what proves the wait is bounded is waiting it out.
       - run: cargo test -p pbps-pg --test live -- --ignored
+      - run: python3 scripts/live-transport.py pg
       # The CLI's own PostgreSQL-dependent test, in the bin target rather than
       # in `tests/` because `deploy::run_probes` is private and what it asserts
       # is that the probes are answered under the settings the statements they

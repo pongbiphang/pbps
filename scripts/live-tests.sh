@@ -58,6 +58,7 @@ cargo test -p pbps-mssql --test live -- --ignored "$@"
 # sentence, so this is a regression guard rather than a fix — see
 # `crates/pbps-db/src/mssql.rs` for the comparison against the PostgreSQL side.
 cargo test -p pbps-db --test live_mssql -- --ignored "$@"
+python3 scripts/live-transport.py mssql
 # `--test-threads=1`: these share one SQL Server, and the deployment lock is a
 # single row in it. Two tests taking it concurrently make each other fail, and
 # the failure reads as a bug in the lock rather than in the test schedule.

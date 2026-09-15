@@ -49,6 +49,27 @@ their no-acquisition behavior; existing planning protections remain in force.
 This delivers the policy portion of ADR case 6, not the lifecycle or binding
 path. See SPEC §9.3.2 for configuration and the current limitation.
 
+## Verified TLS foundation (#607)
+
+`pbps-db::transport::PeerVerifiedConn` owns one connection whose TLS handshake
+verified the certificate chain and expected peer name. It requires PostgreSQL
+`sslmode=require` and SQL Server encryption with certificate validation. Failed
+trust setup, plaintext/opportunistic settings and disabled peer checks cannot
+construct it. Its opaque connection identity changes on reconnect; callers
+cannot replace the underlying connection while retaining that identity.
+
+Disposable PostgreSQL and SQL Server fixtures exercise trusted and untrusted
+roots, wrong peer names, reconnects, successful relay traffic and corruption of
+encrypted replies. These tests run in both local engine scripts and CI.
+
+This is a library primitive, not resolver admission or an enabled CLI analysis
+path. TLS verifies its peer; it cannot certify a backend hop behind a terminating
+proxy. The Docker/server profiles in #608/#609 must establish actual runtime-
+bound admission: every hop or qualified local private channel, read-only engine
+identity comparison and instance separation, run binding and invalidation before
+scratch DDL/source transfer. Full ADR cases 11, 19 and 20 remain with those
+profiles. Ordinary connection defaults and discovery qualification are unchanged.
+
 ## Ordered implementation issues
 
 Each issue describes its scope, ADR acceptance cases, positive/negative tests
@@ -58,7 +79,7 @@ before the next issue is claimed. #597 is complete; #606 starts this sequence.
 | Step | Issue | Required outcome |
 |---|---|---|
 | 1 | [#606](https://github.com/pongbiphang/pbps/issues/606) | configure named profiles and lazy selection policy |
-| 2 | [#607](https://github.com/pongbiphang/pbps/issues/607) | authenticate evidence channels and prove instance separation |
+| 2 | [#607](https://github.com/pongbiphang/pbps/issues/607) | add peer-verified TLS connection primitives |
 | 3 | [#608](https://github.com/pongbiphang/pbps/issues/608) | acquire and contain run-owned Docker environments |
 | 4 | [#609](https://github.com/pongbiphang/pbps/issues/609) | qualify dedicated scratch-server lifecycle and exclusivity |
 | 5 | [#610](https://github.com/pongbiphang/pbps/issues/610) | qualify analysis environment builds and deployment context |

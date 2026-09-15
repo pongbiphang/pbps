@@ -20,6 +20,8 @@ tokio.workspace = true
 # One driver per module, named nowhere else in the workspace: `tiberius` in
 # `mssql`, `tokio-postgres` in `postgres` (ADR-0007 decision 5, DECISIONS 225).
 tiberius.workspace = true
+# Inspect the same effective ADO.NET keys as the driver before its handshake.
+connection-string.workspace = true
 tokio-util.workspace = true
 tokio-postgres.workspace = true
 # TLS for the PostgreSQL driver, chosen here because `tokio-postgres` leaves it
