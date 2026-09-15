@@ -22038,6 +22038,88 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         .expect("drop");
 }
 
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::{Reads, Rewrite, Rows, against};
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        let s = probe_schema_9("index_cost263");
+        fresh(&mut conn, &s).await;
+        for (kind, definition, indexed) in [
+            ("expression", "CREATE INDEX ix ON t ((v + 1))", true),
+            ("predicate", "CREATE INDEX ix ON t (id) WHERE v > 5", true),
+            ("key", "CREATE INDEX ix ON t (v)", true),
+            ("included", "CREATE INDEX ix ON t (id) INCLUDE (v)", true),
+            ("primary", "ALTER TABLE t ADD PRIMARY KEY (v)", true),
+            ("unique", "ALTER TABLE t ADD UNIQUE (v)", true),
+            ("unrelated", "CREATE INDEX ix ON t (id)", false),
+            ("check", "ALTER TABLE t ADD CHECK (v > 0)", false),
+            ("none", "", false),
+        ] {
+            // Reuse one isolated table so every case has the same row count
+            // and attribute numbers; the index definition is the only change.
+            conn.execute(&format!(
+                "SET search_path = {s}, pg_catalog;
+                 CREATE TABLE t (id integer, v integer);
+                 INSERT INTO t SELECT g, g FROM generate_series(1, 20) g;
+                 {definition}; ANALYZE t"
+            ))
+            .await
+            .unwrap();
+            let change = Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: TableName::new(&s, "t").column("v"),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+            };
+            let mut estimate = one_estimate(&change, Strategy::default()).unwrap();
+            assert_eq!(estimate.rewrite, Rewrite::Yes);
+            against(&mut conn, &mut estimate).await.unwrap();
+            if matches!(kind, "expression" | "predicate") {
+                assert!(
+                    !truth(&mut conn, "SELECT 2 = ANY(indkey::int2[]) FROM pg_index WHERE indexrelid = 'ix'::regclass").await,
+                    "{kind} must refer to v outside the stored key/include attributes"
+                );
+                let before = number(
+                    &mut conn,
+                    "SELECT relfilenode::int FROM pg_class WHERE oid = 'ix'::regclass",
+                )
+                .await;
+                conn.execute("ALTER TABLE t ALTER COLUMN v TYPE bigint")
+                    .await
+                    .unwrap();
+                let after = number(
+                    &mut conn,
+                    "SELECT relfilenode::int FROM pg_class WHERE oid = 'ix'::regclass",
+                )
+                .await;
+                assert_ne!(before, after, "{kind}: the engine rebuilds this index");
+            }
+            conn.execute("DROP TABLE t").await.unwrap();
+            assert_eq!(estimate.rows, Some(Rows::Estimated(20)), "{kind}");
+            if indexed {
+                assert!(
+                    matches!(&estimate.rewrite, Rewrite::Unknown(why) if why.contains("index")),
+                    "{kind}: {estimate:#?}"
+                );
+                assert!(matches!(estimate.reads, Reads::Unknown(_)), "{kind}");
+            } else {
+                assert_eq!(estimate.rewrite, Rewrite::Yes, "{kind}");
+                assert_eq!(estimate.reads, Reads::EveryRow, "{kind}");
+            }
+        }
+        conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
 /// A table absent from the catalog because this plan creates it is not a table
 /// the database has unexpectedly lost.
 ///
