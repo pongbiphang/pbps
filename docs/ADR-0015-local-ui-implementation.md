@@ -824,51 +824,70 @@ locked-copy `update-index` ran it), so every `git` also takes
    "signed commit" is the organization's signing policy applied by the user's
    configuration, not a guarantee this UI adds — a forced signature fails on
    a machine without a key, and so does the shell's.
-5. It moves the branch to the commit only if the branch is still where it
-   was: `git update-ref --no-deref refs/heads/<branch> <oid> <tip>`, a
-   compare-and-swap on the named ref itself — `--no-deref` so that a branch
-   turned into a symbolic ref since step 1 is not followed to a target the
-   UI never locked — 
-   that refuses if anything moved the branch in between (ref locks are not
-   the index lock; **measured**, the update went through with the index lock
-   held) — a refusal here undoes step 2 as described there, since the tree
-   would otherwise hold an edit no commit records — and the one step that
-   changes the checkout. `update-ref` takes
-   `HEAD`'s lock itself when `HEAD` names the branch it moves (**measured**:
-   with `HEAD.lock` held it failed with `cannot lock ref 'HEAD'`), so the
-   UI releases `HEAD.lock` for this one command and takes it back right
-   after, together with the branch's own lock — an empty
-   `<git-common-dir>/refs/heads/<branch>.lock`, created exclusively — that
-   lock, like `HEAD.lock` and `index.lock`, is the *files* ref backend's own
-   protocol, so the UI refuses a repository whose `extensions.refStorage`
-   names another backend (`reftable` keeps branches in tables no such file
-   guards) rather than hold a lock that locks nothing — and
-   only then checks that `HEAD` is still symbolic to the recorded branch,
-   that the branch is still a direct ref and not a symbolic one (`git
-   symbolic-ref refs/heads/<branch>` must fail, as in step 1 — a sibling
-   worktree can make it one under the locks of step 0, which do not cover
-   the branch), and that the branch still names `<oid>` (`git rev-parse
-   refs/heads/<branch>`).
+5. It moves the branch only if its tip **and direct-ref type** still match
+   step 1. It runs one interactive `git update-ref --stdin` process, with
+   the hook/fsmonitor overrides above, and sends:
 
-   This catches a retarget to a *different* tip — the CAS above refuses it
-   outright — but not one to the *same* tip. `--no-deref` keeps the
-   *write* off whatever the branch points to; it says nothing about
-   whether the CAS's own old-value comparison follows symbolic
-   indirection, and it does: where the resolved value matches `<tip>`,
-   `update-ref` writes a *direct* ref over whatever it found, symbolic or
-   not, in the same atomic step that validates it — so a branch a sibling
-   worktree turned into a symbolic ref pointing at another branch *at
-   exactly `<tip>`* is silently overwritten, the retarget discarded
-   before the check above ever runs, which by then finds a branch that
-   genuinely is direct, because `update-ref` just made it so (**measured**
-   on git 2.43: with `refs/heads/<branch>` made symbolic to
-   `refs/heads/<other>`, itself at exactly `<tip>`, the single-shot form
-   still succeeded, and `refs/heads/<branch>` came back a *direct* ref at
-   `<oid>` — only its own lock, held by another worktree, refuses it).
-   This is a known, uncaught gap, tracked as #385: closing it needs the
-   check taken *before* the write, under a lock the write itself does not
-   yet hold, which is a larger change to this step than decision 5 as
-   written makes, and is deferred rather than made part of it.
+   ```text
+   start
+   option no-deref
+   update refs/heads/<branch> <oid> <tip>
+   prepare
+   ```
+
+   The UI waits for `prepare: ok`. Before sending `commit`, it asks the
+   **live** branch under the transaction's lock whether it is still direct:
+   `git symbolic-ref --quiet refs/heads/<branch>` must return the
+   non-symbolic result (exit 1), while `git rev-parse --verify
+   refs/heads/<branch>^{commit}` must still name `<tip>`. A symbolic result,
+   a failed read, or an unexpected response sends `abort`, never `commit`.
+   The UI waits for the acknowledgement and process exit before retaking
+   its persistent locks. A preparation failure or abort publishes
+   `rolling-back` and undoes step 2 under the existing protocol, discards
+   the locks without installing the index, and pushes nothing. The commit
+   built in step 4 remains unreferenced. Unsupported transactional plumbing
+   refuses compose; it does not fall back to the single-shot form.
+
+   This preserves the old-value compare-and-swap: `prepare` refuses a
+   moved tip. It adds the type check **before** the write (#385). The old
+   `git update-ref --no-deref refs/heads/<branch> <oid> <tip>` did not test
+   type: its old-value comparison follows symbolic indirection even with
+   `--no-deref`. A symbolic branch pointing at exactly `<tip>` therefore
+   passed and was overwritten as direct before any post-write check could
+   see it. **Measured** on Git 2.43.0's Linux files backend: after `prepare`,
+   the live ref still held its symbolic spelling while the branch lock
+   held `<oid>`; the type check saw it, `abort` preserved it byte for byte,
+   and a genuinely direct branch committed. Stale direct and symbolic tips
+   refused at `prepare`; a held index lock did not prevent preparation or
+   commit. The retained [ref experiment](../spikes/git-compose-refs/README.md)
+   pins these controls and the reverted single-shot failure (DECISIONS 487).
+
+   `update-ref` takes `HEAD`'s lock itself when `HEAD` names the branch it
+   moves: with `HEAD.lock` pre-held, `prepare` failed with `cannot lock ref
+   'HEAD'` in that same measurement. The UI therefore releases `HEAD.lock`
+   across the **whole transaction**, from `start` through `commit` or
+   `abort`, not just around one write. After a successful commit and process
+   exit it retakes `HEAD.lock` and the branch's own persistent lock —
+   `<git-common-dir>/refs/heads/<branch>.lock`, created exclusively and
+   carrying the record's id as described below. These are the *files* ref
+   backend's locks: the UI still refuses a repository whose
+   `extensions.refStorage` names another backend rather than hold a file
+   that protects no ref.
+
+   Only with both locks held does it run the existing three-part
+   post-write check: `git symbolic-ref --no-recurse HEAD` must equal
+   `refs/heads/<branch>` **directly**, the branch must still be direct
+   (`git symbolic-ref --quiet refs/heads/<branch>` returns 1), and
+   `git rev-parse --verify refs/heads/<branch>^{commit}` must name `<oid>`.
+   A read error never satisfies a check. The immediate HEAD read is required
+   here and in success recovery below (#386): bare `symbolic-ref HEAD`
+   would accept `HEAD -> c -> <branch>`, leaving `c` free to move under the
+   two locks. The experiment inserts that hop both before preparation and
+   after commit, then verifies refusal under the persistent locks; reverting
+   only this read to the recursive command makes both controls fail.
+   Checking branch type before commit does **not** replace any post-write
+   check. The transaction releases its locks before the UI retakes its own,
+   leaving a separate window for a ref or HEAD change.
    The gap admits a `symbolic-ref` and it admits a `reset --soft`, which
    moves the branch under a held index lock, and either leaves an index
    built for `<oid>` wrong for the checkout; and a branch is shared by every
@@ -993,20 +1012,12 @@ locked-copy `update-index` ran it), so every `git` also takes
    that is already there when it runs, rather than catching one formed
    afterward: it records the ref `HEAD` names *directly*, not the
    recursive answer, and refuses the compose outright where that ref is
-   itself symbolic. A chain another worktree forms after step 1 has
-   recorded a direct branch — turning that branch itself into a
-   symbolic ref before step 5's `update-ref` runs — still reaches step
-   5, and step 5's own CAS catches half of it: a retarget to a
-   *different* tip fails the compare-and-swap outright, undoing step 2
-   the ordinary way. A retarget to the *same* tip does not — that is
-   the gap #385 tracks, not this one — because `update-ref` validates
-   and overwrites a same-tip symbolic ref in one atomic step, and the
-   post-write check that would ask whether the branch is still direct
-   finds one only because `update-ref` just wrote it. Step 1's guard's
-   reason has not gone even so, since it closes the chain that was
-   there to compose on, which is a different case from either half of
-   this one. The page then names the
-   commit, the tip the branch actually holds, and every path with what
+   itself symbolic. A branch made symbolic after step 1 is now refused at
+   step 5: a different tip fails preparation's compare-and-swap; the same tip fails
+   the direct-ref check while prepared, before any write. Step 1's refusal
+   remains: it prevents composing on an already-known chain before placing
+   files, rather than relying on the later refusal and undo. The page then
+   names the commit, the tip the branch actually holds, and every path with what
    became of it, since the user's index is the one they had and only
    they can say which of the two states they want. **Measured** both
    ways: undisturbed, the check passed and the index was installed
@@ -1095,7 +1106,8 @@ Step 6 removes the record, last, after the cleanup below. A record found
 in `locking` has nothing placed and is finished by removing the locks it
 names and the record. A record found
 in `placing` or `composed` with the branch still at the leased tip is a
-compose that never reached its `update-ref`: the UI first publishes
+compose whose branch update did not commit (including a prepared transaction
+that aborted): the UI first publishes
 `rolling-back`, then undoes step 2 from the names in the record, exactly
 as a refusal in those steps does. A record in `rolling-back` resumes that
 undo, never the success path, regardless of the current `HEAD`, branch
@@ -1158,7 +1170,7 @@ or already holds this record's id, in which case it is the record's own
 and is used as it stands and removed with the others at the end. In the
 `composed` phase there is a second kind of leftover it can account for:
 `update-ref` takes both locks itself, which is why the UI gives up
-`HEAD.lock` for that one command, so a stop inside it leaves locks `git`
+`HEAD.lock` across the transaction, so a stop inside it leaves locks `git`
 wrote rather than the UI. `git` writes the new value into the branch's
 lock and leaves `HEAD.lock` empty (**measured**, from a
 `reference-transaction` hook in the `prepared` phase: the branch's lock
@@ -1182,10 +1194,11 @@ only `composed` or `installed`, never a record that reached `rolling-back`;
 the latter follows the rollback rule above even if all the checks below
 would now pass. For the success path it
 requires all of what step 5 required after its own `update-ref`: that
-`HEAD` is still symbolic to the record's branch, that the branch is
-still a direct ref and not a symbolic one, and that it still names the
-record's commit. `index.lock` does not cover `HEAD` (**measured**, in
-step 0), so a process that died after `update-ref` released `HEAD.lock`
+`git symbolic-ref --no-recurse HEAD` equals the record's branch directly,
+that the branch is still direct (the quiet symbolic-ref check returns 1),
+and that its verified commit is the record's commit. A chain that only
+resolves to that branch or any read error cannot authorize index installation.
+`index.lock` does not cover `HEAD` (**measured**, in step 0), so a process that died after `update-ref` released `HEAD.lock`
 leaves a window in which a `symbolic-ref` can move `HEAD` to another
 branch, and an index built for the record's branch installed onto that
 one would be a staged difference nobody made. Where all of that holds,
@@ -1501,32 +1514,17 @@ What this ADR reasons about and has not measured, in the order the steps of
   missing beside a retained copy. Step 4 measures how narrow that window
   is and whether resolving the exchange's own paths with `openat2`'s
   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (Linux 5.6+) closes it.
-- **The case decision 5's step 1 now refuses.** No compose exists yet to
-  test — there is no UI crate, and #64 is still open — so the refusal
-  itself is unverified in code, and it takes two executions to pin, not
-  one: with the refusal in place, step 1 exits on `HEAD -> a -> b`
-  before the compose gets anywhere near step 5, so the same run cannot
-  also reach step 5's checkpoint to retarget `a` there. Step 4 pins it
-  beside the existing `symbolic-ref`-in-the-gap case as a guarded run and
-  a reverted one: the guarded run builds `HEAD -> a -> b` and asserts the
-  compose is refused at step 1 with the chain named; the reverted run
-  restores step 1's pre-fix behavior *whole* — the bare, recursive
-  `symbolic-ref HEAD` this decision no longer uses, which records `b`
-  and never asks whether `a` is itself symbolic, not merely the refusal
-  with `--no-recurse` left in place, which would record `a` itself and
-  catch the retarget below through its own lock instead of reproducing
-  the defect. It then builds the same chain, pauses the compose after
-  step 5's checks have passed and before step 6 installs the prepared
-  index — retargeting any earlier changes what the restored, recursive
-  `symbolic-ref HEAD` answers, and step 5's own check that `HEAD` is
-  still symbolic to the recorded branch, run after the compare-and-swap
-  and unrelated to step 1's fix, catches that and undoes step 2 instead —
-  retargets `a` to a branch whose tip lacks the change, resumes, and
-  asserts that it installs an index built for `b`'s tip onto a checkout
-  `symbolic-ref` has moved to the other
-  branch, with `git status` then reporting the composed paths staged —
-  the difference nobody made that the refusal
-  exists to prevent.
+- **The case decision 5's step 1 refuses.** The read-only viewer exists,
+  but compose and its UI recovery harness remain #494 / step 4 of #64.
+  That harness must start with `HEAD -> a -> b` and assert refusal before
+  placement. Restoring step 1's former recursive HEAD read must demonstrate
+  that it records `b` and reaches the placement checkpoint; the new step-5
+  direct HEAD check still refuses it later. It is no longer correct to
+  expect reverting step 1 alone to pass all the later guards. To reproduce
+  the historical staged-difference path, a separately labelled historical
+  control restores the recursive post-write HEAD read too, then retargets
+  `a` after that check and before index installation. It must not weaken
+  the current guards just to make the earlier counterexample reachable.
 - **A crash during step 5's per-path undo (#152).** The compose and its
   recovery harness do not exist yet; this amendment specifies the
   protocol, not an implemented or measured recovery. Step 4 of #64 must
@@ -1548,19 +1546,22 @@ What this ADR reasons about and has not measured, in the order the steps of
   user rather than overwritten, and an undisturbed `composed` recovery
   that still installs its prepared index. These are required tests when
   #64 builds compose, not coverage supplied by this design-only change.
-- **The same-tip symbolic rewrite step 5's compare-and-swap does not
-  catch.** Tracked as #385, not fixed here: a branch a sibling worktree
-  turns into a symbolic ref pointing at another branch *at exactly the
-  recorded tip*, after step 1 but before step 5's `update-ref`, is
-  silently overwritten with a direct ref in the same atomic step that
-  validates it — `--no-deref` keeps the write off whatever the branch
-  points to, not off the branch's own type, and the CAS dereferences for
-  its own comparison regardless — so the post-write check that asks
-  whether the branch is still direct finds one only because `update-ref`
-  just made it so. Closing it needs that ask taken *before* the write,
-  under a lock the write does not yet hold, which is a larger change to
-  this step than decision 5 as written makes and is deferred rather than
-  folded into it; #385 has the measurements and the shape of the fix.
+- **The composed UI paths behind #385 and #386.** The retained Git
+  experiment measures the mechanisms on Linux with Git 2.43.0, including
+  a sibling worktree changing the shared branch and a competing process
+  explicitly changing the composing worktree's own HEAD. A sibling's HEAD
+  is a different file. It does not implement file placement, record recovery,
+  index installation, pushes, or the UI's error display. Step 4 must pin a
+  same-tip branch rewrite between steps 1 and 5, assert abort with the
+  symbolic ref preserved and every placement undone, then restore the
+  single-shot form and observe the silent overwrite. Independently insert
+  `HEAD -> c -> <branch>` in each lock-release window, assert refusal and
+  no index installation, and restore the recursive HEAD read to demonstrate
+  the failure. Repeat the immediate-HEAD condition during `composed`
+  success recovery, with direct HEAD as the accepted control; `rolling-back`
+  must remain irreversible. Preserve the existing different-tip, branch-type
+  and post-write tip controls. Windows compose, including #471's interrupted
+  restoration, remains refused until its own platform protocol is measured.
 - **DNS rebinding through browsers that pass a numeric `Host` unchanged.**
   Decision 3's `Host` check is the standard answer; step 3's tests send the
   cross-origin `POST`, the rebinding `Host`, the foreign peer and a request to
