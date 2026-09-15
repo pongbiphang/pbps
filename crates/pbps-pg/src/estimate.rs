@@ -646,6 +646,10 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
 /// said — an estimate that was measured on ordinary tables and is quoted about
 /// a partitioned one is worse than no estimate, because the number carries the
 /// authority of the measurement it did not come from.
+///
+/// `indkey` omits expression and predicate references. Keep it beside the
+/// dependency query: primary/unique indexes depend on their constraint, not
+/// directly on its columns (measured on PostgreSQL 16 and 18).
 const SHAPE: &str = "\
 SELECT c.relkind::text AS relkind,
        c.relhassubclass AS inherited,
@@ -655,7 +659,13 @@ SELECT c.relkind::text AS relkind,
                   AND ($2 <> '' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
                         WHERE a.attrelid = c.oid AND a.attname = $2
                           AND NOT a.attisdropped
-                          AND a.attnum = ANY (i.indkey::int2[])))) AS column_is_indexed,
+                          AND (a.attnum = ANY (i.indkey::int2[])
+                               OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                                           WHERE d.classid = 'pg_catalog.pg_class'::regclass
+                                             AND d.objid = i.indexrelid
+                                             AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                                             AND d.refobjid = c.oid
+                                             AND d.refobjsubid = a.attnum))))) AS column_is_indexed,
        (SELECT k.conname::text FROM pg_catalog.pg_constraint k
          WHERE k.conrelid = c.oid AND k.contype = 'c' AND k.convalidated
            AND k.conname::text NOT IN
