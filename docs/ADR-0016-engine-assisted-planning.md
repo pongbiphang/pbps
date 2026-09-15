@@ -83,7 +83,9 @@ extensions, types, operators, casts and candidate overloads as well as desired
 managed objects. Following current dependency edges alone is insufficient:
 an unbound candidate can become the selected overload. Captured external
 definitions remain prerequisites, never another source of managed declarations
-or permission to modify external production objects.
+or permission to modify external production objects. Their full text is private,
+ephemeral reconstruction input; only their fingerprints enter saved evidence
+(decision 5).
 
 Use supported catalog reconstruction and engine-specific ordering to prepare
 that namespace. Reconstructed retained context must preserve the relevant
@@ -177,13 +179,40 @@ production credentials into a container or include secrets in saved evidence.
 Extend the saved-plan format, not semantic `Schema` equality, to carry:
 
 - the analysis/adapter version, coverage and unresolved limitations;
-- the target facts required by the decision, including relevant definitions,
-  settings, identities and complete candidate sets within its read scope;
+- the target facts required by the decision: logical identities, complete
+  candidate sets within its read scope, relevant non-secret settings, and
+  canonical fingerprints of retained external definitions, never their source;
 - the resolver's observed environment fingerprint and image digest/platform
   when applicable;
 - the current/desired logical bindings and resulting explicit typed changes;
 - typed descriptions of the derived pre-apply predicates and expected
   post-apply bindings, not user-supplied SQL to execute after approval.
+
+**External source is reconstruction input, not a review artifact.** Unmanaged
+function/view definitions can contain credentials or confidential literals.
+Regardless of whether a secret is recognized, keep their complete source only
+in private per-run reconstruction inputs and scratch resources, discarded on
+completion or failure. Do not export it through saved-plan fields, generated
+deployment SQL, `explain`, human/JSON diagnostics, logs or persistent caches.
+Source-bearing engine errors must not bypass this boundary. This applies to
+retained external prerequisites, not to the user's managed declarations and
+explicit typed changes that the reviewed deployment already needs to contain.
+
+For each such prerequisite, save its logical identity, a cryptographic digest,
+and the digest/canonicalization version needed to repeat the comparison. Hash
+the complete engine-canonical definition under the recorded read settings,
+including literals; do not remove suspected secrets before hashing and thereby
+hide changes to them. Canonicalization must not guess SQL equivalence or depend
+on scratch OIDs. A fingerprint detects changes; it is not encryption or a
+promise that review artifacts are suitable for public disclosure.
+
+During the coherent pre-publication and pre-apply captures below, re-read each
+required target definition and recompute its fingerprint using the same
+versioned procedure. A mismatch, missing/unreadable definition or unsupported
+fingerprint version prevents publication/application; a changed prerequisite
+requires replanning and approval. This needs neither the original source in
+`plan.json` nor a resolver at apply time. Evidence/explanations name the object,
+fingerprint and failed condition without echoing its definition.
 
 Deterministic serialization and the plan checksum cover this evidence. The
 implementation must bump affected artifact/wire formats and generated schemas;
@@ -305,6 +334,15 @@ protection under test is removed.
    and prove the closing read sees the apply's own DDL and uses the existing
    revalidation boundary. Qualify each engine independently; this test does not
    promise to prevent external DDL after the last observation.
+10. **`external_definition_evidence_keeps_source_private` (planned):** use a
+    retained external function/view whose source contains a confidential marker.
+    Reconstruction can use its full definition, but the marker and source never
+    appear in plan/SQL artifacts, `explain`, human/JSON diagnostics, logs or
+    persistent caches, including when scratch compilation fails. Changing only
+    the literal changes the fingerprint and refuses publication/apply with the
+    same object identity and candidate set. Missing/unreadable definitions and
+    unsupported fingerprint versions do not pass; an unchanged prerequisite
+    verifies without Docker or the original source in the saved plan.
 
 ## Delivery and supersession
 

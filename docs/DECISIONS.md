@@ -12391,7 +12391,11 @@ SPEC is in sync with all of these.
      design and live tests, sharing infrastructure but not binding semantics.
 
      Saved evidence joins the checksum and includes relevant target candidate
-     sets, environment prerequisites and expected bindings. Recheck before
+     sets, environment prerequisites and expected bindings. Retained external
+     definitions stay private and ephemeral for reconstruction; only logical
+     identities and versioned canonical fingerprints enter the saved evidence.
+     Publication/apply re-read and hash the target definition, without exporting
+     its source through artifacts or diagnostics. Recheck before
      artifact publication and under the deployment lock before apply; changed
      premises require replanning and approval. Each capture must itself be
      coherent; repeated mixed-time reads are not evidence. PostgreSQL inherits

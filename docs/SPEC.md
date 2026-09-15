@@ -1240,6 +1240,17 @@ replanning and renewed approval. `explain` can show this evidence
 and its limits offline. The first resolver-backed apply path is transactional
 only, with the additional guard in §7.6; staged restrictions remain unchanged.
 
+Retained external definitions are private, ephemeral reconstruction inputs,
+not additional source shipped to reviewers. Saved evidence records their
+logical identities and versioned canonical fingerprints, never the full text.
+Publication/apply checks re-read and hash the target definitions; a changed,
+missing or unreadable prerequisite cannot pass. `explain`, generated SQL,
+diagnostics and logs do not expose this external source or its confidential
+literals, including through engine errors. The user's managed declarations and
+explicit deployment changes remain ordinary reviewable plan contents. A
+fingerprint is a change detector, not permission to publish otherwise sensitive
+artifacts; ADR-0016 defines the capture and comparison contract.
+
 #### 9.3.3 Resolver environment discovery (accepted, not implemented)
 
 **PostgreSQL and SQL Server are both in scope from the first environment
