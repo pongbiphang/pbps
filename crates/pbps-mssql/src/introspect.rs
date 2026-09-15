@@ -691,25 +691,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut unsupported_temporal_tables = BTreeSet::new();
     let mut unavailable_object_ids = BTreeSet::new();
 
-    // This is source-database context, not a limitation of a managed object:
-    // attributing it to a table would refuse valid same-default deployments.
-    // COLUMNS also reads system objects and the ledger; only inventoried user
-    // tables count. Collation covers character aliases and computed columns too.
-    let user_table_ids: BTreeSet<_> = raw.tables.iter().map(|table| table.object_id).collect();
-    if raw
-        .columns
-        .iter()
-        .any(|column| column.collation.is_some() && user_table_ids.contains(&column.object_id))
-    {
-        onboarding_notices.push(format!(
-            "source database default collation `{}` is not recorded in the declarations; \
-             character columns bootstrapped onto a target with a different default \
-             may have different comparison semantics; ensure the target database \
-             uses this default before bootstrapping",
-            raw.database_collation
-        ));
-    }
-
     for t in &raw.tables {
         // Both halves of active versioning, and a current table whose period
         // remains after versioning is disabled, must stay unmanaged. Declaring
@@ -802,7 +783,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // explicitly — round-trips for free *onto a database whose own
         // default is the same*: the emitter writes no `COLLATE`, so the
         // column is created under whatever default the target has.
-        // The onboarding notice above names that source default; nothing
+        // The onboarding notice names that source default (DECISIONS 491); nothing
         // compares it with the target's. Anything differing from the source default
         // is a difference the declaration cannot hold regardless of target;
         // reported here rather than dropped, the way a clustered index is
@@ -1080,6 +1061,26 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 descending: i.is_descending,
             });
         }
+    }
+
+    // This is source context for bootstrapping the emitted declarations, not
+    // managed-object drift that would refuse valid same-default deployments
+    // (DECISIONS 491). Match the surviving column inventory: omitted temporal
+    // tables, computed columns and UDTs already have their own limitations.
+    // COLUMNS also reads system objects and the ledger, which cannot match.
+    if raw.columns.iter().any(|column| {
+        column.collation.is_some()
+            && tables
+                .get(&column.object_id)
+                .is_some_and(|table| table.columns.contains_key(&column.name))
+    }) {
+        onboarding_notices.push(format!(
+            "source database default collation `{}` is not recorded in the declarations; \
+             character columns bootstrapped onto a target with a different default \
+             may have different comparison semantics; ensure the target database \
+             uses this default before bootstrapping",
+            raw.database_collation
+        ));
     }
 
     let mut schema = Schema::default();
@@ -1671,6 +1672,88 @@ mod tests {
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
         assert!(pulled.onboarding_notices.is_empty());
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+    }
+
+    #[test]
+    fn omitted_temporal_character_tables_do_not_report_a_database_collation() {
+        for (temporal_type, has_period) in [(2, true), (1, false), (0, true)] {
+            let mut omitted = raw_table(10, "dbo", "omitted");
+            omitted.temporal_type = temporal_type;
+            omitted.has_period = has_period;
+            let mut code = raw_column(10, "code", "varchar");
+            code.collation = Some("Latin1_General_CI_AS".into());
+            let raw = RawCatalog {
+                tables: vec![omitted, raw_table(20, "dbo", "numeric_only")],
+                columns: vec![code, raw_column(20, "amount", "int")],
+                database_collation: "Latin1_General_CI_AS".into(),
+                ..Default::default()
+            };
+            let pulled = assemble(&raw);
+            assert!(pulled.onboarding_notices.is_empty());
+            assert_eq!(pulled.schema.tables.len(), 1);
+            assert!(
+                pulled
+                    .schema
+                    .tables
+                    .contains_key(&TableName::new("dbo", "numeric_only"))
+            );
+            assert_eq!(pulled.limitations.len(), 1);
+            assert_eq!(
+                pulled.limitations[0].target.object_name(),
+                TableName::new("dbo", "omitted")
+            );
+            assert!(
+                pulled.limitations[0]
+                    .detail
+                    .contains("PERIOD FOR SYSTEM_TIME")
+            );
+            assert_eq!(pulled.warnings, vec![pulled.limitations[0].detail.clone()]);
+        }
+    }
+
+    #[test]
+    fn omitted_character_columns_do_not_report_a_database_collation() {
+        for computed in [true, false] {
+            for keep_numeric_column in [true, false] {
+                let mut code =
+                    raw_column(10, "code", if computed { "varchar" } else { "code_type" });
+                code.collation = Some("Latin1_General_CI_AS".into());
+                code.is_computed = computed;
+                code.is_user_defined_type = !computed;
+                let mut raw = RawCatalog {
+                    tables: vec![raw_table(10, "dbo", "customer")],
+                    columns: vec![code],
+                    database_collation: "Latin1_General_CI_AS".into(),
+                    ..Default::default()
+                };
+                if keep_numeric_column {
+                    raw.columns.push(raw_column(10, "amount", "int"));
+                }
+                let pulled = assemble(&raw);
+                assert!(pulled.onboarding_notices.is_empty());
+                let table_name = TableName::new("dbo", "customer");
+                if keep_numeric_column {
+                    let table = &pulled.schema.tables[&table_name];
+                    assert_eq!(table.columns.len(), 1);
+                    assert!(table.columns.contains_key("amount"));
+                } else {
+                    assert!(pulled.schema.tables.is_empty());
+                    assert!(pulled.limitations.iter().any(|limitation| {
+                        limitation.detail.contains("no supported columns remain")
+                    }));
+                }
+                assert!(pulled.limitations.iter().any(|limitation| {
+                    limitation.target.object_name() == table_name
+                        && limitation.detail.contains("customer.code")
+                        && limitation.detail.contains(if computed {
+                            "computed columns"
+                        } else {
+                            "user-defined type"
+                        })
+                }));
+                assert_eq!(pulled.warnings.len(), pulled.limitations.len());
+            }
+        }
     }
 
     fn one_table_catalog() -> RawCatalog {

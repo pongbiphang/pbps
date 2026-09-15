@@ -1290,6 +1290,7 @@ async fn pull_reports_the_source_default_once_when_character_columns_exist() {
             .expect("introspect numeric control");
         assert!(numeric.warnings.is_empty(), "{:?}", numeric.warnings);
         assert!(numeric.limitations.is_empty());
+        assert!(numeric.onboarding_notices.is_empty());
 
         db.conn
             .execute(&format!(
@@ -1329,6 +1330,111 @@ async fn pull_reports_the_source_default_once_when_character_columns_exist() {
             2
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
+    let mut db = TestDb::create("omitted_collation434").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.numeric_only (amount int NULL);
+             CREATE TABLE dbo.versioned (
+                 id int NOT NULL PRIMARY KEY,
+                 code varchar(20) NULL,
+                 valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+                 valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+                 PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+             ) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+        )
+        .await
+        .expect("create character columns only in omitted temporal/history tables");
+    let rows = db.conn
+        .query("SELECT t.temporal_type FROM sys.tables t JOIN sys.columns c ON c.object_id = t.object_id WHERE c.collation_name IS NOT NULL ORDER BY t.temporal_type;")
+        .await
+        .expect("measure both collated temporal inventories");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<u8>("temporal_type").unwrap(), Some(1));
+    assert_eq!(rows[1].try_get::<u8>("temporal_type").unwrap(), Some(2));
+    let temporal = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect omitted temporal character columns");
+
+    db.conn
+        .execute("CREATE TYPE dbo.code_type FROM varchar(20) NULL;")
+        .await
+        .expect("create character alias type");
+    db.conn
+        .execute(
+            "ALTER TABLE dbo.numeric_only ADD computed_code AS CONVERT(varchar(20), amount),
+                 alias_code dbo.code_type NULL;",
+        )
+        .await
+        .expect("add omitted character columns to a retained numeric table");
+    let rows = db.conn
+        .query("SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.numeric_only') AND c.collation_name IS NOT NULL;")
+        .await
+        .expect("measure computed and alias column collations");
+    assert_eq!(rows.len(), 2);
+    let omitted = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect omitted character columns on a retained table");
+
+    db.conn
+        .execute("ALTER TABLE dbo.numeric_only ADD declared_code varchar(20) NULL;")
+        .await
+        .expect("add an expressible character column");
+    let declared = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the retained character control");
+    db.drop().await;
+
+    let numeric_name = TableName::new("dbo", "numeric_only");
+    for pulled in [&temporal, &omitted, &declared] {
+        assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(pulled.schema.tables.contains_key(&numeric_name));
+        for name in ["versioned", "versioned_history"] {
+            assert!(pulled.limitations.iter().any(|limitation| {
+                limitation.target.object_name() == TableName::new("dbo", name)
+                    && limitation.detail.contains("system versioning")
+            }));
+        }
+        assert_eq!(pulled.warnings.len(), pulled.limitations.len());
+    }
+    assert!(
+        temporal.onboarding_notices.is_empty(),
+        "{:?}",
+        temporal.onboarding_notices
+    );
+    assert!(
+        omitted.onboarding_notices.is_empty(),
+        "{:?}",
+        omitted.onboarding_notices
+    );
+    assert_eq!(omitted.schema.tables[&numeric_name].columns.len(), 1);
+    assert!(
+        omitted.schema.tables[&numeric_name]
+            .columns
+            .contains_key("amount")
+    );
+    for (column, reason) in [
+        ("computed_code", "computed columns"),
+        ("alias_code", "user-defined type"),
+    ] {
+        assert!(omitted.limitations.iter().any(|limitation| {
+            limitation.target.object_name() == numeric_name
+                && limitation.detail.contains(column)
+                && limitation.detail.contains(reason)
+        }));
+    }
+    assert_eq!(declared.limitations, omitted.limitations);
+    assert_eq!(declared.onboarding_notices.len(), 1);
+    assert!(declared.onboarding_notices[0].starts_with("source database default collation `"));
+    assert!(
+        declared.schema.tables[&numeric_name]
+            .columns
+            .contains_key("declared_code")
+    );
 }
 
 #[tokio::test]
