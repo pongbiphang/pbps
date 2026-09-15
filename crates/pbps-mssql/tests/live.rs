@@ -2696,15 +2696,9 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
 /// against the same server: 129 plain characters must be counted and
 /// refused, 128 must pass both the probe and the `ALTER`.
 ///
-/// A trailing space and a non-BMP character are included because a Rust
-/// character count disagrees with the engine here, and the fix has to ask
-/// the server rather than guess: `LEN` ignores a trailing blank the same way
-/// `ALTER` does when it shortens a character column (measured: a 128-`x`
-/// value plus one trailing space still converts), and it counts a surrogate
-/// pair as two units, exactly how `nvarchar(128)` — and so `sysname` —
-/// measures its own capacity. A probe built from `.chars().count()` would
-/// call 65 non-BMP characters (130 UTF-16 units, over capacity) the same as
-/// 64 (exactly 128 units, the boundary).
+/// Trailing spaces may be discarded; astral characters occupy two UTF-16
+/// units. The explicit SC-collation matrix below also pins that boundary when
+/// the database's LEN counts each surrogate pair only once (DECISIONS 493).
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
@@ -2770,7 +2764,9 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
             .1;
         assert_eq!(blocked, i32::from(!alter_succeeds), "{label}: {counts:?}");
         assert!(
-            !counts.iter().any(|(d, _)| d.contains("cannot become")),
+            !counts
+                .iter()
+                .any(|(d, _)| d.starts_with("values in") && !d.contains("too long")),
             "{label}: fell through to the truncating TRY_CONVERT probe: {counts:?}"
         );
 
@@ -2795,13 +2791,9 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
     db.drop().await;
 }
 
-/// Round 2 of the review on PR #460 (issue #142): the fixed `sysname` bound
-/// was routed through the `LEN`-based length arm regardless of the source
-/// type. `LEN` on a `varbinary` source counts bytes, not the UTF-16 units
-/// `sysname`'s capacity is measured in, so a value that comfortably fits
-/// `sysname` once converted still read as too long. This is "a valid plan is
-/// refused" (one of the three cases the review loop always fixes), not the
-/// `_SC`-collation false-clean deferred to issue #461.
+/// A binary source is measured in bytes; 200 bytes of UTF-16 text fit in
+/// sysname's 256-byte capacity. Keep the original false-blocker control beside
+/// the over-capacity and padding matrix below (DECISIONS 493).
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
@@ -2858,6 +2850,178 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
     assert_eq!(len_after, 100);
 
     db.drop().await;
+}
+
+// Keep the probe and actual ALTER on exactly the same stored value. Collect
+// verdicts until after cleanup so a reverted-probe failure leaves no database.
+async fn unicode_capacity_verdict(
+    db: &mut TestDb,
+    from: &str,
+    source_collation: &str,
+    to: &str,
+    value: &str,
+) -> (i32, Result<(), String>) {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    db.conn
+        .execute(&format!(
+            "DROP TABLE IF EXISTS dbo.t; CREATE TABLE dbo.t(v {from}{source_collation} NULL);"
+        ))
+        .await
+        .expect("create capacity fixture");
+    // A separate batch avoids binding the INSERT against the preceding
+    // fixture's type when this iteration changes the source family.
+    db.conn
+        .execute(&format!("INSERT dbo.t(v) VALUES ({value});"))
+        .await
+        .expect("insert capacity fixture");
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: "dbo.t.v".parse().unwrap(),
+            from: ty(from),
+            to: ty(to),
+            from_nullable: true,
+            to_nullable: true,
+        })],
+    };
+    let preflight = Mssql.preflight(&changes);
+    assert_eq!(preflight.probes.len(), 1, "{from} -> {to}");
+    let probe = &preflight.probes[0];
+    let rows = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|error| panic!("{from} -> {to}: {}: {error}", probe.sql));
+    let blocked = rows[0].try_get_at::<i32>(0).unwrap().unwrap();
+    let result = db
+        .conn
+        .execute(&format!("ALTER TABLE dbo.t ALTER COLUMN v {to} NULL;"))
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            error
+                .server_error_code()
+                .unwrap_or_else(|| error.to_string())
+        });
+    (blocked, result)
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn unicode_capacity_matches_alter_under_supplementary_character_collations() {
+    let mut db = TestDb::create("unicode_capacity461").await;
+    db.conn
+        .execute("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS_SC_UTF8;")
+        .await
+        .expect("select supplementary-character-aware default");
+    let rows = db.conn
+        .query("SELECT LEN(CONVERT(nvarchar(max),0x3DD800DE)), DATALENGTH(CONVERT(nvarchar(max),0x3DD800DE));")
+        .await
+        .expect("measure astral character units");
+    assert_eq!(rows[0].try_get_at::<i64>(0).unwrap(), Some(1));
+    assert_eq!(rows[0].try_get_at::<i64>(1).unwrap(), Some(4));
+    let mut verdicts = Vec::new();
+    for to in ["sysname", "nvarchar(128)", "nchar(128)"] {
+        for (from, collation) in [
+            ("nvarchar(300)", ""),
+            ("nchar(300)", ""),
+            ("varchar(600)", " COLLATE Latin1_General_100_CI_AS_SC_UTF8"),
+            // SQL Server rejects legacy ntext under SC/UTF8 collations.
+            ("ntext", " COLLATE Latin1_General_100_CI_AS"),
+        ] {
+            for (value, fits) in [
+                ("REPLICATE(CONVERT(nvarchar(max),0x3DD800DE),64)", true),
+                ("REPLICATE(CONVERT(nvarchar(max),0x3DD800DE),65)", false),
+                ("REPLICATE(CONVERT(nvarchar(max),0x3DD800DE),64)+N' '", true),
+                ("REPLICATE(N'x',128)", true),
+                ("REPLICATE(N'x',129)", false),
+                ("REPLICATE(N'x',128)+N' '", true),
+                ("N''", true),
+                ("NULL", true),
+            ] {
+                let result = unicode_capacity_verdict(&mut db, from, collation, to, value).await;
+                verdicts.push((format!("{from} -> {to}: {value}"), fits, result));
+            }
+        }
+    }
+    db.drop().await;
+    for (label, fits, (blocked, alter)) in verdicts {
+        assert_eq!(alter.is_ok(), fits, "{label}: ALTER {alter:?}");
+        if !fits {
+            assert_eq!(
+                alter.as_ref().err().map(String::as_str),
+                Some("2628"),
+                "{label}"
+            );
+        }
+        assert_eq!(blocked, i32::from(!fits), "{label}: ALTER {alter:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn binary_unicode_capacity_preserves_zero_padding_and_rejects_nonzero_suffixes() {
+    let mut db = TestDb::create("binary_capacity472").await;
+    let mut verdicts = Vec::new();
+    for to in ["sysname", "nvarchar(128)", "nchar(128)"] {
+        for from in ["binary(600)", "varbinary(600)", "varbinary(max)"] {
+            for (value, bounded_fits, max_fits) in [
+                ("CONVERT(varbinary(max),REPLICATE(N'x',100))", true, true),
+                ("CONVERT(varbinary(max),REPLICATE(N'x',128))", true, true),
+                ("CONVERT(varbinary(max),REPLICATE(N'x',129))", false, false),
+                (
+                    "CONVERT(varbinary(max),REPLICATE(N'x',128)+N' ')",
+                    false,
+                    true,
+                ),
+                (
+                    "CONVERT(varbinary(max),REPLICATE(N'x',128))+0x0000",
+                    true,
+                    false,
+                ),
+                (
+                    "CONVERT(varbinary(max),REPLICATE(N'x',128))+0x00",
+                    true,
+                    false,
+                ),
+                (
+                    "CONVERT(varbinary(max),REPLICATE(N'x',128))+0x01",
+                    false,
+                    false,
+                ),
+                (
+                    "CONVERT(varbinary(max),REPLICATE(N'x',128))+0x0001",
+                    false,
+                    false,
+                ),
+                ("0x", true, true),
+                ("NULL", true, true),
+            ] {
+                let fits = if from == "varbinary(max)" {
+                    max_fits
+                } else {
+                    bounded_fits
+                };
+                let result = unicode_capacity_verdict(&mut db, from, "", to, value).await;
+                verdicts.push((format!("{from} -> {to}: {value}"), fits, result));
+            }
+        }
+        // Other non-character sources must retain ordinary conversion checks.
+        let result = unicode_capacity_verdict(&mut db, "int", "", to, "42").await;
+        verdicts.push((format!("int -> {to}"), true, result));
+    }
+    db.drop().await;
+    for (label, fits, (blocked, alter)) in verdicts {
+        assert_eq!(alter.is_ok(), fits, "{label}: ALTER {alter:?}");
+        if !fits {
+            assert_eq!(
+                alter.as_ref().err().map(String::as_str),
+                Some("2628"),
+                "{label}"
+            );
+        }
+        assert_eq!(blocked, i32::from(!fits), "{label}: ALTER {alter:?}");
+    }
 }
 
 /// A default this engine fills every row from is not counted as a missing

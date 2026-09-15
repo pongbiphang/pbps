@@ -12548,3 +12548,34 @@ SPEC is in sync with all of these.
      provisioned or probed with DDL, and no source, fingerprints or credentials
      are collected. The envelope gains optional fields; published schema set
      11 archives that addition while envelope wire version 1 stays compatible.
+
+493. **Unicode conversion probes measure the capacity ALTER enforces.**
+    SQL Server's `nchar(n)`, `nvarchar(n)` and `sysname` capacities count UTF-16
+    units, while `LEN` under an SC collation counts an astral surrogate pair
+    once. Measure the unbounded `nvarchar(max)` conversion with
+    `DATALENGTH(RTRIM(...))` against twice the target bound; the unbounded
+    conversion avoids measuring an already truncated result, and trimming
+    preserves ALTER's acceptance of trailing U+0020 spaces. Keep the target
+    `TRY_CONVERT(...) IS NULL` test alongside capacity, so conversion validity
+    does not disappear when a bounded Unicode target takes this branch.
+
+    Bounded binary and varbinary sources have a different truncation rule. Measured
+    on SQL Server, 258 bytes encoding 129 ordinary Unicode characters are
+    refused by ALTER to `sysname`, while 200 bytes encoding 100 characters fit.
+    A suffix of zero bytes beyond the 256-byte capacity may be discarded, but
+    a suffix encoding a Unicode space may not. Inspect that binary suffix with
+    `SUBSTRING(...) <> 0x`: SQL Server's binary comparison zero-pads its shorter
+    operand, accepting only an all-zero suffix. This also handles fixed binary
+    padding and odd-length suffixes without confusing source bytes with target
+    character counts. In contrast, `varbinary(max)` follows the converted-text
+    rule: a trailing Unicode space may be discarded, but a trailing zero unit
+    may not. It therefore uses the unbounded Unicode measurement above. No
+    catalog collation lookup or source mutation is needed.
+
+    The live matrix compares every generated probe with the actual ALTER for
+    all three Unicode targets, SC and UTF8 character sources, legacy ntext,
+    binary/varbinary/max sources, ordinary numeric conversion, exact capacities,
+    supplementary characters, spaces, zero padding, odd bytes, empty values
+    and NULL. An oversized value is refused with 2628; accepted padding stays
+    unblocked. Existing non-Unicode code-page probes, unbounded targets,
+    timestamp refusal and static risk classification keep their boundaries.
