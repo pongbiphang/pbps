@@ -12385,7 +12385,7 @@ SPEC is in sync with all of these.
      connection alias is supplied. Prove separation before scratch DDL or source
      transfer with qualified read-only identity/provisioning evidence; unknown
      identity refuses and reconnects/failovers requalify. No production rows or
-     credentials are copied.
+     target authentication material are copied.
 
      DDL can execute expressions or extension code, so every resolver workload
      also needs qualified execution containment before declaration transfer or
@@ -12421,6 +12421,12 @@ SPEC is in sync with all of these.
      Retained external definitions stay private and ephemeral for reconstruction;
      only logical identities and versioned canonical fingerprints enter saved
      evidence.
+     These fingerprints can verify guesses of confidential literals; no plaintext
+     is not a secret-free promise. Plans carrying external-input fingerprints
+     require a validated confidential classification and protected publication
+     to authorized recipients, with no verifiers in ordinary diagnostics or
+     public derivative checksums. Unknown/public handling refuses; this does
+     not introduce an approval service or key-management system.
      Before source transfer, qualify and enforce engine/platform controls over
      server logging, intermediaries, container capture/forwarding and disposable
      source-bearing storage. Unknown controls refuse reconstruction; client

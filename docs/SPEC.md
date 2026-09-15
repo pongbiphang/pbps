@@ -1278,9 +1278,17 @@ controls refuse reconstruction before transfer; client redaction or deleting a
 scratch database is not proof, and pre-existing audit policies are not disabled
 to satisfy the check. ADR-0016 defines the trusted-runtime boundary and lifecycle.
 The user's managed declarations and explicit deployment changes remain ordinary
-reviewable plan contents. A fingerprint is a change detector, not permission to
-publish otherwise sensitive
-artifacts; ADR-0016 defines the capture and comparison contract.
+reviewable plan contents. Fingerprints can verify guesses of low-entropy
+confidential literals: omitting plaintext does not make an artifact secret-free.
+Plans with external-input fingerprints are conservatively classified
+confidential/secret-bearing, with a checksum-covered classification validated
+from their evidence. Publication requires qualified, access-controlled handling
+for recipients authorized for those inputs; public or unknown handling refuses.
+Those recipients can still review offline without production credentials.
+Ordinary diagnostics/logs/`explain` omit the digests and equivalent guessing
+verifiers; derived checksums inherit confidentiality where they expose the same
+oracle. Do not strip required evidence to produce a public applyable plan.
+ADR-0016 defines this boundary without a new approval or key-management service.
 
 #### 9.3.3 Resolver environment discovery (accepted, not implemented)
 

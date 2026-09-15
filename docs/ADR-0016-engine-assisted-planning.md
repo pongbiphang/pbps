@@ -260,7 +260,10 @@ failovers must requalify before further scratch DDL or source transfer.
 
 Clean up only resources created for the run on success, failure or cancellation;
 report cleanup failures without touching pre-existing objects. Do not propagate
-production credentials into a container or include secrets in saved evidence.
+target authentication material into scratch or serialize it in evidence.
+Retained source stays private, and its derived fingerprints require the
+confidential artifact handling in decision 5; absence of plaintext is not a
+secret-free guarantee.
 
 ### 5. Seal evidence before approval; never resolve during apply
 
@@ -274,6 +277,8 @@ Extend the saved-plan format, not semantic `Schema` equality, to carry:
 - the resolver's observed environment fingerprint and image digest/platform
   when applicable;
 - the current/desired logical bindings and resulting explicit typed changes;
+- a derived confidentiality classification covered by the checksum; external
+  input fingerprints require confidential handling, never a caller-waived flag;
 - typed descriptions of the derived pre-apply predicates and expected
   post-apply bindings, not user-supplied SQL to execute after approval.
 
@@ -340,6 +345,32 @@ secrets before hashing and thereby hide changes to them. Canonicalization must
 not guess SQL equivalence. A fingerprint detects changes; it is not encryption
 or a promise that review artifacts are suitable for public disclosure.
 
+**External-input fingerprints are confidential verifiers, not declassified
+source.** Knowing the surrounding definition can let a reader test guesses of
+a low-entropy literal against its digest. A public salt or another hash does
+not remove that property. Conservatively classify every plan containing these
+fingerprints as confidential/secret-bearing, without attempting to recognize
+secrets in SQL. Validate this classification from the evidence shape; a missing
+or downgraded label cannot make such an artifact valid for public handling.
+
+Store and transfer it only through access-controlled artifact paths for people
+authorized for the underlying inputs. Those reviewers still need no production
+credentials and can review offline; lack of credentials does not imply lack
+of confidentiality obligations. Refuse publication to an unprotected destination
+or a workflow whose required confidential handling cannot be established.
+Preserve existing output files on refusal. Artifact integration must define and
+qualify its access controls rather than treat a warning as enforcement; this
+does not create a new approval service or key-management system. pbps cannot
+prevent an authorized recipient from redistributing a file after receipt.
+
+Ordinary diagnostics, logs and `explain` report the classification, affected
+objects and failed conditions without external digests or equivalent guessing
+verifiers. Derived identifiers/checksums that expose an equivalent verifier
+inherit the confidential classification; hiding the input digest while
+publishing such a derivative does not declassify it. Any output carrying them
+needs the same protected handling. Required evidence may not be removed to
+manufacture a publicly shareable applyable plan.
+
 During the coherent pre-publication and pre-apply captures below, re-read each
 required target input's properties and recompute its fingerprint using the same
 versioned procedure, along with rechecking membership/absence predicates. A
@@ -349,8 +380,9 @@ and approval even if its identity, the managed checksum and existing bindings
 are unchanged. This also protects a resolver's decision not to rebuild: the
 closing observation of an old binding cannot waive a failed prerequisite.
 Neither the original source in `plan.json` nor a resolver at apply time is
-needed. Evidence/explanations name the object, fingerprint and failed condition
-without echoing private source or properties.
+needed. The protected artifact carries the fingerprints; explanations name the
+object and failed condition without echoing private source, properties or
+verifiers.
 
 Deterministic serialization and the plan checksum cover this evidence. The
 implementation must bump affected artifact/wire formats and generated schemas;
@@ -551,6 +583,15 @@ protection under test is removed.
     non-equivalent apply context invalidate it before DDL. A matching context
     must apply without a spurious rebuild/binding rollback, and running the
     compilation as the setup administrator must fail the negative control.
+17. **`external_fingerprints_require_confidential_artifact_handling` (planned):**
+    use known surrounding source and a small literal dictionary to demonstrate
+    that candidate hashes can match the saved fingerprint. Such evidence must
+    be classified confidential even without a recognized secret; public/unknown
+    handling and a missing/downgraded label refuse publication while preserving
+    prior files. Ordinary logs/diagnostics/explanations must omit the verifier
+    and equivalent derived verifiers. An authorized, access-controlled artifact
+    can still be reviewed offline and applied without new key-management or
+    resolver access; omitting mandatory evidence cannot produce a public plan.
 
 ## Delivery and supersession
 
