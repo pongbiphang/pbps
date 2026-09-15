@@ -21179,7 +21179,7 @@ fn one_estimate(
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
     use pbps_model::{Change, PlannedChange};
-    use pbps_pg::estimate::Rewrite;
+    use pbps_pg::estimate::{Lock, Reads, Rewrite};
 
     let mut conn = connect().await;
     let s = probe_schema_9("rewrite");
@@ -21358,6 +21358,88 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
          half the operators who ran it"
     );
     let _ = PlannedChange::new(change);
+
+    // An identity has no explicit default, but the sequence still backfills
+    // every row. Plain and literal-default additions keep their relfilenode.
+    let plain = Column::new(ty("integer"));
+    let mut literal = plain.clone();
+    literal.default = Some("7".into());
+    let mut identity = plain.clone().not_null();
+    identity.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    let mut stepped = plain.clone().not_null();
+    stepped.identity = Some(pbps_model::Identity {
+        seed: 7,
+        increment: 3,
+    });
+    for count in [0, 1000] {
+        for column in [&plain, &literal, &identity, &stepped] {
+            conn.execute(&format!(
+                "DROP TABLE IF EXISTS {s}.added;
+                 CREATE TABLE {s}.added (v integer);
+                 INSERT INTO {s}.added SELECT generate_series(1, {count})"
+            ))
+            .await
+            .expect("rows to backfill");
+            let node =
+                format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{s}.added'::regclass");
+            let before = number(&mut conn, &node).await;
+            let change = Change::AddColumn {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                table: TableName::new(&s, "added"),
+                name: "n".into(),
+                column: Box::new(column.clone()),
+            };
+            let ours = one_estimate(&change, Strategy::default()).expect("an estimate");
+            for statement in Postgres::new()
+                .emit(&change, Strategy::default())
+                .expect("emit")
+            {
+                conn.execute(&statement.sql).await.expect("add the column");
+            }
+            let rebuilt = before != number(&mut conn, &node).await;
+            assert_eq!(
+                ours.rewrite,
+                if rebuilt { Rewrite::Yes } else { Rewrite::No },
+                "{count} rows, {column:?}"
+            );
+            assert_eq!(ours.lock, Lock::AccessExclusive);
+            assert_eq!(
+                ours.reads,
+                if rebuilt {
+                    Reads::EveryRow
+                } else {
+                    Reads::Nothing
+                }
+            );
+            assert_eq!(ours.is_cheap(), !rebuilt);
+            let expected_sum = if let Some(identity) = column.identity {
+                i64::from(count) * identity.seed
+                    + i64::from(count * (count - 1) / 2) * identity.increment
+            } else if column.default.is_some() {
+                i64::from(count * 7)
+            } else {
+                0
+            };
+            assert_eq!(
+                i64::from(
+                    number(
+                        &mut conn,
+                        &format!("SELECT COALESCE(sum(n), 0)::int FROM {s}.added")
+                    )
+                    .await
+                ),
+                expected_sum,
+                "the emitted addition must backfill the declared values"
+            );
+            assert_eq!(
+                number(&mut conn, &format!("SELECT count(*)::int FROM {s}.added")).await,
+                count
+            );
+        }
+    }
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await

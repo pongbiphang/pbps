@@ -144,7 +144,8 @@ engine confirmed without amendment.
 | `numeric(10,2)` → `numeric(10,4)` | **REWRITE** |
 | `ADD COLUMN d int DEFAULT 7` | no rewrite |
 | `ADD COLUMN d uuid DEFAULT gen_random_uuid()` | **REWRITE** |
-| `SET NOT NULL`, `DROP COLUMN`, `ADD COLUMN` with no default | no rewrite |
+| `ADD COLUMN d int GENERATED ALWAYS AS IDENTITY` | **REWRITE** (also measured on PostgreSQL 16.15) |
+| `SET NOT NULL`, `DROP COLUMN`, `ADD COLUMN` with no default or identity | no rewrite |
 
 **Measured**, what a rewrite costs and what it holds:
 

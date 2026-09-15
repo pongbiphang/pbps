@@ -465,6 +465,18 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             ..
         } => {
             let about = format!("adding the column {}", table.column(name));
+            // The identity sequence backfills every stored row even though
+            // `default` is absent. Measured on PostgreSQL 16 and 18, this also
+            // rebuilds an empty table.
+            if column.identity.is_some() {
+                return e(
+                    about,
+                    table,
+                    Rewrite::Yes,
+                    Reads::EveryRow,
+                    Lock::AccessExclusive,
+                );
+            }
             // Measured, `ADD COLUMN d integer DEFAULT 7` rewrites nothing and
             // reads nothing, and `ADD COLUMN d uuid DEFAULT gen_random_uuid()`
             // rebuilds the table. Both are one `AddColumn` carrying a default,
@@ -1247,6 +1259,37 @@ mod tests {
         let literal = estimate(&column("'2026-01-02'"), Strategy::default()).expect("an estimate");
         assert_eq!(literal.rewrite, Rewrite::No);
         assert!(literal.is_cheap(), "{literal:#?}");
+    }
+
+    #[test]
+    fn adding_an_identity_backfills_rows_without_an_explicit_default() {
+        for identity in [
+            None,
+            Some(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            }),
+        ] {
+            let mut column = pbps_model::Column::new(ty("integer"));
+            column.identity = identity;
+            column.nullable = identity.is_none();
+            let change = Change::AddColumn {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                table: tname("app.t"),
+                name: "v".into(),
+                column: Box::new(column),
+            };
+            let ours = estimate(&change, Strategy::default()).expect("an estimate");
+            let (rewrite, reads) = if identity.is_some() {
+                (Rewrite::Yes, Reads::EveryRow)
+            } else {
+                (Rewrite::No, Reads::Nothing)
+            };
+            assert_eq!(ours.rewrite, rewrite);
+            assert_eq!(ours.reads, reads);
+            assert_eq!(ours.lock, Lock::AccessExclusive);
+            assert_eq!(ours.is_cheap(), identity.is_none());
+        }
     }
 
     /// A foreign key locks the table nobody was looking at.
