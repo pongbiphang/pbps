@@ -3,7 +3,8 @@
 //! containment, target separation and the relevant engine compatibility.
 
 use super::{
-    File, FileIdentity, ProcessLease, UnqualifiedProcess, proc_base, process_scope, socket_owners,
+    File, ProcessLease, UnqualifiedProcess, observe_incidental, proc_base, process_scope,
+    socket_owners,
 };
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::ConnectionId;
@@ -135,11 +136,9 @@ impl PrivateChannelLease {
             if pid == self.workload.pid() {
                 continue;
             }
-            let process = ProcessLease::capture(pid)?;
-            if FileIdentity::of(&directory)? != FileIdentity::of(&process.directory)? {
-                return Err(UnqualifiedProcess);
-            }
-            security(&process, self.profile.uid, self.profile.capabilities)?;
+            observe_incidental(pid, &directory, |process| {
+                security(&process, self.profile.uid, self.profile.capabilities)
+            })?;
         }
         // Re-read after descriptor inspection so a closed/replaced socket
         // cannot be accepted from an earlier table snapshot.

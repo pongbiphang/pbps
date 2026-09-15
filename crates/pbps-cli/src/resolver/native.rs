@@ -320,6 +320,65 @@ fn process_gone(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
 }
 
+fn process_exited(directory: &File) -> Result<bool, UnqualifiedProcess> {
+    let stat = match std::fs::read_to_string(proc_base(directory).join("stat")) {
+        Ok(stat) => stat,
+        Err(error) if process_gone(&error) => return Ok(true),
+        Err(_) => return Err(UnqualifiedProcess),
+    };
+    exited_stat(&stat)
+}
+
+fn exited_stat(stat: &str) -> Result<bool, UnqualifiedProcess> {
+    let (_, fields) = stat.rsplit_once(')').ok_or(UnqualifiedProcess)?;
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    let state = fields.first().ok_or(UnqualifiedProcess)?;
+    let threads: u32 = fields
+        .get(17)
+        .ok_or(UnqualifiedProcess)?
+        .parse()
+        .map_err(|_| UnqualifiedProcess)?;
+    if threads == 0 {
+        return Err(UnqualifiedProcess);
+    }
+    // A dead leader can retain live threads, and /proc/PID/task can become
+    // unavailable after pthread_exit. The same kernel stat record must show
+    // that only the dead leader remains; absence of its task directory is not
+    // proof of group exit (proc_pid_task(5), proc_pid_stat(5) field 20).
+    Ok(matches!(*state, "Z" | "X") && threads == 1)
+}
+
+fn observe_incidental<T>(
+    pid: u32,
+    directory: &File,
+    inspect: impl FnOnce(ProcessLease) -> Result<T, UnqualifiedProcess>,
+) -> Result<Option<T>, UnqualifiedProcess> {
+    let result = (|| {
+        let process = ProcessLease::capture(pid)?;
+        if FileIdentity::of(directory)? != FileIdentity::of(&process.directory)? {
+            return Err(UnqualifiedProcess);
+        }
+        inspect(process)
+    })();
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            if !process_exited(directory)? {
+                return Err(error);
+            }
+            // Prove exit through the held proc inode, then exclude replacement
+            // of its numeric PID. Never turn a live permission failure into
+            // absence. Essential service/backend leases still must stay live.
+            match open_process(pid) {
+                Ok(current) if FileIdentity::of(&current)? == FileIdentity::of(directory)? => (),
+                Err(error) if process_gone(&error) => (),
+                Ok(_) | Err(_) => return Err(UnqualifiedProcess),
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn open_process(pid: u32) -> std::io::Result<File> {
     // The opt-in kernel fixture mounts only its two owned process trees into
     // a private PID namespace. Production always uses the real proc mount.
@@ -456,11 +515,7 @@ fn socket_owners(
                 Err(_) => return Err(UnqualifiedProcess),
             }
         }
-        if owns_socket {
-            let lease = ProcessLease::capture(pid)?;
-            if FileIdentity::of(&directory)? != FileIdentity::of(&lease.directory)? {
-                return Err(UnqualifiedProcess);
-            }
+        if owns_socket && let Some(lease) = observe_incidental(pid, &directory, Ok)? {
             owners.push(lease);
         }
     }
@@ -494,6 +549,79 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn incidental_exit_during_inspection_does_not_hide_live_failures_or_pid_replacement() {
+        let mut owner = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let owner_directory = open_process(owner.id()).unwrap();
+        let directory = open_process(child.id()).unwrap();
+        let owner_lease = ProcessLease::capture(owner.id()).unwrap();
+        let live = observe_incidental(child.id(), &directory, |lease| lease.check());
+        let unreadable = observe_incidental(owner.id(), &owner_directory, |_| {
+            Err::<(), _>(UnqualifiedProcess)
+        });
+        let exited = observe_incidental(child.id(), &directory, |lease| {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            lease.check()
+        });
+        let reaped = observe_incidental(child.id(), &directory, |lease| lease.check());
+        // Pairing an old held inode with another live numeric PID simulates
+        // the identity mismatch that reuse produces, without exhausting PIDs.
+        let replaced = observe_incidental(owner.id(), &directory, |lease| lease.check());
+        let owner_still_live = owner_lease.check();
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        assert!(matches!(live, Ok(Some(()))));
+        assert!(unreadable.is_err(), "unreadable live state is not absence");
+        assert!(
+            matches!(exited, Ok(None)),
+            "exit during inspection is benign"
+        );
+        assert!(
+            matches!(reaped, Ok(None)),
+            "an already reaped child is benign"
+        );
+        assert!(
+            replaced.is_err(),
+            "PID substitution must still refuse the scan"
+        );
+        assert!(owner_still_live.is_ok());
+    }
+
+    #[test]
+    fn an_unreaped_incidental_child_is_skipped_only_after_all_tasks_exit() {
+        let mut child = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let directory = open_process(child.id()).unwrap();
+        child.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !process_exited(&directory).unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let exited = observe_incidental(child.id(), &directory, |lease| lease.check());
+        child.wait().unwrap();
+        assert!(matches!(exited, Ok(None)));
+    }
+
+    #[test]
+    fn a_zombie_leader_does_not_prove_that_its_other_threads_exited() {
+        // Linux reports Z with num_threads > 1 after a leader calls
+        // pthread_exit while a worker remains alive. comm may contain ')'.
+        let stat = |state: &str, threads: &str| {
+            format!(
+                "1 (fixture) name) {state} {} {threads}",
+                ["0"; 16].join(" ")
+            )
+        };
+        assert!(!exited_stat(&stat("Z", "2")).unwrap());
+        assert!(!exited_stat(&stat("S", "1")).unwrap());
+        assert!(exited_stat(&stat("Z", "1")).unwrap());
+        assert!(exited_stat(&stat("X", "1")).unwrap());
+        assert!(exited_stat(&stat("Z", "unknown")).is_err());
+        assert!(exited_stat(&stat("Z", "0")).is_err());
+        assert!(exited_stat("unreadable").is_err());
+    }
 
     #[test]
     fn a_process_lease_expires_even_while_its_proc_directory_is_held() {
