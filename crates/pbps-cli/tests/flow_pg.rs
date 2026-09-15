@@ -6746,6 +6746,174 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
         });
 }
 
+/// An action uses ONLY on a regular table but still reaches every partition.
+/// Keep the lock privilege bar at the named relation and retain the engine's
+/// recursive partition lock, including the FK's concurrent-attach protection.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn referential_action_locks_exclude_plain_children_and_hold_partitions() {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let admin = server();
+    let deployer = format!("pbps_action_locks_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![deployer.clone()],
+    };
+    on_server(
+        &admin,
+        &format!("CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'"),
+    );
+    let own = OwnDatabase::new(&admin, "action_lock_scope");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app; CREATE TABLE app.p(id integer PRIMARY KEY); \
+             CREATE TABLE app.c(id integer REFERENCES app.p ON UPDATE CASCADE); \
+             CREATE TABLE app.unreached() INHERITS (app.c); \
+             CREATE TABLE app.pc(id integer REFERENCES app.p ON UPDATE CASCADE, region integer) PARTITION BY RANGE(region); \
+             CREATE TABLE app.pc_first PARTITION OF app.pc FOR VALUES FROM (0) TO (10); \
+             CREATE TABLE app.pc_next(id integer, region integer CHECK (region >= 10 AND region < 20)); \
+             INSERT INTO app.p VALUES (1); INSERT INTO app.c VALUES (1); \
+             INSERT INTO app.unreached VALUES (1); INSERT INTO app.pc VALUES (1, 0); \
+             GRANT USAGE ON SCHEMA app TO {deployer}; \
+             GRANT UPDATE, SELECT ON app.p TO {deployer}; \
+             GRANT INSERT ON app.c, app.pc TO {deployer}"
+        ),
+    );
+    // A partition tree cannot contain the plain inheritance edge we exclude.
+    // Pin the engine rule instead of relying on a mixed, impossible fixture.
+    for sql in [
+        "CREATE TABLE app.mixed() INHERITS (app.pc)",
+        "CREATE TABLE app.mixed() INHERITS (app.pc_first)",
+        "CREATE TABLE app.mixed() INHERITS (app.c) PARTITION BY RANGE(id)",
+    ] {
+        assert!(try_on_server(connection, sql).is_err(), "{sql}");
+    }
+    let deployment = as_role(connection, &deployer);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut writer = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &deployment)
+                .await
+                .unwrap();
+            let mut other = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            let framing = pbps_pg::Postgres::new().transaction_framing();
+            writer.execute("SET lock_timeout = '250ms'").await.unwrap();
+            other.execute("SET lock_timeout = '250ms'").await.unwrap();
+            other.begin(framing).await.unwrap();
+            other
+                .execute("LOCK TABLE ONLY app.unreached IN SHARE MODE")
+                .await
+                .unwrap();
+            writer.begin(framing).await.unwrap();
+            let write = RowWrite {
+                table: pbps_model::TableName::new("app", "p"),
+                operation: RowOperation::Update {
+                    columns: ["id".to_owned()].into(),
+                },
+            };
+            let guard = pbps_pg::data_triggers::prepare(
+                &mut writer,
+                std::slice::from_ref(&write),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .expect(
+                "a SHARE lock on an unreached inheritance child must not delay the action guard",
+            );
+            pbps_pg::data_triggers::check(&mut writer, &write, &guard)
+                .await
+                .unwrap();
+            let locks = writer
+                .query(
+                    "SELECT c.relname AS name FROM pg_catalog.pg_locks l \
+                 JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE l.pid = pg_catalog.pg_backend_pid() AND n.nspname = 'app' \
+                   AND l.mode = 'RowExclusiveLock' AND l.granted ORDER BY c.relname",
+                )
+                .await
+                .unwrap();
+            let names: Vec<_> = locks
+                .iter()
+                .map(|row| row.try_get::<&str>("name").unwrap().unwrap())
+                .collect();
+            assert_eq!(names, ["c", "p", "pc", "pc_first"]);
+            writer
+                .execute("UPDATE app.p SET id = 2 WHERE id = 1")
+                .await
+                .unwrap();
+            writer.commit(framing).await.unwrap();
+            // Only the action's actual targets moved. The concurrently locked
+            // inheritance child is unaffected by both guard and engine DML.
+            let rows = other
+                .query(
+                    "SELECT (SELECT id FROM ONLY app.c) AS ordinary, \
+                 (SELECT id FROM app.pc) AS partitioned, \
+                 (SELECT id FROM app.unreached) AS unreached",
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows[0].try_get::<i32>("ordinary").unwrap(), Some(2));
+            assert_eq!(rows[0].try_get::<i32>("partitioned").unwrap(), Some(2));
+            assert_eq!(rows[0].try_get::<i32>("unreached").unwrap(), Some(1));
+
+            // Direct DML has no ONLY, so its own guard must still recurse and
+            // block on that same child. The first refusal is lock contention,
+            // not missing privileges on the child (the deployer has none).
+            writer.begin(framing).await.unwrap();
+            let direct = RowWrite {
+                table: pbps_model::TableName::new("app", "c"),
+                operation: RowOperation::Update {
+                    columns: ["id".to_owned()].into(),
+                },
+            };
+            let refused = pbps_pg::data_triggers::prepare(
+                &mut writer,
+                &[direct],
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .err()
+            .expect("direct DML reaches the locked inheritance child");
+            assert_eq!(refused.server_error_code().as_deref(), Some("55P03"));
+            writer.rollback(framing).await.unwrap();
+            other.rollback(framing).await.unwrap();
+
+            // Keep the existing protection against a new partition joining
+            // this FK's referencing side while the guard holds its locks.
+            // Pair the refusal with success after release on both PGs.
+            writer.begin(framing).await.unwrap();
+            pbps_pg::data_triggers::prepare(
+                &mut writer,
+                &[write],
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            let attach =
+                "ALTER TABLE app.pc ATTACH PARTITION app.pc_next FOR VALUES FROM (10) TO (20)";
+            let refused = other
+                .execute(attach)
+                .await
+                .expect_err("ATTACH must wait for the guarded FK write");
+            assert_eq!(refused.server_error_code().as_deref(), Some("55P03"));
+            writer.rollback(framing).await.unwrap();
+            other
+                .execute(attach)
+                .await
+                .expect("ATTACH succeeds after the guard releases its locks");
+        });
+}
+
 /// A guard failure must retain its table and remedy after driver redaction,
 /// on both the ordinary and staged failed-attempt recording paths.
 #[test]

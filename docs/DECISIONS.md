@@ -12332,3 +12332,35 @@ SPEC is in sync with all of these.
      rejects a valid plan. Existing JSON variants, saved formats, risk classes
      and approval gates remain unchanged. ADR-0012 Amendment 3 and the per-engine
      live matrices record the measured boundary.
+
+489. **A referential-action lock follows the engine's inheritance boundary.**
+     DECISIONS 451's trigger closure already follows ONLY for foreign-key
+     actions, but its lock recursively included plain inheritance children the
+     action cannot reach (#438). Measured on PostgreSQL 16.15 and 18.6, another
+     session's SHARE lock on such a child delayed the guard even though the
+     cascade never wrote it. The deployment role needs no privilege on that
+     child for PostgreSQL's recursive lock; the defect is unnecessary blocking,
+     not a missing child privilege.
+
+     For an ordinary action target, take `LOCK TABLE ONLY ... IN ROW EXCLUSIVE
+     MODE`. For a partitioned target, retain the existing recursive lock as
+     one server statement. Both engines refuse plain inheritance from a
+     partitioned table or one of its partitions, and refuse a partitioned
+     table that also inherits from an ordinary table. Thus a recursive
+     partition lock contains no plain-inheritance descendants to exclude.
+     Replacing it with an enumerated list of separately locked partitions
+     would introduce a gap without narrowing the legal relation set. A regular
+     relation cannot become partitioned while retaining its oid; the existing
+     post-lock name-to-oid check still rejects name replacement.
+
+     The named row statement keeps its recursive lock: it has no ONLY and
+     can write ordinary inheritance children. The action target's existing
+     INSERT/UPDATE/DELETE/TRUNCATE privilege requirement is unchanged.
+     Live controls on both engines hold an unrelated child's SHARE lock while
+     the guard and cascade complete, inspect the writer's locks on both a
+     regular action target and a partitioned one, and verify the untouched
+     child's row. The same lock still blocks a direct write's guard. A new
+     partition of the FK's referencing side times out on ATTACH while the
+     guard holds its locks; ATTACH succeeds immediately after release. Restoring
+     the old recursive regular-table lock makes the first concurrency assertion
+     fail with lock timeout.
