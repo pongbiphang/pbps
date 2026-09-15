@@ -6,6 +6,22 @@
 
 use std::collections::BTreeMap;
 
+/// Read-only engine observations for a native runtime admission check. They
+/// are not globally unique instance proofs: clones can retain these values.
+/// The caller must bind them to the actual kernel process and connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceObservation {
+    pub instance_key: String,
+    pub process: BackendProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendProcess {
+    NativePid(std::num::NonZeroU32),
+    /// SQL Server's PAL process number is not its native Linux socket owner.
+    RuntimeOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum Observation {

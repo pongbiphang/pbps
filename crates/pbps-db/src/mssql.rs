@@ -8,7 +8,6 @@
 //! (DECISIONS 225).
 
 use tiberius::{Client, Config};
-use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::{DbError, Param};
@@ -41,7 +40,8 @@ pub struct Row(tiberius::Row);
 
 /// An open SQL Server connection.
 pub struct Conn {
-    client: Client<Compat<TcpStream>>,
+    client: Client<Compat<crate::transport::BoxedStream>>,
+    endpoints: Option<crate::transport::TcpEndpoints>,
 }
 
 impl From<tiberius::error::Error> for DbError {
@@ -110,8 +110,36 @@ impl Conn {
             addr: config.get_addr().to_owned(),
             source,
         })?;
-        let client = Client::connect(config, tcp.compat_write()).await?;
-        Ok(Self { client })
+        let endpoints =
+            crate::transport::TcpEndpoints::capture(&tcp).map_err(|source| DbError::Connect {
+                addr: config.get_addr().to_owned(),
+                source,
+            })?;
+        let stream: crate::transport::BoxedStream = Box::new(tcp);
+        let client = Client::connect(config, stream.compat_write()).await?;
+        Ok(Self {
+            client,
+            endpoints: Some(endpoints),
+        })
+    }
+
+    pub(crate) fn tcp_endpoints(&self) -> Option<crate::transport::TcpEndpoints> {
+        self.endpoints
+    }
+
+    pub(crate) async fn connect_stream(
+        stream: crate::transport::BoxedStream,
+        login: crate::transport::StreamLogin,
+    ) -> Result<Self, DbError> {
+        let mut config = Config::new();
+        config.database(&login.database);
+        config.authentication(tiberius::AuthMethod::sql_server(login.user, login.password));
+        config.encryption(tiberius::EncryptionLevel::NotSupported);
+        let client = Client::connect(config, stream.compat_write()).await?;
+        Ok(Self {
+            client,
+            endpoints: None,
+        })
     }
 
     pub(crate) async fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {

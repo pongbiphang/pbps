@@ -30,6 +30,7 @@ pub struct Row(tokio_postgres::Row);
 /// An open PostgreSQL connection.
 pub struct Conn {
     client: tokio_postgres::Client,
+    endpoints: Option<crate::transport::TcpEndpoints>,
     /// The polled connection future. Held, not detached — see the module header.
     _driver: tokio::task::JoinHandle<()>,
 }
@@ -216,6 +217,11 @@ impl Conn {
         // socket-level; `Config::connect`'s own `connect_socket` is the one
         // place that does, and this seam does not call it (issue #113).
         apply_socket_options(&tcp, &config, tcp_user_timeout, &format!("{host}:{port}"))?;
+        let endpoints =
+            crate::transport::TcpEndpoints::capture(&tcp).map_err(|source| DbError::Connect {
+                addr: format!("{host}:{port}"),
+                source,
+            })?;
 
         // `connect_raw`, not `connect`: the driver's own `connect` opens the
         // socket, and then the three failures above collapse into its error
@@ -243,12 +249,35 @@ impl Conn {
         let mut conn = Self {
             client,
             _driver: driver,
+            endpoints: Some(endpoints),
         };
         // The endpoint is spelled again rather than kept: `addr` is moved into
         // whichever of the two connect errors above fires.
         conn.require_session(config.get_target_session_attrs(), &format!("{host}:{port}"))
             .await?;
         Ok(conn)
+    }
+
+    pub(crate) fn tcp_endpoints(&self) -> Option<crate::transport::TcpEndpoints> {
+        self.endpoints
+    }
+
+    pub(crate) async fn connect_stream(
+        stream: crate::transport::BoxedStream,
+        login: crate::transport::StreamLogin,
+    ) -> Result<Self, DbError> {
+        let mut config = Config::new();
+        config
+            .user(&login.user)
+            .password(&login.password)
+            .dbname(&login.database)
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await?;
+        Ok(Self {
+            client,
+            _driver: hold(connection),
+            endpoints: None,
+        })
     }
 
     /// Enforces `target_session_attrs`, which `connect_raw` does not.

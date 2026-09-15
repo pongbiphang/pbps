@@ -1,0 +1,13 @@
+linux-amd64-v1.json is derived from the Moby default seccomp profile:
+https://github.com/moby/moby/blob/v28.3.3/profiles/seccomp/default.json
+
+Copyright 2012-2017 Docker, Inc.
+This product includes software developed at Docker, Inc. (https://www.docker.com).
+Licensed under the Apache License, Version 2.0, like this repository.
+https://www.apache.org/licenses/LICENSE-2.0
+
+pbps changes: restrict the architecture set to x86-64 and its compat ABIs;
+remove connect, socketcall, ptrace, process_vm_readv, process_vm_writev,
+pidfd_getfd and unshare from the allowlist; allow sendto/sendmsg/sendmmsg only
+without MSG_FASTOPEN, which could otherwise initiate a connection. This file is a launch policy,
+not a certification of a host or an engine.

@@ -3,6 +3,33 @@
 use pbps_db::resolver::{Candidate, Discovery, Extension, Observation};
 use pbps_db::{Conn, DbError};
 
+/// The cluster identifier is observed alongside, never instead of, qualified
+/// process provenance. Cloned clusters can share a system identifier.
+pub async fn instance_identity(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+) -> Result<pbps_db::resolver::InstanceObservation, DbError> {
+    let rows = conn.query("SELECT system_identifier::text AS instance_key, pg_catalog.pg_backend_pid()::text AS backend_pid FROM pg_catalog.pg_control_system()").await?;
+    let [row] = rows.as_slice() else {
+        return Err(DbError::BadRow(
+            "native PostgreSQL identity expected one control row".into(),
+        ));
+    };
+    let key = row
+        .try_get::<&str>("instance_key")?
+        .filter(|value| value.parse::<i64>().is_ok_and(|id| id != 0))
+        .ok_or_else(|| {
+            DbError::BadRow("native PostgreSQL cluster identity is unreadable".into())
+        })?;
+    let process = row
+        .try_get::<&str>("backend_pid")?
+        .and_then(|value| value.parse::<std::num::NonZeroU32>().ok())
+        .ok_or_else(|| DbError::BadRow("native PostgreSQL backend process is unreadable".into()))?;
+    Ok(pbps_db::resolver::InstanceObservation {
+        instance_key: key.to_owned(),
+        process: pbps_db::resolver::BackendProcess::NativePid(process),
+    })
+}
+
 // Version-dependent locale fields are projected by name from this one catalog
 // row: PostgreSQL 17 renamed daticulocale to datlocale. A missing/NULL field
 // stays unreported, never an empty locale certified as equivalent.

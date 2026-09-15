@@ -7,8 +7,50 @@
 
 use crate::{Conn, DbError, Driver, Param, Row};
 
-/// An opaque, process-local identity minted after a successful verified
-/// handshake. It is neither a server identity nor a saved-plan field.
+mod stream;
+pub(crate) use stream::BoxedStream;
+pub use stream::{ByteStream, StreamConn, StreamLogin};
+
+mod query_sealed {
+    pub trait Sealed {}
+}
+
+/// Engine-owned queries can use either transport primitive. This trait does
+/// not classify SQL as read-only or grant runtime admission.
+pub trait QueryConnection: query_sealed::Sealed {
+    fn query<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send + 'a;
+}
+
+/// Endpoints observed from the socket actually handed to the driver. These
+/// are connection facts, not peer authentication or runtime qualification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpEndpoints {
+    local: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+}
+
+impl TcpEndpoints {
+    pub(crate) fn capture(socket: &tokio::net::TcpStream) -> std::io::Result<Self> {
+        Ok(Self {
+            local: socket.local_addr()?,
+            peer: socket.peer_addr()?,
+        })
+    }
+
+    pub fn local(&self) -> std::net::SocketAddr {
+        self.local
+    }
+    pub fn peer(&self) -> std::net::SocketAddr {
+        self.peer
+    }
+}
+
+/// An opaque, process-local identity minted after a successful
+/// database handshake. It is neither a server identity nor a saved-plan field;
+/// transport qualification belongs to the connection type that carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionId([u8; 32]);
 
@@ -20,6 +62,7 @@ pub struct ConnectionId([u8; 32]);
 pub struct PeerVerifiedConn {
     conn: Conn,
     id: ConnectionId,
+    endpoints: TcpEndpoints,
 }
 
 impl PeerVerifiedConn {
@@ -37,9 +80,17 @@ impl PeerVerifiedConn {
                 crate::postgres::Conn::connect_verified(connection_string).await?,
             )),
         };
+        let endpoints = match &conn {
+            Conn::Mssql(conn) => conn.tcp_endpoints(),
+            Conn::Postgres(conn) => conn.tcp_endpoints(),
+        }
+        .ok_or_else(|| {
+            DbError::Refused("the verified TCP connection has no observed socket endpoints".into())
+        })?;
         Ok(Self {
             conn,
             id: ConnectionId(rand::random()),
+            endpoints,
         })
     }
 
@@ -49,6 +100,12 @@ impl PeerVerifiedConn {
 
     pub fn driver(&self) -> Driver {
         self.conn.driver()
+    }
+
+    /// A native runtime verifier must retain this connection while matching
+    /// its actual kernel socket. The endpoint tuple alone is not a capability.
+    pub fn tcp_endpoints(&self) -> TcpEndpoints {
+        self.endpoints
     }
 
     /// Qualification reads use this same connection. Their SQL and meaning
@@ -63,6 +120,13 @@ impl PeerVerifiedConn {
         params: &[Param<'_>],
     ) -> Result<Vec<Row>, DbError> {
         self.conn.query_with(sql, params).await
+    }
+}
+
+impl query_sealed::Sealed for PeerVerifiedConn {}
+impl QueryConnection for PeerVerifiedConn {
+    async fn query<'a>(&'a mut self, sql: &'a str) -> Result<Vec<Row>, DbError> {
+        PeerVerifiedConn::query(self, sql).await
     }
 }
 
