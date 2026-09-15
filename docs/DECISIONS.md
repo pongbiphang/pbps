@@ -12306,3 +12306,29 @@ SPEC is in sync with all of these.
      UI compose or crash-recovery harness. #494 / #64 step 4 must test the
      full protocol; #471's Windows restoration remains separate. No database
      model, approval, saved-plan format or execution boundary changes.
+
+488. **Operational row work is shared; storage mechanics remain engine-specific
+     (issue #255).** SQL Server's catalogue measurements found in-place updates
+     with unchanged heap/allocation IDs, and data-dependent log growth even when
+     the update path processes every row. PostgreSQL's replacement-storage
+     observation cannot be generalized into a promise that every rewrite needs
+     a second copy. Shared `pbps-dialect::estimate::{Rewrite, Reads}` describes
+     row-processing work independently of physical bytes, disk space and risk.
+     PostgreSQL reexports the types; its measured answers remain unchanged.
+
+     SQL Server estimates offline column type/nullability changes, using catalog
+     compression and approximate row counts. Its description names in-place
+     updates. Unmeasured operations, ONLINE, other versions, special storage and
+     index/constraint context stay explicitly unknown or unavailable. Catalog
+     dependencies are not projected through planned drops, so no second planner
+     grows inside the estimate. Whole-plan provenance retains stored names
+     across renames and prevents newly created/retyped identities borrowing
+     current storage facts from a name that will be reused.
+
+     Locks, catalog queries, provenance and row-statistics semantics stay in
+     each engine; only the common answers cross the pure dialect seam. The
+     diagnostic counters/log-volume measurements live only in tests. Planning
+     needs no new server-performance permission, and a failed estimate never
+     rejects a valid plan. Existing JSON variants, saved formats, risk classes
+     and approval gates remain unchanged. ADR-0012 Amendment 3 and the per-engine
+     live matrices record the measured boundary.

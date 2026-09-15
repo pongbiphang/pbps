@@ -684,9 +684,15 @@ and as the catalog has it, which is the only name the measurement may use — an
 the second is private with no public constructor beside it, so a caller cannot
 build the estimate that cannot be measured (409).
 
-**No SQL Server cost measurements were taken here either.** Whether
-`int -> bigint` is metadata-only there is still the open question ADR-0012's
-Limits record, and this step did not answer it.
+**The original step measured PostgreSQL only.** Issue #255 subsequently
+measured SQL Server's whole type catalogue: uncompressed `int -> bigint`
+updates every row in place, while row compression permits a metadata-only
+change. Connected SQL Server plans now estimate column type/nullability changes
+on the measured ordinary rowstore shapes, reporting unknowns for ONLINE,
+unmeasured versions/storage and index/constraint context. Other changes remain
+unmeasured. ADR-0012 Amendment 3 records the evidence and the shared
+`pbps-dialect::estimate::{Rewrite, Reads}` boundary; locks and catalog context
+stay engine-specific. Neither engine's estimate changes the saved plan or gate.
 
 Not in this step: at the time the CLI still refused the `postgres` dialect, so
 none of the three was reached by a command. Step 10 wired the probes through

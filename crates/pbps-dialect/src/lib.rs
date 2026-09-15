@@ -39,6 +39,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod estimate;
+
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
     RoutineArg, Schema, Strategy, Table, TableName,

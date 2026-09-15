@@ -53,28 +53,34 @@ pub async fn execute_staged_statement(
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::CostReport {
-    use crate::cost::{ChangeCost, CostReport, Reads, Rewrite, Rows};
+    use crate::cost::{ChangeCost, CostReport, Rows};
     match conn.driver() {
-        Driver::Mssql => CostReport::Unavailable {
-            engine: "sqlserver",
-            reason: "operational_cost is not implemented for SQL Server; its costs have not been measured (ADR-0012, issue #255)".to_owned(),
-        },
-        Driver::Postgres => {
-            use pbps_pg::estimate as pg;
-            let mut estimates = pg::planned_estimates(cs).into_iter().peekable();
+        Driver::Mssql => {
+            use pbps_mssql::estimate as ms;
+            let mut estimates = ms::planned_estimates(cs).into_iter().peekable();
+            if estimates.peek().is_none() && !cs.changes.is_empty() {
+                return CostReport::Unavailable {
+                    engine: "sqlserver",
+                    reason: "operational_cost currently measures SQL Server column type and nullability changes; this plan contains neither".to_owned(),
+                };
+            }
             let mut changes = Vec::with_capacity(cs.changes.len());
             for change_index in 0..cs.changes.len() {
-                let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index) else {
+                let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index)
+                else {
                     changes.push(ChangeCost::Unavailable {
                         change_index,
-                        reason: "operational_cost has no measurement for this PostgreSQL change".to_owned(),
+                        reason: "operational_cost has no measurement for this SQL Server change"
+                            .to_owned(),
                     });
                     continue;
                 };
-                if let Err(error) = pg::against(conn, &mut e).await {
+                if let Err(error) = ms::against(conn, &mut e).await {
                     changes.push(ChangeCost::Unavailable {
                         change_index,
-                        reason: format!("operational_cost could not read PostgreSQL catalog context: {error}"),
+                        reason: format!(
+                            "operational_cost could not read SQL Server catalog context: {error}"
+                        ),
                     });
                     continue;
                 }
@@ -82,16 +88,55 @@ pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::C
                     change_index,
                     about: e.about,
                     table: e.table.to_string(),
-                    rewrite: match e.rewrite {
-                        pg::Rewrite::Yes => Rewrite::Yes,
-                        pg::Rewrite::No => Rewrite::No,
-                        pg::Rewrite::Unknown(reason) => Rewrite::Unknown { reason },
+                    rewrite: e.rewrite.into(),
+                    reads: e.reads.into(),
+                    lock: e.lock.to_owned(),
+                    blocks: e.blocks.to_owned(),
+                    also_locks: Vec::new(),
+                    rows: match e.rows {
+                        Some(count) => Rows::Estimated { count },
+                        None => Rows::Unknown {
+                            reason: e.rows_unknown.unwrap_or_else(|| {
+                                "no catalog row estimate is available".to_owned()
+                            }),
+                        },
                     },
-                    reads: match e.reads {
-                        pg::Reads::EveryRow => Reads::EveryRow,
-                        pg::Reads::Nothing => Reads::Nothing,
-                        pg::Reads::Unknown(reason) => Reads::Unknown { reason },
-                    },
+                });
+            }
+            CostReport::Available {
+                engine: "sqlserver",
+                changes,
+            }
+        }
+        Driver::Postgres => {
+            use pbps_pg::estimate as pg;
+            let mut estimates = pg::planned_estimates(cs).into_iter().peekable();
+            let mut changes = Vec::with_capacity(cs.changes.len());
+            for change_index in 0..cs.changes.len() {
+                let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index)
+                else {
+                    changes.push(ChangeCost::Unavailable {
+                        change_index,
+                        reason: "operational_cost has no measurement for this PostgreSQL change"
+                            .to_owned(),
+                    });
+                    continue;
+                };
+                if let Err(error) = pg::against(conn, &mut e).await {
+                    changes.push(ChangeCost::Unavailable {
+                        change_index,
+                        reason: format!(
+                            "operational_cost could not read PostgreSQL catalog context: {error}"
+                        ),
+                    });
+                    continue;
+                }
+                changes.push(ChangeCost::Available {
+                    change_index,
+                    about: e.about,
+                    table: e.table.to_string(),
+                    rewrite: e.rewrite.into(),
+                    reads: e.reads.into(),
                     lock: e.lock.to_string(),
                     blocks: e.lock.blocks().to_owned(),
                     also_locks: e.also_locks.iter().map(ToString::to_string).collect(),
@@ -99,12 +144,17 @@ pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::C
                         Some(pg::Rows::Estimated(count)) => Rows::Estimated { count },
                         Some(pg::Rows::NeverAnalyzed) => Rows::NeverAnalyzed,
                         None => Rows::Unknown {
-                            reason: e.rows_unknown.unwrap_or_else(|| "no catalog row estimate is available".to_owned()),
+                            reason: e.rows_unknown.unwrap_or_else(|| {
+                                "no catalog row estimate is available".to_owned()
+                            }),
                         },
                     },
                 });
             }
-            CostReport::Available { engine: "postgres", changes }
+            CostReport::Available {
+                engine: "postgres",
+                changes,
+            }
         }
     }
 }

@@ -54,6 +54,28 @@ pub enum Reads {
     Unknown { reason: String },
 }
 
+impl From<pbps_dialect::estimate::Rewrite> for Rewrite {
+    fn from(value: pbps_dialect::estimate::Rewrite) -> Self {
+        use pbps_dialect::estimate::Rewrite as Work;
+        match value {
+            Work::Yes => Self::Yes,
+            Work::No => Self::No,
+            Work::Unknown(reason) => Self::Unknown { reason },
+        }
+    }
+}
+
+impl From<pbps_dialect::estimate::Reads> for Reads {
+    fn from(value: pbps_dialect::estimate::Reads) -> Self {
+        use pbps_dialect::estimate::Reads as Work;
+        match value {
+            Work::EveryRow => Self::EveryRow,
+            Work::Nothing => Self::Nothing,
+            Work::Unknown(reason) => Self::Unknown { reason },
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Rows {

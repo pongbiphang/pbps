@@ -13450,6 +13450,114 @@ fn a_declared_unreadable_trigger_is_never_recorded_or_planned_over() {
 
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn sql_server_cost_reports_row_work_without_changing_the_saved_plan_or_gate() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let own = OwnDatabase::new(&server, "cost255");
+    let d = Demo::new("cost255");
+    let ok = |o: Output| {
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        o
+    };
+    d.table(
+        "table: dbo.t\ncolumns:\n  i: {type: int}\n  w: {type: varchar(5)}\n  n: {type: int}\n",
+    );
+    ok(d.run(&["plan"]));
+    d.commit();
+    ok(d.run(&["bootstrap", "--db", own.connection()]));
+    on_server(
+        own.connection(),
+        "INSERT dbo.t VALUES (1,'one',1),(2,'two',2),(3,'tri',3)",
+    );
+    d.table("table: dbo.t\ncolumns:\n  i: {type: bigint}\n  w: {type: varchar(10)}\n  n: {type: int, nullable: false}\n");
+    let offline = ok(d.run(&["plan", "--format", "json"]));
+    let offline: serde_json::Value = serde_json::from_str(&stdout(&offline)).unwrap();
+    assert!(offline["data"].get("cost").is_none());
+    d.commit();
+    let artifact = d.root.join("deployment.json");
+    for compressed in [false, true] {
+        if compressed {
+            on_server(
+                own.connection(),
+                "ALTER TABLE dbo.t REBUILD WITH(DATA_COMPRESSION=ROW)",
+            );
+        }
+        let out = ok(d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--format",
+            "json",
+            "--out",
+            artifact.to_str().unwrap(),
+        ]));
+        envelope_matches_schema(
+            &jsonschema::validator_for(&envelope_schema()).unwrap(),
+            "plan",
+            &out,
+        );
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        let cost = &report["data"]["cost"];
+        assert_eq!(cost["status"], "available");
+        assert_eq!(cost["engine"], "sqlserver");
+        let saved_text = std::fs::read_to_string(&artifact).unwrap();
+        let saved: pbps_model::SavedPlan = serde_json::from_str(&saved_text).unwrap();
+        let saved_json: serde_json::Value = serde_json::from_str(&saved_text).unwrap();
+        assert!(saved_json.get("cost").is_none());
+        let costs = cost["changes"].as_array().unwrap();
+        assert_eq!(costs.len(), 3);
+        assert_eq!(costs.len(), saved.changes.changes.len());
+        for (index, change) in saved.changes.changes.iter().enumerate() {
+            let c = &costs[index];
+            assert_eq!(c["change_index"], index);
+            assert_eq!(c["status"], "available");
+            assert_eq!(c["rows"]["count"], 3);
+            assert_eq!(c["lock"], "Sch-M");
+            assert_eq!(c["blocks"], "reads and writes");
+            let rewrites =
+                if let pbps_model::Change::AlterColumnType { column, .. } = &change.change {
+                    match column.name.as_str() {
+                        "i" => !compressed,
+                        "w" => false,
+                        other => panic!("unexpected column {other}"),
+                    }
+                } else {
+                    assert!(matches!(
+                        change.change,
+                        pbps_model::Change::AlterColumnNullability { .. }
+                    ));
+                    true
+                };
+            assert_eq!(c["rewrite"]["value"], if rewrites { "yes" } else { "no" });
+            assert_eq!(
+                c["reads"]["value"],
+                if rewrites { "every_row" } else { "nothing" }
+            );
+            if rewrites {
+                assert!(c["about"].as_str().unwrap().contains("in-place"));
+            }
+        }
+        assert_eq!(
+            saved.changes.risks(),
+            [pbps_model::RiskClass::NotNull].into_iter().collect()
+        );
+        let human = stdout(&ok(d.run(&["plan", "--db", own.connection()])));
+        assert!(human.contains("in-place row updates") && human.contains("approximately 3"));
+        let applied = d.run(&[
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            artifact.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&artifact),
+        ]);
+        assert_ne!(code(&applied), 0);
+        assert!(stderr(&applied).contains("--allow"), "{}", stderr(&applied));
+    }
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
     let own = OwnDatabase::new(&server, "plan-json");
@@ -13528,7 +13636,7 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
         cost["reason"]
             .as_str()
             .unwrap()
-            .contains("not been measured")
+            .contains("column type and nullability changes")
     );
     envelope_matches_schema(
         &jsonschema::validator_for(&envelope_schema()).unwrap(),
@@ -13536,7 +13644,7 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
         &o,
     );
     let human = stdout(&assert_ok(d.run(&["plan", "--db", own.connection()])));
-    assert!(human.contains("operational_cost is not implemented for SQL Server"));
+    assert!(human.contains("this plan contains neither"));
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert_eq!(saved.changes.changes.len(), 1);
