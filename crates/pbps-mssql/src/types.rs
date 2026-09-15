@@ -695,6 +695,20 @@ fn safe_if(cond: bool) -> TypeChangeRisk {
 mod tests {
     use super::*;
 
+    include!("../tests/support/estimate_types.rs");
+
+    #[test]
+    fn every_catalogue_type_has_a_live_cost_measurement() {
+        for (name, _) in CATALOGUE {
+            assert!(
+                ESTIMATE_TYPES
+                    .iter()
+                    .any(|(declared, _)| ty(declared).base == *name),
+                "{name} is missing from the live operational-cost matrix"
+            );
+        }
+    }
+
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
     }

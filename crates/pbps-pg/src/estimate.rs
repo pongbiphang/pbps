@@ -61,26 +61,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_db::{Conn, DbError};
 use pbps_model::{Change, ChangeSet, ColumnType, Strategy, TableName};
 
-/// Whether the statement rebuilds the table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Rewrite {
-    /// The table is rebuilt: every row is written again, and the space the old
-    /// copy holds is needed alongside it until the statement commits.
-    Yes,
-    /// A catalog change only.
-    No,
-    /// Not a function of the declaration alone. The reason is the answer.
-    Unknown(String),
-}
-
-/// Whether the statement reads every row, which is a separate question from
-/// whether it rewrites them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reads {
-    EveryRow,
-    Nothing,
-    Unknown(String),
-}
+// Preserve this engine's public entry points while sharing only the questions
+// both measured implementations answer. PostgreSQL's Yes still replaces the
+// table's storage; SQL Server's Yes can be an in-place row-update operation.
+pub use pbps_dialect::estimate::{Reads, Rewrite};
 
 /// The lock the statement takes on the table, in the engine's own words.
 ///

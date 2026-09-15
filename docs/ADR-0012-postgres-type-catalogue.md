@@ -2,8 +2,9 @@
 
 - Status: accepted and built. The catalogue landed with Phase 5 step 2
   (Amendment 1) and §3's estimate with step 9 (Amendment 2); the PostgreSQL
-  live suite re-measures both.
-- Date: 2026-09-05, amended 2026-09-10
+  live suite re-measures both. Amendment 3 adds SQL Server's column estimates
+  and live catalogue measurements.
+- Date: 2026-09-05, amended 2026-09-15
 - Related: docs/SPEC.md §7.2, §11.2, §12, 14.1 (the P1 estimate row);
   [ADR-0003](ADR-0003-execution-strategy.md);
   [ADR-0009](ADR-0009-postgres-modules.md);
@@ -23,7 +24,9 @@ on 2026-09-05. Rewrites were detected by comparing `pg_class.relfilenode` either
 side of the statement, which is the engine's own answer to "was this table
 rebuilt", not a proxy for it.
 
-**No SQL Server measurements were taken for this document.** Nothing below
+**No SQL Server measurements were taken for the original design.** Amendment 3
+adds that engine's measurements; the original sections and their Limits below
+retain the evidence available when they were written. Nothing in those sections
 claims anything about SQL Server's costs; where the contrast would matter it is
 named as an open question rather than asserted.
 
@@ -499,6 +502,67 @@ largest table in the database.
 `int -> bigint` is metadata-only there remains the open question the Limits
 section records; this step measured one engine and says so.
 
+## Amendment 3 — SQL Server row work, measured before sharing the answer (#255)
+
+Measured on SQL Server 2025 RTM-CU8, 17.0.4075.5, Express, using the live suite's
+digest-pinned image, on 2026-09-15. All 32 catalogue base types were represented
+by 56 declarations, including length, `max`, decimal storage/scale and temporal
+precision boundaries. Every ordered pair was attempted on empty and populated
+heaps, uncompressed and row-compressed. A second pass used NULL data. Refused
+conversions remain refusals in the results, never metadata-only answers.
+
+The observations answer the original Limits question, but also change the
+question worth sharing:
+
+| Change/context | Row-update path | Observation |
+|---|---|---|
+| Uncompressed `int -> bigint` | every row | With one row, page count and heap ID both remain unchanged despite the update |
+| ROW/PAGE-compressed `int -> bigint` | none | Log volume stays independent of row count |
+| Uncompressed `decimal(10,2) -> decimal(12,2)` | every row | Some values produce no extra log bytes, although the table is scanned and every row updated |
+| Bounded `varchar(5) -> varchar(10)` | none | This does not extend to `varchar(5) -> varchar(max)` |
+| `NULL -> NOT NULL`, even with a free type widening | every row | SQL Server takes an update path, unlike PostgreSQL's validation-only scan |
+
+No accepted catalogue case replaced the heap/allocation-unit ID. Log growth
+changed between NULL and non-NULL samples in 64 cases; the row-update and scan
+paths agreed in every comparable case. **Page counts, allocation IDs and log
+volume alone cannot identify SQL Server's row work.** The live test reads
+`sys.dm_db_index_operational_stats` before and after the operation, requires
+either zero updates/scans or one update per row and a scan, and checks the
+counterexample log/allocation observations alongside those counters. Those
+diagnostic permissions are required only by the test, not by connected planning.
+
+The same paths were checked on heaps and clustered rowstore tables, with
+NONE/ROW/PAGE compression and all four source/target nullability combinations.
+Every accepted offline ALTER held `Sch-M`. The boundary test includes oversized
+row refusals, the `sysname` storage alias, legacy LOB conversions and spatial
+types: even restating `geography` or `geometry` takes the update path.
+
+**Decision.** Share `Rewrite` and `Reads` in `pbps-dialect::estimate`.
+`Rewrite::Yes` describes the row-rewrite operation: PostgreSQL replaces storage,
+whereas SQL Server can update in place and skip writing unchanged physical
+bytes. It is not a promise of a second table copy or an estimate of disk space.
+`Reads` remains independent. The SQL Server description names in-place updates;
+existing JSON values and PostgreSQL results remain unchanged. Engine-specific
+locks, catalog provenance and row-count semantics do not move into a generic
+estimate framework (DECISIONS 488).
+
+**Scope.** SQL Server's connected estimate covers offline column type and
+nullability changes on the measured version's ordinary, single-partition
+rowstore tables. It reads compression and approximate row counts from catalog
+views. ONLINE, other engine versions, special storage, and column index or
+constraint context return explicit unknowns. Catalog dependencies are not
+projected through preceding drops: that uncertainty is kept visible instead of
+duplicating the planner in the estimate. Newly created or previously retyped
+identities have no measured future storage; original names are preserved across
+table and column renames. Missing or unreadable catalog context is never zero
+rows or a cheap operation. Other change kinds remain unmeasured.
+
+`crates/pbps-mssql/tests/support/estimate.rs` re-measures the catalogue, storage
+boundaries, lock and log controls, and connected identity/uncertainty behavior.
+PostgreSQL retains its own `relfilenode` matrix. CLI tests verify the existing
+JSON schema, catalog row counts, compression-dependent answers, and unchanged
+saved-plan and approval behavior. Cost remains outside correctness risk.
+
 ## Placement
 
 The catalogue landed in Phase 5 step 2 (#77); the estimate landed in step 9
@@ -506,4 +570,5 @@ The catalogue landed in Phase 5 step 2 (#77); the estimate landed in step 9
 of cost from correctness risk was recorded before either implementation, so
 adding rewrite measurements did not change the approval classes. Amendments 1
 and 2 and the Limits section distinguish later live evidence from the original
-spike and preserve unknown costs, including SQL Server's unmeasured estimate.
+spike. Amendment 3 adds SQL Server's measured column estimates while keeping
+unmeasured operations and storage context explicit.

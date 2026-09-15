@@ -32,6 +32,7 @@ pub mod catalog;
 pub mod doctor;
 pub mod edition;
 pub mod emit;
+pub mod estimate;
 pub mod ident;
 pub mod impact;
 pub mod introspect;

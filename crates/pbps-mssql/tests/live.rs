@@ -32,6 +32,9 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+#[path = "support/estimate.rs"]
+mod estimate_tests;
+
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn an_authorized_migration_connection_failure_does_not_claim_missing_rights() {

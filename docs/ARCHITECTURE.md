@@ -14,7 +14,8 @@ pbps-load      YAML -> model; the only crate that may depend on serde-saphyr
 pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL. Also owns
                the managed-set scope and observed identity
 pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
-               probes. Connection-bound work is free async fns in the dialect
+               probes, shared operational row-work answers. Connection-bound
+               work is free async fns in the dialect
                crate, not trait methods; pbps-cli::engine routes to them
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a change becomes SQL), catalog introspection,
@@ -41,8 +42,8 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 ```
 
 - Only `pbps-db` and the engine modules that take a `Conn` (`catalog`, `state`,
-  `impact`, `doctor`, `edition` on SQL Server; `catalog`, `state`, `impact`,
-  `doctor`, `roles`, `modules`, `data_triggers`, `staged` on PostgreSQL) are async; the CLI `block_on`s
+  `impact`, `doctor`, `edition`, `estimate` on SQL Server; `catalog`, `state`, `impact`,
+  `doctor`, `roles`, `modules`, `data_triggers`, `staged`, `estimate` on PostgreSQL) are async; the CLI `block_on`s
   them per command, through `engine`.
 - Two places in `pbps-cli` name an engine to *choose* it: `dialect_for` (the
   pure `Dialect`) and `db::driver_for` (the driver). `engine` names both to
