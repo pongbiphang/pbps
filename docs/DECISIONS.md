@@ -12453,6 +12453,13 @@ SPEC is in sync with all of these.
      Ordinary output omits the verifier; protected invocation still supplies
      the human-approved `--checksum`. Unknown or overly broad access refuses,
      without silently changing grants or replacing the approval mechanism.
+     Pre-feature timeline readers can expose the checksum despite an unsupported
+     state version. #594 separately owns the ledger/legacy-access design and
+     compatibility tests; its acceptance, implementation and passing tests are
+     mandatory before confidential resolver publication/apply/recording is
+     enabled. Version metadata or new-client redaction cannot waive that gate.
+     This decision selects no physical ledger migration or credential transition
+     and preserves ordinary-plan behavior and explicit SHA-256 approval.
      Before source transfer, qualify and enforce engine/platform controls over
      server logging, intermediaries, container capture/forwarding and disposable
      source-bearing storage. Every resolver control/evidence exchange, including

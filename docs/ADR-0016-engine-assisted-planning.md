@@ -494,9 +494,12 @@ checksum consumer before the feature can publish a plan, not just `plan.json`:
   boundary must hold before the checksum enters those paths; an `apply` check
   after process creation cannot undo an argument leak. An integration that
   cannot provide that boundary cannot run a confidential plan.
-- The existing ledger `plan_checksum` and any snapshot copies remain the audit
-  record. Before publication and again before apply DDL, establish that ledger
-  readers and the applicable database audit/log/export paths meet the same
+- The checksum and any snapshot copies retain their audit role. The existing
+  ledger `plan_checksum` projection continues to serve ordinary plans; the
+  physical projection and compatibility transition for confidential values
+  require the separate legacy-reader design below. Before publication and
+  again before apply DDL, establish that ledger readers and the applicable
+  database audit/log/export paths meet the same
   authorization requirement. CLI redaction is not a substitute for protecting
   direct database reads. Unknown or broader exposure refuses the confidential
   operation; pbps does not silently change pre-existing grants or audit policy.
@@ -504,6 +507,23 @@ checksum consumer before the feature can publish a plan, not just `plan.json`:
   metadata; do not require the original plan file to recover it later.
   `status`, state/history/list/show/export, diagnostics and ledger fan-out must
   propagate the classification or omit the verifier from ordinary output.
+
+**Legacy-reader protection is a blocking delivery dependency, not a metadata
+promise.** Pre-feature timeline readers can project `plan_checksum` without
+reading `state_json` and retain it even for an unsupported state version.
+Adding versioned classification or redaction to new clients does not constrain
+those readers. [#594](https://github.com/pongbiphang/pbps/issues/594) must separately
+design, implement and test an enforceable ledger projection/storage or
+legacy-access compatibility boundary, including snapshot copies, fallback
+queries and direct readers on both engines. This ADR chooses no physical layout,
+migration protocol or credential transition. Until that follow-up is accepted,
+implemented and passes its compatibility tests, confidential resolver-plan
+publication, application and recording remain disabled. A warning, operator
+assertion, format bump or installation of a newer client cannot waive the gate;
+do not strip required evidence or put a confidential verifier into a legacy-readable
+projection to bypass it. Ordinary plans, previews and environment discovery keep
+their existing scope. The explicit approved SHA-256 remains the approval/audit
+value; deferring its protected storage design does not introduce a new token.
 
 The implementation must qualify this end-to-end propagation, including failure
 paths, before enabling confidential resolver artifacts. Historical records that
@@ -836,6 +856,13 @@ protection under test is removed.
 3. **SQL Server resolver:** shared infrastructure, but a separately designed
    binding adapter and real SQL Server tests before connected planning can use
    its evidence. PostgreSQL tests do not qualify it.
+
+Confidential resolver artifacts in either binding stage additionally depend on
+the completed legacy-reader boundary in decision 5/#594. Its tests must run
+pre-feature clients, unsupported-version and restricted-column readers, direct
+reads and snapshot/fallback paths, with negative controls for verifier exposure
+and for publication/apply attempted before the gate is satisfied. Environment
+support and non-confidential paths do not claim that this dependency is complete.
 
 This supersedes ADR-0009's blanket exclusion of a scratch engine from connected
 planning only for the new resolver path. It does not change that ADR's

@@ -124,6 +124,12 @@ Delivery is split into three stages:
 3. SQL Server binding resolution after its own design and live-engine tests,
    reusing the shared infrastructure rather than PostgreSQL binding semantics.
 
+Confidential resolver-plan publication/apply is blocked on the separate
+legacy-reader protection design, implementation and compatibility tests in
+[#594](https://github.com/pongbiphang/pbps/issues/594). A format/classification
+change alone does not protect old timeline readers. This PR selects no ledger
+migration or access-transition architecture; ordinary paths remain unchanged.
+
 Neither a suggested Docker image nor a successful preview is deployment proof.
 Runtime/dynamic-SQL analysis, automatic custom-image synthesis, snapshot-derived
 deployable plans and resolver-backed staged apply remain outside this scope.

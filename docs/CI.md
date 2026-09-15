@@ -115,6 +115,11 @@ compute a replacement approval automatically. Explicit `--checksum` approval
 remains, and the launch boundary must be private before that value reaches
 arguments. These are future delivery requirements, not a claim that the current
 templates implement them or a change to existing ordinary-plan behavior.
+Confidential resolver publication/apply also remains disabled until the
+legacy-reader compatibility design in
+[#594](https://github.com/pongbiphang/pbps/issues/594) is accepted, implemented
+and passes its compatibility tests.
+Upgrading the pipeline's binary alone does not qualify older history readers.
 
 **The connection string has no space in it, on purpose.** `UID=u` is the alias
 for `User Id=u`; both are accepted, and only the first can be masked on GitLab,

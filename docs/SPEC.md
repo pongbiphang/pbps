@@ -941,6 +941,14 @@ Readers must propagate the classification or omit confidential verifiers from
 ordinary output; an unknown historical classification is not proof of publicity.
 Proven legacy formats without this evidence retain ordinary-plan handling.
 
+Pre-feature timeline readers can still expose the existing checksum projection
+without accepting a new state format. Versioned metadata alone is insufficient.
+[#594](https://github.com/pongbiphang/pbps/issues/594) must separately establish
+and test the ledger/legacy-access compatibility boundary before confidential
+resolver plans may be published, applied or recorded. This is a hard delivery
+prerequisite, not a warning or a claim that old readers already refuse. No
+physical ledger layout or migration protocol is selected here (ADR-0016).
+
 The **whole snapshot** is stored rather than a delta or a checksum: drift
 detection can then compare in full, the snapshot doubles as a backup, and it can
 answer "what did this table look like three months ago?". `pbps state prune --keep
@@ -1344,6 +1352,9 @@ shell traces receive the checksum. Publication and pre-apply checks refuse
 unknown ledger/audit protection; no automatic grant changes or alternate
 approval token are introduced. These consumers must be qualified before enabling
 confidential resolver artifacts; existing ordinary plans keep their behavior.
+This includes the blocking legacy-reader design, implementation and compatibility
+tests tracked in §8.1/#594; a newer client or format label alone does not enable
+the confidential path.
 
 #### 9.3.3 Resolver environment discovery (accepted, not implemented)
 
