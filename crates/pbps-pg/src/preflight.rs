@@ -142,6 +142,12 @@ use pbps_model::{Cell, Change, ChangeSet, ColumnRef, RowKey, TableName, Value};
 use crate::emit::{qualified, value_literal};
 use crate::quote;
 
+/// Keep large counts reportable in the runner's i32 result column. Clamp while
+/// the aggregate is still wide, before the cast could turn it into unchecked.
+fn saturated_count(expression: &str) -> String {
+    format!("LEAST({expression}, {})::int", i32::MAX)
+}
+
 /// The columns of the foreign key the generated statement is being built for,
 /// with their names on the child side (`c`) and the parent side (`rc`).
 ///
@@ -837,8 +843,8 @@ fn counting_expression(r: &Referencing<'_>) -> String {
         exclusion,
         arrival,
     } = r;
-    format!(
-        "LEAST(COALESCE((SELECT pg_catalog.sum(\n           \
+    saturated_count(&format!(
+        "COALESCE((SELECT pg_catalog.sum(\n           \
            (pg_catalog.xpath('/row/n/text()',\n             \
              pg_catalog.query_to_xml(x.stmt, false, true, '')))[1]::text::bigint)\n    \
          FROM (SELECT 'SELECT (SELECT count(*) FROM '\n                 \
@@ -853,11 +859,11 @@ fn counting_expression(r: &Referencing<'_>) -> String {
                AND con.conparentid = 0\n                 \
                AND {DELETE_ACTION_FIRES}\n                 \
                AND con.confrelid = pg_catalog.to_regclass({})\n                 \
-               {gone}) AS x), 0), 2147483647)::int",
+               {gone}) AS x), 0)",
         value_literal(&format!(" AS ch WHERE EXISTS ({parent_row}")),
         tuple(STORED),
         value_literal(parent),
-    )
+    ))
 }
 
 /// The keys this plan takes away before its deletes run, as catalog filters.
@@ -1559,7 +1565,9 @@ fn hidden_children_probe(
              and {table}'s referenced columns, or take the policy off"
         ),
         format!(
-            "SELECT LEAST(((SELECT count(*)\n  \
+            "SELECT {} AS n;",
+            saturated_count(&format!(
+                "((SELECT count(*)\n  \
                FROM {} con\n  \
                JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid\n  \
                JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace\n \
@@ -1573,11 +1581,12 @@ fn hidden_children_probe(
                                   OR (NOT EXISTS (SELECT 1 {KEY_COLUMNS}\n   \
                                         AND NOT pg_catalog.has_column_privilege(con.conrelid, c.attnum, 'SELECT'))\n   \
                                       AND {row_keys}))))\n                 \
-                {}){}{parent_side}), 2147483647)::int AS n;",
-            "pg_catalog.pg_constraint",
-            value_literal(&parent),
-            gone_keys(names),
-            planned
+                {}){}{parent_side})",
+                "pg_catalog.pg_constraint",
+                value_literal(&parent),
+                gone_keys(names),
+                planned
+            ))
         ),
     ))
 }
@@ -1701,7 +1710,7 @@ fn unprobeable_probe(
             described.join(", ")
         ),
         format!(
-            "SELECT LEAST(count(*), 2147483647)::int AS n\n  \
+            "SELECT {} AS n\n  \
                FROM {} con\n \
               WHERE con.contype = 'f'\n   \
                 AND con.conparentid = 0\n   \
@@ -1709,6 +1718,7 @@ fn unprobeable_probe(
                 AND con.confrelid = pg_catalog.to_regclass({})\n   \
                 AND con.conrelid = pg_catalog.to_regclass({})\n   \
                 AND ({}){gone};",
+            saturated_count("count(*)"),
             "pg_catalog.pg_constraint",
             value_literal(&qualified(&stored.table)?),
             value_literal(&qualified(&stored_child)?),
@@ -2179,20 +2189,20 @@ fn planned_key_probes(
         let evaluated = |term: &str| -> String { assembled_int(term, &clauses) };
         let stored_rows = |body: &str| {
             let pieces = spliced(body);
-            format!(
-                "LEAST(COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',\n           \
+            saturated_count(&format!(
+                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',\n           \
                    pg_catalog.query_to_xml('SELECT (SELECT count(*) FROM '\n             \
                      || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END\n             \
                      || {} || ') AS n', false, true, '')))[1]::text::bigint\n    \
                  FROM pg_catalog.pg_class cl\n   \
-                WHERE cl.oid = pg_catalog.to_regclass({})), 0), 2147483647)::int",
+                WHERE cl.oid = pg_catalog.to_regclass({})), 0)",
                 {
                     let mut body_pieces = vec![value_literal(&format!("{child_sql} AS ch WHERE "))];
                     body_pieces.extend(pieces);
                     body_pieces.join(" || ")
                 },
                 value_literal(&child_sql)
-            )
+            ))
         };
 
         let moved = names.moved.get(&a.child);
@@ -2375,12 +2385,15 @@ fn planned_key_probes(
                 a.child
             ),
             format!(
-                "SELECT LEAST({}{arrivals}, 2147483647)::int AS n;",
-                if created {
-                    "0".to_owned()
-                } else {
-                    stored_rows(&format!("{as_backfilled}{surviving}{narrowing}"))
-                }
+                "SELECT {} AS n;",
+                saturated_count(&format!(
+                    "{}{arrivals}",
+                    if created {
+                        "0".to_owned()
+                    } else {
+                        stored_rows(&format!("{as_backfilled}{surviving}{narrowing}"))
+                    }
+                ))
             ),
         ));
         // A backfill no probe can evaluate reaches every stored row the plan
@@ -2440,7 +2453,7 @@ fn planned_key_probes(
                 a.child,
                 described.join(", ")
             ),
-            format!("SELECT LEAST({}, 2147483647)::int AS n;", terms.join(" + ")),
+            format!("SELECT {} AS n;", saturated_count(&terms.join(" + "))),
         ));
     }
     // A mark stands for a collation only inside a body the engine assembles;
@@ -2849,7 +2862,10 @@ fn keys(n: usize) -> Vec<String> {
 fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Probe {
     Probe::new(
         format!("existing NULLs in {column}, which NOT NULL would reject"),
-        format!("SELECT count(*)::int AS n FROM {from} WHERE {reads} IS NULL;"),
+        format!(
+            "SELECT {} AS n FROM {from} WHERE {reads} IS NULL;",
+            saturated_count("count(*)")
+        ),
     )
 }
 
@@ -2872,7 +2888,8 @@ fn duplicate_probe(from: &str, columns: &[String], description: &str) -> Probe {
         // The rows, not the groups: "3 duplicate groups" makes an operator do
         // arithmetic before they know how much data is involved.
         format!(
-            "SELECT COALESCE(sum(c), 0)::int AS n FROM (\n    SELECT count(*) AS c FROM {from}\n     WHERE {}\n     GROUP BY {list} HAVING count(*) > 1) AS dup;",
+            "SELECT {} AS n FROM (\n    SELECT count(*) AS c FROM {from}\n     WHERE {}\n     GROUP BY {list} HAVING count(*) > 1) AS dup;",
+            saturated_count("COALESCE(sum(c), 0)"),
             present.join(" AND ")
         ),
     )
@@ -2946,7 +2963,7 @@ fn build(
                     "rows that have no value for the new NOT NULL column {}",
                     table.column(name)
                 ),
-                format!("SELECT count(*)::int AS n FROM {};", qualified(&stored)?),
+                format!("SELECT {} AS n FROM {};", saturated_count("count(*)"), qualified(&stored)?),
             )])
         }
 
@@ -2996,7 +3013,8 @@ fn build(
                     // whatever the target, and counting it under "cannot
                     // become" would name the wrong problem.
                     format!(
-                        "SELECT count(*)::int AS n FROM {table}\n WHERE {quoted} IS NOT NULL AND ({fails});"
+                        "SELECT {} AS n FROM {table}\n WHERE {quoted} IS NOT NULL AND ({fails});",
+                        saturated_count("count(*)")
                     ),
                 ));
             }
@@ -3057,7 +3075,8 @@ fn build(
                 // ride in one. A column reference needs no path and is the
                 // common case; an unqualified *function* or table makes the
                 // probe unchecked, and the runner says so.
-                "SELECT count(*)::int AS n FROM {} WHERE NOT ({})",
+                "SELECT {} AS n FROM {} WHERE NOT ({})",
+                saturated_count("count(*)"),
                 qualified(&stored)?,
                 constraint.expression
             );
@@ -3292,8 +3311,8 @@ fn orphan_probe(
     Ok(vec![Probe::new(
         format!("rows with no matching parent for the new foreign key {name}"),
         format!(
-            "SELECT LEAST({}, 2147483647)::int AS n;",
-            assembled_int(&term, &clauses)
+            "SELECT {} AS n;",
+            saturated_count(&assembled_int(&term, &clauses))
         ),
     )])
 }
@@ -3605,6 +3624,150 @@ mod tests {
         ChangeSet {
             changes: changes.into_iter().map(planned).collect(),
         }
+    }
+
+    #[test]
+    fn every_counting_probe_saturates_before_narrowing_the_result() {
+        let table: TableName = "app.child".parse().unwrap();
+        let mut required = pbps_model::Column::new("integer".parse().unwrap());
+        required.nullable = false;
+        let cases = [
+            (
+                "required addition",
+                Change::AddColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: table.clone(),
+                    name: "new_value".into(),
+                    column: Box::new(required),
+                },
+            ),
+            (
+                "nullability",
+                Change::AlterColumnNullability {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: table.column("v"),
+                    ty: "integer".parse().unwrap(),
+                    to_nullable: false,
+                },
+            ),
+            (
+                "conversion and folded nullability",
+                Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: table.column("v"),
+                    from: "varchar(10)".parse().unwrap(),
+                    to: "varchar(3)".parse().unwrap(),
+                    from_nullable: true,
+                    to_nullable: false,
+                },
+            ),
+            (
+                "check",
+                Change::AddCheck {
+                    table: table.clone(),
+                    name: "positive".into(),
+                    constraint: pbps_model::CheckConstraint {
+                        expression: "v > 0".into(),
+                    },
+                },
+            ),
+            (
+                "unique constraint",
+                Change::AddUnique {
+                    table: table.clone(),
+                    name: "uq".into(),
+                    constraint: pbps_model::UniqueConstraint {
+                        columns: vec!["v".into()],
+                    },
+                },
+            ),
+            (
+                "unique index",
+                Change::AddIndex {
+                    table: table.clone(),
+                    name: "ix".into(),
+                    index: Box::new(pbps_model::Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            name: "v".into(),
+                            descending: false,
+                        }],
+                        include: vec![],
+                        unique: true,
+                        filter: None,
+                    }),
+                },
+            ),
+            (
+                "primary key",
+                Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(pbps_model::PrimaryKey {
+                        name: None,
+                        columns: vec!["v".into()],
+                    }),
+                },
+            ),
+            (
+                "foreign key",
+                Change::AddForeignKey {
+                    table: table.clone(),
+                    name: "fk".into(),
+                    constraint: Box::new(pbps_model::ForeignKey {
+                        columns: vec!["v".into()],
+                        references_table: "app.parent".parse().unwrap(),
+                        references_columns: vec!["v".into()],
+                        on_delete: pbps_model::ReferentialAction::NoAction,
+                        on_update: pbps_model::ReferentialAction::NoAction,
+                    }),
+                },
+            ),
+            ("pre-delete", deleting("app.parent", "old")),
+        ];
+        for (kind, change) in cases {
+            let report = super::probes(&set(vec![change]));
+            assert!(report.unchecked.is_empty(), "{kind}: {report:#?}");
+            let counts: Vec<_> = report
+                .probes
+                .iter()
+                .filter(|probe| probe.sql.contains("count(*)"))
+                .collect();
+            assert!(
+                !counts.is_empty(),
+                "{kind} must exercise its count builder: {report:#?}"
+            );
+            for probe in counts {
+                assert!(
+                    probe.sql.starts_with("SELECT LEAST("),
+                    "{kind}: {}",
+                    probe.sql
+                );
+                assert!(
+                    probe.sql.contains(", 2147483647)::int AS n"),
+                    "{kind}: {}",
+                    probe.sql
+                );
+                assert!(
+                    !probe.sql.contains("count(*)::int"),
+                    "{kind}: {}",
+                    probe.sql
+                );
+                assert!(
+                    !probe.sql.contains("COALESCE(sum(c), 0)::int"),
+                    "{kind}: {}",
+                    probe.sql
+                );
+            }
+        }
+        // Changes without a count question must not gain a synthetic probe.
+        assert!(super::probes(&set(vec![])).probes.is_empty());
+        let relaxed = super::probes(&set(vec![Change::AlterColumnNullability {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column("v"),
+            ty: "integer".parse().unwrap(),
+            to_nullable: true,
+        }]));
+        assert!(relaxed.probes.is_empty() && relaxed.unchecked.is_empty());
     }
 
     /// ADR-0013 §1, and the reason it is a test and not only a comment: the
