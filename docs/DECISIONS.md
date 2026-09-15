@@ -12489,3 +12489,33 @@ SPEC is in sync with all of these.
      image synthesis, snapshot-derived deployable plans and resolver-backed
      staged apply are deferred. Existing rebind protections remain until tested
      replacements land. No runtime format changes are made by this decision.
+
+491. **The source-default collation reminder follows emitted character columns.**
+     SQL Server's declarations do not carry the source database's default
+     collation. A bootstrap target with another default may therefore give
+     retained character columns different comparison semantics. Report the
+     source default once through `Pulled::onboarding_notices`, shown during
+     pull/init adoption, rather than attaching a managed-object limitation
+     or a routine connected-read warning (#432). The source default is
+     onboarding context, not evidence of drift: making it a limitation would
+     refuse valid deployments even when the target has the same default.
+
+     The reminder describes the emitted declarations, not every character
+     column present in the source catalog (#434). Match collated raw columns
+     by table object id and column name against the assembled, supported
+     table/column inventory. Temporal/history tables, tables retaining only
+     a period, computed columns, UDT columns and wholly omitted tables cannot
+     trigger it by themselves. System and ledger columns are outside that
+     inventory too. Their existing omission reports remain intact, as required
+     by DECISIONS 14 and 17. A retained character column with a non-default
+     collation still receives DECISIONS 443's separate column limitation and
+     triggers the source-default reminder; a numeric-only declaration does not.
+
+     This documents the reporting boundary, without modelling collation or
+     comparing the source and target defaults. Unit cases cover active
+     versioning, history, period-only tables and omitted columns with and
+     without a retained numeric sibling. Live SQL Server fixtures measure
+     character collations in omitted temporal/history, computed and alias
+     columns, retain their limitation reports, and introduce a supported
+     character column to require exactly one reminder. Existing matching and
+     non-matching column controls preserve DECISIONS 443's baseline.
