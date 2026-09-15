@@ -4,6 +4,7 @@
 > Language: Rust
 > Position: declarative database schema version control and deployment
 > Supported dialects: SQL Server and PostgreSQL
+> Accepted, not yet implemented: engine-assisted planning and resolver environment discovery (§9.3.2–9.3.3; ADR-0016)
 
 ---
 
@@ -22,7 +23,7 @@ Compared with what exists:
 |---|---|---|
 | Flyway | Imperative | Verbose; the current schema is never visible at a glance; refactoring is hard. A pure executor — review, approval and audit are left to the user. Since the Teams tier ended in 2025, undo, drift detection and code analysis are Enterprise-only |
 | Liquibase | Imperative | The same imperative gap, plus a changelog dialect to learn and a JVM to carry. Community moved to the Functional Source License in 5.0; policy checks, the drift report and the tamper-evident audit trail are in the paid Secure tier |
-| Atlas | Declarative | Rename intent exists (`renamed_from`, v0.22+) but matches by name with no identity anchor, so two branches' renames can merge silently; HCL learning curve; SQL Server, saved-plan approval and drift detection sit behind the Pro plan and its cloud registry, as do views, functions, triggers and grants. The declarative path expects a connection and approval in real time, which a disconnected environment cannot give |
+| Atlas | Declarative | Rename intent exists (`renamed_from`, v0.22+) but matches by name with no identity anchor, so two branches' renames can merge silently; HCL learning curve; SQL Server, saved-plan approval and drift detection sit behind the Pro plan and its cloud registry, as do views, functions, triggers and grants. Atlas supports [pre-planning](https://atlasgo.io/declarative/plan); pbps's distinction is file-based approval without a cloud registry, not the existence of a separate planning step |
 | Bytebase | Governance platform | Answers the review question well — 100+ built-in rules, an approval queue, background drift detection — but as **a server that is the source of truth**: policies, approvals and history live in its own database rather than in git, so it is a second system of record, and it is an operated service rather than a binary in the pipeline |
 | Skeema | Declarative | MySQL only |
 | DACPAC | Declarative | Tied to the SQL Server + Visual Studio ecosystem; rename and accidental-drop risk |
@@ -694,6 +695,17 @@ merged diff of every skipped version, and intent surviving in the ids file is
 precisely what makes that possible. A plan computed offline (without `--db`) is
 always a preview and is never accepted by `apply`.
 
+**Planned extension (§9.3.2):** target-aware planning may use an isolated
+resolver to determine desired bindings. The target remains the source of the
+current state; a resolver never promotes an offline or `--base` preview. Its
+evidence and target preconditions join the approved plan's checksum. `apply`
+checks those preconditions and executes the fixed plan, without starting a
+resolver or choosing new changes. Unknown required bindings prevent artifact
+creation before deployment approval, not at an interactive production prompt.
+For confidential resolver evidence, the plan checksum remains the approval and
+audit identifier but requires the protected display, invocation and persistence
+paths in §9.3.2/ADR-0016. This does not replace explicit `--checksum` approval.
+
 Because the change set is pinned by checksum, a coarse flag like `--allow` is
 safe: **what gets approved is exactly the plan approved at the deployment gate,
 no more and no less**. The flag lives in the CI configuration, in plain sight and
@@ -730,7 +742,8 @@ dependencies and prints a report:
 Dialect differences have to be absorbed by the abstraction: PostgreSQL stores
 resolved dependencies and `RENAME COLUMN` updates views automatically, whereas SQL
 Server stores definition text and `sp_rename` **does not**. That is exactly why
-`rename_impact` belongs on the `Dialect` trait.
+connected rename-impact queries belong in the engine crates, routed through
+`pbps-cli::engine` (see [ARCHITECTURE.md](ARCHITECTURE.md)).
 
 Impact outside the database — applications, reports, downstream ELT — is invisible
 to the tool; a checklist is printed and attached to the MR for a human to sign
@@ -869,6 +882,18 @@ section, not a defect; it is answered by pointing here.
 
 See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
 
+**Planned binding-evidence guard (§9.3.2):** a resolver-backed transactional
+plan additionally checks its recorded target prerequisites under the deployment
+lock before DDL, then rechecks its complete prerequisite manifest together with
+covered result bindings before committing and recording success. Closing
+prerequisites match the expected post-apply state sealed during planning,
+including legitimate changes from the approved plan; an unchanged old binding
+cannot excuse a failed prerequisite. A mismatch or unreadable required input
+rolls back the apply. This checks logical result bindings and versioned
+resolution-input fingerprints, not general managed-expression wording, and adds
+neither staged guarantees nor protection against arbitrary external writes after
+the last observation. Plans without resolver evidence retain the existing guard.
+
 ---
 
 ## 8. Environment state and drift
@@ -904,6 +929,25 @@ CREATE TABLE dbo.__pbps_lock (
     locked_at  DATETIME2(3)  NOT NULL
 );
 ```
+
+**Planned confidential resolver artifacts (§9.3.2):** their `plan_checksum`,
+including copies inside snapshots, remains confidential. Resolver publication
+and pre-apply qualification must cover direct ledger readers, database audit/log
+destinations and state/history exports; masking CLI output alone is insufficient.
+Refuse unknown or overly broad access rather than changing grants silently.
+Persist classification in versioned ledger/snapshot metadata with the checksum
+so later readers do not depend on retaining the original plan file.
+Readers must propagate the classification or omit confidential verifiers from
+ordinary output; an unknown historical classification is not proof of publicity.
+Proven legacy formats without this evidence retain ordinary-plan handling.
+
+Pre-feature timeline readers can still expose the existing checksum projection
+without accepting a new state format. Versioned metadata alone is insufficient.
+[#594](https://github.com/pongbiphang/pbps/issues/594) must separately establish
+and test the ledger/legacy-access compatibility boundary before confidential
+resolver plans may be published, applied or recorded. This is a hard delivery
+prerequisite, not a warning or a claim that old readers already refuse. No
+physical ledger layout or migration protocol is selected here (ADR-0016).
 
 The **whole snapshot** is stored rather than a delta or a checksum: drift
 detection can then compare in full, the snapshot doubles as a backup, and it can
@@ -991,6 +1035,13 @@ positive is rebuilding one constraint, which is cheap and idempotent. When a
 dev database is configured (see 9.3), the offline preview upgrades this
 best-effort normalization to a real-engine round-trip.
 
+Normalization and binding are separate questions. An unchanged declaration can
+bind differently when the surrounding namespace changes. The planned resolver
+of §9.3.2 compares target bindings with compiled desired bindings; it does not
+turn equal normalized text into proof of equal dependencies. Relevant unmanaged
+objects can be prerequisites of that comparison without becoming managed state
+or authorizing their modification.
+
 ### 8.3 Three ways out of drift
 
 | Path | Command | When |
@@ -1044,7 +1095,8 @@ each configured environment as well as the project.
 | `pbps doctor` | Whether this project — and each environment it can reach — is ready to deploy from (see 9.5) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
-directly, a developer can still do the whole job locally**.
+directly, a developer can still author intent and review a preview locally**.
+Producing an applyable artifact still requires the target as queried (§7.3).
 
 Baseline precedence:
 
@@ -1092,6 +1144,8 @@ every environment has been `snapshot`ted and drifts by nothing.
 
 ### 9.3 The dev database (optional)
 
+#### 9.3.1 Existing preview rehearsal
+
 `plan` accepts an optional throwaway engine for higher-fidelity previews:
 
 ```bash
@@ -1124,11 +1178,10 @@ catalog stores `([amount]>(0))` — and it is reported *with the stored form*,
 which is the one thing no offline normalization can produce and exactly what is
 needed to silence it.
 
-Three stances, all deliberate and all different from Atlas (whose dev database
-is required for many operations):
+Three stances govern this preview rehearsal:
 
-- **Always optional.** The air-gap promise of 9.1 stands: with no Docker the
-  preview degrades to lightweight normalization and says so.
+- **Always optional for previews.** The air-gap promise of 9.1 stands: with no
+  Docker the preview degrades to lightweight normalization and says so.
 - **A dev-database-verified plan is still a preview.** Applyable plans come
   only from `plan --db` against the target (7.3); the two-layer review model
   does not move.
@@ -1137,6 +1190,267 @@ is required for many operations):
   syntax and convergence, not edition capabilities — and the tool says so
   rather than pretending otherwise (see [ADR-0003](ADR-0003-execution-strategy.md)
   on edition-dependent risk).
+
+#### 9.3.2 Engine-assisted planning (accepted, not implemented)
+
+The new **resolver** answers a different question from preview rehearsal:
+whether desired declarations bind differently from the objects already on the
+target. [ADR-0016](ADR-0016-engine-assisted-planning.md) records the rationale,
+evidence contract, implementation boundaries and acceptance tests.
+
+- Plain `plan`, `plan --check` and offline `explain` keep their no-target,
+  no-resolver paths. Offline binding uncertainty is reported as unverified,
+  not as successful validation; it does not add a resolver requirement to
+  `--check` or change its intent-check contract.
+- Connected planning keeps a lightweight path where typed changes and catalog
+  facts determine the answer. For a covered creation-time binding question it
+  distinguishes **proven unaffected**, **proven to require rebuilding**, and
+  **requires resolution**. A name match or changed candidate set alone is not
+  proof of a changed binding. Conservative extra resolver requests are an
+  accepted boundary; implementing PostgreSQL's SQL semantics in the scanner
+  to eliminate them is not the design.
+- A required but unavailable, incompatible or inconclusive resolver prevents
+  writing either deployable plan or SQL output. Diagnostics name the object,
+  uncertainty and remedy. Neither risk approval nor warning suppression can
+  waive required resolution. Explicit qualification is a possible declaration
+  repair, not an unconditional bypass; it does not disambiguate every overload.
+  `depends_on` supplies dependency/order intent, not the engine's binding choice.
+- Resolver selection is explicit, through `--resolve-with` or project/environment
+  configuration. A configured resolver runs only when needed, without a prompt.
+  `--dev` remains preview-only and incompatible with a target; it is not an alias
+  for this new option. `--resolve-with` requires a target-aware plan and cannot
+  turn `--check` or a snapshot preview into a connected operation.
+
+Planned command shape (not accepted by the current binary):
+
+```bash
+pbps plan --env prod --resolve-with docker://postgres:18 \
+  --out plan.json --sql plan.sql
+```
+
+The image above is a candidate, not a claim of compatibility; §9.3.3 governs
+selection and validation. A dedicated scratch-server connection is also an
+accepted resolver source, with credentials referenced through an environment
+variable in configuration.
+
+**Current comes from the target; desired comes from compilation.** Read the
+target's actual bindings, then compile the desired namespace in isolation and
+compare logical identities (catalog class, schema, name, signature and relevant
+subobjects), never cross-database OIDs. Bootstrapping old declarations is not a
+substitute for current bindings: it can itself choose a different dependency.
+The desired namespace includes retained external prerequisites and relevant
+candidate sets, not just managed objects. Missing definitions, unreadable
+metadata or an environment that cannot be reproduced remain unresolved;
+fabricated stubs never constitute binding evidence.
+
+Resolved dependencies also become cross-kind ordering edges in the final typed
+plan: remove dependents before their old inputs, and establish desired inputs
+before recreating defaults, CHECKs, index predicates or modules. An arriving
+routine must precede the expression rebuild it enables, regardless of today's
+fixed change classes. Combine binding edges with structural, data, identity,
+authorization and restoration constraints; unsupported cycles refuse before
+publication, without hidden SQL or stubs. Seal the ordering evidence and final
+ordered ChangeSet before emission/approval; later consumers preserve it and
+apply never reorders or resolves dependencies. Existing non-resolver ordering
+is unchanged; ADR-0016 requires cross-kind real-engine acceptance cases.
+
+Only supported **creation-time, observable bindings** are covered. PostgreSQL
+coverage is to include views, SQL-standard function bodies and the supported
+routine-header/default/CHECK/index-predicate binding surfaces, with each class
+enabled only after real-engine tests. Empty dependency catalogs are not proof
+of no dependencies. Runtime-bound bodies and dynamic SQL keep their existing
+limitations and impact warnings; the resolver does not execute routines to
+discover those dependencies or claim whole-program validation.
+
+Compilation itself may evaluate expressions or extension code. Before resolver
+DDL or declaration transfer, verify and enforce an engine/platform containment
+profile for all compiled source, not just retained external definitions. Deny
+workload-initiated network access and access to host files, credentials, devices
+or runtime sockets outside the isolated run; allow only the bounded incoming
+pbps control channel and qualified runtime inputs/private disposable storage.
+Controls live outside SQL privileges and bound resource use and lifetime.
+Image acquisition is a separate trusted phase, not workload egress permission.
+Unknown controls refuse compilation; violations abort without evidence or a
+broader-access retry. Supplied scratch servers must meet the same contract.
+Required semantics that cannot run within it remain unsupported, not stubbed;
+ADR-0016 defines the trusted-runtime boundary and negative acceptance cases.
+
+All resolver DDL runs in isolated scratch resources, never on the target, even
+inside a savepoint. No production rows are copied. The saved plan pins the
+resolved changes, evidence scope, engine/environment fingerprint, target
+prerequisites (including candidate sets) and expected bindings. Initial capture,
+pre-publication recheck and apply verification each require a coherent
+engine-appropriate catalog view, not a mixture of independent reads. The
+planning capture is released before scratch work; the recheck gets a fresh
+snapshot. PostgreSQL follows DECISIONS 250 and 423 for owned and caller-owned
+reads respectively; non-snapshot inputs must be pinned/validated separately,
+and closing verification must see the apply's own DDL. Necessary target facts
+are rechecked before publishing the artifact and at apply; stale facts require
+replanning and renewed approval. `explain` can show this evidence
+and its limits offline. The first resolver-backed apply path is transactional
+only, with the additional guard in §7.6; staged restrictions remain unchanged.
+
+The evidence manifest pins every required external resolution input, not only
+routine/view source: include versioned canonical fingerprints of relevant
+cast, type, operator, extension and other class-specific properties, complete
+membership and required absence predicates. Logical identity alone cannot
+detect a semantic property change. Re-read those inputs coherently before
+publication/apply and in the closing post-DDL capture; mismatched, unreadable or
+unsupported properties refuse even when the managed checksum and existing
+bindings are unchanged. This includes
+evidence for deciding not to rebuild. Each adapter must qualify the completeness
+of its input coverage; a closing read of the old binding is not a substitute.
+Closing checks use a post-apply manifest derived and sealed from the approved
+typed changes, so planned candidate/grant changes are distinguished from drift.
+An unprovable transition refuses at planning, never becomes an apply-time choice.
+
+Retained external definitions are private, ephemeral reconstruction inputs,
+not additional source shipped to reviewers. Saved evidence records their
+logical identities and versioned canonical fingerprints, never the full text.
+Publication/apply checks re-read and hash the target definitions; a changed,
+missing or unreadable prerequisite cannot pass. `explain`, generated SQL,
+diagnostics and logs do not expose this external source or its confidential
+literals, including through engine errors. Before transmitting any external
+definition, verify and enforce a supported engine/platform safety profile for
+server statement/audit/error logging, intermediaries and container log capture
+or forwarding. Source-bearing diagnostics and scratch storage must stay private
+and disposable, without persistent/exported copies. Unknown or unenforceable
+controls refuse reconstruction before transfer; client redaction or deleting a
+scratch database is not proof, and pre-existing audit policies are not disabled
+to satisfy the check. ADR-0016 defines the trusted-runtime boundary and lifecycle.
+
+Every resolver qualification, target-evidence read (including apply rechecks),
+scratch DDL/control exchange and binding result requires authenticated integrity
+and peer validation, including managed-only analysis without private inputs.
+Qualify the actual channels before accepting evidence or sending declarations;
+private inputs additionally require confidentiality. The initial remote profile
+uses authenticated encryption for all these exchanges; plaintext, downgrade and
+disabled peer checks refuse. Local channels require qualified peer/host
+isolation, not merely localhost. Reconnects requalify and results stay bound to
+the actual peer/run. Private-source logging controls remain conditional.
+Existing unrelated connection defaults are unchanged; apply does not contact
+a resolver.
+
+The user's managed declarations and explicit deployment changes remain ordinary
+reviewable plan contents. Fingerprints can verify guesses of low-entropy
+confidential literals: omitting plaintext does not make an artifact secret-free.
+Plans with external-input fingerprints are conservatively classified
+confidential/secret-bearing, with a checksum-covered classification validated
+from their evidence. Publication requires qualified, access-controlled handling
+for recipients authorized for those inputs; public or unknown handling refuses.
+Those recipients can still review offline without production credentials.
+Ordinary diagnostics/logs/`explain` omit the digests and equivalent guessing
+verifiers; derived checksums inherit confidentiality where they expose the same
+oracle. Do not strip required evidence to produce a public applyable plan.
+ADR-0016 defines this boundary without a new approval or key-management service.
+The boundary includes the plan checksum's existing consumers: protected
+plan/explain/UI/CI output, a private launch environment for literal `--checksum`
+arguments, and qualified ledger/audit/history access. Ordinary explain output
+uses a placeholder rather than printing a confidential checksum or runnable
+approval command. The launch boundary must hold before process arguments or
+shell traces receive the checksum. Publication and pre-apply checks refuse
+unknown ledger/audit protection; no automatic grant changes or alternate
+approval token are introduced. These consumers must be qualified before enabling
+confidential resolver artifacts; existing ordinary plans keep their behavior.
+This includes the blocking legacy-reader design, implementation and compatibility
+tests tracked in §8.1/#594; a newer client or format label alone does not enable
+the confidential path.
+
+#### 9.3.3 Resolver environment discovery (accepted, not implemented)
+
+**PostgreSQL and SQL Server are both in scope from the first environment
+support stage.** Collect the target requirements read-only, suggest a candidate
+image or configured scratch server, and verify its actual compatibility before
+using it as evidence. A recommendation is not a verified environment.
+
+| Engine | Relevant environment facts |
+|---|---|
+| PostgreSQL | Server version; relevant extension versions and schemas; encoding, locale/collation provider and versions; effective deployment search paths and relevant settings |
+| SQL Server | Product version/build/update information; Edition and EngineEdition/product family; server and database collation; database compatibility level and relevant persisted/session settings |
+
+The collected profile is limited to facts required by the analysis. It is not a
+dump of all server settings, secrets or data. Unreadable, absent and unsupported
+facts remain distinct. Deployment settings, rather than an arbitrary login's
+defaults, govern compilation. Version equality alone proves neither extension
+availability nor semantic compatibility; SQL Server compatibility levels and
+edition limits remain independent checks. A Developer scratch run cannot waive
+target edition checks, and Azure products cannot be mapped to boxed SQL Server
+by comparing version numbers alone.
+
+Require qualified provenance/content identity for the actual target and resolver
+engine plus analysis-relevant loaded or required native libraries, including
+extensions and parser hooks. Matching reported versions or catalog fingerprints
+do not establish equivalence between vendor-patched or locally rebuilt binaries.
+Accept identical qualified content or a versioned, real-engine-tested mapping
+for the identified builds and analysis scope; unknown identity or unmeasured
+differences refuse. Read-only runtime/provisioning evidence must establish the
+actual backend's loaded/required content, not merely files on disk or a candidate
+image digest. Seal identities and the compatibility rule in the evidence manifest,
+maintain scratch stability and recheck target executable prerequisites at every
+capture, including publication and both apply captures. No new target agent,
+binary copying, host scan or attestation service is introduced; inadequate
+hosted-product evidence remains an explicit unsupported case (ADR-0016).
+
+Compatibility includes the effective deployment authorization context, not
+merely the introspection or scratch administrator's login. Capture and reproduce
+the relevant roles/principals, memberships, ownership, schema/object privileges
+and effective path/default-schema visibility at each covered deployment
+statement, including relevant typed authorization changes. Use private run-local
+principals without production authentication material; setup privileges cannot
+stand in for deployment privileges. Seal and recheck the relevant authorization
+inputs before publication and against the actual apply session before DDL.
+Unsupported or unreadable context refuses evidence. ADR-0016 requires separate
+engine-specific qualification; this does not add target privilege management.
+
+Candidate suggestions use known official images or team-configured trusted
+images/registries. Selecting one does not promise that every production build,
+extension, platform or hosted product has a matching image. No general-purpose
+image search or automatic custom-image assembly is required. When there is no
+verified candidate, list the missing conditions and accept a suitable dedicated
+scratch server instead; never silently downgrade required compatibility.
+
+Merely connecting to production does not download or start anything. After
+explicit resolver opt-in, acquisition follows a configured pull policy, supports
+preloaded images/internal registries and records the actual image digest and
+platform. The container runs on the pbps host/CI runner, not on production.
+The resolver must be outside the target PostgreSQL cluster or SQL Server
+instance, not merely in another database. Before any scratch DDL or external
+source transfer, use qualified read-only identity and provisioning/endpoint
+evidence to prove separation; different names, credentials or connection URLs
+are insufficient. Reject the target instance/cluster and unknown or ambiguous
+identity; reconnects/failovers must requalify. Never use target-side writes to
+prove identity. Scratch credentials are separate from production credentials,
+and cleanup is restricted to resources created for that run. Air-gapped
+operation needs no registry access when a suitable image or server is already
+available.
+
+Qualification is pinned to the actual backend/session, not its connection URL.
+Reconnects, failovers and pooled-session/runtime replacements invalidate all
+previous qualification and partial binding results. Recheck full environment
+compatibility, effective session settings, isolation and applicable source
+controls before further DDL/source transfer or evidence publication. Even a
+compatible replacement restarts complete compilation in fresh run-owned scratch
+resources; never combine old-session results with new-session evidence.
+
+The same connection can still observe in-place changes. Keep all relevant
+resolver settings, authorization and reconstructed namespace stable throughout
+qualification, compilation and evidence capture, using qualified exclusivity
+or mutation detection that catches every relevant intervening change, including
+change-and-restore. Initial/final equality alone is insufficient. Unexpected or
+unanswerable drift discards the entire run and refuses publication or restarts
+complete reconstruction after requalification. Supplied servers must qualify
+this property too; no long production transaction or DDL lock is introduced.
+
+`doctor` will reuse this profile for read-only requirements and candidate
+diagnostics; it does not pull images, create scratch databases or call a mere
+suggestion verified. Connected planning performs the provision-and-verify step
+only when resolution is required. Missing optional resolver configuration does
+not make ordinary deployment readiness fail.
+
+Delivery is split: **shared environment support for both engines, PostgreSQL
+binding resolution first, SQL Server binding resolution later** after its own
+design and live tests. Sharing lifecycle, evidence and reporting infrastructure
+does not share SQL binding semantics or enable an unimplemented adapter.
 
 ### 9.4 Docs, status, and drift alerting
 
@@ -1313,6 +1627,12 @@ It answers, from the file alone:
 | What exactly do I type? | the `apply` command, with the target, `--checksum`, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
 | What am I approving? | the plan checksum `apply` will recompute and require to match the explicit `--checksum` supplied by the deployment gate |
 
+**Planned confidential resolver plans (§9.3.2):** the literal checksum and exact
+approval command above require qualified protected output. Ordinary output
+shows the confidential classification and a placeholder, not the verifier or a
+command ready to execute. Authorized offline review still supplies the same
+checksum through a protected launch path; `apply` does not choose the approval.
+
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It
 stays optional because a command needing credentials is a command the reviewer
@@ -1374,6 +1694,14 @@ and writes neither a plan nor SQL artifact for those refusals. Warning-only
 policy/edition findings remain in the single JSON report with exit `0`, without
 duplicate human prose on stderr. Operational failures remain `unanswerable`
 and exit `1`. Human output keeps its existing diagnostics.
+
+For the planned resolver (§9.3.2), a known resolution requirement without a
+configured resolver, an observed incompatibility, or a known unsupported
+resolution case is a finding refusal (exit `2`). Connection, metadata-read,
+image-acquisition and startup failures are `unanswerable` (exit `1`). Both
+preserve existing output files and publish no partial deployment artifacts.
+Offline uncertainty remains advisory, and the same structured evidence and
+remedies appear in human and JSON reports.
 
 The envelope's own schema is published, generated from the types the commands
 serialize: `pbps schema --kind envelope`, and `schemas/envelope.schema.json` in
@@ -1508,6 +1836,13 @@ time CI merely follows instructions. `when: manual` is an approval gate, not a
 decision point — what the approver confirms is the deployment-layer plan.sql,
 the concrete plan for that specific environment (the two layers of 7.3).
 
+The planned resolver belongs in the **plan** job, before that approval. Teams
+may configure a trusted resolver there so uncertainty is resolved automatically;
+an unresolved requirement stops the job with a remedy. Neither the offline
+check/preview jobs nor the apply job gain a Docker requirement. A target change
+that invalidates saved resolution evidence sends the workflow back through plan
+and approval, never through an apply-time choice of a different migration.
+
 **Monitoring is a scheduled pipeline, not a service.** The same primitives
 compose into drift alerting with nothing hosted:
 
@@ -1569,14 +1904,13 @@ pub trait Dialect {
 
     /// ChangeSet -> executable statements
     fn emit(&self, change: &Change) -> Result<Vec<Statement>>;
-
-    fn introspect(&self, conn: &mut Conn) -> Result<Schema>;
-
-    /// The dependency impact of a rename (needed for MSSQL, nearly empty for PG)
-    fn rename_impact(&self, conn: &mut Conn, target: &RenameTarget)
-        -> Result<ImpactReport>;
 }
 ```
+
+This is a sketch of the pure dialect surface. Connection-bound introspection,
+rename-impact queries and the planned resolver operations are free async
+functions in the engine crates, routed by `pbps-cli::engine`, not methods on
+`Dialect`. [ARCHITECTURE.md](ARCHITECTURE.md) records the current boundaries.
 
 `pbps-model`, `pbps-diff` and `pbps-load` are entirely dialect-agnostic. Adding a
 database is work with clearly drawn boundaries.
@@ -1669,6 +2003,13 @@ dialect to test: on its first connection to a real server it found that the seam
 no process default to choose between them — which building, linting and
 `cargo deny` all reported as green (DECISIONS 228).
 
+The accepted resolver extension has additional, **not yet implemented**
+acceptance tests in [ADR-0016](ADR-0016-engine-assisted-planning.md#acceptance-tests).
+They must demonstrate correct binding decisions, refusal on missing evidence,
+artifact pinning and transactional result checks before existing rebind
+protections are retired. Environment tests cover both engines; PostgreSQL tests
+do not qualify the future SQL Server binding adapter.
+
 ---
 
 ## 12. Phases
@@ -1676,6 +2017,12 @@ no process default to choose between them — which building, linting and
 Phases 0-5 are complete as scoped; Phase 6 remains the next phase. Supported
 features and remaining limitations are tracked in [STATUS.md](STATUS.md) and
 the individual ADRs.
+
+**Accepted extension, not part of the completed Phase 5 claim:** §9.3.2–9.3.3
+and [ADR-0016](ADR-0016-engine-assisted-planning.md) add shared resolver
+environment support for both engines, followed by PostgreSQL binding resolution
+and then a separately validated SQL Server adapter. These are delivery stages,
+not a renumbering of the phases or a claim that the new commands already exist.
 
 | Phase | Contents | Value delivered |
 |---|---|---|

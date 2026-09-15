@@ -101,7 +101,25 @@ has no `url:` field for the same reason.
 | `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;UID=u;Password=p;TrustServerCertificate=true`. `UID=` rather than the more usual `User Id=`, because the space would stop GitLab masking it — see below. An **environment** secret / **protected** variable — see "Who can reach the credential" |
 | `PBPS_STAGING_URL` | the same, for staging | a separate account, with the same permissions |
 | `PBPS_PROD_URL` on `monitoring` | `verify`, `status` | the drift watch's copy. `verify` reads and writes nothing, so this one is a **read-only** account |
-| the plan's SHA-256 | `apply --checksum` | not a secret; it is the approval. A `workflow_dispatch` input on GitHub, a manual-job variable on GitLab — supplied by whoever approved, at the moment they approve |
+| the plan's SHA-256 | `apply --checksum` | the explicit approval, supplied by whoever approved at the moment they approve. Current ordinary plans use a `workflow_dispatch` input on GitHub or a manual-job variable on GitLab; future confidential resolver plans have the additional handling rule below |
+
+**Planned resolver artifacts are not automatically qualified by these templates.**
+[ADR-0016](ADR-0016-engine-assisted-planning.md) classifies external-input
+fingerprints and equivalent plan-checksum verifiers as confidential. Before
+enabling that future format, qualify artifact recipients, explain/approval
+output, workflow inputs and logs, process-argument/shell visibility, and target
+ledger/audit/history readers as one protected path. A masked variable alone
+does not protect arguments or database records. Refuse an unqualified path;
+do not print a confidential checksum into the ordinary summaries below or
+compute a replacement approval automatically. Explicit `--checksum` approval
+remains, and the launch boundary must be private before that value reaches
+arguments. These are future delivery requirements, not a claim that the current
+templates implement them or a change to existing ordinary-plan behavior.
+Confidential resolver publication/apply also remains disabled until the
+legacy-reader compatibility design in
+[#594](https://github.com/pongbiphang/pbps/issues/594) is accepted, implemented
+and passes its compatibility tests.
+Upgrading the pipeline's binary alone does not qualify older history readers.
 
 **The connection string has no space in it, on purpose.** `UID=u` is the alias
 for `User Id=u`; both are accepted, and only the first can be masked on GitLab,

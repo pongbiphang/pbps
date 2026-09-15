@@ -12364,3 +12364,128 @@ SPEC is in sync with all of these.
      guard holds its locks; ATTACH succeeds immediately after release. Restoring
      the old recursive regular-table lock makes the first concurrency assertion
      fail with lock timeout.
+
+490. **Engine-assisted planning is optional infrastructure, but required
+     evidence cannot be waived (accepted design; not implemented).**
+     [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+     and [ADR-0016](ADR-0016-engine-assisted-planning.md) keep offline previews
+     and the existing `--dev` rehearsal distinct from a future target-aware
+     `--resolve-with` path. Typed/catalog facts retain a lightweight path;
+     uncertain covered binding questions require an isolated engine before an
+     applyable artifact can be produced. Conservative extra resolver requests
+     are accepted instead of growing a SQL-semantic parser or treating every
+     candidate as a proven reason to rebuild.
+
+     Current bindings come from the target; desired bindings come from compiling
+     the desired namespace with its relevant external prerequisites. Old-YAML
+     bootstrap is not the current baseline, CREATE success is not complete
+     dependency proof, and empty catalogs are not proof of no dependencies.
+     Binding-derived edges order typed changes across object kinds: teardown
+     precedes removal of old inputs and desired inputs precede dependent rebuilds,
+     including routine-driven default/CHECK/index changes. Combine existing
+     structural/data/authorization constraints, refuse unsupported cycles before
+     publication, and seal the final order without hidden SQL. Apply and emitters
+     preserve that order; no runtime dependency choice or ordinary-plan reorder
+     is introduced.
+     Runtime/dynamic SQL retains its existing limits. All scratch DDL stays
+     outside the target instance/cluster, including when another database or
+     connection alias is supplied. Prove separation before scratch DDL or source
+     transfer with qualified read-only identity/provisioning evidence; unknown
+     identity refuses and reconnects/failovers requalify. No production rows or
+     target authentication material are copied.
+
+     DDL can execute expressions or extension code, so every resolver workload
+     also needs qualified execution containment before declaration transfer or
+     compilation. Deny outbound/external side effects and host-resource access
+     outside the run, with controls enforced outside SQL privileges and bounded
+     resources/lifetime. Trusted image acquisition is separate. Unknown controls
+     refuse; violations abort without evidence, stubs or broader-access retries.
+     This qualifies the planned resolver lifecycle, not a new sandbox service.
+
+     Environment discovery, trusted candidate suggestions and actual
+     compatibility checks cover both PostgreSQL and SQL Server first. A Docker
+     tag is a candidate, not verified compatibility; acquisition is explicit,
+     lazy, policy-bound and usable with local images/internal registries.
+     Reported versions are not executable identity: qualify actual engine and
+     relevant loaded/required native-library provenance and content on both
+     sides. Only matching content or a measured, versioned mapping of identified
+     builds establishes compatibility; unknown provenance or same-version local
+     patches cannot pass by catalog equality. Seal these prerequisites and
+     validate them through capture, reconnect, scratch stability and apply;
+     qualified read-only deployment evidence introduces no target agent, host
+     scan, binary copying or new attestation service.
+     Qualification belongs to the actual backend/session: reconnects, failovers
+     and replacements recheck full compatibility, effective settings and safety
+     controls before proceeding, not only instance separation. Discard partial
+     evidence and restart complete compilation in fresh scratch resources even
+     when the replacement qualifies; do not mix results across sessions.
+     Same-connection qualification also needs stable analysis inputs throughout
+     compilation: enforce exclusivity or detect all relevant intervening
+     mutations, including change-and-restore, and discard an invalidated run.
+     Initial/final equality alone is not evidence of stability; these protections
+     apply to scratch, not a new production lock or coordination service.
+     Compile under a reproduced, qualified deployment authorization context,
+     not the setup administrator's or introspection login's privileges. Pin and
+     recheck relevant roles, ownership and effective grants/path visibility,
+     including the actual apply context, without copying authentication material
+     or introducing target privilege management.
+     PostgreSQL binding resolution lands first; SQL Server follows its own
+     design and live tests, sharing infrastructure but not binding semantics.
+
+     Saved evidence joins the checksum and includes relevant target candidate
+     sets, environment prerequisites and expected bindings. The versioned input
+     manifest fingerprints every required external resolution property, including
+     casts, types, operators and extensions, with complete membership/absence
+     predicates. Identity-only or routine/view-source-only checks are insufficient;
+     an unchanged old binding cannot waive a changed premise for not rebuilding.
+     Retained external definitions stay private and ephemeral for reconstruction;
+     only logical identities and versioned canonical fingerprints enter saved
+     evidence.
+     These fingerprints can verify guesses of confidential literals; no plaintext
+     is not a secret-free promise. Plans carrying external-input fingerprints
+     require a validated confidential classification and protected publication
+     to authorized recipients, with no verifiers in ordinary diagnostics or
+     public derivative checksums. Unknown/public handling refuses; this does
+     not introduce an approval service or key-management system.
+     The same classification covers the existing SHA-256 approval/audit value:
+     qualify literal display, command/CI/process-argument paths and ledger,
+     snapshot and history readers before enabling these resolver artifacts.
+     Ordinary output omits the verifier; protected invocation still supplies
+     the human-approved `--checksum`. Unknown or overly broad access refuses,
+     without silently changing grants or replacing the approval mechanism.
+     Pre-feature timeline readers can expose the checksum despite an unsupported
+     state version. #594 separately owns the ledger/legacy-access design and
+     compatibility tests; its acceptance, implementation and passing tests are
+     mandatory before confidential resolver publication/apply/recording is
+     enabled. Version metadata or new-client redaction cannot waive that gate.
+     This decision selects no physical ledger migration or credential transition
+     and preserves ordinary-plan behavior and explicit SHA-256 approval.
+     Before source transfer, qualify and enforce engine/platform controls over
+     server logging, intermediaries, container capture/forwarding and disposable
+     source-bearing storage. Every resolver control/evidence exchange, including
+     managed-only analysis and target rechecks, requires authenticated integrity
+     and peer validation; private inputs additionally need confidentiality.
+     Initial remote profiles use authenticated encryption throughout; localhost
+     or unverified TLS is not proof. Private-source logging remains conditional.
+     Unknown controls refuse reconstruction; client
+     redaction and database deletion are not proof of no retained copies. Do not
+     disable pre-existing audit policies. ADR-0016 defines the trusted-runtime
+     boundary and required negative tests for both isolation and source handling.
+     Publication/apply re-read and fingerprint every required input's properties
+     and recheck membership/absence without exporting private source or properties
+     through artifacts or diagnostics. Recheck before
+     artifact publication and under the deployment lock before apply; changed
+     premises require replanning and approval. Each capture must itself be
+     coherent; repeated mixed-time reads are not evidence. PostgreSQL inherits
+     the owned/caller-owned read boundaries of 250 and 423, with non-snapshot
+     inputs handled explicitly. Initial result verification is transactional:
+     the closing coherent capture checks both bindings and the complete input
+     manifest against sealed post-apply expectations, including approved typed
+     changes, before commit/success. A retained old binding cannot waive changed
+     prerequisites visible at that boundary; failed checks roll back, without
+     promising to prevent later external writes. Apply never starts a
+     resolver or changes the approved migration. Preview-only rehearsal, human
+     intent, risk gates and the single-deployer limits remain intact; arbitrary
+     image synthesis, snapshot-derived deployable plans and resolver-backed
+     staged apply are deferred. Existing rebind protections remain until tested
+     replacements land. No runtime format changes are made by this decision.

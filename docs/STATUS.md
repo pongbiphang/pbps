@@ -99,6 +99,43 @@ say whether what the emitter sent is what comes back.
 
 ## Open items
 
+### Engine-assisted planning and resolver environments
+
+**Accepted design; not implemented.** [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
+the existing SQL Server `--dev` rehearsal, while adding a distinct future
+`--resolve-with` path for target-aware planning. The current command lists above
+do not include that option; existing version/edition diagnostics are not yet
+the new environment compatibility or binding-evidence system.
+
+Delivery is split into three stages:
+
+1. Environment discovery, trusted candidate suggestions and compatibility
+   checks for **both PostgreSQL and SQL Server**, with explicit, policy-bound
+   acquisition and support for local images or dedicated scratch servers.
+   Resolver qualification includes target instance/cluster separation and
+   pre-compilation execution containment, plus pre-transfer source-handling
+   controls for logging and disposable storage, and qualified actual executable
+   identities or tested build mappings rather than reported versions alone;
+   unknown safety prerequisites refuse the affected resolver operation.
+2. PostgreSQL creation-time binding resolution, checksum-pinned evidence and
+   transactional apply/result guards; uncertainty prevents deployable output
+   unless resolved, while proven cases retain the lightweight path.
+3. SQL Server binding resolution after its own design and live-engine tests,
+   reusing the shared infrastructure rather than PostgreSQL binding semantics.
+
+Confidential resolver-plan publication/apply is blocked on the separate
+legacy-reader protection design, implementation and compatibility tests in
+[#594](https://github.com/pongbiphang/pbps/issues/594). A format/classification
+change alone does not protect old timeline readers. This PR selects no ledger
+migration or access-transition architecture; ordinary paths remain unchanged.
+
+Neither a suggested Docker image nor a successful preview is deployment proof.
+Runtime/dynamic-SQL analysis, automatic custom-image synthesis, snapshot-derived
+deployable plans and resolver-backed staged apply remain outside this scope.
+Existing rebind protections remain until their replacements pass ADR-0016's
+acceptance tests; this decision does not resolve PR #542 by documentation.
+
 ### Artifact format versions reset at the first release
 
 The plan file, the state snapshot and the published editor schemas are each
