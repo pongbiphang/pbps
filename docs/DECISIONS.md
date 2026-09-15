@@ -12364,3 +12364,39 @@ SPEC is in sync with all of these.
      guard holds its locks; ATTACH succeeds immediately after release. Restoring
      the old recursive regular-table lock makes the first concurrency assertion
      fail with lock timeout.
+
+490. **Engine-assisted planning is optional infrastructure, but required
+     evidence cannot be waived (accepted design; not implemented).**
+     [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+     and [ADR-0016](ADR-0016-engine-assisted-planning.md) keep offline previews
+     and the existing `--dev` rehearsal distinct from a future target-aware
+     `--resolve-with` path. Typed/catalog facts retain a lightweight path;
+     uncertain covered binding questions require an isolated engine before an
+     applyable artifact can be produced. Conservative extra resolver requests
+     are accepted instead of growing a SQL-semantic parser or treating every
+     candidate as a proven reason to rebuild.
+
+     Current bindings come from the target; desired bindings come from compiling
+     the desired namespace with its relevant external prerequisites. Old-YAML
+     bootstrap is not the current baseline, CREATE success is not complete
+     dependency proof, and empty catalogs are not proof of no dependencies.
+     Runtime/dynamic SQL retains its existing limits. All scratch DDL stays
+     outside the target; no production rows or credentials are copied.
+
+     Environment discovery, trusted candidate suggestions and actual
+     compatibility checks cover both PostgreSQL and SQL Server first. A Docker
+     tag is a candidate, not verified compatibility; acquisition is explicit,
+     lazy, policy-bound and usable with local images/internal registries.
+     PostgreSQL binding resolution lands first; SQL Server follows its own
+     design and live tests, sharing infrastructure but not binding semantics.
+
+     Saved evidence joins the checksum and includes relevant target candidate
+     sets, environment prerequisites and expected bindings. Recheck before
+     artifact publication and under the deployment lock before apply; changed
+     premises require replanning and approval. Initial result verification is
+     transactional, before commit and success recording. Apply never starts a
+     resolver or changes the approved migration. Preview-only rehearsal, human
+     intent, risk gates and the single-deployer limits remain intact; arbitrary
+     image synthesis, snapshot-derived deployable plans and resolver-backed
+     staged apply are deferred. Existing rebind protections remain until tested
+     replacements land. No runtime format changes are made by this decision.

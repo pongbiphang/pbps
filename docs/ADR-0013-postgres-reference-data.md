@@ -1154,6 +1154,13 @@ reads deterministic would have made them depend on the declarations.
   which is a write and is refused three paragraphs above. A rule whose two
   sides cannot both be computed is not a rule.
 
+  **Accepted amendment, not implemented:**
+  [ADR-0016](ADR-0016-engine-assisted-planning.md) adds the missing desired side
+  through isolated engine-assisted planning, without DDL on the target or SQL
+  parsing in pbps. Current bindings still come directly from the target, never
+  from bootstrapping old declarations. Its coverage is creation-time observable
+  bindings, not the runtime-bound and dynamic-SQL cases excluded above.
+
   **What can be computed is the shadow.** For each recorded dependency, ask the
   catalog whether a same-named object now sits *earlier* on the write path than
   the schema the object actually bound to. No parsing, no DDL, no write —
@@ -1321,7 +1328,12 @@ reads deterministic would have made them depend on the declarations.
   argument types, for routines and operators. The test is one comparison: the
   set recorded at creation against the set the catalog will hold when this
   plan has run. **Any difference rebuilds the object once**, and the rebuild
-  re-records the set. **Measured**, both captures above are a gained member:
+  re-records the set. This is the current conservative rule. For supported
+  binding questions, ADR-0016's planned replacement treats a candidate change
+  as a reason to resolve, not proof that rebuilding is necessary. A compatible
+  resolver supplies actual desired bindings; an unresolved required question
+  prevents deployable output. The existing protection stays until that path is
+  implemented and tested. **Measured**, both captures above are a gained member:
 
   ```
   the same-named routines on the effective path, at creation -> now:

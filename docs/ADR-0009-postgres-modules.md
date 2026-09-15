@@ -843,8 +843,18 @@ that close every other route were each established separately:
 |---|---|
 | Ask the target, inside a savepoint | Planning must not execute DDL on the environment it plans against: the attempt takes DDL locks and fires event triggers whose effects do not roll back |
 | Carry both shapes and let `apply` choose | SPEC §7.3 — *"what gets approved is exactly the plan approved at the deployment gate"*. Replace and rebuild are not two spellings of one change; a checksum over "one of these two" pins nothing a reviewer read |
-| Ask a dev database from `plan --db` | `crates/pbps-cli/src/main.rs:642` refuses `--dev` with `--db`, and SPEC §9.3 gives the reason — *"a rehearsal answers a preview's question, and combining the two would invite a dev-verified plan to be read as a target-verified one"*, plus *"a dev-database-verified plan is still a preview"* |
+| Ask a dev database from `plan --db` | The existing `--dev` preview rehearsal is refused with a target (SPEC §9.3.1). The accepted, unimplemented resolver below is a separate path, not permission to promote a preview or choose replace versus rebuild at apply time |
 | Read the answer out of the declaration | The deciding facts — a view's column list, a function's return type — live inside `definition`, which §8.2 says this tool does not parse |
+
+**Accepted amendment, not implemented:**
+[ADR-0016](ADR-0016-engine-assisted-planning.md) admits an isolated resolver in
+target-aware planning to compare actual current and desired bindings. It
+supersedes the blanket exclusion of scratch-engine assistance, not this
+section's drop-and-create strategy for PostgreSQL module changes. The target
+remains read-only during planning, restore obligations and unmanaged-dependent
+gates remain, and the approved plan never contains an apply-time choice.
+Existing `--dev` remains preview-only. Until the resolver's coverage and live
+tests land, the current planning rules described here remain in force.
 
 Two earlier versions of this section took the first two routes in turn. This one
 takes none of them, and the reason it costs less than it appears to is §3's own

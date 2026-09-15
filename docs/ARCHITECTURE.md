@@ -58,6 +58,27 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)
   for the boundary correction.
 
+## Planned engine-assisted planning
+
+[ADR-0016](ADR-0016-engine-assisted-planning.md) and
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+are accepted design, not implemented capabilities. They preserve the boundaries
+above: CLI owns resolver lifecycle and reporting; the engine crates own
+environment queries, compatibility rules, scratch DDL and binding extraction;
+`pbps-db` owns transport, not SQL or provisioning. Connected work continues
+through `pbps-cli::engine`, not I/O on the pure `Dialect` trait or in the differ.
+
+Shared deterministic plan evidence belongs beside semantic `Schema`, never in
+its equality or as driver-specific types. The final typed ChangeSet remains the
+only input to deployment SQL emission. Target reads and scratch writes use
+separate connections and credentials, and `apply` checks saved prerequisites
+without invoking the resolver or adding changes after approval.
+
+Environment discovery/recommendation/compatibility covers PostgreSQL and SQL
+Server first. Binding adapters follow separately: PostgreSQL first, SQL Server
+after engine-specific design and live tests. An unimplemented capability is
+reported explicitly, never supplied by another engine's assumptions.
+
 ## Inviolable constraints
 
 Keep these numbers stable: other documents cite them. Where a rule already
