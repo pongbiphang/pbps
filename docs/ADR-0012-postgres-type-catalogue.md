@@ -10,8 +10,8 @@
   [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md)
 
 The type catalogue is the largest single piece of a dialect — SPEC §12 counts it
-first among the things a second engine re-implements. This decides its shape
-before it is written, and it turned up one finding that is not about types at
+first among the things a second engine re-implements. This decided its shape
+before it was written, and it turned up one finding that is not about types at
 all: **`TypeChangeRisk` answers its question correctly and PostgreSQL proves the
 question is not the only one worth asking.**
 
@@ -296,8 +296,8 @@ replacement is a declared transformation with its own ADR, not a flag.
 | `pbps-model` | **Nothing, because arrays are out.** `ColumnType` holds a base and arguments, which fits every spelling this catalogue admits. Admitting `text[]` would need a dimension in `ColumnType` — a real model change, and the reason arrays wait (§1). Nothing *for this document's decisions*: [ADR-0013](ADR-0013-postgres-reference-data.md) does add three `StateSnapshot` fields |
 | `pbps-dialect` | `normalize_type`'s contract, already named in [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) Amendment 3 |
 | `TypeChangeRisk` | **Nothing** — §2 |
-| The estimate (14.1 P1) | Gains its first measured dataset and a stated boundary — §3 |
-| `pbps-postgres` | The catalogue itself, which does not exist yet |
+| The estimate (14.1 P1) | Implemented in `pbps-pg::estimate` with the measured dataset and boundary in §3 and Amendment 2; connected reporting is described in STATUS (DECISIONS 430) |
+| `pbps-pg` | The implemented type catalogue; Amendment 1 records what building it added |
 
 ## Ruled out
 
@@ -501,7 +501,9 @@ section records; this step measured one engine and says so.
 
 ## Placement
 
-Phase 5, with the catalogue. The one item that should not wait for it is §3's
-boundary: if the estimate is built before it is written down, the pressure to
-put "this rewrites the table" into the risk class will be at its highest exactly
-when nobody has measured what that costs.
+The catalogue landed in Phase 5 step 2 (#77); the estimate landed in step 9
+(#84), with connected reporting added by #305 (DECISIONS 430). §3's separation
+of cost from correctness risk was recorded before either implementation, so
+adding rewrite measurements did not change the approval classes. Amendments 1
+and 2 and the Limits section distinguish later live evidence from the original
+spike and preserve unknown costs, including SQL Server's unmeasured estimate.

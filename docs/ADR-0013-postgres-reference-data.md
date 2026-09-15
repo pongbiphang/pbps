@@ -1,6 +1,10 @@
 # ADR-0013: Reference data on PostgreSQL — the collision ADR-0004 never recorded
 
-- Status: proposed. Phase 5 design; nothing is built.
+- Status: accepted; scoped reference-data support landed in Phase 5 step 7
+  (#82), probes in step 9 (#84), and the CLI path in step 10 (#85). This remains
+  a design record, not a claim that every proposed mechanism shipped unchanged.
+  The implementation notes below and Limits distinguish delivered behavior,
+  later measurements and deferred work.
 - Date: 2026-09-05
 - Related: docs/SPEC.md §1.3, §7.5, §8.2, §12;
   [ADR-0004](ADR-0004-reference-data.md), which this revisits;
@@ -1561,7 +1565,24 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 ## What this changes
 
-| | |
+The table preserves the design obligations and their rationale. The recorded
+module text, expressions and bindings landed together in
+`StateSnapshot::declared` (DECISIONS 207), and `pbps-pg` implements the row
+reader, emitter, probes and connected collision checks. Two delivery boundaries
+matter when reading the original proposal:
+
+- The setting-sensitive structural-default canonicalization described in the
+  table remains [#173](https://github.com/pongbiphang/pbps/issues/173); the
+  reference-data and framing fixtures do not establish that every typed
+  default is resolved into the saved plan. The bare-literal refusal and
+  supported emitted forms are recorded in DECISIONS 261.
+- The original three-exception write-setting proposal was superseded by the
+  framing measurements recorded in DECISIONS 267. The Limits section
+  names the temporal-expression fixture and what it actually measures.
+  Completion of Phase 5 does not close every binding or security follow-up;
+  [STATUS](STATUS.md) and the open issues retain those boundaries.
+
+| Design area | Decision and rationale (subject to the implementation notes above) |
 |---|---|
 | `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each with the **candidate set** visible at creation — the same-named objects of the same catalog class on the effective write path, by identity for routines and operators (§3); earlier versions carried two flags in its place, and the one that inferred qualification from a name was refuted by overloading; and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact — and so does a plain-literal default on a setting-sensitive column, emitted as the resolved typed spelling, because the DDL that types a literal is where a session reads it (§3); the **default probe is gone from the data path** — an omitted cell is refused over a non-literal default and spelled by the plan over a literal one, so `plan --db` evaluates no user code for a cell and `apply` has nothing to assert — while `plan --db` itself stays inside a `READ ONLY` transaction, because §9.1 makes it a preview; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
@@ -1610,9 +1631,13 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 ## Placement
 
-Phase 5, with the emitter and the probes. Nothing here needs to land sooner:
-§2's one candidate for being a live bug was measured and is not one.
+The declared-state fields landed during model preparation (DECISIONS 207–209).
+Phase 5 step 7 (#82) built the PostgreSQL reference-data path, step 9 (#84)
+added preflight probes, and step 10 (#85) connected them to the CLI. The Limits
+section names the production fixtures; the historical sequence and session
+experiments above retain their original scope. Deferred structural-default
+work (#173) is not made complete by those fixtures.
 
-One item is not Phase 5 work at all and should be fixed whenever SPEC §12 is
-next edited: that sentence claims a PostgreSQL collision is recorded in ADR-0004,
-and until this document existed, none was.
+SPEC §12 now points to this ADR for the PostgreSQL reference-data collision;
+the original claim that ADR-0004 already recorded it was corrected in the
+Phase 5 documentation follow-up (#301).

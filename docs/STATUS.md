@@ -332,9 +332,22 @@ disappears with the connection (DECISIONS 273). And a nullable primary key
 column. SQL Server refuses the table; measured, this engine
 accepts it and sets `NOT NULL` itself, so the declaration and the database
 disagree from the moment the table exists and the `DROP NOT NULL` that would put
-it back is refused for ever (DECISIONS 266). The rest of the other dialect's
-key-column checks are absent here and are issue #175 — they fail at the server,
-which is late but not silent.
+it back is refused for ever (DECISIONS 266).
+
+The structural validator subsequently landed in
+[PR #474](https://github.com/pongbiphang/pbps/pull/474) for #156, superseding
+[#175](https://github.com/pongbiphang/pbps/issues/175#issuecomment-5651660572).
+`Postgres::validate_table` now checks nonempty keys and existing local columns,
+repeated primary/unique columns, matching nonempty foreign-key lists, included
+column existence, and empty CHECK/filter expressions
+([DECISIONS 452](DECISIONS.md)). Its unit and emitted-DDL live matrix preserve
+PostgreSQL's legal repeated index/INCLUDE and local foreign-key columns.
+Index width and key-type eligibility remain target questions: server build
+limits and installed operator classes can make a declaration valid, so the
+offline validator does not infer them from stock PostgreSQL. Separate deferred
+FK checks remain: the column-count boundary in
+[#475](https://github.com/pongbiphang/pbps/issues/475) and repeated referenced
+columns in [#476](https://github.com/pongbiphang/pbps/issues/476).
 
 `CREATE TABLE` names `USING heap` rather than leaving the access method to
 `default_table_access_method`: the reader accepts only heap, so a table created

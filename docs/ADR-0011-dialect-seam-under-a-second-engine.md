@@ -1,6 +1,8 @@
 # ADR-0011: The dialect seam under a second engine — what Phase 0 got right, and three amendments
 
-- Status: proposed. Phase 5 design; nothing is built.
+- Status: accepted and implemented. The seam preparation (DECISIONS 193–195)
+  and Phase 5 step 1 (#75, DECISIONS 226–227) delivered the amendments. Placement
+  records the implemented scanner shape; Limits names its measured coverage.
 - Date: 2026-09-04
 - Related: docs/SPEC.md §11.2, §12; `crates/pbps-dialect/src/lib.rs`;
   [ADR-0009](ADR-0009-postgres-modules.md),
@@ -31,8 +33,9 @@ question for the **seam**: the `Dialect` trait and `Statement`, which is where a
 second engine actually lands, and which Phase 0 explicitly claims to have
 validated against PostgreSQL.
 
-That claim is written into the crate's own header, as a four-row table of "the
-four most easily missed differences [that] all fit". Three of the four hold. One
+At the time of the spike, that claim was written into the crate's header as a
+four-row table of "the four most easily missed differences [that] all fit".
+Three of the four hold. One
 is false, and the interesting part is that its **conclusion** is right while its
 **reason** is not — which is the more dangerous of the two ways to be wrong,
 because nothing downstream fails.
@@ -62,11 +65,12 @@ And, beyond the four, two more the trait already provides for:
 - **`CREATE INDEX CONCURRENTLY` refuses a transaction block** —
   `ERROR: CREATE INDEX CONCURRENTLY cannot run inside a transaction block`.
   `Statement::transactional` exists for exactly this, and ADR-0003's staged
-  apply is the machinery it feeds. PostgreSQL's `strategy: online` will map here.
+  apply is the machinery it feeds. PostgreSQL's `strategy: online` now maps here,
+  within the emitter's supported index shapes.
 
 ## Amendment 1: `Vec<Statement>` is right; its stated reason is false
 
-Two places say the same false thing:
+Two places originally said the same false thing (corrected as recorded below):
 
 ```rust
 //! | Type + nullability change | needs two statements | can be merged into one | `Dialect::emit` returns a `Vec` |
@@ -281,10 +285,9 @@ that pin the delivered amendments.
 
 ## Placement
 
-Phase 5, with the first PostgreSQL commits. None of the three is large; all
-three are the kind of thing that becomes expensive once a second dialect has
-been written against the wrong version. Amendment 1 and the nesting half of
-Amendment 2 landed ahead of the crate, in the seam-preparation PR
+The amendments landed before or with the first PostgreSQL commits, avoiding
+writing a second dialect against the wrong contract. Amendment 1 and the
+nesting half of Amendment 2 landed ahead of the crate, in the seam-preparation PR
 (DECISIONS 193–195). **The rest landed with Phase 5 step 1** (issue #75): the
 shared scanner takes each engine's lexis (DECISIONS 226) and `normalize_type`'s
 contract is on the trait with `serial` refused under it (DECISIONS 227). Both
