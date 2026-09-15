@@ -34,7 +34,7 @@ limitations and deferred findings. Two groups of commands:
 | `rename`, `rename-table`, `rename-role`, `drop`, `drop-table`, `drop-role` | Record the intent only a human can supply |
 | `docs` (`--format markdown\|html\|erd`) | Documentation and an ERD from the declarations |
 | `explain --plan` | What a saved plan does, why it needs approval, and the exact command that approves it |
-| `doctor` (`--env`) | Whether this project and its environments are ready to deploy from |
+| `doctor` (`--env` / `--db`, `--format json`) | Deployment readiness and advisory resolver environment discovery; no provisioning |
 | `schema` (`--kind declaration\|config`) | JSON Schema for editors, generated from the loader's own types |
 | `completions <shell>`, `man` | Shell completions and man pages |
 

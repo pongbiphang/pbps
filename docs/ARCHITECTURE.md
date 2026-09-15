@@ -42,8 +42,8 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 ```
 
 - Only `pbps-db` and the engine modules that take a `Conn` (`catalog`, `state`,
-  `impact`, `doctor`, `edition`, `estimate` on SQL Server; `catalog`, `state`, `impact`,
-  `doctor`, `roles`, `modules`, `data_triggers`, `staged`, `estimate` on PostgreSQL) are async; the CLI `block_on`s
+  `impact`, `doctor`, `edition`, `estimate`, `resolver` on SQL Server; `catalog`, `state`, `impact`,
+  `doctor`, `roles`, `modules`, `data_triggers`, `staged`, `estimate`, `resolver` on PostgreSQL) are async; the CLI `block_on`s
   them per command, through `engine`.
 - Two places in `pbps-cli` name an engine to *choose* it: `dialect_for` (the
   pure `Dialect`) and `db::driver_for` (the driver). `engine` names both to
@@ -62,7 +62,9 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 
 [ADR-0016](ADR-0016-engine-assisted-planning.md) and
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
-are accepted design, not implemented capabilities. They preserve the boundaries
+are accepted design; only initial read-only `doctor` environment discovery is
+implemented (#597). Resolver qualification, acquisition and binding evidence
+remain planned. The design preserves the boundaries
 above: CLI owns resolver lifecycle and reporting; the engine crates own
 environment queries, compatibility rules, scratch DDL and binding extraction;
 `pbps-db` owns transport, not SQL or provisioning. Connected work continues
@@ -86,6 +88,14 @@ Environment discovery/recommendation/compatibility covers PostgreSQL and SQL
 Server first. Binding adapters follow separately: PostgreSQL first, SQL Server
 after engine-specific design and live tests. An unimplemented capability is
 reported explicitly, never supplied by another engine's assumptions.
+
+The initial discovery report lives in `pbps-db::resolver`, alongside other
+connected report shapes. Its serialization/schema derives describe advisory
+observations, not persisted plan evidence. Engine `resolver::discover` functions
+own catalog SQL and candidate-family suggestions; CLI `engine` dispatches and
+`doctor` renders. Discovery has no verified state, provisions nothing and
+does not select dependencies. Its partial inventory cannot be reused as an
+ADR-0016 coherent evidence capture (DECISIONS 491).
 
 ## Inviolable constraints
 

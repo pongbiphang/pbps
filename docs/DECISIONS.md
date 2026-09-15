@@ -12519,3 +12519,32 @@ SPEC is in sync with all of these.
      columns, retain their limitation reports, and introduce a supported
      character column to require exactly one reminder. Existing matching and
      non-matching column controls preserve DECISIONS 443's baseline.
+
+492. **Ship advisory resolver discovery before qualification, without a
+     verified state.** The first bounded child of #595 (#597) adds catalog-only
+     environment observations and official image-family suggestions to `doctor`
+     on both engines. A separate `pbps-db::resolver::Discovery` report holds
+     these connected answers; engine crates own its SQL and candidate rules,
+     and CLI dispatch/reporting follows the existing seam. Serialization and
+     JSON Schema dependencies describe that shared report without duplicating
+     DTOs in CLI or moving transport/engine SQL into the domain model.
+     `DiscoveryCompatibility` can only express `Unverified`; these observations
+     cannot authorize resolver compilation or enter saved-plan evidence.
+     Discovery labels session settings as the introspection connection's, not
+     the future deployment context, and names the missing analysis-specific
+     build, authorization, compatibility, transport, isolation, containment and
+     stability qualification. The initial inventory is not a coherent evidence
+     capture or full prerequisite manifest (ADR-0016 decisions 4–5).
+
+     SQL NULL is `NotReported`, distinct from both an observed empty string and
+     an unknown qualification with its reason: metadata visibility and product
+     support can also produce NULL, so it cannot prove absence or compatibility.
+     An actual failed query stays unanswerable; missing optional qualification
+     stays advisory to ordinary readiness (SPEC §9.8 and §9.3.3). PostgreSQL
+     locale fields span the PostgreSQL 16/18 catalog spellings. SQL Server
+     suggestions require an explicitly known boxed product family and release;
+     hosted or unknown products do not borrow boxed version numbers. No image
+     tag certifies build, platform or target edition equivalence. Nothing is
+     provisioned or probed with DDL, and no source, fingerprints or credentials
+     are collected. The envelope gains optional fields; published schema set
+     11 archives that addition while envelope wire version 1 stays compatible.

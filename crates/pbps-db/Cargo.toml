@@ -13,6 +13,8 @@ pbps-model.workspace = true
 # dialect's, so this crate holds no engine SQL (ADR-0014 §2).
 pbps-dialect.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+schemars.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 # One driver per module, named nowhere else in the workspace: `tiberius` in

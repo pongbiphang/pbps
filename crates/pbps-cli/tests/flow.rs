@@ -20,6 +20,15 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/resolver_discovery.rs"]
+mod resolver_discovery;
+
+#[test]
+#[ignore = "needs live SQL Server; set PBPS_TEST_DB"]
+fn doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine() {
+    resolver_discovery::check(&std::env::var("PBPS_TEST_DB").unwrap(), "mssql");
+}
+
 struct Demo {
     /// The project directory: where `pbps.yml` is.
     dir: PathBuf,

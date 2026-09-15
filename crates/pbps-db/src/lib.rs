@@ -37,6 +37,7 @@ pub mod impact;
 pub mod ledger;
 mod mssql;
 mod postgres;
+pub mod resolver;
 
 pub use ledger::{
     LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineStaged, TimelineState,

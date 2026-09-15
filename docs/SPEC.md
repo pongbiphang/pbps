@@ -1356,7 +1356,27 @@ This includes the blocking legacy-reader design, implementation and compatibilit
 tests tracked in §8.1/#594; a newer client or format label alone does not enable
 the confidential path.
 
-#### 9.3.3 Resolver environment discovery (accepted, not implemented)
+#### 9.3.3 Resolver environment discovery (partial delivery)
+
+**Delivery status:** the initial read-only `doctor` subset is implemented
+(#597). Resolver selection, acquisition, compatibility qualification and
+binding evidence remain planned under #595; the requirements below still
+govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
+
+`pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
+database locale/encoding and installed extension metadata on PostgreSQL;
+product/build/edition, collations and compatibility level on SQL Server; and
+a bounded set of introspection-session settings on both. SQL NULL is reported
+as `not-reported` (absent, hidden or unsupported), not as a compatible empty
+value. A failed query is `resolver.discovery-unknown`, an unanswerable outcome.
+The report always labels compatibility `unverified`, names outstanding
+qualification requirements and only suggests a known official image family
+where the observed version/product permits one. It never contacts a registry,
+starts Docker or creates scratch resources. Missing resolver qualification
+does not fail ordinary deployment readiness. These observations are not a
+coherent evidence capture or a complete deployment requirement manifest;
+persisted module settings, per-object collations, executable identities and
+per-statement authorization still require the later analysis-specific readers.
 
 **PostgreSQL and SQL Server are both in scope from the first environment
 support stage.** Collect the target requirements read-only, suggest a candidate
@@ -1441,7 +1461,7 @@ unanswerable drift discards the entire run and refuses publication or restarts
 complete reconstruction after requalification. Supplied servers must qualify
 this property too; no long production transaction or DDL lock is introduced.
 
-`doctor` will reuse this profile for read-only requirements and candidate
+`doctor` will extend its initial inventory with this full profile for read-only requirements and candidate
 diagnostics; it does not pull images, create scratch databases or call a mere
 suggestion verified. Connected planning performs the provision-and-verify step
 only when resolution is required. Missing optional resolver configuration does

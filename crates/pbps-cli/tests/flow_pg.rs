@@ -18,6 +18,15 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/resolver_discovery.rs"]
+mod resolver_discovery;
+
+#[test]
+#[ignore = "needs live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine() {
+    resolver_discovery::check(&server(), "postgres");
+}
+
 fn server() -> String {
     std::env::var("PBPS_TEST_PG_DB")
         .expect("PBPS_TEST_PG_DB is not set; see scripts/live-tests-pg.sh")
