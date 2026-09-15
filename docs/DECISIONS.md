@@ -12399,6 +12399,11 @@ SPEC is in sync with all of these.
      compatibility checks cover both PostgreSQL and SQL Server first. A Docker
      tag is a candidate, not verified compatibility; acquisition is explicit,
      lazy, policy-bound and usable with local images/internal registries.
+     Qualification belongs to the actual backend/session: reconnects, failovers
+     and replacements recheck full compatibility, effective settings and safety
+     controls before proceeding, not only instance separation. Discard partial
+     evidence and restart complete compilation in fresh scratch resources even
+     when the replacement qualifies; do not mix results across sessions.
      PostgreSQL binding resolution lands first; SQL Server follows its own
      design and live tests, sharing infrastructure but not binding semantics.
 

@@ -186,6 +186,23 @@ scratch success cannot override them. Azure product versions are not boxed
 SQL Server version selectors, and a Linux container is not automatically
 equivalent to a deployment using platform-specific features.
 
+**Qualification belongs to the actual backend/session and analysis run, not
+the resolver URL.** Pin the concrete connection used for reconstruction and
+binding reads. A reconnect, failover, pooled-session replacement or runtime
+replacement invalidates its previous qualification and partial binding evidence;
+it is not transparent recovery. Before further scratch DDL, declaration
+transfer or evidence publication, re-establish instance separation, execution
+containment, applicable source-handling controls and the full engine-specific
+compatibility check on the replacement. Re-read version/product, extensions,
+collation and all other required environment facts, and establish and verify
+the effective deployment/session settings; do not inherit a "verified" result
+from the old connection. Mismatch or unknown requirements refuse the operation.
+Even a compatible replacement restarts complete reconstruction and compilation
+in fresh run-owned scratch resources, discarding old partial results rather
+than combining evidence across sessions. Publication must identify the backend
+and qualification that actually produced the complete evidence and retain the
+target-freshness recheck in decision 5.
+
 Suggest known official images or team-configured trusted images/registries;
 do not search arbitrary registries or automatically assemble custom images.
 Metadata can describe what is needed without identifying the production
@@ -455,6 +472,17 @@ protection under test is removed.
     negative control showing the sentinel is reachable when containment is
     removed in the test fixture. Compilation requiring a blocked effect is
     refused without stubs or a less restrictive retry.
+14. **`resolver_reconnect_requalifies_all_evidence` (planned):** replace a
+    qualified resolver connection with a separate backend that still passes
+    target-instance separation but differs in a required version, extension,
+    collation or effective session setting. Each mismatch or unknown fact must
+    refuse further DDL/source transfer and evidence publication; the old
+    qualification cannot pass. Cover failover and pooled-session replacement.
+    A compatible replacement must requalify all safety and compatibility inputs,
+    discard partial bindings and restart complete compilation in fresh scratch
+    resources; only the new backend's complete evidence may be sealed. Pin both
+    engines with supported runtime fixtures and a negative control that fails
+    when cached qualification or old partial bindings are reused.
 
 ## Delivery and supersession
 

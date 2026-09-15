@@ -1315,6 +1315,14 @@ and cleanup is restricted to resources created for that run. Air-gapped
 operation needs no registry access when a suitable image or server is already
 available.
 
+Qualification is pinned to the actual backend/session, not its connection URL.
+Reconnects, failovers and pooled-session/runtime replacements invalidate all
+previous qualification and partial binding results. Recheck full environment
+compatibility, effective session settings, isolation and applicable source
+controls before further DDL/source transfer or evidence publication. Even a
+compatible replacement restarts complete compilation in fresh run-owned scratch
+resources; never combine old-session results with new-session evidence.
+
 `doctor` will reuse this profile for read-only requirements and candidate
 diagnostics; it does not pull images, create scratch databases or call a mere
 suggestion verified. Connected planning performs the provision-and-verify step
