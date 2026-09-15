@@ -1,7 +1,10 @@
 # ADR-0014: The driver seam, tested — what a second driver actually costs `pbps-db`
 
-- Status: proposed. Phase 5 design. This does not revisit
-  [ADR-0007](ADR-0007-connection-strategy.md); it **tests one of its claims**.
+- Status: accepted; the seam amendments landed in DECISIONS 193–194, two
+  drivers behind `Conn` in Phase 5 step 1 (#75, DECISIONS 225), and the
+  connected CLI seam in step 10 (#85, DECISIONS 417–418). The original spike
+  tests one claim of [ADR-0007](ADR-0007-connection-strategy.md); later delivery
+  does not widen what that spike measured.
 - Date: 2026-09-05
 - Related: docs/SPEC.md §11.2, §11.3, §11.5, §12, open question 10;
   [architecture constraint 9](ARCHITECTURE.md#inviolable-constraints);
@@ -18,8 +21,8 @@ ADR-0007's fifth decision:
 > crate. That was built before the decision on purpose: the cost of being wrong
 > is what makes a decision hard to take, and this lowers it.
 
-That is a claim about a thing nobody has done. ADR-0007 set the standard for
-claims like it by running a spike for ADBC — and reporting honestly that the
+At the time, that was a claim about a thing nobody had done. ADR-0007 set the
+standard for claims like it by running a spike for ADBC — and reporting that the
 spike never reached the behavioural question, because the driver could not be
 obtained. **This one reached it.**
 
@@ -57,11 +60,12 @@ the first time.
 ## The verdict
 
 **The seam holds for the question this spike asked, which is narrower than the
-one Phase 5 needs to answer.**
+one Phase 5 subsequently answered.**
 
-The spike *replaced* one driver with another behind the same shape. Phase 5 has
-to *keep both*, selected per project — and that is not the same test. Measured
-by reading the code rather than by running it: `crates/pbps-cli/src/db.rs`'s
+The spike *replaced* one driver with another behind the same shape. Phase 5 had
+to *keep both*, selected per project — a different test. The following inventory
+is historical, read from the code at the time of the spike:
+`crates/pbps-cli/src/db.rs`'s
 `connect` returns the concrete `pbps_db::Conn`, and **21 functions in
 `pbps-mssql` take `&mut Conn` concretely**. A `tokio-postgres` client cannot
 appear behind that shape without an enum, a trait, a duplicated connected path,
@@ -75,13 +79,15 @@ So the honest verdict is in two parts:
   fundamentally different driver without changing a caller. That was the part
   most at risk, and it held.
 - **What it does not prove:** that two drivers coexist. The concrete `Conn` at
-  the CLI boundary is the seam's untested half, and the cost of the second
-  dialect includes making that boundary polymorphic.
+  the CLI boundary was the seam's untested half. Production subsequently added
+  driver dispatch within `Conn` (DECISIONS 225) and connected dispatch in
+  `pbps-cli::engine` (DECISIONS 417); the Limits section names tests of those
+  later paths, separately from this spike.
 
 With that correction, **it costs one signature *plus* a decision at the CLI
 boundary, and it makes one false statement in CLAUDE.md visible.**
 
-| Seam point | Second driver |
+| Seam point at the time of the spike | Spike result |
 |---|---|
 | `Row`, `try_get`, `try_get_at` | unchanged |
 | `FromColumn` blanket impl | unchanged in shape; NULL is expressed differently by the two drivers and the seam's own `Result<Option<Self>>` absorbs both |
@@ -226,12 +232,12 @@ never answered:   Some("ConnectTimeout")
 
 ## Ruled out
 
-- **Deciding *how* `Conn` becomes polymorphic** — enum, trait, or generics.
-  Premature with one real driver and one spike: the useful abstraction is the
-  one drawn from two implementations that both exist, which is ADR-0007's own
-  "the data-driven extraction waits for the second dialect", applied to itself.
-  What is *not* deferred, and what this document got wrong the first time, is
-  that the boundary has to change at all.
+- **Deciding *how* `Conn` becomes polymorphic in the spike** — enum, trait,
+  or generics. This was deferred until two implementations existed, following
+  ADR-0007's "the data-driven extraction waits for the second dialect".
+  DECISIONS 225 and 417 subsequently settled the production dispatch. The
+  spike had already established that the boundary had to change; it did not
+  establish the cost or behavior of that later implementation.
 - **Re-exporting the driver's types** to avoid `FromColumn` and `Param`. The
   spike is the argument against it: those two are what let a second driver be a
   change to one crate.
@@ -272,6 +278,9 @@ The spike is retained outside the production workspace, together with
 preserve how the original answers were obtained; the production live suite
 verifies the current implementation. Retention replaces the earlier promise
 to delete the experiments once their decisions were settled.
-The two amendments (§1, §2) are small, are not PostgreSQL-specific, and are
-better taken while there is still exactly one dialect to update — but they touch
-`pbps-db` and `pbps-mssql`, so they wait for PR #10 rather than compete with it.
+The two amendments (§1, §2) landed ahead of the PostgreSQL crate, after PR #10
+(DECISIONS 193–194): textual server error codes and dialect-owned transaction
+framing. Step 1 (#75) then put both drivers behind `Conn`, and step 10
+(#85) connected the engine paths to the CLI. TLS authentication, statement
+cancellation and the cost of another engine remain outside the spike's evidence,
+as the Limits section records.

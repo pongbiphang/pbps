@@ -1,23 +1,29 @@
 # PongBiphang Schema (`pbps`)
 
-Declarative database schema version control. You maintain one description of what
-the schema should look like; the tool works out the rest.
+Declarative database schema version control for SQL Server and PostgreSQL. You
+maintain one description of what the schema should look like; the tool works
+out the rest.
 
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
   through [docs/ADR-0015-local-ui-implementation.md](docs/ADR-0015-local-ui-implementation.md);
-  ADR-0009 to ADR-0014 are the PostgreSQL design, written against a real
-  server before the dialect exists, and ADR-0015 is how the local UI of
-  ADR-0006 is built
+  ADR-0009 to ADR-0014 record the PostgreSQL design, measured before the
+  dialect was built and revisited against its implementation; ADR-0015 records
+  how the local UI of ADR-0006 is built
 - Copy-pastable CI pipelines and the exit-code contract they rest on:
   [docs/CI.md](docs/CI.md)
 - Why each non-obvious choice was made: [docs/DECISIONS.md](docs/DECISIONS.md)
 - Bugs shipped or nearly shipped, and their shapes: [docs/PITFALLS.md](docs/PITFALLS.md)
 - Current phase, command surface, open items: [docs/STATUS.md](docs/STATUS.md)
 
-**Phases 0 through 4 are complete** for SQL Server: tables, columns, keys,
-constraints and indexes; views, procedures, functions and triggers; reference
-data, roles and grants, and the `policies:` block. Two groups of commands:
+**Phases 0 through 5 are complete as scoped**, with SQL Server and PostgreSQL
+supported through the CLI: tables, columns, keys, constraints and indexes;
+views, procedures, functions and triggers; reference data, roles and grants,
+and the `policies:` block. Capabilities remain engine-specific: PostgreSQL
+uses existing cluster roles, refuses identity-keyed reference data and cannot
+declare `PUBLIC` grants; its module rebuilds refuse carried state they cannot
+preserve. The ADRs and [current status](docs/STATUS.md) retain the other
+limitations and deferred findings. Two groups of commands:
 
 | No database needed | Purpose |
 |---|---|
@@ -60,12 +66,17 @@ what one engine can express — reference data
 ([ADR-0004](docs/ADR-0004-reference-data.md)), roles and grants
 ([ADR-0005](docs/ADR-0005-roles-and-grants.md)), declarative policies
 ([ADR-0008](docs/ADR-0008-policies.md)). Depth preceded the second dialect on
-purpose: a team evaluating pbps for SQL Server is not blocked by the absence of
-PostgreSQL, it is blocked by the parts of its own estate that are not yet
-expressible. Next is Phase 5, the PostgreSQL dialect; its design is already
-recorded, grounded in measurements on a real server, in
+purpose: the first engine's users needed more of their own estate to be
+expressible before a second engine was added. Phase 5 then built the PostgreSQL
+dialect and connected it to the CLI, following the measured design in
 [ADR-0009](docs/ADR-0009-postgres-modules.md) through
 [ADR-0014](docs/ADR-0014-driver-seam-tested.md).
+
+The next phase is **Phase 6**, the optional local UI
+([ADR-0006](docs/ADR-0006-optional-ui.md),
+[ADR-0015](docs/ADR-0015-local-ui-implementation.md)). Its read-only viewer is
+already available as `pbps ui`; intent composition and the remaining steps are
+future work tracked in [#64](https://github.com/pongbiphang/pbps/issues/64).
 
 ### Starting a project
 

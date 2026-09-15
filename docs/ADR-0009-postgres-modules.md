@@ -1,15 +1,16 @@
 # ADR-0009: Modules on PostgreSQL — overloading, deparsing, and what `CREATE OR ALTER` was buying
 
-- Status: accepted. §1 (DECISIONS 200–205) and §2.2 (DECISIONS 207–208) are
-  applied; the rest is design until the PostgreSQL crate. This decided the model
-  before the dialect is written.
+- Status: accepted; the model changes and scoped PostgreSQL module support are
+  implemented. Phase 5 step 5 (#80) built the module paths and step 10 (#85)
+  connected them to the CLI. The amendments and Limits distinguish the shipped
+  behavior from the original design and the remaining exclusions.
 - Date: 2026-09-04
 - Related: docs/SPEC.md §8.2, §12, open question 9;
   [ADR-0002](ADR-0002-module-model.md), which this revisits;
   [ADR-0005](ADR-0005-roles-and-grants.md);
   [ADR-0010](ADR-0010-postgres-privileges.md)
 
-## Why this is written before any PostgreSQL code
+## Why this was written before any PostgreSQL code
 
 SPEC §12 states the test Phase 5 exists to run: *"If Phase 5 forces a large
 change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place."*
@@ -1209,19 +1210,24 @@ transactional and leaves nothing behind.
 
 ## What this changes in `pbps-model`
 
-The test SPEC §12 set was "does Phase 5 force a large change". The answer:
+The test SPEC §12 set was "does Phase 5 force a large change". These model
+changes landed before the dialect. The three categories of recorded context
+below share `StateSnapshot::declared` (`Declared`), rather than three top-level
+snapshot fields (DECISIONS 207); the amendments record that implementation.
+The binding row describes the design obligation, with conservative rebuilds
+and remaining limits detailed in ADR-0013 §3 and [STATUS](STATUS.md).
 
-| Change | Size |
+| Implemented model change | Representation and rationale |
 |---|---|
 | `Schema::modules` keyed by `ModuleId` instead of `ObjectName` | One key type; every dialect-agnostic user of it goes through the map |
-| `GrantTarget::Object` must be able to name a function by signature (see [ADR-0010](ADR-0010-postgres-privileges.md)) | The same `ModuleId` |
+| `GrantTarget::Object` names a function by signature (see [ADR-0010](ADR-0010-postgres-privileges.md)) | The same `ModuleId` |
 | The state snapshot keeps a module's **declared** text beside the read-back (§2.2) | One field, and a state format bump |
 | The state snapshot also keeps **what each managed object bound to** at creation ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) | A second field in the same bump. Which schema an unqualified name resolved to is an input to the declaration's meaning — measured, for any expression parsed at creation, not only for a module. The *binding*, not the path string: a new same-named object earlier on an unchanged path moves one and not the other. What the field buys is a conservative test, asked of the catalog *as this plan will leave it* — does the visible candidate set — same name, same catalog class, by identity for routines and operators — differ from the one recorded when the object was created, computed against the catalog the plan leaves behind. One rebuild per change, re-recorded; a qualified reference into an extension's schema never rebuilds and one standing behind a shadow rebuilds once. Earlier versions carried flags instead, and the one that inferred qualification from a name was refuted by overloading (measured) — because what an unchanged declaration would bind to today is not computable without parsing it. Scoped to what the model can declare: module bodies, `Column::default`, `CheckConstraint::expression`, `Index::filter` |
 | And those **declared expressions** beside the ones read back (ADR-0013 §4) | A third field. All three are compared as text and PostgreSQL respells all three — `'unnamed'` comes back `'unnamed'::text`, `label <> 'none'` comes back `((label <> 'none'::text))` — so without it every connected plan re-emits `AlterColumnDefault`, revalidates every check and rebuilds every filtered index, for ever |
-| `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
+| `check_names`' one-namespace rule is a dialect question | A trait method; MSSQL keeps today's answer |
 | A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
 | `Module::on` is **removed** | A trigger's table is half of its identity, so it moves into the key. Containers hold names, elements do not — leaving it in `Module` would have let a snapshot say `app.audit` is on `app.orders` in the key and on `app.customers` in the value |
-| `ModuleDeps` keyed by `ModuleId` on **both** sides | Today `BTreeMap<ObjectName, BTreeSet<ObjectName>>`, which cannot say that `app.f(integer)` depends on something while `app.f(text)` does not — two valid declarations would share or overwrite one hint entry, and the ordering it exists to fix would be computed from the wrong graph |
+| `ModuleDeps` keyed by `ModuleId` on **both** sides | Replaced the name-only map, which could not distinguish dependencies of `app.f(integer)` from those of `app.f(text)`; overloads no longer share one hint entry |
 
 Everything else — `ModuleKind`, the ids file (modules still carry no
 identity), `docs`, the policy engine — is unchanged. The differ is unchanged in
@@ -1295,10 +1301,13 @@ earlier claim is the point: "we checked" is not the same claim as "it held".
 
 ## Placement
 
-Phase 5, ahead of the emitter. The `ModuleId` key change is a `pbps-model`
-change and therefore the most expensive kind to take late (SPEC §12, Phase 0's
-lesson) — it should land with, or before, the first PostgreSQL code, and it
-costs SQL Server nothing because the argument list is absent there.
+The model preparation landed ahead of the PostgreSQL emitter (DECISIONS
+200–209). That ordering kept the format change out of the engine implementation;
+SQL Server retains its name-only routine identity. Phase 5 step 5 (#80) then
+built module emission, introspection and rebuild checks; step 10 (#85) and the
+connected-check follow-up (#305) exposed them through the CLI. The Limits
+section names the production live fixtures; the original measurements above
+remain evidence from the design spike, not measurements of that later CLI.
 
 ## Amendment — what landing §2.2 changed
 

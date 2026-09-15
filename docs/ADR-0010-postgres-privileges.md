@@ -1,8 +1,9 @@
 # ADR-0010: Privileges on PostgreSQL — the role is not the portable unit
 
-- Status: accepted. The model changes of §3 and §6 (DECISIONS 210–211) are
-  applied; the rest is design until the PostgreSQL crate. This decided the
-  format before the dialect is written.
+- Status: accepted; the model changes (DECISIONS 210–211) and scoped PostgreSQL
+  privilege support are implemented. Phase 5 step 6 (#81) built the engine
+  paths; step 10 (#85) and its follow-ups connected the CLI checks. The Limits
+  retain unmodelled grants and the boundary around cluster roles.
 - Date: 2026-09-04
 - Related: docs/SPEC.md §5, §8.1, §8.2, §12, open questions 7 and 9;
   [ADR-0005](ADR-0005-roles-and-grants.md), which this revisits;
@@ -385,10 +386,10 @@ folded into the role.
 
 | Change | Size |
 |---|---|
-| `Permission` gains `usage`, `create`, `truncate`, `trigger`, `maintain`; `alter` and `view-definition` become dialect-refused | An enum and a `validate_role` table |
-| `GrantTarget::Object` must name a function by signature | The `ModuleId` of [ADR-0009](ADR-0009-postgres-modules.md) |
-| Role *existence* becomes a dialect capability rather than a given | A trait method; SQL Server keeps today's answer |
-| PostgreSQL catalog read-back, ACL expansion, unexpressible reporting | `pbps-postgres`, which does not exist yet |
+| `Permission` includes `usage`, `create`, `truncate`, `trigger`, `maintain`; unsupported words are dialect-refused | An enum and a `validate_role` table |
+| `GrantTarget::Object` names a function by signature | The `ModuleId` of [ADR-0009](ADR-0009-postgres-modules.md) |
+| Role *existence* is a dialect capability rather than a given | A trait method; SQL Server keeps today's answer |
+| PostgreSQL catalog read-back, ACL expansion, unexpressible reporting | Implemented in `pbps-pg`; step 6 and its amendment below record the measured scope |
 
 `Role`, its `grants` map, the ids file's `roles` section, the `revoke` and
 `grant-widen` risk classes, the drift comparison and the managed-set rule are
@@ -448,9 +449,12 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
 
 ## Placement
 
-Phase 5, ahead of the emitter, for the same reason as ADR-0009: the parts that
-touch `Permission`, `GrantTarget` and the ids file are format, and format is the
-most expensive thing in this project to change late (SPEC §12).
+The model preparation (DECISIONS 210–211) landed before the PostgreSQL
+emitter, for the same reason as ADR-0009: format is the most expensive thing
+to change late (SPEC §12). Phase 5 step 6 (#81) built the PostgreSQL role/ACL
+paths, and step 10 (#85) plus the doctor and permission-version follow-ups
+(#304, #321) connected their CLI checks. The original measurements and the
+later implementation amendment remain separate evidence.
 
 ## Amendment — what landing §3 and §6 changed
 
@@ -469,10 +473,11 @@ most expensive thing in this project to change late (SPEC §12).
   Server's edition — a connected check, not a format one.
 - **The editor schema lists the union** (schema version 7), not one engine's
   words: which word a project's engine lacks is `validate`'s finding.
-- **`manages_roles` has no reader yet** (DECISIONS 211). SQL Server answers
-  `true` and the CLI's role-existence paths are unchanged; the reading — refuse
-  a missing role with the `CREATE ROLE` to run, make `drop-role` revoke and
-  stop — lands with the dialect that first answers `false`.
+- **`manages_roles` initially had no reader** (DECISIONS 211). The preparation
+  kept SQL Server's `true` answer and role-existence behavior. The PostgreSQL
+  consumer subsequently landed with step 6: a missing role is refused with
+  the `CREATE ROLE` a human runs, and dropping a declaration revokes its managed
+  grants without dropping the cluster role. Step 10 connected the CLI paths.
 
 ## Amendment — what landing §1, §2, §4, §5 and §7 changed
 
