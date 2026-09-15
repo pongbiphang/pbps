@@ -711,6 +711,9 @@ fn resolve_roles(
         }
     }
 
+    // The conflict already accounts for these sources. Offering the losing
+    // source again would make ambiguity candidates depend on intent order.
+    disappeared.retain(|role| !conflicting_sources.contains(role));
     if !appeared.is_empty() && !disappeared.is_empty() {
         blockers.push(Blocker::AmbiguousRoles {
             disappeared: disappeared.into_iter().collect(),
@@ -720,9 +723,7 @@ fn resolve_roles(
     }
 
     for role in disappeared {
-        if !conflicting_sources.contains(&role) {
-            blockers.push(Blocker::DropRoleNeedsReason { role });
-        }
+        blockers.push(Blocker::DropRoleNeedsReason { role });
     }
 
     for name in appeared {
@@ -838,6 +839,9 @@ fn resolve_tables(
         }
     }
 
+    // Keep conflicted sources out of both ambiguity and missing-drop reports;
+    // matching one contender above does not make the other a new decision.
+    disappeared.retain(|table| !conflicting_sources.contains(&table.to_string()));
     if !appeared.is_empty() && !disappeared.is_empty() {
         blockers.push(Blocker::AmbiguousTables {
             disappeared: disappeared.into_iter().collect(),
@@ -847,9 +851,7 @@ fn resolve_tables(
     }
 
     for table in disappeared {
-        if !conflicting_sources.contains(&table.to_string()) {
-            blockers.push(Blocker::DropTableNeedsReason { table });
-        }
+        blockers.push(Blocker::DropTableNeedsReason { table });
     }
 
     for name in appeared {
@@ -1014,6 +1016,10 @@ fn resolve_columns(
             }
         }
 
+        // Use the qualified identity recorded by the conflict, before either
+        // remaining-source diagnostic can offer it to the operator again.
+        disappeared
+            .retain(|name| !conflicting_sources.contains(&table_name.column(name).to_string()));
         if !appeared.is_empty() && !disappeared.is_empty() {
             blockers.push(Blocker::AmbiguousColumns {
                 table: table_name.clone(),
@@ -1024,11 +1030,9 @@ fn resolve_columns(
         }
 
         for name in disappeared {
-            if !conflicting_sources.contains(&table_name.column(&name).to_string()) {
-                blockers.push(Blocker::DropColumnNeedsReason {
-                    column: table_name.column(name),
-                });
-            }
+            blockers.push(Blocker::DropColumnNeedsReason {
+                column: table_name.column(name),
+            });
         }
 
         for name in appeared {
