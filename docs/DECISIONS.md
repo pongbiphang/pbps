@@ -12435,9 +12435,11 @@ SPEC is in sync with all of these.
      without silently changing grants or replacing the approval mechanism.
      Before source transfer, qualify and enforce engine/platform controls over
      server logging, intermediaries, container capture/forwarding and disposable
-     source-bearing storage. Private target reads and scratch transfers also
-     require verified confidential transport and peer identity, including each
-     hop and apply's target rechecks; localhost or unverified TLS is not proof.
+     source-bearing storage. Every resolver control/evidence exchange, including
+     managed-only analysis and target rechecks, requires authenticated integrity
+     and peer validation; private inputs additionally need confidentiality.
+     Initial remote profiles use authenticated encryption throughout; localhost
+     or unverified TLS is not proof. Private-source logging remains conditional.
      Unknown controls refuse reconstruction; client
      redaction and database deletion are not proof of no retained copies. Do not
      disable pre-existing audit policies. ADR-0016 defines the trusted-runtime

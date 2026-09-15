@@ -1291,13 +1291,19 @@ and disposable, without persistent/exported copies. Unknown or unenforceable
 controls refuse reconstruction before transfer; client redaction or deleting a
 scratch database is not proof, and pre-existing audit policies are not disabled
 to satisfy the check. ADR-0016 defines the trusted-runtime boundary and lifecycle.
-Before private target reads (including apply rechecks) or scratch transfer,
-qualify confidential transport and the actual peer on every hop. Remote links
-require authenticated encryption with peer validation; plaintext, downgrade and
-disabled certificate checks refuse. A local private channel needs independently
-qualified peer/host isolation, not merely a localhost address. Reconnects
-requalify before any private input crosses the connection. Existing unrelated
-connection defaults are unchanged; apply still does not contact a resolver.
+
+Every resolver qualification, target-evidence read (including apply rechecks),
+scratch DDL/control exchange and binding result requires authenticated integrity
+and peer validation, including managed-only analysis without private inputs.
+Qualify the actual channels before accepting evidence or sending declarations;
+private inputs additionally require confidentiality. The initial remote profile
+uses authenticated encryption for all these exchanges; plaintext, downgrade and
+disabled peer checks refuse. Local channels require qualified peer/host
+isolation, not merely localhost. Reconnects requalify and results stay bound to
+the actual peer/run. Private-source logging controls remain conditional.
+Existing unrelated connection defaults are unchanged; apply does not contact
+a resolver.
+
 The user's managed declarations and explicit deployment changes remain ordinary
 reviewable plan contents. Fingerprints can verify guesses of low-entropy
 confidential literals: omitting plaintext does not make an artifact secret-free.

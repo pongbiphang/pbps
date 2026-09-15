@@ -292,10 +292,16 @@ Source-bearing engine errors must not bypass this boundary. This applies to
 retained external prerequisites, not to the user's managed declarations and
 explicit typed changes that the reviewed deployment already needs to contain.
 
-**Qualify source handling before sending the source, not after an error.**
-Before requesting private target inputs or sending them to scratch, qualify
-the actual transport and peer on both legs, including apply's target re-reads.
-Remote transport requires authenticated encryption with verified peer identity
+**Authenticate the evidence channels; protect private source before transfer.**
+Authenticated integrity and peer validation cover every resolver qualification,
+target-evidence read, scratch control/DDL exchange and returned binding result,
+even when all declarations are managed and no private external input exists.
+Qualify the actual channels before accepting any evidence or sending declarations,
+including apply's target-evidence rechecks. Bind commands/results to the qualified
+peer, connection and analysis run; a checksum over a saved result does not
+authenticate the exchange that produced it. Private inputs additionally need
+confidentiality. The initial remote transport profile requires authenticated
+encryption with verified peer identity for all these exchanges,
 using an approved trust root or pinned peer key/certificate. Plaintext,
 opportunistic downgrade and encryption with certificate/identity checks disabled
 do not qualify. An authenticated tunnel qualifies only if every remaining hop
@@ -306,13 +312,16 @@ to the actual connections and re-establish it on reconnect or endpoint changes.
 A local socket or run-private control channel may qualify through tested peer
 authentication and host/runtime isolation instead of TLS, but `localhost`, a
 container label or an exposed host port alone is not proof. Unknown protection
-or peer identity refuses before a source-bearing query/transfer, not after data
-has crossed the channel. Secure acquisition of per-run trust material must not
-fall back to accepting any certificate. This extends the private-input resolver
-path, not the defaults of unrelated existing connection workflows, and adds no
-resolver connection during apply. Transport facts remain the connection layer's
-responsibility; engine identity/compatibility and caller policy remain separate.
+or peer identity refuses before accepting evidence or sending declarations/private
+inputs, not after the exchange. Secure acquisition of per-run trust material must
+not fall back to accepting any certificate. This qualifies the new resolver
+control/evidence paths, not the defaults of unrelated existing connection
+workflows, and adds no resolver connection during apply. Transport facts remain
+the connection layer's responsibility; engine identity/compatibility and caller
+policy remain separate.
 
+The following private-source logging/storage controls are conditional on handling
+those private inputs; transport authentication/integrity above is not.
 For both containers and supplied scratch servers, a versioned engine/platform
 safety profile must establish effective suppression of source-bearing statement,
 parameter, audit, trace and failed-statement logging. Cover the server and any
@@ -669,6 +678,14 @@ protection under test is removed.
     setup and apply-time target re-reads without any scratch connection. A
     certificate-validation bypass or localhost-only exemption must fail the
     negative control, independently for each supported engine/transport.
+20. **`managed_only_resolution_authenticates_every_exchange` (planned):** use
+    only managed declarations with no private external prerequisites. A controlled
+    intermediary relays qualification reads but attempts to alter DDL, replace
+    a binding result or substitute a prior run's response; no forged input may
+    become verified evidence. Cover both target-evidence and scratch channels,
+    including reconnects and peer substitution. Valid authenticated exchanges
+    still resolve without imposing private-source logging prerequisites on this
+    case; removing channel authentication must fail the negative control.
 
 ## Delivery and supersession
 
