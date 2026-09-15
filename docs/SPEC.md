@@ -884,11 +884,15 @@ See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
 
 **Planned binding-evidence guard (§9.3.2):** a resolver-backed transactional
 plan additionally checks its recorded target prerequisites under the deployment
-lock before DDL, and its covered result bindings before committing and recording
-success. A mismatch refuses the apply; a result mismatch rolls back the
-transaction. This checks logical binding identities, not expression wording,
-and adds neither staged guarantees nor protection against arbitrary concurrent
-external writers. Plans without resolver evidence retain the existing guard.
+lock before DDL, then rechecks its complete prerequisite manifest together with
+covered result bindings before committing and recording success. Closing
+prerequisites match the expected post-apply state sealed during planning,
+including legitimate changes from the approved plan; an unchanged old binding
+cannot excuse a failed prerequisite. A mismatch or unreadable required input
+rolls back the apply. This checks logical result bindings and versioned
+resolution-input fingerprints, not general managed-expression wording, and adds
+neither staged guarantees nor protection against arbitrary external writes after
+the last observation. Plans without resolver evidence retain the existing guard.
 
 ---
 
@@ -1272,10 +1276,14 @@ routine/view source: include versioned canonical fingerprints of relevant
 cast, type, operator, extension and other class-specific properties, complete
 membership and required absence predicates. Logical identity alone cannot
 detect a semantic property change. Re-read those inputs coherently before
-publication/apply; mismatched, unreadable or unsupported properties refuse even
-when the managed checksum and existing bindings are unchanged. This includes
+publication/apply and in the closing post-DDL capture; mismatched, unreadable or
+unsupported properties refuse even when the managed checksum and existing
+bindings are unchanged. This includes
 evidence for deciding not to rebuild. Each adapter must qualify the completeness
 of its input coverage; a closing read of the old binding is not a substitute.
+Closing checks use a post-apply manifest derived and sealed from the approved
+typed changes, so planned candidate/grant changes are distinguished from drift.
+An unprovable transition refuses at planning, never becomes an apply-time choice.
 
 Retained external definitions are private, ephemeral reconstruction inputs,
 not additional source shipped to reviewers. Saved evidence records their

@@ -300,7 +300,8 @@ Extend the saved-plan format, not semantic `Schema` equality, to carry:
 - a derived confidentiality classification covered by the checksum; external
   input fingerprints require confidential handling, never a caller-waived flag;
 - typed descriptions of the derived pre-apply predicates and expected
-  post-apply bindings, not user-supplied SQL to execute after approval.
+  post-apply prerequisite manifest and bindings, not user-supplied SQL to execute
+  after approval.
 
 **External source is reconstruction input, not a review artifact.** Unmanaged
 function/view definitions can contain credentials or confidential literals.
@@ -505,19 +506,33 @@ preserves existing output files. SPEC §9.8 distinguishes a known requirement or
 incompatibility (finding) from a failed read/provisioning operation (unanswerable).
 
 `apply` checks baseline and resolution prerequisites in one coherent capture
-under its existing deployment lock before DDL. The closing binding read also
-needs a coherent, fresh view that includes the transaction's own changes; do
+under its existing deployment lock before DDL. The closing capture re-reads
+both covered result bindings and the complete resolution prerequisite manifest,
+including fingerprints, membership/absence, environment and authorization facts.
+It needs a coherent, fresh view that includes the transaction's own changes; do
 not freeze the whole apply at its pre-DDL snapshot. PostgreSQL's caller-owned
 READ COMMITTED transaction uses the one-statement catalog capture and
 revalidation boundary of DECISIONS 423, extended to the resolution-evidence
 scope. A savepoint or repeated non-atomic reads are not a substitute. Relevant
 external candidates must be included even when their change would not affect
 the ordinary managed-schema checksum.
+
+Compare closing prerequisites with their expected post-apply state, derived and
+sealed during planning from the approved typed changes. Unchanged prerequisites
+still match their initial fingerprints; legitimate planned candidate, membership
+or authorization changes match the sealed transition rather than being refused
+for differing from the pre-DDL state. An adapter unable to establish these
+postconditions must refuse evidence, not skip an input or derive a new approval
+decision during apply. Drift committed after the pre-DDL check and visible in
+the closing capture must fail even when the dependent object was not rebuilt
+and its retained binding still matches. Unreadable required inputs also fail.
 Changed premises require replanning and renewed approval, never rerunning the
 resolver or choosing a different migration at apply time. Within the initial
-transactional path, compare covered result bindings before commit and success
-recording; a mismatch rolls back. Keep SPEC §7.6's single-deployer assumptions
-and its other limitations. Resolver-backed staged plans are outside the first
+transactional path, a failed binding or prerequisite postcondition rolls back
+the apply's changes before commit and success recording. This is a closing
+observation/revalidation boundary, not prevention of arbitrary external writes
+after the last observation. Keep SPEC §7.6's single-deployer assumptions and its
+other limitations. Resolver-backed staged plans are outside the first
 delivery, not silently downgraded to weaker evidence.
 
 `explain` reads evidence, prerequisites, rebuilt objects and uncovered cases
@@ -716,6 +731,16 @@ protection under test is removed.
     clean full restart after requalification and an unchanged run that succeeds.
     The negative control must fail when stability protection is removed, with
     no target writer or production lock required.
+22. **`closing_capture_rechecks_resolution_prerequisites` (planned):** after
+    the pre-DDL check, commit an unmanaged candidate/property or authorization
+    change through a second connection before the closing capture. Keep the
+    dependent managed object untouched so its old binding still matches the
+    approved result; the closing prerequisite mismatch must nevertheless roll
+    back the apply's changes and prevent success recording. Cover unreadable
+    inputs and a positive case where the approved plan itself changes a candidate
+    or grant and the sealed post-apply manifest matches. Neither case starts a
+    resolver during apply. Omitting the closing manifest check must fail the
+    negative control; do not claim to catch writes after the last observation.
 
 ## Delivery and supersession
 

@@ -12456,8 +12456,12 @@ SPEC is in sync with all of these.
      premises require replanning and approval. Each capture must itself be
      coherent; repeated mixed-time reads are not evidence. PostgreSQL inherits
      the owned/caller-owned read boundaries of 250 and 423, with non-snapshot
-     inputs handled explicitly. Initial result verification is
-     transactional, before commit and success recording. Apply never starts a
+     inputs handled explicitly. Initial result verification is transactional:
+     the closing coherent capture checks both bindings and the complete input
+     manifest against sealed post-apply expectations, including approved typed
+     changes, before commit/success. A retained old binding cannot waive changed
+     prerequisites visible at that boundary; failed checks roll back, without
+     promising to prevent later external writes. Apply never starts a
      resolver or changes the approved migration. Preview-only rehearsal, human
      intent, risk gates and the single-deployer limits remain intact; arbitrary
      image synthesis, snapshot-derived deployable plans and resolver-backed
