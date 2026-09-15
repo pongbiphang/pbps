@@ -135,6 +135,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
             Environment {
                 url_env: var.clone(),
                 description: None,
+                resolve_with: None,
             },
         );
     }
@@ -146,6 +147,8 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         hooks: Hooks::default(),
         unmanaged: Unmanaged::Ignore,
         dev: None,
+        resolvers: BTreeMap::new(),
+        resolve_with: None,
         // Left to the default: a new project has no reference data yet, and a
         // number written into every generated pbps.yml is one more line to
         // explain in the first hour.
@@ -675,6 +678,7 @@ mod tests {
             Environment {
                 url_env: "null".to_owned(),
                 description: None,
+                resolve_with: None,
             },
         );
         let config = Config {
@@ -685,6 +689,8 @@ mod tests {
             hooks: Hooks::default(),
             unmanaged: Unmanaged::Ignore,
             dev: None,
+            resolvers: BTreeMap::new(),
+            resolve_with: None,
             max_data_rows: None,
             policies: None,
         };

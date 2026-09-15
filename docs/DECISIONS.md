@@ -12579,3 +12579,26 @@ SPEC is in sync with all of these.
     and NULL. An oversized value is refused with 2628; accepted padding stays
     unblocked. Existing non-Unicode code-page probes, unbounded targets,
     timestamp refusal and static risk classification keep their boundaries.
+
+494. **Select a named resolver policy without acquiring or certifying it.**
+     #606 advances ADR-0016's shared environment stage after #597. Configuration
+     names trusted Docker/server profiles; an internally tagged enum prevents
+     ambiguous mixed backends. CLI > environment > project precedence returns
+     pure configuration data. Server credentials remain environment-variable
+     references, and Docker pull policy defaults to `never`; `if_missing` is
+     explicit acquisition authorization for that configured source. Neither a
+     source selection nor a discovered candidate proves qualification.
+
+     The CLI accepts profile names instead of inline credentials or arbitrary
+     image arguments. Connected summaries expose the selected profile/policy
+     as `not_acquired`; selection is not persisted as saved-plan evidence and
+     does not waive existing planning protections. The sole status variant
+     cannot report success from infrastructure that has not been implemented.
+     Acquiring, admitting and qualifying a real runtime belongs to #607–#611;
+     binding-backed planning follows later in #595's ordered child issues.
+     Offline/check/explain and doctor do not resolve defaults or read scratch
+     credentials. An unknown selected profile is an actionable finding before
+     target access/output; contradictory explicit workflow flags keep the
+     existing flag-error convention. Schema set 12 archives the new config and
+     optional summary data without changing the envelope wire version or any
+     saved-plan format.

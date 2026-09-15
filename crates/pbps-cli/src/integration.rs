@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.
@@ -75,6 +75,8 @@ pub const SCHEMA_VERSION: u32 = 11;
 //     current checked-in copies (DECISIONS 465).
 // 11: doctor's advisory resolver environment observations and qualification
 //     gaps for PostgreSQL and SQL Server (ADR-0016; issue #597).
+// 12: named resolver profiles and connected planning's unacquired selection
+//     report (ADR-0016; issue #606).
 
 /// Every command that emits an envelope, with the payload its `data` carries.
 ///
@@ -277,6 +279,83 @@ pub fn cmd_man(dir: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolver_profile_schema_and_loader_agree_on_backends_and_policies() {
+        let document = schema(SchemaKind::Config);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        for (profile, valid) in [
+            (
+                serde_json::json!({"kind": "docker", "image": "postgres:18"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "docker", "image": "registry.local:5000/team/pg:18", "pull": "if_missing"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "SCRATCH_DB"}),
+                true,
+            ),
+            (serde_json::json!({}), false),
+            (serde_json::json!({"kind": "server", "url_env": ""}), false),
+            (
+                serde_json::json!({"kind": "server", "url_env": "postgres://secret@host/db"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url": "postgres://secret@host/db"}),
+                false,
+            ),
+            (serde_json::json!({"kind": "docker", "image": ""}), false),
+            (
+                serde_json::json!({"kind": "docker", "image": "https://registry/pg"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "docker", "image": "pg:18 --privileged"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "docker", "image": "pg:18", "url_env": "SCRATCH"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "server", "url_env": "SCRATCH", "pull": "never"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "docker", "image": "pg:18", "pull": "always"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "docker", "image": "pg:18", "verified": true}),
+                false,
+            ),
+        ] {
+            let config =
+                serde_json::json!({"dialect": "postgres", "resolvers": {"scratch": profile}});
+            assert_eq!(validator.is_valid(&config), valid, "{config}");
+            assert_eq!(
+                pbps_config::Config::parse(&config.to_string(), std::path::Path::new("pbps.yml"))
+                    .is_ok(),
+                valid,
+                "{config}"
+            );
+        }
+        for config in [
+            serde_json::json!({"dialect": "mssql", "resolve_with": ""}),
+            serde_json::json!({"dialect": "mssql", "resolvers": {"bad name": {"kind": "server", "url_env": "SCRATCH"}}}),
+            serde_json::json!({"dialect": "mssql", "environments": {"prod": {"url_env": "TARGET", "resolve_with": "bad/name"}}}),
+        ] {
+            assert!(!validator.is_valid(&config), "{config}");
+            assert!(
+                pbps_config::Config::parse(&config.to_string(), std::path::Path::new("pbps.yml"))
+                    .is_err(),
+                "{config}"
+            );
+        }
+    }
 
     /// The checked-in copies under `schemas/` are what an editor resolving a
     /// `$schema` URL fetches, and what anyone browsing the repository reads. A

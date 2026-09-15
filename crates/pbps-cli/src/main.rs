@@ -132,6 +132,11 @@ enum Command {
         #[arg(long)]
         dev: Option<String>,
 
+        /// Select a named resolver profile for target planning. Selection only:
+        /// resolver acquisition and binding qualification are not implemented yet
+        #[arg(long, value_name = "PROFILE")]
+        resolve_with: Option<String>,
+
         /// human (default) or json. With --db/--env, JSON reports change counts,
         /// connected checks and findings. --out writes the separate saved plan
         /// accepted by apply; inspect it with `pbps explain --plan`
@@ -667,6 +672,7 @@ fn run() -> anyhow::Result<()> {
             sql,
             staged,
             dev,
+            resolve_with,
             format,
         } => {
             // Every refusal below goes through the envelope, not `bail!`. These
@@ -710,6 +716,23 @@ fn run() -> anyhow::Result<()> {
                          environment; run them separately",
                     )?;
                 }
+                let resolver_selection = match project
+                    .config
+                    .select_resolver(resolve_with.as_deref(), target.env.as_deref())
+                {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        let report = output::Report::plain("plan", vec![
+                            output::Finding::error("resolver.selection", error.to_string())
+                                .remedy("Select a profile declared under resolvers in pbps.yml with --resolve-with <profile>."),
+                        ]);
+                        if json {
+                            return report.emit_json();
+                        }
+                        eprint!("{}", output::human(&report.findings));
+                        return report.outcome();
+                    }
+                };
                 let target = output::or_unanswerable(
                     "plan",
                     json,
@@ -723,6 +746,7 @@ fn run() -> anyhow::Result<()> {
                     sql.as_deref(),
                     staged,
                     json,
+                    resolver_selection,
                 );
                 // A typed refusal already emitted its findings envelope. Only
                 // operational failures need the unanswerable wrapper (DECISIONS 485).
@@ -730,6 +754,11 @@ fn run() -> anyhow::Result<()> {
                     return planned;
                 }
                 return output::or_unanswerable("plan", json, "plan.failed", planned);
+            }
+            if resolve_with.is_some() {
+                refuse(
+                    "--resolve-with selects a resolver for target planning; pass --db or --env. Offline previews and --check never use a resolver",
+                )?;
             }
             if staged {
                 // Staged execution is a property of a plan that is going to be
@@ -2288,6 +2317,9 @@ pub struct PlanData {
     connected_checks: Vec<engine::ConnectedCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<cost::CostReport>,
+    /// Selected policy only, outside the saved artifact and its evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
 }
 
 /// What an offline `plan` was asked to do.
@@ -2758,6 +2790,7 @@ fn cmd_plan(
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
                 connected_checks: Vec::new(),
                 cost: None,
+                resolver_selection: None,
             }),
         );
         // A non-converging rehearsal is an error finding, so `outcome` exits 2
