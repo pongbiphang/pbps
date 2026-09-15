@@ -176,6 +176,29 @@ secrets, logins or production rows. Effective deployment settings, including
 per-statement or persisted module settings where relevant, are not necessarily
 the defaults of the connection used for discovery.
 
+**The provisioning administrator is not the deployment authorization context.**
+Read and qualify the effective deployment role/principal and analysis-relevant
+role membership, inheritance/impersonation, ownership, schema/object privileges
+and default-schema/search-path visibility. The introspection login is not
+automatically the deployer either. Reproduce the authorization context expected
+at each covered deployment statement, including relevant preceding typed
+authorization changes; a matching search-path string alone is insufficient.
+Administrative credentials may prepare private scratch resources, but desired
+compilation must use the qualified deployment context, not broader setup rights.
+
+Reconstruct only the necessary authorization metadata using isolated run-local
+roles/principals, preserving identity semantics where they affect resolution.
+Do not copy production logins, authentication material or unrelated grants.
+Each engine adapter must qualify the mapping and effective privilege checks;
+do not assume another engine's role or ownership semantics. Missing/unreadable
+privileges, unsupported impersonation or inability to reproduce the required
+context prevents evidence. Seal the relevant authorization inputs in decision
+5's manifest and recheck them before publication and against the actual apply
+session before DDL. Reconnect qualification includes these facts; an equivalent
+environment with broader privileges cannot silently pass. This is resolver
+context reconstruction, not permission to modify target grants or a new
+authorization-management feature.
+
 Compatibility is an engine-specific, versioned rule with measured coverage,
 not string equality on a Docker tag. Initially require matching engine/product
 and relevant versions/settings unless a tested rule establishes a particular
@@ -297,7 +320,8 @@ this source-handling prerequisite merely because a resolver is configured.
 **Pin all resolution inputs, not only objects with source text.** The versioned
 input manifest covers every external prerequisite in the supported analysis
 read scope, including relevant cast, type, operator and extension properties,
-whether or not it is a direct current dependency. Each adapter defines the
+and the effective deployment authorization inputs from decision 4, whether or
+not it is a direct current dependency. Each adapter defines the
 complete class-specific properties required for reconstruction and resolution,
 including referenced prerequisites, and qualifies that coverage before use.
 Identity/candidate membership alone is not a fingerprint of those properties.
@@ -515,6 +539,18 @@ protection under test is removed.
     still pass. Each supported adapter needs its own applicable fixtures; a
     negative control that checks only identities or routine/view source hashes
     must miss the changed-property case and fail the test.
+16. **`resolver_uses_the_deployment_authorization_context` (planned):** use
+    a least-privilege deployment role and a more privileged scratch setup role.
+    On PostgreSQL, place competing objects on a path where the deployer lacks
+    schema USAGE; establish the engine's effective visibility and binding, then
+    require scratch to reproduce that result rather than the setup role's.
+    Cover schema/object grants, ownership, inherited/switched roles and relevant
+    per-statement authorization changes with engine-specific fixtures, including
+    SQL Server's own principal/default-schema cases before enabling its adapter.
+    Unreadable or unreproducible context refuses evidence; changed grants or a
+    non-equivalent apply context invalidate it before DDL. A matching context
+    must apply without a spurious rebuild/binding rollback, and running the
+    compilation as the setup administrator must fail the negative control.
 
 ## Delivery and supersession
 

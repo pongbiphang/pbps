@@ -12404,6 +12404,11 @@ SPEC is in sync with all of these.
      controls before proceeding, not only instance separation. Discard partial
      evidence and restart complete compilation in fresh scratch resources even
      when the replacement qualifies; do not mix results across sessions.
+     Compile under a reproduced, qualified deployment authorization context,
+     not the setup administrator's or introspection login's privileges. Pin and
+     recheck relevant roles, ownership and effective grants/path visibility,
+     including the actual apply context, without copying authentication material
+     or introducing target privilege management.
      PostgreSQL binding resolution lands first; SQL Server follows its own
      design and live tests, sharing infrastructure but not binding semantics.
 

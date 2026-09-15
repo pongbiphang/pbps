@@ -1303,6 +1303,17 @@ edition limits remain independent checks. A Developer scratch run cannot waive
 target edition checks, and Azure products cannot be mapped to boxed SQL Server
 by comparing version numbers alone.
 
+Compatibility includes the effective deployment authorization context, not
+merely the introspection or scratch administrator's login. Capture and reproduce
+the relevant roles/principals, memberships, ownership, schema/object privileges
+and effective path/default-schema visibility at each covered deployment
+statement, including relevant typed authorization changes. Use private run-local
+principals without production authentication material; setup privileges cannot
+stand in for deployment privileges. Seal and recheck the relevant authorization
+inputs before publication and against the actual apply session before DDL.
+Unsupported or unreadable context refuses evidence. ADR-0016 requires separate
+engine-specific qualification; this does not add target privilege management.
+
 Candidate suggestions use known official images or team-configured trusted
 images/registries. Selecting one does not promise that every production build,
 extension, platform or hosted product has a matching image. No general-purpose
