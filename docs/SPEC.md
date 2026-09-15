@@ -1228,9 +1228,15 @@ discover those dependencies or claim whole-program validation.
 All resolver DDL runs in isolated scratch resources, never on the target, even
 inside a savepoint. No production rows are copied. The saved plan pins the
 resolved changes, evidence scope, engine/environment fingerprint, target
-prerequisites (including candidate sets) and expected bindings. Necessary
-target facts are rechecked before publishing the artifact and at apply; stale
-facts require replanning and renewed approval. `explain` can show this evidence
+prerequisites (including candidate sets) and expected bindings. Initial capture,
+pre-publication recheck and apply verification each require a coherent
+engine-appropriate catalog view, not a mixture of independent reads. The
+planning capture is released before scratch work; the recheck gets a fresh
+snapshot. PostgreSQL follows DECISIONS 250 and 423 for owned and caller-owned
+reads respectively; non-snapshot inputs must be pinned/validated separately,
+and closing verification must see the apply's own DDL. Necessary target facts
+are rechecked before publishing the artifact and at apply; stale facts require
+replanning and renewed approval. `explain` can show this evidence
 and its limits offline. The first resolver-backed apply path is transactional
 only, with the additional guard in §7.6; staged restrictions remain unchanged.
 

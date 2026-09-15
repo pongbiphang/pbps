@@ -195,16 +195,40 @@ format or retroactively certify existing saved plans. No new snapshot-to-applyab
 path, automatic export artifact or separate persistent approval store is
 introduced.
 
-Capture target inputs read-only, release the read transaction before scratch
-work, and recheck the required facts before publishing the plan. Do not hold a
-production DDL lock or long transaction while downloading an image or compiling
-the declarations. Failure publishes neither partial plan nor partial SQL and
+**Each target-evidence capture must be coherent in its own right.** The initial
+capture and pre-publication recheck each use a fresh engine-appropriate
+consistent snapshot, shared by every query for snapshot-visible bindings,
+definitions, identity/state records and candidate sets. Independent autocommit
+queries or a read-only transaction at READ COMMITTED do not establish that
+contract. Comparing two mixed-time collections does not make either one valid.
+
+For PostgreSQL's owned planning captures, retain `REPEATABLE READ READ ONLY`
+and transaction-local canonical settings (DECISIONS 250), keeping all relevant
+catalog readers on that capture's connection and snapshot. Do not assume the
+snapshot also freezes session/global settings or catalog rendering functions;
+pin the applicable session settings and validate other required inputs, or
+refuse evidence whose consistency cannot be established. The rendering-function
+limit is recorded in [PITFALLS](PITFALLS.md#the-snapshot-the-rendering-functions-do-not-read-from).
+The future SQL Server adapter must establish its own catalog-consistency
+strategy and prerequisites before producing evidence, not assume that a
+similarly named isolation mode covers all metadata.
+
+Release the initial read transaction before scratch work, then perform the
+fresh coherent recheck before publishing the plan. Do not hold a production
+DDL lock or long transaction while downloading an image or compiling the
+declarations. Failure publishes neither partial plan nor partial SQL and
 preserves existing output files. SPEC §9.8 distinguishes a known requirement or
 incompatibility (finding) from a failed read/provisioning operation (unanswerable).
 
-`apply` checks baseline and resolution prerequisites under its existing
-deployment lock before DDL. Relevant external candidates must be included even
-when their change would not affect the ordinary managed-schema checksum.
+`apply` checks baseline and resolution prerequisites in one coherent capture
+under its existing deployment lock before DDL. The closing binding read also
+needs a coherent, fresh view that includes the transaction's own changes; do
+not freeze the whole apply at its pre-DDL snapshot. PostgreSQL's caller-owned
+READ COMMITTED transaction uses the one-statement catalog capture and
+revalidation boundary of DECISIONS 423, extended to the resolution-evidence
+scope. A savepoint or repeated non-atomic reads are not a substitute. Relevant
+external candidates must be included even when their change would not affect
+the ordinary managed-schema checksum.
 Changed premises require replanning and renewed approval, never rerunning the
 resolver or choosing a different migration at apply time. Within the initial
 transactional path, compare covered result bindings before commit and success
@@ -272,6 +296,15 @@ protection under test is removed.
    result bindings roll back without recording success. Evidence can be
    explained offline; human and JSON refusal reports agree. No staged or
    unsupported-engine path bypasses the evidence requirement.
+9. **`target_evidence_capture_never_seals_mixed_catalog_states` (planned):**
+   use two connections to change a covered binding, definition or candidate set
+   between component reads of the initial capture, pre-publication recheck and
+   apply precondition capture. Each collection must represent one coherent
+   state or fail; none may seal an impossible combination. Cover non-snapshot
+   settings/rendering inputs separately, preserve prior artifacts on failure,
+   and prove the closing read sees the apply's own DDL and uses the existing
+   revalidation boundary. Qualify each engine independently; this test does not
+   promise to prevent external DDL after the last observation.
 
 ## Delivery and supersession
 

@@ -12393,7 +12393,10 @@ SPEC is in sync with all of these.
      Saved evidence joins the checksum and includes relevant target candidate
      sets, environment prerequisites and expected bindings. Recheck before
      artifact publication and under the deployment lock before apply; changed
-     premises require replanning and approval. Initial result verification is
+     premises require replanning and approval. Each capture must itself be
+     coherent; repeated mixed-time reads are not evidence. PostgreSQL inherits
+     the owned/caller-owned read boundaries of 250 and 423, with non-snapshot
+     inputs handled explicitly. Initial result verification is
      transactional, before commit and success recording. Apply never starts a
      resolver or changes the approved migration. Preview-only rehearsal, human
      intent, risk gates and the single-deployer limits remain intact; arbitrary
