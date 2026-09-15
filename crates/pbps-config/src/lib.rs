@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod resolver;
+
 pub const CONFIG_FILE: &str = "pbps.yml";
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,16 @@ pub enum ConfigError {
 
     #[error("no environment named `{name}` in {CONFIG_FILE}; it declares: {available}")]
     UnknownEnvironment { name: String, available: String },
+
+    #[error(
+        "no resolver profile named `{name}` in {CONFIG_FILE}; it declares: {available}. Configure it under resolvers or select an existing profile with --resolve-with"
+    )]
+    UnknownResolver { name: String, available: String },
+
+    #[error(
+        "resolver profile names must start with an ASCII letter or digit and contain only letters, digits, dots, underscores or hyphens"
+    )]
+    InvalidResolverName,
 
     #[error(
         "environment `{name}` reads its connection string from ${var}, which is not set.\n\
@@ -110,6 +122,11 @@ pub struct Environment {
     /// Shown by `pbps status`, for humans reading a list of environments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Overrides the project's resolver profile for this deployment target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[A-Za-z0-9][A-Za-z0-9_.-]*$"))]
+    pub resolve_with: Option<String>,
 }
 
 impl Environment {
@@ -237,6 +254,16 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<Dev>,
 
+    /// Explicitly trusted sources for the separate target-planning resolver.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("propertyNames" = serde_json::json!({"pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"})))]
+    pub resolvers: BTreeMap<String, resolver::ResolverProfile>,
+
+    /// Default profile name. Selection/acquisition stays lazy and target-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[A-Za-z0-9][A-Za-z0-9_.-]*$"))]
+    pub resolve_with: Option<String>,
+
     /// How many rows a `data:` block may declare before `validate` says this
     /// does not look like reference data (ADR-0004).
     ///
@@ -270,10 +297,26 @@ fn default_ids_file() -> PathBuf {
 
 impl Config {
     pub fn parse(yaml: &str, path: &Path) -> Result<Self, ConfigError> {
-        serde_saphyr::from_str(yaml).map_err(|e| ConfigError::Parse {
+        let config: Self = serde_saphyr::from_str(yaml).map_err(|e| ConfigError::Parse {
             path: path.to_owned(),
             message: e.to_string(),
-        })
+        })?;
+        if config
+            .resolvers
+            .keys()
+            .map(String::as_str)
+            .chain(config.resolve_with.as_deref())
+            .chain(
+                config
+                    .environments
+                    .values()
+                    .filter_map(|env| env.resolve_with.as_deref()),
+            )
+            .any(|name| !resolver::valid_profile_name(name))
+        {
+            return Err(ConfigError::InvalidResolverName);
+        }
+        Ok(config)
     }
 }
 
@@ -500,6 +543,7 @@ mod tests {
         let env = Environment {
             url_env: "PBPS_DEFINITELY_UNSET_9137".into(),
             description: None,
+            resolve_with: None,
         };
         let err = env.connection_string("prod").unwrap_err();
         assert!(

@@ -33,7 +33,7 @@ commands emit has a published schema of its own (`schema --kind envelope`,
 output against it.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
-(`--force` / `--data`), `plan --db` (`--staged`), `apply` (`--plan` /
+(`--force` / `--data`), `plan --db` (`--staged` / `--resolve-with`), `apply` (`--plan` /
 `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state list` (`--limit` / `--format json`),
@@ -101,17 +101,22 @@ say whether what the emitter sent is what comes back.
 
 ### Engine-assisted planning and resolver environments
 
-**Initial doctor discovery implemented; resolution remains planned.**
+**Doctor discovery and named profile selection implemented; resolution remains planned.**
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
-the existing SQL Server `--dev` rehearsal, while adding a distinct future
-`--resolve-with` path for target-aware planning. The current command lists above
-do not include that option. Connected `doctor` reports an advisory target
+the existing SQL Server `--dev` rehearsal. Target planning accepts
+`--resolve-with <profile>` (#606), with CLI > environment > project precedence.
+Profiles carry a trusted Docker image and pull policy (default `never`), or a
+separate scratch credential-variable reference. Selection looks up no credentials
+and acquires no resources; connected summaries report `not_acquired` outside
+the saved artifact. Existing planning checks remain in force.
+Connected `doctor` reports an advisory target
 environment inventory and known official image-family suggestions for both
 engines, without acquisition. It names unknown qualification requirements;
 session observations do not establish the deployment context. No environment
 has been verified and no binding evidence is produced. See
-[the staged delivery plan](RESOLVER-DELIVERY.md) for #595 and its first child #597.
+[the staged delivery plan](RESOLVER-DELIVERY.md) for #595, completed discovery
+#597, and ordered implementation steps #606–#621.
 
 Delivery is split into three stages:
 

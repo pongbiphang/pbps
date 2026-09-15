@@ -20,6 +20,20 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/resolver_selection.rs"]
+mod resolver_selection;
+
+#[test]
+fn resolver_configuration_keeps_offline_commands_offline() {
+    resolver_selection::offline("mssql");
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence() {
+    resolver_selection::connected(&std::env::var("PBPS_TEST_DB").unwrap(), "mssql");
+}
+
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 

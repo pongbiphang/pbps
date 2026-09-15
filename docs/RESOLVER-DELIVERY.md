@@ -37,21 +37,50 @@ This is partial coverage of ADR acceptance cases **5 and 6**, not completion
 of either case or the shared-environment stage. Binding resolution is still
 unimplemented on both engines. Existing planning protections remain in force.
 
-## Remaining bounded deliveries and dependencies
+## Named selection and policy (#606)
 
-| Delivery | Depends on | Required outcome and ADR acceptance cases |
+Target planning accepts `--resolve-with <profile>`, overriding the selected
+environment then project default. Tagged Docker/server profiles carry explicit
+trusted image/pull policy or a separate credential-variable reference. Selection
+looks up no credentials, acquires no resources and certifies no compatibility.
+The connected summary reports the selected policy as `not_acquired`; it never
+enters the saved deployment artifact. Offline/check/explain and doctor keep
+their no-acquisition behavior; existing planning protections remain in force.
+This delivers the policy portion of ADR case 6, not the lifecycle or binding
+path. See SPEC §9.3.2 for configuration and the current limitation.
+
+## Ordered implementation issues
+
+Each issue describes its scope, ADR acceptance cases, positive/negative tests
+and dependencies. The issue loop is sequential: the current PR must merge
+before the next issue is claimed. #597 is complete; #606 starts this sequence.
+
+| Step | Issue | Required outcome |
 |---|---|---|
-| Selection and acquisition policy | Discovery report | CLI `--resolve-with` over environment/project configuration; trusted image/server sources, local/internal-registry and pull/no-pull policy; offline/check/explain exclusions and lazy acquisition. Finish the policy portions of 6. |
-| Qualified runtime lifecycle, both engines | Selection/policy | Prove actual instance separation, authenticated transport, runtime containment and bounded run-owned cleanup before any declaration transfer or scratch DDL. Qualify dedicated-server and container profiles independently. Cases 11, 13, 19, 20; lifecycle portions of 6, 12, 14, 21. |
-| Analysis-specific compatibility, both engines | Discovery and qualified lifecycle | Real backend/build/native-library identity or measured versioned build mappings; full relevant environment and deployment authorization, per-statement settings and stability. Compatible cases succeed; unknown/mismatched cases refuse. Cases 5, 14, 16, 21, 23. |
-| PostgreSQL capture and binding surfaces | Qualified PostgreSQL runtime and compatibility | Observe current target bindings coherently; reconstruct complete desired namespace/candidate prerequisites without stubs; compare logical identities. Deliver views, SQL-standard bodies and each supported header/expression surface with its own live coverage. Cases 1–4, 9, 15, 16. |
-| Sealed PostgreSQL planning and transactional apply | Binding surfaces and complete prerequisite coverage | Typed cross-kind ordering, versioned checksum-covered evidence, pre-publication recheck, offline explanation, locked pre-DDL and closing binding/prerequisite checks; modeled postconditions accept approved changes. Cases 7–9, 15, 22, 24. Apply never starts a resolver. |
-| Confidential artifacts and inputs | **Separately accepted and implemented #594** plus qualified private-source lifecycle | Qualified source logging/storage/transport and protected artifact, launch, ledger/history and legacy-reader paths before enabling any confidential publication/apply/recording. Cases 10, 12, 17–19 plus #594 compatibility tests. Do not choose a ledger/access transition implicitly. |
-| SQL Server binding design and adapter | Shared qualified environment support; separate engine-specific design | Establish SQL Server coverage, catalog consistency, reconstruction/order, authorization and transactional verification before enabling binding evidence. Run all applicable cases 1–24 independently; confidential paths also depend on #594. PostgreSQL success does not qualify SQL Server. |
+| 1 | [#606](https://github.com/pongbiphang/pbps/issues/606) | configure named profiles and lazy selection policy |
+| 2 | [#607](https://github.com/pongbiphang/pbps/issues/607) | authenticate evidence channels and prove instance separation |
+| 3 | [#608](https://github.com/pongbiphang/pbps/issues/608) | acquire and contain run-owned Docker environments |
+| 4 | [#609](https://github.com/pongbiphang/pbps/issues/609) | qualify dedicated scratch-server lifecycle and exclusivity |
+| 5 | [#610](https://github.com/pongbiphang/pbps/issues/610) | qualify analysis environment builds and deployment context |
+| 6 | [#611](https://github.com/pongbiphang/pbps/issues/611) | qualify analysis environment builds and deployment context |
+| 7 | [#612](https://github.com/pongbiphang/pbps/issues/612) | capture coherent binding inputs and complete prerequisite manifests |
+| 8 | [#613](https://github.com/pongbiphang/pbps/issues/613) | reconstruct desired namespaces and extract covered creation bindings |
+| 9 | [#614](https://github.com/pongbiphang/pbps/issues/614) | seal versioned evidence and deterministic cross-kind change ordering |
+| 10 | [#615](https://github.com/pongbiphang/pbps/issues/615) | integrate lazy target planning and pre-publication verification |
+| 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply |
+| 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | qualify private source logging transport and disposable storage |
+| 13 | [#618](https://github.com/pongbiphang/pbps/issues/618) | integrate protected artifacts approval launch and history |
+| 14 | [#619](https://github.com/pongbiphang/pbps/issues/619) | design creation binding coverage and catalog consistency |
+| 15 | [#620](https://github.com/pongbiphang/pbps/issues/620) | implement qualified binding planning and transactional apply |
+| 16 | [#621](https://github.com/pongbiphang/pbps/issues/621) | complete the cross-engine acceptance matrix and delivery documentation |
 
-Stages may need multiple surface-specific PRs. Every enabled capability needs
-positive cases, failure/unknown cases and a counterfactual that removes the
-protection and fails. Permanent refusal of an unfinished stage is not delivery.
+#594 must separately complete its accepted design, implementation and legacy-
+reader compatibility tests before #618 is claimed. It is an additional hard
+prerequisite, not a waived or implicitly chosen ledger/access transition.
+#617 qualifies private reconstruction controls; it does not enable confidential
+publication/apply/recording by itself. The SQL Server binding design precedes
+its adapter, and final acceptance covers both engines independently. Every
+agreed stage needs successful supported cases; permanent refusal is not delivery.
 
 ## Coordination and boundaries
 

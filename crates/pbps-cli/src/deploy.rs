@@ -3403,6 +3403,7 @@ pub fn cmd_plan_db(
     sql_out: Option<&std::path::Path>,
     staged: bool,
     json: bool,
+    resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
     let loaded = crate::load(project, dialect.as_ref())?;
@@ -3855,9 +3856,16 @@ pub fn cmd_plan_db(
         risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
         connected_checks,
         cost: Some(cost),
+        resolver_selection,
     };
     if !json {
         println!("Baseline: {baseline_description}");
+        if let Some(selection) = &data.resolver_selection {
+            println!(
+                "Resolver profile: {} ({:?}); not acquired. Resolver qualification and binding resolution are not implemented; existing planning checks remain in force.",
+                selection.name, selection.source,
+            );
+        }
         print!("{}", crate::report::plan(&cs));
         for check in &data.connected_checks {
             println!("{}: {}", check.name, check.message);

@@ -18,6 +18,20 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/resolver_selection.rs"]
+mod resolver_selection;
+
+#[test]
+fn resolver_configuration_keeps_offline_commands_offline() {
+    resolver_selection::offline("postgres");
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence() {
+    resolver_selection::connected(&server(), "postgres");
+}
+
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 

@@ -62,8 +62,9 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 
 [ADR-0016](ADR-0016-engine-assisted-planning.md) and
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
-are accepted design; only initial read-only `doctor` environment discovery is
-implemented (#597). Resolver qualification, acquisition and binding evidence
+are accepted design; initial read-only `doctor` environment discovery (#597)
+and named profile selection/policy (#606) are implemented. Resolver qualification,
+acquisition and binding evidence
 remain planned. The design preserves the boundaries
 above: CLI owns resolver lifecycle and reporting; the engine crates own
 environment queries, compatibility rules, scratch DDL and binding extraction;
@@ -96,6 +97,11 @@ own catalog SQL and candidate-family suggestions; CLI `engine` dispatches and
 `doctor` renders. Discovery has no verified state, provisions nothing and
 does not select dependencies. Its partial inventory cannot be reused as an
 ADR-0016 coherent evidence capture (DECISIONS 491).
+
+Named resolver configuration lives in `pbps-config::resolver`. Its tagged source
+profiles and pure precedence lookup contain credential-variable names only.
+CLI exposes the unacquired selection as optional command-summary data, never
+as model evidence or acquisition/compatibility proof (DECISIONS 494).
 
 ## Inviolable constraints
 

@@ -1221,17 +1221,58 @@ evidence contract, implementation boundaries and acceptance tests.
   for this new option. `--resolve-with` requires a target-aware plan and cannot
   turn `--check` or a snapshot preview into a connected operation.
 
-Planned command shape (not accepted by the current binary):
+Selection syntax is implemented (#606); acquisition and binding resolution
+remain unimplemented. Existing connected planning checks still apply:
 
 ```bash
-pbps plan --env prod --resolve-with docker://postgres:18 \
+pbps plan --env prod --resolve-with pg_local \
   --out plan.json --sql plan.sql
 ```
 
-The image above is a candidate, not a claim of compatibility; §9.3.3 governs
-selection and validation. A dedicated scratch-server connection is also an
-accepted resolver source, with credentials referenced through an environment
-variable in configuration.
+The profile name refers to an explicitly configured source, not a verified
+runtime. CLI selection overrides the selected environment's `resolve_with`,
+which overrides the project default. Profiles and their acquisition policies
+are data only; selection reads no resolver credentials and contacts no engine
+or registry. The connected summary reports `resolver_selection` with status
+`not_acquired`, outside the saved plan and its checksum. Until acquisition and
+binding support land, the human report names that limitation; selection does
+not replace or waive any existing planning check.
+
+`pbps.yml` can declare trusted Docker or dedicated-server profiles:
+
+```yaml
+resolve_with: pg_local
+resolvers:
+  pg_local:
+    kind: docker
+    image: postgres:18
+    pull: never
+  internal:
+    kind: docker
+    image: registry.example:5000/team/pg:approved
+    pull: if_missing
+  scratch:
+    kind: server
+    url_env: PBPS_SCRATCH_DB
+environments:
+  prod:
+    url_env: PROD_DB
+    resolve_with: scratch
+```
+
+`pull: never` is the default and requires a preloaded image when acquisition
+is implemented; `if_missing` authorizes acquisition of the configured source
+only when absent. It is not permission for compiled code to access a network.
+Actual digest/platform, build compatibility, instance separation, transport
+and containment still require qualification in the dependent steps. A server
+profile names a separate credential variable, never an inline connection
+string. No fallback to target credentials exists.
+
+A missing selected profile is a named finding (exit 2) before target access or
+output writes. An unused profile/default is not resolved by offline commands,
+`doctor` or `apply`. Explicit `--resolve-with` on an offline/check/preview
+invocation is a conflicting-flags error; configuration alone does not change
+those commands' behavior. See [delivery tracking](RESOLVER-DELIVERY.md).
 
 **Current comes from the target; desired comes from compilation.** Read the
 target's actual bindings, then compile the desired namespace in isolation and
@@ -1359,8 +1400,8 @@ the confidential path.
 #### 9.3.3 Resolver environment discovery (partial delivery)
 
 **Delivery status:** the initial read-only `doctor` subset is implemented
-(#597). Resolver selection, acquisition, compatibility qualification and
-binding evidence remain planned under #595; the requirements below still
+(#597), followed by named profile selection/policy (#606). Resolver acquisition,
+compatibility qualification and binding evidence remain planned under #595; the requirements below still
 govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
 
 `pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
