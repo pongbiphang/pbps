@@ -548,6 +548,14 @@ pub async fn role_owned_securables(
 // The server: what it is and what it can do
 // ---------------------------------------------------------------------------
 
+/// Advisory target observations; never acquires or contacts a resolver.
+pub async fn resolver_discovery(conn: &mut Conn) -> Result<pbps_db::resolver::Discovery, DbError> {
+    match conn.driver() {
+        Driver::Mssql => pbps_mssql::resolver::discover(conn).await,
+        Driver::Postgres => pbps_pg::resolver::discover(conn).await,
+    }
+}
+
 /// The server's version, as text an operator recognises.
 pub async fn server_version(conn: &mut Conn) -> Result<String, DbError> {
     match conn.driver() {

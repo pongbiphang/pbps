@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.
@@ -73,6 +73,8 @@ pub const SCHEMA_VERSION: u32 = 10;
 // 10: all accumulated schema changes after 9, including envelope constraints
 //     and payloads. Versioned archives now pin each set independently of the
 //     current checked-in copies (DECISIONS 465).
+// 11: doctor's advisory resolver environment observations and qualification
+//     gaps for PostgreSQL and SQL Server (ADR-0016; issue #597).
 
 /// Every command that emits an envelope, with the payload its `data` carries.
 ///

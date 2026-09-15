@@ -58,6 +58,12 @@ pub struct EnvDiagnosis {
     /// statement depends on (ADR-0002).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_create_or_alter: Option<bool>,
+    /// Advisory resolver requirements observed on this target. No resolver is
+    /// contacted or provisioned, and no compatibility or binding is certified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<pbps_db::resolver::Discovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver_discovery_unknown: Option<String>,
     /// The permissions pbps needs and this account does not hold.
     pub missing_permissions: Vec<String>,
 
@@ -123,6 +129,8 @@ impl EnvDiagnosis {
             edition: None,
             supports_online: None,
             supports_create_or_alter: None,
+            resolver: None,
+            resolver_discovery_unknown: None,
             missing_permissions: Vec::new(),
             permissions_unknown: false,
             absent_schemas: Vec::new(),
@@ -350,6 +358,7 @@ fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
                         | "permission.unknown"
                         | "state.lock-unknown"
                         | "server.capabilities-unknown"
+                        | "resolver.discovery-unknown"
                 )
         })
         .count()
@@ -662,6 +671,14 @@ async fn examine(
             d.edition = caps.edition;
         }
     }
+    match crate::engine::resolver_discovery(&mut conn).await {
+        Ok(discovery) => d.resolver = Some(discovery),
+        Err(error) => {
+            // Catalog diagnostics are not allowed to echo source supplied by
+            // the server. Preserve a source-free cause/code, as ledger does.
+            d.resolver_discovery_unknown = Some(crate::engine::ledger_safe_reason(&error.into()));
+        }
+    }
     let ask = pbps_db::doctor::Ask {
         managed_schemas: &declared.schemas,
         managed_tables: &declared.tables,
@@ -869,6 +886,18 @@ fn env_findings(
         ),
         _ => {}
     }
+    if let Some(why) = &d.resolver_discovery_unknown {
+        out.push(
+            output::Finding::error(
+                "resolver.discovery-unknown",
+                format!(
+                    "{}: resolver environment discovery could not be completed ({why})",
+                    d.environment
+                ),
+            )
+            .remedy("check target connectivity and catalog-read permissions, then rerun doctor"),
+        );
+    }
     if let Some(why) = &d.server_capabilities_unknown {
         out.push(output::Finding::error(
             "server.capabilities-unknown",
@@ -980,6 +1009,9 @@ fn render(report: &output::Report<Diagnosis>) -> String {
             if let Some(ed) = &e.edition {
                 out.push_str(&format!("                 edition {ed}\n"));
             }
+            if let Some(resolver) = &e.resolver {
+                render_resolver(&mut out, resolver);
+            }
             if e.supports_create_or_alter == Some(false) {
                 out.push_str("                 no CREATE OR ALTER (pre-2016 SP1)\n");
             }
@@ -999,6 +1031,45 @@ fn render(report: &output::Report<Diagnosis>) -> String {
         out.push_str(&output::human(&report.findings));
     }
     out
+}
+
+fn render_resolver(out: &mut String, discovery: &pbps_db::resolver::Discovery) {
+    use pbps_db::resolver::{Candidate, Observation};
+    out.push_str("                 resolver compatibility: unverified (read-only discovery)\n");
+    out.push_str("                 session_* values describe the introspection connection, not qualified deployment settings\n");
+    for (key, fact) in &discovery.observations {
+        let value = match fact {
+            Observation::Observed { value } => value.as_str(),
+            Observation::NotReported => "not reported (absent, hidden or unsupported)",
+            Observation::Unknown { reason } => reason.as_str(),
+        };
+        out.push_str(&format!("                   {key}: {value}\n"));
+    }
+    if let Some(extensions) = &discovery.extensions {
+        out.push_str(&format!(
+            "                   installed extensions: {} (catalog inventory only)\n",
+            extensions.len()
+        ));
+        for extension in extensions {
+            out.push_str(&format!(
+                "                     {} {} in {}\n",
+                extension.name, extension.version, extension.schema
+            ));
+        }
+    }
+    match &discovery.candidate {
+        Candidate::Suggested { image } => out.push_str(&format!(
+            "                   suggested image: {image} (not acquired or verified)\n"
+        )),
+        Candidate::Unavailable { reason } => out.push_str(&format!(
+            "                   no image suggestion: {reason}\n"
+        )),
+    }
+    for (key, fact) in &discovery.qualification {
+        if let Observation::Unknown { reason } = fact {
+            out.push_str(&format!("                   unknown {key}: {reason}\n"));
+        }
+    }
 }
 
 #[cfg(test)]

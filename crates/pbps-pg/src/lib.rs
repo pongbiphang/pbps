@@ -41,6 +41,7 @@ pub mod data_triggers;
 pub mod doctor;
 mod drop_impact;
 mod emit;
+pub mod resolver;
 
 /// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):
 /// `"` quotes an identifier and `[` does not, `E'…'` is an escape string and

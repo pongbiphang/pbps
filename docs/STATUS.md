@@ -101,12 +101,17 @@ say whether what the emitter sent is what comes back.
 
 ### Engine-assisted planning and resolver environments
 
-**Accepted design; not implemented.** [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
+**Initial doctor discovery implemented; resolution remains planned.**
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
 the existing SQL Server `--dev` rehearsal, while adding a distinct future
 `--resolve-with` path for target-aware planning. The current command lists above
-do not include that option; existing version/edition diagnostics are not yet
-the new environment compatibility or binding-evidence system.
+do not include that option. Connected `doctor` reports an advisory target
+environment inventory and known official image-family suggestions for both
+engines, without acquisition. It names unknown qualification requirements;
+session observations do not establish the deployment context. No environment
+has been verified and no binding evidence is produced. See
+[the staged delivery plan](RESOLVER-DELIVERY.md) for #595 and its first child #597.
 
 Delivery is split into three stages:
 
