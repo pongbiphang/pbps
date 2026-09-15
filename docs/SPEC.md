@@ -702,6 +702,9 @@ evidence and target preconditions join the approved plan's checksum. `apply`
 checks those preconditions and executes the fixed plan, without starting a
 resolver or choosing new changes. Unknown required bindings prevent artifact
 creation before deployment approval, not at an interactive production prompt.
+For confidential resolver evidence, the plan checksum remains the approval and
+audit identifier but requires the protected display, invocation and persistence
+paths in §9.3.2/ADR-0016. This does not replace explicit `--checksum` approval.
 
 Because the change set is pinned by checksum, a coarse flag like `--allow` is
 safe: **what gets approved is exactly the plan approved at the deployment gate,
@@ -922,6 +925,17 @@ CREATE TABLE dbo.__pbps_lock (
     locked_at  DATETIME2(3)  NOT NULL
 );
 ```
+
+**Planned confidential resolver artifacts (§9.3.2):** their `plan_checksum`,
+including copies inside snapshots, remains confidential. Resolver publication
+and pre-apply qualification must cover direct ledger readers, database audit/log
+destinations and state/history exports; masking CLI output alone is insufficient.
+Refuse unknown or overly broad access rather than changing grants silently.
+Persist classification in versioned ledger/snapshot metadata with the checksum
+so later readers do not depend on retaining the original plan file.
+Readers must propagate the classification or omit confidential verifiers from
+ordinary output; an unknown historical classification is not proof of publicity.
+Proven legacy formats without this evidence retain ordinary-plan handling.
 
 The **whole snapshot** is stored rather than a delta or a checksum: drift
 detection can then compare in full, the snapshot doubles as a backup, and it can
@@ -1289,6 +1303,15 @@ Ordinary diagnostics/logs/`explain` omit the digests and equivalent guessing
 verifiers; derived checksums inherit confidentiality where they expose the same
 oracle. Do not strip required evidence to produce a public applyable plan.
 ADR-0016 defines this boundary without a new approval or key-management service.
+The boundary includes the plan checksum's existing consumers: protected
+plan/explain/UI/CI output, a private launch environment for literal `--checksum`
+arguments, and qualified ledger/audit/history access. Ordinary explain output
+uses a placeholder rather than printing a confidential checksum or runnable
+approval command. The launch boundary must hold before process arguments or
+shell traces receive the checksum. Publication and pre-apply checks refuse
+unknown ledger/audit protection; no automatic grant changes or alternate
+approval token are introduced. These consumers must be qualified before enabling
+confidential resolver artifacts; existing ordinary plans keep their behavior.
 
 #### 9.3.3 Resolver environment discovery (accepted, not implemented)
 
@@ -1537,6 +1560,12 @@ It answers, from the file alone:
 | What is checked first? | the derived pre-flight probes (7.5), by description |
 | What exactly do I type? | the `apply` command, with the target, `--checksum`, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
 | What am I approving? | the plan checksum `apply` will recompute and require to match the explicit `--checksum` supplied by the deployment gate |
+
+**Planned confidential resolver plans (§9.3.2):** the literal checksum and exact
+approval command above require qualified protected output. Ordinary output
+shows the confidential classification and a placeholder, not the verifier or a
+command ready to execute. Authorized offline review still supplies the same
+checksum through a protected launch path; `apply` does not choose the approval.
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It

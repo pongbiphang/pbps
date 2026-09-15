@@ -12427,6 +12427,12 @@ SPEC is in sync with all of these.
      to authorized recipients, with no verifiers in ordinary diagnostics or
      public derivative checksums. Unknown/public handling refuses; this does
      not introduce an approval service or key-management system.
+     The same classification covers the existing SHA-256 approval/audit value:
+     qualify literal display, command/CI/process-argument paths and ledger,
+     snapshot and history readers before enabling these resolver artifacts.
+     Ordinary output omits the verifier; protected invocation still supplies
+     the human-approved `--checksum`. Unknown or overly broad access refuses,
+     without silently changing grants or replacing the approval mechanism.
      Before source transfer, qualify and enforce engine/platform controls over
      server logging, intermediaries, container capture/forwarding and disposable
      source-bearing storage. Unknown controls refuse reconstruction; client

@@ -371,6 +371,42 @@ publishing such a derivative does not declassify it. Any output carrying them
 needs the same protected handling. Required evidence may not be removed to
 manufacture a publicly shareable applyable plan.
 
+**The plan checksum keeps its approval/audit job and inherits confidentiality.**
+For these new confidential resolver artifacts, qualification must cover every
+checksum consumer before the feature can publish a plan, not just `plan.json`:
+
+- `plan` summaries, human/JSON `explain`, generated commands/SQL comments, UI,
+  hooks and CI logs may show a literal checksum only through a qualified
+  protected output. Ordinary output uses a clearly non-executable placeholder
+  for the confidential checksum; it does not claim to supply the complete
+  approval command. This condition qualifies SPEC §9.6's existing display rule.
+- `apply --checksum` still receives the checksum a human approved, not a
+  substitute token or one computed automatically by the deployment job. Its
+  launch must use a qualified private runner/session whose process arguments,
+  shell history/tracing and job metadata have authorized-only visibility. This
+  boundary must hold before the checksum enters those paths; an `apply` check
+  after process creation cannot undo an argument leak. An integration that
+  cannot provide that boundary cannot run a confidential plan.
+- The existing ledger `plan_checksum` and any snapshot copies remain the audit
+  record. Before publication and again before apply DDL, establish that ledger
+  readers and the applicable database audit/log/export paths meet the same
+  authorization requirement. CLI redaction is not a substitute for protecting
+  direct database reads. Unknown or broader exposure refuses the confidential
+  operation; pbps does not silently change pre-existing grants or audit policy.
+  Persist the classification with the checksum in versioned ledger/snapshot
+  metadata; do not require the original plan file to recover it later.
+  `status`, state/history/list/show/export, diagnostics and ledger fan-out must
+  propagate the classification or omit the verifier from ordinary output.
+
+The implementation must qualify this end-to-end propagation, including failure
+paths, before enabling confidential resolver artifacts. Historical records that
+cannot establish a checksum's safe classification must not assume it public.
+Proven legacy formats without this evidence retain their ordinary-plan handling;
+an absent label alone is not proof of that provenance.
+These are handling requirements for the new evidence-bearing format, not a new
+approval mechanism, ledger service or retrofit of ordinary plans. Plans without
+this confidential evidence retain their existing checksum/CLI behavior.
+
 During the coherent pre-publication and pre-apply captures below, re-read each
 required target input's properties and recompute its fingerprint using the same
 versioned procedure, along with rechecking membership/absence predicates. A
@@ -592,6 +628,17 @@ protection under test is removed.
     and equivalent derived verifiers. An authorized, access-controlled artifact
     can still be reviewed offline and applied without new key-management or
     resolver access; omitting mandatory evidence cannot produce a public plan.
+18. **`confidential_plan_checksums_stay_in_protected_paths` (planned):** trace
+    a confidential plan's exact checksum through plan/explain human and JSON
+    output, command previews, UI/hooks, CI trace/metadata, process arguments and
+    shell history, ledger/snapshot persistence and status/history exports.
+    Ordinary outputs must not expose it or print a runnable checksum command;
+    protected review and launch must still use that exact human-approved SHA-256.
+    An unauthorized direct ledger reader or unqualified audit/runner path refuses
+    publication/application before disclosure or DDL, as appropriate, rather
+    than passing because CLI output was masked. Cover failure paths, unknown
+    historical classification and normal non-confidential plan behavior. Removing
+    a consumer's protection must expose the fixture verifier and fail its test.
 
 ## Delivery and supersession
 
