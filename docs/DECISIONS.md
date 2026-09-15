@@ -12380,6 +12380,13 @@ SPEC is in sync with all of these.
      the desired namespace with its relevant external prerequisites. Old-YAML
      bootstrap is not the current baseline, CREATE success is not complete
      dependency proof, and empty catalogs are not proof of no dependencies.
+     Binding-derived edges order typed changes across object kinds: teardown
+     precedes removal of old inputs and desired inputs precede dependent rebuilds,
+     including routine-driven default/CHECK/index changes. Combine existing
+     structural/data/authorization constraints, refuse unsupported cycles before
+     publication, and seal the final order without hidden SQL. Apply and emitters
+     preserve that order; no runtime dependency choice or ordinary-plan reorder
+     is introduced.
      Runtime/dynamic SQL retains its existing limits. All scratch DDL stays
      outside the target instance/cluster, including when another database or
      connection alias is supplied. Prove separation before scratch DDL or source

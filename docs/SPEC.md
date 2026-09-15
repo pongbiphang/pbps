@@ -1235,6 +1235,17 @@ candidate sets, not just managed objects. Missing definitions, unreadable
 metadata or an environment that cannot be reproduced remain unresolved;
 fabricated stubs never constitute binding evidence.
 
+Resolved dependencies also become cross-kind ordering edges in the final typed
+plan: remove dependents before their old inputs, and establish desired inputs
+before recreating defaults, CHECKs, index predicates or modules. An arriving
+routine must precede the expression rebuild it enables, regardless of today's
+fixed change classes. Combine binding edges with structural, data, identity,
+authorization and restoration constraints; unsupported cycles refuse before
+publication, without hidden SQL or stubs. Seal the ordering evidence and final
+ordered ChangeSet before emission/approval; later consumers preserve it and
+apply never reorders or resolves dependencies. Existing non-resolver ordering
+is unchanged; ADR-0016 requires cross-kind real-engine acceptance cases.
+
 Only supported **creation-time, observable bindings** are covered. PostgreSQL
 coverage is to include views, SQL-standard function bodies and the supported
 routine-header/default/CHECK/index-predicate binding surfaces, with each class

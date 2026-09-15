@@ -93,9 +93,37 @@ observed identities, definitions and dependencies. An unavailable definition,
 unreproducible dependency or unresolved creation-order cycle is a named limit,
 not permission to introduce fake tables, stub functions or parser heuristics.
 Only differences in established desired bindings can supply binding-driven
-rebuild decisions. Their dependency closure, ordering, ACL/owner restoration,
+rebuild decisions. Their dependency closure, ACL/owner restoration,
 unmanaged protection and risk classification remain ordinary typed planning.
 No hidden statement and no `DROP ... CASCADE` is introduced.
+
+**Binding evidence also supplies cross-kind ordering constraints.** Final
+target-aware planning must translate observed current and desired dependencies
+into explicit edges between the approved typed changes. Remove dependent
+expressions before dropping or replacing their current inputs; establish their
+desired tables, columns, routines and required authorization before recreating
+them. This includes defaults, CHECKs and index predicates, not only module-to-module
+edges. An arriving routine must precede the expression rebuild it enables even
+when the existing class order would put `AlterColumnDefault`, `AddCheck` or
+`AddIndex` before `CreateModule`/`AlterModule`. Scratch compilation order alone
+does not fix deployment order, and `depends_on` is not a required workaround.
+
+Combine these edges with existing structural, row-data, identity and restoration
+constraints in deterministic planning, before SQL emission and checksum sealing.
+Preserve the qualified per-statement authorization context at that final order.
+Only split operations through representable, explicitly approved typed changes
+when their intermediate states satisfy those constraints; otherwise report a
+named ordering/cycle limitation before publication. Do not solve a cycle with
+stubs, hidden SQL, unapproved identity intent or a blanket move of all modules
+ahead of tables. An acyclic, representable binding-derived order must not be
+refused merely because it crosses today's fixed classes.
+
+Seal the ordering evidence and final ordered ChangeSet; every later emitter or
+executor must preserve it rather than re-sort by the old classes. Engine adapters
+produce dependency facts; planning consumes them as deterministic data, without
+I/O in the differ or a new SQL-emission path. Apply never derives new edges or
+chooses an order after approval. Existing plans without resolver evidence retain
+their ordering behavior; this is a delivery requirement for the new path.
 
 ### 3. Bound the evidence to what the engine exposes
 
@@ -782,6 +810,19 @@ protection under test is removed.
     separately measured compatible-build mapping are positive controls. Removing
     executable qualification must fail the negative control. Qualify each
     supported engine/platform separately without a target agent or host scan.
+24. **`resolver_orders_cross_kind_binding_changes` (planned):** on PostgreSQL,
+    introduce a managed routine candidate that changes an unchanged default,
+    CHECK or index predicate's desired binding. The saved typed plan and emitted
+    SQL must establish that routine before recreating each affected expression,
+    and transactional apply must succeed with the expected bindings without
+    target drift or a manual `depends_on` hint. Include replacement of an old
+    input requiring dependent teardown first, a routine whose signature needs
+    a table created in the same plan, and required grants/row-data constraints.
+    Check deterministic ordering after save/load and through emission/execution;
+    an unsupported cycle refuses before publication without hidden statements.
+    Restoring the fixed cross-kind class order must fail the negative control.
+    A plan without resolver evidence retains the existing ordering behavior;
+    SQL Server needs its own live cases before its binding adapter is enabled.
 
 ## Delivery and supersession
 
