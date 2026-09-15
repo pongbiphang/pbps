@@ -12404,6 +12404,11 @@ SPEC is in sync with all of these.
      controls before proceeding, not only instance separation. Discard partial
      evidence and restart complete compilation in fresh scratch resources even
      when the replacement qualifies; do not mix results across sessions.
+     Same-connection qualification also needs stable analysis inputs throughout
+     compilation: enforce exclusivity or detect all relevant intervening
+     mutations, including change-and-restore, and discard an invalidated run.
+     Initial/final equality alone is not evidence of stability; these protections
+     apply to scratch, not a new production lock or coordination service.
      Compile under a reproduced, qualified deployment authorization context,
      not the setup administrator's or introspection login's privileges. Pin and
      recheck relevant roles, ownership and effective grants/path visibility,

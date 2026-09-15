@@ -1388,6 +1388,15 @@ controls before further DDL/source transfer or evidence publication. Even a
 compatible replacement restarts complete compilation in fresh run-owned scratch
 resources; never combine old-session results with new-session evidence.
 
+The same connection can still observe in-place changes. Keep all relevant
+resolver settings, authorization and reconstructed namespace stable throughout
+qualification, compilation and evidence capture, using qualified exclusivity
+or mutation detection that catches every relevant intervening change, including
+change-and-restore. Initial/final equality alone is insufficient. Unexpected or
+unanswerable drift discards the entire run and refuses publication or restarts
+complete reconstruction after requalification. Supplied servers must qualify
+this property too; no long production transaction or DDL lock is introduced.
+
 `doctor` will reuse this profile for read-only requirements and candidate
 diagnostics; it does not pull images, create scratch databases or call a mere
 suggestion verified. Connected planning performs the provision-and-verify step

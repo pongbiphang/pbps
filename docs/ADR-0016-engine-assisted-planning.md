@@ -226,6 +226,26 @@ than combining evidence across sessions. Publication must identify the backend
 and qualification that actually produced the complete evidence and retain the
 target-freshness recheck in decision 5.
 
+**A live connection is not a stable resolver environment.** From qualification
+through reconstruction/compilation and freezing the complete binding evidence,
+protect the whole analysis read scope: engine/extension compatibility facts,
+effective settings and authorization, retained prerequisites and reconstructed
+candidate/managed objects. Only this run's explicitly expected setup and
+compilation changes may alter that scope. A unique scratch database name or an
+unchanged connection is not proof that another session cannot mutate it.
+
+Use qualified engine/runtime-enforced exclusivity, or an engine-specific mutation
+detection strategy proven to detect every relevant intervening change, including
+change-and-restore sequences. Comparing initial/final fingerprints alone cannot
+exclude a mixed compilation. A supplied server whose shared instance settings
+or namespace cannot meet this requirement is unsuitable for this analysis.
+Detected or unanswerable in-place drift invalidates all partial/final evidence;
+abort without publishing, or fully requalify and restart complete reconstruction
+in fresh run-owned resources. No result from the invalidated run may be reused.
+These protections are confined to scratch; they do not add a long target
+transaction/DDL lock or a new coordination service. Each engine must qualify
+its strategy before its resolver adapter can produce evidence.
+
 Suggest known official images or team-configured trusted images/registries;
 do not search arbitrary registries or automatically assemble custom images.
 Metadata can describe what is needed without identifying the production
@@ -686,6 +706,16 @@ protection under test is removed.
     including reconnects and peer substitution. Valid authenticated exchanges
     still resolve without imposing private-source logging prerequisites on this
     case; removing channel authentication must fail the negative control.
+21. **`resolver_in_place_mutations_cannot_seal_mixed_evidence` (planned):** keep
+    the resolver connection alive while a second session attempts relevant
+    extension/settings, authorization or reconstructed candidate changes between
+    compilation steps. Include a change restored before the final fingerprint
+    check. Qualified exclusion must prevent the change, or the complete run must
+    be invalidated without publication; a later matching fingerprint cannot
+    rescue partial bindings. Cover shared instance facts on supplied servers,
+    clean full restart after requalification and an unchanged run that succeeds.
+    The negative control must fail when stability protection is removed, with
+    no target writer or production lock required.
 
 ## Delivery and supersession
 
