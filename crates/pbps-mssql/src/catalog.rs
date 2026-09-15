@@ -187,6 +187,11 @@ SELECT DISTINCT d.referencing_id, d.referenced_id
  WHERE d.referenced_id IS NOT NULL
  ORDER BY d.referencing_id, d.referenced_id;";
 
+// Non-schema-bound FN and TF functions can be created while a referenced
+// table is absent (pinned against SQL Server by the deferred-resolution live
+// test). Including them in the temporal omission closure would discard
+// modules bootstrap can create; views, inline functions and schema-bound
+// functions require their references to exist already.
 fn requires_bound_references(type_code: &str, schema_bound: bool) -> bool {
     matches!(type_code.trim(), "V" | "IF") || schema_bound
 }

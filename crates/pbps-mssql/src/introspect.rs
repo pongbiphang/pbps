@@ -195,8 +195,9 @@ pub struct RawModule {
     pub definition: Option<String>,
     /// A trigger's table, as `(schema, table)`.
     pub parent: Option<(String, String)>,
-    /// Views and inline table-valued functions bind referenced objects when
-    /// they are created; other T-SQL modules permit deferred name resolution.
+    /// Views, inline table-valued functions and schema-bound modules require
+    /// referenced objects at creation. Non-schema-bound scalar and multi-
+    /// statement table-valued functions permit deferred table resolution.
     pub requires_bound_references: bool,
     /// Whether the module was created with `QUOTED_IDENTIFIER` and `ANSI_NULLS`
     /// both ON, which is what a `CREATE OR ALTER` sent by pbps will run under.
@@ -640,6 +641,41 @@ fn action(code: u8) -> ReferentialAction {
     }
 }
 
+fn extend_unavailable_modules<'a>(
+    modules: &[RawModule],
+    dependencies: impl IntoIterator<Item = &'a RawObjectDependency>,
+    unavailable: &mut BTreeSet<i32>,
+) {
+    let bound: BTreeSet<_> = modules
+        .iter()
+        .filter(|module| module.requires_bound_references)
+        .map(|module| module.object_id)
+        .collect();
+    let mut dependents: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for dependency in dependencies {
+        if bound.contains(&dependency.referencing_object_id) {
+            dependents
+                .entry(dependency.referenced_object_id)
+                .or_default()
+                .push(dependency.referencing_object_id);
+        }
+    }
+
+    // Follow reverse edges from omitted objects, so catalog order cannot make
+    // a long chain rescan every module and edge. Only newly unavailable IDs
+    // enter the worklist; cycles and shared dependencies are visited once.
+    let mut pending: Vec<_> = unavailable.iter().copied().collect();
+    while let Some(object_id) = pending.pop() {
+        if let Some(modules) = dependents.remove(&object_id) {
+            for module in modules {
+                if unavailable.insert(module) {
+                    pending.push(module);
+                }
+            }
+        }
+    }
+}
+
 /// Assembles the raw catalog rows into a [`Schema`].
 ///
 /// Rows referring to an object id that is not in `tables` are ignored: the
@@ -708,22 +744,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 
     // Grow the unavailable set before assembling either constraints or
     // modules. Both can bind an object that was omitted from the declarations.
-    loop {
-        let mut changed = false;
-        for module in &raw.modules {
-            if module.requires_bound_references
-                && raw.object_dependencies.iter().any(|dependency| {
-                    dependency.referencing_object_id == module.object_id
-                        && unavailable_object_ids.contains(&dependency.referenced_object_id)
-                })
-            {
-                changed |= unavailable_object_ids.insert(module.object_id);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    extend_unavailable_modules(
+        &raw.modules,
+        &raw.object_dependencies,
+        &mut unavailable_object_ids,
+    );
 
     for c in &raw.columns {
         let Some(table) = tables.get_mut(&c.object_id) else {
@@ -2515,6 +2540,57 @@ mod module_tests {
             pulled.unmanaged_modules[0]
                 .why
                 .contains("system versioning")
+        );
+    }
+
+    #[test]
+    fn unavailable_dependency_closure_visits_each_edge_once() {
+        use std::cell::Cell;
+
+        let mut modules: Vec<_> = (2..=65)
+            .rev()
+            .map(|id| {
+                let mut view = module("dbo", &format!("v_{id}"), ModuleKind::View, None);
+                view.object_id = id;
+                view
+            })
+            .collect();
+        let mut deferred = module("dbo", "p_deferred", ModuleKind::Procedure, None);
+        deferred.object_id = 100;
+        let mut behind_deferred = module("dbo", "v_deferred", ModuleKind::View, None);
+        behind_deferred.object_id = 101;
+        modules.extend([deferred, behind_deferred]);
+        let mut dependencies: Vec<_> = (2..=65)
+            .rev()
+            .map(|id| RawObjectDependency {
+                referencing_object_id: id,
+                referenced_object_id: id - 1,
+            })
+            .collect();
+        // A reachable cycle still terminates. Deferred and unknown modules
+        // cannot carry omission through to their dependents; an unseeded
+        // cycle does not itself make an object unavailable.
+        dependencies.extend([(2, 65), (100, 1), (101, 100), (200, 1), (101, 101)].map(
+            |(referencing_object_id, referenced_object_id)| RawObjectDependency {
+                referencing_object_id,
+                referenced_object_id,
+            },
+        ));
+        let visits: Vec<_> = dependencies.iter().map(|_| Cell::new(0)).collect();
+        let mut unavailable = BTreeSet::from([1]);
+        extend_unavailable_modules(
+            &modules,
+            dependencies.iter().enumerate().map(|(index, dependency)| {
+                visits[index].set(visits[index].get() + 1);
+                dependency
+            }),
+            &mut unavailable,
+        );
+
+        assert_eq!(unavailable, (1..=65).collect());
+        assert!(
+            visits.iter().all(|count| count.get() == 1),
+            "each catalog edge must be read once: {visits:?}"
         );
     }
 
