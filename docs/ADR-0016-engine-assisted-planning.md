@@ -293,6 +293,26 @@ retained external prerequisites, not to the user's managed declarations and
 explicit typed changes that the reviewed deployment already needs to contain.
 
 **Qualify source handling before sending the source, not after an error.**
+Before requesting private target inputs or sending them to scratch, qualify
+the actual transport and peer on both legs, including apply's target re-reads.
+Remote transport requires authenticated encryption with verified peer identity
+using an approved trust root or pinned peer key/certificate. Plaintext,
+opportunistic downgrade and encryption with certificate/identity checks disabled
+do not qualify. An authenticated tunnel qualifies only if every remaining hop
+is encrypted/authenticated or inside a qualified private boundary; an unverified
+backend hop after TLS termination is not silently exempt. Pin this qualification
+to the actual connections and re-establish it on reconnect or endpoint changes.
+
+A local socket or run-private control channel may qualify through tested peer
+authentication and host/runtime isolation instead of TLS, but `localhost`, a
+container label or an exposed host port alone is not proof. Unknown protection
+or peer identity refuses before a source-bearing query/transfer, not after data
+has crossed the channel. Secure acquisition of per-run trust material must not
+fall back to accepting any certificate. This extends the private-input resolver
+path, not the defaults of unrelated existing connection workflows, and adds no
+resolver connection during apply. Transport facts remain the connection layer's
+responsibility; engine identity/compatibility and caller policy remain separate.
+
 For both containers and supplied scratch servers, a versioned engine/platform
 safety profile must establish effective suppression of source-bearing statement,
 parameter, audit, trace and failed-statement logging. Cover the server and any
@@ -639,6 +659,16 @@ protection under test is removed.
     than passing because CLI output was masked. Cover failure paths, unknown
     historical classification and normal non-confidential plan behavior. Removing
     a consumer's protection must expose the fixture verifier and fail its test.
+19. **`private_resolver_inputs_require_verified_transport` (planned):** cover
+    both target capture/recheck and scratch transfer with disposable endpoints.
+    Plaintext, downgrade, an untrusted/wrong peer and an unprotected backend hop
+    must refuse before a private definition or property crosses the channel;
+    prove this using a controlled interception fixture and confidential marker.
+    Valid authenticated encryption and a separately qualified local private
+    channel must pass. Include reconnect/endpoint substitution, failed trust
+    setup and apply-time target re-reads without any scratch connection. A
+    certificate-validation bypass or localhost-only exemption must fail the
+    negative control, independently for each supported engine/transport.
 
 ## Delivery and supersession
 

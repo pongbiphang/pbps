@@ -12435,7 +12435,10 @@ SPEC is in sync with all of these.
      without silently changing grants or replacing the approval mechanism.
      Before source transfer, qualify and enforce engine/platform controls over
      server logging, intermediaries, container capture/forwarding and disposable
-     source-bearing storage. Unknown controls refuse reconstruction; client
+     source-bearing storage. Private target reads and scratch transfers also
+     require verified confidential transport and peer identity, including each
+     hop and apply's target rechecks; localhost or unverified TLS is not proof.
+     Unknown controls refuse reconstruction; client
      redaction and database deletion are not proof of no retained copies. Do not
      disable pre-existing audit policies. ADR-0016 defines the trusted-runtime
      boundary and required negative tests for both isolation and source handling.
