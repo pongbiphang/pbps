@@ -1355,6 +1355,20 @@ edition limits remain independent checks. A Developer scratch run cannot waive
 target edition checks, and Azure products cannot be mapped to boxed SQL Server
 by comparing version numbers alone.
 
+Require qualified provenance/content identity for the actual target and resolver
+engine plus analysis-relevant loaded or required native libraries, including
+extensions and parser hooks. Matching reported versions or catalog fingerprints
+do not establish equivalence between vendor-patched or locally rebuilt binaries.
+Accept identical qualified content or a versioned, real-engine-tested mapping
+for the identified builds and analysis scope; unknown identity or unmeasured
+differences refuse. Read-only runtime/provisioning evidence must establish the
+actual backend's loaded/required content, not merely files on disk or a candidate
+image digest. Seal identities and the compatibility rule in the evidence manifest,
+maintain scratch stability and recheck target executable prerequisites at every
+capture, including publication and both apply captures. No new target agent,
+binary copying, host scan or attestation service is introduced; inadequate
+hosted-product evidence remains an explicit unsupported case (ADR-0016).
+
 Compatibility includes the effective deployment authorization context, not
 merely the introspection or scratch administrator's login. Capture and reproduce
 the relevant roles/principals, memberships, ownership, schema/object privileges

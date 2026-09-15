@@ -209,6 +209,35 @@ scratch success cannot override them. Azure product versions are not boxed
 SQL Server version selectors, and a Linux container is not automatically
 equivalent to a deployment using platform-specific features.
 
+**Reported versions are not executable identity.** Qualify the provenance and
+content identity of the actual engine and analysis-relevant native libraries,
+including loaded extensions, parser hooks and their relevant runtime dependencies,
+on both target and resolver. Same-version vendor patches or local rebuilds are
+not automatically equivalent. Require matching executable content or a versioned,
+real-engine-tested compatibility rule for the specific identified builds and
+analysis scope; an unmeasured difference or unknown required identity refuses
+evidence. A Docker digest identifies a candidate runtime, not modified mounts or
+the target's loaded code. Catalog extension versions alone cannot close this gap.
+
+Use qualified read-only runtime/provisioning evidence from the trusted deployment
+boundary, bound to the actual backend and loaded content. A file currently on
+disk, an operator-entered version or an unverified build manifest does not prove
+what a running backend loaded or will load during the covered analysis. Include
+required late-loaded code in qualification; if that set or its identity cannot
+be established, refuse the affected resolver operation. This does not require
+a new production agent, arbitrary host-file scanning, copying target binaries
+or a new attestation service. A hosted product without adequate qualified
+evidence remains unsupported for this analysis, not equivalent by product name.
+
+Seal these identities and the compatibility-rule version in decision 5's
+environment/input manifest, and requalify them on reconnect or replacement.
+The existing stability contract covers executable replacement and loading during
+scratch compilation. Target capture, publication and both apply captures must
+validate the relevant running/required executable identities as non-snapshot
+inputs; changed or unreadable premises invalidate evidence even if catalog
+fingerprints and retained bindings match. Apply only verifies those sealed
+inputs and never starts a resolver or accepts a new build mapping.
+
 **Qualification belongs to the actual backend/session and analysis run, not
 the resolver URL.** Pin the concrete connection used for reconstruction and
 binding reads. A reconnect, failover, pooled-session replacement or runtime
@@ -741,6 +770,18 @@ protection under test is removed.
     or grant and the sealed post-apply manifest matches. Neither case starts a
     resolver during apply. Omitting the closing manifest check must fail the
     negative control; do not claim to catch writes after the last observation.
+23. **`same_version_builds_do_not_imply_resolver_equivalence` (planned):** use
+    real-engine fixtures with distinct same-version engine or extension builds,
+    including a parser-hook library that changes creation-time binding while
+    reported versions, candidate identities and retained bindings still match.
+    Unqualified executable differences must prevent publication; changing a
+    pinned executable before apply must refuse without success recording, even
+    with no concurrent target writer. Cover a running backend with an older
+    loaded library than the file on disk, required late loading, unreadable
+    provenance and replacement/reconnect. Identical qualified content and a
+    separately measured compatible-build mapping are positive controls. Removing
+    executable qualification must fail the negative control. Qualify each
+    supported engine/platform separately without a target agent or host scan.
 
 ## Delivery and supersession
 

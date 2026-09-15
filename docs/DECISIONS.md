@@ -12399,6 +12399,14 @@ SPEC is in sync with all of these.
      compatibility checks cover both PostgreSQL and SQL Server first. A Docker
      tag is a candidate, not verified compatibility; acquisition is explicit,
      lazy, policy-bound and usable with local images/internal registries.
+     Reported versions are not executable identity: qualify actual engine and
+     relevant loaded/required native-library provenance and content on both
+     sides. Only matching content or a measured, versioned mapping of identified
+     builds establishes compatibility; unknown provenance or same-version local
+     patches cannot pass by catalog equality. Seal these prerequisites and
+     validate them through capture, reconnect, scratch stability and apply;
+     qualified read-only deployment evidence introduces no target agent, host
+     scan, binary copying or new attestation service.
      Qualification belongs to the actual backend/session: reconnects, failovers
      and replacements recheck full compatibility, effective settings and safety
      controls before proceeding, not only instance separation. Discard partial
