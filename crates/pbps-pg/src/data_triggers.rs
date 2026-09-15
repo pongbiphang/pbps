@@ -272,7 +272,8 @@ async fn walk(
 async fn lock_by_oid(conn: &mut Conn, relation: i64) -> Result<(), DbError> {
     let rows = conn
         .query(&format!(
-            "SELECT n.nspname AS schema_name, c.relname AS table_name
+            "SELECT n.nspname AS schema_name, c.relname AS table_name,
+                    c.relkind = 'p' AS partitioned
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE c.oid = {relation}::pg_catalog.oid"
@@ -283,13 +284,23 @@ async fn lock_by_oid(conn: &mut Conn, relation: i64) -> Result<(), DbError> {
     let name = row.try_get::<&str>("table_name")?.ok_or_else(missing)?;
     let (schema, name) = (schema.to_owned(), name.to_owned());
     let table = TableName::new(&schema, &name);
+    // Referential actions use ONLY: an ordinary inheritance child is not in
+    // their write set. A partition tree cannot contain plain inheritance
+    // edges (measured on 16/18), so keep its one recursive LOCK statement;
+    // enumerating partitions before locking them would introduce a new gap.
+    // A relation cannot become partitioned without replacing its oid (489).
+    let only = if row.try_get::<bool>("partitioned")?.ok_or_else(missing)? {
+        ""
+    } else {
+        "ONLY "
+    };
     // ROW EXCLUSIVE needs INSERT, UPDATE, DELETE or TRUNCATE on the table;
     // measured on 18.6, SELECT alone is `permission denied`. The engine runs
     // the action as the referencing table's owner and so needs none of them,
     // which makes this the one plan the closure can refuse for a reason that
     // is not a trigger at all: say which table and why (DECISIONS 451).
     conn.execute(&format!(
-        "LOCK TABLE {}.{} IN ROW EXCLUSIVE MODE",
+        "LOCK TABLE {only}{}.{} IN ROW EXCLUSIVE MODE",
         ident(&schema),
         ident(&name)
     ))
