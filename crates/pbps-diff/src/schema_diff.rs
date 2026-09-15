@@ -413,361 +413,14 @@ pub fn diff_partial(
     // with the name it will have. Two changes to one object are therefore
     // sorted against two different spellings of it, and the alphabet — not the
     // dependency — decides which wins. Anything with a real order between them
-    // belongs in separate `order_key` classes; this tiebreaker cannot express
-    // it.
+    // belongs in ordering classes or explicit dependency edges; this
+    // tiebreaker cannot express it.
     // Rows follow the foreign keys among the tables that declare them. The
     // declared side is the right one to read: a row being inserted is going
     // into the schema as it will be, not as it was.
     let data_rank = rank_of_tables(&pbps_model::data::insertion_order(declared.schema));
     // Roles that are dropped together are ordered parent before member.
     let role_rank = member_depth(&planned);
-    // A table renamed onto a name a drop in this same plan vacates is
-    // otherwise refused mid-apply: PostgreSQL keeps an index — and the index
-    // behind a named primary key or unique constraint — in the schema's
-    // relation namespace (issue #176), so `RenameTable`'s class-1 ordering
-    // ahead of `DropIndex`/`DropUnique`/a primary-key drop's class 2 claims
-    // that name before the drop frees it. Measured end to end: `app.old`
-    // renamed to `app.target` while `app.other` drops an index named
-    // `target` plans `rename_table` then `drop_index`, and PostgreSQL
-    // refuses the rename with `42P07: relation "target" already exists` —
-    // even though `check_index_names` (176) sees no collision at all in the
-    // plan's *final* declared schema. A valid plan refused is always fixed
-    // (AGENTS.md), regardless of which pass the defect is in.
-    //
-    // Only `DropIndex`, `DropUnique` and a primary-key drop ever *free* a
-    // name this namespace holds — the same boundary `check_index_names`
-    // draws, so a check constraint (no backing index) never moves for this
-    // reason. `DropForeignKey` moves too, but for the second, separate
-    // reason below.
-    //
-    // Two guards keep the move safe rather than trading one ordering bug for
-    // another — both measured on `pbps-test-pg-cw`, not assumed:
-    //
-    // - `DropUnique` and the primary-key drop stay where they were if their
-    //   own table is itself some `RenameTable`'s target in this plan. Both
-    //   run as `ALTER TABLE <table> DROP CONSTRAINT`, so moving one ahead of
-    //   the rename that gives its table that very name has the statement
-    //   name a relation that does not exist yet.
-    //
-    //   `DropIndex` is deliberately not on this list. This whole move only
-    //   ever runs where `indexes_share_namespace_with_tables` is true, which
-    //   today is PostgreSQL alone, and `pbps-pg`'s `emit.rs` renders the
-    //   change as `DROP INDEX <schema>.<name>` — no `ALTER TABLE`, so no
-    //   dependency on the table's current spelling at all (SQL Server's own
-    //   `DROP INDEX <name> ON <table>` does name the table, but never reaches
-    //   here: it never shares this namespace, so this whole apparatus is
-    //   always a no-op for it). Measured: excluding `DropIndex` the same way
-    //   as the other two reproduces the identical bug one level down —
-    //   `app.old` owns an index literally named `target` and is itself the
-    //   table renamed to `app.target`; keeping the drop in place after the
-    //   rename hits the same `42P07`, and moving only the index drop ahead of
-    //   the rename (nothing else about it) clears it.
-    // - A `DropForeignKey` moves into the same class as a freeing drop it
-    //   shares the plan with — unless *its own* table is itself some
-    //   `RenameTable`'s target, the same reason as `DropUnique` above, since
-    //   `DropForeignKey` also runs as `ALTER TABLE ... DROP CONSTRAINT`.
-    //   `dependency_rank` below already ranks every foreign-key drop ahead of
-    //   every candidate-key drop it shares a class with, as a blanket
-    //   layering rather than a per-object graph (its own comment: "matching
-    //   suppliers by name would add a way to fail... and buy nothing"); this
-    //   move does not change that rule, it only puts a foreign-key drop and a
-    //   freeing drop in the same class so the existing rule can order them
-    //   there instead of leaving the foreign-key drop stranded in class 2,
-    //   after a rename it needed to precede. Measured: a foreign key
-    //   referencing the very constraint a freeing drop lifts plans
-    //   `drop_foreign_key`, `drop_unique`, `rename_table` in that order, and
-    //   PostgreSQL takes all three — the previous code refused to reorder at
-    //   all the moment *any* `DropForeignKey` was anywhere in the plan, which
-    //   was wrong in the opposite direction from the bug it was guarding.
-    //
-    //   One case is still refused, and is exactly what #467 (rewritten) now
-    //   tracks: a table's *own* foreign-key drop cannot move ahead of that
-    //   table's own rename (the first bullet above forces it to stay), so if
-    //   some *other* table's drop frees the very name this table renames
-    //   onto, the plan is refused just as before. Measured: `app.old2`
-    //   renames to `app.target2` and also drops its own foreign key, while
-    //   `app.other2` frees `target2` by dropping a unique constraint of that
-    //   name — refused with the same `42P07`. Moving the pinned foreign-key
-    //   drop early regardless does not fail *safely* either: `ALTER TABLE
-    //   app.target2 DROP CONSTRAINT ...` ahead of the rename resolves
-    //   `target2` to `app.other2`'s not-yet-dropped backing index, not to
-    //   `old2` at all, and PostgreSQL refuses it as an operation indexes do
-    //   not support. Telling this case apart from the safe one above needs
-    //   exactly the per-object foreign-key reference data `Change` still does
-    //   not carry.
-    let renamed_to: BTreeSet<TableName> = planned
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { to, .. } => Some(to.clone()),
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
-        })
-        .collect();
-    // Whether `table`'s current spelling is itself some `RenameTable`'s
-    // target in this plan — an `ALTER TABLE <table> ...` drop on it needs
-    // that rename to have already run (measured above).
-    let needs_its_own_rename_first = |table: &TableName| renamed_to.contains(table);
-    // A cross-schema rename (`s1.old` -> `s2.target`) is `emit.rs`'s
-    // `rename_table` running two statements, not one: `ALTER TABLE s1.old
-    // SET SCHEMA s2;` lands the table at the *intermediate* name `s2.old`
-    // first, and only `ALTER TABLE s2.old RENAME TO target;` after that gives
-    // it its declared name. `renamed_to` above only knows the second name;
-    // measured on `pbps-test-pg-cw`, an index named `old` elsewhere in `s2`
-    // is a real, distinct collision the first statement hits with `relation
-    // "old" already exists in schema "s2"`, and dropping that index first is
-    // exactly what turns the plan valid. So the intermediate name is claimed
-    // too, and needs to free the same way the final one does — both are
-    // claimed by the very same `RenameTable`, so this changes what
-    // `frees_a_renamed_name` checks against, not the sort itself.
-    //
-    // Only when *both* the schema and the name change: a same-schema rename
-    // never runs `SET SCHEMA` at all (`at` starts and stays at `from`'s
-    // schema), and a schema-only move (`from.name == to.name`) lands on its
-    // declared name in that one statement, so `renamed_to` already has it.
-    let claimed_by_a_rename: BTreeSet<TableName> = planned
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. }
-                if from.schema != to.schema && from.name != to.name =>
-            {
-                Some(TableName::new(to.schema.clone(), from.name.clone()))
-            }
-            Change::RenameTable { .. }
-            | Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
-        })
-        .chain(renamed_to.iter().cloned())
-        .collect();
-    // Whether dropping `freed_name` from `table`'s schema frees a name some
-    // `RenameTable` in this plan is waiting to claim — either its final
-    // declared name, or the intermediate one a cross-schema rename passes
-    // through first (above).
-    let frees_a_renamed_name = |table: &TableName, freed_name: &str| -> bool {
-        claimed_by_a_rename.contains(&TableName::new(table.schema.clone(), freed_name.to_owned()))
-    };
-    // A cross-schema `RenameTable`'s own table's final identity — the set
-    // `DropIndex` must *not* be exempted for, unlike the same-schema case
-    // round 2 fixed. `DropIndex`'s only field for its object's location is
-    // `table`, and `diff_constraints` always fills it with the table's
-    // *declared* (final, destination) schema, never wherever the table
-    // actually is when the drop runs. Within one schema that spelling is
-    // right throughout, which is why round 2's exemption is safe there.
-    // Across schemas it is not: `emit.rs` renders `DROP INDEX
-    // <table.schema>.<name>`, so a table's own index, moved ahead of that
-    // same table's cross-schema rename, becomes `DROP INDEX
-    // <destination>.<name>;` before `SET SCHEMA` has moved the object into
-    // that schema at all.
-    //
-    // Measured on `pbps-test-pg-cw`: `s1.old` (renaming to `s2.target`) owns
-    // a plain index literally named `target`. Moved fully ahead, `DROP
-    // INDEX "s2"."target";` refuses with `index "target" does not exist`
-    // (it is still `s1.target`); left fully behind (this fix's fallback),
-    // the rename's own `RENAME TO target` refuses first with the original
-    // `42P07` (the index has not moved yet). The only order that succeeds
-    // at all runs the drop *between* the rename's two statements — `SET
-    // SCHEMA` first, then the drop, then `RENAME TO` — which this sorter
-    // cannot express: `RenameTable` is one `Change`, not two independently
-    // orderable ones. Separately confirmed: `DROP INDEX "s1"."target";`
-    // (the *source* schema) ahead of the whole rename does apply clean, so
-    // the plan is genuinely satisfiable — the `Change` model just cannot
-    // say so yet. Tracked in #484, not attempted here.
-    //
-    // So none of a table's own indexes count as freeing anything while that
-    // table is mid a cross-schema rename, regardless of which name — final
-    // or intermediate — would otherwise match: every one of them is stamped
-    // with the same wrong-until-`SET SCHEMA` schema, not only the one whose
-    // name happens to collide.
-    let cross_schema_rename_targets: BTreeSet<TableName> = planned
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(to.clone()),
-            Change::RenameTable { .. }
-            | Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
-        })
-        .collect();
-    let is_a_freeing_drop = |c: &Change| -> bool {
-        match c {
-            Change::DropIndex { table, name } => {
-                !cross_schema_rename_targets.contains(table) && frees_a_renamed_name(table, name)
-            }
-            Change::DropUnique { table, name } => {
-                !needs_its_own_rename_first(table) && frees_a_renamed_name(table, name)
-            }
-            Change::SetPrimaryKey {
-                table,
-                to: None,
-                from: Some(pk),
-            } => match pk.name.as_deref() {
-                Some(name) => {
-                    !needs_its_own_rename_first(table) && frees_a_renamed_name(table, name)
-                }
-                None => false,
-            },
-            Change::SetPrimaryKey { .. }
-            | Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::AddUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. } => false,
-        }
-    };
-    let has_a_freeing_drop = planned.iter().any(|p| is_a_freeing_drop(&p.change));
-    // A foreign-key drop pinned to its own table's post-rename spelling
-    // (measured above) cannot safely move; when one exists, nothing moves,
-    // rather than risk moving a freeing drop ahead of a foreign-key drop
-    // that, for all this plan's `Change`s say, might depend on it (#467).
-    let has_a_pinned_foreign_key_drop = planned.iter().any(|p| {
-        matches!(&p.change, Change::DropForeignKey { table, .. } if needs_its_own_rename_first(table))
-    });
-    let can_reorder = dialect.indexes_share_namespace_with_tables()
-        && has_a_freeing_drop
-        && !has_a_pinned_foreign_key_drop;
-    let moves_ahead_of_the_rename = |c: &Change| -> bool {
-        if !can_reorder {
-            return false;
-        }
-        match c {
-            Change::DropIndex { .. } | Change::DropUnique { .. } | Change::SetPrimaryKey { .. } => {
-                is_a_freeing_drop(c)
-            }
-            Change::DropForeignKey { table, .. } => !needs_its_own_rename_first(table),
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::AddUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. } => false,
-        }
-    };
     // The tables a `RenameColumn` in this plan claims a column name on. Both
     // this and the drops below carry `declared_table_name` (`diff_columns`),
     // so the two spellings meet.
@@ -876,11 +529,7 @@ pub fn diff_partial(
     // classes without a new ordinal shifting every one below it — the cost
     // `order_key`'s own doc names.
     let sort_class = |c: &Change| -> (u8, u8) {
-        if moves_ahead_of_the_rename(c) {
-            // Ahead of the table rename whose name it frees, and ahead of
-            // everything else that class holds.
-            (1, 0)
-        } else if frees_a_renamed_column(c) {
+        if frees_a_renamed_column(c) {
             // Between the constraint and index drops of class 2 — a column a
             // check or an index names cannot be dropped while they stand —
             // and the `RenameColumn` of class 3 that is waiting for its name.
@@ -912,6 +561,7 @@ pub fn diff_partial(
             format!("{:?}", p.change),
         )
     });
+    crate::rename_order::order(&mut planned, base, &renames, dialect);
     Diffed {
         changes: ChangeSet { changes: planned },
         errors: errs,
@@ -2277,8 +1927,9 @@ fn diff_modules(
 
 /// The order of application.
 ///
-/// The table rename comes first, so every later step can use current names,
-/// and the constraint and index drops come next: they must precede both the
+/// Ordinarily the table rename comes first, so later steps use current names.
+/// The specific freeing-drop graph may order some drops around it and supplies
+/// their execution addresses (DECISIONS 496). Remaining constraint and index drops come next: they must precede both the
 /// column renames they would otherwise block and the column drops they
 /// reference. Adding them back must follow adding columns.
 /// Inserting a class shifts every class below it, and these ordinals are
@@ -5799,19 +5450,10 @@ mod tests {
         );
     }
 
-    /// The one case this fix still refuses, and what #467 (rewritten) now
-    /// tracks: a foreign-key drop pinned to its *own* table's post-rename
-    /// spelling cannot move ahead of that table's own rename (the same
-    /// reason `DropUnique` stays put in that position), so when some *other*
-    /// table's drop frees the exact name this table renames onto, nothing
-    /// reorders and the plan is refused exactly as it was before this
-    /// round's fix. Measured on `pbps-test-pg-cw`: moving the pinned drop
-    /// early regardless does not even fail *safely* — the not-yet-renamed
-    /// table's new name resolves to the freeing drop's own backing index
-    /// instead, and PostgreSQL refuses it as an operation indexes do not
-    /// support.
+    /// An unrelated FK stays after its owner's rename without pinning the
+    /// other table's freeing unique drop (issue #467).
     #[test]
-    fn a_foreign_key_drop_pinned_to_its_own_renamed_table_blocks_all_reordering() {
+    fn an_unrelated_foreign_key_keeps_its_owner_name_without_blocking_other_drops() {
         let mut old_t = table(&[
             ("id", Column::new(ty("int"))),
             ("parent_id", Column::new(ty("int"))),
@@ -5852,9 +5494,8 @@ mod tests {
         );
         assert_eq!(
             kinds(&cs),
-            ["RenameTable", "DropForeignKey", "DropUnique"],
-            "the renamed table's own foreign-key drop cannot move ahead of \
-             its own rename, so nothing else moves either: {cs:?}"
+            ["DropUnique", "RenameTable", "DropForeignKey"],
+            "only a referencing FK must precede the freeing key: {cs:?}"
         );
     }
 
@@ -5955,21 +5596,10 @@ mod tests {
         );
     }
 
-    /// Round-4 review finding: round 2's "`DropIndex` never needs its own
-    /// table's current name" conclusion was correct but incomplete — the
-    /// schema qualifier is still there, and for a cross-schema rename the
-    /// schema in `DropIndex`'s declared identity is the *destination*, not
-    /// wherever the table currently is. `s1.old` (renaming to `s2.target`)
-    /// owns a plain index literally named `target`; measured on
-    /// `pbps-test-pg-cw`, moving it fully ahead of the rename produces
-    /// `DROP INDEX "s2"."target";` while the index is still `s1.target`
-    /// (`index "target" does not exist`), and leaving it in place hits the
-    /// same `42P07` the rename was already refusing. Neither flat order
-    /// works — the only one that does runs the drop between the rename's
-    /// two statements, which this sorter cannot express — so this stays
-    /// refused rather than reordered unsafely.
+    /// Moving a filtered index drop ahead of its own cross-schema rename
+    /// must update the typed address, including the recorded filter removal.
     #[test]
-    fn a_cross_schema_renames_own_index_is_not_moved_even_when_it_matches_the_final_name() {
+    fn a_cross_schema_renames_own_index_uses_its_source_address_before_the_rename() {
         let mut old_t = table(&[("id", Column::new(ty("int")))]);
         old_t.indexes.insert(
             "target".into(),
@@ -5980,7 +5610,7 @@ mod tests {
                 }],
                 include: vec![],
                 unique: false,
-                filter: None,
+                filter: Some("id > 0".into()),
             },
         );
         let base = schema_of("s1.old", old_t);
@@ -5997,9 +5627,190 @@ mod tests {
         );
         assert_eq!(
             kinds(&cs),
-            ["RenameTable", "DropIndex"],
-            "the drop's own table is mid a cross-schema rename, so it never \
-             counts as freeing anything and stays in its ordinary place: {cs:?}"
+            ["DropIndex", "RenameTable"],
+            "the drop must precede SET SCHEMA and carry its source address: {cs:?}"
+        );
+        assert!(
+            matches!(&cs.changes[0].change, Change::DropIndex { table, .. } if table.to_string() == "s1.old")
+        );
+        let mut recorded = pbps_model::Declared::from_schema(&base);
+        recorded.advance(&cs);
+        assert!(recorded.expressions.filters.is_empty(), "{recorded:?}");
+    }
+
+    #[test]
+    fn a_referencing_foreign_key_uses_its_source_name_before_freeing_its_rename() {
+        let mut owner = table(&[("id", Column::new(ty("int")))]);
+        owner.unique.insert("target".into(), unique(&["id"]));
+        let mut child = table(&[("id", Column::new(ty("int")))]);
+        child
+            .foreign_keys
+            .insert("fk_child".into(), fk(&["id"], "app.owner", &["id"]));
+        let base = two_tables(("app.owner", owner), ("app.old", child));
+        let declared = two_tables(
+            ("app.owner", table(&[("id", Column::new(ty("int")))])),
+            ("app.target", table(&[("id", Column::new(ty("int")))])),
+        );
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["DropForeignKey", "DropUnique", "RenameTable"]);
+        assert!(
+            matches!(&cs.changes[0].change, Change::DropForeignKey { table, .. } if table.to_string() == "app.old")
+        );
+    }
+
+    #[test]
+    fn a_freeing_constraint_drop_runs_between_its_owner_and_claimant_renames() {
+        for primary in [false, true] {
+            let mut owner = table(&[("id", Column::new(ty("int")).not_null())]);
+            if primary {
+                owner.primary_key = Some(PrimaryKey {
+                    name: Some("target".into()),
+                    columns: vec!["id".into()],
+                });
+            } else {
+                owner.unique.insert("target".into(), unique(&["id"]));
+            }
+            let base = two_tables(
+                ("app.owner_old", owner),
+                ("app.claimant_old", table(&[("id", Column::new(ty("int")))])),
+            );
+            let declared = two_tables(
+                (
+                    "app.owner_new",
+                    table(&[("id", Column::new(ty("int")).not_null())]),
+                ),
+                ("app.target", table(&[("id", Column::new(ty("int")))])),
+            );
+            let cs = run_with(
+                &SharesIndexNamespace,
+                &base,
+                &declared,
+                &[
+                    Intent::RenameTable {
+                        from: "app.owner_old".parse().unwrap(),
+                        to: "app.owner_new".parse().unwrap(),
+                    },
+                    Intent::RenameTable {
+                        from: "app.claimant_old".parse().unwrap(),
+                        to: "app.target".parse().unwrap(),
+                    },
+                ],
+            );
+            assert_eq!(
+                kinds(&cs),
+                [
+                    "RenameTable",
+                    if primary {
+                        "SetPrimaryKey"
+                    } else {
+                        "DropUnique"
+                    },
+                    "RenameTable"
+                ],
+                "{cs:?}"
+            );
+            assert!(
+                matches!(&cs.changes[0].change, Change::RenameTable { to, .. } if to.to_string() == "app.owner_new")
+            );
+            assert_eq!(
+                cs.changes[1].change.table().unwrap().to_string(),
+                "app.owner_new"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_key_on_other_columns_does_not_move_with_a_freeing_key() {
+        let mut owner = table(&[
+            ("id", Column::new(ty("int"))),
+            ("other", Column::new(ty("int"))),
+        ]);
+        owner.unique.insert("target".into(), unique(&["id"]));
+        owner.unique.insert("other_key".into(), unique(&["other"]));
+        let mut child = table(&[("id", Column::new(ty("int")))]);
+        child
+            .foreign_keys
+            .insert("fk_child".into(), fk(&["id"], "app.owner", &["other"]));
+        let base = two_tables(("app.owner", owner.clone()), ("app.old", child));
+        owner.unique.remove("target");
+        let declared = two_tables(
+            ("app.owner", owner),
+            ("app.target", table(&[("id", Column::new(ty("int")))])),
+        );
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropUnique", "RenameTable", "DropForeignKey"],
+            "{cs:?}"
+        );
+        assert_eq!(
+            cs.changes[2].change.table().unwrap().to_string(),
+            "app.target"
+        );
+    }
+
+    #[test]
+    fn mutually_blocking_owner_preferences_use_an_executable_source_address() {
+        let mut a = table(&[("id", Column::new(ty("int")))]);
+        a.unique.insert("new_b".into(), unique(&["id"]));
+        let mut b = table(&[("id", Column::new(ty("int")))]);
+        b.unique.insert("new_a".into(), unique(&["id"]));
+        let base = two_tables(("app.old_a", a), ("app.old_b", b));
+        let declared = two_tables(
+            ("app.new_a", table(&[("id", Column::new(ty("int")))])),
+            ("app.new_b", table(&[("id", Column::new(ty("int")))])),
+        );
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "app.old_a".parse().unwrap(),
+                    to: "app.new_a".parse().unwrap(),
+                },
+                Intent::RenameTable {
+                    from: "app.old_b".parse().unwrap(),
+                    to: "app.new_b".parse().unwrap(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropUnique", "RenameTable", "DropUnique", "RenameTable"],
+            "{cs:?}"
+        );
+        assert!(
+            cs.changes[0]
+                .change
+                .table()
+                .unwrap()
+                .name
+                .starts_with("old_")
+        );
+        assert!(
+            cs.changes[2]
+                .change
+                .table()
+                .unwrap()
+                .name
+                .starts_with("new_")
         );
     }
 

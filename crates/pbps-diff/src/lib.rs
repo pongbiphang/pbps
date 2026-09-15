@@ -9,6 +9,7 @@
 
 pub mod identity;
 pub mod managed;
+mod rename_order;
 pub mod schema_diff;
 
 pub use identity::{

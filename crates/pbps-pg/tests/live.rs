@@ -28,6 +28,9 @@ use pbps_pg::Postgres;
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 
+#[path = "support/rename_order.rs"]
+mod rename_order_tests;
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
