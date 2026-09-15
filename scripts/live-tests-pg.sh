@@ -80,6 +80,7 @@ cargo test -p pbps-pg --test live -- --ignored "$@"
 # has no other live suite of its own, so this is the one place its `From`
 # impls are ever run against a real server.
 cargo test -p pbps-db --test live_pg -- --ignored "$@"
+python3 scripts/live-transport.py pg
 # And the CLI's own PostgreSQL-dependent test, which lives in the bin target
 # rather than in `tests/`: `deploy::preflight` and `deploy::run_probes` are
 # private, and the thing under test is that the second pins the session before

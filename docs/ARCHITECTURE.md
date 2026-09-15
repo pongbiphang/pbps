@@ -103,6 +103,13 @@ profiles and pure precedence lookup contain credential-variable names only.
 CLI exposes the unacquired selection as optional command-summary data, never
 as model evidence or acquisition/compatibility proof (DECISIONS 494).
 
+The verified TLS primitive lives in `pbps-db::transport`; its opaque connection
+identity belongs to one successfully authenticated handshake. Only the private
+driver modules interpret connection options or name driver types. It contains
+no SQL or provisioning and grants no resolver admission: runtime and engine
+profiles must qualify every backend hop, separation and run binding before
+using its replies as evidence (DECISIONS 495).
+
 ## Inviolable constraints
 
 Keep these numbers stable: other documents cite them. Where a rule already

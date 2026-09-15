@@ -157,6 +157,24 @@ impl Conn {
         let config: Config = connection_string
             .parse()
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
+        Self::connect_config(config, is_linux).await
+    }
+
+    pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
+        let config: Config = connection_string
+            .parse()
+            .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
+        // Prefer may accept a server's plaintext refusal of SSLRequest. This
+        // constructor promises peer verification before database authentication.
+        if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
+            return Err(DbError::Refused(
+                "peer-verified PostgreSQL connections require sslmode=require".into(),
+            ));
+        }
+        Self::connect_config(config, cfg!(target_os = "linux")).await
+    }
+
+    async fn connect_config(config: Config, is_linux: bool) -> Result<Self, DbError> {
         let (host, port) = endpoint(&config)?;
         let addr = format!("{host}:{port}");
         let budget = connect_budget(&config)?;

@@ -79,6 +79,7 @@ tokio-postgres = { version = "0.7", default-features = false }
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
+connection-string = "0.2"
 # `tokio-postgres`'s own `connect_socket` applies `keepalives`,
 # `keepalives_idle/_interval/_retries` and `tcp_user_timeout` through
 # `socket2::SockRef` and shuffles `load_balance_hosts=random` through `rand` —

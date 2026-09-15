@@ -13,6 +13,29 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::{DbError, Param};
 
+/// Use the driver's parser for escaping, case and duplicate-key precedence.
+/// Splitting on semicolons would mistake password contents for policy. The
+/// driver has no public trust/encryption getters, so only these two effective
+/// keys are checked here; Config still validates every option it supports.
+fn verified_options(connection_string: &str) -> Result<(), DbError> {
+    let options: connection_string::AdoNetString = connection_string
+        .parse()
+        .map_err(|_| DbError::BadConnectionString("invalid ADO.NET syntax".into()))?;
+    if options
+        .get("encrypt")
+        .is_some_and(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "yes"))
+        || options.get("trustservercertificate").is_some_and(|value| {
+            !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "no")
+        })
+    {
+        return Err(DbError::Refused(
+            "peer-verified SQL Server connections require Encrypt=true and certificate validation"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// One row as this driver hands it back.
 pub struct Row(tiberius::Row);
 
@@ -52,6 +75,20 @@ impl Conn {
     pub(crate) async fn connect(connection_string: &str) -> Result<Self, DbError> {
         let config = Config::from_ado_string(connection_string)
             .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
+        Self::connect_config(config).await
+    }
+
+    pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
+        verified_options(connection_string)?;
+        let mut config = Config::from_ado_string(connection_string)
+            .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
+        // Keep this explicit even if the driver's default changes. Trust is
+        // still its normal chain/name verifier; verified_options rejects bypasses.
+        config.encryption(tiberius::EncryptionLevel::Required);
+        Self::connect_config(config).await
+    }
+
+    async fn connect_config(config: Config) -> Result<Self, DbError> {
         let addr = config.get_addr().to_owned();
         // A firewall that drops rather than refuses leaves the OS retrying for
         // over two minutes. Waiting that long for a pipeline to say "I could
@@ -191,5 +228,32 @@ impl Row {
 
     pub(crate) fn bool_at(&self, idx: usize) -> Result<Option<bool>, DbError> {
         Ok(self.0.try_get::<bool, _>(idx)?)
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn effective_trust_options_follow_driver_escaping_and_duplicate_precedence() {
+        for input in [
+            "Server=localhost;Password={marker;TrustServerCertificate=true};Encrypt=YES",
+            "Encrypt=false;Encrypt=true;TrustServerCertificate=true;TrustServerCertificate=no",
+            "ENCRYPT={ true };TRUSTSERVERCERTIFICATE={ false }",
+            "Server=localhost",
+        ] {
+            verified_options(input).unwrap();
+            Config::from_ado_string(input).unwrap();
+        }
+        for input in [
+            "Encrypt=true;Encrypt=no",
+            "TrustServerCertificate=false;TRUSTSERVERCERTIFICATE=YES",
+            "Encrypt=maybe",
+            "TrustServerCertificate=maybe",
+            "Password={unterminated",
+        ] {
+            assert!(verified_options(input).is_err());
+        }
     }
 }
