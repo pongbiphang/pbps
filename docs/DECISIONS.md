@@ -12387,6 +12387,14 @@ SPEC is in sync with all of these.
      identity refuses and reconnects/failovers requalify. No production rows or
      credentials are copied.
 
+     DDL can execute expressions or extension code, so every resolver workload
+     also needs qualified execution containment before declaration transfer or
+     compilation. Deny outbound/external side effects and host-resource access
+     outside the run, with controls enforced outside SQL privileges and bounded
+     resources/lifetime. Trusted image acquisition is separate. Unknown controls
+     refuse; violations abort without evidence, stubs or broader-access retries.
+     This qualifies the planned resolver lifecycle, not a new sandbox service.
+
      Environment discovery, trusted candidate suggestions and actual
      compatibility checks cover both PostgreSQL and SQL Server first. A Docker
      tag is a candidate, not verified compatibility; acquisition is explicit,

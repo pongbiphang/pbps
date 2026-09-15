@@ -116,8 +116,43 @@ unconditionally require a resolver that could never answer its question.
 
 DDL compilation can itself evaluate expressions or invoke extension code.
 Isolation is therefore an operational trust boundary, not a claim that no
-user-supplied code can run. The resolver is neither a performance test nor a
-production-data rehearsal, and does not replace apply's data probes.
+user-supplied code can run. Before any resolver DDL or declaration transfer,
+verify a versioned engine/platform execution-containment profile, for both
+managed declarations and retained external definitions. Instance separation
+and private source handling alone do not establish this profile.
+
+The profile must deny workload-initiated access outside the isolated run,
+including production services, the host network, cloud metadata and external
+DNS/network destinations, even if copied source contains usable credentials.
+Allow only the bounded incoming pbps database-control channel and its replies;
+it must not provide a proxy for arbitrary workload requests. Trusted image and
+extension acquisition happens before declaration transfer, outside the contained
+compilation phase, under the acquisition policy in decision 4. That permission
+does not grant the compiled workload network access.
+
+Limit filesystem access to the qualified engine/runtime inputs and private
+per-run scratch storage; write access stays within disposable run resources.
+Do not expose project/home directories, production credentials, host devices,
+container-runtime sockets or host mounts/privileges that escape this boundary.
+The profile includes bounded resource use and lifetime, and is enforced outside
+the SQL privilege boundary so routines, extensions, subprocesses or a database
+administrator role inside scratch cannot relax it. A container label or SQL
+permission check alone is not execution containment. Supplied servers need a
+qualified, externally enforced boundary too, not just a separate database.
+
+Verify effective controls before the workload starts and maintain them until
+it and any descendants stop; reconnects or runtime replacement requalify.
+Unknown or unenforceable controls refuse compilation before source transfer.
+A containment violation or loss of control aborts the run, stops its workload
+and enters cleanup without publishing evidence. Do not retry with broader
+access. If faithful reconstruction requires blocked external effects, report
+unsupported analysis rather than remove required semantics or fabricate a stub.
+As with source handling, this assumes a trusted runtime and administrator;
+supported profiles require real-engine/platform qualification, not a claim of
+protection against every runtime vulnerability. No new sandbox service or
+plugin execution system is introduced: these are admission requirements for
+the existing planned resolver lifecycle. The resolver is neither a performance
+test nor a production-data rehearsal, and does not replace apply's data probes.
 
 ### 4. Discover requirements for both engines; verify the chosen environment
 
@@ -406,6 +441,20 @@ protection under test is removed.
     pre-existing audit policy is disabled. Qualify Docker and supplied-server
     paths independently for each supported engine/platform; removing the
     pre-transfer gate must make the negative case fail.
+13. **`resolver_compilation_cannot_escape_its_run` (planned):** exercise
+    engine-supported creation-time evaluation from managed and retained
+    external definitions, including extension/subprocess paths where supported.
+    Use disposable network and filesystem sentinels, never real production
+    services, to prove outbound connections, DNS/metadata access, host-file
+    reads/writes and runtime-socket access cannot succeed, even with a marker
+    credential in the source. Unknown controls refuse before transfer; violations
+    and control loss stop the workload and publish no evidence. Cover descendant
+    cleanup and resource/time limits; an ordinary contained declaration must
+    still compile and produce its expected bindings. Qualify containers and
+    supplied servers independently on each supported engine/platform, with a
+    negative control showing the sentinel is reachable when containment is
+    removed in the test fixture. Compilation requiring a blocked effect is
+    refused without stubs or a less restrictive retry.
 
 ## Delivery and supersession
 

@@ -1225,6 +1225,19 @@ of no dependencies. Runtime-bound bodies and dynamic SQL keep their existing
 limitations and impact warnings; the resolver does not execute routines to
 discover those dependencies or claim whole-program validation.
 
+Compilation itself may evaluate expressions or extension code. Before resolver
+DDL or declaration transfer, verify and enforce an engine/platform containment
+profile for all compiled source, not just retained external definitions. Deny
+workload-initiated network access and access to host files, credentials, devices
+or runtime sockets outside the isolated run; allow only the bounded incoming
+pbps control channel and qualified runtime inputs/private disposable storage.
+Controls live outside SQL privileges and bound resource use and lifetime.
+Image acquisition is a separate trusted phase, not workload egress permission.
+Unknown controls refuse compilation; violations abort without evidence or a
+broader-access retry. Supplied scratch servers must meet the same contract.
+Required semantics that cannot run within it remain unsupported, not stubbed;
+ADR-0016 defines the trusted-runtime boundary and negative acceptance cases.
+
 All resolver DDL runs in isolated scratch resources, never on the target, even
 inside a savepoint. No production rows are copied. The saved plan pins the
 resolved changes, evidence scope, engine/environment fingerprint, target

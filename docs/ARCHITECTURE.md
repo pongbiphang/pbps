@@ -74,8 +74,11 @@ only input to deployment SQL emission. Target reads and scratch writes use
 separate instances/clusters, connections and credentials. Engine identity checks
 and trusted provisioning evidence must establish separation before scratch DDL;
 a different database name is insufficient. CLI lifecycle and engine-specific
-controls jointly qualify source handling before external definitions are sent,
+profiles also qualify runtime-enforced network/filesystem containment before
+any compiled source is sent, plus source handling for external definitions,
 including server/container log capture and disposable storage (ADR-0016).
+Containment is enforced outside SQL privileges by the qualified runtime, not by
+adding a plugin engine or moving provisioning into database transport.
 `apply` checks saved prerequisites without invoking the resolver or adding
 changes after approval.
 

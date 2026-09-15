@@ -114,7 +114,8 @@ Delivery is split into three stages:
    checks for **both PostgreSQL and SQL Server**, with explicit, policy-bound
    acquisition and support for local images or dedicated scratch servers.
    Resolver qualification includes target instance/cluster separation and
-   pre-transfer source-handling controls for logging and disposable storage;
+   pre-compilation execution containment, plus pre-transfer source-handling
+   controls for logging and disposable storage;
    unknown safety prerequisites refuse the affected resolver operation.
 2. PostgreSQL creation-time binding resolution, checksum-pinned evidence and
    transactional apply/result guards; uncertainty prevents deployable output
