@@ -1,0 +1,30 @@
+git version 2.43.0
+Platform: Linux; files ref backend; Python standard-library experiment
+Scope: isolated Git ref operations and success predicate, not UI recovery
+
+Guarded: 8 tests passed, exit 0.
+- A direct matching branch commits while the prepared index stays uninstalled.
+- A prepared symbolic branch stays visible; its pending lock contains the new oid.
+- A sibling's direct and symbolic writes to the prepared branch are refused.
+- Aborting a same-tip symbolic rewrite preserves the live ref bytes and leaves
+  the composed commit unreferenced; the sibling target stays at the old tip.
+- Stale direct and symbolic tips refuse prepare, preserving the live ref.
+- A pre-held HEAD lock refuses prepare; a held index lock does not.
+- HEAD hops inserted before prepare or after commit fail the immediate-target
+  predicate. The intermediate ref can still move under HEAD and branch locks.
+- Existing post-write branch-type and tip checks still refuse changed branches.
+
+Single-shot update restored: exit 1, one assertion failure.
+  test_same_tip_symbolic_rewrite_is_preserved_and_refused:
+  live ref bytes are the new direct oid, not the retained "ref: refs/heads/b".
+  The other seven tests pass.
+
+Recursive HEAD read restored: exit 1, two assertion failures.
+  test_head_chain_inserted_after_commit_fails_the_success_check:
+  recursive HEAD check accepted an unlocked hop.
+  test_head_chain_inserted_before_prepare_is_also_refused_after_commit:
+  HEAD hop survived the transaction.
+  The other six tests pass.
+
+No UI compose, file-placement undo, recovery-record publication, index
+installation or push is implemented here. No Windows or macOS measurement.

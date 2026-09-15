@@ -12282,3 +12282,27 @@ SPEC is in sync with all of these.
      `destructive_rationale_covers_data_and_uniqueness_loss` pins the gate's
      explanation. This entry records the existing behavior; it changes no
      risk class or execution rule.
+
+487. **Compose checks ref type before publishing and HEAD's immediate target
+     before installing the index (issues #385 and #386).** ADR-0015 decision 5
+     uses an interactive `update-ref --stdin` transaction: start, no-deref
+     update, prepare, then inspect the live branch under Git's lock before
+     committing. The old-value CAS follows symbolic indirection even with
+     `--no-deref`; the single-shot form can overwrite a same-tip symbolic
+     ref before a post-write type check sees it. Abort preserves that ref.
+
+     Preparation does not replace the post-write guard. After Git releases
+     its locks, the UI retakes its persistent HEAD and branch locks and
+     requires a direct branch at the composed commit and the exact immediate
+     target from `symbolic-ref --no-recurse HEAD`. A recursive read admits
+     an intermediate ref neither lock protects. The same immediate-target
+     condition governs success recovery; rollback remains irreversible.
+
+     The retained `spikes/git-compose-refs` experiment measures both races,
+     held locks, unchanged user index, and ordinary/stale-tip controls on
+     Linux with Git 2.43.0. Restoring the single-shot update fails the
+     same-tip assertion; restoring recursive HEAD reads fails both inserted
+     hop assertions. These are ref-protocol measurements, not an implemented
+     UI compose or crash-recovery harness. #494 / #64 step 4 must test the
+     full protocol; #471's Windows restoration remains separate. No database
+     model, approval, saved-plan format or execution boundary changes.

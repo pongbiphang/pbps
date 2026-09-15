@@ -10,6 +10,7 @@ the conclusions; they do not replace the experiment that produced them
 | `yaml-span` | YAML parser/span evaluation for ADR-0001 | Cargo package excluded from the root workspace |
 | `pg-driver` | Driver-seam experiment for ADR-0014 | Independent Cargo workspace, also explicitly excluded at the root |
 | `pg-measurements` | SQL observations supporting the Phase 5 ADRs | SQL and scripts, no Cargo package; run manually |
+| `git-compose-refs` | ADR-0015 prepared ref and immediate HEAD guards, with reverted controls | Python standard-library experiment; no compose implementation or workspace CI job |
 
 They are historical experiments, not shipped components or workspace CI jobs.
 The production crates and their live tests are the authority for current
