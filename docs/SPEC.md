@@ -1246,9 +1246,17 @@ logical identities and versioned canonical fingerprints, never the full text.
 Publication/apply checks re-read and hash the target definitions; a changed,
 missing or unreadable prerequisite cannot pass. `explain`, generated SQL,
 diagnostics and logs do not expose this external source or its confidential
-literals, including through engine errors. The user's managed declarations and
-explicit deployment changes remain ordinary reviewable plan contents. A
-fingerprint is a change detector, not permission to publish otherwise sensitive
+literals, including through engine errors. Before transmitting any external
+definition, verify and enforce a supported engine/platform safety profile for
+server statement/audit/error logging, intermediaries and container log capture
+or forwarding. Source-bearing diagnostics and scratch storage must stay private
+and disposable, without persistent/exported copies. Unknown or unenforceable
+controls refuse reconstruction before transfer; client redaction or deleting a
+scratch database is not proof, and pre-existing audit policies are not disabled
+to satisfy the check. ADR-0016 defines the trusted-runtime boundary and lifecycle.
+The user's managed declarations and explicit deployment changes remain ordinary
+reviewable plan contents. A fingerprint is a change detector, not permission to
+publish otherwise sensitive
 artifacts; ADR-0016 defines the capture and comparison contract.
 
 #### 9.3.3 Resolver environment discovery (accepted, not implemented)
@@ -1283,9 +1291,16 @@ Merely connecting to production does not download or start anything. After
 explicit resolver opt-in, acquisition follows a configured pull policy, supports
 preloaded images/internal registries and records the actual image digest and
 platform. The container runs on the pbps host/CI runner, not on production.
-Scratch credentials are separate from production credentials, and cleanup is
-restricted to resources created for that run. Air-gapped operation needs no
-registry access when a suitable image or server is already available.
+The resolver must be outside the target PostgreSQL cluster or SQL Server
+instance, not merely in another database. Before any scratch DDL or external
+source transfer, use qualified read-only identity and provisioning/endpoint
+evidence to prove separation; different names, credentials or connection URLs
+are insufficient. Reject the target instance/cluster and unknown or ambiguous
+identity; reconnects/failovers must requalify. Never use target-side writes to
+prove identity. Scratch credentials are separate from production credentials,
+and cleanup is restricted to resources created for that run. Air-gapped
+operation needs no registry access when a suitable image or server is already
+available.
 
 `doctor` will reuse this profile for read-only requirements and candidate
 diagnostics; it does not pull images, create scratch databases or call a mere

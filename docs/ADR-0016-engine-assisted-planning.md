@@ -169,7 +169,20 @@ its observed fingerprint without inventing an image digest.
 
 Run containers on the pbps host or CI runner. Scratch connections and
 credentials are separate from the target, and a supplied server gets fresh,
-uniquely named scratch databases. Reject using the target database as scratch.
+uniquely named scratch databases on a separate instance/cluster.
+
+**Isolation is an instance/cluster boundary, not a database-name check.**
+Before any scratch DDL, including database creation, or transfer of retained
+external source, establish that the resolver is outside the target PostgreSQL
+cluster or SQL Server instance. Each engine adapter must qualify an identity
+comparison using read-only instance/cluster facts and trusted provisioning or
+endpoint evidence for its supported deployment types. Different database names,
+credentials, connection strings or DNS aliases alone do not prove separation.
+Reject the same instance/cluster and missing, unreadable or ambiguous identity
+evidence without a write probe or target-side configuration change. Bind the
+decision to the actual connections; reconnects, endpoint replacements and
+failovers must requalify before further scratch DDL or source transfer.
+
 Clean up only resources created for the run on success, failure or cancellation;
 report cleanup failures without touching pre-existing objects. Do not propagate
 production credentials into a container or include secrets in saved evidence.
@@ -197,6 +210,36 @@ deployment SQL, `explain`, human/JSON diagnostics, logs or persistent caches.
 Source-bearing engine errors must not bypass this boundary. This applies to
 retained external prerequisites, not to the user's managed declarations and
 explicit typed changes that the reviewed deployment already needs to contain.
+
+**Qualify source handling before sending the source, not after an error.**
+For both containers and supplied scratch servers, a versioned engine/platform
+safety profile must establish effective suppression of source-bearing statement,
+parameter, audit, trace and failed-statement logging. Cover the server and any
+configured extensions, proxies, container stdout/stderr collectors, logging
+drivers and forwarding destinations that can retain the reconstruction input.
+Any unavoidable source-bearing diagnostic buffer must be private, per-run and
+ephemeral, with no durable or remote export and cleanup on success, failure or
+cancellation. Source-free operational diagnostics are still allowed. Private
+scratch storage containing definitions or recovery records must likewise remain
+within the qualified disposable lifecycle; dropping a database alone does not
+establish that retained copies disappeared.
+
+Verify the profile's effective controls and keep them enforced for the whole
+source-bearing operation. An image tag, a user-supplied "safe" boolean, client
+error redaction or a successful cleanup is not that verification. If required
+controls are unknown, unreadable, incompatible or cannot be maintained, refuse
+source-bearing reconstruction before transmitting any external definition and
+name the unmet requirement without echoing source. Loss of an enforced control
+during a run stops further source transfer, invalidates that run and enters
+cleanup without publishing evidence. Do not disable production or pre-existing
+shared audit/logging policies to make a resolver qualify. A supplied server
+must already meet a supported profile; configuration changes
+are limited to resources owned by this run under its provisioning policy.
+Qualify these profiles with real-engine/platform tests, not an assumption that
+one session setting controls every collector. This contract assumes a trusted
+runtime and administrator, not protection against a hostile host secretly
+recording inputs. A plan needing no external reconstruction does not acquire
+this source-handling prerequisite merely because a resolver is configured.
 
 For each such prerequisite, save its logical identity, a cryptographic digest,
 and the digest/canonicalization version needed to repeat the comparison. Hash
@@ -337,12 +380,32 @@ protection under test is removed.
 10. **`external_definition_evidence_keeps_source_private` (planned):** use a
     retained external function/view whose source contains a confidential marker.
     Reconstruction can use its full definition, but the marker and source never
-    appear in plan/SQL artifacts, `explain`, human/JSON diagnostics, logs or
-    persistent caches, including when scratch compilation fails. Changing only
-    the literal changes the fingerprint and refuses publication/apply with the
+    appear in plan/SQL artifacts, `explain`, human/JSON diagnostics,
+    durable/exported logs or persistent caches, including when scratch
+    compilation fails. Changing only the literal changes the fingerprint and
+    refuses publication/apply with the
     same object identity and candidate set. Missing/unreadable definitions and
     unsupported fingerprint versions do not pass; an unchanged prerequisite
     verifies without Docker or the original source in the saved plan.
+11. **`resolver_rejects_the_target_instance_before_writes` (planned):** on both
+    engines, point the resolver at another database on the target instance or
+    cluster, including through an alias and different credentials. Refuse before
+    database creation, source transfer or other scratch DDL. Missing/unreadable
+    identity facts and a reconnect or failover to the target also fail closed.
+    A separately identified, compatible scratch instance passes, with only
+    run-owned resources created and removed; the target remains read-only.
+12. **`resolver_source_logging_is_qualified_before_transfer` (planned):** use
+    a confidential marker in a retained external definition and exercise server
+    statement/audit/trace and failure logging, container stderr collection and
+    forwarding. A persistent source collector or unknown controls refuse before
+    source transfer; a qualified profile permits reconstruction without the
+    marker reaching durable/exported logs or copies,
+    including failed compilation and cancellation. Cover private ephemeral
+    diagnostic/storage cleanup and its failure reporting. Losing an enforced
+    control aborts without further source transfer or published evidence, and no
+    pre-existing audit policy is disabled. Qualify Docker and supplied-server
+    paths independently for each supported engine/platform; removing the
+    pre-transfer gate must make the negative case fail.
 
 ## Delivery and supersession
 

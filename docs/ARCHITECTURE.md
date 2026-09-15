@@ -71,8 +71,13 @@ through `pbps-cli::engine`, not I/O on the pure `Dialect` trait or in the differ
 Shared deterministic plan evidence belongs beside semantic `Schema`, never in
 its equality or as driver-specific types. The final typed ChangeSet remains the
 only input to deployment SQL emission. Target reads and scratch writes use
-separate connections and credentials, and `apply` checks saved prerequisites
-without invoking the resolver or adding changes after approval.
+separate instances/clusters, connections and credentials. Engine identity checks
+and trusted provisioning evidence must establish separation before scratch DDL;
+a different database name is insufficient. CLI lifecycle and engine-specific
+controls jointly qualify source handling before external definitions are sent,
+including server/container log capture and disposable storage (ADR-0016).
+`apply` checks saved prerequisites without invoking the resolver or adding
+changes after approval.
 
 Environment discovery/recommendation/compatibility covers PostgreSQL and SQL
 Server first. Binding adapters follow separately: PostgreSQL first, SQL Server
