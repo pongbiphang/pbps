@@ -1253,6 +1253,16 @@ replanning and renewed approval. `explain` can show this evidence
 and its limits offline. The first resolver-backed apply path is transactional
 only, with the additional guard in §7.6; staged restrictions remain unchanged.
 
+The evidence manifest pins every required external resolution input, not only
+routine/view source: include versioned canonical fingerprints of relevant
+cast, type, operator, extension and other class-specific properties, complete
+membership and required absence predicates. Logical identity alone cannot
+detect a semantic property change. Re-read those inputs coherently before
+publication/apply; mismatched, unreadable or unsupported properties refuse even
+when the managed checksum and existing bindings are unchanged. This includes
+evidence for deciding not to rebuild. Each adapter must qualify the completeness
+of its input coverage; a closing read of the old binding is not a substitute.
+
 Retained external definitions are private, ephemeral reconstruction inputs,
 not additional source shipped to reviewers. Saved evidence records their
 logical identities and versioned canonical fingerprints, never the full text.

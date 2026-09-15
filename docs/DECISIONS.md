@@ -12408,17 +12408,23 @@ SPEC is in sync with all of these.
      design and live tests, sharing infrastructure but not binding semantics.
 
      Saved evidence joins the checksum and includes relevant target candidate
-     sets, environment prerequisites and expected bindings. Retained external
-     definitions stay private and ephemeral for reconstruction; only logical
-     identities and versioned canonical fingerprints enter the saved evidence.
+     sets, environment prerequisites and expected bindings. The versioned input
+     manifest fingerprints every required external resolution property, including
+     casts, types, operators and extensions, with complete membership/absence
+     predicates. Identity-only or routine/view-source-only checks are insufficient;
+     an unchanged old binding cannot waive a changed premise for not rebuilding.
+     Retained external definitions stay private and ephemeral for reconstruction;
+     only logical identities and versioned canonical fingerprints enter saved
+     evidence.
      Before source transfer, qualify and enforce engine/platform controls over
      server logging, intermediaries, container capture/forwarding and disposable
      source-bearing storage. Unknown controls refuse reconstruction; client
      redaction and database deletion are not proof of no retained copies. Do not
      disable pre-existing audit policies. ADR-0016 defines the trusted-runtime
      boundary and required negative tests for both isolation and source handling.
-     Publication/apply re-read and hash the target definition, without exporting
-     its source through artifacts or diagnostics. Recheck before
+     Publication/apply re-read and fingerprint every required input's properties
+     and recheck membership/absence without exporting private source or properties
+     through artifacts or diagnostics. Recheck before
      artifact publication and under the deployment lock before apply; changed
      premises require replanning and approval. Each capture must itself be
      coherent; repeated mixed-time reads are not evidence. PostgreSQL inherits

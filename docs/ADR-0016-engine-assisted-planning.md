@@ -246,7 +246,8 @@ Extend the saved-plan format, not semantic `Schema` equality, to carry:
 - the analysis/adapter version, coverage and unresolved limitations;
 - the target facts required by the decision: logical identities, complete
   candidate sets within its read scope, relevant non-secret settings, and
-  canonical fingerprints of retained external definitions, never their source;
+  versioned canonical fingerprints of every required external resolution
+  input's properties, including retained definitions without exporting source;
 - the resolver's observed environment fingerprint and image digest/platform
   when applicable;
 - the current/desired logical bindings and resulting explicit typed changes;
@@ -293,21 +294,39 @@ runtime and administrator, not protection against a hostile host secretly
 recording inputs. A plan needing no external reconstruction does not acquire
 this source-handling prerequisite merely because a resolver is configured.
 
-For each such prerequisite, save its logical identity, a cryptographic digest,
-and the digest/canonicalization version needed to repeat the comparison. Hash
-the complete engine-canonical definition under the recorded read settings,
-including literals; do not remove suspected secrets before hashing and thereby
-hide changes to them. Canonicalization must not guess SQL equivalence or depend
-on scratch OIDs. A fingerprint detects changes; it is not encryption or a
-promise that review artifacts are suitable for public disclosure.
+**Pin all resolution inputs, not only objects with source text.** The versioned
+input manifest covers every external prerequisite in the supported analysis
+read scope, including relevant cast, type, operator and extension properties,
+whether or not it is a direct current dependency. Each adapter defines the
+complete class-specific properties required for reconstruction and resolution,
+including referenced prerequisites, and qualifies that coverage before use.
+Identity/candidate membership alone is not a fingerprint of those properties.
+Record the complete per-class membership and required absence predicates too,
+so additions/removals cannot disappear behind unchanged surviving identities.
+Unknown or unreadable required properties, or an input whose relevant semantics
+cannot be represented and rechecked, prevent verified evidence.
+
+For each prerequisite, save its logical identity, a cryptographic digest and
+the class-specific digest/canonicalization version needed to repeat the
+comparison. Hash all required canonical properties, normalizing object
+references to logical identities rather than physical or scratch OIDs.
+Source-bearing inputs include their complete engine-canonical definition under
+the recorded read settings, including literals; do not remove suspected
+secrets before hashing and thereby hide changes to them. Canonicalization must
+not guess SQL equivalence. A fingerprint detects changes; it is not encryption
+or a promise that review artifacts are suitable for public disclosure.
 
 During the coherent pre-publication and pre-apply captures below, re-read each
-required target definition and recompute its fingerprint using the same
-versioned procedure. A mismatch, missing/unreadable definition or unsupported
-fingerprint version prevents publication/application; a changed prerequisite
-requires replanning and approval. This needs neither the original source in
-`plan.json` nor a resolver at apply time. Evidence/explanations name the object,
-fingerprint and failed condition without echoing its definition.
+required target input's properties and recompute its fingerprint using the same
+versioned procedure, along with rechecking membership/absence predicates. A
+mismatch, missing/unreadable property or unsupported fingerprint version
+prevents publication/application; a changed prerequisite requires replanning
+and approval even if its identity, the managed checksum and existing bindings
+are unchanged. This also protects a resolver's decision not to rebuild: the
+closing observation of an old binding cannot waive a failed prerequisite.
+Neither the original source in `plan.json` nor a resolver at apply time is
+needed. Evidence/explanations name the object, fingerprint and failed condition
+without echoing private source or properties.
 
 Deterministic serialization and the plan checksum cover this evidence. The
 implementation must bump affected artifact/wire formats and generated schemas;
@@ -483,6 +502,19 @@ protection under test is removed.
     resources; only the new backend's complete evidence may be sealed. Pin both
     engines with supported runtime fixtures and a negative control that fails
     when cached qualification or old partial bindings are reused.
+15. **`external_resolution_properties_invalidate_stale_evidence` (planned):**
+    produce an otherwise applyable plan whose resolver decides not to rebuild
+    an affected object. Change an unmanaged cast's conversion context without
+    changing its logical source/target identity, the overload candidate names,
+    managed checksum or the object's existing binding. Establish on the real
+    engine that fresh compilation now binds differently; publication/pre-apply
+    rechecks must refuse stale evidence before applying or recording success.
+    Cover identity-preserving relevant type/operator/extension property changes,
+    input additions/removals, unreadable properties and unsupported coverage
+    versions, with no concurrent writer during apply. Unchanged complete inputs
+    still pass. Each supported adapter needs its own applicable fixtures; a
+    negative control that checks only identities or routine/view source hashes
+    must miss the changed-property case and fail the test.
 
 ## Delivery and supersession
 
