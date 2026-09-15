@@ -63,9 +63,10 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 [ADR-0016](ADR-0016-engine-assisted-planning.md) and
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-accepted-not-implemented)
 are accepted design; initial read-only `doctor` environment discovery (#597)
-and named profile selection/policy (#606) are implemented. Resolver qualification,
-acquisition and binding evidence
-remain planned. The design preserves the boundaries
+and named profile selection/policy (#606) are implemented. The internal Docker
+runtime supports acquisition, native target separation and contained private
+channels (#608). Engine compatibility qualification and binding evidence remain
+planned. The design preserves the boundaries
 above: CLI owns resolver lifecycle and reporting; the engine crates own
 environment queries, compatibility rules, scratch DDL and binding extraction;
 `pbps-db` owns transport, not SQL or provisioning. Connected work continues
@@ -109,6 +110,18 @@ driver modules interpret connection options or name driver types. It contains
 no SQL or provisioning and grants no resolver admission: runtime and engine
 profiles must qualify every backend hop, separation and run binding before
 using its replies as evidence (DECISIONS 495).
+
+The internal Docker runtime layer lives in `pbps-cli::resolver`: local Docker
+API ownership and lifecycle remain outside database transport. Its `engine`
+routing modules select fixed source-free bootstrap recipes and dispatch the
+engine-owned identity queries. `pbps-db::transport::StreamConn` provides only
+database protocol over a supplied stream, with no host lookup, reconnect or
+claim of peer qualification. It is not a fallback for failed TLS. Engine
+identity SQL remains in `pbps-pg::resolver` and `pbps-mssql::resolver` through
+the sealed query-connection seam. Native process/channel and kernel leases are
+ephemeral CLI capabilities, never semantic schema or saved-plan evidence.
+See [the runtime boundary](RESOLVER-RUNTIME.md) for its staged startup,
+supported profile and the remaining environment/binding gates.
 
 ## Inviolable constraints
 

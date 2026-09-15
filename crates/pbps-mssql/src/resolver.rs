@@ -3,6 +3,40 @@
 use pbps_db::resolver::{Candidate, Discovery, Observation};
 use pbps_db::{Conn, DbError};
 
+/// A master database GUID may be copied with an installation. Separation is
+/// decided using the qualified native runtime as well, never GUID inequality
+/// or SERVERPROPERTY('ProcessID'), which is virtualized by the Linux PAL.
+pub async fn instance_identity(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+) -> Result<pbps_db::resolver::InstanceObservation, DbError> {
+    let rows = conn.query("SELECT CONVERT(nvarchar(36), database_guid) AS instance_key FROM master.sys.database_recovery_status WHERE database_id = 1").await?;
+    let [row] = rows.as_slice() else {
+        return Err(DbError::BadRow(
+            "native SQL Server identity expected one master database row".into(),
+        ));
+    };
+    let key = row
+        .try_get::<&str>("instance_key")?
+        .filter(|value| master_guid(value))
+        .ok_or_else(|| DbError::BadRow("native SQL Server master identity is unreadable".into()))?;
+    Ok(pbps_db::resolver::InstanceObservation {
+        instance_key: key.to_ascii_lowercase(),
+        process: pbps_db::resolver::BackendProcess::RuntimeOnly,
+    })
+}
+
+fn master_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+        && value != "00000000-0000-0000-0000-000000000000"
+}
+
 const ENVIRONMENT: &str = "\
 SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS product_version,
        CONVERT(nvarchar(128), SERVERPROPERTY('ProductMajorVersion')) AS product_major_version,

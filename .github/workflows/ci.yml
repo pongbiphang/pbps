@@ -242,6 +242,44 @@ jobs:
             exit 1
           }
 
+  # Native admission needs one disposable Linux host per engine. Keep these
+  # away from the shared live services: the full factory owns both a target
+  # and scratch instance, and its root inspector reads their actual processes.
+  resolver:
+    needs: quick
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pg, mssql]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Preload explicitly trusted fixture images
+        run: |
+          docker pull postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+          if [ "$FIXTURE_ENGINE" = mssql ]; then
+            docker pull mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
+          fi
+        env:
+          FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: Docker ownership, containment and private channel
+        run: python3 scripts/live-resolver.py "$FIXTURE_ENGINE"
+        env:
+          FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: Native target aliases and unprotected proxy backend
+        run: python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE"
+        env:
+          FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: Complete factory on the disposable native host
+        run: |
+          cargo test -p pbps-cli --lib --no-run --message-format=json > /tmp/pbps-resolver-artifacts.jsonl
+          PBPS_FIXTURE_BINARY=$(python3 -c 'import json; rows = [json.loads(line) for line in open("/tmp/pbps-resolver-artifacts.jsonl")]; print(next(row["executable"] for row in rows if row.get("executable") and row.get("target", {}).get("name") == "pbps_cli"))')
+          sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
+        env:
+          FIXTURE_ENGINE: ${{ matrix.engine }}
+
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.
   msrv:
@@ -269,7 +307,7 @@ jobs:
   # `failure` could land after the run that superseded it reported success.
   gate:
     name: ci-gate
-    needs: [quick, windows, live, live-pg, dev-rehearsal, msrv]
+    needs: [quick, windows, live, live-pg, dev-rehearsal, resolver, msrv]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:

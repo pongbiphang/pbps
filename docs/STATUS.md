@@ -123,6 +123,15 @@ against both engines with disposable trust and an intercepting relay. It does
 not enable resolver analysis or certify instance separation, proxy backend hops
 or local private channels; those require the runtime profiles in #608/#609.
 
+The internal Docker runtime (#608) now acquires explicit trusted images and
+qualifies native Linux target separation, effective kernel containment and a
+run-private database channel before exposing a source-free session. It owns
+bounded startup, continuity and cleanup for both engines. This library is not
+wired into binding planning: engine build/context qualification (#610/#611)
+and the subsequent source-handling and binding steps remain required. See
+[the runtime boundary and fixtures](RESOLVER-RUNTIME.md). Dedicated scratch
+servers remain #609.
+
 Delivery is split into three stages:
 
 1. Environment discovery, trusted candidate suggestions and compatibility

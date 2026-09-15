@@ -5,6 +5,7 @@
 use pbps_db::transport::PeerVerifiedConn;
 use pbps_db::{Driver, Param};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -110,6 +111,39 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
     .expect("record corruption must terminate the exchange promptly");
     assert!(result.is_err(), "altered TLS reply yielded accepted rows");
     assert!(relay.did_corrupt.load(Ordering::SeqCst));
+
+    let relay = Relay::start(port()).await;
+    let mut proxied = PeerVerifiedConn::connect(driver(), &address("localhost", relay.port))
+        .await
+        .unwrap();
+    relay.capture.store(true, Ordering::SeqCst);
+    read_value(&mut proxied).await;
+    relay.capture.store(false, Ordering::SeqCst);
+    // Retain whole, previously accepted application records from this live
+    // session. A stale reply must fail even for a managed-only scalar query.
+    {
+        let saved = relay.saved.lock().unwrap();
+        let mut records = saved.as_slice();
+        assert!(!records.is_empty());
+        while !records.is_empty() {
+            assert!(records.len() >= 5 && records[0] == 23 && records[1] == 3);
+            let length = 5 + u16::from_be_bytes([records[3], records[4]]) as usize;
+            assert!(
+                records.len() >= length,
+                "capture must contain complete TLS records"
+            );
+            records = &records[length..];
+        }
+    }
+    relay.replay.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxied.query("SELECT CAST(610 AS INT) AS value"),
+    )
+    .await
+    .expect("replayed records must terminate the exchange promptly");
+    assert!(result.is_err(), "stale TLS records yielded accepted rows");
+    assert!(relay.did_replay.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -126,6 +160,10 @@ struct Relay {
     port: u16,
     corrupt: Arc<AtomicBool>,
     did_corrupt: Arc<AtomicBool>,
+    capture: Arc<AtomicBool>,
+    saved: Arc<Mutex<Vec<u8>>>,
+    replay: Arc<AtomicBool>,
+    did_replay: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -137,6 +175,14 @@ impl Relay {
         let did_corrupt = Arc::new(AtomicBool::new(false));
         let requested = corrupt.clone();
         let observed = did_corrupt.clone();
+        let capture = Arc::new(AtomicBool::new(false));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let replay = Arc::new(AtomicBool::new(false));
+        let did_replay = Arc::new(AtomicBool::new(false));
+        let capturing = capture.clone();
+        let captured = saved.clone();
+        let replaying = replay.clone();
+        let replayed = did_replay.clone();
         let task = tokio::spawn(async move {
             let (downstream, _) = listener.accept().await.unwrap();
             let upstream = tokio::net::TcpStream::connect(("127.0.0.1", upstream_port))
@@ -153,6 +199,20 @@ impl Relay {
                     if n == 0 {
                         break;
                     }
+                    if capturing.load(Ordering::SeqCst) {
+                        let mut saved = captured.lock().unwrap();
+                        assert!(saved.len() + n <= 128 * 1024);
+                        saved.extend_from_slice(&buffer[..n]);
+                    }
+                    if replaying.swap(false, Ordering::SeqCst) {
+                        let saved = captured.lock().unwrap().clone();
+                        assert!(!saved.is_empty());
+                        replayed.store(true, Ordering::SeqCst);
+                        if reply.write_all(&saved).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     if requested.swap(false, Ordering::SeqCst) {
                         buffer[n - 1] ^= 1;
                         observed.store(true, Ordering::SeqCst);
@@ -168,6 +228,10 @@ impl Relay {
             port,
             corrupt,
             did_corrupt,
+            capture,
+            saved,
+            replay,
+            did_replay,
             task,
         }
     }

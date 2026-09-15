@@ -12669,3 +12669,57 @@ SPEC is in sync with all of these.
     retention, and absence/definition negatives. Historical table-name reuse and
     column rename chains remain separate scopes (#536 and #541); this graph adds
     no implicit drop or rename intent and no connected I/O to the differ.
+
+497. **Docker resolver admission holds native runtime capabilities across a
+    source-free bootstrap gate.** Image acquisition is policy-bound and records
+    actual immutable content and platform, but grants no compatibility or source
+    permission. A protected local Unix socket and its live root-installed Docker
+    peer authenticate provisioning. The initial `linux-amd64-v1` profile requires
+    the target observer and daemon on the same native Linux kernel; an arbitrary
+    root-owned proxy, remote endpoint or unreadable kernel premise is refused.
+
+    Reserve only a root deadline and an unprivileged fixed waiter. Before engine
+    initialization, independently bind the target's verified TLS connection to
+    its actual engine service/socket owners, reject shared runtime namespaces,
+    and measure effective cgroup and visible mount controls. Retain those handles
+    through the bootstrap transition. Engine-owned readiness precedes the sole
+    private protocol connection; a failed handshake discards the entire run.
+    A fixed forwarder in separate PID/mount namespaces owns that connection.
+    The workload has no outbound network, executable writable storage, runtime
+    socket or access to the forwarder's descriptors. Denying `connect` alone is
+    insufficient: measured TCP Fast Open requires flag restrictions on the send
+    syscalls too. Unset image environment keys before execution and disable
+    inherited healthchecks rather than trusting image metadata as isolation.
+
+    Recheck live process, namespace, mount, cgroup, backend and socket handles
+    around continuity reads. Cancellation removes the whole session capability
+    before awaiting I/O, so a later matching fingerprint cannot revive it.
+    Cleanup is supervised independently of the requester and may reconnect only
+    to remove the exact owned resource; it cannot resume analysis. A root timer
+    bounds descendants even after client loss. Native target revalidation needs
+    no Docker binary, database write probe or installed production agent.
+
+    The CLI owns provisioning and runtime lifecycle; `pbps-db` supplies a bounded
+    byte-stream protocol connection without claiming transport qualification.
+    Instance SQL remains in the engine crates. No serializable admission flag,
+    plan-format change, binding operation or `--dev` certification is added.
+    Build/context compatibility and source-handling gates remain later #595
+    steps. See [the runtime boundary and measured fixtures](RESOLVER-RUNTIME.md)
+    for supported premises and the distinction between component fixtures and
+    complete admission on a disposable native Linux runner.
+
+498. **Authenticate socket-activated Docker through its accepted Unix peer,
+    not the listener creator's credentials.** Linux `SO_PEERCRED` preserves
+    the creator of a listener inherited by `dockerd -H fd://`, so requiring
+    that PID to be dockerd rejects the standard systemd installation. A
+    protected `/run/docker.pid` supplies the candidate only when the listener
+    creator is native PID 1 running root-installed systemd. Root process and
+    executable checks still apply. One exact `NETLINK_SOCK_DIAG` query binds
+    the client inode and kernel cookie to the accepted peer inode; dockerd
+    must hold that peer descriptor. Hold and recheck the process/socket binding
+    across API requests and attach traffic. Never accept arbitrary root
+    proxies, trust Docker response metadata as peer proof, dump every host
+    socket or reconnect to recover admission. The existing Rustix dependency
+    supplies safe Linux socket calls without project-local unsafe code.
+    An inherited-listener fixture measures the creator/acceptor distinction
+    and rejects unrelated owners, cookie substitution and lost continuity.
