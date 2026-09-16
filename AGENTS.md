@@ -86,13 +86,21 @@ checksum-pinned, and state lives in the database itself.
 - A P0 or P1 in a ready-phase code review resets the count: address it under the
   finding rules (P0 is always fixed; P1 is fixed or deferred according to the
   three-case list), move the PR back to draft, and resume the loop.
-- Once the ready-phase gate qualifies, start CI on the PR head with
-  `gh workflow run ci.yml --ref <branch>` and wait for it. CI runs only when
-  started; a push clears the checks.
+- CI runs itself on every push to the branch, so by the time the ready-phase
+  gate qualifies there is a run on the head already. Wait for `ci-gate` on the
+  current head and read the run, not `check-runs`, which lists only the jobs
+  created so far. Retry a transient failure with `gh run rerun <run-id>`
+  (`--failed` for the failed jobs alone): a re-run keeps the run's pull-request
+  association, so its `ci-gate` is the one the merge box reads. Never reach for
+  `gh workflow run ci.yml` to do that — it starts a `workflow_dispatch` run
+  whose check suite belongs to no pull request, so it goes green in the Actions
+  tab while the required check stays unsatisfied (DECISIONS 206). Dispatch is
+  for a branch that has no pull request.
 - Red CI: fix it, push, and return to the loop as a draft.
 - If `master` moves before merge, rebase and push the rebased head with
-  `git push --force-with-lease`. A conflict-free rebase requires CI again on the
-  new remote head before merge.
+  `git push --force-with-lease`. The ruleset is strict, so a branch that is
+  `BEHIND` cannot merge however green it is; the push starts the run on the
+  rebased head by itself, and that run is what the merge waits for.
 - If that rebase needs conflict resolution, resolve it, run the required local
   tests, push, and obtain a completed code review whose `Reviewed commit:` is
   the conflict-resolution head. P0 is always fixed; P1–P3 follow the same
@@ -120,11 +128,13 @@ checksum-pinned, and state lives in the database itself.
   and coordinate multiple eligible issues concurrently. Each subagent owns
   exactly one issue at a time, uses an isolated branch and worktree, and never
   merges. Dependency-linked issues merge in topological order.
-- `ci.yml` runs nothing on `master` after a merge: the merged tree is the one
-  CI passed. The dependency audit is separate and does run on `master` when the
-  merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own workflow —
-  wait for it in that case, and a red audit is the next task, not the next
-  issue.
+- `ci.yml` runs on `master` after a merge. It is not a gate — the strict
+  ruleset already made the merged tree the tree CI passed — so do not wait for
+  it before taking the next issue; a red one is a real regression and the next
+  task. The dependency audit is a separate workflow and does run on `master`
+  when the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own
+  workflow — wait for it in that case, and a red audit is the next task, not
+  the next issue.
 - Take the next issue, following "Taking an issue", only when the user requested
   a continuous or multi-wave loop.
 
