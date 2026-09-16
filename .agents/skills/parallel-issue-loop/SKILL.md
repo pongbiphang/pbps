@@ -136,8 +136,11 @@ Each worker must:
 Subagents must never merge. When a worker says its PR is ready, the primary agent
 independently verifies the issue-to-diff match, architecture, tests, review state,
 unresolved threads, current head SHA, dependency order, current-base status, and
-CI evidence. Only the primary agent may merge, using a merge commit, and only
-when every condition in the review reference is satisfied.
+CI evidence. Only the primary agent may enqueue, with `gh pr merge --merge` and
+a merge commit, and only when every condition in the review reference is
+satisfied. With a merge queue required that command adds the PR to the queue
+rather than merging it; wait for the queued merge to land before treating the PR
+as merged (DECISIONS 502).
 
 After a merge, verify the intended issue closed, capture the merge commit, clean
 the issue worktree and local branch safely, update dependent agents, and report

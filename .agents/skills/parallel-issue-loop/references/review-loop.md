@@ -137,8 +137,17 @@ Before merge, the primary agent—not an issue worker—must independently confi
 - dependency merge order is satisfied;
 - required CI checks are green on the mergeable PR head.
 
-Subagents never merge. The primary agent uses a merge commit, deletes the issue
-branch, and removes its worktree only after every gate passes.
+Subagents never enqueue and never merge. Once every gate passes the primary
+agent enqueues with `gh pr merge --merge`. With a merge queue required that
+command **adds the PR to the queue** rather than merging it: GitHub builds
+`master` plus everything queued ahead plus this PR and runs `ci.yml` on the
+`merge_group` event, merging only if that is green (DECISIONS 502). Wait for the
+merge to land before deleting the issue branch and removing its worktree — a
+queued PR is not a merged one, and the queue can still eject it.
+
+If the queue ejects the PR, read why before re-queueing. A conflict is handled
+in §5. A merge-group check that fails where the PR's own run passed is a real
+interaction with what merged ahead of it, not a flake to re-queue through.
 
 ## 7. Closeout
 
