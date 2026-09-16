@@ -285,19 +285,24 @@ impl CandidateSession {
             // a 15-second handshake, and a slow daemon near the end of the
             // budget would otherwise spend a minute past it before anyone
             // looked at the clock.
+            // Short-circuiting on purpose: a first mint that reports the
+            // daemon peer changed is the answer, and asking for a second
+            // channel from the same handle cannot improve it. Awaiting it
+            // anyway lets a stalled connect run out the deadline, and the
+            // timeout arm below then reports the previous login's
+            // `Error::Start` — burying the daemon failure that is the cause.
             let acquired = tokio::time::timeout_at(deadline, async {
-                (
-                    retry_api.additional_of_my_kind().await,
-                    retry_api.additional_of_my_kind().await,
-                )
+                let next_api = retry_api.additional_of_my_kind().await?;
+                let next_attach = retry_api.additional_of_my_kind().await?;
+                Ok::<_, Error>((next_api, next_attach))
             })
             .await;
             let Ok(acquired) = acquired else {
                 return Err(failure);
             };
             (api, attach_api) = match acquired {
-                (Ok(next_api), Ok(next_attach)) => (next_api, next_attach),
-                (Err(cause), _) | (Ok(_), Err(cause)) => {
+                Ok(pair) => pair,
+                Err(cause) => {
                     return Err(StartFailure {
                         cause,
                         recovery_names: failure.recovery_names,
