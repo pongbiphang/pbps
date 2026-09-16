@@ -236,6 +236,27 @@ impl Drop for LocalApi {
 }
 
 impl LocalApi {
+    /// Another connection of **this handle's own kind**.
+    ///
+    /// [`Self::additional`] is the qualified form: it re-verifies the native
+    /// daemon lease, and it is what the factory uses, so every channel a
+    /// deployment holds is one of those. But `start_channels` lets a test
+    /// supply channels the factory forbids — `connect`/`connect_peer` leave
+    /// `native_daemon` empty on purpose — and a retry has to be able to mint
+    /// from whatever it was handed rather than refusing on that path alone
+    /// (issue #638, where that refusal made the retry unreachable in exactly
+    /// the tests written to exercise it).
+    ///
+    /// It never changes a handle's kind: a qualified handle mints qualified
+    /// ones and an unqualified handle mints unqualified ones. What a channel
+    /// is allowed to be is decided where it is first created, not here.
+    async fn additional_of_my_kind(&self) -> Result<Self, Error> {
+        if self.native_daemon.is_some() {
+            return self.additional().await;
+        }
+        Self::connect_peer(&self.socket_path, self.peer.0).await
+    }
+
     async fn additional(&self) -> Result<Self, Error> {
         let lease = self.native_daemon.as_ref().ok_or(Error::NativeDaemon)?;
         lease.check().map_err(|_| Error::NativeDaemon)?;

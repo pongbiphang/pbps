@@ -267,17 +267,35 @@ impl CandidateSession {
             // The attempt closed its own control container, confirmed; mint
             // the next pair from the handle held back for exactly this, which
             // re-verifies the daemon peer the way every other additional
-            // connection here does. After the deadline check, so a loop that
-            // is about to stop does not open connections to discard.
+            // connection here does — and, on the unqualified channels only a
+            // test is allowed to supply, mints that kind rather than refusing
+            // to mint at all. After the deadline check, so a loop that is
+            // about to stop does not open connections to discard.
             //
-            // A failure to mint is reported as itself. `additional()` says
+            // A failure to mint is reported as itself. Minting says
             // `ControlLost` or `NativeDaemon` — the protected Docker channel
             // is gone or its authenticated peer changed — and answering that
             // with the previous login's `Error::Start` would send an operator
             // to look at container startup for a problem in the daemon
             // connection. The recovery names the spent attempt left are
             // carried across, since nothing has recovered them.
-            (api, attach_api) = match (retry_api.additional().await, retry_api.additional().await) {
+            //
+            // Bounded by the same deadline, because acquiring a channel is
+            // itself a wait: `connect_profile` permits a 15-second connect and
+            // a 15-second handshake, and a slow daemon near the end of the
+            // budget would otherwise spend a minute past it before anyone
+            // looked at the clock.
+            let acquired = tokio::time::timeout_at(deadline, async {
+                (
+                    retry_api.additional_of_my_kind().await,
+                    retry_api.additional_of_my_kind().await,
+                )
+            })
+            .await;
+            let Ok(acquired) = acquired else {
+                return Err(failure);
+            };
+            (api, attach_api) = match acquired {
                 (Ok(next_api), Ok(next_attach)) => (next_api, next_attach),
                 (Err(cause), _) | (Ok(_), Err(cause)) => {
                     return Err(StartFailure {
@@ -286,6 +304,14 @@ impl CandidateSession {
                     });
                 }
             };
+            // And checked once more with the channels in hand. The bound above
+            // stops the *wait*; this stops the *launch*, because
+            // `one_control_attempt` creates its control container before it
+            // ever reaches its own `timeout_at`. The two guards are two
+            // different things the budget has to survive.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure);
+            }
         }
     }
 
