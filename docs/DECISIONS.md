@@ -12773,3 +12773,53 @@ SPEC is in sync with all of these.
      The routine arm needs none of this: its lock is `SELECT … FROM pg_proc
      WHERE p.oid = $1 FOR UPDATE`, taken by oid, with no name between the two
      statements to move.
+
+500. **A still-starting engine's refused login is retried; everything else it
+     says is reported once (issue #638).** The private session waits behind the
+     bootstrap's engine-owned readiness greeting, and on PostgreSQL that
+     greeting is exact: it waits for `postmaster.pid` to say `ready`, and for
+     that engine accepting a connection and authenticating it are the same
+     moment. On SQL Server they are not. **Measured** on the pinned image:
+
+     ```text
+     in-container 127.0.0.1:1433 accepts                  4170ms
+     "SQL Server is now ready for client connections"     4170ms   <- the greeting
+     sa can actually log in                               4766ms
+     ```
+
+     The greeting is driven by grepping for that very line, so it is early by
+     the same ~600ms as the port is, and the resolver logged in inside a window
+     where the engine answers TDS and refuses `sa`. That is the intermittent
+     `18456` that had been failing the `resolver (mssql)` job.
+
+     **The probe cannot live in the engine container.** For this engine the
+     only honest readiness signal is a successful login; a login needs
+     `connect`; and the workload's seccomp policy denies `connect` by design —
+     only the trusted forwarder may initiate a connection, which
+     `native_and_compat_network_and_process_bypasses_are_not_allowed` pins.
+     Nor is there a later log line to wait for instead: at the instant the
+     login first worked the errorlog tail was msdb upgrade steps, whose
+     presence and number depend on whether this is a first start. A probe put
+     there anyway does not fail — it *spins*, and the measured cost was the
+     whole 90-second budget rather than an error naming the cause.
+
+     **So the retry is where the login already is**, and it retries the whole
+     attempt rather than the login: the forwarder opens exactly one TCP session
+     to the engine and then pipes it, so a refused login spends the channel and
+     the next attempt needs a control container of its own. Three properties
+     make that affordable rather than merely possible. The attempt closes its
+     own container before the loop builds the next, and an attempt whose
+     cleanup could not be confirmed is *terminal* — retrying past it would
+     carry a recovery name into a session tracking only the container the next
+     attempt made. The loop shares the one 90-second budget a single attempt
+     used to have, as a deadline under `timeout_at`, rechecked after the pause
+     as well as before it, because `timeout_at` bounds the attempt and not the
+     wait in front of it. And the handles for each attempt are minted from one
+     held back for exactly that, which re-verifies the daemon peer the way
+     every other additional connection here does.
+
+     **Narrow on purpose.** Only `18456` is retried. Every other refusal is
+     reported on the first attempt, because a credential this resolver
+     generated for a container it started is not going to become correct by
+     being asked again, and a retry loop that tolerates every error is a
+     timeout wearing a disguise.

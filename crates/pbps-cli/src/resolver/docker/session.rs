@@ -209,7 +209,8 @@ impl CandidateSession {
     /// session to the engine and then pipes it, so a refused login spends the
     /// channel. The attempt closes its own container before this loop builds
     /// the next, and the whole loop shares the one 90-second budget a single
-    /// attempt used to have, so nothing waits longer than it did (issue #638).
+    /// attempt used to have, so nothing waits longer than it did (DECISIONS
+    /// 500, issue #638).
     ///
     /// Narrow on purpose: only SQL Server's `18456` is retried. Every other
     /// refusal is reported on the first attempt, because a credential this

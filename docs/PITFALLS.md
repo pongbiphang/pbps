@@ -2287,3 +2287,56 @@ Two things it is easy to get wrong on the way out:
   them by oid as well — `pg_describe_object` alone prints the same words
   twice, and it answers `NULL` for an oid that is gone, which is a case the
   message has to be able to say out loud.
+
+
+## Answering on the port is not being able to authenticate
+
+The resolver waits for an engine-owned readiness greeting before opening its
+private session, and on PostgreSQL that greeting is exact. On SQL Server it is
+not, and neither is the thing it greps for. Measured on the pinned image, the
+port accepts at 4170ms, `SQL Server is now ready for client connections`
+appears at 4170ms, and `sa` can log in at 4766ms (DECISIONS 500).
+
+That is the tool's own subject matter, not only CI's. Every readiness check
+this project makes has to name which of the three states it means, because a
+server answers TCP first, says it is ready second, and authenticates third —
+and the shell script that has always waited for this engine
+(`scripts/live-tests.sh`) waits for a real query for exactly that reason.
+
+Two traps sat inside the fix:
+
+- **A probe in the wrong place does not fail, it spins.** Putting the login
+  probe in the engine container looked right and is forbidden: the workload's
+  seccomp policy denies `connect` by design, so the probe can never succeed,
+  the liveness guard beside it keeps passing, and the measured cost was the
+  entire 90-second budget rather than an error naming the cause. A readiness
+  check that cannot fail loudly is worse than none.
+- **A retry loop that tolerates every error is a timeout wearing a disguise.**
+  Only the one code a still-starting engine returns is retried. A credential
+  the resolver generated for a container it started does not become correct by
+  being asked again, and neither does a lost daemon channel — reporting the
+  latter as the former sends an operator to look at container startup for a
+  problem in the Docker connection.
+
+## A child is inspected before it has `exec`ed
+
+`ProcessLease::capture` requires a root-installed executable, which is the whole
+point of the check. Between `fork` and `execve` a child still wears its
+*parent's* executable — in a test, the `cargo test` binary under
+`target/debug/deps`, owned by the build user — so a test that captures a child
+it has just spawned is told `UnqualifiedProcess` about a process that is
+qualified a microsecond later.
+
+Four tests in one module failed on this in CI, and `quick` is what every other
+job `needs`, so each one took the whole matrix with it. Production never meets
+the window: every non-test caller of `capture` takes its pid from a connection,
+a daemon handshake or the catalog.
+
+The measurement is the lesson. The window is about **one spawn in forty
+thousand** on a fast machine: 240 whole-module runs pinned to one core against
+two CPU hogs never showed it, and a first probe of this exact hypothesis ran
+2,000 spawns, reported "no such window", and nearly buried the right answer. It
+took 82,028 spawns and an instrumented `capture` — one that says which of its
+six refusal legs fired — to see 2 refusals and read the cause off them. When a
+rate is unknown, a probe that finds nothing has measured the probe, not the
+question; size it against the rate you would need to detect.
