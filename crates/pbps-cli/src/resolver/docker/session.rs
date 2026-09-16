@@ -253,17 +253,38 @@ impl CandidateSession {
             {
                 return Err(failure);
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Rechecked after the sleep, not only before it: with less than
+            // the sleep left on the budget the wait itself carries past the
+            // deadline, and `one_control_attempt` starts a control container
+            // before it ever reaches `timeout_at`. Without this the loop would
+            // exceed the 90 seconds it advertises and start one more container
+            // to clean up while doing it.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure);
+            }
             // The attempt closed its own control container, confirmed; mint
             // the next pair from the handle held back for exactly this, which
             // re-verifies the daemon peer the way every other additional
-            // connection here does.
-            let (Ok(next_api), Ok(next_attach)) =
-                (retry_api.additional().await, retry_api.additional().await)
-            else {
-                return Err(failure);
+            // connection here does. After the deadline check, so a loop that
+            // is about to stop does not open connections to discard.
+            //
+            // A failure to mint is reported as itself. `additional()` says
+            // `ControlLost` or `NativeDaemon` — the protected Docker channel
+            // is gone or its authenticated peer changed — and answering that
+            // with the previous login's `Error::Start` would send an operator
+            // to look at container startup for a problem in the daemon
+            // connection. The recovery names the spent attempt left are
+            // carried across, since nothing has recovered them.
+            (api, attach_api) = match (retry_api.additional().await, retry_api.additional().await) {
+                (Ok(next_api), Ok(next_attach)) => (next_api, next_attach),
+                (Err(cause), _) | (Ok(_), Err(cause)) => {
+                    return Err(StartFailure {
+                        cause,
+                        recovery_names: failure.recovery_names,
+                    });
+                }
             };
-            (api, attach_api) = (next_api, next_attach);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
