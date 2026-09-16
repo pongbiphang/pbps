@@ -2197,14 +2197,22 @@ Three traps sat inside the fix, and each of them is a measurement:
   none and the merge box waited on "Expected — Waiting for status to be
   reported" forever. Querying check runs *by SHA* returns them and agrees with
   the Actions tab, which is why this reads as a GitHub fault rather than a
-  configuration one. The gate reports a **commit status** instead: a status is
-  addressed to a commit, not to a suite, so there is nothing left to associate
-  (DECISIONS 206).
+  configuration one. The gate reported a **commit status** instead: a status is
+  addressed to a commit, not to a suite, so there was nothing left to associate
+  (DECISIONS 206). The workaround is retired — `ci.yml` triggers on
+  `pull_request` again and `ci-gate` is an ordinary check run (DECISIONS 501) —
+  but the rule it was built around is not: **a workflow run only reaches a pull
+  request when its event is one of those four.** Anything dispatched, scheduled
+  or triggered by `repository_dispatch` is invisible there however green it is.
 - **A required job skipped by `if:` counts as passing.** GitHub treats
   `success`, `skipped` and `neutral` alike in a required check, so guarding
   an expensive job with a label or a `draft` test opens the gate instead of
   closing it. If a condition must gate a merge, the job has to run and fail —
-  or the gate has to be a separate report, as `ci-gate` is.
+  or the gate has to be a job that inspects the results itself, as `ci-gate` is.
+  This is also why `ci-gate` counts `skipped` as a failure rather than passing
+  it through, and why `ci.yml` carries no `paths` filter: the reverse of this
+  trap is a required check that never reports at all, which blocks the pull
+  request with nothing that can clear it.
 
 ## A pre-delete count includes the row its statement removes
 

@@ -12823,3 +12823,53 @@ SPEC is in sync with all of these.
      generated for a container it started is not going to become correct by
      being asked again, and a retry loop that tolerates every error is a
      timeout wearing a disguise.
+501. **CI is triggered by the pull request again; the gate is a check run, not
+    a commit status.** This supersedes 206, whose every premise was a property
+    of the private repository. That entry made CI a hand-started
+    `workflow_dispatch` workflow because "running the full matrix on each
+    [commit] spent the private repository's minutes on states nobody would
+    merge", and made its `gate` job report a **commit status** because a
+    `workflow_dispatch` check suite is associated with no pull request. Since
+    the move to the `pongbiphang` organisation the repository is public,
+    standard runners bill nothing, and the trigger that forced the workaround
+    is gone. `ci.yml` now runs on `pull_request`, on `push` to `master`, on
+    `merge_group`, and still on `workflow_dispatch` for re-running a red job by
+    hand; `gate` is an ordinary job named `ci-gate`, and its check run reaches
+    the pull request the ordinary way.
+
+    Measured against fifteen comparable projects rather than chosen: every one
+    of rust-analyzer, cargo, diesel, bevy, rust, clap, tokio, sqlx, ripgrep,
+    atlas, deno, uv, polars, sea-orm and paradedb triggers on `pull_request`
+    together with `push` to the default branch. None is dispatch-only.
+
+    **One required check rather than seven job names, and it is not a style
+    choice.** A ruleset lives outside the repository: it has no history, no
+    review, and nothing ties it to a job rename. Requiring the job names makes
+    a rename close the gate forever and a new job open it silently. More
+    decisively, GitHub counts a **skipped** required check as a passing one, so
+    requiring job names directly cannot survive any future conditional job. The
+    aggregating job can, because it inspects `needs.*.result` itself and treats
+    `skipped` as the failure it is. The same reasoning is visible in
+    rust-analyzer's `conclusion` job and clap's `ci` job, both of which carry
+    the warning in a comment. The cost is that the `needs` list must name every
+    job; the gate's comment says so, and a check that asserts it is issue #637.
+
+    **`paths` and `paths-ignore` stay off the trigger.** A required check that
+    never reports leaves a pull request blocked with nothing that can clear it —
+    the same class of stall 206 records, reached from the other side. Skipping
+    work for documentation-only changes is therefore not attempted here; the
+    projects above that do it either keep those checks unrequired or filter at
+    the job level behind exactly such an aggregator.
+
+    What does not change: the `ci-before-merge` ruleset still requires the one
+    `ci-gate` context, so this is a workflow change and not a ruleset change,
+    and the fan-in of every job onto `quick` stays. That fan-in was justified
+    by the minutes and is kept for fail-fast alone — nothing expensive should
+    start for a commit that does not compile.
+
+    The strict up-to-date policy 206 relies on is left in place here. It
+    serialises merges when several pull requests are in flight, which is the
+    subject of issue #636: a merge queue is the automated form of the same
+    guarantee, and 206 rejected one only because "merge queues need an
+    organisation-owned or public repository and this one is neither". It is now
+    both.
