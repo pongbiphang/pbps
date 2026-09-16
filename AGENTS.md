@@ -89,8 +89,13 @@ checksum-pinned, and state lives in the database itself.
 - CI runs itself on every push to the branch, so by the time the ready-phase
   gate qualifies there is a run on the head already. Wait for `ci-gate` on the
   current head and read the run, not `check-runs`, which lists only the jobs
-  created so far. `gh workflow run ci.yml --ref <branch>` still works and is
-  for re-running a red job by hand, not for starting the gate.
+  created so far. Retry a transient failure with `gh run rerun <run-id>`
+  (`--failed` for the failed jobs alone): a re-run keeps the run's pull-request
+  association, so its `ci-gate` is the one the merge box reads. Never reach for
+  `gh workflow run ci.yml` to do that — it starts a `workflow_dispatch` run
+  whose check suite belongs to no pull request, so it goes green in the Actions
+  tab while the required check stays unsatisfied (DECISIONS 206). Dispatch is
+  for a branch that has no pull request.
 - Red CI: fix it, push, and return to the loop as a draft.
 - If `master` moves before merge, rebase and push the rebased head with
   `git push --force-with-lease`. The ruleset is strict, so a branch that is

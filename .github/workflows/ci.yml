@@ -15,7 +15,12 @@ name: CI
 # ruleset alone: a queue whose required checks do not run on the merge group
 # never advances.
 #
-# `workflow_dispatch` is kept for re-running a red job by hand.
+# `workflow_dispatch` is kept for running the matrix on a branch that has no
+# pull request. It cannot retry a pull request's CI: a dispatched check suite
+# belongs to no pull request, so its `ci-gate` never reaches the merge box —
+# the failure DECISIONS 206 describes, reached by a different route. A pull
+# request's run is retried with `gh run rerun <run-id>`, which keeps the
+# association because it is the same run.
 #
 # Do not add `paths` or `paths-ignore` here. `ci-gate` is a required check, and
 # a required check that never reports leaves a pull request blocked with

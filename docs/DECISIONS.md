@@ -12833,9 +12833,19 @@ SPEC is in sync with all of these.
     the move to the `pongbiphang` organisation the repository is public,
     standard runners bill nothing, and the trigger that forced the workaround
     is gone. `ci.yml` now runs on `pull_request`, on `push` to `master`, on
-    `merge_group`, and still on `workflow_dispatch` for re-running a red job by
-    hand; `gate` is an ordinary job named `ci-gate`, and its check run reaches
-    the pull request the ordinary way.
+    `merge_group`, and still on `workflow_dispatch` for running the matrix on a
+    branch that has no pull request; `gate` is an ordinary job named `ci-gate`,
+    and its check run reaches the pull request the ordinary way.
+
+    **Dispatch cannot retry a pull request's CI**, and saying it could was the
+    first error this entry's own pull request made. `gh workflow run` raises a
+    `workflow_dispatch` event, and 206's finding applies to it unchanged: the
+    suite belongs to no pull request, so the run goes green in the Actions tab
+    while the required check stays unsatisfied. `gh run rerun <run-id>` is the
+    retry, because it is another attempt at the *same* run and keeps its event
+    and its association. Measured on this pull request rather than assumed:
+    after `gh run rerun`, run 35114661123 reported `event=pull_request`,
+    `attempt=2`, and the pull request's own checks list showed it.
 
     Measured against fifteen comparable projects rather than chosen: every one
     of rust-analyzer, cargo, diesel, bevy, rust, clap, tokio, sqlx, ripgrep,
