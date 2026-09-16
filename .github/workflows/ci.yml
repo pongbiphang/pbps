@@ -324,18 +324,30 @@ jobs:
   # to catch (DECISIONS 206; rust-analyzer's `conclusion` job and clap's `ci`
   # job carry the same warning).
   #
-  # `!cancelled()` rather than `always()`: `cancel-in-progress` above kills the
-  # older of two runs on a pull request, and a cancelled run that reported
-  # `failure` could land after the run that superseded it reported success.
+  # `always()` and not `!cancelled()`, which this job carried at first and which
+  # was wrong for the same reason the line above exists: cancel the run and
+  # `!cancelled()` skips the gate, a skipped required check passes, and the
+  # merge box opens over a matrix that never ran. The commit-status version had
+  # no such hole — it simply wrote nothing, and a required status that is
+  # absent blocks.
   #
-  # For the same reason `skipped` is a failure below and not a pass. Nothing
-  # here is meant to be skipped; if something ever is, the gate should shut
-  # rather than open, and a `paths` filter added later cannot quietly qualify a
-  # pull request that nothing ran on.
+  # The reason `!cancelled()` was there at all belonged to that version too: a
+  # status is addressed to a SHA, so a cancelled run writing `failure` late
+  # could overwrite the run that superseded it. Check runs do not overwrite one
+  # another — each belongs to its own run, and branch protection reads the
+  # latest on the head — so the race is gone and the guard against it had
+  # outlived its reason. `always()` costs the opposite error instead: a
+  # cancelled run reports a failing gate, which shuts a gate that a re-run
+  # opens again. Wrongly shut is recoverable; wrongly open is not.
+  #
+  # For the same reason `skipped` and `cancelled` are failures below and not
+  # passes. Nothing here is meant to be skipped; if something ever is, the gate
+  # should shut rather than open, and a `paths` filter added later cannot
+  # quietly qualify a pull request that nothing ran on.
   gate:
     name: ci-gate
     needs: [quick, windows, live, live-pg, dev-rehearsal, resolver, msrv]
-    if: ${{ !cancelled() }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       # Through the environment, not `${{ }}` inside `run:`: interpolation

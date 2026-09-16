@@ -12864,6 +12864,21 @@ SPEC is in sync with all of these.
     the warning in a comment. The cost is that the `needs` list must name every
     job; the gate's comment says so, and a check that asserts it is issue #637.
 
+    **The gate runs on `always()`, and the first version of this got that
+    wrong too.** It carried `if: ${{ !cancelled() }}` over from the
+    commit-status design without re-deriving it. Cancel the run and
+    `!cancelled()` skips the gate; a skipped required check passes; the merge
+    box opens over a matrix that never ran. The commit-status version had no
+    such hole, because it wrote nothing on cancellation and an absent required
+    status blocks. The guard's own reason belonged to that version as well: a
+    status is addressed to a SHA, so a cancelled run writing `failure` late
+    could overwrite the run that superseded it — whereas check runs never
+    overwrite one another, each belonging to its own run. The race was gone and
+    the guard against it was still there, which is the shape AGENTS.md calls a
+    filter nobody re-reads. `always()` buys the opposite error: a cancelled run
+    reports a failing gate, which a re-run clears. Wrongly shut is recoverable;
+    wrongly open is not.
+
     **`paths` and `paths-ignore` stay off the trigger.** A required check that
     never reports leaves a pull request blocked with nothing that can clear it —
     the same class of stall 206 records, reached from the other side. Skipping
