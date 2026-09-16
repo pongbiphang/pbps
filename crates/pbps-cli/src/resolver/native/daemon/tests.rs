@@ -29,7 +29,14 @@ async fn socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer(
     let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let descriptor: OwnedFd = listener.into();
-    let mut daemon = Command::new("/dockerd")
+    // Through the exec wait, for the reason this whole change exists: between
+    // `fork` and `execve` the child still wears its parent's executable, and
+    // here that parent is `/systemd`, the fixture's PID 1. `connect_native`
+    // below captures a lease on this pid, so reaching it inside that window
+    // would refuse a daemon that is about to be the right one — the flake in
+    // the process half of issue #638, in the one spawn this test qualifies.
+    let mut command = Command::new("/dockerd");
+    command
         .args([
             "--ignored",
             "--exact",
@@ -37,9 +44,8 @@ async fn socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer(
         ])
         .stdin(Stdio::from(descriptor))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut daemon = crate::resolver::native::spawned_and_execed(&mut command, "dockerd");
     std::fs::write("/run/docker.pid", daemon.id().to_string()).unwrap();
     let accepted = LocalApi::connect_native(path).await;
     let second = LocalApi::connect_native(path).await;
@@ -104,7 +110,10 @@ async fn an_inherited_listener_is_bound_to_the_acceptor_and_lost_ownership_is_te
     let process = ProcessLease::capture(child.id()).unwrap();
     let creator = stream.peer_cred().unwrap().pid().unwrap() as u32;
     let observed = UnixPeer::capture(&stream, &process).await;
-    let mut unrelated = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+    let mut unrelated = crate::resolver::native::spawned_and_execed(
+        Command::new("/usr/bin/sleep").arg("30"),
+        "sleep",
+    );
     let other = ProcessLease::capture(unrelated.id()).unwrap();
     let outcome = observed.as_ref().map(|peer| {
         (

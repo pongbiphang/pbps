@@ -546,16 +546,107 @@ fn start_ticks(base: &Path) -> Result<u64, UnqualifiedProcess> {
         .map_err(|_| UnqualifiedProcess)
 }
 
+/// Spawns a child and waits until it has actually `exec`ed the program named.
+///
+/// Between `fork` and `execve` the child still wears its **parent's**
+/// executable, and this parent is a `cargo test` binary under
+/// `target/debug/deps` — owned by the build user, not by root.
+/// [`ProcessLease::capture`] refuses exactly that, and rightly: a
+/// root-installed executable is the whole point of the check. So a test that
+/// captures a child it has just spawned is asserting a state it has not yet
+/// established, and is told `UnqualifiedProcess` about a process that is
+/// perfectly qualified a microsecond later.
+///
+/// **Measured** on a 32-core machine, with the refusal instrumented to say
+/// which of `capture`'s six legs fired: 2 refusals in 82,028 spawns, both
+/// `exe rejected: path=…/target/debug/deps/pbps_cli-… uid=1000 mode=100755`.
+/// One in forty thousand passes locally forever — 240 whole-module runs
+/// pinned to one core against two CPU hogs never showed it — and is common
+/// enough on a two-core CI runner running the whole workspace's tests to have
+/// turned `master` red on four different tests (issue #638 collects the runs).
+///
+/// Waiting on `/proc/PID/exe` rather than on a sleep: the window is the exec
+/// itself, so the thing to wait for is the exec, and a duration long enough to
+/// be safe on the slowest runner would be paid by every run on every machine.
+///
+/// **Production never meets this window.** Every non-test caller of `capture`
+/// takes its pid from a connection, a daemon handshake or the catalog — never
+/// from a process it has just spawned — so this is a defect in what the tests
+/// establish, not in what the resolver checks.
+#[cfg(test)]
+pub(crate) fn spawned_and_execed(
+    command: &mut std::process::Command,
+    program: &str,
+) -> std::process::Child {
+    let child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {program}: {error}"));
+    wait_for_exec(child.id(), program);
+    child
+}
+
+/// The waiting half of [`spawned_and_execed`], for the one fixture that has to
+/// build its own child with a retry loop of its own.
+#[cfg(test)]
+pub(crate) fn wait_for_exec(pid: u32, program: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // A `read_link` that fails means the child is already gone, which is a
+    // different problem and the caller's to report: stop waiting and let its
+    // own assertions say so.
+    while std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| !path.ends_with(program))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} never replaced this test binary with {program} in /proc/PID/exe"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
 
+    /// [`spawned_and_execed`] returns only once `/proc/PID/exe` names the
+    /// program asked for, which is what every capture below depends on.
+    ///
+    /// The fork/exec window it exists to close is a microsecond wide and fires
+    /// about once in forty thousand spawns, so a test that merely spawned and
+    /// captured in a loop would pass without the fix. This makes the same
+    /// transition wide enough to assert on instead: `bash` execs `sleep`, so
+    /// `/proc/PID/exe` is observably `bash` first and `sleep` after, and a
+    /// helper that did not wait would be handing back a child wearing the
+    /// wrong executable almost every run.
+    #[test]
+    fn waiting_for_an_exec_returns_only_once_the_named_program_is_running() {
+        let mut child = spawned_and_execed(
+            Command::new("/bin/bash")
+                .args(["-c", "exec /usr/bin/sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            "sleep",
+        );
+        let executable = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+        assert!(
+            executable.ends_with("sleep"),
+            "returned while the child was still {}",
+            executable.display()
+        );
+        // And the state the other tests in this module go on to assert: a
+        // child handed back by the helper is one `capture` qualifies.
+        ProcessLease::capture(child.id())
+            .expect("a root-installed executable is observable once the exec has happened");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     #[test]
     fn incidental_exit_during_inspection_does_not_hide_live_failures_or_pid_replacement() {
-        let mut owner = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
-        let mut child = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let mut owner = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
         let owner_directory = open_process(owner.id()).unwrap();
         let directory = open_process(child.id()).unwrap();
         let owner_lease = ProcessLease::capture(owner.id()).unwrap();
@@ -594,7 +685,7 @@ mod tests {
 
     #[test]
     fn an_unreaped_incidental_child_is_skipped_only_after_all_tasks_exit() {
-        let mut child = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
         let directory = open_process(child.id()).unwrap();
         child.kill().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -627,13 +718,14 @@ mod tests {
 
     #[test]
     fn a_process_lease_expires_even_while_its_proc_directory_is_held() {
-        let mut child = Command::new("/usr/bin/sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = spawned_and_execed(
+            Command::new("/usr/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            "sleep",
+        );
         let lease = ProcessLease::capture(child.id());
         let cleanup = child.kill();
         child.wait().unwrap();
@@ -680,6 +772,11 @@ mod tests {
                 }
             }
         };
+        // The same exec window as everywhere else, and here it would let the
+        // test pass for the wrong reason: a pre-exec capture is refused
+        // because this test binary is not root-installed, which is not the
+        // refusal this test is about.
+        wait_for_exec(child.id(), path.file_name().unwrap().to_str().unwrap());
         let lease = ProcessLease::capture(child.id());
         let cleanup = child.kill();
         child.wait().unwrap();
@@ -691,13 +788,14 @@ mod tests {
     #[test]
     fn exec_in_the_same_process_invalidates_its_previous_lease() {
         use std::io::Write as _;
-        let mut child = Command::new("/bin/bash")
-            .args(["-c", "read -r line; exec /usr/bin/sleep 30"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = spawned_and_execed(
+            Command::new("/bin/bash")
+                .args(["-c", "read -r line; exec /usr/bin/sleep 30"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            "bash",
+        );
         let lease = ProcessLease::capture(child.id());
         let invalidated = match &lease {
             Ok(lease) => {
