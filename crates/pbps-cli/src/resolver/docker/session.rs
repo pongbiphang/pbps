@@ -241,11 +241,20 @@ impl CandidateSession {
                 Ok(session) => return Ok(session),
                 Err(failure) => failure,
             };
-            if !engine_starting || tokio::time::Instant::now() >= deadline {
+            // A non-empty `recovery_names` means the attempt could not confirm
+            // that its own control container is gone. Retrying past that would
+            // carry the name into a session that tracks only the container the
+            // *next* attempt made, so an operator would be told to recover one
+            // container while another stood untracked in the workload's
+            // namespace. An unconfirmed cleanup is terminal.
+            if !engine_starting
+                || !failure.recovery_names.is_empty()
+                || tokio::time::Instant::now() >= deadline
+            {
                 return Err(failure);
             }
-            // The attempt closed its own control container; mint the next
-            // pair from the handle held back for exactly this, which
+            // The attempt closed its own control container, confirmed; mint
+            // the next pair from the handle held back for exactly this, which
             // re-verifies the daemon peer the way every other additional
             // connection here does.
             let (Ok(next_api), Ok(next_attach)) =
