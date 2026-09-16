@@ -318,27 +318,26 @@ jobs:
   # a change to this file and not to a ruleset nobody re-reads. `name` is the
   # `ci-gate` context `ci-before-merge` already requires.
   #
-  # `if: ${{ !cancelled() }}` is load-bearing. A job that `needs` a failed job
-  # is *skipped*, and GitHub counts a skipped required check as a passing one —
-  # so a gate without this line reports success in exactly the case it exists
-  # to catch (DECISIONS 206; rust-analyzer's `conclusion` job and clap's `ci`
-  # job carry the same warning).
+  # `if: ${{ always() }}` is load-bearing, and it must be `always()` rather than
+  # any narrower condition. One rule drives all of it: **a skipped job reports a
+  # skipped check run, and GitHub counts a skipped required check as a passing
+  # one** (DECISIONS 206; rust-analyzer's `conclusion` job and clap's `ci` job
+  # carry the same warning). So any condition that can skip *this* job hands the
+  # merge box a pass for a matrix that did not pass. A job that `needs` a failed
+  # job is skipped by default, which is why some condition is needed at all; and
+  # `!cancelled()` skips it whenever the run is cancelled, which is why that one
+  # is not enough. `always()` is the only condition that never skips.
   #
-  # `always()` and not `!cancelled()`, which this job carried at first and which
-  # was wrong for the same reason the line above exists: cancel the run and
-  # `!cancelled()` skips the gate, a skipped required check passes, and the
-  # merge box opens over a matrix that never ran. The commit-status version had
-  # no such hole — it simply wrote nothing, and a required status that is
-  # absent blocks.
-  #
-  # The reason `!cancelled()` was there at all belonged to that version too: a
-  # status is addressed to a SHA, so a cancelled run writing `failure` late
-  # could overwrite the run that superseded it. Check runs do not overwrite one
-  # another — each belongs to its own run, and branch protection reads the
-  # latest on the head — so the race is gone and the guard against it had
-  # outlived its reason. `always()` costs the opposite error instead: a
-  # cancelled run reports a failing gate, which shuts a gate that a re-run
-  # opens again. Wrongly shut is recoverable; wrongly open is not.
+  # This job did carry `!cancelled()` at first, so the hole is recorded rather
+  # than merely avoided: cancelling a run skipped the gate and opened the merge
+  # box. Its reason belonged to the commit-status version — a status is
+  # addressed to a SHA, so a cancelled run writing `failure` late could
+  # overwrite the run that superseded it. Check runs never overwrite one another
+  # — each belongs to its own run, and branch protection reads the latest on the
+  # head — so that race ended with the mechanism while the guard against it
+  # stayed. `always()` costs the opposite error: a cancelled run reports a
+  # failing gate, cleared by `gh run rerun <run-id>`. Wrongly shut is
+  # recoverable; wrongly open is not.
   #
   # For the same reason `skipped` and `cancelled` are failures below and not
   # passes. Nothing here is meant to be skipped; if something ever is, the gate
