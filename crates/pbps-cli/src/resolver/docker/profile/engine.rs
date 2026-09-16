@@ -125,7 +125,21 @@ pub(super) fn bootstrap(driver: Driver, password: &str) -> Bootstrap {
             ambient: "--ambient-caps=-all,+net_bind_service",
             storage_path: "/var/opt/mssql",
             storage_options: "rw,nosuid,nodev,noexec,size=1073741824,uid=10001,gid=0,mode=700",
-            program: "/opt/mssql/bin/sqlservr >/dev/null 2>&1 & engine=$!; until grep -q 'SQL Server is now ready for client connections' /var/opt/mssql/log/errorlog 2>/dev/null; do kill -0 \"$engine\"; sleep 0.1; done; printf 'pbps-engine-ready-v1\\n'; wait \"$engine\"",
+            // Readiness is a successful **login**, not a log line. Measured on
+            // the pinned image: `127.0.0.1:1433` accepts at 4170ms and the
+            // errorlog says "SQL Server is now ready for client connections"
+            // at 4170ms, but `sa` cannot log in until 4766ms — so both signals
+            // this once used are early, and the ~600ms between them is the
+            // `18456` that turned the resolver job red (issue #638). Nor is
+            // there a later line to grep: at the instant the login first
+            // worked the log tail was msdb upgrade steps, whose presence
+            // depends on whether this is a first start.
+            //
+            // `SQLCMDPASSWORD` rather than `-P`: the password would otherwise
+            // stand in this container's `/proc/PID/cmdline` for the whole
+            // wait. `kill -0` still fails the wait if the engine dies, so a
+            // server that will never accept a login is not waited on forever.
+            program: "/opt/mssql/bin/sqlservr >/dev/null 2>&1 & engine=$!; export SQLCMDPASSWORD=\"$MSSQL_SA_PASSWORD\"; until /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1 -U sa -Q 'SELECT 1' >/dev/null 2>&1; do kill -0 \"$engine\"; sleep 0.1; done; unset SQLCMDPASSWORD; printf 'pbps-engine-ready-v1\\n'; wait \"$engine\"",
             environment: vec![
                 "PATH=/usr/bin:/bin".into(),
                 "ACCEPT_EULA=Y".into(),
