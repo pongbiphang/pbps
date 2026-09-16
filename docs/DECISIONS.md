@@ -12879,6 +12879,19 @@ SPEC is in sync with all of these.
     reports a failing gate, which a re-run clears. Wrongly shut is recoverable;
     wrongly open is not.
 
+    Measured on the pull request that made the change, not argued: run
+    35117078034 on the commit that introduced `always()` was cancelled by
+    `cancel-in-progress` when the next commit was pushed, and the gate reported
+
+        run conclusion = cancelled
+          ci-gate: failure
+        GET /commits/<sha>/check-runs -> ci-gate status=completed conclusion=failure
+
+    A real cancellation produced a real `ci-gate` check run, and it is
+    `failure`. Under `!cancelled()` that check run would not have existed as a
+    conclusion at all — the job would have been skipped, and a skipped required
+    check passes.
+
     **`paths` and `paths-ignore` stay off the trigger.** A required check that
     never reports leaves a pull request blocked with nothing that can clear it —
     the same class of stall 206 records, reached from the other side. Skipping
