@@ -97,25 +97,44 @@ checksum-pinned, and state lives in the database itself.
   tab while the required check stays unsatisfied (DECISIONS 206). Dispatch is
   for a branch that has no pull request.
 - Red CI: fix it, push, and return to the loop as a draft.
-- If `master` moves before merge, rebase and push the rebased head with
-  `git push --force-with-lease`. The ruleset is strict, so a branch that is
-  `BEHIND` cannot merge however green it is; the push starts the run on the
-  rebased head by itself, and that run is what the merge waits for.
-- If that rebase needs conflict resolution, resolve it, run the required local
-  tests, push, and obtain a completed code review whose `Reviewed commit:` is
-  the conflict-resolution head. P0 is always fixed; P1–P3 follow the same
-  three-case finding rules, and P2 may be deferred directly to a linked
-  `deferred-review` issue. A P0 or P1 must be addressed and followed by another
-  completed resulting-head code review. Once that review has no P0 or P1, the
-  PR may proceed without repeating the draft or ready three-review gates; all
-  branch checks required on that head must still be green.
-- Before merge, the primary agent independently verifies the issue-to-diff
-  match, architecture, local-test evidence, review counts and heads, thread
-  dispositions, dependency order, and required CI checks. Subagents never
-  merge.
-- The primary agent merges with a merge commit (`gh pr merge --merge`), deletes
-  the branch, and removes the worktree only after every gate above passes.
-- Never bypass the ruleset that requires green CI on the PR head.
+- **`master` moving is not your problem any more.** The merge queue builds the
+  pull request against the current `master` and against whatever is queued
+  ahead of it, so a branch that is merely behind is merged without anyone
+  rebasing it. Do not rebase to clear `BEHIND`; the strict policy that made
+  that necessary is off (DECISIONS 502).
+- A **conflict** is still yours. The queue cannot resolve one — it ejects the
+  pull request instead. Rebase, resolve it, run the required local tests, push
+  with `git push --force-with-lease`, and obtain a completed code review whose
+  `Reviewed commit:` is the conflict-resolution head. P0 is always fixed;
+  P1–P3 follow the same three-case finding rules, and P2 may be deferred
+  directly to a linked `deferred-review` issue. A P0 or P1 must be addressed
+  and followed by another completed resulting-head code review. Once that
+  review has no P0 or P1, the PR may proceed without repeating the draft or
+  ready three-review gates; all branch checks required on that head must still
+  be green.
+- Before **enqueueing**, the primary agent independently verifies the
+  issue-to-diff match, architecture, local-test evidence, review counts and
+  heads, thread dispositions, dependency order, and required CI checks. That
+  verification is unchanged; only the step it precedes has moved. Subagents
+  never enqueue and never merge.
+- The primary agent enqueues with `gh pr merge --merge` once every gate above
+  passes. With a merge queue required, that command **adds the pull request to
+  the queue** rather than merging it: GitHub builds a branch of `master` plus
+  everything queued ahead plus this pull request, runs `ci.yml` on the
+  `merge_group` event, and merges only if that is green. Wait for the merge to
+  land before deleting the branch and removing the worktree — a queued pull
+  request is not a merged one.
+- A pull request must be green on its **own** head before it can be queued, so
+  `ci.yml` runs twice per merge: once on the pull request, once on the merge
+  group. That is the price of the queue and it is the cheap half of the trade —
+  what it buys is that neither run has to be repeated because somebody else
+  merged first.
+- If the queue ejects the pull request, read why before re-queueing. A conflict
+  is the case above. A failing merge-group check that the pull request's own
+  run passed is a real interaction with what merged ahead of it, not a flake to
+  re-queue through.
+- Never bypass the ruleset. It requires green CI on the pull request head and
+  green CI on the merge group.
 - Report at each merge: the draft and ready review counts, the qualifying route,
   the merge commit, and every finding deferred to an issue.
 - Never add "one more round" — more review is a new instruction.
@@ -128,8 +147,8 @@ checksum-pinned, and state lives in the database itself.
   and coordinate multiple eligible issues concurrently. Each subagent owns
   exactly one issue at a time, uses an isolated branch and worktree, and never
   merges. Dependency-linked issues merge in topological order.
-- `ci.yml` runs on `master` after a merge. It is not a gate — the strict
-  ruleset already made the merged tree the tree CI passed — so do not wait for
+- `ci.yml` runs on `master` after a merge. It is not a gate — the merge queue
+  already ran it on the exact tree the merge produced — so do not wait for
   it before taking the next issue; a red one is a real regression and the next
   task. The dependency audit is a separate workflow and does run on `master`
   when the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own

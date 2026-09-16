@@ -12911,3 +12911,55 @@ SPEC is in sync with all of these.
     guarantee, and 206 rejected one only because "merge queues need an
     organisation-owned or public repository and this one is neither". It is now
     both.
+
+502. **A merge queue on `master`, and the strict up-to-date policy off.** With
+    several pull requests in flight the strict policy serialised every merge:
+    merging one left the rest `BEHIND`, each had to rebase and re-run the full
+    matrix, and whoever merged next invalidated the others again. That cost is
+    inherent to the policy rather than to how long CI takes, so making CI
+    faster could not have removed it.
+
+    The queue is the automated form of the same guarantee, not a weaker one.
+    GitHub states the relationship plainly: it "provides the same benefits as
+    the **Require branches to be up to date before merging** branch
+    protection, but does not require a pull request author to update their
+    pull request branch". The property 206 wanted — that the tree CI ran on is
+    the tree the merge commit holds — is what the queue enforces, by building
+    `master` plus everything queued ahead plus this pull request and running
+    `ci.yml` on the `merge_group` event against exactly that.
+
+    206 rejected a queue for a reason that expired: "merge queues need an
+    organisation-owned or public repository and this one is neither". Since the
+    move to `pongbiphang` it is both. 501 added the `merge_group` trigger so
+    that turning the queue on would be a ruleset change alone; a queue whose
+    required checks do not run on the merge group never advances.
+
+    **Strict is turned off, and the two are not mutually exclusive.** GitHub
+    accepts both at once. Leaving strict on would nevertheless have made the
+    queue pointless: the author would still have to update the branch before it
+    could be queued, which is the exact work the queue exists to remove. So
+    this is a deliberate pairing rather than a constraint.
+
+    **What it costs, stated rather than discovered later.** A pull request must
+    be green on its *own* head before it can be queued, so `ci.yml` runs twice
+    per merge — once on the pull request, once on the merge group. That is the
+    cheap half of the trade: what disappears is not a run but the *repetition*
+    of runs caused by somebody else merging first, which had no bound. A
+    conflict is still the author's to resolve; the queue ejects a pull request
+    it cannot merge rather than guessing.
+
+    Measured against the field rather than chosen. Of the fifteen projects
+    surveyed for 501, the four running a merge queue — rust-analyzer, cargo,
+    diesel, bevy — are precisely the ones with many concurrent pull requests
+    and long CI, and rust-lang/rust ran bors, the same idea, for years before
+    GitHub shipped one. The projects without one (atlas, tokio, sqlx, ripgrep,
+    clap) keep the strict policy and pay the serialisation. This repository has
+    the first shape, not the second.
+
+    Settings: `merge_method: MERGE`, because the merge commit is what this
+    repository keeps (AGENTS.md). `grouping_strategy: ALLGREEN`, so every pull
+    request's own merge commit must pass, not only the head of the group —
+    the weaker setting would let a pull request merge on somebody else's green.
+    `max_entries_to_build: 5`, which is what makes the validation parallel and
+    therefore what actually removes the serialisation; `min_entries_to_merge: 1`
+    with no wait, so a ready entry merges instead of waiting to be batched.
