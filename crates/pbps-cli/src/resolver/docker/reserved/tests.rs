@@ -19,6 +19,7 @@ async fn a_reserved_runtime_has_no_database_until_its_fixed_bootstrap_gate_opens
             LocalApi::connect(&path).await.unwrap(),
             LocalApi::connect(&path).await.unwrap(),
             LocalApi::connect(&path).await.unwrap(),
+            LocalApi::connect(&path).await.unwrap(),
             image.clone(),
             driver,
         )

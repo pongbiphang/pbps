@@ -16,6 +16,9 @@ pub struct ReservedSession {
     bootstrap: AttachStream,
     control_api: LocalApi,
     attach_api: LocalApi,
+    /// Held back, unspent, so a login refused by a still-starting engine can
+    /// be retried on a control container of its own (issue #638).
+    retry_api: LocalApi,
     image: CandidateImage,
     driver: Driver,
     password: String,
@@ -63,7 +66,17 @@ impl ReservedSession {
         }
         let control_api = api.additional().await.map_err(failure)?;
         let attach_api = api.additional().await.map_err(failure)?;
-        Self::reserve_channels(api, bootstrap_api, control_api, attach_api, image, driver).await
+        let retry_api = api.additional().await.map_err(failure)?;
+        Self::reserve_channels(
+            api,
+            bootstrap_api,
+            control_api,
+            attach_api,
+            retry_api,
+            image,
+            driver,
+        )
+        .await
     }
 
     pub(super) async fn reserve_channels(
@@ -71,6 +84,7 @@ impl ReservedSession {
         bootstrap_api: LocalApi,
         control_api: LocalApi,
         attach_api: LocalApi,
+        retry_api: LocalApi,
         image: CandidateImage,
         driver: Driver,
     ) -> Result<Self, StartFailure> {
@@ -114,6 +128,7 @@ impl ReservedSession {
                 bootstrap,
                 control_api,
                 attach_api,
+                retry_api,
                 image,
                 driver,
                 password,
@@ -226,6 +241,7 @@ impl ReservedSession {
         CandidateSession::connect_workload(
             self.control_api,
             self.attach_api,
+            self.retry_api,
             self.image,
             self.driver,
             self.password,
