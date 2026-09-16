@@ -70,10 +70,12 @@ finding still needs the disposition above. Count a review only when its
 move the count.
 
 When either route qualifies, kill the watch and post no further draft
-`@codex review`. Rebase onto `origin/master` if it moved, push, and mark the PR
-ready. The rebase does not repeat the qualified draft gate, but the ready-phase
-code review must name the rebased current head. Never add one extra draft round
-without a new user instruction.
+`@codex review`, then mark the PR ready. Do **not** rebase merely because
+`master` moved: the merge queue builds the PR against current `master`, so a
+branch that is only behind needs nothing (DECISIONS 502). Rebase only to
+resolve a conflict; that rebase does not repeat the qualified draft gate, but
+the ready-phase code review must then name the resolution head. Never add one
+extra draft round without a new user instruction.
 
 ## 4. Ready gate
 
@@ -96,17 +98,21 @@ do not reset the no-P1 count solely because of that lower-priority finding.
 
 ## 5. CI and base changes
 
-After the ready gate qualifies, start CI on the remote PR head with
-`gh workflow run ci.yml --ref <branch>` and wait. A push clears the checks. A
-red CI result requires a fix, push, and return to the draft loop.
+CI runs itself on every push, so by the time the ready gate qualifies there is
+a run on the head already; wait for `ci-gate` on it. Retry a transient failure
+with `gh run rerun <run-id>` (`--failed` for the failed jobs alone), which keeps
+the run's pull-request association. Never use `gh workflow run ci.yml` for that
+— it raises a `workflow_dispatch` event whose check suite belongs to no pull
+request, so it goes green in the Actions tab while the required check stays
+unsatisfied (DECISIONS 206, 501). A red CI result requires a fix, push, and
+return to the draft loop.
 
-If `master` moves before merge, rebase and push the new head with
-`git push --force-with-lease`:
+`master` moving before merge needs no action: the queue rebuilds the PR against
+current `master` when it is enqueued.
 
-- A conflict-free rebase requires CI again on the new remote head.
-- If conflict resolution is required, resolve it, run the required local tests,
-  push, and obtain a completed code review whose `Reviewed commit:` is the
-  conflict-resolution head.
+- If the queue ejects the PR for a conflict, resolve it, run the required local
+  tests, push with `git push --force-with-lease`, and obtain a completed code
+  review whose `Reviewed commit:` is the conflict-resolution head.
 - P0 from the conflict-resolution review is always fixed. P1–P3 use the same
   three-case finding rules above; a P2 may be deferred directly to a linked
   `deferred-review` issue.

@@ -104,11 +104,13 @@ and merge order.
   dependency safely, pause that downstream issue and escalate to the primary
   agent; workers must not invent a temporary integration branch or copy
   unreviewed changes between worktrees.
-- Merge in topological order. After an upstream merge, rebase or retarget each
-  downstream branch onto the updated base and rerun required tests. A
-  conflict-free rebase requires CI again on the new remote head. A rebase that
-  needs conflict resolution follows the resulting-head code-review gate in the
-  review reference. Do not automatically repeat the earlier draft/ready streak.
+- Merge in topological order. After an upstream merge, a downstream branch that
+  is merely behind needs nothing: the merge queue builds it against current
+  `master` when it is enqueued (DECISIONS 502). A branch stacked on the upstream
+  branch must still be rebased onto `master`, because its base ref is
+  disappearing, and a conflict ejects the PR from the queue — resolve it, rerun
+  required tests, and follow the resulting-head code-review gate in the review
+  reference. Do not automatically repeat the earlier draft/ready streak.
 - Do not merge a downstream PR while its required upstream issue remains
   unmerged. Related issues without a true prerequisite may merge independently.
 

@@ -72,12 +72,14 @@ checksum-pinned, and state lives in the database itself.
   or P1, or as soon as a completed review reports no findings. A P0 or P1 resets
   the count. Count a review only if its `Reviewed commit:` is the pushed head.
   Never push a docs-only commit to move the count.
-- On stopping: kill the watch and post no further `@codex review`. Rebase onto
-  `origin/master` if it moved, push, then mark the PR ready. That triggers the
-  required code review; wait for it. A security review is optional: if run, its
-  findings use the same triage rules, but its completion is not a gate. The
-  rebase does not repeat the qualified draft gate, but the ready-phase code
-  review must name the rebased current head.
+- On stopping: kill the watch and post no further `@codex review`, then mark the
+  PR ready. Do **not** rebase merely because `master` moved — the queue handles
+  that, and rebasing would re-run the local checks and CI and create a new
+  review head for nothing (DECISIONS 502). Rebase only to resolve a conflict;
+  that rebase does not repeat the qualified draft gate, but the ready-phase code
+  review must then name the resolution head. Marking ready triggers the required
+  code review; wait for it. A security review is optional: if run, its findings
+  use the same triage rules, but its completion is not a gate.
 - In the ready phase, a completed code review with no findings qualifies the PR
   for CI immediately. Otherwise, obtain three consecutive completed code
   reviews with no P0 or P1; P2/P3 findings do not reset the count, but each must

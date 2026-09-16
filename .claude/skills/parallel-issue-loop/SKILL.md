@@ -116,15 +116,16 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   every shared change. If stacking cannot represent the dependency safely, pause
   that downstream issue and decide yourself; workers must not invent an
   integration branch or copy unreviewed changes between worktrees.
-- Merge in topological order. After an upstream merge, **rebase** each
-  downstream branch onto the updated `master`, push with
-  `--force-with-lease`, and rerun the required tests. Retargeting the PR base
-  is not an alternative: it leaves the downstream head untested against the new
-  base, and because `ci-gate` is a commit status on that head, the stale green
-  from before the upstream merge survives the retarget. A conflict-free rebase
-  requires CI again on the new remote head; a rebase that needs conflict
-  resolution follows the resulting-head code-review gate in the review
-  reference. Do not automatically repeat the draft or ready streak.
+- Merge in topological order. After an upstream merge, a downstream branch
+  that is merely `BEHIND` needs **nothing**: the merge queue builds it against
+  current `master` when it is enqueued (DECISIONS 502). Two cases still need
+  you. A branch **stacked on the upstream branch** must be retargeted to
+  `master` or rebased onto it, because its base ref is disappearing; prefer the
+  rebase, so the downstream head is the thing that was reviewed and tested. And
+  a conflict ejects the PR from the queue: resolve it, push with
+  `--force-with-lease`, rerun the required tests, and follow the
+  resulting-head code-review gate in the review reference. Do not automatically
+  repeat the draft or ready streak.
 - Never merge a downstream PR while its required upstream issue is unmerged.
   Related issues without a true prerequisite may merge independently.
 
@@ -174,9 +175,12 @@ belong to the recorded pushed heads, that every finding has a fix or a linked
 deferred issue, that no review thread is unresolved, that dependency order is
 satisfied, and that the required CI checks are green on the mergeable head.
 
-Only you merge, with `gh pr merge --merge`, and only after every gate passes.
-Then delete the branch, remove the worktree, and confirm the intended issue
-closed.
+Only you enqueue, with `gh pr merge --merge`, and only after every gate
+passes. With a merge queue required that command adds the PR to the queue
+rather than merging it; the queue runs `ci.yml` on the `merge_group` and merges
+only if that is green. Wait for the merge to land — a queued PR is not a merged
+one — then delete the branch, remove the worktree, and confirm the intended
+issue closed.
 
 If the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or the
 dependency-audit workflow, wait for the dependency audit; a red audit is the
