@@ -104,7 +104,10 @@ async fn an_inherited_listener_is_bound_to_the_acceptor_and_lost_ownership_is_te
     let process = ProcessLease::capture(child.id()).unwrap();
     let creator = stream.peer_cred().unwrap().pid().unwrap() as u32;
     let observed = UnixPeer::capture(&stream, &process).await;
-    let mut unrelated = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+    let mut unrelated = crate::resolver::native::spawned_and_execed(
+        Command::new("/usr/bin/sleep").arg("30"),
+        "sleep",
+    );
     let other = ProcessLease::capture(unrelated.id()).unwrap();
     let outcome = observed.as_ref().map(|peer| {
         (
