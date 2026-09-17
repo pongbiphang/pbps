@@ -251,29 +251,91 @@ pub async fn before_a_rebuild(
     })
 }
 
-/// Takes the lock the kind allows, or says why there is none.
+/// What holds each half of the qualified name a rebuild's `DROP` will use.
+///
+/// The two halves are held by different things, which is why the answer names
+/// both (DECISIONS 503).
+#[derive(Clone, Copy)]
+struct Locks {
+    /// The lock on the object itself, which holds the local half of the name.
+    object: &'static str,
+    /// Both halves, for the answer where the schema half is held too.
+    and_the_schema: &'static str,
+    /// Why the name can mean something else at the second resolve at all — it
+    /// is not the same sentence for the two lock shapes, and a message that
+    /// named the wrong cause would send an operator looking in the wrong place.
+    how_it_moved: &'static str,
+}
+
+/// Takes the locks the kind allows, or says why one of them is out of reach.
+///
+/// **Two components, two locks.** Every `DROP` this rebuild goes on to run
+/// names its target as `<schema>.<object>`, and nothing holds that name whole.
+/// The object's own lock holds the local half — a rename needs it, so with it
+/// held the name cannot leave the object — and the **schema** half is held by
+/// nothing it can take: `ALTER SCHEMA … RENAME` updates a `pg_namespace` row
+/// and touches neither the relation nor the `pg_proc` entry. Only a row lock
+/// on that `pg_namespace` entry stops it, which is [`pin_the_namespace`].
+///
+/// The pin comes **first**, before the object's lock and before the second
+/// resolve: a pin taken afterwards would leave open exactly the window the
+/// second resolve exists to close.
 async fn serialize(
     conn: &mut Conn,
     id: &ModuleId,
     kind: ModuleKind,
     oid: i64,
 ) -> Result<Serialized, DbError> {
+    // The schema half of the name the `DROP` will use. A trigger's `DROP`
+    // names its parent table (`DROP TRIGGER <name> ON <schema>.<table>`), so
+    // the schema that has to hold still is the table's, not the trigger's.
+    let in_schema = match kind {
+        ModuleKind::Trigger => match id.attached_to() {
+            Some(on) => on.schema.clone(),
+            None => {
+                return Ok(Serialized::Not(format!(
+                    "`{id}` does not say which table it is on, so there is no lock to take"
+                )));
+            }
+        },
+        ModuleKind::View | ModuleKind::Function | ModuleKind::Procedure => {
+            id.object_name().schema.clone()
+        }
+    };
+    let schema_pin = pin_the_namespace(conn, &in_schema).await?;
     match kind {
         // A view is a relation, so its own lock is the right one.
         ModuleKind::View => {
+            const LOCKS: Locks = Locks {
+                object: "the view's own ACCESS EXCLUSIVE lock",
+                and_the_schema: "the view's own ACCESS EXCLUSIVE lock, and a row lock on its \
+                                 schema's `pg_namespace` entry",
+                how_it_moved: "a `LOCK TABLE` resolves its name when it runs — so the lock is \
+                               held on something other than what the reads describe",
+            };
             conn.execute(&format!(
                 "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
                 quoted(&id.object_name())
             ))
             .await?;
-            locked_what_the_reads_describe(conn, id, kind, oid).await?;
-            Ok(Serialized::By("the view's own ACCESS EXCLUSIVE lock"))
+            locked_what_the_reads_describe(conn, id, kind, oid, LOCKS).await?;
+            Ok(both_halves_held(LOCKS, &in_schema, schema_pin))
         }
         // A trigger is neither a relation nor a routine, and the lock that
         // serializes it is its **parent table's**. Measured: with it held,
         // `ALTER TABLE l2.t DISABLE TRIGGER audit` from another session is
         // cancelled.
         ModuleKind::Trigger => {
+            const LOCKS: Locks = Locks {
+                object: "the trigger's parent table's ACCESS EXCLUSIVE lock",
+                and_the_schema: "the trigger's parent table's ACCESS EXCLUSIVE lock, and a row \
+                                 lock on that table's schema's `pg_namespace` entry",
+                how_it_moved: "a `LOCK TABLE` resolves its name when it runs — so the lock is \
+                               held on something other than what the reads describe",
+            };
+            // Asked again rather than carried down: the block above took only
+            // the schema from it, and its `None` arm has already returned, so
+            // this arm cannot reach the `else` below.
             let Some(on) = id.attached_to() else {
                 return Ok(Serialized::Not(format!(
                     "`{id}` does not say which table it is on, so there is no lock to take"
@@ -284,16 +346,25 @@ async fn serialize(
                 quoted(on)
             ))
             .await?;
-            locked_what_the_reads_describe(conn, id, kind, oid).await?;
-            Ok(Serialized::By(
-                "the trigger's parent table's ACCESS EXCLUSIVE lock",
-            ))
+            locked_what_the_reads_describe(conn, id, kind, oid, LOCKS).await?;
+            Ok(both_halves_held(LOCKS, &in_schema, schema_pin))
         }
         // The one that is out of reach for the accounts this tool is for.
         // Measured, as the non-superuser owner of the function:
         // `SELECT oid FROM pg_proc … FOR UPDATE` is `permission denied for
         // table pg_proc`, and as a superuser the same statement is accepted.
         ModuleKind::Function | ModuleKind::Procedure => {
+            const LOCKS: Locks = Locks {
+                object: "a row lock on the routine's `pg_proc` entry",
+                and_the_schema: "a row lock on the routine's `pg_proc` entry, and one on its \
+                                 schema's `pg_namespace` entry",
+                // The row lock is keyed by oid, so unlike the relation arms it
+                // is never on the wrong object. What can have moved is the
+                // name, and the `DROP` that follows goes by name.
+                how_it_moved: "the row lock is keyed by oid, so it is held on the object the \
+                               reads describe — what moved is the name, and the `DROP` that \
+                               follows goes by name",
+            };
             // Inside a savepoint, because a failed statement dooms a
             // PostgreSQL transaction and this one is *expected* to fail for
             // the accounts this tool is built for. **Measured**, as the
@@ -322,9 +393,16 @@ async fn serialize(
             match taken {
                 Ok(_) => {
                     conn.execute("RELEASE SAVEPOINT pbps_routine_lock").await?;
-                    Ok(Serialized::By(
-                        "a row lock on the routine's `pg_proc` entry",
-                    ))
+                    // The same second resolve the relation arms make, and for
+                    // the same reason one statement further on: the lock lands
+                    // on the right row, and the `DROP FUNCTION <schema>.<name>
+                    // (<args>)` that follows still goes by name. **Measured**
+                    // on 18.6, the row lock does hold that name — an
+                    // `ALTER FUNCTION … RENAME` updates this row and queues
+                    // behind it — so unlike the schema half, this one is
+                    // pinned rather than merely checked (DECISIONS 503).
+                    locked_what_the_reads_describe(conn, id, kind, oid, LOCKS).await?;
+                    Ok(both_halves_held(LOCKS, &in_schema, schema_pin))
                 }
                 Err(e) => {
                     conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_lock")
@@ -335,16 +413,142 @@ async fn serialize(
                     if e.server_error_code().as_deref() != Some("42501") {
                         return Err(e);
                     }
+                    // Both halves can be missing at once, and for this account
+                    // they usually are: the two locks are refused by the same
+                    // privilege. The sentence that called the `pg_proc` row
+                    // lock "the only lock that would serialize it" was true
+                    // until 503 and is not now — an operator told about that
+                    // one alone would read the schema half as held.
+                    let and_the_schema = match &schema_pin {
+                        SchemaPin::Held => String::new(),
+                        SchemaPin::Not(why) => format!(
+                            " The schema component of the name that `DROP` uses is not pinned \
+                             either: {why}. A session that renames `{in_schema}` away and \
+                             creates a replacement under that name sends the `DROP` to an \
+                             object this plan never approved over."
+                        ),
+                    };
                     Ok(Serialized::Not(format!(
                         "this rebuild is not serialized: a routine is not a relation, so the \
-                         only lock that would serialize it is a row lock on its `pg_proc` entry, \
-                         and this account cannot take one ({e}). A concurrent `ALTER FUNCTION` \
-                         between this read and the `DROP` is reverted by the rebuild, and pbps \
-                         cannot stop it without privileges it should not need (ADR-0009 §3)"
+                         lock that would serialize its reads is a row lock on its `pg_proc` \
+                         entry, and this account cannot take one ({e}). A concurrent \
+                         `ALTER FUNCTION` between this read and the `DROP` is reverted by the \
+                         rebuild, and pbps cannot stop it without privileges it should not need \
+                         (ADR-0009 §3).{and_the_schema}"
                     )))
                 }
             }
         }
+    }
+}
+
+/// Whether the schema half of the name a rebuild's `DROP` uses is held for the
+/// rest of the caller's transaction, and where it is not, why.
+enum SchemaPin {
+    Held,
+    Not(String),
+}
+
+/// Pins the schema component of the name a rebuild's `DROP` will use, where
+/// the account can take the only lock that pins it.
+///
+/// **Measured** on PostgreSQL 18.6, A the rebuild and B another session. The
+/// object's own lock is not this lock, and does not stand in for it:
+///
+/// ```text
+/// A: BEGIN; LOCK TABLE q.v IN ACCESS EXCLUSIVE MODE;   -- q.v is 152249
+/// B: ALTER SCHEMA q RENAME TO q_old;                   -- accepted, not blocked
+///    CREATE SCHEMA q; CREATE TABLE q.t(i int);
+///    CREATE VIEW q.v AS SELECT i * 3 AS i FROM q.t;    -- 152257
+/// A: DROP VIEW q.v;  COMMIT;
+///    -- 152257 is gone; 152249, the object A locked and read, survives as q_old.v
+/// ```
+///
+/// The row lock does stop it, and costs nothing else. **Measured** on the same
+/// server: with `SELECT … FROM pg_namespace … FOR UPDATE` held, B's
+/// `ALTER SCHEMA q RENAME TO q_old` is `canceling statement due to lock
+/// timeout … while updating tuple … in relation "pg_namespace"`, while B's
+/// `CREATE TABLE q.other(i int)` is accepted and A's own `DROP`/`CREATE` of
+/// both a view and a routine in that schema run unaffected. Only a statement
+/// that rewrites the schema's own row waits.
+///
+/// **And it is out of reach for the accounts this tool is built for**, exactly
+/// as the routine arm's own lock is. Measured as the non-superuser owner of
+/// the schema, every row-lock strength is refused the same way —
+/// `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` and `FOR KEY SHARE` are each
+/// `permission denied for table pg_namespace` — because a row lock of any
+/// strength needs `UPDATE` on the table. There is no weaker request to fall
+/// back to, so the fallback is the sentence, not another lock. The savepoint is
+/// the routine arm's device for the routine arm's reason: a failed statement
+/// dooms a PostgreSQL transaction, and this one is *expected* to fail.
+async fn pin_the_namespace(conn: &mut Conn, schema: &str) -> Result<SchemaPin, DbError> {
+    conn.execute("SAVEPOINT pbps_namespace_pin").await?;
+    let taken = conn
+        .query_with(
+            "SELECT n.oid::int8 AS oid FROM pg_catalog.pg_namespace n \
+             WHERE n.nspname = $1 FOR UPDATE",
+            &[Param::Str(schema)],
+        )
+        .await;
+    match taken {
+        Ok(rows) => {
+            conn.execute("RELEASE SAVEPOINT pbps_namespace_pin").await?;
+            // Absent, empty and unreadable are three different things: a
+            // statement that succeeded and matched nothing is not a pin, and
+            // reporting one would be the one direction this must not fail in.
+            // The lock and the second resolve that follow are what report it;
+            // this only declines to claim what it did not take.
+            if rows.is_empty() {
+                return Ok(SchemaPin::Not(format!(
+                    "`{schema}` is no longer in the catalog, so there is no row to lock: another \
+                     session renamed or dropped the schema between this rebuild's read and this \
+                     lock"
+                )));
+            }
+            Ok(SchemaPin::Held)
+        }
+        Err(e) => {
+            conn.execute("ROLLBACK TO SAVEPOINT pbps_namespace_pin")
+                .await?;
+            // Released as well as rolled back: `ROLLBACK TO` keeps the marker,
+            // and a marker left standing shadows a caller's own savepoint of
+            // the same name. (The routine arm's marker beside this one has the
+            // same gap and is issue #534, which owns that fix.)
+            conn.execute("RELEASE SAVEPOINT pbps_namespace_pin").await?;
+            // Only missing privileges permit an unpinned name (ADR-0009 §3).
+            // A cancellation or another engine failure must still abort.
+            if e.server_error_code().as_deref() != Some("42501") {
+                return Err(e);
+            }
+            Ok(SchemaPin::Not(format!(
+                "only a row lock on `{schema}`'s `pg_namespace` entry stops an \
+                 `ALTER SCHEMA … RENAME`, and this account cannot take one ({e})"
+            )))
+        }
+    }
+}
+
+/// The answer, once the object's own lock is held and the second resolve has
+/// passed: `By` only when the schema half is held too.
+///
+/// A rebuild whose schema can still move is **not** serialized, even though
+/// its reads are: the `DROP` that follows resolves a name whose first
+/// component another session may by then have given to a different schema, and
+/// what it destroys is an object no plan approved over. Saying `By` there
+/// would answer a question nobody asked — whether the *reads* were safe — in
+/// the words of the one they did (DECISIONS 503).
+fn both_halves_held(locks: Locks, schema: &str, pin: SchemaPin) -> Serialized {
+    match pin {
+        SchemaPin::Held => Serialized::By(locks.and_the_schema),
+        SchemaPin::Not(why) => Serialized::Not(format!(
+            "this rebuild is serialized only halfway: its reads are held by {}, but the schema \
+             component of the name its `DROP` uses is not pinned — {why}. A session that renames \
+             `{schema}` away and creates a replacement under that name between this check and \
+             the `DROP` sends the `DROP` to an object this plan never approved over. SPEC §7.6's \
+             read-back catches that and rolls the whole apply back, and pbps cannot prevent it \
+             without privileges it should not need (ADR-0009 §3)",
+            locks.object
+        )),
     }
 }
 
@@ -381,11 +585,22 @@ async fn serialize(
 /// records the choice; `data_triggers::lock_by_oid` is the same device applied
 /// to the mirror image, where the oid is known and the name is read for the
 /// lock (DECISIONS 445).
+///
+/// **The routine arm asks it too, for the half of the question 499 did not
+/// answer.** Its lock is taken by oid, so the lock never lands on the wrong
+/// row — that is the question 499's closing paragraph answered. The `DROP
+/// FUNCTION <schema>.<name>(<args>)` one statement later still goes by name,
+/// and a session that renamed the routine aside and created a replacement
+/// before the lock was taken leaves that name meaning the replacement. So the
+/// same second resolve runs, and here it *pins*: **measured** on 18.6, an
+/// `ALTER FUNCTION … RENAME` updates the very row the lock holds and queues
+/// behind it (DECISIONS 503).
 async fn locked_what_the_reads_describe(
     conn: &mut Conn,
     id: &ModuleId,
     kind: ModuleKind,
     oid: i64,
+    locks: Locks,
 ) -> Result<(), DbError> {
     let now = module_oid(conn, id, kind).await?;
     if now == Some(oid) {
@@ -404,13 +619,14 @@ async fn locked_what_the_reads_describe(
     };
     Err(DbError::Refused(format!(
         "`{id}` moved between this rebuild's read and its lock: the reads that say what a \
-         rebuild would destroy are keyed to {reads_describe}, and with the `ACCESS EXCLUSIVE` \
-         lock held that name {now_means}. Another session renamed or dropped the object and \
-         gave its name away in between, and a `LOCK TABLE` resolves its name when it runs — so \
-         the lock is held on something other than what the reads describe.\nNothing is \
-         reported rather than an answer about one object beside a lock on another: the `DROP` \
-         that follows goes by name, so it would destroy whatever stands under it — an object \
-         no plan approved over. Run the deploy again once the other session has finished."
+         rebuild would destroy are keyed to {reads_describe}, and with {held} held that name \
+         {now_means}. Another session renamed or dropped the object and gave its name away in \
+         between, and {how_it_moved}.\nNothing is reported rather than an answer about one \
+         object beside a lock on another: the `DROP` that follows goes by name, so it would \
+         destroy whatever stands under it — an object no plan approved over. Run the deploy \
+         again once the other session has finished.",
+        held = locks.object,
+        how_it_moved = locks.how_it_moved
     )))
 }
 
