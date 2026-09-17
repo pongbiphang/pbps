@@ -659,18 +659,16 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
         .filter(|g| g.ends_with("SCHEMA::[dest]"))
         .collect();
     at_destination.sort();
-    // `SELECT` is named twice at the destination, by the probes and by the
-    // row read-back, which is the same "one permission, two reasons" shape
-    // the ledger's own `SELECT` has. The reasons differ; the securable and
-    // the remedy do not.
+    // Named once each, and by the read-back rather than by the probes: the
+    // probes run before the transfer and read the table where it still is, so
+    // a table that carries no rows is not asked about its destination at all.
     let reasons: Vec<&str> = pbps_mssql::doctor::missing(&held)
         .iter()
         .filter(|g| g.permission == "SELECT" && g.securable() == "SCHEMA::[dest]")
         .map(|g| g.why)
         .collect();
-    assert_eq!(reasons.len(), 2, "{reasons:?}");
-    assert_ne!(reasons[0], reasons[1], "{reasons:?}");
-    at_destination.dedup();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("read-back"), "{reasons:?}");
     assert_eq!(
         at_destination,
         [

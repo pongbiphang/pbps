@@ -1667,14 +1667,16 @@ narrowed from the schema to the tables nothing else covered the read it needs
 (DECISIONS 509). PostgreSQL asks the same question in its own vocabulary, over
 the same list.
 
-A declared table whose recorded identity lives in **another schema** is asked
-about twice: at the object it currently is, which the probes read before
-anything runs, and at the destination schema, because `ALTER SCHEMA ...
-TRANSFER` drops every permission on the object it moves and the destination
-object does not exist yet for a grant to sit on. That second question covers
-every demand the table carries — the row DML as well as the read — because the
-transfer drops all of them, and asking only for the read would report a remedy
-that leaves the first row failing (DECISIONS 512).
+A declared table **that declares rows** and whose recorded identity lives in
+another schema is asked about twice: at the object it currently is, which the
+probes read before anything runs, and at the destination schema, because
+`ALTER SCHEMA ... TRANSFER` drops every permission on the object it moves and
+the destination object does not exist yet for a grant to sit on. That second
+question covers every demand the rows carry — the DML as well as the read —
+because the transfer drops all of them, and asking only for the read would
+report a remedy that leaves the first row failing. A moving table with no rows
+is asked only at its source: the probes are spent before the transfer, and
+nothing reads it afterwards (DECISIONS 512).
 
 An existing `__pbps_state` that still needs the timeline columns also requires
 `ALTER` on that object (SQL Server), or ownership/equivalent (PostgreSQL).

@@ -1945,21 +1945,17 @@ pub async fn permissions(
 /// Keep each declaration's fallback independent from the recorded names that
 /// still exist, and choose the narrowest securable whose answer was read.
 ///
-/// # Why a cross-schema move is answered at two securables
+/// # Why a cross-schema move is *not* answered here
 ///
-/// A declared table whose recorded identity lives in another schema is moved
-/// by `ALTER SCHEMA <dest> TRANSFER <source>.<name>`, and that statement
-/// **drops every permission on the object** (measured on the pinned image,
-/// 17.0.4075.5: a login holding `SELECT` on `app.old_name` and `ALTER` on both
-/// schemas ran the transfer, and its next read of `dest.old_name` failed with
-/// error 229 — `HAS_PERMS_BY_NAME` answering 1 before the move and 0 after).
-/// So the source object's answer, which is the one the current-name resolution
-/// asks for, says nothing about the read that follows the move. The
-/// destination object does not exist yet, so the only securable a grant can
-/// sit on for it is the destination schema, and a `GRANT SELECT ON
-/// SCHEMA::dest` was measured to carry the post-transfer read. Both answers
-/// are kept: the source one is still needed, because the probes read the table
-/// before the transfer runs (issue #517, DECISIONS 512).
+/// `ALTER SCHEMA <dest> TRANSFER` drops every permission on the object it
+/// moves, so the source answer says nothing about any statement that runs
+/// afterwards (DECISIONS 512). This requirement is not one of them: it is the
+/// pre-flight probes' `SELECT`, and `preflight` runs before
+/// `execute_statements`, so the probes read the table where it still is. The
+/// only read that happens *after* the transfer is the row read-back, which is
+/// scoped to the plan's data tables — so the destination is demanded by
+/// `data_gaps`, of the tables that are really read there, and not of every
+/// managed table (issue #517, and the round that narrowed it).
 fn managed_table_rights<'a>(
     declared: &[ObjectName],
     resolved: &BTreeMap<ObjectName, ObjectName>,
@@ -1975,11 +1971,6 @@ fn managed_table_rights<'a>(
     {
         if let Some((query, granted)) = query.and_then(|q| objects.get(q).map(|g| (q, g))) {
             rights.insert(Securable::Object(query.clone()), granted.clone());
-            if query.schema != table.schema
-                && let Some(granted) = schemas.get(&table.schema)
-            {
-                rights.insert(Securable::Schema(table.schema.clone()), granted.clone());
-            }
         } else if let Some(granted) = schemas.get(&table.schema) {
             rights.insert(Securable::Schema(table.schema.clone()), granted.clone());
         }
@@ -4004,17 +3995,19 @@ mod tests {
         assert_eq!(missing(&held).len(), applicable);
     }
 
-    /// `ALTER SCHEMA ... TRANSFER` drops every permission on the object it
-    /// moves, so the source object's answer — the one current-name resolution
-    /// asks for — proves nothing about the read that follows the move. The
-    /// destination object does not exist yet, so the destination *schema* is
-    /// the only securable a grant for it can sit on (issue #517).
+    /// A table that moves between schemas and carries **no rows** is not asked
+    /// about its destination at all. The probes' `SELECT` reads it before the
+    /// transfer — `preflight` runs before `execute_statements` — and the only
+    /// read that happens afterwards is the row read-back, which is scoped to
+    /// the plan's data tables. Demanding the destination of every moving table
+    /// refused a deployment that would have run (issue #517, round 5).
     #[test]
-    fn a_cross_schema_move_is_asked_about_the_destination_schema_as_well() {
+    fn a_cross_schema_move_without_rows_is_not_asked_about_its_destination() {
         let declared = table("dest.old_name");
         let recorded = table("app.old_name");
         let resolved = [(declared.clone(), recorded.clone())].into_iter().collect();
-        // The source object is fully readable; the destination schema is not.
+        // The source object is readable; the destination schema is not, and
+        // nothing about this table is read there.
         let objects = [(recorded.clone(), read())].into_iter().collect();
         let schemas = [
             ("app".to_owned(), read()),
@@ -4031,28 +4024,11 @@ mod tests {
             &objects,
             &schemas,
         );
-        let named: Vec<String> = missing(&held)
-            .iter()
-            .map(|g| format!("{} on {}", g.permission, g.securable()))
-            .collect();
-        assert_eq!(named, ["SELECT on SCHEMA::[dest]"], "{named:?}");
-
-        // Granting it there closes the gap, and the source answer is still
-        // asked for: the probes read the table before the transfer runs.
-        held.managed_tables = managed_table_rights(
-            &[table("dest.old_name")],
-            &resolved,
-            std::iter::empty(),
-            &objects,
-            &[("app".to_owned(), read()), ("dest".to_owned(), read())]
-                .into_iter()
-                .collect(),
-        );
         assert!(missing(&held).is_empty(), "{:?}", missing(&held));
-        assert!(
-            held.managed_tables
-                .contains_key(&Securable::Object(recorded)),
-            "the source object stays asked about: {:?}",
+        assert_eq!(
+            held.managed_tables.keys().collect::<Vec<_>>(),
+            [&Securable::Object(recorded)],
+            "one securable, the source: {:?}",
             held.managed_tables
         );
     }

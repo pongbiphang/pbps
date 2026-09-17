@@ -13502,6 +13502,16 @@ SPEC is in sync with all of these.
      the table where it is now. An ordinary rename is unaffected — its schema
      does not change, so the second question is not asked.
 
+     **Demanded of the tables that are really read there, and of no others.**
+     The first cut asked it of every managed table that moves, and that refused
+     a deployment which would have run: the probes' `SELECT` is spent *before*
+     the transfer — `preflight` runs before `execute_statements` — and the only
+     read that happens afterwards is the row read-back, which `apply_under_lock`
+     scopes to the plan's data tables. A moving table with no `data:` block is
+     therefore never read at its destination, and asking for it there was the
+     over-demand this list exists to avoid, arrived at while fixing an
+     under-demand. The question lives in the data path alone.
+
      **Every demand the table carries, not only the read.** The transfer drops
      *all* of the object's permissions, so a report that asked the destination
      for `SELECT` alone would print a remedy that makes `doctor` go green on an
