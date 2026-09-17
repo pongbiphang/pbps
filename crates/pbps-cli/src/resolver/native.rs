@@ -532,7 +532,13 @@ pub(crate) fn process_scope(
             if !seen.insert(pid) {
                 continue;
             }
-            if scope.len() >= 1024 {
+            // A bound against a pathological /proc, not a profile limit: it
+            // must exceed the largest `pids.max` any profile admits (the
+            // dedicated-server profile allows 2048) so that a runtime meeting
+            // its named ceiling is never refused for reaching this instead —
+            // `process_scope` counts processes, and threads do not add entries
+            // here, so real engines stay far below it (finding on #640).
+            if scope.len() >= 4096 {
                 return Err(UnqualifiedProcess);
             }
             let directory = match open_process(pid) {
