@@ -9,7 +9,7 @@ use super::profile::{self, ServerProfile};
 use super::{Error, Premise};
 use crate::resolver::native::{
     BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative, for_each_occupant,
-    groups, mount_rows, private_network, process_scope, security,
+    foreign_network_tasks, groups, mount_rows, private_network, process_scope, security,
 };
 
 /// The processes the daemon's record names, before anything is measured of
@@ -230,19 +230,22 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     // engine's network namespace directly is what this refuses, and is the
     // reachable case. Tightening the exception to the forwarder's exact task
     // set is #681.
-    for_each_occupant(init, "net", |occupant| {
-        if init.same_namespace(occupant, "pid")? {
-            return Ok(());
-        }
-        for forwarder in forwarders {
-            if forwarder.same_namespace(occupant, "pid")? {
-                return Ok(());
-            }
-        }
-        refused(occupant, "net");
-        Err(UnqualifiedProcess)
-    })
-    .map_err(Premise::Accounting.named())?;
+    //
+    // Censused capture-free, by PID-namespace identity: a forwarder shares
+    // the engine's network namespace and reaps and respawns its `cat` pipes
+    // as it forwards, so qualifying each occupant would race a legitimate
+    // child that is momentarily a zombie with no executable to read (finding
+    // on #640).
+    let mut pid_anchors = vec![init];
+    pid_anchors.extend(forwarders.iter().copied());
+    let foreign = foreign_network_tasks(init, &pid_anchors).map_err(Premise::Accounting.named())?;
+    if !foreign.is_empty() {
+        #[cfg(test)]
+        eprintln!(
+            "accounting refused net occupants outside every known pid namespace: {foreign:?}"
+        );
+        return Err(Error::Containment(Premise::Accounting));
+    }
     // Mount and IPC alike: a container joined to either reaches the
     // engine's files or its shared memory without being in any listing the
     // engine's PID namespace produces. No forwarder shares these.

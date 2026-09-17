@@ -635,6 +635,47 @@ pub(crate) fn namespace_task_ids(
     Ok(ids)
 }
 
+/// The tasks sharing a lease's network namespace whose PID namespace is none
+/// of the given anchors'.
+///
+/// A capture-free census: it compares namespace identity rather than
+/// qualifying each task, so a short-lived occupant — a forwarder's `cat` pipe
+/// being reaped and respawned while it forwards — is skipped as it vanishes
+/// rather than refused for having, at the instant of capture, no executable to
+/// read. `for_each_occupant` cannot serve here for exactly that reason: it
+/// captures a `ProcessLease` for every occupant, and a zombie between reap and
+/// wait has none. The caller decides what an unaccounted task means.
+pub(crate) fn foreign_network_tasks(
+    net_anchor: &ProcessLease,
+    pid_anchors: &[&ProcessLease],
+) -> Result<Vec<u32>, UnqualifiedProcess> {
+    let mut foreign = Vec::new();
+    for id in namespace_task_ids(net_anchor, "net")? {
+        let directory = match open_process(id) {
+            Ok(directory) => directory,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        let handle = match File::open(proc_base(&directory).join("ns").join("pid")) {
+            Ok(handle) => handle,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        let mut owned = false;
+        for anchor in pid_anchors {
+            if anchor.owns_namespace("pid", &handle)? {
+                owned = true;
+                break;
+            }
+        }
+        if !owned {
+            foreign.push(id);
+        }
+    }
+    net_anchor.check()?;
+    Ok(foreign)
+}
+
 /// Applies one check to every task sharing a lease's namespace, capturing
 /// each in turn and letting it go before the next.
 pub(crate) fn for_each_occupant(
