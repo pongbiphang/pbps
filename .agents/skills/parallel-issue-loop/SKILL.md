@@ -104,12 +104,14 @@ and merge order.
   dependency safely, pause that downstream issue and escalate to the primary
   agent; workers must not invent a temporary integration branch or copy
   unreviewed changes between worktrees.
-- Merge in topological order. After an upstream merge, a downstream branch that
-  is merely behind needs nothing: the merge queue builds it against current
-  `master` when it is enqueued (DECISIONS 502). A branch stacked on the upstream
-  branch must still be rebased onto `master`, because its base ref is
-  disappearing, and a conflict ejects the PR from the queue — resolve it, rerun
-  required tests, and follow the resulting-head code-review gate in the review
+- Merge in topological order. After an upstream merge, a downstream branch
+  needs nothing, stacked or not: the merge queue builds a merely behind branch
+  against current `master` when it is enqueued, and GitHub retargets a branch
+  stacked on the deleted upstream branch onto that PR's base by itself
+  (DECISIONS 502). Do not rebase either case — that rewrites the reviewed head
+  and repeats the local checks, CI and resulting-head review. Only a conflict
+  needs you: it ejects the PR from the queue, so resolve it, rerun required
+  tests, and follow the resulting-head code-review gate in the review
   reference. Do not automatically repeat the earlier draft/ready streak.
 - Do not merge a downstream PR while its required upstream issue remains
   unmerged. Related issues without a true prerequisite may merge independently.

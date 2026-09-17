@@ -117,13 +117,16 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   that downstream issue and decide yourself; workers must not invent an
   integration branch or copy unreviewed changes between worktrees.
 - Merge in topological order. After an upstream merge, a downstream branch
-  that is merely `BEHIND` needs **nothing**: the merge queue builds it against
-  current `master` when it is enqueued (DECISIONS 502). Two cases still need
-  you. A branch **stacked on the upstream branch** must be retargeted to
-  `master` or rebased onto it, because its base ref is disappearing; prefer the
-  rebase, so the downstream head is the thing that was reviewed and tested. And
-  a conflict ejects the PR from the queue: resolve it, push with
-  `--force-with-lease`, rerun the required tests, and follow the
+  needs **nothing**, stacked or not. A merely `BEHIND` branch is built against
+  current `master` by the queue when it is enqueued (DECISIONS 502). A branch
+  **stacked on the upstream branch** is retargeted by GitHub itself: deleting a
+  merged head branch retargets every open PR that used it as a base onto the
+  merged PR's base. Its head already contains the upstream commits, so the
+  queue then builds it against `master` like any other behind branch. **Do not
+  rebase it** — that rewrites the head that was reviewed and repeats the local
+  checks, CI and resulting-head review, which is the work 502 exists to remove.
+  Only a conflict needs you: it ejects the PR from the queue, so resolve it,
+  push with `--force-with-lease`, rerun the required tests, and follow the
   resulting-head code-review gate in the review reference. Do not automatically
   repeat the draft or ready streak.
 - Never merge a downstream PR while its required upstream issue is unmerged.
