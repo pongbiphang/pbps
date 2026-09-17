@@ -14403,6 +14403,12 @@ fn offline_validation_names_unchecked_key_spelling_without_refusing_valid_declar
         ),
         ("mssql", "nvarchar(3)", "abcdef", true),
         ("mssql", "varchar(8)", "漢", true),
+        // No SQL Server row is exempt here, and that is a fact about the
+        // engine rather than an omission: the only conversion that preserves a
+        // key is `nvarchar(max)` (DECISIONS 469), which this engine will not
+        // accept as a key column at all. So every declared SQL Server key
+        // earns the note, and PostgreSQL's two exempt rows above are the
+        // negative control for both.
     ]
     .into_iter()
     .enumerate()
@@ -14443,6 +14449,29 @@ fn offline_validation_names_unchecked_key_spelling_without_refusing_valid_declar
                     && message.contains("plan --db"),
                 "{message}"
             );
+            // The two engines promise different things, and the note has to
+            // say which (issue #528). PostgreSQL requires the read-back to
+            // equal the declared spelling, for a key as well as a cell. SQL
+            // Server aliases a key's spelling at read time (DECISIONS 71), so
+            // its note names conversion and collision and explicitly does not
+            // promise the spelling check.
+            if dialect == "postgres" {
+                assert!(
+                    message.contains("reads back with the same spelling"),
+                    "{message}"
+                );
+            } else {
+                assert!(
+                    !message.contains("reads back with the same spelling"),
+                    "the SQL Server note must not promise a check it does not make: {message}"
+                );
+                assert!(message.contains("one row once converted"), "{message}");
+                assert!(
+                    message.contains("does not require the engine to spell a key back as written"),
+                    "{message}"
+                );
+                assert!(message.contains("`01`"), "{message}");
+            }
         }
         if !should_note {
             assert!(
@@ -14452,6 +14481,104 @@ fn offline_validation_names_unchecked_key_spelling_without_refusing_valid_declar
         }
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+/// A PostgreSQL row key holding U+0000 is not exempt from the conversion note,
+/// however unbounded its column's type is (issue #526).
+///
+/// The identity exemption is about the conversion: unbounded text hands a key
+/// back byte for byte (DECISIONS 469), so there is nothing to warn about. There
+/// is one key that is not true of, and it is true of it in the strongest
+/// possible way — PostgreSQL text cannot hold U+0000 at all, so the declaration
+/// is refused at the first insert, and `validate` used to report it clean.
+///
+/// **The escape has to actually be U+0000**, or this test passes for the wrong
+/// reason on a literal backslash and a zero. The first block proves it: the
+/// loader reads `"bad\0key"` and `"bad\u0000key"` as the *same* mapping key,
+/// which only happens if both decoded to the same one character.
+#[test]
+fn a_postgres_row_key_holding_a_nul_is_not_exempt_from_the_conversion_note() {
+    let declaration = |ty: &str, rows: &str| {
+        format!(
+            "table: app.t\ncolumns:\n  code: {{type: {ty}, nullable: false}}\n\
+             primary_key: {{name: pk_t, columns: [code]}}\ndata:\n  mode: exact\n  rows:\n{rows}"
+        )
+    };
+    let nul_key = "    \"bad\\0key\": {}\n";
+
+    // The premise. Two spellings of one escape are one key to the loader.
+    let d = Demo::new("key-nul526-premise");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    d.table(&declaration(
+        "text",
+        "    \"bad\\0key\": {}\n    \"bad\\u0000key\": {}\n",
+    ));
+    let out = d.run(&["validate", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let message = json["findings"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("duplicate mapping key"),
+        "the two escapes must decode to the same key, or this test proves nothing: {json}"
+    );
+
+    for ty in ["text", "varchar", "character varying"] {
+        let d = Demo::new(&format!("key-nul526-{}", ty.replace(' ', "-")));
+        std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        d.table(&declaration(ty, nul_key));
+        let out = d.run(&["validate", "--format", "json"]);
+        // A note, not a refusal: this is still the offline command that asks
+        // the engine nothing, and the exit code says so.
+        assert_eq!(code(&out), 0, "{ty}: {}{}", stdout(&out), stderr(&out));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        let notes: Vec<_> = json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "dialect.not-checked")
+            .collect();
+        assert_eq!(notes.len(), 1, "{ty}: {json}");
+        assert_eq!(notes[0]["severity"], "note", "{ty}: {json}");
+        let message = notes[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("converts to") && message.contains("plan --db"),
+            "{ty}: {message}"
+        );
+
+        // The negative control on the same type: an ordinary key keeps the
+        // exemption, or this would be a blanket note on unbounded text.
+        d.table(&declaration(ty, "    ordinary: {}\n"));
+        let out = d.run(&["validate", "--format", "json"]);
+        assert_eq!(code(&out), 0, "{ty}: {}{}", stdout(&out), stderr(&out));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        assert!(
+            !json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == "dialect.not-checked"),
+            "{ty}: {json}"
+        );
+    }
+
+    // And a table that declares no rows declares no keys, so it is asked
+    // nothing at all — whatever its key column's type.
+    let d = Demo::new("key-nul526-empty");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: text, nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\n",
+    );
+    let out = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        !json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "dialect.not-checked"),
+        "{json}"
+    );
 }
 
 #[test]
