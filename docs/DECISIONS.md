@@ -13570,3 +13570,44 @@ SPEC is in sync with all of these.
      demand is on an object that exists, at the securable it exists on, which is
      an over-demand this reading cannot see; the destination demand was one it
      could.
+
+515. **A retype asks the catalog for the keys standing on its column, not only
+     for the keys the plan drops (issue #503).**
+
+     `key_drop_blockers` was built around a key *removal*: a `SetPrimaryKey`,
+     `DropUnique` or `DropIndex` gives it something to ask the catalog about,
+     and it names the foreign keys bound to that index (460). A bounded
+     `varchar`/`nvarchar`/`varbinary` widening keeps its key and its index, so
+     such a plan carries no removal at all — and the differ's own retype
+     maintenance recreates only the foreign keys inside the managed projection,
+     because that projection is the recorded schema. A key held by a table this
+     project does not declare is therefore in nobody's list, and the first thing
+     that notices it is the engine.
+
+     Measured on 17.0.4075.5: widening `varchar(10)` to `varchar(20)` on a
+     column an undeclared child references fails with 5074 naming the
+     constraint, followed by 4922; the child's own column fails the same way,
+     and the same column with no key on it widens. So the check now also takes
+     every `AlterColumnType` whose dialect answer demands foreign keys removed
+     (`RetypeDependents::foreign_keys`), and asks `sys.foreign_key_columns` for
+     the keys that reference that column *and* the keys that column is part of
+     — both refuse — minus everything the plan removes before it. What is left
+     is named and refused during connected planning and again before apply,
+     through the path the key side already uses; nothing is added to the
+     approved plan, and no change is ever synthesized for the unmanaged table.
+
+     **The name asked about is the environment's, not the declarations'.** A
+     `RenameColumn` is `order_key` 3 and an `AlterColumnType` 9, so by the time
+     the statement runs the column has its declared name — but this check runs
+     before any statement. The reversal walks the plan backwards by the
+     column's *uid* rather than by name, because a plan may rename two columns
+     into each other's names and a name-matched walk can follow the wrong one.
+     An absent column is a failed read and refuses, exactly as an absent key
+     does; the table half already stops at `stored_key_table` for a table this
+     plan creates.
+
+     **PostgreSQL needs none of this.** Measured on 18.6, the same widening
+     under the same external foreign key succeeds — the engine rebuilds the
+     constraint itself. What it refuses is a type the key cannot be implemented
+     over at all (`varchar` to `integer`), which is an incompatibility rather
+     than a dependency standing in the way, and is not what this check is for.

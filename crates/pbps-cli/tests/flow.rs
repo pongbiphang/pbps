@@ -14687,3 +14687,318 @@ fn connected_plan_json_keeps_edition_warnings_without_duplicate_prose() {
         "{report}"
     );
 }
+
+/// A declared child row the plan does not name stays where it is, and the
+/// parent delete that would take it out is refused — with a retype of both key
+/// endpoints in the same plan, and without (issue #502).
+///
+/// The review that prompted this proposed restoring unchanged foreign keys
+/// before the DML so that `ON DELETE CASCADE` could remove an unchanged child.
+/// pbps counts such a child instead (DECISIONS 55 and 73), and SPEC §7.6
+/// requires a declared row the plan does not name to stay unchanged — so the
+/// proposal would delete data nobody declared, which is the one thing the data
+/// gate exists to prevent. The behaviour was already right; what was missing
+/// was a permanent measurement of it across both shapes of plan, and of the
+/// two dispositions that *are* declared and do go through.
+///
+/// A database per cell, because each writes state: a refusal that leaves the
+/// ledger untouched and a successful apply that records one cannot share an
+/// environment without one of them reading the other's.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_declared_child_row_survives_a_parent_delete_with_and_without_a_retype() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // What the child's declaration says once parent `1` is gone from it.
+    #[derive(Clone, Copy)]
+    enum Child {
+        /// Still pointing at the row the plan removes: not named by the plan,
+        /// so not touched by it, so the delete is refused.
+        Unchanged,
+        /// Moved onto the surviving parent, in the declarations.
+        Moved,
+        /// Removed, in the declarations.
+        Deleted,
+    }
+    for (cell, (retyped, child)) in [
+        (false, Child::Unchanged),
+        (false, Child::Moved),
+        (false, Child::Deleted),
+        (true, Child::Unchanged),
+        (true, Child::Moved),
+        (true, Child::Deleted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let own = OwnDatabase::new(&server, &format!("child502{cell}"));
+        let connection = own.connection().to_owned();
+        let d = Demo::new(&format!("child502-{cell}"));
+        let parent = |ty: &str, rows: &str| {
+            format!(
+                "table: dbo.parent\ncolumns:\n  code: {{type: {ty}, nullable: false}}\n\
+                 primary_key: {{name: pk_parent, columns: [code]}}\n\
+                 data:\n  mode: exact\n  rows:\n{rows}"
+            )
+        };
+        // `on_delete: cascade` is the shape the review's proposal was about:
+        // the engine would happily take the child out, and pbps refuses
+        // first rather than let a cascade delete an undeclared change.
+        let child_file = |ty: &str, rows: &str| {
+            format!(
+                "table: dbo.child\ncolumns:\n  id: {{type: int, nullable: false}}\n  \
+                 parent_code: {{type: {ty}, nullable: false}}\n\
+                 primary_key: {{name: pk_child, columns: [id]}}\n\
+                 foreign_keys:\n  fk_child_parent:\n    columns: [parent_code]\n    \
+                 references: dbo.parent(code)\n    on_delete: cascade\n\
+                 data:\n  mode: exact\n  rows:\n{rows}"
+            )
+        };
+        let write = |name: &str, body: String| {
+            std::fs::write(d.dir.join("schema").join(name), body).unwrap();
+        };
+        write(
+            "dbo.parent.yml",
+            parent("int", "    \"1\": {}\n    \"2\": {}\n"),
+        );
+        write(
+            "dbo.child.yml",
+            child_file("int", "    \"10\": {parent_code: 1}\n"),
+        );
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let o = d.run(&["bootstrap", "--db", &connection]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+        // The plan under test: parent `1` leaves the declarations, and the
+        // child says one of three things about it.
+        let ty = if retyped { "bigint" } else { "int" };
+        write("dbo.parent.yml", parent(ty, "    \"2\": {}\n"));
+        write(
+            "dbo.child.yml",
+            child_file(
+                ty,
+                match child {
+                    Child::Unchanged => "    \"10\": {parent_code: 1}\n",
+                    Child::Moved => "    \"10\": {parent_code: 2}\n",
+                    Child::Deleted => "",
+                },
+            ),
+        );
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "cell {cell}: {}{}", stdout(&o), stderr(&o));
+        let o = d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            // Wide on purpose: the subject here is the child boundary, not
+            // the gate, and a refusal that came from a missing `--allow`
+            // would read like the one this test is looking for.
+            "--allow",
+            "data-update,data-delete,destructive,constraint,narrowing,not-null,rename",
+        ]);
+        let out = format!("{}{}", stdout(&o), stderr(&o));
+        let rows = |sql: &str| {
+            rt.block_on(async {
+                let mut c = connect_live(&connection).await.expect("connect");
+                let r = c.query(sql).await.expect(sql);
+                r[0].try_get_at::<i32>(0).unwrap().unwrap()
+            })
+        };
+        match child {
+            Child::Unchanged => {
+                assert_ne!(
+                    code(&o),
+                    0,
+                    "cell {cell}: the delete must be refused: {out}"
+                );
+                // And it is refused over the row that would be orphaned,
+                // before any user data moves: both rows are where bootstrap
+                // left them. The two plans refuse in different words — the
+                // pre-delete count for the ordinary one, the rebuilt key's
+                // own check when the endpoints are retyped — and naming both
+                // is the point of the matrix.
+                assert!(
+                    out.contains("still reference dbo.parent row `1`")
+                        || out.contains("no matching parent"),
+                    "cell {cell}: the refusal must name the row it protects: {out}"
+                );
+                assert!(
+                    out.contains("nothing has been changed") || out.contains("rolled back"),
+                    "cell {cell}: the refusal must say the data is untouched: {out}"
+                );
+                assert_eq!(
+                    rows("SELECT COUNT(*) FROM dbo.parent;"),
+                    2,
+                    "cell {cell}: the parent row must still be there: {out}"
+                );
+                assert_eq!(
+                    rows("SELECT COUNT(*) FROM dbo.child WHERE parent_code = 1;"),
+                    1,
+                    "cell {cell}: the child row must be untouched: {out}"
+                );
+            }
+            Child::Moved | Child::Deleted => {
+                assert_eq!(code(&o), 0, "cell {cell}: {out}");
+                let v = d.run(&["verify", "--db", &connection]);
+                assert_eq!(code(&v), 0, "cell {cell}: {}{}", stdout(&v), stderr(&v));
+                assert_eq!(
+                    rows("SELECT COUNT(*) FROM dbo.parent;"),
+                    1,
+                    "cell {cell}: the declared delete ran"
+                );
+                assert_eq!(
+                    rows("SELECT COUNT(*) FROM dbo.child;"),
+                    match child {
+                        Child::Moved => 1,
+                        Child::Unchanged | Child::Deleted => 0,
+                    },
+                    "cell {cell}: the child is what its declaration says"
+                );
+            }
+        }
+    }
+}
+
+/// A foreign key held by a table this project does not declare is named by
+/// `plan --db`, and named again before `apply` runs a single statement — even
+/// though the widening drops no key for the older check to inspect (#503).
+///
+/// The wording is part of the diagnostic: the count says which of the two
+/// questions were asked, and the remedy cannot say "before the drop" when the
+/// plan drops nothing (DECISIONS 515).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn an_undeclared_key_is_named_by_connected_planning_and_again_before_apply() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "extfk503");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("extfk503-live");
+    // A benign change travels with the retype, and it is ordered before it:
+    // the refusal has to happen before that one runs, not after.
+    let table = |code: &str, note_default: &str| {
+        format!(
+            "table: dbo.parent\ncolumns:\n  code: {{type: {code}, nullable: false}}\n  \
+             note: {{type: varchar(10){note_default}}}\n\
+             primary_key: {{name: pk_parent, columns: [code]}}\n"
+        )
+    };
+    std::fs::write(
+        d.dir.join("schema").join("dbo.parent.yml"),
+        table("varchar(10)", ""),
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["bootstrap", "--db", &connection])),
+        0,
+        "bootstrap"
+    );
+
+    // Somebody else's table, pointing at ours. It is not in the declarations
+    // and never will be; pbps must not touch it, only refuse to break it.
+    on_server(
+        &connection,
+        "CREATE TABLE dbo.ext_child (id int NOT NULL PRIMARY KEY, \
+         code varchar(10) NOT NULL CONSTRAINT fk_external503 FOREIGN KEY REFERENCES dbo.parent(code));",
+    );
+
+    std::fs::write(
+        d.dir.join("schema").join("dbo.parent.yml"),
+        table("varchar(20)", ", default: \"''\""),
+    )
+    .unwrap();
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    let out = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "connected planning must refuse: {out}");
+    assert!(
+        out.contains("drop_blockers")
+            && out.contains("fk_external503")
+            && out.contains("dbo.ext_child"),
+        "the unmanaged child and its key must be named: {out}"
+    );
+    assert!(
+        out.contains("before the change that needs them gone"),
+        "the remedy must not speak of a drop this plan does not make: {out}"
+    );
+
+    // And again before apply, on a plan computed while the key was not there.
+    // Nothing of the plan may run first: the default that is ordered before
+    // the retype is still absent afterwards.
+    on_server(
+        &connection,
+        "ALTER TABLE dbo.ext_child DROP CONSTRAINT fk_external503;",
+    );
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // And when it passes, the count says which questions were asked. This
+    // plan drops no key and retypes one column, and the line has to say so.
+    assert!(
+        stdout(&o).contains("0 unique-key drop(s) and 1 column retype(s) checked"),
+        "{}",
+        stdout(&o)
+    );
+    on_server(
+        &connection,
+        "ALTER TABLE dbo.ext_child ADD CONSTRAINT fk_external503 FOREIGN KEY (code) REFERENCES dbo.parent(code);",
+    );
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive,constraint,narrowing,not-null",
+    ]);
+    let out = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "apply must refuse it too: {out}");
+    // The check's own refusal, not the engine's. Both name the constraint —
+    // 5074 does too — so the test has to say which one spoke, or it would
+    // pass on the failure this check exists to prevent.
+    assert!(
+        out.contains("drop_blockers") && out.contains("fk_external503"),
+        "apply's refusal must be the dependency check's: {out}"
+    );
+    assert!(
+        !out.contains("5074"),
+        "the statement must never have reached the engine: {out}"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let defaults = rt.block_on(async {
+        let mut c = connect_live(&connection).await.expect("connect");
+        let r = c
+            .query(
+                "SELECT COUNT(*) FROM sys.default_constraints \
+                 WHERE parent_object_id = OBJECT_ID(N'dbo.parent', N'U');",
+            )
+            .await
+            .expect("count the defaults");
+        r[0].try_get_at::<i32>(0).unwrap().unwrap()
+    });
+    assert_eq!(
+        defaults, 0,
+        "the benign change ordered before the retype must not have run"
+    );
+}

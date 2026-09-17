@@ -61,6 +61,33 @@ fn stored_key_table(
     Some(name)
 }
 
+/// The original column at one statement's position, by identity rather than by
+/// name. A `RenameColumn` runs at rank 3 and an `AlterColumnType` at 9, so by
+/// the time the `ALTER` runs the column has its declared name — but this check
+/// runs before any statement, against a catalog that still has the old one.
+///
+/// Matched on the column's uid, which both changes carry: a plan may rename
+/// two columns into each other's names, and walking the chain backwards by uid
+/// cannot follow the wrong one.
+fn stored_key_column(
+    cs: &pbps_model::ChangeSet,
+    index: usize,
+    uid: &pbps_model::Uid,
+    declared: &str,
+) -> String {
+    let mut name = declared.to_owned();
+    for p in cs.changes[..index].iter().rev() {
+        if let Change::RenameColumn {
+            uid: renamed, from, ..
+        } = &p.change
+            && renamed == uid
+        {
+            name = from.clone();
+        }
+    }
+    name
+}
+
 /// Existing inbound FK dependencies of constraint or standalone unique keys.
 /// Called in the planning/preflight transaction; it never tries DDL to learn
 /// whether a drop is legal. The engine's key_index_id, not a column-set match,
@@ -160,7 +187,47 @@ pub async fn key_drop_blockers(
             index: get::<i32>(row, "idx")?,
         });
     }
-    if keys.is_empty() {
+    // The columns whose type change the engine will not perform while a
+    // foreign key stands on them, whether or not the same change also drops a
+    // key. A widening that keeps its key and index (`keys_and_indexes` false)
+    // has no key drop for the loop above to inspect, and the differ's own
+    // foreign-key maintenance reaches only the *managed* projection — so an
+    // inbound key from a table this project does not declare is nobody's
+    // question until the `ALTER` runs and the engine refuses it. Measured on
+    // 17.0.4075.5: widening `varchar(10)` to `varchar(20)` under an external
+    // inbound key fails with 5074 naming the constraint, then 4922; the child
+    // side of the same key fails the same way, and the same column with no key
+    // on it widens (DECISIONS 515).
+    struct Retyped {
+        change_index: usize,
+        table: TableName,
+        column: String,
+    }
+    let mut retypes = Vec::new();
+    for (index, p) in cs.changes.iter().enumerate() {
+        let Change::AlterColumnType {
+            uid,
+            column,
+            from,
+            to,
+            ..
+        } = &p.change
+        else {
+            continue;
+        };
+        if !crate::types::retype_dependents(from, to).foreign_keys {
+            continue;
+        }
+        let Some(table) = stored_key_table(cs, index, &column.table) else {
+            continue;
+        };
+        retypes.push(Retyped {
+            change_index: index,
+            table,
+            column: stored_key_column(cs, index, uid, &column.name),
+        });
+    }
+    if keys.is_empty() && retypes.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -274,6 +341,79 @@ pub async fn key_drop_blockers(
         reports.push(pbps_db::impact::DropReport {
             change_index: index,
             target: format!("key `{key_name}` on {table}"),
+            blocking: blocking.into_iter().collect(),
+        });
+    }
+    for Retyped {
+        change_index: index,
+        table,
+        column,
+    } in retypes
+    {
+        let qualified = qualified(&table)?;
+        let mut blocking = BTreeSet::new();
+        // A column the catalog does not have is a failed read, not a report of
+        // no dependencies (decision 460). A table this plan creates has
+        // already left `retypes` at `stored_key_table`, so an absent column
+        // here means the name this check reversed is not the one the
+        // environment has, and answering "nothing blocks it" would be a guess.
+        let located = conn
+            .query_with(
+                "SELECT OBJECT_ID(@P1, N'U') AS obj,
+                    COLUMNPROPERTY(OBJECT_ID(@P1, N'U'), @P2, 'ColumnId') AS col",
+                &[Param::Str(&qualified), Param::Str(&column)],
+            )
+            .await?;
+        let located = located.first().ok_or_else(|| {
+            DbError::Refused(format!(
+                "key_drop_blockers: column `{column}` on {table} could not be located"
+            ))
+        })?;
+        let (Some(object), Some(column_id)) =
+            (opt::<i32>(located, "obj")?, opt::<i32>(located, "col")?)
+        else {
+            return Err(DbError::Refused(format!(
+                "key_drop_blockers: column `{column}` on {table} is absent from the readable catalog"
+            ))
+            .into());
+        };
+        // Both directions, because both refuse: the key that references this
+        // column and the key this column is part of. A managed key of either
+        // kind is dropped by the plan's own retype maintenance and filtered
+        // out below with everything else it removes; what is left is a key
+        // this project does not declare.
+        let rows = conn
+            .query_with(
+                "SELECT fk.object_id AS oid, fk.parent_object_id AS child,
+                    s.name AS schema_name, t.name AS table_name, fk.name AS name
+             FROM sys.foreign_key_columns fkc
+             JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id
+             JOIN sys.tables t ON t.object_id = fk.parent_object_id
+             JOIN sys.schemas s ON s.schema_id = t.schema_id
+             WHERE (fkc.referenced_object_id = @P1 AND fkc.referenced_column_id = @P2)
+                OR (fkc.parent_object_id = @P1 AND fkc.parent_column_id = @P2)",
+                &[Param::I32(object), Param::I32(column_id)],
+            )
+            .await?;
+        for row in rows {
+            let oid = get::<i32>(&row, "oid")?;
+            let child = get::<i32>(&row, "child")?;
+            if !removals.iter().any(|&(at, removed, on, whole)| {
+                at < index && if whole { on == child } else { removed == oid }
+            }) {
+                let child = TableName::new(
+                    get::<&str>(&row, "schema_name")?,
+                    get::<&str>(&row, "table_name")?,
+                );
+                blocking.insert(format!(
+                    "foreign key `{}` on {child}",
+                    get::<&str>(&row, "name")?
+                ));
+            }
+        }
+        reports.push(pbps_db::impact::DropReport {
+            change_index: index,
+            target: format!("column `{column}` on {table}"),
             blocking: blocking.into_iter().collect(),
         });
     }
