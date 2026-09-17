@@ -651,9 +651,35 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
     )
     .await
     .expect("read permissions");
-    assert!(
-        named_gaps(&held).contains(&"SELECT on SCHEMA::[dest]".to_owned()),
-        "the destination's read is demanded: {held:?}"
+    // Every data demand, not only the read: the transfer drops the writes too,
+    // and a report naming the read alone would go green once that was granted
+    // while the first row still failed.
+    let mut at_destination: Vec<String> = named_gaps(&held)
+        .into_iter()
+        .filter(|g| g.ends_with("SCHEMA::[dest]"))
+        .collect();
+    at_destination.sort();
+    // `SELECT` is named twice at the destination, by the probes and by the
+    // row read-back, which is the same "one permission, two reasons" shape
+    // the ledger's own `SELECT` has. The reasons differ; the securable and
+    // the remedy do not.
+    let reasons: Vec<&str> = pbps_mssql::doctor::missing(&held)
+        .iter()
+        .filter(|g| g.permission == "SELECT" && g.securable() == "SCHEMA::[dest]")
+        .map(|g| g.why)
+        .collect();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert_ne!(reasons[0], reasons[1], "{reasons:?}");
+    at_destination.dedup();
+    assert_eq!(
+        at_destination,
+        [
+            "DELETE on SCHEMA::[dest]",
+            "INSERT on SCHEMA::[dest]",
+            "SELECT on SCHEMA::[dest]",
+            "UPDATE on SCHEMA::[dest]",
+        ],
+        "{held:?}"
     );
     // And the source is still asked about: the probes read the table where it
     // is now, before the transfer runs.
@@ -690,7 +716,9 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
         "the transfer drops the object's permissions with it"
     );
 
-    // The control, and the remedy the report prints.
+    // And the writes go with it, which is why the read alone is not the
+    // remedy: granted `SELECT` there, the read runs and the first row does
+    // not.
     db.conn
         .execute(&format!(
             "USE [{0}]; GRANT SELECT ON SCHEMA::dest TO [{login}];",
@@ -702,6 +730,25 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
     lp.query("SELECT COUNT(*) FROM dest.old_name;")
         .await
         .expect("the destination read runs once it is granted");
+    assert!(
+        lp.execute("INSERT INTO dest.old_name VALUES ('b', N'B');")
+            .await
+            .is_err(),
+        "the read grant does not carry the row the declaration writes"
+    );
+
+    // The whole remedy, and the control.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT INSERT, UPDATE, DELETE ON SCHEMA::dest TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the destination writes");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    lp.execute("INSERT INTO dest.old_name VALUES ('b', N'B');")
+        .await
+        .expect("the row the declaration writes runs once the writes are granted");
 
     drop(lp);
     drop_login(&login).await;

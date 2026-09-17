@@ -2003,6 +2003,24 @@ fn managed_table_rights<'a>(
 /// Deduplicated against this requirement's own gaps, like the ledger's: five
 /// tables in one schema that all fall back to it need one `GRANT`, not five
 /// identical lines telling the operator to run it five times.
+///
+/// # Why a cross-schema move is answered twice here too
+///
+/// The object answer is the *source's*, and `ALTER SCHEMA ... TRANSFER` drops
+/// every permission on the object it moves — not only the read (512). Measured
+/// on the pinned image: a login holding `SELECT, INSERT, UPDATE, DELETE` on
+/// `app.old_name` and `SELECT` on `SCHEMA::dest` ran the transfer and was then
+/// refused its `INSERT` with error 229, while `HAS_PERMS_BY_NAME` answered 1
+/// for the destination's `SELECT` and 0 for its `INSERT`. So demanding the
+/// destination for the read alone would have reported a remedy that makes
+/// `doctor` go green on an environment where the first row still fails — the
+/// misleading all-clear being worse than the silence it replaced.
+///
+/// The destination is therefore asked for **every** data requirement, at its
+/// schema, which is the only securable a grant for a not-yet-existing object
+/// can sit on. The source answer is kept as well: the rows are written where
+/// the table is now when no transfer is in the plan, and `doctor` never sees a
+/// plan.
 fn data_gaps(held: &Held, r: &Requirement, wanted: fn(&DataDemand) -> bool, out: &mut Vec<Gap>) {
     let mut reported: Vec<Securable> = Vec::new();
     for (table, demand) in &held.data_tables {
@@ -2034,6 +2052,27 @@ fn data_gaps(held: &Held, r: &Requirement, wanted: fn(&DataDemand) -> bool, out:
                 permission: r.name,
                 why: r.why,
                 securable,
+            });
+        }
+        // The destination of a move between schemas, when the resolution
+        // crossed one. See the note above: the source's answer says nothing
+        // about any statement that runs after the transfer.
+        let Some(query) = held.data_securable.get(table) else {
+            continue;
+        };
+        if query.schema == table.schema {
+            continue;
+        }
+        let destination = Securable::Schema(table.schema.clone());
+        if let Some(granted) = held.schemas.get(&table.schema)
+            && !granted.contains(r.name)
+            && !reported.contains(&destination)
+        {
+            reported.push(destination.clone());
+            out.push(Gap {
+                permission: r.name,
+                why: r.why,
+                securable: destination,
             });
         }
     }
@@ -4015,6 +4054,73 @@ mod tests {
                 .contains_key(&Securable::Object(recorded)),
             "the source object stays asked about: {:?}",
             held.managed_tables
+        );
+    }
+
+    /// And the move takes the table's **writes** with it, not only its read.
+    /// The transfer drops every permission on the object, so a report that
+    /// demanded the destination for `SELECT` alone would go green once that
+    /// was granted and the first row would still fail (issue #517, round 3).
+    #[test]
+    fn a_cross_schema_move_demands_the_destinations_dml_as_well_as_its_read() {
+        let declared = table("dest.t");
+        let recorded = table("app.t");
+        let mut held = everything(&["app", "dest"]);
+        held.data_tables.insert(declared.clone(), exact_table());
+        held.data_securable
+            .insert(declared.clone(), recorded.clone());
+        // Everything on the source object, which is where a grant issued
+        // before the move sits, and nothing on the destination schema.
+        held.data_objects.insert(recorded, dml_and_read());
+        // The destination keeps what a deployer needs to *create* there —
+        // `ALTER`, `REFERENCES`, `VIEW DEFINITION` — and holds none of the
+        // rights the rows need, which is the shape the operator is left in
+        // after granting only what the schema questions asked for.
+        held.schemas
+            .get_mut("dest")
+            .expect("the managed schema is in the map")
+            .retain(|p| !dml_and_read().contains(p));
+
+        let mut named: Vec<String> = missing(&held)
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        named.sort();
+        named.dedup();
+        assert_eq!(
+            named,
+            [
+                "DELETE on SCHEMA::[dest]",
+                "INSERT on SCHEMA::[dest]",
+                "SELECT on SCHEMA::[dest]",
+                "UPDATE on SCHEMA::[dest]",
+            ],
+            "every data demand is asked at the destination: {:?}",
+            missing(&held)
+        );
+
+        // Granted there, and the report is clean — the source answer still
+        // carries the statements that run before the transfer.
+        let full = everything(&["dest"]).schemas["dest"].clone();
+        held.schemas.insert("dest".to_owned(), full);
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+    }
+
+    /// A data table that is not moving is asked at one securable, as before:
+    /// the second question exists for the move and must not fire without one.
+    #[test]
+    fn a_data_table_staying_put_is_not_asked_about_a_second_schema() {
+        let name = table("app.t");
+        let mut held = everything(&["app"]);
+        held.data_tables.insert(name.clone(), exact_table());
+        held.data_securable.insert(name.clone(), name.clone());
+        held.data_objects.insert(name, BTreeSet::new());
+        assert!(
+            !missing(&held)
+                .iter()
+                .any(|g| g.securable().starts_with("SCHEMA::")),
+            "{:?}",
+            missing(&held)
         );
     }
 

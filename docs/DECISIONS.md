@@ -13502,6 +13502,19 @@ SPEC is in sync with all of these.
      the table where it is now. An ordinary rename is unaffected — its schema
      does not change, so the second question is not asked.
 
+     **Every demand the table carries, not only the read.** The transfer drops
+     *all* of the object's permissions, so a report that asked the destination
+     for `SELECT` alone would print a remedy that makes `doctor` go green on an
+     environment where the first row still fails — a misleading all-clear, which
+     is worse than the silence it replaced. Measured on 17.0.4075.5: a login
+     holding `SELECT, INSERT, UPDATE, DELETE` on `app.old_name` and `SELECT` on
+     `SCHEMA::dest` ran the transfer, read the table at its new name, and was
+     refused its `INSERT` with error 229 — `HAS_PERMS_BY_NAME` answering 1 for
+     the destination's `SELECT` and 0 for its `INSERT`. So the data
+     requirements ask at the destination too, and `SELECT` is named there twice,
+     by the probes and by the read-back, which is the "one permission, two
+     reasons" shape the ledger's own `SELECT` already has.
+
      What this does **not** demand is the `CONTROL` on the source object that the
      transfer statement itself wants on top of `ALTER` on the destination. That
      over-demand is a separate question (#352), and this entry deliberately
