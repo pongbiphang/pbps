@@ -706,6 +706,14 @@ impl DedicatedServer {
         endpoint: ScratchEndpoint,
         target: &mut NativeTarget,
     ) -> Result<Self, Error> {
+        // Captured before any forwarder is opened, so the analysis deadline is
+        // no later than every forwarder's own root-guard deadline: a forwarder
+        // is created after this instant and its guard lives `profile.lifetime`
+        // from then, so `admitted + lifetime` expires first. Setting the
+        // deadline after admission instead let the supervisor remove a
+        // forwarder while the analysis still thought the run live, refusing an
+        // otherwise valid check near the bound (finding on #640).
+        let admitted = Instant::now();
         let driver = target
             .driver()
             .map_err(|_| Error::Unqualified("the target's driver is unreadable"))?;
@@ -809,7 +817,7 @@ impl DedicatedServer {
                 target: target
                     .witness()
                     .map_err(|_| Error::Unqualified("the target's witness is unreadable"))?,
-                deadline: Instant::now() + profile.lifetime,
+                deadline: admitted + profile.lifetime,
                 accepted: inventory.counter.total,
                 opened: 0,
                 epoch: inventory.counter.epoch,

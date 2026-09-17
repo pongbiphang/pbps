@@ -197,6 +197,12 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
                 return Err(UnqualifiedProcess);
             }
         }
+        // `security` confirms no-new-privileges, that a seccomp filter is
+        // loaded, and the capability ceiling. A filter's *presence* is
+        // measured; its BPF contents cannot be read from `/proc`, so a
+        // permissive operator policy allowing a non-IP channel such as
+        // `AF_VSOCK` — which the loopback network checks do not contain — is
+        // the operator's provisioning responsibility, tracked in #684.
         security(occupant, profile.uid, profile.capabilities)?;
         let (gids, supplementary) = groups(occupant)?;
         if gids.iter().any(|value| *value != profile.gid)
