@@ -238,11 +238,7 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     // on #640).
     let mut pid_anchors = vec![init];
     pid_anchors.extend(forwarders.iter().copied());
-    let foreign = foreign_network_tasks(init, &pid_anchors).map_err(|error| {
-        #[cfg(test)]
-        eprintln!("accounting: net census errored");
-        Premise::Accounting.named()(error)
-    })?;
+    let foreign = foreign_network_tasks(init, &pid_anchors).map_err(Premise::Accounting.named())?;
     if !foreign.is_empty() {
         #[cfg(test)]
         eprintln!(
@@ -262,11 +258,7 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
                 Err(UnqualifiedProcess)
             }
         })
-        .map_err(|error| {
-            #[cfg(test)]
-            eprintln!("accounting: {namespace} census errored");
-            Premise::Accounting.named()(error)
-        })?;
+        .map_err(Premise::Accounting.named())?;
     }
     Ok(())
 }

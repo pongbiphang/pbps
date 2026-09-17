@@ -87,7 +87,12 @@ impl ProcessLease {
             return Err(UnqualifiedProcess);
         }
         let mut namespaces = Vec::new();
-        for name in ["pid", "mnt", "net", "user"] {
+        // `ipc` is here for the dedicated-server profile's occupant accounting:
+        // a container sharing the engine's IPC namespace reaches its shared
+        // memory. The Docker profile only ever asks about pid/mnt/net/user, so
+        // this is additive — `same_process` and `check` iterate whatever was
+        // captured, and no caller assumes the set's size.
+        for name in ["pid", "mnt", "net", "user", "ipc"] {
             let file = File::open(base.join("ns").join(name)).map_err(|_| UnqualifiedProcess)?;
             let identity = FileIdentity::of(&file)?;
             namespaces.push((name, file, identity));
@@ -654,29 +659,12 @@ pub(crate) fn foreign_network_tasks(
         let directory = match open_process(id) {
             Ok(directory) => directory,
             Err(error) if process_gone(&error) => continue,
-            Err(error) => {
-                #[cfg(test)]
-                eprintln!(
-                    "foreign_network_tasks: open pid={id} errno={:?}",
-                    error.raw_os_error()
-                );
-                let _ = error;
-                return Err(UnqualifiedProcess);
-            }
+            Err(_) => return Err(UnqualifiedProcess),
         };
         let handle = match File::open(proc_base(&directory).join("ns").join("pid")) {
             Ok(handle) => handle,
             Err(error) if process_gone(&error) => continue,
-            Err(error) => {
-                #[cfg(test)]
-                eprintln!(
-                    "foreign_network_tasks: open ns/pid pid={id} errno={:?} exe={:?}",
-                    error.raw_os_error(),
-                    std::fs::read_link(proc_base(&directory).join("exe")).ok()
-                );
-                let _ = error;
-                return Err(UnqualifiedProcess);
-            }
+            Err(_) => return Err(UnqualifiedProcess),
         };
         let mut owned = false;
         for anchor in pid_anchors {
@@ -686,17 +674,6 @@ pub(crate) fn foreign_network_tasks(
             }
         }
         if !owned {
-            #[cfg(test)]
-            eprintln!(
-                "foreign_network_tasks: unaccounted pid={id} exe={:?} nspid={:?}",
-                std::fs::read_link(proc_base(&directory).join("exe")).ok(),
-                std::fs::read_to_string(proc_base(&directory).join("status"))
-                    .ok()
-                    .and_then(|s| s
-                        .lines()
-                        .find(|l| l.starts_with("NSpid:"))
-                        .map(str::to_owned))
-            );
             foreign.push(id);
         }
     }
