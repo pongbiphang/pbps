@@ -13168,3 +13168,87 @@ SPEC is in sync with all of these.
      is right there — 475 measured that engine accepting Unicode White_Space as
      a separator — but it has the comment half of this bug, and that is issue
      #661 rather than scope here.
+
+505. **`doctor` asks for the delete count's policy-catalog read, at the
+     database and on each securable an effective metadata `DENY` sits on;
+     `VIEW SECURITY DEFINITION` is not what decides it (issues #522, #524).**
+     468 made SQL Server's shared preflight/execution count prove the row-level
+     security policy catalog readable *before* it discovers referencing keys,
+     because a parent-only deployer can see neither the foreign key nor the
+     filtered child its `DELETE` would still cascade into. `doctor` asked
+     `VIEW DEFINITION` only on the **managed** schemas (SPEC §9.5,
+     `Needed::Managed`), and a security policy can live in a schema the project
+     neither manages nor declares. So an account holding everything `doctor`
+     listed passed readiness and met `Cannot count referencing rows: inspecting
+     row-level security policies requires database VIEW DEFINITION.` at its
+     first `mode: exact` delete. The count fails safely — this was a readiness
+     diagnostic gap, not an accepted destructive plan — which is exactly what
+     the command exists to remove.
+
+     **Two requirements for one proof**, because the two halves are missing in
+     two different places and a `GRANT` fixes only the first.
+     `Needed::DeleteCatalog` is the database-wide `VIEW DEFINITION` the count
+     asks for outright. `Needed::DeleteCatalogDenied` is the count's own second
+     check: an **effective** object or schema metadata `DENY` reaching this
+     principal directly or through a role. A database grant loses to one (460),
+     so reporting the database permission alone would send an operator to grant
+     something they already hold. Each is reported on the securable that
+     carries it, which is both the truth and the remedy.
+
+     **Demanded only of a declaration that removes a row**, for the reason
+     `Needed::RoleAdmin` gives: database-wide `VIEW DEFINITION` is a broad ask,
+     whether the project needs it is visible in the declarations `doctor`
+     already reads, and `ensure` never emits a `DELETE`. The
+     `sys.database_permissions` scan behind the second half is asked under the
+     same condition, so a project that removes no rows is neither asked nor
+     told. The live test holds both declarations against the same account and
+     the same server to pin the difference.
+
+     **A denied securable often cannot be named, and an invented name is worse
+     than none.** Measured on SQL Server 2022 (16.0.4295.3) and 2025
+     (17.0.4075.5) alike: an object carrying an effective `DENY VIEW
+     DEFINITION` answers NULL to both `OBJECT_SCHEMA_NAME` and `OBJECT_NAME` —
+     the denial being reported is itself what removes the metadata visibility —
+     and a `SELECT` grant on its schema does not bring the name back. A denied
+     *schema* is still named. `Gap::securable` offers its output as the thing a
+     statement names, so the unnameable case travels as
+     `Securable::Unreadable { class, id }` and prints
+     `OBJECT::<unnameable: id 1221579390>`: deliberately not bracket-quoted,
+     because it is not a name, and one query away from the name for whoever
+     holds the `DENY`. `introspect::Securable::Unreadable` records the same
+     finding for `pull`; absent, empty and unreadable are three different
+     things.
+
+     `sys.database_permissions.class` is a `tinyint`, and the driver hands that
+     back as a `u8`: reading it as an `i32` fails outright. The widening happens
+     in the engine, where the column is named. Only the live test could find
+     that — the unit tests build `Held` by hand.
+
+     **`VIEW SECURITY DEFINITION` was the premise of #524 and the engine does
+     not support it.** A review read the permission's name and concluded that
+     an effective denial of it could leave database `VIEW DEFINITION` granted
+     while hiding a policy, so that the count would accept a filtered zero. Run
+     on both engines above, with an enabled FILTER policy in a separate schema,
+     child `SELECT` and database `VIEW DEFINITION`:
+
+     | Deployment permissions | db `VIEW DEFINITION` | db `VIEW SECURITY DEFINITION` | visible FK / predicate | probe and guard |
+     | --- | --- | --- | --- | --- |
+     | baseline | 1 | 1 | 1 / 1 | both refuse the active policy |
+     | direct database `DENY` | 1 | 0 | 1 / 1 | both refuse the active policy |
+     | role-inherited database `DENY` | 1 | 0 | 1 / 1 | both refuse the active policy |
+
+     With the policy disabled and the child detached, all three count a real
+     zero and the guarded delete runs. Refusing on the denial alone would reject
+     those three — a valid plan refused, the one direction this count may not
+     fail in. `sys.fn_builtin_permissions(DEFAULT)` reports the permission at
+     **DATABASE** scope only, covered by `VIEW DEFINITION`, and denying it on
+     the policy object or its schema is syntax error 102. So there is no
+     production change for #524: the fixture is asserted permanently instead,
+     the scope list and the 102 included, so that an engine which grows the
+     scope fails that test rather than passing it silently.
+
+     **No permanent SQL Server 2022 container in CI.** The two engines answered
+     every cell of that table identically, and both were measured here. The
+     `pbps-test-pg16` precedent exists because the two PostgreSQL servers
+     *differ* — pinning a second engine is worth its cost when it disagrees,
+     not merely when it is older.

@@ -4246,6 +4246,19 @@ fn seeded_table() -> pbps_mssql::doctor::DataDemand {
 /// The same, with the correctable columns named — the set an emitted `UPDATE`
 /// could reach, and therefore the set the permission has to cover.
 fn seeded_table_with(columns: &[&str]) -> pbps_mssql::doctor::DataDemand {
+    declared_table(pbps_model::DataMode::Exact, columns)
+}
+
+/// The same declaration under `mode: ensure`: its rows are inserted and
+/// corrected and never removed, so no emitted statement is a `DELETE` and
+/// nothing about it demands the count that precedes one.
+fn ensured_table() -> pbps_mssql::doctor::DataDemand {
+    declared_table(pbps_model::DataMode::Ensure, &["label"])
+}
+
+/// One declared table with one row, read through `DataDemand::of` — the one
+/// place a declaration is turned into the statements it could emit.
+fn declared_table(mode: pbps_model::DataMode, columns: &[&str]) -> pbps_mssql::doctor::DataDemand {
     let ty: pbps_model::ColumnType = "varchar(20)".parse().unwrap();
     let mut t = pbps_model::schema::Table {
         primary_key: Some(pbps_model::schema::PrimaryKey {
@@ -4253,7 +4266,7 @@ fn seeded_table_with(columns: &[&str]) -> pbps_mssql::doctor::DataDemand {
             columns: vec!["code".to_owned()],
         }),
         data: Some(pbps_model::TableData {
-            mode: pbps_model::DataMode::Exact,
+            mode,
             rows: [(
                 pbps_model::RowKey("a".to_owned()),
                 pbps_model::Row(Default::default()),
@@ -4269,7 +4282,7 @@ fn seeded_table_with(columns: &[&str]) -> pbps_mssql::doctor::DataDemand {
         t.columns
             .insert((*column).to_owned(), pbps_model::Column::new(ty.clone()));
     }
-    pbps_mssql::doctor::DataDemand::of(&t).expect("an `exact` table with a row demands all three")
+    pbps_mssql::doctor::DataDemand::of(&t).expect("a table with a declared row demands something")
 }
 
 /// The readiness question for one project's declared data tables, asked the
@@ -4363,8 +4376,10 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         .expect("create login");
     // Exactly the list `doctor` printed before reference data was on it: the
     // managed permissions on `app`, the ledger's own on `dbo` (the tables do
-    // not exist yet, so those fall back to the schema), and the four database
-    // `CREATE`s. No DML anywhere near `app`.
+    // not exist yet, so those fall back to the schema), the four database
+    // `CREATE`s, and the database-wide `VIEW DEFINITION` the count before a
+    // reference-data `DELETE` asks for (DECISIONS 505). No DML anywhere near
+    // `app`.
     // `CREATE SCHEMA` has to be first in its batch, so it travels inside an
     // `EXEC`, which gives it one of its own.
     db.conn
@@ -4374,7 +4389,8 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT VIEW DEFINITION TO [{login}];",
             db.name
         ))
         .await
@@ -5128,11 +5144,247 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
     db.drop().await;
 }
 
+/// The count that runs *before* a reference-data `DELETE` refuses until it can
+/// prove the row-level security policy catalog readable, and `doctor` has to
+/// say which read that is (DECISIONS 468, 505).
+///
+/// Nothing here can be settled without the engine. Whether `VIEW DEFINITION` on
+/// the managed schema lets a policy in another schema be seen, what the count
+/// really does to an account holding everything `doctor` used to ask for, and —
+/// the half a database `GRANT` cannot fix — whether an effective object or
+/// schema metadata `DENY` still stops it, are all claims about SQL Server. Each
+/// state below is measured twice: the gap `doctor` reports, and the refusal the
+/// real probe and the emitted guard meet under the same permissions.
+///
+/// The parent is in `app`, the child in a schema this project does not manage,
+/// and the policy in a third — the arrangement `Needed::Managed`'s schema-scoped
+/// `VIEW DEFINITION` cannot see, and the reason the requirement is asked at the
+/// database.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_count_needs() {
+    use pbps_model::{Change, ChangeSet, PlannedChange, RowKey, change::DeleteCause};
+
+    let mut db = TestDb::create("doctorrls").await;
+    let login = format!("pbps_rls_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+    let role = format!("{login}_readers");
+
+    // The declared table, with the row DML granted on it, so that every gap
+    // below is about the catalog read and not about a permission the setup
+    // forgot.
+    db.conn
+        .execute(
+            "CREATE TABLE app.t (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NOT NULL); INSERT INTO app.t VALUES ('a', N'A');",
+        )
+        .await
+        .expect("create the declared table");
+    db.conn
+        .execute(&format!(
+            "GRANT INSERT, UPDATE, DELETE ON app.t TO [{login}]; \
+             CREATE ROLE [{role}]; ALTER ROLE [{role}] ADD MEMBER [{login}];"
+        ))
+        .await
+        .expect("grant the row DML and make the role");
+    // `CREATE SCHEMA` and `CREATE FUNCTION` each have to be first in a batch.
+    db.conn
+        .execute("EXEC(N'CREATE SCHEMA kid;'); EXEC(N'CREATE SCHEMA sec;');")
+        .await
+        .expect("create the unmanaged schemas");
+    db.conn
+        .execute(
+            "CREATE TABLE kid.child (id int NOT NULL PRIMARY KEY, \
+             parent varchar(20) NULL REFERENCES app.t(code) ON DELETE CASCADE, \
+             owner_id int NOT NULL); INSERT INTO kid.child VALUES (1, 'a', 1);",
+        )
+        .await
+        .expect("create the referencing child");
+    db.conn
+        .execute(
+            "CREATE FUNCTION sec.only_owner(@owner_id int) RETURNS TABLE WITH SCHEMABINDING \
+             AS RETURN SELECT 1 AS allowed \
+             WHERE @owner_id = CONVERT(int, SESSION_CONTEXT(N'visible_owner'));",
+        )
+        .await
+        .expect("create the predicate");
+    db.conn
+        .execute(
+            "CREATE SECURITY POLICY sec.children \
+             ADD FILTER PREDICATE sec.only_owner(owner_id) ON kid.child WITH (STATE=ON);",
+        )
+        .await
+        .expect("create the policy");
+    // The filter hides the child from every session, `sa` included, so the
+    // owner's own count below has to opt into seeing it. That the deployer
+    // cannot is the point of the fixture; that this connection can is what
+    // makes "the child is still there" a real observation.
+    db.conn
+        .execute("EXEC sys.sp_set_session_context @key=N'visible_owner', @value=1;")
+        .await
+        .expect("see the child from this connection");
+
+    let deletion = Change::DeleteRow {
+        table: TableName::new("app", "t"),
+        key_column: "code".into(),
+        key: RowKey::from("a"),
+        cause: DeleteCause::Undeclared,
+        dropped: Default::default(),
+        row: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+    };
+    let probe_sql = Mssql
+        .preflight(&ChangeSet {
+            changes: vec![PlannedChange::new(deletion.clone())],
+        })
+        .probes
+        .remove(0)
+        .sql;
+    let guard_sql = Mssql
+        .emit(&deletion, Default::default())
+        .unwrap()
+        .remove(0)
+        .sql;
+
+    // The policy's own id, which is all the report can offer for it: the `DENY`
+    // below is what takes its name away — measured on the pinned image,
+    // `OBJECT_NAME` answers NULL for it, and a grant on its schema does not
+    // bring the name back. Read here as the owner, so the assertion names the
+    // right object rather than whatever id came back.
+    let rows = db
+        .conn
+        .query("SELECT OBJECT_ID(N'sec.children') AS id;")
+        .await
+        .expect("read the policy's id");
+    let policy_id: i32 = rows[0]
+        .try_get("id")
+        .expect("id")
+        .expect("the policy is there");
+
+    let exact: pbps_mssql::doctor::DataTables = [("app.t".parse().unwrap(), seeded_table())]
+        .into_iter()
+        .collect();
+    // The same table declared `mode: ensure`: rows inserted and corrected, none
+    // removed. No `DELETE` is ever emitted for it, so the count never runs and
+    // this broad database grant must not be demanded (the over-demand this
+    // requirement is gated to avoid).
+    let ensure: pbps_mssql::doctor::DataTables = [("app.t".parse().unwrap(), ensured_table())]
+        .into_iter()
+        .collect();
+
+    for (state, change, expected_gaps, refusal) in [
+        (
+            // Everything `doctor` asked for before this requirement existed:
+            // the base minus the one grant this requirement added to it.
+            "nothing granted at the database",
+            format!("REVOKE VIEW DEFINITION TO [{login}];"),
+            vec!["VIEW DEFINITION on the database".to_owned()],
+            "requires database VIEW DEFINITION",
+        ),
+        (
+            // Granted, and the count gets past the visibility proof to the
+            // answer it exists to give: an enabled FILTER predicate.
+            "database VIEW DEFINITION granted",
+            format!("GRANT VIEW DEFINITION TO [{login}];"),
+            vec![],
+            "row-level security FILTER predicate",
+        ),
+        (
+            // The half the database grant cannot fix (DECISIONS 460).
+            "a direct metadata DENY on the policy",
+            format!("DENY VIEW DEFINITION ON OBJECT::sec.children TO [{login}];"),
+            vec![format!(
+                "VIEW DEFINITION on OBJECT::<unnameable: id {policy_id}>"
+            )],
+            "metadata DENY",
+        ),
+        (
+            // And reached through a role, which is how a real deployment
+            // account collects one.
+            "a role-inherited metadata DENY on the policy's schema",
+            format!(
+                "REVOKE VIEW DEFINITION ON OBJECT::sec.children FROM [{login}]; \
+                 DENY VIEW DEFINITION ON SCHEMA::sec TO [{role}];"
+            ),
+            vec!["VIEW DEFINITION on SCHEMA::[sec]".to_owned()],
+            "metadata DENY",
+        ),
+    ] {
+        db.conn
+            .execute(&change)
+            .await
+            .unwrap_or_else(|e| panic!("{state}: {e}"));
+        let mut lp = connect_live(&as_login)
+            .await
+            .unwrap_or_else(|e| panic!("{state}: connect as the login: {e}"));
+
+        let held = data_permissions(&mut lp, &exact).await;
+        assert_eq!(named_gaps(&held), expected_gaps, "{state}: {held:?}");
+        // The same account, the same server, a declaration that removes no
+        // row: neither the database read nor a denial is reported, because
+        // neither is needed.
+        let held = data_permissions(&mut lp, &ensure).await;
+        assert!(
+            named_gaps(&held).is_empty(),
+            "{state}: a declaration that emits no DELETE was asked for the \
+             delete count's catalog read: {held:?}"
+        );
+
+        // What the account really meets, which is what makes the report above
+        // a readiness answer rather than a guess.
+        let counted = lp
+            .query(&probe_sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert!(
+            counted.as_ref().is_err_and(|e| e.contains(refusal)),
+            "{state}: {counted:?}"
+        );
+        let guarded = lp
+            .execute(&guard_sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert!(
+            guarded.as_ref().is_err_and(|e| e.contains(refusal)),
+            "{state}: {guarded:?}"
+        );
+        drop(lp);
+        // Read as the owner: the deployer cannot see this table at all, and a
+        // cascade that ran would have taken the row with it.
+        let rows = db
+            .conn
+            .query("SELECT COUNT(*) AS n FROM kid.child WHERE parent = 'a';")
+            .await
+            .expect("count the child");
+        let n: i32 = rows[0].try_get("n").expect("n").expect("a count");
+        assert_eq!(n, 1, "{state}: the hidden child was cascaded away");
+    }
+
+    // Best-effort, like the other login tests here: the server may still count
+    // a just-closed session as logged in, and a tidy-up that failed must not be
+    // reported as this test failing. The container is throwaway.
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
 /// The base a least-privilege login needs before any of the questions this
 /// file asks about reference data: the managed permissions on `app`, the
-/// ledger's own on `dbo`, and the four database `CREATE`s. Everything the
-/// tests below then add or take away is DML, so a gap they report is about
-/// the grant under test and not about a permission the setup forgot.
+/// ledger's own on `dbo`, the four database `CREATE`s, and the database-wide
+/// `VIEW DEFINITION` the count before a reference-data `DELETE` asks for
+/// (DECISIONS 505). Everything the tests below then add or take away is DML,
+/// so a gap they report is about the grant under test and not about a
+/// permission the setup forgot.
 ///
 /// `CREATE SCHEMA` has to be first in its batch, so it travels inside an
 /// `EXEC`, which gives it one of its own.
@@ -5152,7 +5404,8 @@ async fn least_privilege_login(db: &mut TestDb, login: &str, password: &str) -> 
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT VIEW DEFINITION TO [{login}];",
             db.name
         ))
         .await

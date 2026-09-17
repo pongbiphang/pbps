@@ -381,3 +381,214 @@ async fn an_invisible_referencing_key_does_not_hide_its_row_filter_from_the_guar
         "neither visible parent nor hidden child was removed"
     );
 }
+
+/// `DENY VIEW SECURITY DEFINITION` is not what decides whether a policy can be
+/// seen, and a count that refused on it alone would refuse safe deletes.
+///
+/// A review read the permission's name and concluded that an effective denial
+/// of it could leave database `VIEW DEFINITION` granted while hiding a policy,
+/// so that the shared delete count would accept a filtered zero. The premise is
+/// measured here instead of reasoned about, in the two shapes a real deployment
+/// account collects such a denial in — directly, and through a role — because
+/// only the engine can settle it (issue #524, DECISIONS 505).
+///
+/// What the engine says: the permission exists at **DATABASE** scope alone and
+/// is covered by `VIEW DEFINITION`, denying it leaves both the foreign key and
+/// the enabled FILTER predicate visible, the count refuses the active policy in
+/// every case, and with the policy disabled and the child detached every case
+/// counts a real zero and the guarded delete runs. Refusing on the denial alone
+/// would reject those last three — a valid plan refused, which is the one thing
+/// this count may not do.
+///
+/// Denying the permission on the policy object or its schema is not a narrower
+/// way to reproduce the premise either: there is no such scope, and the attempt
+/// is a syntax error. That is asserted rather than described, so that a future
+/// engine which grows the scope fails this test rather than passing it silently.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn denying_the_security_definition_permission_hides_no_policy_and_refuses_no_safe_delete() {
+    let mut db = TestDb::create("rls_secdef524").await;
+    fixture(&mut db.conn, "CASCADE").await;
+    db.conn
+        .execute(
+            "CREATE USER deployer WITHOUT LOGIN; CREATE ROLE definition_deniers;
+             ALTER ROLE definition_deniers ADD MEMBER deployer;
+             GRANT SELECT, DELETE ON dbo.parent TO deployer;
+             GRANT SELECT ON dbo.child TO deployer;
+             GRANT VIEW DEFINITION TO deployer;",
+        )
+        .await
+        .unwrap();
+
+    // The permission's scopes, from the engine's own list rather than from the
+    // documentation: one row, at the database.
+    let scopes: Vec<String> = db
+        .conn
+        .query(
+            "SELECT class_desc FROM sys.fn_builtin_permissions(DEFAULT) \
+             WHERE permission_name = N'VIEW SECURITY DEFINITION' ORDER BY class_desc;",
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.try_get::<&str>("class_desc")
+                .unwrap()
+                .unwrap()
+                .trim()
+                .to_owned()
+        })
+        .collect();
+
+    // And therefore what happens when it is denied anywhere narrower. 102 is
+    // the parser's, which is the answer this asserts: no such securable.
+    let mut narrower = Vec::new();
+    for on in ["OBJECT::security_rules.children", "SCHEMA::security_rules"] {
+        narrower.push((
+            on,
+            number(
+                &mut db.conn,
+                &format!(
+                    "BEGIN TRY EXEC(N'DENY VIEW SECURITY DEFINITION ON {on} TO deployer'); \
+                     SELECT 0; END TRY BEGIN CATCH SELECT ERROR_NUMBER(); END CATCH"
+                ),
+            )
+            .await,
+        ));
+    }
+
+    let sql = Mssql
+        .emit(&deletion(), Default::default())
+        .unwrap()
+        .remove(0)
+        .sql;
+    let mut observations = Vec::new();
+    for (state, change) in [
+        ("baseline", "SELECT 1;"),
+        (
+            "direct database denial",
+            "DENY VIEW SECURITY DEFINITION TO deployer;",
+        ),
+        (
+            "role-inherited database denial",
+            "REVOKE VIEW SECURITY DEFINITION TO deployer; \
+             DENY VIEW SECURITY DEFINITION TO definition_deniers;",
+        ),
+    ] {
+        db.conn.execute(change).await.unwrap();
+        db.conn
+            .execute("EXECUTE AS USER='deployer';")
+            .await
+            .unwrap();
+        let held = [
+            number(
+                &mut db.conn,
+                "SELECT COALESCE(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION'), 0)",
+            )
+            .await,
+            number(
+                &mut db.conn,
+                "SELECT COALESCE(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', \
+                 'VIEW SECURITY DEFINITION'), 0)",
+            )
+            .await,
+        ];
+        let visible = [
+            number(
+                &mut db.conn,
+                "SELECT COUNT(*) FROM sys.foreign_keys \
+                 WHERE referenced_object_id = OBJECT_ID(N'dbo.parent')",
+            )
+            .await,
+            number(
+                &mut db.conn,
+                "SELECT COUNT(*) FROM sys.security_predicates sp \
+                 JOIN sys.security_policies pol ON pol.object_id = sp.object_id \
+                 WHERE sp.target_object_id = OBJECT_ID(N'dbo.child') \
+                   AND sp.predicate_type = 0 AND pol.is_enabled = 1",
+            )
+            .await,
+        ];
+        let counted = probe(&mut db.conn, &plan()).await;
+        let guarded = attempt(&mut db.conn, &sql).await;
+        db.conn.execute("REVERT;").await.unwrap();
+        observations.push((state, held, visible, counted, guarded));
+    }
+
+    // The safe half, under the same three permission states: nothing filters,
+    // nothing references, and the delete the operator asked for must run.
+    db.conn
+        .execute(
+            "ALTER SECURITY POLICY security_rules.children WITH (STATE=OFF);
+             UPDATE dbo.child SET parent = 2;",
+        )
+        .await
+        .unwrap();
+    let mut safe = Vec::new();
+    for (state, change) in [
+        (
+            "baseline",
+            "REVOKE VIEW SECURITY DEFINITION TO definition_deniers;",
+        ),
+        (
+            "direct database denial",
+            "DENY VIEW SECURITY DEFINITION TO deployer;",
+        ),
+        (
+            "role-inherited database denial",
+            "REVOKE VIEW SECURITY DEFINITION TO deployer; \
+             DENY VIEW SECURITY DEFINITION TO definition_deniers;",
+        ),
+    ] {
+        db.conn.execute(change).await.unwrap();
+        db.conn
+            .execute("EXECUTE AS USER='deployer';")
+            .await
+            .unwrap();
+        let counted = probe(&mut db.conn, &plan()).await;
+        let guarded = attempt(&mut db.conn, &sql).await;
+        db.conn.execute("REVERT;").await.unwrap();
+        safe.push((state, counted, guarded));
+    }
+    db.drop().await;
+
+    assert_eq!(scopes, ["DATABASE"], "the permission's scopes");
+    for (on, error) in narrower {
+        assert_eq!(error, 102, "denying it on {on} must be a syntax error");
+    }
+    for (state, held, visible, counted, guarded) in observations {
+        assert_eq!(held[0], 1, "{state}: database VIEW DEFINITION is held");
+        assert_eq!(
+            held[1],
+            i32::from(state == "baseline"),
+            "{state}: the denial is in force"
+        );
+        assert_eq!(
+            visible,
+            [1, 1],
+            "{state}: the key and the enabled predicate are both still visible"
+        );
+        assert!(
+            counted
+                .as_ref()
+                .is_err_and(|e| e.contains("row-level security")),
+            "{state}: {counted:?}"
+        );
+        assert!(
+            guarded
+                .0
+                .as_ref()
+                .is_err_and(|e| e.contains("row-level security")),
+            "{state}: {guarded:?}"
+        );
+        assert_eq!(guarded.1, [1, 1, 0], "{state}: the child is unchanged");
+    }
+    for (state, counted, guarded) in safe {
+        assert_eq!(counted, Ok(0), "{state}: nothing references the parent row");
+        assert!(
+            guarded.0.is_ok(),
+            "{state}: a safe delete was refused: {guarded:?}"
+        );
+        assert_eq!(guarded.1, [0, 1, 0], "{state}: the parent row is gone");
+    }
+}

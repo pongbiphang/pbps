@@ -3845,9 +3845,11 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
     );
     // Exactly the list `doctor` printed before reference data was on it: the
     // managed permissions on `app`, the ledger's own on `dbo` (its tables do
-    // not exist yet, so those fall back to the schema), and the four database
-    // `CREATE`s. No DML anywhere near `app`. `CREATE SCHEMA` has to be first in
-    // its batch, so it travels inside an `EXEC`.
+    // not exist yet, so those fall back to the schema), the four database
+    // `CREATE`s, and the database-wide `VIEW DEFINITION` the count before a
+    // reference-data `DELETE` asks for (DECISIONS 505). No DML anywhere near
+    // `app`. `CREATE SCHEMA` has to be first in its batch, so it travels
+    // inside an `EXEC`.
     on_server(
         db.connection(),
         &format!(
@@ -3855,7 +3857,8 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT VIEW DEFINITION TO [{login}];"
         ),
     );
 

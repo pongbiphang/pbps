@@ -191,6 +191,54 @@ pub enum Needed {
     /// Asked at the same scope, and of the same tables, as
     /// [`Needed::DataInsert`].
     DataDelete,
+
+    /// Needed at the **database**, and only when the declarations would have a
+    /// reference-data row removed: the count that precedes such a delete
+    /// refuses to run until it can prove the row-level security policy catalog
+    /// readable (DECISIONS 468, 505).
+    ///
+    /// Not covered by anything above it. `Needed::Managed`'s `VIEW DEFINITION`
+    /// is asked on the schemas this project manages, which is what SPEC §9.5
+    /// asks for and is right for reading the catalog — and it is not what the
+    /// delete count demands. A security policy can live in a schema this
+    /// project does not manage and does not declare, so a complete answer
+    /// about "is any enabled FILTER predicate on the child I am about to
+    /// cascade into" is a **database**-wide question. Measured on the pinned
+    /// image, a parent-only deployer can see neither the foreign key nor the
+    /// policy and its `DELETE` still cascades into the hidden child, which is
+    /// why `counting_statement` asks before it discovers keys rather than
+    /// after.
+    ///
+    /// So an account holding everything else in this list passed readiness and
+    /// then met `Cannot count referencing rows: inspecting row-level security
+    /// policies requires database VIEW DEFINITION.` at the first `mode: exact`
+    /// delete. The count fails safely — this is a readiness diagnostic gap,
+    /// not an accepted destructive plan — which is exactly what this command
+    /// exists to remove.
+    ///
+    /// Demanded of a project that removes reference-data rows and of no other,
+    /// for the reason [`Needed::RoleAdmin`] gives: database-wide `VIEW
+    /// DEFINITION` is a broad ask, whether the project needs it is visible in
+    /// the declarations `doctor` already reads, and `ensure` never emits a
+    /// `DELETE`.
+    DeleteCatalog,
+
+    /// The other half of the same proof, one securable in: an **effective**
+    /// object or schema metadata `DENY` that this account cannot see through.
+    ///
+    /// A database grant loses to it, so database `VIEW DEFINITION` answering 1
+    /// is not the whole answer (DECISIONS 460). `counting_statement` refuses on
+    /// the same condition with `an effective object/schema metadata DENY
+    /// prevents a complete view of row-level security policies`, and a
+    /// readiness command that reported only the database permission would send
+    /// an operator to grant something they already hold.
+    ///
+    /// Reported as the permission that is effectively missing **on that
+    /// securable**, because that is both the truth and the remedy: the probe's
+    /// own test is `HAS_PERMS_BY_NAME(<that object or schema>, …, 'VIEW
+    /// DEFINITION') <> 1`. Gathered only when a reference-data delete is
+    /// declared, so a project that removes no rows is neither asked nor told.
+    DeleteCatalogDenied,
 }
 
 /// A permission pbps needs, what needs it, and where it has to be held.
@@ -217,7 +265,7 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 21] = [
+pub const REQUIRED: [Requirement; 23] = [
     req(
         "ALTER",
         "adding the timeline columns to an existing pre-migration state ledger",
@@ -361,6 +409,22 @@ pub const REQUIRED: [Requirement; 21] = [
         "removing an undeclared row from a table declared `mode: exact`",
         Needed::DataDelete,
     ),
+    // The count that precedes that DELETE, which refuses to run until it can
+    // prove the policy catalog readable. Two entries for one proof, because
+    // the two halves are missing in two different places and a `GRANT` fixes
+    // only the first.
+    req(
+        "VIEW DEFINITION",
+        "the count before removing a row, which must prove no enabled row-level security \
+         FILTER predicate can hide a child it would cascade into",
+        Needed::DeleteCatalog,
+    ),
+    req(
+        "VIEW DEFINITION",
+        "the same count, which an effective metadata DENY on this securable stops from \
+         seeing the whole policy catalog",
+        Needed::DeleteCatalogDenied,
+    ),
 ];
 
 // # A permission deliberately absent: `CONTROL` on the managed schemas
@@ -454,6 +518,17 @@ pub struct Held {
     /// reporting them as gaps.
     pub roles_declared: bool,
 
+    /// The securables carrying an **effective** metadata `DENY` this account
+    /// cannot see through — the exact condition `counting_statement` refuses
+    /// on before a reference-data delete (DECISIONS 460, 505).
+    ///
+    /// Empty and *not asked about* are the same thing here on purpose: the
+    /// question is only put when the declarations would remove a row, so a
+    /// project that removes none is neither asked nor told. That is the
+    /// `roles_declared` bargain, and the read it saves is a database-wide scan
+    /// of `sys.database_permissions`.
+    pub metadata_denials: BTreeSet<Securable>,
+
     /// Per object, the permissions effective on it — asked about every named
     /// object, absent or invisible included, for the same reason
     /// `referenced_objects` is.
@@ -544,6 +619,27 @@ pub enum Securable {
     Database,
     Schema(String),
     Object(ObjectName),
+    /// A securable whose name this account cannot read, carried by the id the
+    /// permission row gave.
+    ///
+    /// `sys.objects` and `sys.schemas` are subject to metadata visibility, and
+    /// the very `DENY` this reports is what takes that visibility away:
+    /// measured on the pinned image, an object carrying an effective
+    /// `DENY VIEW DEFINITION` answers NULL to both `OBJECT_SCHEMA_NAME` and
+    /// `OBJECT_NAME`, and a `SELECT` grant on its schema does not bring the
+    /// name back. A denied *schema* is still named, so this is in practice the
+    /// object case (`introspect::Securable::Unreadable` records the same
+    /// finding for `pull`).
+    ///
+    /// The id rather than an invented name, because [`Gap::securable`] offers
+    /// its output as the thing a statement names: a placeholder that looks
+    /// pasteable and is not would be worse than none, while an id is one query
+    /// away from the name for whoever holds the `DENY` — and absent, empty and
+    /// unreadable are three different things.
+    Unreadable {
+        class: &'static str,
+        id: i32,
+    },
 }
 
 impl std::fmt::Display for Securable {
@@ -558,6 +654,9 @@ impl std::fmt::Display for Securable {
             Securable::Object(o) => {
                 write!(f, "OBJECT::{}.{}", spelled(&o.schema), spelled(&o.name))
             }
+            // Deliberately not bracket-quoted: this is not a name, and
+            // nothing good comes of its looking like one.
+            Securable::Unreadable { class, id } => write!(f, "{class}::<unnameable: id {id}>"),
         }
     }
 }
@@ -1490,6 +1589,66 @@ pub async fn permissions(
         }
     }
 
+    // The other half of the delete count's proof, asked only of a project that
+    // removes rows (DECISIONS 505). This is `counting_statement`'s own second
+    // check, read-only and word for word: a metadata `DENY` that reaches this
+    // principal directly or through a role, on an object or a schema whose
+    // effective `VIEW DEFINITION` is therefore 0. A database grant does not
+    // win against it (460), so asking `HAS_PERMS_BY_NAME` at the database
+    // alone would answer 1 and still leave the count refusing.
+    let mut metadata_denials: BTreeSet<Securable> = BTreeSet::new();
+    if data.values().any(DataDemand::removes) {
+        // `sys.database_permissions.class` is a `tinyint`; the driver hands
+        // that back as a `u8` and reading it as an `i32` fails outright, so
+        // the widening happens in the engine where the column is named.
+        let sql = "SELECT CONVERT(int, dp.class) AS class, dp.major_id AS major_id, \
+                   OBJECT_SCHEMA_NAME(dp.major_id) AS obj_schema, \
+                   OBJECT_NAME(dp.major_id) AS obj_name, \
+                   SCHEMA_NAME(dp.major_id) AS sch_name \
+                   FROM sys.database_permissions dp \
+                   WHERE dp.state = N'D' \
+                     AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL') \
+                     AND (dp.grantee_principal_id = USER_ID() \
+                          OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1) \
+                     AND ((dp.class = 1 AND dp.minor_id = 0 \
+                           AND COALESCE(HAS_PERMS_BY_NAME( \
+                                 QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' \
+                                 + QUOTENAME(OBJECT_NAME(dp.major_id)), \
+                                 N'OBJECT', N'VIEW DEFINITION'), 0) <> 1) \
+                       OR (dp.class = 3 \
+                           AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id), \
+                                 N'SCHEMA', N'VIEW DEFINITION'), 0) <> 1));";
+        for row in &conn.query(sql).await? {
+            let class: i32 = row.try_get("class")?.unwrap_or(0);
+            let id: i32 = row.try_get("major_id")?.unwrap_or(0);
+            // A securable the account cannot name is still a denial it cannot
+            // see through, so an unread name travels as its id rather than
+            // being dropped: silence here would read as "no DENY", and the
+            // `DENY` this reports is itself what hides the name.
+            let securable = if class == 3 {
+                match row.try_get::<&str>("sch_name")? {
+                    Some(name) => Securable::Schema(name.to_owned()),
+                    None => Securable::Unreadable {
+                        class: "SCHEMA",
+                        id,
+                    },
+                }
+            } else {
+                match (
+                    row.try_get::<&str>("obj_schema")?,
+                    row.try_get::<&str>("obj_name")?,
+                ) {
+                    (Some(schema), Some(name)) => Securable::Object(ObjectName::new(schema, name)),
+                    _ => Securable::Unreadable {
+                        class: "OBJECT",
+                        id,
+                    },
+                }
+            };
+            metadata_denials.insert(securable);
+        }
+    }
+
     let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
@@ -1513,6 +1672,7 @@ pub async fn permissions(
         ledger_migration_needed,
         referenced_objects,
         roles_declared,
+        metadata_denials,
         granted_objects,
         granted_unresolvable,
         granted_schemas,
@@ -1767,6 +1927,35 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             // emits a DELETE, and demanding one would be asking for the
             // permission that mode was chosen to withhold.
             Needed::DataDelete => data_gaps(held, r, DataDemand::removes, &mut out),
+            // Only when a row would be removed, and asked at the database
+            // because a policy can live in a schema this project does not
+            // manage: `Needed::Managed`'s own `VIEW DEFINITION` cannot see it
+            // (DECISIONS 505). `ensure` never emits a DELETE, so a project
+            // that only inserts and corrects is never told to hold this.
+            Needed::DeleteCatalog => {
+                if held.data_tables.values().any(DataDemand::removes)
+                    && !held.database.contains(r.name)
+                {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Database,
+                    });
+                }
+            }
+            // Reported per securable, because that is where the remedy is: the
+            // database grant above can be held in full and the count still
+            // refuse. Gathered only under the same condition, so this is empty
+            // for a project that removes no rows.
+            Needed::DeleteCatalogDenied => {
+                for securable in &held.metadata_denials {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: securable.clone(),
+                    });
+                }
+            }
             Needed::Ledger => {
                 // Both tables missing means both fall back to the same schema,
                 // and the operator needs one `GRANT`, not two identical lines
@@ -1904,9 +2093,16 @@ mod tests {
             .map(|r| r.name.to_owned())
             .collect();
         Held {
+            // `DeleteCatalog` is database-scoped like `Needed::Database` and
+            // belongs in a helper that means "this account holds everything":
+            // leaving it out would put one extra gap into every test about a
+            // `mode: exact` table, where the property under test is which DML
+            // that table is asked for. The requirement has its own tests.
+            // (`RoleAdmin` stays out because the helper leaves
+            // `roles_declared` false, so it is never asked about at all.)
             database: REQUIRED
                 .iter()
-                .filter(|r| matches!(r.needed, Needed::Database))
+                .filter(|r| matches!(r.needed, Needed::Database | Needed::DeleteCatalog))
                 .map(|r| r.name.to_owned())
                 .collect(),
             schemas: schemas
@@ -1930,6 +2126,7 @@ mod tests {
             ledger_migration_needed: false,
             referenced_objects: BTreeMap::new(),
             roles_declared: false,
+            metadata_denials: BTreeSet::new(),
             granted_objects: BTreeMap::new(),
             granted_unresolvable: BTreeSet::new(),
             granted_schemas: BTreeMap::new(),
@@ -2631,6 +2828,135 @@ mod tests {
         assert_eq!(gaps[0].securable(), "OBJECT::[app].[t]");
     }
 
+    /// The count that runs *before* that `DELETE` needs database-wide `VIEW
+    /// DEFINITION`, and holding it on every managed schema is not the same
+    /// thing: a security policy can sit in a schema this project does not
+    /// manage, and `counting_statement` refuses until it can prove the policy
+    /// catalog readable (DECISIONS 468, 505). An account holding the rest of
+    /// this list passed readiness and met that refusal on its first exact
+    /// delete.
+    #[test]
+    fn a_declaration_that_removes_rows_is_asked_for_the_database_catalog_read() {
+        let mut held = everything(&["app"]);
+        held.database.remove("VIEW DEFINITION");
+        held.data_tables.insert(
+            table("app.t"),
+            demand(pbps_model::DataMode::Exact, &["a"], &[]),
+        );
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        held.data_objects.insert(
+            table("app.t"),
+            ["DELETE".to_owned(), "INSERT".to_owned()]
+                .into_iter()
+                .collect(),
+        );
+
+        let gaps = missing(&held);
+        let asked: Vec<_> = gaps
+            .iter()
+            .filter(|g| g.permission == "VIEW DEFINITION" && g.securable() == "the database")
+            .collect();
+        assert_eq!(asked.len(), 1, "{gaps:?}");
+        assert!(asked[0].why.contains("FILTER predicate"), "{:?}", asked[0]);
+    }
+
+    /// And of no other project. `ensure` never emits a `DELETE`, so the count
+    /// never runs and database-wide `VIEW DEFINITION` — a broad ask — is not
+    /// demanded. The over-demand this whole enum exists to avoid, and the
+    /// reason the requirement is gated on the declarations rather than asked
+    /// unconditionally.
+    #[test]
+    fn a_declaration_that_removes_no_rows_is_not_asked_for_the_database_catalog_read() {
+        for demanded in [
+            Some(demand(pbps_model::DataMode::Ensure, &["a"], &["label"])),
+            None,
+        ] {
+            let mut held = everything(&["app"]);
+            held.database.remove("VIEW DEFINITION");
+            if let Some(d) = demanded {
+                held.data_tables.insert(table("app.t"), d);
+                held.data_securable.insert(table("app.t"), table("app.t"));
+                held.data_objects.insert(
+                    table("app.t"),
+                    ["INSERT".to_owned(), "UPDATE".to_owned()]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            let gaps = missing(&held);
+            assert!(
+                !gaps
+                    .iter()
+                    .any(|g| g.permission == "VIEW DEFINITION" && g.securable() == "the database"),
+                "{gaps:?}"
+            );
+        }
+    }
+
+    /// The database grant can be held in full and the count still refuse: an
+    /// effective object or schema metadata `DENY` beats it (DECISIONS 460), and
+    /// the remedy is on that securable rather than on the database. Reported
+    /// where it is, so an operator is not sent to grant something they already
+    /// hold.
+    #[test]
+    fn an_effective_metadata_denial_is_reported_on_the_securable_that_carries_it() {
+        let mut held = everything(&["app"]);
+        held.data_tables.insert(
+            table("app.t"),
+            demand(pbps_model::DataMode::Exact, &["a"], &[]),
+        );
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        held.data_objects.insert(
+            table("app.t"),
+            ["DELETE".to_owned(), "INSERT".to_owned()]
+                .into_iter()
+                .collect(),
+        );
+        // The database permission is held; only the denials are the problem.
+        assert!(held.database.contains("VIEW DEFINITION"));
+        held.metadata_denials
+            .insert(Securable::Object(table("sec.pol")));
+        held.metadata_denials
+            .insert(Securable::Schema("sec".to_owned()));
+        // The case the engine actually produces for an object: the `DENY`
+        // being reported is what hides the name, so the id is all there is.
+        held.metadata_denials.insert(Securable::Unreadable {
+            class: "OBJECT",
+            id: 1_221_579_390,
+        });
+
+        let gaps = missing(&held);
+        let where_denied: Vec<String> = gaps
+            .iter()
+            .filter(|g| g.permission == "VIEW DEFINITION")
+            .map(Gap::securable)
+            .collect();
+        assert_eq!(
+            where_denied,
+            // `Securable`'s own order: the schema, the object in it, then
+            // the one that could not be named.
+            vec![
+                "SCHEMA::[sec]".to_owned(),
+                "OBJECT::[sec].[pol]".to_owned(),
+                "OBJECT::<unnameable: id 1221579390>".to_owned(),
+            ],
+            "{gaps:?}"
+        );
+        assert!(
+            !where_denied.contains(&"the database".to_owned()),
+            "{gaps:?}"
+        );
+
+        // The negative case beside it: no denial, nothing said.
+        held.metadata_denials.clear();
+        assert!(
+            !missing(&held)
+                .iter()
+                .any(|g| g.permission == "VIEW DEFINITION"),
+            "a project with no denial is told nothing about the policy catalog"
+        );
+    }
+
     /// An enumeration table whose only column is its code — the commonest
     /// reference-data shape there is — inserts and deletes and can never
     /// update: the differ builds an `UPDATE` only from the columns a row can
@@ -3289,6 +3615,7 @@ mod tests {
             ledger_migration_needed: false,
             referenced_objects: BTreeMap::new(),
             roles_declared: false,
+            metadata_denials: BTreeSet::new(),
             granted_objects: BTreeMap::new(),
             granted_unresolvable: BTreeSet::new(),
             granted_schemas: BTreeMap::new(),
@@ -3298,7 +3625,8 @@ mod tests {
         };
         // Not the ones that depend on what the project declares: no foreign
         // key out of the managed schemas, no role, and no declared row means
-        // none of those are asked about at all.
+        // none of those are asked about at all — including the two halves of
+        // the delete count's catalog proof, which no row removal demands here.
         let applicable = REQUIRED
             .iter()
             .filter(|r| {
@@ -3312,6 +3640,8 @@ mod tests {
                         | Needed::DataInsert
                         | Needed::DataUpdate
                         | Needed::DataDelete
+                        | Needed::DeleteCatalog
+                        | Needed::DeleteCatalogDenied
                 )
             })
             .count();
