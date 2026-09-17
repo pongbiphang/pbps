@@ -12986,10 +12986,11 @@ SPEC is in sync with all of these.
     request's own merge commit must pass, not only the head of the group —
     the weaker setting would let a pull request merge on somebody else's green.
     `max_entries_to_build: 5`, which is what makes the validation parallel and
-    therefore what actually removes the serialisation; `min_entries_to_merge: 1`
-    with no wait, so a ready entry merges instead of waiting to be batched.
-    `check_response_timeout_minutes: 60`, because the engine-backed jobs take
-    tens of minutes and a timeout shorter than the matrix ejects healthy entries
-    for not having answered yet. These values are recorded here because the
-    ruleset lives outside the repository: this entry is the only reproducible
-    record of them.
+    therefore what actually removes the serialisation; `max_entries_to_merge: 5`
+    to match it, since a group cannot merge more than it built;
+    `min_entries_to_merge: 1` with no wait, so a ready entry merges instead of
+    waiting to be batched. `check_response_timeout_minutes: 60`, because the
+    engine-backed jobs take tens of minutes and a timeout shorter than the
+    matrix ejects healthy entries for not having answered yet. These values are
+    recorded here because the ruleset lives outside the repository: this entry
+    is the only reproducible record of them.
