@@ -116,15 +116,27 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   every shared change. If stacking cannot represent the dependency safely, pause
   that downstream issue and decide yourself; workers must not invent an
   integration branch or copy unreviewed changes between worktrees.
-- Merge in topological order. After an upstream merge, **rebase** each
-  downstream branch onto the updated `master`, push with
-  `--force-with-lease`, and rerun the required tests. Retargeting the PR base
-  is not an alternative: it leaves the downstream head untested against the new
-  base, and because `ci-gate` is a commit status on that head, the stale green
-  from before the upstream merge survives the retarget. A conflict-free rebase
-  requires CI again on the new remote head; a rebase that needs conflict
-  resolution follows the resulting-head code-review gate in the review
-  reference. Do not automatically repeat the draft or ready streak.
+- Merge in topological order. After an upstream merge, a downstream branch
+  needs **nothing**, stacked or not. A merely `BEHIND` branch is built against
+  current `master` by the queue when it is enqueued (DECISIONS 502). A branch
+  **stacked on the upstream branch** is retargeted by GitHub itself: deleting a
+  merged head branch retargets every open PR that used it as a base onto the
+  merged PR's base. Its head already contains the upstream commits, so the
+  queue then builds it against `master` like any other behind branch. That
+  retarget waits on the deletion, which is your closeout step and happens no
+  other way here; until it does, the downstream PR is still based on a merged
+  feature branch, and merging it would write to that branch instead of entering
+  the `master` queue. **Do not
+  rebase it** — that rewrites the head that was reviewed and repeats the local
+  checks, CI and resulting-head review, which is the work 502 exists to remove.
+  Two things do need you, and both begin by rebasing onto current `master`,
+  because neither reproduces on a branch that predates it: a **conflict**,
+  which ejects the PR from the queue, and an **interaction the merge group
+  confirmed** — `master` changed something the branch still calls — which a
+  stale branch cannot even compile. Rebase, fix it, push with
+  `--force-with-lease`, rerun the required tests, and follow the resulting-head
+  code-review gate in the review reference. Do not automatically repeat the
+  draft or ready streak.
 - Never merge a downstream PR while its required upstream issue is unmerged.
   Related issues without a true prerequisite may merge independently.
 
@@ -174,9 +186,14 @@ belong to the recorded pushed heads, that every finding has a fix or a linked
 deferred issue, that no review thread is unresolved, that dependency order is
 satisfied, and that the required CI checks are green on the mergeable head.
 
-Only you merge, with `gh pr merge --merge`, and only after every gate passes.
-Then delete the branch, remove the worktree, and confirm the intended issue
-closed.
+Only you enqueue, with `gh pr merge --merge`, and only after every gate
+passes — never with `--delete-branch`, which `gh` refuses outright when a merge
+queue is required, because deleting the head branch before the queue has merged
+closes the PR and drops it from the queue. With a merge queue required that
+command adds the PR to the queue rather than merging it; the queue runs `ci.yml`
+on the `merge_group` and merges only if that is green. Wait for the merge to
+land — a queued PR is not a merged one — then delete the branch **locally and
+on the remote**, remove the worktree, and confirm the intended issue closed.
 
 If the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or the
 dependency-audit workflow, wait for the dependency audit; a red audit is the

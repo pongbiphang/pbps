@@ -72,12 +72,16 @@ checksum-pinned, and state lives in the database itself.
   or P1, or as soon as a completed review reports no findings. A P0 or P1 resets
   the count. Count a review only if its `Reviewed commit:` is the pushed head.
   Never push a docs-only commit to move the count.
-- On stopping: kill the watch and post no further `@codex review`. Rebase onto
-  `origin/master` if it moved, push, then mark the PR ready. That triggers the
-  required code review; wait for it. A security review is optional: if run, its
-  findings use the same triage rules, but its completion is not a gate. The
-  rebase does not repeat the qualified draft gate, but the ready-phase code
-  review must name the rebased current head.
+- On stopping: kill the watch and post no further `@codex review`, then mark the
+  PR ready. Do **not** rebase merely because `master` moved — the queue handles
+  that, and rebasing would re-run the local checks and CI and create a new
+  review head for nothing (DECISIONS 502). Rebase only for the two cases that
+  need the combined tree in your hands: a conflict, or an interaction the merge
+  group confirmed;
+  that rebase does not repeat the qualified draft gate, but the ready-phase code
+  review must then name the resolution head. Marking ready triggers the required
+  code review; wait for it. A security review is optional: if run, its findings
+  use the same triage rules, but its completion is not a gate.
 - In the ready phase, a completed code review with no findings qualifies the PR
   for CI immediately. Otherwise, obtain three consecutive completed code
   reviews with no P0 or P1; P2/P3 findings do not reset the count, but each must
@@ -97,25 +101,64 @@ checksum-pinned, and state lives in the database itself.
   tab while the required check stays unsatisfied (DECISIONS 206). Dispatch is
   for a branch that has no pull request.
 - Red CI: fix it, push, and return to the loop as a draft.
-- If `master` moves before merge, rebase and push the rebased head with
-  `git push --force-with-lease`. The ruleset is strict, so a branch that is
-  `BEHIND` cannot merge however green it is; the push starts the run on the
-  rebased head by itself, and that run is what the merge waits for.
-- If that rebase needs conflict resolution, resolve it, run the required local
-  tests, push, and obtain a completed code review whose `Reviewed commit:` is
-  the conflict-resolution head. P0 is always fixed; P1–P3 follow the same
-  three-case finding rules, and P2 may be deferred directly to a linked
-  `deferred-review` issue. A P0 or P1 must be addressed and followed by another
-  completed resulting-head code review. Once that review has no P0 or P1, the
-  PR may proceed without repeating the draft or ready three-review gates; all
-  branch checks required on that head must still be green.
-- Before merge, the primary agent independently verifies the issue-to-diff
-  match, architecture, local-test evidence, review counts and heads, thread
-  dispositions, dependency order, and required CI checks. Subagents never
-  merge.
-- The primary agent merges with a merge commit (`gh pr merge --merge`), deletes
-  the branch, and removes the worktree only after every gate above passes.
-- Never bypass the ruleset that requires green CI on the PR head.
+- **`master` moving is not your problem any more.** The merge queue builds the
+  pull request against the current `master` and against whatever is queued
+  ahead of it, so a branch that is merely behind is merged without anyone
+  rebasing it. Do not rebase to clear `BEHIND`; the strict policy that made
+  that necessary is off (DECISIONS 502).
+- **Two things still put the branch back in your hands**, and both start the
+  same way: rebase onto current `master`, because neither can be reproduced on
+  a branch that predates it. A **conflict**, which the queue cannot resolve and
+  ejects instead. And an **interaction the merge group confirmed** — `master`
+  changed something this branch still calls — which a stale branch cannot even
+  compile, let alone test. Rebase, fix it, run the required local tests, push
+  with `git push --force-with-lease`, and obtain a completed code review whose
+  `Reviewed commit:` is the resulting head. P0 is always fixed;
+  P1–P3 follow the same three-case finding rules, and P2 may be deferred
+  directly to a linked `deferred-review` issue. A P0 or P1 must be addressed
+  and followed by another completed resulting-head code review. Once that
+  review has no P0 or P1, the PR may proceed without repeating the draft or
+  ready three-review gates; all branch checks required on that head must still
+  be green.
+- Before **enqueueing**, the primary agent independently verifies the
+  issue-to-diff match, architecture, local-test evidence, review counts and
+  heads, thread dispositions, dependency order, and required CI checks. That
+  verification is unchanged; only the step it precedes has moved. Subagents
+  never enqueue and never merge.
+- The primary agent enqueues with `gh pr merge --merge` once every gate above
+  passes — never with `--delete-branch`, which `gh` refuses outright when a
+  merge queue is required, because deleting the head branch before the queue
+  has merged closes the pull request and drops it from the queue. With a merge
+  queue required, that command **adds the pull request to the queue** rather
+  than merging it: GitHub builds a branch of `master` plus everything queued
+  ahead plus this pull request, runs `ci.yml` on the `merge_group` event, and
+  merges only if that is green. Wait for the merge to land before deleting the
+  branch and removing the worktree — a queued pull request is not a merged one.
+- **Delete the remote head branch once the merge has landed**, not only the
+  local one. GitHub retargets a pull request stacked on a merged branch onto
+  that pull request's base when the branch is *deleted*, not when it is merged,
+  and this repository does not delete it by itself. A downstream pull request
+  left based on a merged feature branch never enters the `master` queue at all:
+  merging it writes to that branch, and its work never reaches `master`
+  (DECISIONS 502).
+- A pull request must be green on its **own** head before it can be queued, so
+  a merge costs **two pre-merge runs** of `ci.yml` — one on the pull request,
+  one on the merge group — plus the post-merge run on `master`, which gates
+  nothing. That is the price of the queue and it is the cheap half of the trade:
+  what it buys is that none of them has to be repeated because somebody else
+  merged first.
+- If the queue ejects the pull request, **read the failing job before
+  re-queueing**, and say which of the two it was. A merge-group failure that
+  reproduces, or that is a test failing on its merits, is a real interaction
+  with what merged ahead of it: rebase and fix it as above, do not re-queue.
+  A merge-group failure
+  whose log shows an infrastructure fault — the resource-shaped engine startup
+  crashes `ci.yml` and docs/PITFALLS.md both record — is transient, and
+  re-queueing is the right move. What is never right is re-queueing without
+  reading, which is how a real interaction gets merged on the second roll.
+  A conflict is the case above.
+- Never bypass the ruleset. It requires green CI on the pull request head and
+  green CI on the merge group.
 - Report at each merge: the draft and ready review counts, the qualifying route,
   the merge commit, and every finding deferred to an issue.
 - Never add "one more round" — more review is a new instruction.
@@ -128,13 +171,17 @@ checksum-pinned, and state lives in the database itself.
   and coordinate multiple eligible issues concurrently. Each subagent owns
   exactly one issue at a time, uses an isolated branch and worktree, and never
   merges. Dependency-linked issues merge in topological order.
-- `ci.yml` runs on `master` after a merge. It is not a gate — the strict
-  ruleset already made the merged tree the tree CI passed — so do not wait for
-  it before taking the next issue; a red one is a real regression and the next
-  task. The dependency audit is a separate workflow and does run on `master`
-  when the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own
-  workflow — wait for it in that case, and a red audit is the next task, not
-  the next issue.
+- `ci.yml` runs on `master` after a merge. It is not a gate — the merge queue
+  already ran it on the exact tree the merge produced — so do not wait for it
+  before taking the next issue. **A red one is read, not assumed**, by the same
+  procedure as an ejection: the merge group passed this identical tree minutes
+  earlier, so open the failing job before calling it a regression. A test
+  failing on its merits is one, and becomes the next task; the resource-shaped
+  engine startup crash that `ci.yml` and docs/PITFALLS.md both record is not,
+  and a re-run on the same tree settles which it was. The dependency audit is a
+  separate workflow and does run on `master` when the merge touched
+  `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own workflow — wait for it in
+  that case, and a red audit is the next task, not the next issue.
 - Take the next issue, following "Taking an issue", only when the user requested
   a continuous or multi-wave loop.
 

@@ -12911,3 +12911,103 @@ SPEC is in sync with all of these.
     guarantee, and 206 rejected one only because "merge queues need an
     organisation-owned or public repository and this one is neither". It is now
     both.
+
+502. **A merge queue on `master`, and the strict up-to-date policy off.** With
+    several pull requests in flight the strict policy serialised every merge:
+    merging one left the rest `BEHIND`, each had to rebase and re-run the full
+    matrix, and whoever merged next invalidated the others again. That cost is
+    inherent to the policy rather than to how long CI takes, so making CI
+    faster could not have removed it.
+
+    The queue is the automated form of the same guarantee, not a weaker one.
+    GitHub states the relationship plainly: it "provides the same benefits as
+    the **Require branches to be up to date before merging** branch
+    protection, but does not require a pull request author to update their
+    pull request branch". The property 206 wanted — that the tree CI ran on is
+    the tree the merge commit holds — is what the queue enforces, by building
+    `master` plus everything queued ahead plus this pull request and running
+    `ci.yml` on the `merge_group` event against exactly that.
+
+    206 rejected a queue for a reason that expired: "merge queues need an
+    organisation-owned or public repository and this one is neither". Since the
+    move to `pongbiphang` it is both. 501 added the `merge_group` trigger so
+    that turning the queue on would be a ruleset change alone; a queue whose
+    required checks do not run on the merge group never advances.
+
+    **Strict is turned off, and the two are not mutually exclusive.** GitHub
+    accepts both at once. Leaving strict on would nevertheless have made the
+    queue pointless: the author would still have to update the branch before it
+    could be queued, which is the exact work the queue exists to remove. So
+    this is a deliberate pairing rather than a constraint.
+
+    **What it costs, stated rather than discovered later.** A pull request must
+    be green on its *own* head before it can be queued, so a merge costs **two
+    pre-merge runs** of `ci.yml` — one on the pull request, one on the merge
+    group — and 501's `push` trigger adds a third on `master` afterwards, which
+    gates nothing. That is the cheap half of the trade: what disappears is not a
+    run but the *repetition* of runs caused by somebody else merging first,
+    which had no bound. A conflict is still the author's to resolve; the queue
+    ejects a pull request it cannot merge rather than guessing.
+
+    **An ejection is read, not re-rolled.** A merge-group failure is not
+    automatically an interaction with what merged ahead: this repository's CI
+    has a documented resource-shaped engine startup crash, and issue #638 was
+    two genuinely flaky tests. Nor is it automatically a flake — that reading is
+    how a real interaction merges on the second attempt. The rule is therefore
+    procedural rather than a verdict: read the failing job, name which it was,
+    and only then fix or re-queue. The `push` run on `master` afterwards is read
+    the same way and for a stronger reason: the merge group passed that exact
+    tree minutes earlier, so a red one is a flake until the failing job says
+    otherwise.
+
+    **A stacked pull request retargets itself only once the upstream branch is
+    deleted.** GitHub retargets every open pull request based on a merged head
+    branch onto that pull request's base, but the trigger is the *deletion* of
+    the branch, not the merge. This repository has `delete_branch_on_merge`
+    off, and the obvious remedy is refused: with a queue required, `gh pr merge
+    --delete-branch` errors out instead of enqueueing, because deleting the head
+    branch before the queue has merged closes the pull request and removes it
+    from the queue. The branch is therefore deleted as a separate closeout step
+    once the merge has landed, and that deletion is what retargets whatever was
+    stacked on it. Left undeleted, the downstream pull request stays based on a
+    merged feature branch: it never enters the `master` queue, and merging it
+    writes to that branch rather than to `master`.
+
+    Measured against the field rather than chosen. Of the fifteen projects
+    surveyed for 501, the four running a merge queue — rust-analyzer, cargo,
+    diesel, bevy — are precisely the ones with many concurrent pull requests
+    and long CI, and rust-lang/rust ran bors, the same idea, for years before
+    GitHub shipped one. The projects without one (atlas, tokio, sqlx, ripgrep,
+    clap) keep the strict policy and pay the serialisation. This repository has
+    the first shape, not the second.
+
+    Settings: `merge_method: MERGE`, because the merge commit is what this
+    repository keeps (AGENTS.md). `grouping_strategy: ALLGREEN`, so every pull
+    request's own merge commit must pass, not only the head of the group —
+    the weaker setting would let a pull request merge on somebody else's green.
+    `max_entries_to_build: 5`, which is what makes the validation parallel and
+    therefore what actually removes the serialisation; `max_entries_to_merge: 5`
+    to match it, since a group cannot merge more than it built;
+    `min_entries_to_merge: 1` with no wait, so a ready entry merges instead of
+    waiting to be batched. `check_response_timeout_minutes: 60`, because the
+    engine-backed jobs take tens of minutes and a timeout shorter than the
+    matrix ejects healthy entries for not having answered yet. These values are
+    recorded here because the ruleset lives outside the repository: this entry
+    is the only reproducible record of them.
+
+    **The ruleset is not sufficient on its own: `allow_auto_merge` has to be
+    enabled on the repository too.** Adding a pull request to the queue goes
+    through the auto-merge API, so with the ruleset in place and that repository
+    setting still off, enqueueing fails outright — measured here as `gh pr merge
+    --merge` answering `Auto merge is not allowed for this repository
+    (enablePullRequestAutoMerge)`. The queue is therefore two switches rather
+    than one, and the second is easy to miss because the ruleset reads as
+    complete without it.
+
+    The rest of the ruleset is unchanged and worth naming, because one of its
+    values is routinely misread: alongside the single required context
+    `ci-gate`, it sets `required_approving_review_count: 0` and
+    `required_review_thread_resolution: true`. A pull request that is `BLOCKED`
+    with green CI is therefore never waiting for an approval — there is none to
+    wait for. It is waiting for an unresolved review thread, and looking for a
+    reviewer instead has cost time here more than once.

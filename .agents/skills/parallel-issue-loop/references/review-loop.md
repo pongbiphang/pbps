@@ -70,10 +70,12 @@ finding still needs the disposition above. Count a review only when its
 move the count.
 
 When either route qualifies, kill the watch and post no further draft
-`@codex review`. Rebase onto `origin/master` if it moved, push, and mark the PR
-ready. The rebase does not repeat the qualified draft gate, but the ready-phase
-code review must name the rebased current head. Never add one extra draft round
-without a new user instruction.
+`@codex review`, then mark the PR ready. Do **not** rebase merely because
+`master` moved: the merge queue builds the PR against current `master`, so a
+branch that is only behind needs nothing (DECISIONS 502). Rebase only to
+resolve a conflict; that rebase does not repeat the qualified draft gate, but
+the ready-phase code review must then name the resolution head. Never add one
+extra draft round without a new user instruction.
 
 ## 4. Ready gate
 
@@ -96,17 +98,21 @@ do not reset the no-P1 count solely because of that lower-priority finding.
 
 ## 5. CI and base changes
 
-After the ready gate qualifies, start CI on the remote PR head with
-`gh workflow run ci.yml --ref <branch>` and wait. A push clears the checks. A
-red CI result requires a fix, push, and return to the draft loop.
+CI runs itself on every push, so by the time the ready gate qualifies there is
+a run on the head already; wait for `ci-gate` on it. Retry a transient failure
+with `gh run rerun <run-id>` (`--failed` for the failed jobs alone), which keeps
+the run's pull-request association. Never use `gh workflow run ci.yml` for that
+— it raises a `workflow_dispatch` event whose check suite belongs to no pull
+request, so it goes green in the Actions tab while the required check stays
+unsatisfied (DECISIONS 206, 501). A red CI result requires a fix, push, and
+return to the draft loop.
 
-If `master` moves before merge, rebase and push the new head with
-`git push --force-with-lease`:
+`master` moving before merge needs no action: the queue rebuilds the PR against
+current `master` when it is enqueued.
 
-- A conflict-free rebase requires CI again on the new remote head.
-- If conflict resolution is required, resolve it, run the required local tests,
-  push, and obtain a completed code review whose `Reviewed commit:` is the
-  conflict-resolution head.
+- If the queue ejects the PR for a conflict, resolve it, run the required local
+  tests, push with `git push --force-with-lease`, and obtain a completed code
+  review whose `Reviewed commit:` is the conflict-resolution head.
 - P0 from the conflict-resolution review is always fixed. P1–P3 use the same
   three-case finding rules above; a P2 may be deferred directly to a linked
   `deferred-review` issue.
@@ -131,8 +137,30 @@ Before merge, the primary agent—not an issue worker—must independently confi
 - dependency merge order is satisfied;
 - required CI checks are green on the mergeable PR head.
 
-Subagents never merge. The primary agent uses a merge commit, deletes the issue
-branch, and removes its worktree only after every gate passes.
+Subagents never enqueue and never merge. Once every gate passes the primary
+agent enqueues with `gh pr merge --merge` — never with `--delete-branch`, which
+`gh` refuses outright when a merge queue is required, because deleting the head
+branch before the queue has merged closes the PR and drops it from the queue.
+With a merge queue required that command **adds the PR to the queue** rather
+than merging it: GitHub builds `master` plus everything queued ahead plus this
+PR and runs `ci.yml` on the `merge_group` event, merging only if that is green
+(DECISIONS 502). Wait for the merge to land before deleting the issue branch
+and removing its worktree — a queued PR is not a merged one, and the queue can
+still eject it. Delete the
+branch on the **remote** as well as locally: GitHub retargets a PR stacked on it
+onto `master` when the branch is deleted, not when it is merged, and nothing
+deletes it here otherwise.
+
+If the queue ejects the PR, read the failing job before re-queueing and say
+which case it was. A conflict is handled in §5. A merge-group failure that
+reproduces, or a test failing on its merits, is a real interaction with what
+merged ahead — rebase onto current `master` so the combined tree is in your
+hands, fix it there, and follow §5's resulting-head gate; do not re-queue. A
+merge-group failure whose log
+shows an infrastructure fault (the resource-shaped engine startup crashes
+`ci.yml` and docs/PITFALLS.md record) is transient, and re-queueing is correct.
+Re-queueing without reading is never correct: it is how a real interaction gets
+merged on the second roll.
 
 ## 7. Closeout
 
