@@ -13093,6 +13093,11 @@ SPEC is in sync with all of these.
      the lock that *is* held beside the one that is not, because either fact
      alone misleads: "not serialized" would deny a lock this transaction holds,
      and naming only the missing one would not say what an operator still has.
+     The routine arm says both for the same reason in the other direction: the
+     two locks are refused by the same privilege, so that account is usually
+     missing both, and the sentence that called the `pg_proc` row lock "the
+     only lock that would serialize it" — true until this entry — would now
+     read as a claim that the schema half is held.
      SPEC §7.6's read-back remains the backstop it always was — this prevents
      for the accounts that can and reports for the accounts that cannot.
 

@@ -8471,6 +8471,12 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
         pbps_pg::modules::Serialized::Not(why) => {
             assert!(why.contains("pg_proc"), "{why}");
             assert!(why.contains("not serialized"), "{why}");
+            // Both locks are refused by the same privilege, so both have to be
+            // in the sentence. Naming `pg_proc` alone would read as "the
+            // schema half is held", which is the one thing this account must
+            // not be told (DECISIONS 503).
+            assert!(why.contains("pg_namespace"), "{why}");
+            assert!(why.contains(&s), "{why}");
         }
         pbps_pg::modules::Serialized::By(what) => {
             panic!("this account should not be able to lock `pg_proc`: {what}")

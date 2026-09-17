@@ -413,12 +413,28 @@ async fn serialize(
                     if e.server_error_code().as_deref() != Some("42501") {
                         return Err(e);
                     }
+                    // Both halves can be missing at once, and for this account
+                    // they usually are: the two locks are refused by the same
+                    // privilege. The sentence that called the `pg_proc` row
+                    // lock "the only lock that would serialize it" was true
+                    // until 503 and is not now — an operator told about that
+                    // one alone would read the schema half as held.
+                    let and_the_schema = match &schema_pin {
+                        SchemaPin::Held => String::new(),
+                        SchemaPin::Not(why) => format!(
+                            " The schema component of the name that `DROP` uses is not pinned \
+                             either: {why}. A session that renames `{in_schema}` away and \
+                             creates a replacement under that name sends the `DROP` to an \
+                             object this plan never approved over."
+                        ),
+                    };
                     Ok(Serialized::Not(format!(
                         "this rebuild is not serialized: a routine is not a relation, so the \
-                         only lock that would serialize it is a row lock on its `pg_proc` entry, \
-                         and this account cannot take one ({e}). A concurrent `ALTER FUNCTION` \
-                         between this read and the `DROP` is reverted by the rebuild, and pbps \
-                         cannot stop it without privileges it should not need (ADR-0009 §3)"
+                         lock that would serialize its reads is a row lock on its `pg_proc` \
+                         entry, and this account cannot take one ({e}). A concurrent \
+                         `ALTER FUNCTION` between this read and the `DROP` is reverted by the \
+                         rebuild, and pbps cannot stop it without privileges it should not need \
+                         (ADR-0009 §3).{and_the_schema}"
                     )))
                 }
             }
