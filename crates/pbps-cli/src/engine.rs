@@ -1059,9 +1059,11 @@ pub fn require_transactional_rebuilds(
         .changes
         .iter()
         .filter_map(|p| {
-            // Only the deciding half that writes SQL. `Kept` writes
-            // nothing, so there is no window between two commits for it to
-            // leave open.
+            // Only the half whose window is an over-exposure. `Kept`
+            // writes a `GRANT` of its own, but the state between its
+            // `CREATE` and that grant is a routine *less* reachable than the
+            // declaration asks for — a caller sees a permission error, not
+            // somebody else's privileges — so staging it is merely slow.
             if let pbps_model::Change::PublicExecution {
                 routine,
                 access: pbps_model::PublicAccess::Revoked,
@@ -1622,8 +1624,8 @@ mod tests {
             assert!(require_transactional_rebuilds(driver, &cs, false).is_ok());
         }
 
-        // The other decision writes no statement, so there is no window
-        // between two commits and nothing to refuse.
+        // The other decision's window leaves the routine closed rather than
+        // open, which is not the exposure this rule is about.
         let mut kept = ChangeSet::default();
         kept.changes
             .push(PlannedChange::new(Change::PublicExecution {

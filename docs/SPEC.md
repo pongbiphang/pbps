@@ -292,10 +292,10 @@ Two more rules, both consequences of the model rather than choices:
   PostgreSQL does; SQL Server does not — a plan that creates a procedure or a
   function also carries a change that takes that default away, and a
   declaration writing `public_execute: true` is what leaves it standing. The
-  plan records that second decision too, even though it writes no statement:
-  the `CREATE` has already left the default standing, and a plan that stayed
-  silent could not be told apart from one that had no opinion about the
-  routine. It is an annotation and not state for the reason ADR-0010 §5 gives: what `PUBLIC`
+  plan records and writes that second decision too, rather than trusting the
+  `CREATE` to have left the default standing: a cluster's own default
+  privileges can revoke it. It is an annotation and not state for the reason
+  ADR-0010 §5 gives: what `PUBLIC`
   holds is never compared, so it says what the plan should *write* rather than
   what the two sides should agree on. The key is refused on a view or a
   trigger, neither of which has an `EXECUTE` privilege.

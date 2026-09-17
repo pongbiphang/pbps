@@ -2374,30 +2374,40 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // procedure alike (DECISIONS 372), and the signature is always
         // spelled: this change carries a `RoutineId`, so there is no
         // overloaded bare name to be ambiguous about.
+        //
+        // Both decisions write a statement, and the second one is the reason
+        // to distrust "the `CREATE` already did it". A cluster whose
+        // deployment role has run `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON
+        // ROUTINES FROM PUBLIC` creates routines with an explicit `proacl`
+        // that `PUBLIC` is not in — measured on 18.6 — so a `Kept` that
+        // emitted nothing would apply a declaration and leave the declared
+        // state unreached, with `verify` unable to say so because what
+        // `PUBLIC` holds is never compared (DECISIONS 371). The `GRANT` is
+        // idempotent against the untouched case: on a routine whose `proacl`
+        // is still `NULL` it writes exactly `acldefault('f', owner)`,
+        // measured equal, so the rebuild guard that compares against
+        // `acldefault` sees no difference either.
         Change::PublicExecution {
-            access: PublicAccess::Revoked,
-            routine,
-            ..
+            access, routine, ..
         } => {
             let target = GrantTarget::Routine(routine.clone());
             let execute = BTreeSet::from([Permission::Execute]);
-            Ok(vec![scoped(
-                pg,
-                target.schema(),
-                &format!(
-                    "REVOKE EXECUTE ON {} FROM PUBLIC;",
-                    securable(&target, &execute)?
-                ),
-            )?])
+            let statement = match access {
+                PublicAccess::Revoked => {
+                    format!(
+                        "REVOKE EXECUTE ON {} FROM PUBLIC;",
+                        securable(&target, &execute)?
+                    )
+                }
+                PublicAccess::Kept => {
+                    format!(
+                        "GRANT EXECUTE ON {} TO PUBLIC;",
+                        securable(&target, &execute)?
+                    )
+                }
+            };
+            Ok(vec![scoped(pg, target.schema(), &statement)?])
         }
-        // No statement, and that is the whole of it: the `CREATE` has already
-        // put the default there. The change exists so the plan *says* the
-        // default is meant to stand — `SetDataMode` is the same shape
-        // (DECISIONS 517).
-        Change::PublicExecution {
-            access: PublicAccess::Kept,
-            ..
-        } => Ok(Vec::new()),
 
         // Reference data (ADR-0004). Each row change is one statement — a `DO`
         // block carrying the write and the checks that hold it to what the
@@ -3321,27 +3331,43 @@ mod tests {
     /// because one word has to take a function and a procedure alike
     /// (DECISIONS 372).
     #[test]
-    fn a_public_execution_revoke_names_the_keyword_and_the_signature() {
+    fn a_public_execution_decision_names_the_keyword_and_the_signature() {
         let pg = Postgres::new();
-        for (spelled, expected) in [
+        for (spelled, access, expected) in [
             (
                 "app.f(integer, text)",
+                PublicAccess::Revoked,
                 "REVOKE EXECUTE ON ROUTINE \"app\".\"f\"(integer, text) FROM PUBLIC;",
             ),
             (
                 "app.zero()",
+                PublicAccess::Revoked,
                 "REVOKE EXECUTE ON ROUTINE \"app\".\"zero\"() FROM PUBLIC;",
+            ),
+            // The opt-in writes its own statement rather than trusting the
+            // `CREATE`: a cluster whose default privileges revoke `EXECUTE`
+            // on routines creates them closed, and a silent decision would
+            // leave the declaration unmet with nothing able to report it.
+            (
+                "app.f(integer, text)",
+                PublicAccess::Kept,
+                "GRANT EXECUTE ON ROUTINE \"app\".\"f\"(integer, text) TO PUBLIC;",
+            ),
+            (
+                "app.zero()",
+                PublicAccess::Kept,
+                "GRANT EXECUTE ON ROUTINE \"app\".\"zero\"() TO PUBLIC;",
             ),
         ] {
             let sql = sql_of(
                 &pg,
                 &Change::PublicExecution {
                     routine: spelled.parse().expect("a routine id parses"),
-                    access: PublicAccess::Revoked,
+                    access,
                     origin: pbps_model::RoutineOrigin::Created,
                 },
             );
-            assert_eq!(sql.len(), 1, "{spelled}");
+            assert_eq!(sql.len(), 1, "{spelled} {access:?}");
             assert!(sql[0].contains(expected), "{spelled}: {}", sql[0]);
             // Never the quoted form, which would be a different grantee.
             assert!(!sql[0].contains("\"PUBLIC\""), "{spelled}: {}", sql[0]);
@@ -3351,20 +3377,6 @@ mod tests {
                 sql[0]
             );
         }
-        // And the other decision writes nothing: the `CREATE` has already put
-        // the default there, so a statement would be a second opinion about
-        // a state that already holds.
-        assert!(
-            sql_of(
-                &pg,
-                &Change::PublicExecution {
-                    routine: "app.f(integer, text)".parse().unwrap(),
-                    access: PublicAccess::Kept,
-                    origin: pbps_model::RoutineOrigin::Rebuilt,
-                },
-            )
-            .is_empty()
-        );
     }
 
     /// ADR-0010 §3. The principal is the cluster's, so each of the three

@@ -13680,17 +13680,28 @@ SPEC is in sync with all of these.
      `String` holding the word would be a sentinel every reader had to know
      about, and a project may declare a role named `PUBLIC`.
 
-     **The plan says so even when it writes nothing.** The opt-in decision —
-     `PublicAccess::Kept` — emits no statement: the `CREATE` has already left
-     the default standing, and a `GRANT EXECUTE … TO PUBLIC` after it would
-     write a real ACL entry where the engine's own default belongs, which is
-     the comparison 371 keeps out of the model. It is still recorded, because
-     a plan that stayed silent about an opted-in routine could not be told
-     apart from a plan that had no opinion about it, and the rebuild guard
-     below needs exactly that distinction: a routine already closed by hand,
-     whose declaration now asks for the default back and whose definition also
-     changed, would otherwise have its valid rebuild refused. `SetDataMode` is
-     the precedent for a change that is in the plan and writes no SQL.
+     **Both decisions are written down, and both are written out.** The
+     opt-in — `PublicAccess::Kept` — could have emitted nothing, on the
+     reasoning that the `CREATE` has already left the default standing. That
+     reasoning is false on a cluster whose deployment role has run
+     `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC`: the
+     `CREATE` then writes an explicit `proacl` that `PUBLIC` is not in
+     (measured on 18.6), so a silent opt-in would apply a declaration and
+     leave the declared state unreached — and 371 keeps what `PUBLIC` holds
+     out of every comparison, so `verify` could not say so either. It emits
+     `GRANT EXECUTE … TO PUBLIC`, which is exactly idempotent where nobody
+     has tampered: on a routine whose `proacl` is still `NULL` the grant
+     writes precisely `acldefault('f', owner)` — measured equal — so the
+     rebuild guard, which compares against `acldefault`, sees no difference
+     either. 371 is about what is *compared*, and the annotation is still
+     never compared.
+
+     Recording it matters separately from writing it. A plan that stayed
+     silent about an opted-in routine could not be told apart from a plan that
+     had no opinion about it, and the rebuild guard below needs exactly that
+     distinction: a routine already closed by hand, whose declaration now asks
+     for the default back and whose definition also changed, would otherwise
+     have its valid rebuild refused.
 
      **The opt-in travels beside the model**, with `strategy:` and
      `depends_on:`, because 371 keeps what `PUBLIC` holds out of every
@@ -13730,8 +13741,11 @@ SPEC is in sync with all of these.
      row the plan writes, so that window is the rest of the plan rather than
      an instant. The same shape as the rebuild rule already in
      `require_transactional_rebuilds`, and refused on either driver: what
-     makes it unsafe is the staging, not the engine. A plan that only keeps
-     the default writes no statement and so opens no window; it is allowed.
+     makes it unsafe is the staging, not the engine. The opt-in's own window
+     runs the other way — between its `CREATE` and its `GRANT` the routine is
+     *less* reachable than the declaration asks for, a permission error rather
+     than somebody else's privileges — so staging it is merely slow, and it is
+     allowed.
 
      **What a pull does with it.** The routines the database lets `PUBLIC`
      execute ride beside the pulled schema and are written into those

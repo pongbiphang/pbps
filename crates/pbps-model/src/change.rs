@@ -540,17 +540,21 @@ pub enum Change {
     /// be one), so a plan cannot ask about a grantee or a permission that is
     /// not this one.
     ///
-    /// # Why the plan says so even when it does nothing
+    /// # Why keeping the default is a change of its own
     ///
-    /// [`PublicAccess::Kept`] writes no SQL: the `CREATE` restores the default
-    /// by itself. It is here because a plan that stayed silent could not be
-    /// told apart from one that had no opinion — and the connected rebuild
-    /// guard has to tell those apart. A routine somebody closed, whose
+    /// [`PublicAccess::Kept`] is here because a plan that stayed silent could
+    /// not be told apart from one that had no opinion — and the connected
+    /// rebuild guard has to tell those apart. A routine somebody closed, whose
     /// declaration now asks for the default back, is a *valid* rebuild, and
     /// silence would have it refused with the missing default it was asked to
     /// restore (ADR-0009 §3). Positive evidence, not an absence, is also what
     /// a reviewer reads: "this routine stays executable by everyone" is a
     /// line worth seeing.
+    ///
+    /// It renders a statement rather than trusting the `CREATE`, because the
+    /// engine's default is not the only thing deciding what a new routine
+    /// arrives holding: a cluster's own `ALTER DEFAULT PRIVILEGES` can revoke
+    /// it (DECISIONS 517).
     PublicExecution {
         routine: RoutineId,
         access: PublicAccess,

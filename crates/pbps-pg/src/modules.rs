@@ -210,7 +210,7 @@ pub async fn before_a_rebuild(
     // (DECISIONS 306). `Change::PublicExecution` is that something.
     //
     // **Either decision explains it, and that is why the plan carries one
-    // even when it writes no SQL.** `Revoked` re-issues the revoke after the
+    // whichever way it went.** `Revoked` re-issues the revoke after the
     // `CREATE`, so the missing default is a state this plan restates, exactly
     // as a declared grant is. `Kept` is the declaration asking for the
     // default back on a routine somebody had closed — a valid rebuild whose

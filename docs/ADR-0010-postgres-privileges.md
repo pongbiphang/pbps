@@ -337,10 +337,11 @@ permission set and no `GrantTarget`, because `EXECUTE` is the only default
 `PUBLIC` holds on a routine and a view or a trigger cannot be one. Deliberately
 **not** a `Revoke` from a role spelled `PUBLIC` — a project may declare a role
 of that name, and a string holding the word would be a sentinel every reader
-had to know about. The opt-in decision writes no statement — the `CREATE`
-already left the default standing — and is recorded anyway, so that a plan with
-no opinion about a routine reads differently from one that deliberately left it
-open (DECISIONS 517).
+had to know about. The opt-in decision is recorded even though the `CREATE`
+would usually have left the default standing, so that a plan with no opinion
+about a routine reads differently from one that deliberately left it open; and
+it writes a `GRANT EXECUTE … TO PUBLIC` of its own rather than trusting that
+`CREATE`, because a cluster's default privileges can revoke it (DECISIONS 517).
 
 Three consequences follow, and the third is the one that reverses a paragraph
 above.

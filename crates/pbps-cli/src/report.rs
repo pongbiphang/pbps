@@ -735,13 +735,15 @@ pub fn describe(c: &Change) -> String {
             access: pbps_model::PublicAccess::Revoked,
             ..
         } => format!("- revoke execute on {routine} from PUBLIC"),
-        // No statement to describe, and the line is still worth a reader's
-        // eye: it says this routine stays runnable by every principal.
+        // A statement of its own, because the engine's default is not
+        // something to take on trust (DECISIONS 517) — and worth a reader's
+        // eye either way: it says this routine stays runnable by every
+        // principal in the cluster.
         Change::PublicExecution {
             routine,
             access: pbps_model::PublicAccess::Kept,
             ..
-        } => format!("= {routine} stays executable by PUBLIC (declared)"),
+        } => format!("+ grant execute on {routine} to PUBLIC (declared)"),
     }
 }
 

@@ -1577,12 +1577,11 @@ fn routine_rebuilds_do_not_restore_revoked_public_execute() {
 /// the definition, asks for a rebuild whose whole effect is the `CREATE`
 /// giving the default back.
 ///
-/// The plan writes no statement for that decision — the `CREATE` has already
-/// done it — so the plan records the decision itself, and the rebuild guard
-/// reads it as the recorded intent it is. A plan that instead stayed silent
-/// about the routine looked to that guard exactly like a plan with no opinion,
-/// and the missing default refused the rebuild: a valid plan refused for
-/// asking for the state it was asked to reach.
+/// The plan records that decision, and the rebuild guard reads it as the
+/// recorded intent it is. A plan that instead stayed silent about the routine
+/// looked to that guard exactly like a plan with no opinion, and the missing
+/// default refused the rebuild: a valid plan refused for asking for the state
+/// it was asked to reach.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
@@ -1634,6 +1633,80 @@ fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
     ));
     assert!(!public_executes(connection, "app.reopen()"));
     succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// The engine's default is not the last word on what a new routine arrives
+/// holding. A cluster whose deployment role has run `ALTER DEFAULT PRIVILEGES
+/// REVOKE EXECUTE ON ROUTINES FROM PUBLIC` creates routines with an explicit
+/// ACL that `PUBLIC` is not in — so an opt-in that emitted nothing, trusting
+/// the `CREATE`, would apply a declaration and leave the declared state
+/// unreached, with `verify` unable to report it because what `PUBLIC` holds is
+/// never compared (DECISIONS 371).
+///
+/// Both directions are measured against that cluster: the declaration that
+/// asks for `PUBLIC` gets it, and the one that does not stays closed.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declaration_opens_a_routine_even_where_default_privileges_close_it() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-default-acl");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    // Per-database, and the deployer is the role creating the routines, so
+    // this is the state every `CREATE` below starts from.
+    on_server(
+        connection,
+        "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC",
+    );
+    let d = Demo::new("routine-default-acl");
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\npublic_execute: true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/shut.yml"),
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    // The declared state, reached against a cluster that would not have
+    // handed it over on its own.
+    assert!(public_executes(connection, "app.open()"));
+    assert!(!public_executes(connection, "app.shut()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // The *rebuild* direction on such a cluster never gets this far, and that
+    // is a different guard doing its job: `pg_default_acl` is one of the
+    // things ADR-0010 §2 refuses to plan over, because who creates an object
+    // decides what it arrives with. Asserted here so that the division of
+    // labour is on the record — the opt-in's `GRANT` is what covers the
+    // `CREATE`, and this refusal is what covers everything else the default
+    // privileges would hand the replacement.
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 3 $$\npublic_execute: true\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("ALTER DEFAULT PRIVILEGES"),
+        "{}",
+        stderr(&refused)
+    );
 }
 
 #[test]
