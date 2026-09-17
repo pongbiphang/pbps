@@ -13675,9 +13675,22 @@ SPEC is in sync with all of these.
      **A change of its own, not a `Revoke` from a role called `PUBLIC`.**
      ADR-0010 §5 named the gap as "a grantee the model does not have"; this is
      that grantee, given the narrowest shape that expresses the act —
-     `Change::RevokePublicExecute` carries a `RoutineId` and nothing else. A
+     `Change::PublicExecution` carries a `RoutineId`, the decision, and which
+     of the two acts brought the routine into being, and nothing else. A
      `String` holding the word would be a sentinel every reader had to know
      about, and a project may declare a role named `PUBLIC`.
+
+     **The plan says so even when it writes nothing.** The opt-in decision —
+     `PublicAccess::Kept` — emits no statement: the `CREATE` has already left
+     the default standing, and a `GRANT EXECUTE … TO PUBLIC` after it would
+     write a real ACL entry where the engine's own default belongs, which is
+     the comparison 371 keeps out of the model. It is still recorded, because
+     a plan that stayed silent about an opted-in routine could not be told
+     apart from a plan that had no opinion about it, and the rebuild guard
+     below needs exactly that distinction: a routine already closed by hand,
+     whose declaration now asks for the default back and whose definition also
+     changed, would otherwise have its valid rebuild refused. `SetDataMode` is
+     the precedent for a change that is in the plan and writes no SQL.
 
      **The opt-in travels beside the model**, with `strategy:` and
      `depends_on:`, because 371 keeps what `PUBLIC` holds out of every
@@ -13695,26 +13708,30 @@ SPEC is in sync with all of these.
      refuses. A rebuild is the other case: on this engine every module edit is
      a drop and a create (ADR-0009 §3), the `CREATE` restores the default, and
      whether anybody was relying on it is not something the declarations can
-     say — so the gate is asked. `Change::RoutineOrigin` is what separates the
-     two, an enum rather than a flag because telling them apart is its whole
-     job.
+     say — so the gate is asked. `RoutineOrigin` is what separates the two, an
+     enum rather than a flag because telling them apart is its whole job, and
+     `PublicAccess` is the second one for the same reason. Keeping the default
+     is `GrantWiden` on either origin — labelled in the report, never gated,
+     exactly as a widening grant is.
 
      **It also closes the deadlock 306 left standing.** A routine somebody had
      closed by hand used to refuse every later plan, because the rebuild would
      restore the default and nothing in the model could take it away again —
      hardening a managed routine and managing it were mutually exclusive. The
      rebuild guard now accepts exactly one missing default: `PUBLIC`'s
-     `EXECUTE`, on a routine whose plan carries the revoke that re-issues it.
-     A different permission, or a different grantee, is still the refusal.
+     `EXECUTE`, on a routine this plan has decided about — either decision,
+     since both say the plan knows what the `CREATE` will leave behind. A
+     different permission, or a different grantee, is still the refusal.
 
-     **A staged run is refused while the plan carries one.** The `CREATE` and
+     **A staged run is refused while the plan closes one.** The `CREATE` and
      the revoke are two statements, and `--staged` commits each on its own —
      so between them the routine is committed, visible to the whole cluster
      and holding the default. The revoke sorts with the grants, after every
      row the plan writes, so that window is the rest of the plan rather than
      an instant. The same shape as the rebuild rule already in
      `require_transactional_rebuilds`, and refused on either driver: what
-     makes it unsafe is the staging, not the engine.
+     makes it unsafe is the staging, not the engine. A plan that only keeps
+     the default writes no statement and so opens no window; it is allowed.
 
      **What a pull does with it.** The routines the database lets `PUBLIC`
      execute ride beside the pulled schema and are written into those

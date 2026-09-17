@@ -365,14 +365,17 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // `EXECUTE` on a procedure it creates, so
         // `Dialect::creates_public_executable_routines` answers `false` here
         // and the differ never builds one — a plan that carried one anyway
-        // would be a plan built for the other engine. Emitting `REVOKE EXECUTE … FROM public` would
-        // apply cleanly against SQL Server's real `public` role and take away
-        // an access nothing here granted, which is the silent wrong answer
-        // `DialectError::Unsupported` exists to prevent.
-        Change::RevokePublicExecute { routine, .. } => Err(DialectError::Unsupported {
+        // would be a plan built for the other engine. Emitting
+        // `REVOKE EXECUTE … FROM public` would apply cleanly against SQL
+        // Server's real `public` role and take away an access nothing here
+        // granted, which is the silent wrong answer
+        // `DialectError::Unsupported` exists to prevent — and the decision to
+        // *keep* a default this engine never grants is just as wrong a claim.
+        Change::PublicExecution { routine, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(
-                "revoking PUBLIC execution on `{routine}`: this engine grants none to revoke,                  and `public` here is an ordinary database role"
+                "settling PUBLIC execution on `{routine}`: this engine grants none to revoke or \
+                 keep, and `public` here is an ordinary database role"
             ),
         }),
 
@@ -3349,20 +3352,28 @@ mod tests {
     /// engine would apply cleanly and take away an access nothing in the
     /// project granted. The change is refused instead.
     #[test]
-    fn a_public_execute_revoke_is_refused_rather_than_rendered_against_the_public_role() {
-        let e = emit(
-            &Change::RevokePublicExecute {
-                routine: "dbo.charge(int)".parse().unwrap(),
-                origin: pbps_model::RoutineOrigin::Created,
-            },
-            Strategy::default(),
-        )
-        .unwrap_err();
-        let DialectError::Unsupported { feature, .. } = &e else {
-            panic!("not unsupported: {e:?}");
-        };
-        assert!(feature.contains("dbo.charge(int)"), "{feature}");
-        assert!(feature.contains("ordinary database role"), "{feature}");
+    fn a_public_execution_decision_is_refused_rather_than_rendered_against_the_public_role() {
+        // Both decisions, because a dialect that refused only the revoking
+        // one would accept a plan claiming this engine has a default to keep.
+        for access in [
+            pbps_model::PublicAccess::Revoked,
+            pbps_model::PublicAccess::Kept,
+        ] {
+            let e = emit(
+                &Change::PublicExecution {
+                    routine: "dbo.charge(int)".parse().unwrap(),
+                    access,
+                    origin: pbps_model::RoutineOrigin::Created,
+                },
+                Strategy::default(),
+            )
+            .unwrap_err();
+            let DialectError::Unsupported { feature, .. } = &e else {
+                panic!("not unsupported: {e:?}");
+            };
+            assert!(feature.contains("dbo.charge(int)"), "{feature}");
+            assert!(feature.contains("ordinary database role"), "{feature}");
+        }
     }
 
     /// A word the model holds for PostgreSQL (ADR-0010 §6) is never rendered

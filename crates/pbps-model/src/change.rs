@@ -523,8 +523,8 @@ pub enum Change {
         permissions: BTreeSet<Permission>,
     },
 
-    /// Take the engine's default `EXECUTE` to `PUBLIC` off a routine this plan
-    /// creates (ADR-0010 §5).
+    /// What this plan settles about the engine's default `EXECUTE` to
+    /// `PUBLIC` on a routine it brings into being (ADR-0010 §5).
     ///
     /// # Why this is its own variant and not a `Revoke` from a role called
     /// `PUBLIC`
@@ -534,17 +534,49 @@ pub enum Change {
     /// declaration may name a role `PUBLIC`, and the two would then be the
     /// same value meaning two different things. ADR-0010 §5 names the gap as
     /// "a grantee the model does not have", so this is that grantee — given
-    /// the narrowest shape that can express the act and nothing else. There is
-    /// no permission set (`EXECUTE` is the only default `PUBLIC` holds on a
-    /// routine) and no [`GrantTarget`] (a view or a trigger cannot be one),
-    /// so a plan cannot ask for a revoke that is not this one.
-    RevokePublicExecute {
+    /// the narrowest shape that can express the decision and nothing else.
+    /// There is no permission set (`EXECUTE` is the only default `PUBLIC`
+    /// holds on a routine) and no [`GrantTarget`] (a view or a trigger cannot
+    /// be one), so a plan cannot ask about a grantee or a permission that is
+    /// not this one.
+    ///
+    /// # Why the plan says so even when it does nothing
+    ///
+    /// [`PublicAccess::Kept`] writes no SQL: the `CREATE` restores the default
+    /// by itself. It is here because a plan that stayed silent could not be
+    /// told apart from one that had no opinion — and the connected rebuild
+    /// guard has to tell those apart. A routine somebody closed, whose
+    /// declaration now asks for the default back, is a *valid* rebuild, and
+    /// silence would have it refused with the missing default it was asked to
+    /// restore (ADR-0009 §3). Positive evidence, not an absence, is also what
+    /// a reviewer reads: "this routine stays executable by everyone" is a
+    /// line worth seeing.
+    PublicExecution {
         routine: RoutineId,
+        access: PublicAccess,
         origin: RoutineOrigin,
     },
 }
 
-/// Whether the routine a [`Change::RevokePublicExecute`] follows is new in
+/// What a [`Change::PublicExecution`] settles.
+///
+/// An enum rather than a bool for the reason [`RoutineOrigin`] is one: the two
+/// are different decisions about who may run the routine, not a flag, and a
+/// `true` in that position is a mistake that compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicAccess {
+    /// The engine's default goes away: the plan writes the `REVOKE`. The
+    /// answer when the declaration says nothing, because which routines are
+    /// `SECURITY DEFINER` is inside a body this tool never parses.
+    Revoked,
+    /// The default stands, because the declaration asked for it
+    /// (`public_execute: true`). No statement — the `CREATE` has already put
+    /// it there — but the decision is in the plan and under its checksum.
+    Kept,
+}
+
+/// Whether the routine a [`Change::PublicExecution`] speaks about is new in
 /// this plan, or one the plan rebuilds.
 ///
 /// It decides the risk class, and it is an enum rather than a bool beside the
@@ -853,7 +885,7 @@ impl Change {
             // once, so grouping by it would put every such revoke in the plan
             // under one heading; grouping by the routine puts each beside the
             // `CreateModule` that made it, which is the change it belongs to.
-            Change::RevokePublicExecute { routine, .. } => routine.to_string(),
+            Change::PublicExecution { routine, .. } => routine.to_string(),
             // A module says its whole identity: `app.f(integer,text)` and
             // `app.f(text)` are two objects, and a label that showed `app.f`
             // for both would group two changes as one.
@@ -906,7 +938,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => return None,
+            | Change::PublicExecution { .. } => return None,
         })
     }
 
@@ -969,7 +1001,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         };
         self.table().into_iter().chain(far_end)
     }
@@ -1073,7 +1105,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         }
     }
 
@@ -1134,7 +1166,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => Vec::new(),
+            | Change::PublicExecution { .. } => Vec::new(),
         }
     }
 
@@ -1223,7 +1255,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => Vec::new(),
+            | Change::PublicExecution { .. } => Vec::new(),
         }
     }
 
@@ -1275,7 +1307,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         }
     }
 
@@ -1315,7 +1347,7 @@ impl Change {
             // nothing on either side of this one — reporting it as a role's
             // revoke would put a grantee into that comparison that no pull
             // ever puts there, and the whole set would then read as drift.
-            Change::RevokePublicExecute { .. } => None,
+            Change::PublicExecution { .. } => None,
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -1363,7 +1395,7 @@ impl Change {
             Change::RenameRole { from, to, .. } => (Some(from.as_str()), Some(to.as_str())),
             // `PUBLIC` is not a role name; it is every principal at once, and
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
-            Change::RevokePublicExecute { .. } => (None, None),
+            Change::PublicExecution { .. } => (None, None),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -1439,7 +1471,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => Vec::new(),
+            | Change::PublicExecution { .. } => Vec::new(),
         }
     }
 
@@ -1509,7 +1541,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => Vec::new(),
+            | Change::PublicExecution { .. } => Vec::new(),
         }
     }
 
@@ -1564,7 +1596,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => Vec::new(),
+            | Change::PublicExecution { .. } => Vec::new(),
         }
     }
 
@@ -1657,7 +1689,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         }
     }
 
@@ -1700,7 +1732,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => Vec::new(),
+            | Change::PublicExecution { .. } => Vec::new(),
         }
     }
 
@@ -1750,7 +1782,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         }
     }
 
@@ -1788,7 +1820,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         }
     }
 
@@ -1879,13 +1911,23 @@ impl Change {
             // is whether anyone was using it (ADR-0010 §5).
             Change::DropRole { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute {
+            | Change::PublicExecution {
+                access: PublicAccess::Revoked,
                 origin: RoutineOrigin::Rebuilt,
                 ..
             } => {
                 r.insert(RiskClass::Revoke);
             }
-            Change::Grant { .. } => {
+            // Leaving the default standing means every principal in the
+            // cluster may run this routine once the plan commits. It writes
+            // no statement, and it is still the widest access this model can
+            // describe — labelled in every plan for the reason `GrantWiden`
+            // exists, and ungated for the same one.
+            Change::Grant { .. }
+            | Change::PublicExecution {
+                access: PublicAccess::Kept,
+                ..
+            } => {
                 r.insert(RiskClass::GrantWiden);
             }
             Change::CreateTable { .. }
@@ -1905,7 +1947,8 @@ impl Change {
             | Change::AddIndex { .. }
             // A revoke that follows a `CREATE` takes nothing from anybody:
             // the object it names did not exist a statement earlier.
-            | Change::RevokePublicExecute {
+            | Change::PublicExecution {
+                access: PublicAccess::Revoked,
                 origin: RoutineOrigin::Created,
                 ..
             }
@@ -2509,30 +2552,68 @@ mod tests {
     }
 
     /// The saved plan is the artifact a human approves and a checksum pins, so
-    /// the grantee this change names has to survive the file. `PUBLIC` is not
-    /// written down anywhere in it — it is the variant — and the routine is
-    /// one string with its signature, the same spelling a module key uses.
+    /// the decision this change carries has to survive the file. `PUBLIC` is
+    /// not written down anywhere in it — it is the variant — and the routine
+    /// is one string with its signature, the same spelling a module key uses.
     #[test]
-    fn a_public_execute_revoke_round_trips_and_names_the_routine_by_signature() {
-        let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::RevokePublicExecute {
-                routine: "app.f(integer,text)".parse().unwrap(),
-                origin: RoutineOrigin::Rebuilt,
-            })],
-        };
-        let json = serde_json::to_string(&cs).unwrap();
-        assert!(json.contains(r#""op":"revoke_public_execute""#), "{json}");
-        assert!(
-            json.contains(r#""routine":"app.f(integer,text)""#),
-            "{json}"
-        );
-        assert!(json.contains(r#""origin":"rebuilt""#), "{json}");
-        assert_eq!(serde_json::from_str::<ChangeSet>(&json).unwrap(), cs);
+    fn a_public_execution_decision_round_trips_and_names_the_routine_by_signature() {
+        for (access, spelled) in [
+            (PublicAccess::Revoked, "revoked"),
+            (PublicAccess::Kept, "kept"),
+        ] {
+            let cs = ChangeSet {
+                changes: vec![PlannedChange::new(Change::PublicExecution {
+                    routine: "app.f(integer,text)".parse().unwrap(),
+                    access,
+                    origin: RoutineOrigin::Rebuilt,
+                })],
+            };
+            let json = serde_json::to_string(&cs).unwrap();
+            assert!(json.contains(r#""op":"public_execution""#), "{json}");
+            assert!(
+                json.contains(r#""routine":"app.f(integer,text)""#),
+                "{json}"
+            );
+            assert!(json.contains(&format!(r#""access":"{spelled}""#)), "{json}");
+            assert!(json.contains(r#""origin":"rebuilt""#), "{json}");
+            assert_eq!(serde_json::from_str::<ChangeSet>(&json).unwrap(), cs);
 
-        // A name without a signature is a view's, not a routine's, and is
-        // refused rather than read as a routine that takes no arguments.
-        let bare = json.replace("app.f(integer,text)", "app.v");
-        assert!(serde_json::from_str::<ChangeSet>(&bare).is_err(), "{bare}");
+            // A name without a signature is a view's, not a routine's, and is
+            // refused rather than read as a routine that takes no arguments.
+            let bare = json.replace("app.f(integer,text)", "app.v");
+            assert!(serde_json::from_str::<ChangeSet>(&bare).is_err(), "{bare}");
+        }
+    }
+
+    /// The two decisions are two risk classes, and neither is the other's.
+    /// Taking the default away from a routine that did not exist a statement
+    /// earlier costs nobody anything; leaving it standing is the widest access
+    /// this model can describe, and is labelled rather than gated.
+    #[test]
+    fn keeping_public_execution_widens_and_closing_a_fresh_routine_risks_nothing() {
+        let risks = |access, origin| {
+            Change::PublicExecution {
+                routine: "app.f()".parse().unwrap(),
+                access,
+                origin,
+            }
+            .intrinsic_risks()
+        };
+        assert!(
+            risks(PublicAccess::Revoked, RoutineOrigin::Created).is_empty(),
+            "{:?}",
+            risks(PublicAccess::Revoked, RoutineOrigin::Created)
+        );
+        assert_eq!(
+            risks(PublicAccess::Revoked, RoutineOrigin::Rebuilt),
+            [RiskClass::Revoke].into_iter().collect()
+        );
+        for origin in [RoutineOrigin::Created, RoutineOrigin::Rebuilt] {
+            assert_eq!(
+                risks(PublicAccess::Kept, origin),
+                [RiskClass::GrantWiden].into_iter().collect()
+            );
+        }
     }
 
     #[test]

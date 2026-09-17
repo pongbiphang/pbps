@@ -1390,11 +1390,13 @@ grant".
   this target has nothing to restate it from. `PUBLIC` stayed off the
   restorable path while nothing could name it; issue #318 gave it one thing
   that can — a routine's missing default `EXECUTE`, accepted where the plan
-  carries the `RevokePublicExecute` that re-issues it after the `CREATE`
-  (ADR-0010 §5 amendment, DECISIONS 517). No `Grant` restates on `PUBLIC`'s
-  behalf even so: the state is the *absence* of the default, so what the plan
-  carries is the revoke, and any other permission or a missing default no such
-  revoke names still refuses. And unchanged from before #248, because none of
+  carries a `PublicExecution` naming that routine, which settles what the
+  `CREATE` will leave behind either by re-issuing the revoke after it or by
+  deliberately keeping the restored default (ADR-0010 §5 amendment,
+  DECISIONS 517). No `Grant` restates on `PUBLIC`'s behalf even so: the state
+  is the *absence* of the default, so what the plan carries is the decision,
+  and any other permission or a missing default no such decision names still
+  refuses. And unchanged from before #248, because none of
   them is
   expressible at all: a column-level grant (`pg_attribute.attacl`), `WITH
   GRANT OPTION`, an owner a rebuild would transfer, `reloptions`, a view

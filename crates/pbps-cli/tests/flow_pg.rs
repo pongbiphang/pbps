@@ -898,7 +898,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::RenameRole { .. }
             | change @ pbps_model::Change::Grant { .. }
             | change @ pbps_model::Change::Revoke { .. }
-            | change @ pbps_model::Change::RevokePublicExecute { .. } => {
+            | change @ pbps_model::Change::PublicExecution { .. } => {
                 panic!("unexpected change {change:?}")
             }
         }
@@ -1569,6 +1569,70 @@ fn routine_rebuilds_do_not_restore_revoked_public_execute() {
     // The edit landed, and the routine is still closed to PUBLIC.
     assert_eq!(scalar(connection, "SELECT app.secret()::bigint"), 2);
     assert!(!public_executes(connection, "app.secret()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// The other direction of the same deadlock. A routine this tool closed on
+/// creation, whose declaration later adds `public_execute: true` *and* edits
+/// the definition, asks for a rebuild whose whole effect is the `CREATE`
+/// giving the default back.
+///
+/// The plan writes no statement for that decision — the `CREATE` has already
+/// done it — so the plan records the decision itself, and the rebuild guard
+/// reads it as the recorded intent it is. A plan that instead stayed silent
+/// about the routine looked to that guard exactly like a plan with no opinion,
+/// and the missing default refused the rebuild: a valid plan refused for
+/// asking for the state it was asked to reach.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-reopen");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-reopen");
+    let file = d.dir.join("schema/reopen.yml");
+    let declaration = |value: u8, open: bool| {
+        format!(
+            "function: app.reopen()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT {value} $$\n{}",
+            if open { "public_execute: true\n" } else { "" }
+        )
+    };
+    std::fs::write(&file, declaration(1, false)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    assert!(!public_executes(connection, "app.reopen()"));
+
+    // Both edits at once, which is the only way the key can take effect: the
+    // annotation is never compared, so it is the rebuild the definition edit
+    // forces that acts on it.
+    std::fs::write(&file, declaration(2, true)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+
+    // Not gated: keeping the engine's default is a widening, and a widening
+    // is labelled rather than gated.
+    succeeds(apply_plan(&d, connection, &plan, false));
+    assert_eq!(scalar(connection, "SELECT app.reopen()::bigint"), 2);
+    assert!(public_executes(connection, "app.reopen()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // And the door closes again the same way it opened, on the next rebuild
+    // that carries the other decision.
+    std::fs::write(&file, declaration(3, false)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "revoke"],
+    ));
+    assert!(!public_executes(connection, "app.reopen()"));
     succeeds(d.run(&["verify", "--db", connection]));
 }
 

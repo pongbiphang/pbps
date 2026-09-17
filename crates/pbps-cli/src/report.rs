@@ -340,7 +340,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::DropModule { .. }
         // `PUBLIC` is not a role the summary can count: no declaration, ids
         // file or pull ever names it (ADR-0010 §5).
-        | Change::RevokePublicExecute { .. } => None,
+        | Change::PublicExecution { .. } => None,
     }
 }
 
@@ -387,7 +387,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::DropRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => {}
+            | Change::PublicExecution { .. } => {}
         }
     }
     Renames { tables, roles }
@@ -730,9 +730,18 @@ pub fn describe(c: &Change) -> String {
             permissions,
             ..
         } => format!("- revoke {} on {target}", permissions_list(permissions)),
-        Change::RevokePublicExecute { routine, .. } => {
-            format!("- revoke execute on {routine} from PUBLIC")
-        }
+        Change::PublicExecution {
+            routine,
+            access: pbps_model::PublicAccess::Revoked,
+            ..
+        } => format!("- revoke execute on {routine} from PUBLIC"),
+        // No statement to describe, and the line is still worth a reader's
+        // eye: it says this routine stays runnable by every principal.
+        Change::PublicExecution {
+            routine,
+            access: pbps_model::PublicAccess::Kept,
+            ..
+        } => format!("= {routine} stays executable by PUBLIC (declared)"),
     }
 }
 

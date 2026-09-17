@@ -9835,7 +9835,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::RevokePublicExecute { routine, .. } = &p.change {
+            if let pbps_model::Change::PublicExecution { routine, .. } = &p.change {
                 Some(routine.to_string())
             } else {
                 None

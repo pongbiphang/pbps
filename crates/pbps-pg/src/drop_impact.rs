@@ -211,7 +211,7 @@ pub async fn drop_blockers(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         })
         .collect();
     let Some(&(last, _)) = targets.last() else {
@@ -332,7 +332,7 @@ fn stored(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => {}
+            | Change::PublicExecution { .. } => {}
         }
     }
     Some((table, column))
@@ -470,7 +470,7 @@ async fn removal(
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
-        | Change::RevokePublicExecute { .. } => Ok(None),
+        | Change::PublicExecution { .. } => Ok(None),
     }
 }
 

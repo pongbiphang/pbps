@@ -28,8 +28,8 @@ use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
-    ModuleId, Permission, PlannedChange, Renames, RoutineOrigin, Schema, Table, TableName, Uid,
-    Value,
+    ModuleId, Permission, PlannedChange, PublicAccess, Renames, RoutineOrigin, Schema, Table,
+    TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -314,7 +314,7 @@ pub fn diff_partial(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         })
         .collect();
     let changed: BTreeSet<ModuleId> = changes
@@ -351,7 +351,7 @@ pub fn diff_partial(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         })
         .collect();
     for id in dialect.rebound_modules(declared.schema, &arriving, &changed) {
@@ -487,7 +487,7 @@ pub fn diff_partial(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         })
         .collect();
     // Whether this drop can be what frees a name a `RenameColumn` above is
@@ -528,7 +528,7 @@ pub fn diff_partial(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => false,
+            | Change::PublicExecution { .. } => false,
         }
     };
     // The class, and a rank inside it, so a change can sit between two
@@ -847,7 +847,7 @@ fn recreate_referenced_foreign_keys(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => continue,
+            | Change::PublicExecution { .. } => continue,
         };
         // PostgreSQL can bind a permutation of a composite candidate key.
         // SQL Server requires its order; a set conservatively covers both.
@@ -925,7 +925,7 @@ fn recreate_retyped_dependents(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         })
         .collect();
     if retyped.is_empty() {
@@ -1661,7 +1661,7 @@ fn dependency_rank(
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
-        | Change::RevokePublicExecute { .. } => 0,
+        | Change::PublicExecution { .. } => 0,
     }
 }
 
@@ -1872,8 +1872,8 @@ fn diff_roles(
     }
 }
 
-/// Takes the engine's default `EXECUTE` to `PUBLIC` off every routine this
-/// plan brings into being (ADR-0010 §5, DECISIONS 371).
+/// Settles what happens to the engine's default `EXECUTE` to `PUBLIC` on
+/// every routine this plan brings into being (ADR-0010 §5, DECISIONS 371).
 ///
 /// # Why this is a separate pass and not part of `diff_modules`
 ///
@@ -1911,7 +1911,7 @@ fn revoke_public_execution(
     // edit is a `CREATE OR ALTER`, the object keeps the ACL it had and a
     // revoke here would take away a state this plan was not asked to change.
     let rebuilds = dialect.rebuilds_modules();
-    let mut revokes = Vec::new();
+    let mut decided = Vec::new();
     for change in changes.iter() {
         // Written as `if let` rather than a match with a wildcard: every
         // other kind of change ends with no `CREATE`, so there is nothing to
@@ -1928,9 +1928,16 @@ fn revoke_public_execution(
         let ModuleId::Routine(routine) = id else {
             continue;
         };
-        if hints.public_execute.contains(id) {
-            continue;
-        }
+        // The declaration's answer, written into the plan either way. Saying
+        // nothing where it asks for the default back would leave the
+        // connected rebuild guard unable to tell that plan from one with no
+        // opinion, and it refuses the missing default it was asked to restore
+        // (ADR-0009 §3).
+        let access = if hints.public_execute.contains(id) {
+            PublicAccess::Kept
+        } else {
+            PublicAccess::Revoked
+        };
         // Whether the object was there before, not which variant said so: a
         // kind change arrives here as a `CreateModule` and is still a routine
         // somebody may have been executing a moment ago.
@@ -1939,12 +1946,13 @@ fn revoke_public_execution(
         } else {
             RoutineOrigin::Created
         };
-        revokes.push(Change::RevokePublicExecute {
+        decided.push(Change::PublicExecution {
             routine: routine.clone(),
+            access,
             origin,
         });
     }
-    changes.extend(revokes);
+    changes.extend(decided);
 }
 
 /// Modules are matched by **name**, never by uid: they carry no data, so they
@@ -2128,7 +2136,7 @@ fn order_key(c: &Change) -> u8 {
         // the two never touch the same grantee — `PUBLIC` is not a role a
         // declaration can name (ADR-0010 §5), so no order between them
         // decides anything.
-        Change::Grant { .. } | Change::RevokePublicExecute { .. } => 16,
+        Change::Grant { .. } | Change::PublicExecution { .. } => 16,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
         Change::SetDataMode { .. } => 17,
@@ -7249,15 +7257,29 @@ mod tests {
             .unwrap()
         }
 
-        fn revoked(cs: &ChangeSet) -> Vec<(String, RoutineOrigin)> {
+        fn decided(cs: &ChangeSet) -> Vec<(String, PublicAccess, RoutineOrigin)> {
             cs.changes
                 .iter()
-                .filter_map(|p| match &p.change {
-                    Change::RevokePublicExecute { routine, origin } => {
-                        Some((routine.to_string(), *origin))
+                .filter_map(|p| {
+                    if let Change::PublicExecution {
+                        routine,
+                        access,
+                        origin,
+                    } = &p.change
+                    {
+                        Some((routine.to_string(), *access, *origin))
+                    } else {
+                        None
                     }
-                    _ => None,
                 })
+                .collect()
+        }
+
+        fn closed(cs: &ChangeSet) -> Vec<(String, RoutineOrigin)> {
+            decided(cs)
+                .into_iter()
+                .filter(|(_, access, _)| *access == PublicAccess::Revoked)
+                .map(|(routine, _, origin)| (routine, origin))
                 .collect()
         }
 
@@ -7279,7 +7301,7 @@ mod tests {
                 &Hints::default(),
             );
             assert_eq!(
-                revoked(&cs),
+                closed(&cs),
                 [("app.f(integer)".to_owned(), RoutineOrigin::Created)],
                 "{:?}",
                 kinds(&cs)
@@ -7287,7 +7309,7 @@ mod tests {
             // And after the create, or it names an object that is not there.
             let k = kinds(&cs);
             let at = |name: &str| k.iter().position(|c| c == name).unwrap();
-            assert!(at("CreateModule") < at("RevokePublicExecute"), "{k:?}");
+            assert!(at("CreateModule") < at("PublicExecution"), "{k:?}");
             // A routine nobody could execute a statement earlier loses
             // nothing, so the gate is not asked: `--allow revoke` in front of
             // every plan that declares a function is friction without safety.
@@ -7308,7 +7330,26 @@ mod tests {
                 .public_execute
                 .insert("app.f(integer)".parse().unwrap());
             let cs = run(&PublicExecutes, &Schema::default(), &declared, &hints);
-            assert!(revoked(&cs).is_empty(), "{:?}", kinds(&cs));
+            assert!(closed(&cs).is_empty(), "{:?}", kinds(&cs));
+            // Said out loud, not by silence. A plan that carried nothing here
+            // could not be told from one with no opinion, and the connected
+            // rebuild guard has to tell those apart — see the rebuild case
+            // below. It widens, and says so.
+            assert_eq!(
+                decided(&cs),
+                [(
+                    "app.f(integer)".to_owned(),
+                    PublicAccess::Kept,
+                    RoutineOrigin::Created
+                )],
+                "{:?}",
+                kinds(&cs)
+            );
+            assert!(
+                cs.risks().contains(&RiskClass::GrantWiden),
+                "{:?}",
+                cs.risks()
+            );
             // And it is the *signature* that opts in, not the name: the other
             // overload is still closed.
             let both = schema_with(&[
@@ -7325,7 +7366,7 @@ mod tests {
             ]);
             let cs = run(&PublicExecutes, &Schema::default(), &both, &hints);
             assert_eq!(
-                revoked(&cs),
+                closed(&cs),
                 [("app.f(text)".to_owned(), RoutineOrigin::Created)],
                 "{:?}",
                 kinds(&cs)
@@ -7350,12 +7391,60 @@ mod tests {
             )]);
             let cs = run(&PublicExecutes, &base, &declared, &Hints::default());
             assert_eq!(
-                revoked(&cs),
+                closed(&cs),
                 [("app.f(integer)".to_owned(), RoutineOrigin::Rebuilt)],
                 "{:?}",
                 kinds(&cs)
             );
             assert!(cs.risks().contains(&RiskClass::Revoke), "{:?}", cs.risks());
+        }
+
+        /// The case a plan that only ever *revoked* got wrong: a routine
+        /// somebody closed, whose declaration now asks for the default back,
+        /// and whose definition changed in the same revision.
+        ///
+        /// On this engine the rebuild's `CREATE` restores the default by
+        /// itself, so there is no statement to write — and a plan that
+        /// therefore said nothing could not be told from one with no opinion.
+        /// `crate::pbps_pg::modules::before_a_rebuild` refuses a missing
+        /// default it finds no recorded intent for, so silence here refused a
+        /// valid rebuild for the very state it had been asked to reach.
+        #[test]
+        fn an_opted_in_rebuild_records_the_decision_rather_than_staying_silent() {
+            let base = schema_with(&[(
+                "app.f(integer)",
+                pbps_model::ModuleKind::Function,
+                "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+            )]);
+            let declared = schema_with(&[(
+                "app.f(integer)",
+                pbps_model::ModuleKind::Function,
+                "RETURNS integer AS $$ SELECT 2 $$ LANGUAGE sql",
+            )]);
+            let mut hints = Hints::default();
+            hints
+                .public_execute
+                .insert("app.f(integer)".parse().unwrap());
+            let cs = run(&PublicExecutes, &base, &declared, &hints);
+            assert_eq!(
+                decided(&cs),
+                [(
+                    "app.f(integer)".to_owned(),
+                    PublicAccess::Kept,
+                    RoutineOrigin::Rebuilt
+                )],
+                "{:?}",
+                kinds(&cs)
+            );
+            // Nothing is taken away, so the revoke gate is not asked — but
+            // the routine stays open to every principal, and that is
+            // labelled.
+            assert!(!cs.risks().contains(&RiskClass::Revoke), "{:?}", cs.risks());
+            assert!(
+                cs.risks().contains(&RiskClass::GrantWiden),
+                "{:?}",
+                cs.risks()
+            );
         }
 
         /// A view has no `EXECUTE` and a trigger is invoked by nobody, so
@@ -7376,7 +7465,7 @@ mod tests {
                 &declared,
                 &Hints::default(),
             );
-            assert!(revoked(&cs).is_empty(), "{:?}", kinds(&cs));
+            assert!(decided(&cs).is_empty(), "{:?}", kinds(&cs));
         }
 
         /// An engine whose `CREATE` grants nobody `EXECUTE` gets none of
@@ -7395,7 +7484,7 @@ mod tests {
                 &declared,
                 &Hints::default(),
             );
-            assert!(revoked(&cs).is_empty(), "{:?}", kinds(&cs));
+            assert!(decided(&cs).is_empty(), "{:?}", kinds(&cs));
         }
     }
 

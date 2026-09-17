@@ -160,7 +160,7 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => None,
+            | Change::PublicExecution { .. } => None,
         })
         .collect()
 }

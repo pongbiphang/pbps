@@ -330,12 +330,17 @@ what stopped the regression while the gap stood.
 **Amendment (issue #318): the gap is closed, and the grantee exists.**
 Expressing "revoked from `PUBLIC`" needed a grantee the model did not have, and
 until it had one, hardening a managed function and managing it were mutually
-exclusive. `Change::RevokePublicExecute` is that grantee, in the narrowest
-shape that expresses the act and nothing else: a `RoutineId`, no permission set
-and no `GrantTarget`, because `EXECUTE` is the only default `PUBLIC` holds on a
-routine and a view or a trigger cannot be one. Deliberately **not** a `Revoke`
-from a role spelled `PUBLIC` — a project may declare a role of that name, and a
-string holding the word would be a sentinel every reader had to know about.
+exclusive. `Change::PublicExecution` is that grantee, in the narrowest
+shape that expresses the act and nothing else: a `RoutineId`, which of the two
+decisions the plan reached, and which act brought the routine into being — no
+permission set and no `GrantTarget`, because `EXECUTE` is the only default
+`PUBLIC` holds on a routine and a view or a trigger cannot be one. Deliberately
+**not** a `Revoke` from a role spelled `PUBLIC` — a project may declare a role
+of that name, and a string holding the word would be a sentinel every reader
+had to know about. The opt-in decision writes no statement — the `CREATE`
+already left the default standing — and is recorded anyway, so that a plan with
+no opinion about a routine reads differently from one that deliberately left it
+open (DECISIONS 517).
 
 Three consequences follow, and the third is the one that reverses a paragraph
 above.

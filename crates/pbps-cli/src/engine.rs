@@ -1059,7 +1059,15 @@ pub fn require_transactional_rebuilds(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::RevokePublicExecute { routine, .. } = &p.change {
+            // Only the deciding half that writes SQL. `Kept` writes
+            // nothing, so there is no window between two commits for it to
+            // leave open.
+            if let pbps_model::Change::PublicExecution {
+                routine,
+                access: pbps_model::PublicAccess::Revoked,
+                ..
+            } = &p.change
+            {
                 Some(routine.to_string())
             } else {
                 None
@@ -1600,11 +1608,11 @@ mod tests {
     fn a_staged_plan_that_closes_a_routine_to_public_is_refused_on_either_driver() {
         use pbps_model::{Change, PlannedChange};
         let mut cs = ChangeSet::default();
-        cs.changes
-            .push(PlannedChange::new(Change::RevokePublicExecute {
-                routine: "app.f(integer)".parse().unwrap(),
-                origin: pbps_model::RoutineOrigin::Created,
-            }));
+        cs.changes.push(PlannedChange::new(Change::PublicExecution {
+            routine: "app.f(integer)".parse().unwrap(),
+            access: pbps_model::PublicAccess::Revoked,
+            origin: pbps_model::RoutineOrigin::Created,
+        }));
         for driver in [Driver::Postgres, Driver::Mssql] {
             let e = require_transactional_rebuilds(driver, &cs, true)
                 .expect_err("a staged run leaves the routine open")
@@ -1613,6 +1621,17 @@ mod tests {
             assert!(e.contains("public_execute: true"), "{e}");
             assert!(require_transactional_rebuilds(driver, &cs, false).is_ok());
         }
+
+        // The other decision writes no statement, so there is no window
+        // between two commits and nothing to refuse.
+        let mut kept = ChangeSet::default();
+        kept.changes
+            .push(PlannedChange::new(Change::PublicExecution {
+                routine: "app.f(integer)".parse().unwrap(),
+                access: pbps_model::PublicAccess::Kept,
+                origin: pbps_model::RoutineOrigin::Created,
+            }));
+        assert!(require_transactional_rebuilds(Driver::Postgres, &kept, true).is_ok());
     }
 
     /// A runtime for the live tests below, built by hand because the

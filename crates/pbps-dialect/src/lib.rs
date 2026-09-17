@@ -373,7 +373,7 @@ impl Unchecked {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::RevokePublicExecute { .. } => change.subject(),
+            | Change::PublicExecution { .. } => change.subject(),
         };
         Self::new(description, reason)
     }
@@ -2007,7 +2007,7 @@ pub trait Dialect {
     /// `CREATE` commits. SQL Server grants no principal `EXECUTE` on a
     /// procedure it creates, and its `public` is an ordinary database role
     /// rather than the engine's default, so it answers `false` and
-    /// [`Change::RevokePublicExecute`] is never built for it.
+    /// [`Change::PublicExecution`] is never built for it.
     ///
     /// What the differ does with a `true` is take the default away as part of
     /// creating the routine, unless the declaration opts back in
