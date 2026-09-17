@@ -578,11 +578,16 @@ async fn a_session_present_at_admission_is_refused_rather_than_counted() {
     let configured = endpoint("PBPS_SERVER_ENDPOINT");
     let mut target = native_target().await;
     let held = session(&configured, maintenance()).await;
-    // The engine's own list is read before the first kernel census, so it
-    // is the signal that names this refusal; the census would have refused
-    // the same session one step later.
+    // The engine listens only on its own loopback, so an intruder present at
+    // admission reaches it through a forwarder in the engine's network
+    // namespace — exactly what the kernel census accounts for, and it runs
+    // before the first session list read. So the census names this refusal;
+    // the engine's session list is the same conclusion by a second route. A
+    // present intruder is refused either way, which is what this test is for:
+    // it is refused, not absorbed into the baseline count.
     match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), &mut target).await {
-        Err(Error::Exclusivity(super::Signal::SessionList)) => (),
+        Err(Error::Containment(super::Premise::Accounting))
+        | Err(Error::Exclusivity(super::Signal::SessionList)) => (),
         Err(other) => panic!("refused, but not for the session the intruder opened: {other}"),
         Ok(_) => panic!("another client was connected while the baseline was read"),
     }

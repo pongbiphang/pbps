@@ -107,7 +107,10 @@ moved it:
   session that has already disconnected is still counted — with one exception
   measured on the same engine: a `walsender` moves it by nothing at all, so a
   replication connection is caught by the session list and the kernel census
-  while it is open and by neither once it has closed (#651). A sum has a way
+  while it is open and by neither once it has closed (#651). A database
+  created, used and dropped entirely between two checks is invisible the same
+  way — its row and its share of the sum are gone before either is sampled
+  (#682). A sum has a way
   back down that a single counter does not: the row is per database, and
   dropping one takes its share away. The rows the total was summed over
   therefore come back with it, and the set may only grow.

@@ -449,7 +449,7 @@ impl Session {
         login: StreamLogin,
         known: &[&TcpPair],
     ) -> Result<Self, Error> {
-        let (forwarder, connection) = Forwarder::open(
+        let (forwarder, mut connection) = Forwarder::open(
             channel.api,
             channel.image,
             channel.driver,
@@ -469,59 +469,59 @@ impl Session {
                 )
             })
         })?;
-        let guard = forwarder
-            .pid()
-            .map_err(|error| Error::Channel(error.to_string()))
-            .and_then(|pid| {
-                ProcessLease::capture(pid).map_err(|_| {
-                    Error::Channel("the forwarder's init process is unreadable".into())
-                })
-            })?;
-        let (pair, backend) =
-            exclusivity::bind(runtime.init(), &guard, channel.profile.port, known)
-                .map_err(|reason| Error::Channel(reason.to_owned()))?;
-        let session = Self {
-            connection,
-            forwarder,
-            guard,
-            pair,
-            backend,
-            session_key: String::new(),
-        };
-        session.check_kernel(runtime.init())?;
-        let mut session = session;
-        let own = engine::own_session(&mut session.connection)
-            .await
-            .map_err(|error| Error::Identity(error.to_string()))?;
-        // PostgreSQL's backend reports its own pid; the process holding the
-        // server end of our session must be that backend. SQL Server has no
-        // such mapping and its engine process is the holder.
-        correlate(
-            &own.process,
-            session.backend.namespace_pid(),
-            runtime.engine(),
-        )?;
-        session.session_key = own.key;
-        Ok(session)
+        // The forwarder is a run-owned container from here on. Every step
+        // below can fail, and dropping the forwarder would only request its
+        // removal, not confirm it, leaving a container neither cleanup nor a
+        // recovery name can identify (finding on #640). So it stays a local
+        // through the fallible steps and is closed on failure; only complete
+        // success moves it into the returned session. The residual — naming
+        // a forwarder whose close *also* fails through the admission error —
+        // is #683.
+        let prepared = async {
+            let guard = forwarder
+                .pid()
+                .map_err(|error| Error::Channel(error.to_string()))
+                .and_then(|pid| {
+                    ProcessLease::capture(pid).map_err(|_| {
+                        Error::Channel("the forwarder's init process is unreadable".into())
+                    })
+                })?;
+            let (pair, backend) =
+                exclusivity::bind(runtime.init(), &guard, channel.profile.port, known)
+                    .map_err(|reason| Error::Channel(reason.to_owned()))?;
+            check_kernel_parts(runtime.init(), &guard, &pair, &backend)?;
+            let own = engine::own_session(&mut connection)
+                .await
+                .map_err(|error| Error::Identity(error.to_string()))?;
+            // PostgreSQL's backend reports its own pid; the process holding the
+            // server end of our session must be that backend. SQL Server has
+            // no such mapping and its engine process is the holder.
+            correlate(&own.process, backend.namespace_pid(), runtime.engine())?;
+            Ok::<_, Error>((guard, pair, backend, own.key))
+        }
+        .await;
+        match prepared {
+            Ok((guard, pair, backend, session_key)) => Ok(Self {
+                connection,
+                forwarder,
+                guard,
+                pair,
+                backend,
+                session_key,
+            }),
+            Err(error) => {
+                drop(connection);
+                let _ = forwarder.close().await;
+                Err(error)
+            }
+        }
     }
 
     /// The forwarder is still the fixed program at its fixed privileges, and
     /// the session's two ends are still where they were, held by whom they
     /// were held by.
     fn check_kernel(&self, init: &ProcessLease) -> Result<(), Error> {
-        let channel = |reason: &str| Error::Channel(reason.to_owned());
-        guard(&self.guard).map_err(|_| channel("the forwarder's init is not the fixed guard"))?;
-        for (pid, directory) in process_scope(&self.guard)
-            .map_err(|_| channel("the forwarder's processes are unreadable"))?
-        {
-            if pid == self.guard.pid() {
-                continue;
-            }
-            observe_incidental(pid, &directory, |process| security(&process, 65534, 0))
-                .map_err(|_| channel("a forwarder process is not at the fixed privileges"))?;
-        }
-        exclusivity::still_bound(init, &self.pair, &self.backend)
-            .map_err(|_| channel("the session's kernel endpoints changed"))
+        check_kernel_parts(init, &self.guard, &self.pair, &self.backend)
     }
 
     async fn check(&self, init: &ProcessLease) -> Result<(), Error> {
@@ -532,6 +532,29 @@ impl Session {
             .map_err(|error| Error::Channel(error.to_string()))?;
         self.check_kernel(init)
     }
+}
+
+/// The kernel half of a session check, on the parts rather than a built
+/// `Session`, so `Session::open` can run it before it owns one.
+fn check_kernel_parts(
+    init: &ProcessLease,
+    forwarder_guard: &ProcessLease,
+    pair: &TcpPair,
+    backend: &ProcessLease,
+) -> Result<(), Error> {
+    let channel = |reason: &str| Error::Channel(reason.to_owned());
+    guard(forwarder_guard).map_err(|_| channel("the forwarder's init is not the fixed guard"))?;
+    for (pid, directory) in process_scope(forwarder_guard)
+        .map_err(|_| channel("the forwarder's processes are unreadable"))?
+    {
+        if pid == forwarder_guard.pid() {
+            continue;
+        }
+        observe_incidental(pid, &directory, |process| security(&process, 65534, 0))
+            .map_err(|_| channel("a forwarder process is not at the fixed privileges"))?;
+    }
+    exclusivity::still_bound(init, pair, backend)
+        .map_err(|_| channel("the session's kernel endpoints changed"))
 }
 
 impl Analysis {
@@ -621,6 +644,15 @@ impl Analysis {
         }
         // Superset: this run's own scratch database adds a row, and nothing
         // may take one away — that is how a total is made to come back down.
+        //
+        // This catches a row *present at admission* being dropped to pay for
+        // an intruding session. It does not catch add-use-remove: a database
+        // created, used and dropped entirely between two of this run's checks
+        // was never in the baseline set, so its increment and its removal both
+        // fall outside every snapshot — a limitation of PostgreSQL's
+        // per-database counter, of the same family as the walsender case
+        // (#651), recorded as #682. SQL Server's single server-level counter
+        // has no row to drop and catches it.
         if !self
             .continuity
             .iter()
@@ -1038,6 +1070,11 @@ async fn close_control(control: &mut Control) -> Vec<String> {
             unconfirmed.push(name);
         }
     }
+    // Write the still-unconfirmed names back into run-owned state before
+    // returning them: a caller that retries `close` or `discard` must see
+    // them again rather than a drained, apparently-clean run (finding on
+    // #640). A forwarder whose container is gone leaves nothing here.
+    control.unconfirmed = unconfirmed.clone();
     unconfirmed
 }
 
