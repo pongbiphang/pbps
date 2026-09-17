@@ -1499,7 +1499,22 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
         };
         // ValueKind::Text also holds UUIDs, dates and numeric renderings. Only
         // unbounded text conversions preserve the key itself (DECISIONS 469).
-        if ty.base == "text" || (ty.base == "character varying" && ty.args.is_empty()) {
+        //
+        // The exemption is about the *conversion*, and there is one key this
+        // engine cannot hold at all, whatever the conversion would do with it.
+        // Measured on 18.6, U+0000 is refused three separate ways —
+        // `chr(0)` is `54000: null character not permitted`, `E'a\000b'` is
+        // `22021: invalid byte sequence for encoding "UTF8": 0x00`, and
+        // `U&'a\0000b'` will not even parse — so a declaration carrying one
+        // is refused at the first insert, and a `validate` that said nothing
+        // about it reported clean on a question it never asked (DECISIONS 508).
+        //
+        // A YAML `"bad\0key"` really is U+0000 by the time it gets here: the
+        // loader reads that escape and `"bad\u0000key"` as the same mapping
+        // key, which is the check a test of this has to make before it means
+        // anything.
+        let identity = ty.base == "text" || (ty.base == "character varying" && ty.args.is_empty());
+        if identity && !data.rows.keys().any(|k| k.as_str().contains('\0')) {
             continue;
         }
         out.push(format!(
@@ -2195,7 +2210,15 @@ mod tests {
         assert!(notes[0].contains("app.status"), "{}", notes[0]);
         assert!(notes[0].contains("collation"), "{}", notes[0]);
         assert!(notes[0].contains("plan --db"), "{}", notes[0]);
-        assert!(notes[1].contains("spelling"), "{}", notes[1]);
+        // This engine really does require the read-back to equal what was
+        // declared, for a key as well as a cell (`catalog::misspelt`), so its
+        // note keeps the stronger sentence SQL Server's had to give up
+        // (issue #528).
+        assert!(
+            notes[1].contains("reads back with the same spelling"),
+            "{}",
+            notes[1]
+        );
         schema
             .tables
             .get_mut(&name())
@@ -2209,6 +2232,76 @@ mod tests {
             vec![notes[0].clone()],
             "identity text still needs the unchanged collision note for multiple keys"
         );
+    }
+
+    /// The identity exemption is about the conversion, and one key defeats it
+    /// whatever the conversion would do: PostgreSQL text cannot hold U+0000 at
+    /// all (508, issue #526). Measured on 18.6, `chr(0)` is `54000: null
+    /// character not permitted` and `E'bad\000key'` is `22021: invalid byte
+    /// sequence for encoding "UTF8": 0x00`, so such a declaration is refused at
+    /// the first insert — and `validate` used to report clean on it.
+    ///
+    /// The premise is asserted first, because a test of an escaped NUL that
+    /// quietly carried a backslash and a zero instead would pass for the wrong
+    /// reason: the loader reads YAML `"bad\0key"` and `"bad\u0000key"` as the
+    /// *same* mapping key, which is only true if both are U+0000.
+    #[test]
+    fn an_unbounded_text_key_this_engine_cannot_hold_still_earns_the_conversion_note() {
+        const NUL_KEY: &str = "bad\u{0}key";
+        assert!(NUL_KEY.contains('\0'), "the premise: this key holds U+0000");
+
+        for ty in ["text", "varchar", "character varying"] {
+            let mut schema = pbps_model::Schema::default();
+            let mut t = table(Some(vec!["code"]), &[("code", ty, None)]);
+            with_rows(&mut t, &[(NUL_KEY, &[])]);
+            schema.tables.insert(name(), t);
+            let notes = not_checked_offline(&schema);
+            assert_eq!(notes.len(), 1, "{ty}: {notes:?}");
+            assert!(notes[0].contains("converts to"), "{ty}: {notes:?}");
+            assert!(
+                notes[0].contains("reads back with the same spelling"),
+                "{ty}: {notes:?}"
+            );
+            assert!(!notes[0].contains("collation"), "{ty}: {notes:?}");
+
+            // The negative case beside it, on the same type: an ordinary key
+            // keeps the exemption, or this would be a blanket refusal of
+            // unbounded text rather than a rule about one character.
+            let mut ordinary = pbps_model::Schema::default();
+            let mut o = table(Some(vec!["code"]), &[("code", ty, None)]);
+            with_rows(&mut o, &[("ordinary", &[])]);
+            ordinary.tables.insert(name(), o);
+            assert!(
+                not_checked_offline(&ordinary).is_empty(),
+                "{ty}: {:?}",
+                not_checked_offline(&ordinary)
+            );
+
+            // And a NUL anywhere in the block is enough: the note is about the
+            // table's keys, not about whichever one sorts first.
+            let mut mixed = pbps_model::Schema::default();
+            let mut m = table(Some(vec!["code"]), &[("code", ty, None)]);
+            with_rows(&mut m, &[("ordinary", &[]), (NUL_KEY, &[])]);
+            mixed.tables.insert(name(), m);
+            let notes = not_checked_offline(&mixed);
+            assert_eq!(notes.len(), 2, "{ty}: {notes:?}");
+            assert!(notes[0].contains("collation"), "{ty}: {notes:?}");
+            assert!(
+                notes[1].contains("reads back with the same spelling"),
+                "{ty}: {notes:?}"
+            );
+        }
+
+        // A bounded type was never exempt, so nothing about it changes; and a
+        // table declaring no rows is asked nothing at all.
+        let mut none = pbps_model::Schema::default();
+        let mut empty = table(Some(vec!["code"]), &[("code", "text", None)]);
+        empty.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: Default::default(),
+        });
+        none.tables.insert(name(), empty);
+        assert!(not_checked_offline(&none).is_empty());
     }
 
     #[test]

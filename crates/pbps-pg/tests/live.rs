@@ -3845,6 +3845,98 @@ async fn a_foreign_keys_width_is_the_servers_answer_and_it_answers_before_lookin
     drop_schema(&mut conn, &s).await;
 }
 
+/// PostgreSQL text cannot hold U+0000, so a declaration whose row key carries
+/// one is refused at the first insert — which is why `validate`'s identity-text
+/// exemption does not cover it (508, issue #526).
+///
+/// Four routes, because a single one would leave open the reading that some
+/// other spelling of the same character gets through — and because the fourth
+/// is the one a declaration really takes: a NUL inside the statement text is
+/// refused by the *driver* while it encodes the message, so the server never
+/// answers and there is no SQLSTATE to report. That is precisely why an offline
+/// note is the only thing that can name such a declaration in advance.
+///
+/// The offline half is asserted beside them: the note is emitted for exactly
+/// the declaration this engine would refuse, and withheld for the ordinary key
+/// it accepts.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_row_key_holding_a_nul_is_refused_by_this_engine_and_is_not_exempt_offline() {
+    let s = emit_schema("nulkey");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TABLE {s}.t (code text PRIMARY KEY)"))
+        .await
+        .unwrap();
+
+    for (route, sql, state) in [
+        ("chr(0)", "SELECT chr(0)::text".to_owned(), "54000"),
+        (
+            "an escape string",
+            format!("INSERT INTO {s}.t (code) VALUES (E'bad\\000key')"),
+            "22021",
+        ),
+        (
+            "a unicode escape",
+            format!("INSERT INTO {s}.t (code) VALUES (U&'bad\\0000key')"),
+            "42601",
+        ),
+    ] {
+        let refused = conn.execute(&sql).await.unwrap_err();
+        assert_eq!(sqlstate(&refused), state, "{route}: {refused}");
+    }
+
+    // The fourth route never reaches the server at all, and it is the one a
+    // declaration would actually take: a NUL inside the statement text is
+    // refused by the driver while it encodes the message, so the engine never
+    // gets to answer. A refusal either way — but not one with a SQLSTATE, so
+    // an offline note is the only thing that can name this declaration before
+    // a deployment meets it.
+    let unsendable = conn
+        .execute(&format!("INSERT INTO {s}.t (code) VALUES ('bad\0key')"))
+        .await
+        .expect_err("a NUL byte cannot be put on the wire");
+    assert_eq!(sqlstate(&unsendable), "no code", "{unsendable}");
+    assert!(
+        unsendable.to_string().contains("encoding message"),
+        "{unsendable}"
+    );
+
+    // And the ordinary key beside them, so the refusals above are about the
+    // character and not about the fixture.
+    conn.execute(&format!("INSERT INTO {s}.t (code) VALUES ('ordinary')"))
+        .await
+        .expect("an ordinary text key is accepted");
+    drop_schema(&mut conn, &s).await;
+
+    // The offline answer for the same two declarations, which is what the note
+    // exists to line up with.
+    let declared = |key: &str| {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("code".into(), Column::new(ty("text")).not_null());
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+        });
+        table.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: [(pbps_model::RowKey::from(key), pbps_model::Row::default())]
+                .into_iter()
+                .collect(),
+        });
+        let mut schema = Schema::default();
+        schema.tables.insert(TableName::new(&s, "t"), table);
+        pbps_pg::rows::not_checked_offline(&schema)
+    };
+    assert_eq!(declared("bad\u{0}key").len(), 1, "the refused one is named");
+    assert!(
+        declared("ordinary").is_empty(),
+        "the accepted one still keeps the identity exemption"
+    );
+}
+
 /// The declaration validator must agree with emitted DDL, including the legal
 /// PostgreSQL repetitions that SQL Server's key-column helper would refuse.
 #[tokio::test]

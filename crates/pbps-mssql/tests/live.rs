@@ -9150,6 +9150,30 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
         .unwrap();
     assert_eq!(as_ensured.tables[&name].data, ensured.tables[&name].data);
 
+    // The other half of what the offline note promises (issue #528). The
+    // *spelling* is aliased — `01` above was read back as `1` and reported as
+    // nothing — while the *conversion* is not: a key this `int` column cannot
+    // read at all is what `plan --db` refuses, and the note may promise only
+    // that. Measured beside the alias so the two cannot drift apart.
+    let mut unconvertible = Schema::default();
+    unconvertible
+        .tables
+        .insert(name.clone(), table_with(DataMode::Exact, &["nope"]));
+    let found = pbps_mssql::catalog::misspelt(&mut db.conn, &unconvertible, &Default::default())
+        .await
+        .expect("read the spellings");
+    let refused: Vec<String> = found
+        .misspelt
+        .iter()
+        .filter(|m| m.column.is_none())
+        .map(|m| m.key.to_string())
+        .collect();
+    assert_eq!(refused, ["nope"], "{found:?}");
+    assert!(
+        found.misspelt[0].canonical.is_none(),
+        "the column could not read it at all: {found:?}"
+    );
+
     db.drop().await;
 }
 

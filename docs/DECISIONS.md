@@ -13330,3 +13330,58 @@ SPEC is in sync with all of these.
      because no table-local rule can see across tables — while a check or
      foreign key sharing a name was never in that namespace and stays the
      table-local rule's alone (ADR-0009 §1, 459).
+
+508. **The identity-text exemption is about the conversion, and one key defeats
+     it; SQL Server's note may not promise a spelling check it does not make
+     (issues #526, #528).** 469 exempted the conversions that hand a key back
+     unchanged — PostgreSQL `text` and unbounded `varchar`, SQL Server
+     `nvarchar(max)` — from `validate`'s offline key note, because there is
+     nothing to warn about when nothing can change. Two reviews then found the
+     two ends of that sentence wrong in two different ways.
+
+     **PostgreSQL cannot hold U+0000 at all**, whatever the conversion would do
+     with it, so the exemption let a declaration through that the engine refuses
+     outright. Measured on 18.6, four routes and four answers:
+
+     | Route | Answer |
+     | --- | --- |
+     | `SELECT chr(0)::text` | `54000: null character not permitted` |
+     | `INSERT ... VALUES (E'bad\000key')` | `22021: invalid byte sequence for encoding "UTF8": 0x00` |
+     | `INSERT ... VALUES (U&'bad\0000key')` | `42601`, the parser: invalid Unicode escape value |
+     | a real NUL byte in the statement text | never reaches the server — the driver refuses to encode the message |
+
+     The fourth is the one a deployment actually takes, and it is the reason a
+     note rather than silence matters here: there is no SQLSTATE to report and
+     no server sentence to quote, so an offline note is the only thing that can
+     name such a declaration before someone runs into it. The exemption now
+     stands unless a declared key carries U+0000; an ordinary unbounded-text key
+     keeps it, which is what stops this from becoming a blanket note on `text`.
+
+     A test of this has to prove its own fixture first. YAML `"bad\0key"` is one
+     character only if the loader reads that escape, and a test that silently
+     carried a backslash and a zero would pass for the wrong reason — so the
+     fixture asserts that `"bad\0key"` and `"bad\u0000key"` are the **same**
+     mapping key before asserting anything about the note. The same trap caught
+     this investigation twice: a shell heredoc turned `\000` into two characters,
+     and a Rust literal turned `E'bad\000key'` into a real NUL byte in the
+     statement text — which is how the driver route above was found.
+
+     **SQL Server's half of the note was a promise it does not keep.** Both
+     dialects said `plan --db` "checks the key conversion and spelling against
+     the live column". On that engine a key's spelling is aliased at read time
+     by design (71, 101): `catalog::misspelt` treats any readable spelling as
+     agreement for a key — `(None, Some(_))` — and compares spellings only for a
+     cell. Measured on 17.0.4075.5, an `int` key declared `01` is stored and
+     read back as `1`, `01` and `1` are one row (`Msg 2627`), and `'nope'` is
+     `Msg 245`. So two of the three questions are real and one is not, and the
+     note now names the two: conversion, and convergence. PostgreSQL keeps the
+     stronger sentence, because `pbps-pg::catalog::misspelt` really does require
+     the read-back to equal the declared spelling for a key as well as a cell.
+
+     One thing the SQL Server side does not need: a NUL carve-out. Measured,
+     `nvarchar` holds U+0000 without complaint (`LEN` 7, `UNICODE` of the fourth
+     character 0), so the difference is PostgreSQL's, not a gap in the sibling
+     validator. And no SQL Server declaration reaches the exemption anyway —
+     `nvarchar(max)` is the only conversion that preserves a key there and the
+     engine will not take it as a key column, which is why the offline test's
+     negative controls are both PostgreSQL's.

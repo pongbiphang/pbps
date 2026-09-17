@@ -1118,7 +1118,37 @@ pub fn decode(
 }
 
 /// What offline validation cannot establish about a declared key's conversion.
-/// The engine's spelling is needed even when there is no second key to collide.
+/// The engine's answer is needed even when there is no second key to collide.
+///
+/// # Why this says less than PostgreSQL's note, and must
+///
+/// The two notes were one sentence, and on this engine the second half of it
+/// was not true. It promised that `plan --db` "checks the key conversion and
+/// spelling against the live column", while a key's spelling is **aliased at
+/// read time** here by design (DECISIONS 71, 101): `catalog::misspelt` treats
+/// any readable spelling as agreement for a key — `(None, Some(_))` — and
+/// compares spellings only for a cell. A note that promised a check the
+/// connected run deliberately does not make would send a reader looking for a
+/// refusal that never comes (DECISIONS 508; issue #528).
+///
+/// **Measured on SQL Server 2025 (17.0.4075.5)**, on an `int` key:
+///
+/// ```text
+/// INSERT INTO dbo.k (code) VALUES ('01'), ('7');  -- stored and read back as 1 and 7
+/// INSERT INTO dbo.k (code) VALUES ('1');
+///   Msg 2627 ... Cannot insert duplicate key ... The duplicate key value is (1).
+/// INSERT INTO dbo.k (code) VALUES ('nope');
+///   Msg 245 ... Conversion failed when converting the varchar value 'nope' to data type int.
+/// ```
+///
+/// So two of the three questions are real and one is not: the conversion can
+/// fail, two declared keys can converge on one row, and a differently spelled
+/// read-back is accepted and mapped back under the declaration's own spelling.
+/// The note names exactly those.
+///
+/// The PostgreSQL note keeps its stronger sentence because that engine really
+/// does require the read-back to equal the declared spelling, for a key as
+/// well as a cell (`pbps-pg::catalog::misspelt`).
 pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
     let mut out = Vec::new();
     for (name, table) in &schema.tables {
@@ -1147,9 +1177,12 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
         }
         out.push(format!(
             "`{name}`: this run did not check whether each declared row key converts to \
-             `{ty}`, the type of `{key}`, and reads back with the same spelling. Even one \
-             key can be refused or respelled by the engine. `pbps plan --db` checks the \
-             key conversion and spelling against the live column."
+             `{ty}`, the type of `{key}`, or whether two of them are one row once \
+             converted. Even one key can be refused by the engine. `pbps plan --db` asks \
+             it both: a key the column cannot read is refused, and two declared keys that \
+             converge are reported. It does not require the engine to spell a key back as \
+             written — `01` under an `int` key is stored as `1` and read back under the \
+             declaration's own spelling (DECISIONS 71)."
         ));
     }
     out
@@ -1818,7 +1851,24 @@ mod tests {
             let notes = not_checked_offline(&schema);
             assert_eq!(notes.len(), usize::from(expected), "{ty}: {notes:?}");
             if expected {
-                assert!(notes[0].contains("spelling"), "{ty}: {notes:?}");
+                // The two questions `plan --db` really asks on this engine.
+                assert!(notes[0].contains("converts to"), "{ty}: {notes:?}");
+                assert!(
+                    notes[0].contains("one row once converted"),
+                    "{ty}: {notes:?}"
+                );
+                // And the one it does not: a key's spelling is aliased at read
+                // time here (DECISIONS 71), so the note may not promise that
+                // the engine spells it back as written (issue #528).
+                assert!(
+                    !notes[0].contains("reads back with the same spelling"),
+                    "{ty}: {notes:?}"
+                );
+                assert!(
+                    notes[0].contains("does not require the engine to spell a key back as written"),
+                    "{ty}: {notes:?}"
+                );
+                assert!(notes[0].contains("`01`"), "{ty}: {notes:?}");
                 assert!(!notes[0].contains("collation"), "{ty}: {notes:?}");
             }
         }
