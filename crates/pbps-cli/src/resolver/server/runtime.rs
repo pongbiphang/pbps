@@ -11,7 +11,6 @@ use crate::resolver::native::{
     BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative, for_each_occupant,
     groups, mount_rows, private_network, process_scope, security,
 };
-use std::collections::BTreeSet;
 
 /// The processes the daemon's record names, before anything is measured of
 /// their runtime.
@@ -217,41 +216,42 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
 /// network namespace. A container joined with `--network container:` would otherwise
 /// be invisible to every other check.
 fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Error> {
-    // The exception is each forwarder's own processes — its guard and the
-    // guard's descendants, which its session check holds to the fixed
-    // program at the fixed privileges — and not its PID namespace: a
-    // container joined to that namespace and to the engine's network is a
-    // sibling the descendant walk never qualifies (finding on #640).
-    let mut owned = Vec::new();
-    for forwarder in forwarders {
-        let scope: BTreeSet<u32> = process_scope(forwarder)
-            .map_err(Premise::Accounting.named())?
-            .into_iter()
-            .map(|(pid, _)| pid)
-            .collect();
-        owned.push((*forwarder, scope));
-    }
+    // The network namespace is the engine's tasks plus this run's forwarders.
+    // A forwarder shares only that namespace, so its own tasks are the one
+    // exception, matched by PID namespace: a forwarder's `bash` reaps and
+    // respawns its `cat` pipes, so a task list captured a moment earlier
+    // would race a legitimate child (finding on #640, where matching each
+    // task against a captured process tree refused the forwarder itself).
+    //
+    // Membership in a forwarder's PID namespace is enough because that
+    // namespace holds nothing but the forwarder: joining it needs
+    // `--pid container:<name>`, and the name is a run-generated 256-bit
+    // token that exists only for this run. A foreign process joining the
+    // engine's network namespace directly is what this refuses, and is the
+    // reachable case. Tightening the exception to the forwarder's exact task
+    // set is #681.
     for_each_occupant(init, "net", |occupant| {
         if init.same_namespace(occupant, "pid")? {
             return Ok(());
         }
-        let group = thread_group(occupant)?;
-        for (forwarder, scope) in &owned {
-            if forwarder.same_namespace(occupant, "pid")? && scope.contains(&group) {
+        for forwarder in forwarders {
+            if forwarder.same_namespace(occupant, "pid")? {
                 return Ok(());
             }
         }
+        refused(occupant, "net");
         Err(UnqualifiedProcess)
     })
     .map_err(Premise::Accounting.named())?;
     // Mount and IPC alike: a container joined to either reaches the
     // engine's files or its shared memory without being in any listing the
-    // engine's PID namespace produces.
+    // engine's PID namespace produces. No forwarder shares these.
     for namespace in ["mnt", "ipc"] {
         for_each_occupant(init, namespace, |occupant| {
             if init.same_namespace(occupant, "pid")? {
                 Ok(())
             } else {
+                refused(occupant, namespace);
                 Err(UnqualifiedProcess)
             }
         })
@@ -260,15 +260,15 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     Ok(())
 }
 
-/// The thread group an occupant task belongs to, as the kernel reports it.
-/// Occupants are enumerated by task, and a forwarder's `cat` is a process
-/// while a thread of it would carry the same descriptors.
-fn thread_group(occupant: &ProcessLease) -> Result<u32, UnqualifiedProcess> {
-    let status = occupant.read_proc("status", 65536)?;
-    let mut values = status.lines().filter_map(|line| line.strip_prefix("Tgid:"));
-    let value = values.next().ok_or(UnqualifiedProcess)?;
-    if values.next().is_some() {
-        return Err(UnqualifiedProcess);
-    }
-    value.trim().parse().map_err(|_| UnqualifiedProcess)
+/// Names an occupant the accounting refused, so a fixture whose containers
+/// are gone by the time anyone looks still says which process and namespace.
+fn refused(occupant: &ProcessLease, namespace: &str) {
+    #[cfg(test)]
+    eprintln!(
+        "accounting refused {} occupant pid={} exe={:?}",
+        namespace,
+        occupant.pid(),
+        occupant.executable_path()
+    );
+    let _ = (occupant, namespace);
 }
