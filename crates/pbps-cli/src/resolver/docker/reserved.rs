@@ -2,7 +2,7 @@
 //! source-free fixed bytes cross this gate after target separation and actual
 //! kernel controls have been checked; declarations never enter this module.
 
-use super::profile::{Launch, engine};
+use super::profile::{LIFETIME_SECS, Launch, engine};
 use super::{
     AttachStream, CandidateImage, CandidateRun, CandidateSession, Error, LocalApi, StartFailure,
 };
@@ -95,7 +95,8 @@ impl ReservedSession {
         );
         let password = format!("Pbps!{:032x}", rand::random::<u128>());
         let launch = Launch::reserved(&image, driver, &token, &password).map_err(failure)?;
-        let workload = CandidateRun::start_launch(api, image.clone(), token, launch).await?;
+        let workload =
+            CandidateRun::start_launch(api, image.clone(), token, launch, LIFETIME_SECS).await?;
         let prepare = async {
             let mut bootstrap = bootstrap_api.attach_inner(workload.container_id()).await?;
             bootstrap

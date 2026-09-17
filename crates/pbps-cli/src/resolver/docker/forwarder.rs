@@ -47,7 +47,9 @@ impl Forwarder {
         );
         let launch =
             Launch::control(image, driver, &owner, workload, lifetime_secs).map_err(failure)?;
-        let run = CandidateRun::start_launch(control_api, image.clone(), owner, launch).await?;
+        let run =
+            CandidateRun::start_launch(control_api, image.clone(), owner, launch, lifetime_secs)
+                .await?;
         let connect = async {
             let mut stream = attach_api.attach_inner(run.container_id()).await?;
             stream

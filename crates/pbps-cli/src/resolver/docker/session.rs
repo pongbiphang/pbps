@@ -340,9 +340,10 @@ impl CandidateSession {
             super::profile::LIFETIME_SECS,
         )
         .map_err(|cause| (failure(cause), false))?;
-        let control = CandidateRun::start_launch(api, image, owner, launch)
-            .await
-            .map_err(|failure| (failure, false))?;
+        let control =
+            CandidateRun::start_launch(api, image, owner, launch, super::profile::LIFETIME_SECS)
+                .await
+                .map_err(|failure| (failure, false))?;
         // Set by the login's own error arm and read after the future has been
         // driven to completion, which is the only place that can tell a
         // still-starting engine from a refusal that will not change.
