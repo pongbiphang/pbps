@@ -3740,6 +3740,111 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
     );
 }
 
+/// A foreign key's width is the **server's** answer, exactly as an index's is
+/// (DECISIONS 452, issue #475).
+///
+/// The review that opened #475 read the two as inconsistent — indexes checked
+/// offline, foreign keys not — and the inconsistency does not exist: neither is
+/// checked offline here, because the limit is this build's `max_index_keys`
+/// rather than a dialect invariant, and refusing 33 offline would reject a
+/// valid declaration on a server built with a larger one. SQL Server's
+/// validator carries a width rule because *there* 32 is a product invariant.
+///
+/// Three things only the engine can say, and all three are why the offline
+/// silence is right:
+///
+/// - 32 columns is accepted, against a unique key of the same 32 columns —
+///   the referenced side built so this measures the width and nothing else.
+/// - 33 is `54011`, the same SQLSTATE the index limit answers with, and the
+///   message names a foreign key rather than an index.
+/// - the width refusal comes **before** the referenced-key lookup: the same
+///   33-column key against a parent with no matching unique constraint at all
+///   is still the width error, not a missing-key one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_foreign_keys_width_is_the_servers_answer_and_it_answers_before_looking_for_a_key() {
+    let s = emit_schema("fkwidth");
+    let mut conn = connect().await;
+    assert_eq!(
+        text(&mut conn, "SHOW max_index_keys").await,
+        "32",
+        "the boundary below measures the pinned stock build, not an offline dialect invariant"
+    );
+    fresh(&mut conn, &s).await;
+    let list = |n: usize| {
+        (0..n)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let columns = (0..33)
+        .map(|i| format!("c{i} integer NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(&format!("CREATE TABLE {s}.parent ({columns})"))
+        .await
+        .unwrap();
+    conn.execute(&format!("CREATE TABLE {s}.child ({columns})"))
+        .await
+        .unwrap();
+    conn.execute(&format!(
+        "ALTER TABLE {s}.parent ADD CONSTRAINT uq32 UNIQUE ({})",
+        list(32)
+    ))
+    .await
+    .expect("32 is inside this build's limit, so the referenced key exists");
+
+    conn.execute(&format!(
+        "ALTER TABLE {s}.child ADD CONSTRAINT fk32 FOREIGN KEY ({0}) REFERENCES {s}.parent ({0})",
+        list(32)
+    ))
+    .await
+    .expect("a 32-column foreign key is accepted");
+
+    // 33, with no 33-column unique key on the parent — there cannot be one on
+    // this build. The error is still the width, which is what makes this a
+    // measurement of the width and not of the missing key.
+    let refused = conn
+        .execute(&format!(
+            "ALTER TABLE {s}.child ADD CONSTRAINT fk33 FOREIGN KEY ({0}) \
+             REFERENCES {s}.parent ({0})",
+            list(33)
+        ))
+        .await
+        .expect_err("33 is past this build's limit");
+    assert_eq!(sqlstate(&refused), "54011", "{refused}");
+    assert!(
+        refused.to_string().contains("foreign key"),
+        "the message names a foreign key, not an index: {refused}"
+    );
+
+    // And the offline validator says nothing about either, which is the whole
+    // point: on a server built wider, both are valid declarations.
+    let pg = Postgres::new();
+    for count in [32usize, 33] {
+        let mut table = Table::default();
+        let columns: Vec<String> = (0..count).map(|i| format!("c{i}")).collect();
+        for column in &columns {
+            table
+                .columns
+                .insert(column.clone(), Column::new(ty("integer")).not_null());
+        }
+        table.foreign_keys.insert(
+            "fk".into(),
+            ForeignKey {
+                columns: columns.clone(),
+                references_table: TableName::new(&s, "parent"),
+                references_columns: columns,
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let problems = pg.validate_table(&TableName::new(&s, "child"), &table);
+        assert!(problems.is_empty(), "width {count}: {problems:?}");
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
 /// The declaration validator must agree with emitted DDL, including the legal
 /// PostgreSQL repetitions that SQL Server's key-column helper would refuse.
 #[tokio::test]
@@ -3855,6 +3960,30 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             },
         );
         cases.push((format!("foreign referenced list {code}"), table, Some(code)));
+    }
+    // The two foreign-key lists, and their two different answers (issue #476).
+    // The referenced list must not repeat a column — `42830`, an analysis rule
+    // of the engine, refused even though `CREATE UNIQUE INDEX … (a, a)` is
+    // itself legal here — while the *local* list may, against a distinct
+    // composite unique key, which 452 measured and which refusing would turn
+    // into a valid declaration rejected. Both need two local columns, which
+    // the loop above does not have.
+    for (local, remote, code) in [
+        (vec!["a", "b"], vec!["a", "a"], Some("42830")),
+        (vec!["a", "a"], vec!["a", "b"], None),
+    ] {
+        let mut table = base();
+        table.foreign_keys.insert(
+            "fk".into(),
+            ForeignKey {
+                columns: local.iter().map(|c| (*c).to_owned()).collect(),
+                references_table: TableName::new(&s, "parent"),
+                references_columns: remote.iter().map(|c| (*c).to_owned()).collect(),
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        cases.push((format!("foreign {local:?} -> {remote:?}"), table, code));
     }
     for (include, code) in [
         (vec!["missing"], Some("42703")),

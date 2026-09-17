@@ -2224,44 +2224,95 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
 /// in, each checked against everything already claimed. A check or
 /// foreign-key constraint has no backing index and is not in this union
 /// (ADR-0009 §1; issue #179 owns per-table constraint-kind reuse).
+///
+/// # The one pair this does not report, and who owns it instead
+///
+/// A named primary key and a unique constraint **on the same table** sharing a
+/// name is already refused by [`Table::constraint_name_conflicts`], which every
+/// dialect's `validate_table` runs. Reporting it here too earned one
+/// declaration two findings for one defect — on `validate`, and again on the
+/// connected planning and bootstrap gates that run the same list
+/// (DECISIONS 141, 507; issue #498).
+///
+/// The table-local rule owns it, because it is the narrower and the
+/// engine-independent one: two constraints of one table may not share a name on
+/// either engine, while this function does not run at all where indexes have no
+/// shared namespace. Nothing else moves. An index against a key constraint, a
+/// key constraint against a table or a view, and two key constraints on
+/// *different* tables are each still reported here — the last because no
+/// table-local rule can see across tables — and a check or foreign key sharing
+/// a name is still the table-local rule's alone.
 pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
     if !dialect.indexes_share_namespace_with_tables() {
         return Vec::new();
     }
+    /// A name already taken, and by what. `key_of` is the table whose own
+    /// constraint-name rule already covers this claim — `Some` for a named
+    /// primary key or unique constraint, `None` for an index, a table or a
+    /// module, which that rule does not compare.
+    struct Claim<'a> {
+        descriptor: String,
+        key_of: Option<&'a TableName>,
+    }
+    let unclaimed = |descriptor| Claim {
+        descriptor,
+        key_of: None,
+    };
     let mut problems = Vec::new();
-    let mut claimed: BTreeMap<ObjectName, String> = BTreeMap::new();
+    let mut claimed: BTreeMap<ObjectName, Claim<'_>> = BTreeMap::new();
     for name in schema.tables.keys() {
-        claimed.insert(name.clone(), format!("table `{name}`"));
+        claimed.insert(name.clone(), unclaimed(format!("table `{name}`")));
     }
     for (id, module) in &schema.modules {
         if dialect.shares_namespace_with_tables(module.kind) {
-            claimed.insert(id.object_name(), format!("{} `{id}`", module.kind));
+            claimed.insert(
+                id.object_name(),
+                unclaimed(format!("{} `{id}`", module.kind)),
+            );
         }
     }
     for (table_name, table) in &schema.tables {
-        let mut declared: Vec<(&str, String)> = Vec::new();
+        let mut declared: Vec<(&str, Claim<'_>)> = Vec::new();
         for index_name in table.indexes.keys() {
             declared.push((
                 index_name.as_str(),
-                format!("index `{table_name}.{index_name}`"),
+                unclaimed(format!("index `{table_name}.{index_name}`")),
             ));
         }
         if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
-            declared.push((pk_name, format!("primary key `{table_name}.{pk_name}`")));
+            declared.push((
+                pk_name,
+                Claim {
+                    descriptor: format!("primary key `{table_name}.{pk_name}`"),
+                    key_of: Some(table_name),
+                },
+            ));
         }
         for unique_name in table.unique.keys() {
             declared.push((
                 unique_name.as_str(),
-                format!("unique constraint `{table_name}.{unique_name}`"),
+                Claim {
+                    descriptor: format!("unique constraint `{table_name}.{unique_name}`"),
+                    key_of: Some(table_name),
+                },
             ));
         }
-        for (name, descriptor) in declared {
-            let claim = ObjectName::new(table_name.schema.clone(), name);
-            if let Some(existing) = claimed.insert(claim.clone(), descriptor.clone()) {
+        for (name, claim) in declared {
+            let claim_name = ObjectName::new(table_name.schema.clone(), name);
+            let descriptor = claim.descriptor.clone();
+            let key_of = claim.key_of;
+            if let Some(existing) = claimed.insert(claim_name.clone(), claim) {
+                // Both sides a named key constraint of the same table: the
+                // table-local rule has already refused this declaration, and
+                // saying so twice does not make it more refused.
+                if existing.key_of.is_some() && existing.key_of == key_of {
+                    continue;
+                }
                 problems.push(format!(
-                    "{existing} and {descriptor} are both named `{claim}`; {} keeps tables, \
+                    "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, \
                      views and indexes in one namespace per schema, so it can hold only one of \
                      them",
+                    existing.descriptor,
                     dialect.name()
                 ));
             }
@@ -3168,6 +3219,95 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("view `coll.v`"), "{problems:?}");
         assert!(problems[0].contains("index `coll.t1.v`"), "{problems:?}");
+    }
+
+    /// One defect, one finding. A named primary key and a unique constraint on
+    /// the same table sharing a name is refused by
+    /// `Table::constraint_name_conflicts`, which every dialect's
+    /// `validate_table` runs, so reporting it here as well gave the same
+    /// declaration two findings — on `validate`, and again on the connected
+    /// planning and bootstrap gates that run the same list (issue #498,
+    /// DECISIONS 141).
+    ///
+    /// The table-local rule keeps it because it is the narrower and the
+    /// engine-independent one: it holds on SQL Server, where this function does
+    /// not run at all.
+    #[test]
+    fn a_primary_key_and_a_unique_constraint_of_one_table_are_left_to_the_table_local_rule() {
+        let shared = with_unique(with_primary_key(table(), "shared"), "shared");
+        assert_eq!(
+            shared.constraint_name_conflicts().len(),
+            1,
+            "the premise: the table-local rule refuses this declaration"
+        );
+        let schema = schema_of(&[("coll.t1", shared)]);
+        assert!(
+            check_index_names(&schema, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_index_names(&schema, &OverloadingDialect)
+        );
+        assert!(check_index_names(&schema, &MinimalDialect).is_empty());
+    }
+
+    /// And nothing else moves. Each of these is a collision no table-local
+    /// rule can see — across two tables, or against an index, which
+    /// `constraint_name_conflicts` deliberately excludes — so each is still
+    /// this function's to report.
+    #[test]
+    fn the_collisions_no_table_local_rule_can_see_are_still_reported() {
+        for (label, tables) in [
+            (
+                "two tables' key constraints",
+                vec![
+                    ("coll.t1", with_primary_key(table(), "shared")),
+                    ("coll.t2", with_unique(table(), "shared")),
+                ],
+            ),
+            (
+                "a primary key and an index on one table",
+                vec![(
+                    "coll.t1",
+                    with_index(with_primary_key(table(), "shared"), "shared"),
+                )],
+            ),
+            (
+                "a unique constraint and an index on one table",
+                vec![(
+                    "coll.t1",
+                    with_index(with_unique(table(), "shared"), "shared"),
+                )],
+            ),
+            (
+                "a primary key named after a table",
+                vec![
+                    ("coll.t1", with_primary_key(table(), "t2")),
+                    ("coll.t2", table()),
+                ],
+            ),
+        ] {
+            let schema = schema_of(&tables);
+            let problems = check_index_names(&schema, &OverloadingDialect);
+            assert_eq!(problems.len(), 1, "{label}: {problems:?}");
+            assert!(
+                problems[0].contains("shared") || problems[0].contains("t2"),
+                "{label}"
+            );
+        }
+    }
+
+    /// The three constraint kinds the table-local rule owns outright: none of
+    /// them is backed by an index, so a name they share was never this
+    /// function's to report and is unaffected by the deduplication above.
+    #[test]
+    fn a_check_or_foreign_key_sharing_a_name_stays_with_the_table_local_rule() {
+        let shared = with_check(with_primary_key(table(), "shared"), "shared");
+        assert_eq!(shared.constraint_name_conflicts().len(), 1);
+        let schema = schema_of(&[("coll.t1", shared)]);
+        assert!(
+            check_index_names(&schema, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_index_names(&schema, &OverloadingDialect)
+        );
     }
 }
 
