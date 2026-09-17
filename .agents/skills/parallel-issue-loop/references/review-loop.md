@@ -138,12 +138,18 @@ Before merge, the primary agent—not an issue worker—must independently confi
 - required CI checks are green on the mergeable PR head.
 
 Subagents never enqueue and never merge. Once every gate passes the primary
-agent enqueues with `gh pr merge --merge`. With a merge queue required that
-command **adds the PR to the queue** rather than merging it: GitHub builds
-`master` plus everything queued ahead plus this PR and runs `ci.yml` on the
-`merge_group` event, merging only if that is green (DECISIONS 502). Wait for the
-merge to land before deleting the issue branch and removing its worktree — a
-queued PR is not a merged one, and the queue can still eject it.
+agent enqueues with `gh pr merge --merge` — never with `--delete-branch`, which
+`gh` refuses outright when a merge queue is required, because deleting the head
+branch before the queue has merged closes the PR and drops it from the queue.
+With a merge queue required that command **adds the PR to the queue** rather
+than merging it: GitHub builds `master` plus everything queued ahead plus this
+PR and runs `ci.yml` on the `merge_group` event, merging only if that is green
+(DECISIONS 502). Wait for the merge to land before deleting the issue branch
+and removing its worktree — a queued PR is not a merged one, and the queue can
+still eject it. Delete the
+branch on the **remote** as well as locally: GitHub retargets a PR stacked on it
+onto `master` when the branch is deleted, not when it is merged, and nothing
+deletes it here otherwise.
 
 If the queue ejects the PR, read the failing job before re-queueing and say
 which case it was. A conflict is handled in §5. A merge-group failure that

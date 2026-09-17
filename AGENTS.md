@@ -126,12 +126,21 @@ checksum-pinned, and state lives in the database itself.
   verification is unchanged; only the step it precedes has moved. Subagents
   never enqueue and never merge.
 - The primary agent enqueues with `gh pr merge --merge` once every gate above
-  passes. With a merge queue required, that command **adds the pull request to
-  the queue** rather than merging it: GitHub builds a branch of `master` plus
-  everything queued ahead plus this pull request, runs `ci.yml` on the
-  `merge_group` event, and merges only if that is green. Wait for the merge to
-  land before deleting the branch and removing the worktree — a queued pull
-  request is not a merged one.
+  passes — never with `--delete-branch`, which `gh` refuses outright when a
+  merge queue is required, because deleting the head branch before the queue
+  has merged closes the pull request and drops it from the queue. With a merge
+  queue required, that command **adds the pull request to the queue** rather
+  than merging it: GitHub builds a branch of `master` plus everything queued
+  ahead plus this pull request, runs `ci.yml` on the `merge_group` event, and
+  merges only if that is green. Wait for the merge to land before deleting the
+  branch and removing the worktree — a queued pull request is not a merged one.
+- **Delete the remote head branch once the merge has landed**, not only the
+  local one. GitHub retargets a pull request stacked on a merged branch onto
+  that pull request's base when the branch is *deleted*, not when it is merged,
+  and this repository does not delete it by itself. A downstream pull request
+  left based on a merged feature branch never enters the `master` queue at all:
+  merging it writes to that branch, and its work never reaches `master`
+  (DECISIONS 502).
 - A pull request must be green on its **own** head before it can be queued, so
   a merge costs **two pre-merge runs** of `ci.yml` — one on the pull request,
   one on the merge group — plus the post-merge run on `master`, which gates
@@ -163,12 +172,16 @@ checksum-pinned, and state lives in the database itself.
   exactly one issue at a time, uses an isolated branch and worktree, and never
   merges. Dependency-linked issues merge in topological order.
 - `ci.yml` runs on `master` after a merge. It is not a gate — the merge queue
-  already ran it on the exact tree the merge produced — so do not wait for
-  it before taking the next issue; a red one is a real regression and the next
-  task. The dependency audit is a separate workflow and does run on `master`
-  when the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own
-  workflow — wait for it in that case, and a red audit is the next task, not
-  the next issue.
+  already ran it on the exact tree the merge produced — so do not wait for it
+  before taking the next issue. **A red one is read, not assumed**, by the same
+  procedure as an ejection: the merge group passed this identical tree minutes
+  earlier, so open the failing job before calling it a regression. A test
+  failing on its merits is one, and becomes the next task; the resource-shaped
+  engine startup crash that `ci.yml` and docs/PITFALLS.md both record is not,
+  and a re-run on the same tree settles which it was. The dependency audit is a
+  separate workflow and does run on `master` when the merge touched
+  `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own workflow — wait for it in
+  that case, and a red audit is the next task, not the next issue.
 - Take the next issue, following "Taking an issue", only when the user requested
   a continuous or multi-wave loop.
 

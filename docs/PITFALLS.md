@@ -2225,6 +2225,18 @@ Three traps sat inside the fix, and each of them is a measurement:
   when the reporting mechanism changed — and the guard against it was carried
   across anyway. A guard whose reason has gone is a filter nobody re-reads,
   and this one was protecting the gate by opening it.
+- **A stacked pull request retargets when the branch is deleted, not when it is
+  merged.** GitHub moves an open pull request based on a merged head branch onto
+  that pull request's base, which is why a stacked branch needs no rebase after
+  its upstream merges — but the trigger is the deletion of the head branch. This
+  repository has `delete_branch_on_merge` off, so leaving it undeleted leaves
+  the downstream pull request based on a merged feature branch, where it never
+  enters the `master` queue and merging it writes to that branch instead of to
+  `master`. The reflex fix makes it worse: with a merge queue required, `gh pr
+  merge --delete-branch` does not enqueue at all, it fails with "Cannot use
+  `-d` or `--delete-branch` when merge queue enabled", because deleting the head
+  branch before the queue has merged closes the pull request and drops it from
+  the queue. The deletion has to be a separate step after the merge lands.
 
 ## A pre-delete count includes the row its statement removes
 

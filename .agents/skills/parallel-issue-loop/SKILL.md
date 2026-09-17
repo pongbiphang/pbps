@@ -107,9 +107,13 @@ and merge order.
 - Merge in topological order. After an upstream merge, a downstream branch
   needs nothing, stacked or not: the merge queue builds a merely behind branch
   against current `master` when it is enqueued, and GitHub retargets a branch
-  stacked on the deleted upstream branch onto that PR's base by itself
-  (DECISIONS 502). Do not rebase either case — that rewrites the reviewed head
-  and repeats the local checks, CI and resulting-head review. Two things do
+  stacked on the upstream branch onto that PR's base by itself — but only once
+  the upstream branch is **deleted**, which is the primary agent's closeout
+  step and does not happen on its own (DECISIONS 502). Until it does, the
+  downstream PR is still based on a merged feature branch, and merging it would
+  write to that branch instead of entering the `master` queue. Do not rebase
+  either case — that rewrites the reviewed head and repeats the local checks,
+  CI and resulting-head review. Two things do
   need you, and both begin by rebasing onto current `master`, because neither
   reproduces on a branch that predates it: a conflict, which ejects the PR from
   the queue, and an interaction the merge group confirmed, which a stale branch
@@ -142,13 +146,16 @@ Subagents must never merge. When a worker says its PR is ready, the primary agen
 independently verifies the issue-to-diff match, architecture, tests, review state,
 unresolved threads, current head SHA, dependency order, current-base status, and
 CI evidence. Only the primary agent may enqueue, with `gh pr merge --merge` and
-a merge commit, and only when every condition in the review reference is
-satisfied. With a merge queue required that command adds the PR to the queue
-rather than merging it; wait for the queued merge to land before treating the PR
-as merged (DECISIONS 502).
+a merge commit — never with `--delete-branch`, which `gh` refuses outright when
+a merge queue is required, because deleting the head branch before the queue has
+merged closes the PR and drops it from the queue — and only when every condition
+in the review reference is satisfied. With a merge queue required that command
+adds the PR to the queue rather than merging it; wait for the queued merge to
+land before treating the PR as merged (DECISIONS 502).
 
 After a merge, verify the intended issue closed, capture the merge commit, clean
-the issue worktree and local branch safely, update dependent agents, and report
+the issue worktree and both the local and the **remote** branch safely, update
+dependent agents, and report
 the review count and any explicitly deferred findings. If the merge touched
 `Cargo.toml`, `Cargo.lock`, `deny.toml`, or the dependency-audit workflow, wait
 for the dependency audit; a failure becomes the next task before any free slot

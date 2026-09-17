@@ -12955,7 +12955,23 @@ SPEC is in sync with all of these.
     two genuinely flaky tests. Nor is it automatically a flake — that reading is
     how a real interaction merges on the second attempt. The rule is therefore
     procedural rather than a verdict: read the failing job, name which it was,
-    and only then fix or re-queue.
+    and only then fix or re-queue. The `push` run on `master` afterwards is read
+    the same way and for a stronger reason: the merge group passed that exact
+    tree minutes earlier, so a red one is a flake until the failing job says
+    otherwise.
+
+    **A stacked pull request retargets itself only once the upstream branch is
+    deleted.** GitHub retargets every open pull request based on a merged head
+    branch onto that pull request's base, but the trigger is the *deletion* of
+    the branch, not the merge. This repository has `delete_branch_on_merge`
+    off, and the obvious remedy is refused: with a queue required, `gh pr merge
+    --delete-branch` errors out instead of enqueueing, because deleting the head
+    branch before the queue has merged closes the pull request and removes it
+    from the queue. The branch is therefore deleted as a separate closeout step
+    once the merge has landed, and that deletion is what retargets whatever was
+    stacked on it. Left undeleted, the downstream pull request stays based on a
+    merged feature branch: it never enters the `master` queue, and merging it
+    writes to that branch rather than to `master`.
 
     Measured against the field rather than chosen. Of the fifteen projects
     surveyed for 501, the four running a merge queue — rust-analyzer, cargo,

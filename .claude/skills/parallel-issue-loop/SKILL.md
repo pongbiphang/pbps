@@ -122,7 +122,11 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   **stacked on the upstream branch** is retargeted by GitHub itself: deleting a
   merged head branch retargets every open PR that used it as a base onto the
   merged PR's base. Its head already contains the upstream commits, so the
-  queue then builds it against `master` like any other behind branch. **Do not
+  queue then builds it against `master` like any other behind branch. That
+  retarget waits on the deletion, which is your closeout step and happens no
+  other way here; until it does, the downstream PR is still based on a merged
+  feature branch, and merging it would write to that branch instead of entering
+  the `master` queue. **Do not
   rebase it** — that rewrites the head that was reviewed and repeats the local
   checks, CI and resulting-head review, which is the work 502 exists to remove.
   Two things do need you, and both begin by rebasing onto current `master`,
@@ -183,11 +187,13 @@ deferred issue, that no review thread is unresolved, that dependency order is
 satisfied, and that the required CI checks are green on the mergeable head.
 
 Only you enqueue, with `gh pr merge --merge`, and only after every gate
-passes. With a merge queue required that command adds the PR to the queue
-rather than merging it; the queue runs `ci.yml` on the `merge_group` and merges
-only if that is green. Wait for the merge to land — a queued PR is not a merged
-one — then delete the branch, remove the worktree, and confirm the intended
-issue closed.
+passes — never with `--delete-branch`, which `gh` refuses outright when a merge
+queue is required, because deleting the head branch before the queue has merged
+closes the PR and drops it from the queue. With a merge queue required that
+command adds the PR to the queue rather than merging it; the queue runs `ci.yml`
+on the `merge_group` and merges only if that is green. Wait for the merge to
+land — a queued PR is not a merged one — then delete the branch **locally and
+on the remote**, remove the worktree, and confirm the intended issue closed.
 
 If the merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or the
 dependency-audit workflow, wait for the dependency audit; a red audit is the
