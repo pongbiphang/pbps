@@ -654,12 +654,29 @@ pub(crate) fn foreign_network_tasks(
         let directory = match open_process(id) {
             Ok(directory) => directory,
             Err(error) if process_gone(&error) => continue,
-            Err(_) => return Err(UnqualifiedProcess),
+            Err(error) => {
+                #[cfg(test)]
+                eprintln!(
+                    "foreign_network_tasks: open pid={id} errno={:?}",
+                    error.raw_os_error()
+                );
+                let _ = error;
+                return Err(UnqualifiedProcess);
+            }
         };
         let handle = match File::open(proc_base(&directory).join("ns").join("pid")) {
             Ok(handle) => handle,
             Err(error) if process_gone(&error) => continue,
-            Err(_) => return Err(UnqualifiedProcess),
+            Err(error) => {
+                #[cfg(test)]
+                eprintln!(
+                    "foreign_network_tasks: open ns/pid pid={id} errno={:?} exe={:?}",
+                    error.raw_os_error(),
+                    std::fs::read_link(proc_base(&directory).join("exe")).ok()
+                );
+                let _ = error;
+                return Err(UnqualifiedProcess);
+            }
         };
         let mut owned = false;
         for anchor in pid_anchors {
@@ -669,6 +686,17 @@ pub(crate) fn foreign_network_tasks(
             }
         }
         if !owned {
+            #[cfg(test)]
+            eprintln!(
+                "foreign_network_tasks: unaccounted pid={id} exe={:?} nspid={:?}",
+                std::fs::read_link(proc_base(&directory).join("exe")).ok(),
+                std::fs::read_to_string(proc_base(&directory).join("status"))
+                    .ok()
+                    .and_then(|s| s
+                        .lines()
+                        .find(|l| l.starts_with("NSpid:"))
+                        .map(str::to_owned))
+            );
             foreign.push(id);
         }
     }
