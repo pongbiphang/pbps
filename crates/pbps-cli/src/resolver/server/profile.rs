@@ -319,7 +319,7 @@ pub(crate) fn contained(rows: &[MountEntry], profile: &ServerProfile) -> Result<
             path if path == profile.storage_path => {
                 tmpfs && all(&["rw", "nosuid", "nodev", "noexec"])
             }
-            path if PRIVATE_TMPFS.contains(&path) => tmpfs && all(&["nosuid", "nodev"]),
+            path if PRIVATE_TMPFS.contains(&path) => tmpfs && all(&["nosuid", "nodev", "noexec"]),
             path if RUNTIME_FILES.contains(&path) => {
                 // The file the runtime wrote, wherever it keeps it: the row's
                 // root ends in the same name. Its contents are #630's scope.
@@ -511,11 +511,11 @@ mod tests {
 1374 1373 0:161 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,uid=1000,gid=1000
 1375 1373 0:162 / /tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,uid=1000,gid=1000
 1376 1373 0:163 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw
-1377 1373 0:164 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,mode=755,uid=1000,gid=1000
+1377 1373 0:164 / /run rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,mode=755,uid=1000,gid=1000
 1378 1373 0:165 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
 1379 1374 0:166 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=100004,mode=620,ptmxmode=666
 1380 1374 0:160 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
-1381 1373 0:167 / /var/tmp rw,nosuid,nodev,relatime - tmpfs tmpfs rw,uid=1000,gid=1000
+1381 1373 0:167 / /var/tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,uid=1000,gid=1000
 1369 1373 0:89 /containers/overlay-containers/64bc/userdata/hosts /etc/hosts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1626324k,mode=700,uid=1000,gid=1000
 1370 1374 0:157 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=64000k,uid=1000,gid=1000
 1371 1377 0:89 /containers/overlay-containers/64bc/userdata/.containerenv /run/.containerenv ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1626324k,mode=700,uid=1000,gid=1000

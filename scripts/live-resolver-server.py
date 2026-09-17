@@ -55,6 +55,10 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 RECIPE = [
     "--network", "none", "--ipc", "private", "--read-only",
     "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777",
+    # /run and /var/tmp forced to noexec: Podman auto-mounts them rw without
+    # noexec, and the profile requires no executable private storage.
+    "--tmpfs", "/run:rw,nosuid,nodev,noexec,size=67108864,mode=755",
+    "--tmpfs", "/var/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777",
     "--security-opt", "no-new-privileges",
     "--memory", "3g", "--memory-swap", "3g", "--cpus", "2", "--pids-limit", "512",
 ]
