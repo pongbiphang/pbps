@@ -13648,3 +13648,76 @@ SPEC is in sync with all of these.
      sits inside, and on 18.6 that `EXISTS` is pulled up into a join whose
      condition carries the cast — evaluated after the scan filter that carries
      the guard. Measured: the same fixture answers rather than raising.
+
+517. **A routine arrives closed to `PUBLIC`, and a declaration is what opens it
+     again (issue #318).**
+
+     On PostgreSQL every function is created with `EXECUTE` to `PUBLIC`: the
+     catalog holds no ACL at all and `acldefault('f', owner)` supplies one
+     (ADR-0010 §5). For a `SECURITY DEFINER` routine that reads "any principal
+     that can reach this schema may act as the owner", and pbps was producing
+     exactly that state with its own `CREATE`. So a plan that creates a
+     procedure or a function now also carries the change that takes the default
+     away, and a declaration saying `public_execute: true` is what leaves it
+     standing.
+
+     **Every routine, not only the definer ones**, and the reason is the one
+     that rules out the narrower fix rather than a preference for the wider
+     one: which routines are `SECURITY DEFINER` is inside a body this tool
+     never parses (SPEC §8.2), and the textual scan that would answer it is
+     fooled by the words appearing in a comment or a string. A security
+     control resting on a comparison that can be fooled is worse than one whose
+     scope is stated plainly. The cost is stated too: an ordinary invoker
+     routine that today relies on the default stops being callable by everyone
+     at its next apply, and the one line that says otherwise goes through the
+     merge request and into the plan's checksum like every other declaration.
+
+     **A change of its own, not a `Revoke` from a role called `PUBLIC`.**
+     ADR-0010 §5 named the gap as "a grantee the model does not have"; this is
+     that grantee, given the narrowest shape that expresses the act —
+     `Change::RevokePublicExecute` carries a `RoutineId` and nothing else. A
+     `String` holding the word would be a sentinel every reader had to know
+     about, and a project may declare a role named `PUBLIC`.
+
+     **The opt-in travels beside the model**, with `strategy:` and
+     `depends_on:`, because 371 keeps what `PUBLIC` holds out of every
+     comparison: a field inside `Module` would make a declared routine stop
+     matching the identical routine read back from the catalog, which is
+     inviolable constraint 1. What it says is therefore what the plan should
+     *write*, never what the two sides should agree on — so adding or removing
+     the key is not itself a change, and takes effect the next time the plan
+     creates or rebuilds the routine.
+
+     **A fresh create carries no risk class and a rebuild carries `revoke`.**
+     Nobody held `EXECUTE` on an object that did not exist a statement earlier,
+     so demanding `--allow revoke` in front of every plan that declares a
+     function would be the friction-without-safety trade `GrantWiden` already
+     refuses. A rebuild is the other case: on this engine every module edit is
+     a drop and a create (ADR-0009 §3), the `CREATE` restores the default, and
+     whether anybody was relying on it is not something the declarations can
+     say — so the gate is asked. `Change::RoutineOrigin` is what separates the
+     two, an enum rather than a flag because telling them apart is its whole
+     job.
+
+     **It also closes the deadlock 306 left standing.** A routine somebody had
+     closed by hand used to refuse every later plan, because the rebuild would
+     restore the default and nothing in the model could take it away again —
+     hardening a managed routine and managing it were mutually exclusive. The
+     rebuild guard now accepts exactly one missing default: `PUBLIC`'s
+     `EXECUTE`, on a routine whose plan carries the revoke that re-issues it.
+     A different permission, or a different grantee, is still the refusal.
+
+     **A staged run is refused while the plan carries one.** The `CREATE` and
+     the revoke are two statements, and `--staged` commits each on its own —
+     so between them the routine is committed, visible to the whole cluster
+     and holding the default. The revoke sorts with the grants, after every
+     row the plan writes, so that window is the rest of the plan rather than
+     an instant. The same shape as the rebuild rule already in
+     `require_transactional_rebuilds`, and refused on either driver: what
+     makes it unsafe is the staging, not the engine.
+
+     **What a pull does with it.** The routines the database lets `PUBLIC`
+     execute ride beside the pulled schema and are written into those
+     declarations as `public_execute: true`. Still not a grant and still not
+     compared — but a pull that recorded nothing would hand back a project
+     whose first apply closes a routine the database has open.

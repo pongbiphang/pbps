@@ -315,7 +315,8 @@ impl Declared {
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
-                | Change::Revoke { .. } => {}
+                | Change::Revoke { .. }
+                | Change::RevokePublicExecute { .. } => {}
             }
         }
     }

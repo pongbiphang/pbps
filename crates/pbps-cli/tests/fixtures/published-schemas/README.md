@@ -26,6 +26,8 @@ constraint or enum edit when the generator and top-level copies change together.
   document agreed. The earlier `8928a71` commit changed the binary's constant to
   9 but its checked-in documents still carried 8, so those copies are not used
   as a version-9 archive.
+- `13/` adds a module's `public_execute:`, the declaration of whether a routine
+  keeps the engine's default `EXECUTE` to `PUBLIC` (issue #318, ADR-0010 §5).
 - `10/` starts the fixed-version contract and includes all accumulated changes
   through issue #191. Existing copies labeled 9 cannot be disambiguated by that
   number alone; regenerate from an updated binary or retain the exact document.

@@ -268,7 +268,8 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
-                | Change::Revoke { .. } => None,
+                | Change::Revoke { .. }
+                | Change::RevokePublicExecute { .. } => None,
             };
             if let Some(table) = contract {
                 contracts.entry(table).or_insert(i);

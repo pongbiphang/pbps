@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::data::{Cell, DataMode, Row, RowKey, Value};
-use crate::module::{Module, ModuleId, ModuleKind, ObjectName};
+use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
@@ -522,6 +522,52 @@ pub enum Change {
         target: GrantTarget,
         permissions: BTreeSet<Permission>,
     },
+
+    /// Take the engine's default `EXECUTE` to `PUBLIC` off a routine this plan
+    /// creates (ADR-0010 §5).
+    ///
+    /// # Why this is its own variant and not a `Revoke` from a role called
+    /// `PUBLIC`
+    ///
+    /// Because `PUBLIC` is not a role this model has, and a string field that
+    /// held the word would be a sentinel every reader had to know about: a
+    /// declaration may name a role `PUBLIC`, and the two would then be the
+    /// same value meaning two different things. ADR-0010 §5 names the gap as
+    /// "a grantee the model does not have", so this is that grantee — given
+    /// the narrowest shape that can express the act and nothing else. There is
+    /// no permission set (`EXECUTE` is the only default `PUBLIC` holds on a
+    /// routine) and no [`GrantTarget`] (a view or a trigger cannot be one),
+    /// so a plan cannot ask for a revoke that is not this one.
+    RevokePublicExecute {
+        routine: RoutineId,
+        origin: RoutineOrigin,
+    },
+}
+
+/// Whether the routine a [`Change::RevokePublicExecute`] follows is new in
+/// this plan, or one the plan rebuilds.
+///
+/// It decides the risk class, and it is an enum rather than a bool beside the
+/// name because distinguishing the two *is* its whole job: "nobody could
+/// execute this a moment ago, because it did not exist" and "somebody may
+/// have been able to, and nothing offline can see whether they were" are
+/// different facts, and a `true` in that position is a mistake that compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineOrigin {
+    /// The plan creates the routine. No principal held `EXECUTE` on it a
+    /// statement earlier, because the object was not there: this revoke takes
+    /// nothing away from anybody and carries no risk class. Classifying it as
+    /// one would put `--allow revoke` in front of every plan that declares a
+    /// function, which is the friction-without-safety trade [`RiskClass`]
+    /// refuses for `GrantWiden`.
+    Created,
+    /// The plan rebuilds a routine that is already there — on PostgreSQL every
+    /// module edit is a drop and a create (ADR-0009 §3), and the create
+    /// restores the engine default this then takes away again. Whether some
+    /// principal was relying on that default is not in the declarations, so
+    /// the gate is asked.
+    Rebuilt,
 }
 
 /// What a row change leaves at its key.
@@ -803,6 +849,11 @@ impl Change {
             | Change::Grant { role: name, .. }
             | Change::Revoke { role: name, .. } => format!("role {name}"),
             Change::RenameRole { from, .. } => format!("role {from}"),
+            // The routine, not the grantee. `PUBLIC` is every principal at
+            // once, so grouping by it would put every such revoke in the plan
+            // under one heading; grouping by the routine puts each beside the
+            // `CreateModule` that made it, which is the change it belongs to.
+            Change::RevokePublicExecute { routine, .. } => routine.to_string(),
             // A module says its whole identity: `app.f(integer,text)` and
             // `app.f(text)` are two objects, and a label that showed `app.f`
             // for both would group two changes as one.
@@ -854,7 +905,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => return None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => return None,
         })
     }
 
@@ -916,7 +968,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         };
         self.table().into_iter().chain(far_end)
     }
@@ -1019,7 +1072,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         }
     }
 
@@ -1079,7 +1133,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         }
     }
 
@@ -1167,7 +1222,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         }
     }
 
@@ -1218,7 +1274,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         }
     }
 
@@ -1251,6 +1308,14 @@ impl Change {
                 target,
                 permissions,
             } => Some((role, target, PermissionChange::Revoked(permissions))),
+            // Named here, and the answer is still `None`: the permission this
+            // moves is `PUBLIC`'s, and `PUBLIC` is not a role the recorded
+            // state holds (ADR-0010 §5, DECISIONS 371). A caller comparing
+            // what a plan is answerable for against the roles it recorded has
+            // nothing on either side of this one — reporting it as a role's
+            // revoke would put a grantee into that comparison that no pull
+            // ever puts there, and the whole set would then read as drift.
+            Change::RevokePublicExecute { .. } => None,
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -1296,6 +1361,9 @@ impl Change {
             | Change::Grant { role: name, .. }
             | Change::Revoke { role: name, .. } => (Some(name.as_str()), None),
             Change::RenameRole { from, to, .. } => (Some(from.as_str()), Some(to.as_str())),
+            // `PUBLIC` is not a role name; it is every principal at once, and
+            // no declaration, ids file or pull ever names it (ADR-0010 §5).
+            Change::RevokePublicExecute { .. } => (None, None),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -1370,7 +1438,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         }
     }
 
@@ -1439,7 +1508,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         }
     }
 
@@ -1493,7 +1563,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         }
     }
 
@@ -1585,7 +1656,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         }
     }
 
@@ -1627,7 +1699,8 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         }
     }
 
@@ -1676,7 +1749,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         }
     }
 
@@ -1713,7 +1787,8 @@ impl Change {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         }
     }
 
@@ -1799,7 +1874,15 @@ impl Change {
             }
             // A role drop's whole effect is revocation, on top of the reason
             // its tombstone already demanded (ADR-0005).
-            Change::DropRole { .. } | Change::Revoke { .. } => {
+            // A rebuild restores the engine's default `EXECUTE` to `PUBLIC`
+            // and this takes it away again; what the declarations cannot say
+            // is whether anyone was using it (ADR-0010 §5).
+            Change::DropRole { .. }
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute {
+                origin: RoutineOrigin::Rebuilt,
+                ..
+            } => {
                 r.insert(RiskClass::Revoke);
             }
             Change::Grant { .. } => {
@@ -1820,6 +1903,12 @@ impl Change {
             // unique index, which can fail on the data like any other
             // uniqueness. A plain index constrains nothing.
             | Change::AddIndex { .. }
+            // A revoke that follows a `CREATE` takes nothing from anybody:
+            // the object it names did not exist a statement earlier.
+            | Change::RevokePublicExecute {
+                origin: RoutineOrigin::Created,
+                ..
+            }
             // Neither creating nor re-stating a module risks anything: a failed
             // CREATE OR ALTER rolls back with the plan's transaction and the
             // environment is unchanged.
@@ -2417,6 +2506,33 @@ mod tests {
             .columns_promised()
             .is_empty()
         );
+    }
+
+    /// The saved plan is the artifact a human approves and a checksum pins, so
+    /// the grantee this change names has to survive the file. `PUBLIC` is not
+    /// written down anywhere in it — it is the variant — and the routine is
+    /// one string with its signature, the same spelling a module key uses.
+    #[test]
+    fn a_public_execute_revoke_round_trips_and_names_the_routine_by_signature() {
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::RevokePublicExecute {
+                routine: "app.f(integer,text)".parse().unwrap(),
+                origin: RoutineOrigin::Rebuilt,
+            })],
+        };
+        let json = serde_json::to_string(&cs).unwrap();
+        assert!(json.contains(r#""op":"revoke_public_execute""#), "{json}");
+        assert!(
+            json.contains(r#""routine":"app.f(integer,text)""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""origin":"rebuilt""#), "{json}");
+        assert_eq!(serde_json::from_str::<ChangeSet>(&json).unwrap(), cs);
+
+        // A name without a signature is a view's, not a routine's, and is
+        // refused rather than read as a routine that takes no arguments.
+        let bare = json.replace("app.f(integer,text)", "app.v");
+        assert!(serde_json::from_str::<ChangeSet>(&bare).is_err(), "{bare}");
     }
 
     #[test]

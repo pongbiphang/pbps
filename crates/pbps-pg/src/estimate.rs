@@ -644,7 +644,8 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::DropRole { .. }
         | Change::RenameRole { .. }
         | Change::Grant { .. }
-        | Change::Revoke { .. } => None,
+        | Change::Revoke { .. }
+        | Change::RevokePublicExecute { .. } => None,
     }
 }
 

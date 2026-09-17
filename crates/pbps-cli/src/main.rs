@@ -1247,7 +1247,12 @@ fn cmd_pull(
         let path = declaration_file::module_path(&dir, id, module.kind)?;
         std::fs::write(
             &path,
-            pbps_load::render_module(id, module, &Default::default()),
+            pbps_load::render_module(
+                id,
+                module,
+                &Default::default(),
+                pulled.public_execute.contains(id),
+            ),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
@@ -2032,7 +2037,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
                 // identity, so there is no rename intent to record (ADR-0002).
-                pbps_load::render_module(&m.id, &m.module, &m.depends_on),
+                pbps_load::render_module(&m.id, &m.module, &m.depends_on, m.public_execute),
                 Vec::new(),
             ),
             pbps_load::LoadedFile::Table(t) => {

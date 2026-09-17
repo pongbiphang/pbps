@@ -140,7 +140,8 @@ pub async fn key_drop_blockers(
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
-                | Change::Revoke { .. } => return None,
+                | Change::Revoke { .. }
+                | Change::RevokePublicExecute { .. } => return None,
             };
             let stored = stored_key_table(cs, index, table)?;
             Some((index, stored, kind, name))
@@ -295,7 +296,8 @@ pub async fn key_drop_blockers(
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => continue,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => continue,
         };
         let Some(table) = stored_key_table(cs, index, table) else {
             continue;
@@ -478,7 +480,8 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => None,
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => None,
         })
         .collect()
 }

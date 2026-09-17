@@ -920,6 +920,16 @@ impl Dialect for Postgres {
         true
     }
 
+    /// **Yes, and it is the reason this method exists.** Measured on 18.6: a
+    /// function created with no grant at all has `proacl IS NULL`, which is
+    /// not "granted to nobody" but "the built-in default applies", and that
+    /// default is `EXECUTE` to `PUBLIC` (ADR-0010 §5). A `SET ROLE` to a
+    /// principal holding nothing but `USAGE` on the schema can call it — and
+    /// where the routine is `SECURITY DEFINER`, call it as its owner.
+    fn creates_public_executable_routines(&self) -> bool {
+        true
+    }
+
     /// Every problem with a role, before anything connects (ADR-0010 §1, §2
     /// and §6). See [`validate::role`].
     fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {

@@ -3131,6 +3131,12 @@ pub fn cmd_bootstrap(
         &pbps_model::Hints {
             strategies: Default::default(),
             module_deps: loaded.hints.module_deps.clone(),
+            // Carried for the same reason, and one more: it is what decides
+            // whether the routines this bootstrap creates arrive executable
+            // by every principal in the cluster (ADR-0010 §5). Dropping it
+            // here would make the first apply into an empty database the one
+            // apply that leaves the engine default standing.
+            public_execute: loaded.hints.public_execute.clone(),
         },
     )
     .map_err(|errs| {
@@ -5904,6 +5910,7 @@ mod tests {
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
+            public_execute: Default::default(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
                 entry(
@@ -9405,6 +9412,7 @@ mod tests {
                     why: "its definition cannot be read back".into(),
                 },
             ],
+            public_execute: Default::default(),
         }
     }
 

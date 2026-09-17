@@ -337,7 +337,10 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::SetDataMode { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
-        | Change::DropModule { .. } => None,
+        | Change::DropModule { .. }
+        // `PUBLIC` is not a role the summary can count: no declaration, ids
+        // file or pull ever names it (ADR-0010 §5).
+        | Change::RevokePublicExecute { .. } => None,
     }
 }
 
@@ -383,7 +386,8 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => {}
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => {}
         }
     }
     Renames { tables, roles }
@@ -726,6 +730,9 @@ pub fn describe(c: &Change) -> String {
             permissions,
             ..
         } => format!("- revoke {} on {target}", permissions_list(permissions)),
+        Change::RevokePublicExecute { routine, .. } => {
+            format!("- revoke execute on {routine} from PUBLIC")
+        }
     }
 }
 

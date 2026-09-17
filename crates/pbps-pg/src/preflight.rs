@@ -761,7 +761,8 @@ impl AsStored {
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
-                | Change::Revoke { .. } => {}
+                | Change::Revoke { .. }
+                | Change::RevokePublicExecute { .. } => {}
             }
         }
         this
@@ -3247,7 +3248,8 @@ fn build(
         | Change::DropRole { .. }
         | Change::RenameRole { .. }
         | Change::Grant { .. }
-        | Change::Revoke { .. } => Ok(Vec::new()),
+        | Change::Revoke { .. }
+        | Change::RevokePublicExecute { .. } => Ok(Vec::new()),
     }
 }
 
@@ -3484,7 +3486,8 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => Vec::new(),
+            | Change::Revoke { .. }
+            | Change::RevokePublicExecute { .. } => Vec::new(),
         };
         for (table, name, constraint) in keys {
             match key_collation_probe(&names, table, name, constraint) {

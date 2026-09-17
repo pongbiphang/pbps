@@ -1033,7 +1033,9 @@ fn rebuilt_modules(
         .collect()
 }
 
-/// PostgreSQL rebuilds must keep their locks, checks and DDL in one transaction.
+/// PostgreSQL rebuilds must keep their locks, checks and DDL in one
+/// transaction — and so must the revoke that closes a routine this plan
+/// creates.
 pub fn require_transactional_rebuilds(
     driver: Driver,
     changes: &ChangeSet,
@@ -1043,6 +1045,39 @@ pub fn require_transactional_rebuilds(
         anyhow::bail!(
             "PostgreSQL module rebuilds require a transaction to preserve their catalog state \
              (ADR-0009 §3); remove --staged and plan again"
+        );
+    }
+    // The `CREATE` and the revoke that closes the routine are two statements,
+    // and a staged run commits each one on its own (DECISIONS 517). Between
+    // those two commits the routine is visible to the whole cluster holding
+    // this engine's default `EXECUTE` to `PUBLIC` — and the revoke sorts with
+    // the grants, after every row the plan writes, so the window is the rest
+    // of the plan rather than an instant. A `SECURITY DEFINER` routine open
+    // for that long is the exposure this revoke exists to prevent, so the
+    // plan is refused rather than run with a gap in it.
+    let closes: Vec<String> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::RevokePublicExecute { routine, .. } = &p.change {
+                Some(routine.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if staged && !closes.is_empty() {
+        anyhow::bail!(
+            "a staged run commits each statement on its own, so {} would stay executable by \
+             every principal in the cluster between its `CREATE` and the revoke that closes it \
+             (DECISIONS 517): {}.\nRemove --staged and plan again, or declare \
+             `public_execute: true` on the routines that are meant to stay open",
+            if closes.len() == 1 {
+                "1 routine".to_owned()
+            } else {
+                format!("{} routines", closes.len())
+            },
+            closes.join(", ")
         );
     }
     Ok(())
@@ -1553,6 +1588,31 @@ mod tests {
         assert!(require_transactional_rebuilds(Driver::Mssql, &cs, true).is_ok());
         assert!(require_transactional_rebuilds(Driver::Postgres, &cs, true).is_err());
         assert!(require_transactional_rebuilds(Driver::Postgres, &cs, false).is_ok());
+    }
+
+    /// The `CREATE` and the revoke that closes the routine are two statements,
+    /// and a staged run commits each on its own — so between them the routine
+    /// is committed, visible, and executable by every principal in the
+    /// cluster (DECISIONS 517). Refused on **either** driver: what makes this
+    /// unsafe is the staging, not the engine, and the change only ever
+    /// reaches a plan for an engine that has the default.
+    #[test]
+    fn a_staged_plan_that_closes_a_routine_to_public_is_refused_on_either_driver() {
+        use pbps_model::{Change, PlannedChange};
+        let mut cs = ChangeSet::default();
+        cs.changes
+            .push(PlannedChange::new(Change::RevokePublicExecute {
+                routine: "app.f(integer)".parse().unwrap(),
+                origin: pbps_model::RoutineOrigin::Created,
+            }));
+        for driver in [Driver::Postgres, Driver::Mssql] {
+            let e = require_transactional_rebuilds(driver, &cs, true)
+                .expect_err("a staged run leaves the routine open")
+                .to_string();
+            assert!(e.contains("app.f(integer)"), "{e}");
+            assert!(e.contains("public_execute: true"), "{e}");
+            assert!(require_transactional_rebuilds(driver, &cs, false).is_ok());
+        }
     }
 
     /// A runtime for the live tests below, built by hand because the

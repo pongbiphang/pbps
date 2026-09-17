@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.

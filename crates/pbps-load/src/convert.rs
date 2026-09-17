@@ -35,6 +35,12 @@ pub struct LoadedModule {
     /// Kept out of `module` so that `Schema` equality stays a question about
     /// the database alone: creation order is invisible there (ADR-0002).
     pub depends_on: std::collections::BTreeSet<ModuleId>,
+    /// Whether the declaration asks for the engine's default `EXECUTE` to
+    /// `PUBLIC` to be left standing. Kept out of `module` for the same
+    /// reason, from the other side: what `PUBLIC` holds is never compared
+    /// (ADR-0010 §5, DECISIONS 371), so a module carrying it would stop
+    /// matching the identical module read back from the catalog.
+    pub public_execute: bool,
 }
 
 /// The result of loading one role declaration (ADR-0005).
@@ -647,6 +653,25 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         }
     }
 
+    // Only a routine has an `EXECUTE` privilege to leave standing: a view is
+    // selected from and a trigger is not invoked by anyone at all, so the key
+    // on either is a decision that would never be acted on. Refused rather
+    // than ignored — a line a reader takes for a security control and the
+    // tool takes for nothing is the worst of the three readings.
+    let public_execute = match &dto.public_execute {
+        Some(v) if !matches!(kind, ModuleKind::Procedure | ModuleKind::Function) => {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&v.defined),
+                format!("`public_execute:` is meaningless on a {kind}"),
+                "only a procedure or a function has an `EXECUTE` privilege; remove the key",
+            ));
+            false
+        }
+        Some(v) => v.value,
+        None => false,
+    };
+
     match (id, errs.is_empty()) {
         (Some(id), true) => Ok(LoadedModule {
             id,
@@ -656,6 +681,7 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
                 definition: dto.definition,
             },
             depends_on,
+            public_execute,
         }),
         _ => Err(errs),
     }

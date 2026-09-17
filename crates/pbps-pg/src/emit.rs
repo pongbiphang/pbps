@@ -2364,6 +2364,29 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             ),
         )?]),
 
+        // `PUBLIC` is written bare, and that is the whole point of the
+        // variant: it is SQL's keyword for every principal at once, and
+        // `quote` would turn it into `"PUBLIC"`, a role of that name — which
+        // on this engine is a different grantee, and on a cluster that has no
+        // such role is `role "PUBLIC" does not exist`.
+        //
+        // `ON ROUTINE`, because one word has to take a function and a
+        // procedure alike (DECISIONS 372), and the signature is always
+        // spelled: this change carries a `RoutineId`, so there is no
+        // overloaded bare name to be ambiguous about.
+        Change::RevokePublicExecute { routine, .. } => {
+            let target = GrantTarget::Routine(routine.clone());
+            let execute = BTreeSet::from([Permission::Execute]);
+            Ok(vec![scoped(
+                pg,
+                target.schema(),
+                &format!(
+                    "REVOKE EXECUTE ON {} FROM PUBLIC;",
+                    securable(&target, &execute)?
+                ),
+            )?])
+        }
+
         // Reference data (ADR-0004). Each row change is one statement — a `DO`
         // block carrying the write and the checks that hold it to what the
         // plan reviewed — under the table's own write path, because the
@@ -3277,6 +3300,44 @@ mod tests {
             "{}",
             sql[0]
         );
+    }
+
+    /// `PUBLIC` is the keyword, never a quoted identifier (issue #318,
+    /// ADR-0010 §5). Quoted, it names a role of that spelling — a different
+    /// grantee where one exists, and `role "PUBLIC" does not exist` where one
+    /// does not. And the securable is `ROUTINE` with the signature spelled,
+    /// because one word has to take a function and a procedure alike
+    /// (DECISIONS 372).
+    #[test]
+    fn a_public_execute_revoke_names_the_keyword_and_the_signature() {
+        let pg = Postgres::new();
+        for (spelled, expected) in [
+            (
+                "app.f(integer, text)",
+                "REVOKE EXECUTE ON ROUTINE \"app\".\"f\"(integer, text) FROM PUBLIC;",
+            ),
+            (
+                "app.zero()",
+                "REVOKE EXECUTE ON ROUTINE \"app\".\"zero\"() FROM PUBLIC;",
+            ),
+        ] {
+            let sql = sql_of(
+                &pg,
+                &Change::RevokePublicExecute {
+                    routine: spelled.parse().expect("a routine id parses"),
+                    origin: pbps_model::RoutineOrigin::Created,
+                },
+            );
+            assert_eq!(sql.len(), 1, "{spelled}");
+            assert!(sql[0].contains(expected), "{spelled}: {}", sql[0]);
+            // Never the quoted form, which would be a different grantee.
+            assert!(!sql[0].contains("\"PUBLIC\""), "{spelled}: {}", sql[0]);
+            assert!(
+                sql[0].starts_with("SET search_path = \"app\", \"pg_temp\";"),
+                "{spelled}: {}",
+                sql[0]
+            );
+        }
     }
 
     /// ADR-0010 §3. The principal is the cluster's, so each of the three

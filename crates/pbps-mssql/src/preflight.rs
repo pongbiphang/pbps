@@ -432,7 +432,8 @@ impl AsStored {
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
-                | Change::Revoke { .. } => {}
+                | Change::Revoke { .. }
+                | Change::RevokePublicExecute { .. } => {}
             }
         }
         this
@@ -818,7 +819,11 @@ fn build(
         // an impossible grant inside the transaction.
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
-        | Change::RenameRole { .. } => Ok(Vec::new()),
+        | Change::RenameRole { .. }
+        // This dialect never produces one and `emit` refuses it; a probe
+        // would be a second opinion about a statement that will not be
+        // written.
+        | Change::RevokePublicExecute { .. } => Ok(Vec::new()),
 
         // Except for the one thing a permission change can fail on that is
         // not the permission: the securable. `validate` accepts a schema

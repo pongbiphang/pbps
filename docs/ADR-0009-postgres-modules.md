@@ -1387,10 +1387,15 @@ grant".
   declared role or not, because the model holds no flag for it to restate.
 - **The undeclared cases still refuse, and so do six the model cannot express
   regardless of who holds them.** A grant to a role the plan does not carry on
-  this target has nothing to restate it from. `PUBLIC` stays off the
-  restorable path *for good* (DECISIONS 306): there is no grantee named
-  `PUBLIC` for a declaration to hold, so no `Grant` can ever restate on its
-  behalf. And unchanged from before #248, because none of them is
+  this target has nothing to restate it from. `PUBLIC` stayed off the
+  restorable path while nothing could name it; issue #318 gave it one thing
+  that can — a routine's missing default `EXECUTE`, accepted where the plan
+  carries the `RevokePublicExecute` that re-issues it after the `CREATE`
+  (ADR-0010 §5 amendment, DECISIONS 517). No `Grant` restates on `PUBLIC`'s
+  behalf even so: the state is the *absence* of the default, so what the plan
+  carries is the revoke, and any other permission or a missing default no such
+  revoke names still refuses. And unchanged from before #248, because none of
+  them is
   expressible at all: a column-level grant (`pg_attribute.attacl`), `WITH
   GRANT OPTION`, an owner a rebuild would transfer, `reloptions`, a view
   column default, and a trigger's `tgenabled`.
