@@ -132,6 +132,7 @@ impl ServerRuntime {
         anchors(init).map_err(Premise::Anchors.named())?;
         let rows = mount_rows(init).map_err(Premise::Mounts.named())?;
         profile::contained(&rows, self.profile).map_err(Error::Mount)?;
+        device_not_engine_writable(init).map_err(Premise::Device.named())?;
         occupants(init, self.profile)?;
         accounted(init, forwarders)?;
         self.init.check().map_err(Premise::Resources.named())
@@ -170,6 +171,23 @@ fn anchors(init: &ProcessLease) -> Result<(), UnqualifiedProcess> {
         return Err(UnqualifiedProcess);
     }
     if init.read_root_dir("sys/class/net")? != std::collections::BTreeSet::from(["lo".to_owned()]) {
+        return Err(UnqualifiedProcess);
+    }
+    init.check()
+}
+
+/// `/dev` is a tmpfs the runtime manages and cannot portably be mounted
+/// `noexec`, unlike the other private tmpfs the mount allowlist requires it
+/// of. What keeps a task from placing an executable there instead is that it
+/// is root-owned and writable by nobody else, and every task in the container
+/// is unprivileged (`occupants`). Measured in the container's own mount
+/// namespace, so the mount's host-side super-options and any user-namespace
+/// mapping do not confuse it (finding on #640).
+fn device_not_engine_writable(init: &ProcessLease) -> Result<(), UnqualifiedProcess> {
+    use std::os::unix::fs::MetadataExt as _;
+    let dev = init.open_in_root("dev")?;
+    let metadata = dev.metadata().map_err(|_| UnqualifiedProcess)?;
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Err(UnqualifiedProcess);
     }
     init.check()

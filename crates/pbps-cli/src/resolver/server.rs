@@ -96,6 +96,7 @@ pub enum Premise {
     Network,
     Anchors,
     Mounts,
+    Device,
     Occupants,
     Accounting,
 }
@@ -114,6 +115,7 @@ impl std::fmt::Display for Premise {
             Self::Network => "the container's network namespace is not a lone loopback device with no route out",
             Self::Anchors => "the container's /proc or /sys is not its own instance",
             Self::Mounts => "the container's mount table is unreadable",
+            Self::Device => "the container's /dev is not a root-owned tmpfs an unprivileged task cannot write to",
             Self::Occupants => "a task in the container's PID namespace is not at the profile's uid, group, privileges or cgroup",
             Self::Accounting => "a process outside the container's PID namespace shares its network or mount namespace",
         })
