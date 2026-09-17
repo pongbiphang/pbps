@@ -72,9 +72,12 @@ static PROFILES: &[ServerProfile] = &[
         driver: Driver::Mssql,
         executable: "sqlservr",
         uid: 10001,
-        // The Microsoft image runs `sqlservr` as `10001:0`: its group is root,
-        // measured, and the Docker profile's own bootstrap uses `--regid=0`.
-        gid: 0,
+        // Run as `10001:10001` with supplementary group `10001`: the mssql
+        // user's own group in the Microsoft image, which `--user 10001` (the
+        // natural unprivileged way to run it) resolves to. Measured on the
+        // pinned image; the Docker profile's `--regid=0` is a different
+        // deployment and not what a supplied container gets.
+        gid: 10001,
         // NET_BIND_SERVICE: the Linux image keeps it for the engine's listener.
         capabilities: 0x400,
         port: 1433,

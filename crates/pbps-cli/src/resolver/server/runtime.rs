@@ -188,9 +188,11 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
     let bounded = cgroup_relative(init).map_err(Premise::Occupants.named())?;
     for_each_occupant(init, "pid", |occupant| {
         // Membership has to hold both ways. A qualified task that left the
-        // namespaces — into an externally connected network, say — would
-        // bridge the run straight out of its containment.
-        for namespace in ["net", "mnt"] {
+        // namespaces — into an externally connected network, say, or an
+        // external IPC namespace to receive through foreign shared memory —
+        // would bridge the run straight out of its containment while keeping
+        // its access to the engine.
+        for namespace in ["net", "mnt", "ipc"] {
             if !init.same_namespace(occupant, namespace)? {
                 return Err(UnqualifiedProcess);
             }
