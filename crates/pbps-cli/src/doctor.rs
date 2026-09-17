@@ -197,10 +197,11 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // environment's own recorded state, read where the permission question is
     // actually asked (DECISIONS 439).
     let ids = crate::read_ids(project).unwrap_or_default();
-    let (referenced, referenced_columns) = referenced_targets(project);
+    let keys = foreign_keys(project);
     let declared = Declared {
-        referenced,
-        referenced_columns,
+        referenced: keys.referenced,
+        referenced_columns: keys.referenced_columns,
+        declared_keys: keys.declared,
         tables: managed_tables(project),
         granted: grant_targets(project, &ids),
         data: data_tables(project),
@@ -457,25 +458,27 @@ fn managed_tables(project: &Project) -> Vec<pbps_model::ObjectName> {
 /// #215). Passing the union keeps a key's subset distinct from the target's
 /// complete catalog column set, which would demand unrelated grants.
 ///
-/// Declarations that do not load give an empty target list and an empty map,
+/// The whole map of declared keys travels beside the undeclared half, because
+/// the two answer different questions and only one walk of the declarations
+/// answers both: which targets are asked about at object scope, and which keys
+/// the environment holds that the next apply will take away (DECISIONS 513).
+///
+/// Declarations that do not load give an empty target list and empty maps,
 /// for the reason [`managed_schemas`] gives.
-fn referenced_targets(
-    project: &Project,
-) -> (
-    Vec<pbps_model::ObjectName>,
-    pbps_db::doctor::ReferencedColumns,
-) {
+fn foreign_keys(project: &Project) -> ForeignKeys {
     let Ok(loaded) = crate::load_quiet(project) else {
-        return (Vec::new(), pbps_db::doctor::ReferencedColumns::new());
+        return ForeignKeys::default();
     };
     let declared: std::collections::BTreeSet<&pbps_model::TableName> =
         loaded.schema.tables.keys().collect();
     let mut targets: std::collections::BTreeSet<pbps_model::ObjectName> =
         std::collections::BTreeSet::new();
     let mut columns = pbps_db::doctor::ReferencedColumns::new();
-    for table in loaded.schema.tables.values() {
+    let mut keys = pbps_db::doctor::DeclaredKeys::new();
+    for (name, table) in &loaded.schema.tables {
         for fk in table.foreign_keys.values() {
             let target = &fk.references_table;
+            keys.entry(name.clone()).or_default().insert(target.clone());
             if declared.contains(target) {
                 continue;
             }
@@ -486,7 +489,22 @@ fn referenced_targets(
                 .extend(fk.references_columns.iter().cloned());
         }
     }
-    (targets.into_iter().collect(), columns)
+    ForeignKeys {
+        referenced: targets.into_iter().collect(),
+        referenced_columns: columns,
+        declared: keys,
+    }
+}
+
+/// What one walk of the declared foreign keys tells `doctor`.
+#[derive(Debug, Default)]
+struct ForeignKeys {
+    /// Targets the declarations do not hold.
+    referenced: Vec<pbps_model::ObjectName>,
+    /// The columns a declared key names on each of `referenced`'s targets.
+    referenced_columns: pbps_db::doctor::ReferencedColumns,
+    /// Every declared key, by the table that holds it.
+    declared: pbps_db::doctor::DeclaredKeys,
 }
 
 /// The tables whose declarations carry rows, and what each would have written
@@ -621,6 +639,8 @@ struct Declared {
     /// The columns a declared key names on each of `referenced`'s targets
     /// (issue #215, DECISIONS 440).
     referenced_columns: pbps_db::doctor::ReferencedColumns,
+    /// Every declared foreign key, by the table that holds it (DECISIONS 513).
+    declared_keys: pbps_db::doctor::DeclaredKeys,
     /// What the managed roles are granted on (ADR-0005).
     granted: pbps_db::doctor::GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
@@ -699,6 +719,7 @@ async fn examine(
         referenced_columns: &declared.referenced_columns,
         granted: &declared.granted,
         data: &declared.data,
+        declared_keys: &declared.declared_keys,
     };
     match crate::engine::permissions(&mut conn, &declared.ids, &ask).await {
         Ok(held) => {
@@ -1125,7 +1146,8 @@ mod tests {
         )
         .unwrap();
         let project = Project::load(&dir.join("pbps.yml")).unwrap();
-        let (targets, columns) = referenced_targets(&project);
+        let keys = foreign_keys(&project);
+        let (targets, columns) = (keys.referenced, keys.referenced_columns);
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(
@@ -1144,6 +1166,27 @@ mod tests {
             ["code".to_owned(), "label".to_owned()]
                 .into_iter()
                 .collect()
+        );
+        // The declared half is the whole map, both classifications together:
+        // the question it answers is which keys this environment holds that
+        // the declarations still name, and a target's own status is beside
+        // the point (DECISIONS 513).
+        assert_eq!(
+            keys.declared[&"app.child".parse::<pbps_model::ObjectName>().unwrap()],
+            [
+                "app.parent".parse::<pbps_model::ObjectName>().unwrap(),
+                "app.t".parse().unwrap(),
+                "shared.parent".parse().unwrap(),
+            ]
+            .into_iter()
+            .collect(),
+            "every target of a declared key, named once"
+        );
+        assert!(
+            !keys
+                .declared
+                .contains_key(&"app.t".parse::<pbps_model::ObjectName>().unwrap()),
+            "a table declaring no key holds no entry"
         );
     }
 

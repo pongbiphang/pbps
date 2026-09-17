@@ -584,6 +584,15 @@ fn values_list(rows: usize, columns: usize) -> String {
 /// Project ids connect pending table/column names to this environment's last
 /// recorded identities; permission gaps name the current grantable securable
 /// (DECISIONS 484). A freed name belongs to a future table, not its old occupant.
+///
+/// [`Ask::declared_keys`] is the field this engine does not read. It says which
+/// keys the next apply takes away, which only a demand made *about a key* can
+/// care about, and there is none here: the children a delete's count reads are
+/// asked about on SQL Server alone (DECISIONS 511), and a schema move carries a
+/// relation's privileges with it, so it demands nothing at its destination —
+/// measured on 18.6, where `ALTER TABLE ... SET SCHEMA` left `relacl` and
+/// `has_table_privilege` unchanged, which is the opposite of what the other
+/// engine's transfer does (DECISIONS 512).
 pub async fn permissions(
     conn: &mut Conn,
     ask: &Ask<'_>,

@@ -23,7 +23,7 @@ use crate::catalog::get;
 
 // What `doctor` asks about is read off the declarations and is `pbps-db`'s;
 // what this engine answers, and how, is below (DECISIONS 417).
-pub use pbps_db::doctor::{DataDemand, DataTables, GrantTargets, ReferencedColumns};
+pub use pbps_db::doctor::{DataDemand, DataTables, DeclaredKeys, GrantTargets, ReferencedColumns};
 
 /// Where a permission has to be held for a deployment to succeed.
 ///
@@ -1367,6 +1367,13 @@ fn resolve_for_query<'a>(
 /// to the schema answer; `Held::granted_objects` has no such fallback, so a
 /// refused grant target is reported through `Held::granted_unresolvable` as
 /// an unconditional gap instead.
+//
+// The parameters are the fields of `Ask` this engine's permission model
+// actually answers, spelled out rather than taken as the whole ask — the
+// PostgreSQL side takes `Ask` because it reads all of it. Each is a distinct
+// type, so the count is not somewhere a miscounted call can hide: swapping any
+// two of them fails to compile.
+#[allow(clippy::too_many_arguments)]
 pub async fn permissions(
     conn: &mut Conn,
     managed_tables: &[ObjectName],
@@ -1374,6 +1381,7 @@ pub async fn permissions(
     referenced: &ReferencedColumns,
     granted: &GrantTargets,
     data: &DataTables,
+    declared_keys: &DeclaredKeys,
     project_ids: &pbps_model::IdsFile,
 ) -> Result<Held, DbError> {
     let rows = conn
@@ -1644,11 +1652,22 @@ pub async fn permissions(
     // The managed question answers for the source, and this child has no
     // `data:` block for `data_gaps` to answer for its destination, so nothing
     // else covers the read. Its destination schema is demanded here instead.
-    let removable: Vec<ObjectName> = data
+    //
+    // **And the exception has an exception**, which is the key that does not
+    // survive the plan. The guard discovers its children from the catalog
+    // *inside* the delete's transaction, by which time a `DropForeignKey` has
+    // already run (`order_key` 2 against 12), so the catalog no longer names
+    // that child and nothing reads it. `doctor` never looks at a plan, but it
+    // does not have to: a key the environment holds and the declarations do
+    // not name is one the next apply takes away, and the declarations are
+    // already in hand (`declared_keys`). Demanding the destination for it
+    // would report a gap against a plan this account can run (DECISIONS 513).
+    let removable: BTreeMap<&ObjectName, ObjectName> = data
         .iter()
         .filter(|(_, demand)| demand.removes())
-        .filter_map(|(declared, _)| data_securable.get(declared).cloned())
+        .filter_map(|(declared, _)| Some((declared, data_securable.get(declared)?.clone())))
         .collect();
+    let removable_names: Vec<ObjectName> = removable.values().cloned().collect();
     // The managed tables this plan moves between schemas, by the name the
     // environment has for them now — which is the name the discovery query
     // answers with, since it reads the catalog.
@@ -1661,10 +1680,14 @@ pub async fn permissions(
     if !removable.is_empty() {
         let mut columns = ReferencedColumns::new();
         let mut destinations: BTreeSet<String> = BTreeSet::new();
-        for (child, named) in self::delete_children(conn, &removable).await? {
+        for (child, named) in self::delete_children(conn, &removable_names).await? {
             if !managed_names.contains(&child) {
                 columns.insert(child, named);
-            } else if let Some(declared) = moved.get(&child) {
+            } else if let Some(declared) = moved.get(&child)
+                && declared_keys
+                    .get(*declared)
+                    .is_some_and(|targets| targets.iter().any(|t| removable.contains_key(t)))
+            {
                 destinations.insert(declared.schema.clone());
             }
         }

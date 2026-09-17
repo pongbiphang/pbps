@@ -13538,3 +13538,35 @@ SPEC is in sync with all of these.
      transfer statement itself wants on top of `ALTER` on the destination. That
      over-demand is a separate question (#352), and this entry deliberately
      leaves it where it was.
+
+513. **A key the declarations no longer name carries no demand, because the plan
+     drops it before anything reads it.**
+
+     The delete-count child that moves between schemas is demanded at its
+     destination (511, 512), and the discovery that finds it reads the catalog —
+     which still holds the key the next apply is about to take away. A managed
+     child that both moves and drops its key into the parent was therefore asked
+     for a `SELECT` on the destination schema that nothing would ever spend:
+     `DropForeignKey` is `order_key` 2 against `DeleteRow`'s 12, the guard
+     (`preflight::still_referenced`) discovers its children from the catalog
+     *inside* the delete's transaction, and by then the constraint is gone. The
+     probe that runs before the statements does still see it, and leaves it out
+     for itself (128) — but the probe reads the child at its *source* name, from
+     before the transfer, so the destination is nobody's demand.
+
+     `doctor` never looks at a plan (417), and does not have to here: a key the
+     catalog holds that the declarations do not name is a `DropForeignKey` the
+     next apply will write, and the declarations are already in hand. So the
+     declared keys travel with the rest of the ask (`Ask::declared_keys`), and
+     the destination is demanded only for a child whose declaration still names
+     a key into a table this project can delete a row from.
+
+     **This narrows one case and not its neighbour**, deliberately. A child the
+     plan drops outright (`DropTable`, `order_key` 6) is also left out of the
+     guard's read, and `doctor` still demands the count's `SELECT` on it — but
+     that child is *undeclared* by construction, since a dropped table is one the
+     declarations no longer hold, and nothing in a declarations-only reading
+     distinguishes it from somebody else's table that will still be there. The
+     demand is on an object that exists, at the securable it exists on, which is
+     an over-demand this reading cannot see; the destination demand was one it
+     could.

@@ -73,6 +73,7 @@ async fn an_undeclared_foreign_key_parent_in_a_managed_schema_is_asked_about() {
         &referenced,
         &pbps_mssql::doctor::GrantTargets::default(),
         &Default::default(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -102,6 +103,7 @@ async fn an_undeclared_foreign_key_parent_in_a_managed_schema_is_asked_about() {
         &["app".to_owned()],
         &referenced,
         &pbps_mssql::doctor::GrantTargets::default(),
+        &Default::default(),
         &Default::default(),
         &pbps_model::IdsFile::default(),
     )
@@ -171,6 +173,7 @@ async fn a_column_deny_is_a_gap_under_an_object_grant_and_under_a_schema_grant()
             &Default::default(),
             &pbps_mssql::doctor::GrantTargets::default(),
             &declared,
+            &Default::default(),
             &pbps_model::IdsFile::default(),
         )
         .await
@@ -207,6 +210,7 @@ async fn a_column_deny_is_a_gap_under_an_object_grant_and_under_a_schema_grant()
             &Default::default(),
             &pbps_mssql::doctor::GrantTargets::default(),
             &declared,
+            &Default::default(),
             &pbps_model::IdsFile::default(),
         )
         .await
@@ -299,6 +303,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &declared,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -362,6 +367,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &declared,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -396,6 +402,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &declared,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -423,6 +430,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &ensured,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -466,6 +474,14 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
     .await
     .expect("record the environment's own state");
     let moving = [parent.clone(), "dest.declared_child".parse().unwrap()];
+    // And it is demanded because the key *survives* the move: the declarations
+    // still name it, so the guard the delete carries will still discover it.
+    let keeps_the_key: pbps_mssql::doctor::DeclaredKeys = [(
+        "dest.declared_child".parse().unwrap(),
+        [parent.clone()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -474,6 +490,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &declared,
+        &keeps_the_key,
         &project_ids,
     )
     .await
@@ -497,6 +514,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &declared,
+        &keeps_the_key,
         &project_ids,
     )
     .await
@@ -504,6 +522,54 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
     assert!(
         !named_gaps(&held).contains(&"SELECT on SCHEMA::[dest]".to_owned()),
         "granting it there closes the gap: {held:?}"
+    );
+
+    // The exception's own exception: a key the declarations no longer name is
+    // one this plan drops, and the drop sorts before the delete (`order_key` 2
+    // against 12). The guard discovers its children from the catalog *inside*
+    // the delete's transaction, so it never reads this child at all, and
+    // demanding the destination would report a gap against a plan that runs
+    // (DECISIONS 513).
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; REVOKE SELECT ON SCHEMA::dest FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("take the destination read away again");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &moving,
+        &["app".to_owned(), "dest".to_owned()],
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &declared,
+        &Default::default(),
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        !named_gaps(&held).contains(&"SELECT on SCHEMA::[dest]".to_owned()),
+        "a key the declarations do not name demands nothing at the destination: {held:?}"
+    );
+    // The premise, from the engine: the guard's question is the catalog's, and
+    // once the drop has run the catalog no longer names this child — which is
+    // why nothing after the drop reads it.
+    assert_eq!(
+        enabled_keys_into(&mut db.conn, "app.t", "app.declared_child").await,
+        1,
+        "the premise: the key is there while the plan has not run"
+    );
+    db.conn
+        .execute("ALTER TABLE app.declared_child DROP CONSTRAINT fk_declared;")
+        .await
+        .expect("drop the key the declarations no longer name");
+    assert_eq!(
+        enabled_keys_into(&mut db.conn, "app.t", "app.declared_child").await,
+        0,
+        "and the guard that runs after the drop finds no child to read"
     );
 
     drop(lp);
@@ -571,6 +637,7 @@ async fn a_column_the_plan_adds_is_demanded_before_the_plan_runs() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &today,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -590,6 +657,7 @@ async fn a_column_the_plan_adds_is_demanded_before_the_plan_runs() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &adds_a_column,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -632,6 +700,7 @@ async fn a_column_the_plan_adds_is_demanded_before_the_plan_runs() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &adds_a_column,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -721,6 +790,7 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
+        &Default::default(),
         &project_ids,
     )
     .await
@@ -825,4 +895,24 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
     drop(lp);
     drop_login(&login).await;
     db.drop().await;
+}
+
+/// How many *enabled* foreign keys the catalog names from `child` into
+/// `parent` — the question `preflight::still_referenced` asks inside the
+/// delete's own transaction, asked here as the owner.
+async fn enabled_keys_into(conn: &mut Conn, parent: &str, child: &str) -> i32 {
+    let rows = conn
+        .query(&format!(
+            "SELECT COUNT(*) AS n FROM sys.foreign_keys fk \
+             WHERE fk.referenced_object_id = OBJECT_ID(N'{parent}', N'U') \
+               AND fk.parent_object_id = OBJECT_ID(N'{child}', N'U') \
+               AND fk.is_disabled = 0;"
+        ))
+        .await
+        .expect("ask the catalog the guard's own question");
+    rows.first()
+        .expect("one row")
+        .try_get("n")
+        .expect("n")
+        .unwrap_or(-1)
 }

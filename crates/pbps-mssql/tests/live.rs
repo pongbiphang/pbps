@@ -3815,6 +3815,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
         &Default::default(),
         &doctor::GrantTargets::default(),
         &doctor::DataTables::new(),
+        &Default::default(),
         &IdsFile::default(),
     )
     .await
@@ -3857,6 +3858,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
             &Default::default(),
             &doctor::GrantTargets::default(),
             &doctor::DataTables::new(),
+            &Default::default(),
             &IdsFile::default(),
         )
         .await
@@ -3951,6 +3953,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -3987,6 +3990,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4021,6 +4025,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4060,6 +4065,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4092,6 +4098,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4154,6 +4161,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4186,6 +4194,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4211,6 +4220,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4298,6 +4308,7 @@ async fn data_permissions(
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         data,
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4326,6 +4337,7 @@ async fn referenced_permissions(
         referenced,
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -4666,6 +4678,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
+        &Default::default(),
         &project_ids,
     )
     .await
@@ -4704,6 +4717,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
+        &Default::default(),
         &project_ids,
     )
     .await
@@ -4845,6 +4859,7 @@ async fn a_renamed_and_a_reused_name_keep_their_own_distinct_demands() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
+        &Default::default(),
         &project_ids,
     )
     .await
@@ -4978,6 +4993,7 @@ async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
         &Default::default(),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &project_ids,
     )
     .await
@@ -5103,6 +5119,7 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &data,
+        &Default::default(),
         &project_ids,
     )
     .await
@@ -5941,6 +5958,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -5967,6 +5985,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -6331,6 +6350,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -6349,6 +6369,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &reference_names(&["shared.parent".parse().unwrap()]),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -6378,6 +6399,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &reference_names(&["shared.parent".parse().unwrap()]),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -9634,6 +9656,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -9679,6 +9702,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         &mut db.conn,
         &[],
         &[],
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -9758,6 +9782,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &Default::default(),
         &pbps_mssql::doctor::GrantTargets::default(),
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -9784,6 +9809,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &Default::default(),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -9869,6 +9895,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &Default::default(),
         &managed,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -9906,6 +9933,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &Default::default(),
         &nowhere,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -9935,6 +9963,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &Default::default(),
         &managed,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -10464,6 +10493,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
         &reference_names(std::slice::from_ref(&bracket)),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await
@@ -10540,6 +10570,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
         &reference_names(&objects),
         &targets,
         &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
         &pbps_model::IdsFile::default(),
     )
     .await

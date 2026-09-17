@@ -45,12 +45,27 @@ pub struct Ask<'a> {
     pub granted: &'a GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
     pub data: &'a DataTables,
+    /// Every declared foreign key, by the table that holds it.
+    ///
+    /// The whole map, targets the declarations hold and targets they do not
+    /// alike — [`Ask::referenced`] is the second half of it, kept apart
+    /// because the two are asked about at different securables.
+    ///
+    /// This is how a `doctor` that never looks at a plan reads a key the next
+    /// apply takes away: the catalog has a key the declarations do not name,
+    /// so a `DropForeignKey` is coming, and the demands that key would have
+    /// carried are not made (DECISIONS 513).
+    pub declared_keys: &'a DeclaredKeys,
 }
 
 /// A foreign-key target the declarations do not hold, mapped to the columns a
 /// declared key names on it — the union across every key that points there.
 /// See [`Ask::referenced_columns`].
 pub type ReferencedColumns = BTreeMap<ObjectName, BTreeSet<String>>;
+
+/// The declared table holding foreign keys, mapped to the tables its keys
+/// point at. See [`Ask::declared_keys`].
+pub type DeclaredKeys = BTreeMap<ObjectName, BTreeSet<ObjectName>>;
 
 /// What the managed roles are granted on, as `doctor` has to ask about it
 /// (ADR-0005). Empty from the project files is not yet "no role": the

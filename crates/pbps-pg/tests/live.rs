@@ -6386,6 +6386,7 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
         managed_tables: std::slice::from_ref(&customer),
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
@@ -6664,6 +6665,7 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         managed_tables: &[],
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
         granted: &granted,
         data: &Default::default(),
     };
@@ -6787,6 +6789,7 @@ async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() 
         managed_tables: &[],
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
     };
     for (owner, migrated) in [(false, false), (true, false), (false, true)] {
         if !owner && !migrated {
@@ -6950,6 +6953,7 @@ async fn a_role_that_may_write_the_ledger_and_not_create_it_deploys() {
         managed_tables: &[],
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
@@ -6995,6 +6999,7 @@ async fn a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted
         managed_tables: &[],
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
@@ -7067,6 +7072,7 @@ async fn a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_nee
         managed_tables: &[],
         referenced: std::slice::from_ref(&parent),
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
@@ -7190,6 +7196,7 @@ async fn a_column_grant_covering_exactly_the_keys_columns_reports_no_gap() {
         managed_tables: &[],
         referenced: std::slice::from_ref(&parent),
         referenced_columns: &referenced_columns,
+        declared_keys: &Default::default(),
     };
     let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
         .await
@@ -7227,6 +7234,7 @@ async fn a_managed_schema_that_is_absent_is_reported_as_absent_and_not_as_a_gap(
         managed_tables: &[],
         referenced: &[],
         referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
     };
     let held = doctor::permissions(&mut db.conn, &ask, &IdsFile::default())
         .await
@@ -25527,6 +25535,7 @@ async fn grant_diagnosis(conn: &mut Conn, granted: &pbps_db::doctor::GrantTarget
             managed_tables: &[],
             referenced: &[],
             referenced_columns: &Default::default(),
+            declared_keys: &Default::default(),
             granted,
             data: &Default::default(),
         },
@@ -25770,6 +25779,7 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
                 managed_tables: &["public.t".parse().unwrap()],
                 referenced: &[],
                 referenced_columns: &Default::default(),
+                declared_keys: &Default::default(),
                 granted: &from_ask,
                 data: &Default::default(),
             },
@@ -25950,6 +25960,7 @@ async fn doctor_data_diagnosis(
             managed_tables: &[],
             referenced: &[],
             referenced_columns: &Default::default(),
+            declared_keys: &Default::default(),
             granted: &Default::default(),
             data: &data,
         },
@@ -26339,6 +26350,7 @@ async fn doctor_data_grant_targets_resolve_the_same_pending_table_identity() {
         managed_tables: &[],
         referenced: &[],
         referenced_columns: &Default::default(),
+        declared_keys: &Default::default(),
         granted: &grants,
         data: &Default::default(),
     };

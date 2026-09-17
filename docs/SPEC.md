@@ -1653,7 +1653,11 @@ recorded, or even in a managed schema. A disabled constraint is skipped, as it
 is by the probe, and a project that removes no row is asked for none of this. A
 child that is itself a managed table is not asked about twice — unless this plan
 moves it to another schema, in which case its destination is asked about, because
-the guard inside the delete's transaction reads it after the transfer.
+the guard inside the delete's transaction reads it after the transfer. That
+destination is asked about only while the key **survives the plan**: a key the
+catalog holds and the declarations no longer name is one the same plan drops,
+and the drop runs before the delete, so the guard finds no child to read
+(DECISIONS 513).
 The demand is the child's **foreign-key columns**, not its whole catalog: the
 count reads the child only through the key tuple, so an object grant covers it
 and so does a grant on those columns alone (DECISIONS 511).

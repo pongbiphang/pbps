@@ -825,6 +825,7 @@ pub async fn permissions(
                 ask.referenced_columns,
                 ask.granted,
                 ask.data,
+                ask.declared_keys,
                 project_ids,
             )
             .await?;
