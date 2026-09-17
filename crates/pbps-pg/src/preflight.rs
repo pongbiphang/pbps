@@ -4158,6 +4158,7 @@ mod tests {
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         };
+        let widening_key = key.clone();
         // The referenced column narrows, which is the case the child-side
         // test above does not reach: the guard then lands on `p` and `q`.
         let narrowed = probes(&set(vec![
@@ -4219,6 +4220,11 @@ mod tests {
         }
         // The negative: a column this plan *widens* carries no guard, so it
         // carries no `CASE` either — the barrier appears where the raise can.
+        //
+        // The key travels with it. Without an `AddForeignKey` there is no
+        // parent-side cast at all, and "no `CASE` anywhere" would then be
+        // true of a probe that was never built — a negative that holds
+        // whatever the barrier does.
         let widened = probes(&set(vec![
             Change::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
@@ -4228,14 +4234,39 @@ mod tests {
                 from_nullable: true,
                 to_nullable: true,
             },
+            Change::AddForeignKey {
+                table: child.clone(),
+                name: "child_status_fkey".to_owned(),
+                constraint: Box::new(widening_key),
+            },
             deleting("app.status", "old"),
         ]));
+        let widened_own: Vec<&Probe> = widened
+            .iter()
+            .filter(|p| {
+                p.description
+                    .contains("the key cannot be added once the row is gone")
+            })
+            .collect();
         assert!(
-            widened
+            widened_own
                 .iter()
-                .all(|p| !p.sql.contains("CASE WHEN NOT (p.\"code\"")),
-            "a widening has nothing to guard against: {widened:#?}"
+                .any(|p| p.sql.contains("CAST(p.\"code\" AS bigint)")),
+            "the branch is reached: this probe does build a parent-side \
+             cast: {widened:#?}"
         );
+        // And it carries no barrier: the mirror of the check above, so that
+        // a `CASE` with any condition at all would be caught here rather
+        // than only one spelled over this column.
+        for probe in &widened_own {
+            for (at, _) in probe.sql.match_indices("CAST(p.\"code\" AS bigint)") {
+                assert!(
+                    !probe.sql[..at].ends_with("THEN "),
+                    "a widening has nothing to guard against, at {at}: {}",
+                    probe.sql
+                );
+            }
+        }
         // And the fenced neighbour is left as it was: this change is about
         // the one shape that had no barrier at all.
         assert!(
