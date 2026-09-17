@@ -47,7 +47,7 @@ async fn native_target() -> NativeTarget {
 /// tooling would.
 struct Admin {
     connection: StreamConn,
-    forwarder: Option<Forwarder>,
+    forwarder: Forwarder,
 }
 
 impl Admin {
@@ -77,23 +77,21 @@ impl Admin {
         .unwrap();
         Self {
             connection,
-            forwarder: Some(forwarder),
+            forwarder,
         }
     }
 
-    /// Gone, confirmed: the forwarder container is removed before this
+    /// Gone, confirmed: the connection is dropped first so the engine sees
+    /// the session end, then the forwarder container is removed before this
     /// returns, so the next admission finds the engine's namespace clean.
-    async fn close(mut self) {
-        drop(std::mem::replace(
-            &mut self.connection,
-            unreachable_connection(),
-        ));
-        self.forwarder.take().unwrap().close().await.unwrap();
+    async fn close(self) {
+        let Self {
+            connection,
+            forwarder,
+        } = self;
+        drop(connection);
+        forwarder.close().await.unwrap();
     }
-}
-
-fn unreachable_connection() -> StreamConn {
-    unreachable!("a closed admin session is never used again")
 }
 
 async fn session(endpoint: &ScratchEndpoint, database: &str) -> Admin {
