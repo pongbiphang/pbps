@@ -64,6 +64,8 @@ arranged in any number of ways. Equality with a layout is decidable: the
 daemon's record is read, the kernel is measured against the rows the profile
 names, and a row it does not name is refused as that row (DECISIONS 514).
 
+Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-authenticated local channel the Docker profile uses; the record and mount rules are measured against both Docker's and Podman's container layouts so they are not over-fit to one runtime's exact output, but a Podman-native daemon is not yet an admittable peer (#686).
+
 `linux-dedicated-v1` requires, of a container on the same native Linux kernel:
 
 | Premise | What is measured |

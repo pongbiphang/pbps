@@ -332,7 +332,12 @@ pub(crate) fn contained(rows: &[MountEntry], profile: &ServerProfile) -> Result<
                     && has("ro")
             }
             path if MASKED_PROC.contains(&path) => {
-                tmpfs
+                // The empty-tmpfs mask must be read-only — both runtimes lay it
+                // out `ro`, and a writable one would be executable private
+                // storage. The `/null` mask is a device (Docker binds the
+                // container's own `/dev/null`, Podman the host devtmpfs), not
+                // storage, so it needs no `ro`.
+                (tmpfs && has("ro"))
                     || (entry.root == "/null"
                         && (entry.kind == "devtmpfs"
                             || (entry.kind == "tmpfs" && entry.device == dev_device)))
@@ -720,6 +725,17 @@ mod tests {
             contained(&rows(&block), postgres())
                 .unwrap_err()
                 .starts_with("/dev/null")
+        );
+        // A writable (non-ro) tmpfs at a mask target is executable storage.
+        let mut table = rows(DOCKER);
+        table.retain(|entry| entry.target != "/proc/acpi");
+        table.push(entry(
+            "930 901 0:99 / /proc/acpi rw,relatime - tmpfs tmpfs rw,mode=1777",
+        ));
+        assert!(
+            contained(&table, postgres())
+                .unwrap_err()
+                .starts_with("/proc/acpi")
         );
     }
 }
