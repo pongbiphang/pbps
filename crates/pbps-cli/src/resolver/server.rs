@@ -1079,6 +1079,11 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         if outcome.is_ok() {
             return Ok(());
         }
+        #[cfg(test)]
+        eprintln!(
+            "remove: control-session drop_scratch failed: {:?}",
+            outcome.err()
+        );
         // A session an administrator terminated is not the end of cleanup:
         // the names are still known, and a fresh session can still act.
         if let Some(session) = control.session.take() {
@@ -1108,15 +1113,29 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         control.profile.lifetime.as_secs(),
     )
     .await
-    .map_err(|_| ())?;
+    .map_err(|failure| {
+        #[cfg(test)]
+        eprintln!("remove: fresh forwarder open failed: {:?}", failure.cause);
+        let _ = failure;
+    })?;
     let outcome = async {
-        let identity = engine::identity(&mut connection).await.map_err(|_| ())?;
+        let identity = engine::identity(&mut connection).await.map_err(|error| {
+            #[cfg(test)]
+            eprintln!("remove: fresh identity failed: {error:?}");
+            let _ = error;
+        })?;
         if identity.instance_key != control.identity.instance_key {
+            #[cfg(test)]
+            eprintln!("remove: fresh identity mismatch");
             return Err(());
         }
         engine::drop_scratch(&mut connection, names)
             .await
-            .map_err(|_| ())
+            .map_err(|error| {
+                #[cfg(test)]
+                eprintln!("remove: fresh drop_scratch failed: {error:?}");
+                let _ = error;
+            })
     }
     .await;
     drop(connection);
