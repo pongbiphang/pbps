@@ -14870,3 +14870,135 @@ fn a_declared_child_row_survives_a_parent_delete_with_and_without_a_retype() {
         }
     }
 }
+
+/// A foreign key held by a table this project does not declare is named by
+/// `plan --db`, and named again before `apply` runs a single statement — even
+/// though the widening drops no key for the older check to inspect (#503).
+///
+/// The wording is part of the diagnostic: the count says which of the two
+/// questions were asked, and the remedy cannot say "before the drop" when the
+/// plan drops nothing (DECISIONS 515).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn an_undeclared_key_is_named_by_connected_planning_and_again_before_apply() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "extfk503");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("extfk503-live");
+    // A benign change travels with the retype, and it is ordered before it:
+    // the refusal has to happen before that one runs, not after.
+    let table = |code: &str, note_default: &str| {
+        format!(
+            "table: dbo.parent\ncolumns:\n  code: {{type: {code}, nullable: false}}\n  \
+             note: {{type: varchar(10){note_default}}}\n\
+             primary_key: {{name: pk_parent, columns: [code]}}\n"
+        )
+    };
+    std::fs::write(
+        d.dir.join("schema").join("dbo.parent.yml"),
+        table("varchar(10)", ""),
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["bootstrap", "--db", &connection])),
+        0,
+        "bootstrap"
+    );
+
+    // Somebody else's table, pointing at ours. It is not in the declarations
+    // and never will be; pbps must not touch it, only refuse to break it.
+    on_server(
+        &connection,
+        "CREATE TABLE dbo.ext_child (id int NOT NULL PRIMARY KEY, \
+         code varchar(10) NOT NULL CONSTRAINT fk_external503 FOREIGN KEY REFERENCES dbo.parent(code));",
+    );
+
+    std::fs::write(
+        d.dir.join("schema").join("dbo.parent.yml"),
+        table("varchar(20)", ", default: \"''\""),
+    )
+    .unwrap();
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    let out = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "connected planning must refuse: {out}");
+    assert!(
+        out.contains("drop_blockers")
+            && out.contains("fk_external503")
+            && out.contains("dbo.ext_child"),
+        "the unmanaged child and its key must be named: {out}"
+    );
+    assert!(
+        out.contains("before the change that needs them gone"),
+        "the remedy must not speak of a drop this plan does not make: {out}"
+    );
+
+    // And again before apply, on a plan computed while the key was not there.
+    // Nothing of the plan may run first: the default that is ordered before
+    // the retype is still absent afterwards.
+    on_server(
+        &connection,
+        "ALTER TABLE dbo.ext_child DROP CONSTRAINT fk_external503;",
+    );
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // And when it passes, the count says which questions were asked. This
+    // plan drops no key and retypes one column, and the line has to say so.
+    assert!(
+        stdout(&o).contains("0 unique-key drop(s) and 1 column retype(s) checked"),
+        "{}",
+        stdout(&o)
+    );
+    on_server(
+        &connection,
+        "ALTER TABLE dbo.ext_child ADD CONSTRAINT fk_external503 FOREIGN KEY (code) REFERENCES dbo.parent(code);",
+    );
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive,constraint,narrowing,not-null",
+    ]);
+    let out = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "apply must refuse it too: {out}");
+    // The check's own refusal, not the engine's. Both name the constraint —
+    // 5074 does too — so the test has to say which one spoke, or it would
+    // pass on the failure this check exists to prevent.
+    assert!(
+        out.contains("drop_blockers") && out.contains("fk_external503"),
+        "apply's refusal must be the dependency check's: {out}"
+    );
+    assert!(
+        !out.contains("5074"),
+        "the statement must never have reached the engine: {out}"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let defaults = rt.block_on(async {
+        let mut c = connect_live(&connection).await.expect("connect");
+        let r = c
+            .query(
+                "SELECT COUNT(*) FROM sys.default_constraints \
+                 WHERE parent_object_id = OBJECT_ID(N'dbo.parent', N'U');",
+            )
+            .await
+            .expect("count the defaults");
+        r[0].try_get_at::<i32>(0).unwrap().unwrap()
+    });
+    assert_eq!(
+        defaults, 0,
+        "the benign change ordered before the retype must not have run"
+    );
+}

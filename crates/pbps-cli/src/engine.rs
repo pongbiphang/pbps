@@ -678,13 +678,27 @@ pub async fn check_drop_blockers(
         Driver::Mssql => {
             let reports = pbps_mssql::impact::key_drop_blockers(conn, changes).await?;
             refuse_drop_reports("SQL Server", &reports)?;
+            // Two kinds of question now, and the count says which: a key this
+            // plan drops, and a column it retypes while a key stands on it
+            // (DECISIONS 515). Classified by the change each report points at
+            // rather than by reading its target text, which belongs to the
+            // engine that wrote it.
+            let retypes = reports
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        changes.changes.get(r.change_index).map(|p| &p.change),
+                        Some(pbps_model::Change::AlterColumnType { .. })
+                    )
+                })
+                .count();
             Ok(ConnectedCheck {
                 name: "drop_blockers",
                 engine: "SQL Server",
                 status: "unavailable",
                 message: format!(
-                    "{} unique-key drop(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
-                    reports.len()
+                    "{} unique-key drop(s) and {retypes} column retype(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
+                    reports.len() - retypes
                 ),
             })
         }
@@ -715,7 +729,7 @@ fn refuse_drop_reports(
         .collect();
     if !blocked.is_empty() {
         anyhow::bail!(
-            "drop_blockers ({engine}): {}.\nRemove these dependencies before the drop, through earlier declared changes or a separately reviewed deployment, then recompute the plan.",
+            "drop_blockers ({engine}): {}.\nRemove these dependencies before the change that needs them gone, through earlier declared changes or a separately reviewed deployment, then recompute the plan.",
             blocked.join("\n")
         );
     }
