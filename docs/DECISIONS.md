@@ -10719,6 +10719,12 @@ SPEC is in sync with all of these.
      space can name a boolean column and is a legal unquoted check/filter
      expression. Rust's Unicode `trim` would refuse that valid declaration, so
      both expression checks use `trim_ascii` and pin Unicode identifier cases.
+     **Amended by 504**: `trim_ascii` is the right *danger* and the wrong
+     *set* — it omits the vertical tab, which this engine does separate tokens
+     with, and no character class sees a comment. Both checks now ask the
+     engine's own lexis (`Lexicon::expression_in`); the Unicode identifier
+     cases this paragraph pins are unchanged and are why literals are never
+     blanked.
 
      The unit tests pin each structural rule and aggregate independent errors.
      The live declaration matrix sends the emitter's statements to the engine,
@@ -13105,3 +13111,60 @@ SPEC is in sync with all of these.
      pin releases its marker on both paths; the routine lock beside it rolls
      back to its own and does not, which is issue #534 and stays there. Two
      savepoint names, two owners.
+
+504. **An expression is empty when the *engine's* lexis finds nothing in it,
+     which is neither of Rust's whitespace classes (issues #480, #482).** 452
+     settled that a non-breaking space is a legal unquoted check/filter
+     expression on PostgreSQL, so Unicode `trim` would refuse a valid
+     declaration, and moved both checks to `trim_ascii`. That was right about
+     the danger and wrong about the set, twice over.
+
+     **Measured** on PostgreSQL 18.6, one `ALTER TABLE … CHECK (<char>)` per
+     character of Unicode White_Space. Exactly six separate tokens — space,
+     tab, LF, **vertical tab**, FF and CR — each answering `syntax error at or
+     near ")"`. Every non-ASCII member names a column instead: `column " "
+     does not exist` for NBSP, the em space, U+2028, U+3000 and the rest, and
+     `column "" does not exist` for NEL. Rust's ASCII-whitespace class omits
+     the vertical tab, so a vertical-tab-only expression passed validation and
+     reached the engine as an empty `CHECK` (#480). The set that is right is
+     the one 475 already named for definition layout: Unicode White_Space
+     intersected with ASCII.
+
+     **And comments are layout without being whitespace bytes.** Measured on
+     the same server, `CHECK (/* x */)`, `CHECK (-- x\n)`, the nesting form
+     `/* a /* b */ c */` and any mixture of them with whitespace are each the
+     same `syntax error at or near ")"` — for a check constraint and a partial
+     index's `WHERE` alike. No character class can see those, which is why the
+     question moved to `Lexicon::expression_in` (#482).
+
+     **It does not lex the literals, and that is the point.** A literal, a
+     quoted identifier and a dollar-quoted body are all *content*: the moment
+     one opens, the answer is `Present` and the scan stops. So there is no
+     literal to skip and no second lexis to drift from `code_only`'s — the
+     mistake 315 paid for — and the `--` inside `'-- not a comment'` cannot be
+     read as a comment, because the scan stopped at the quote.
+
+     That half is not a nicety. Measured, `CHECK ('true')` and `CHECK ("flag")`
+     are **accepted** outright, and `CHECK ('-- not a comment')` is refused on
+     *value* grounds (`invalid input syntax for type boolean`, `22P02`) rather
+     than as a missing expression. Blanking literals the way `code_only` does
+     would therefore refuse a valid declaration, which is the one direction
+     this check must never fail in.
+
+     **Absent, empty and unreadable are three different things**, so the answer
+     is three variants rather than a bool. Text that ends inside a block
+     comment that never closes holds *unknown*, not *nothing*: measured, the
+     engine calls that `unterminated /* comment`, and a validator that refused
+     it as an empty expression would name a cause the engine disagrees with.
+     `Unreadable` is left to the engine, which has the better sentence for it.
+
+     The live declaration matrix sends each shape to the server and asserts the
+     SQLSTATE, so the class above is pinned by the engine rather than by this
+     entry. `22P02` joins `42704`, `42804` and `54011` in the set of refusals
+     the offline validator is expected *not* to make: an expression the engine
+     parsed and then rejected as a value is one it had no business refusing.
+
+     SQL Server's own validator still asks Rust's `trim()`. Its whitespace half
+     is right there — 475 measured that engine accepting Unicode White_Space as
+     a separator — but it has the comment half of this bug, and that is issue
+     #661 rather than scope here.

@@ -398,6 +398,25 @@ impl Unchecked {
 /// both answered the same — `SELECT /* a /* b */ c */ 1` returns `1` on either.
 /// A field no implementation varies is a field nobody maintains, and the
 /// abstraction worth having is the one two implementations draw (ADR-0014).
+/// What an engine's lexis finds in a declared check or filter expression.
+///
+/// Three answers rather than a bool, because the third is the one a bool hides:
+/// text that ends inside a block comment holds *unknown*, not *nothing*, and a
+/// validator that refused it as empty would name a cause the engine disagrees
+/// with (DECISIONS 504).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expression {
+    /// Nothing the engine would parse: this engine's whitespace, and comments
+    /// that close. Measured, the engine refuses this as a syntax error.
+    Absent,
+    /// At least one token — including a literal or a quoted identifier, either
+    /// of which can be a whole valid expression on its own.
+    Present,
+    /// The text ends inside a block comment that never closes, so what it
+    /// holds cannot be read. The engine has its own name for this one.
+    Unreadable,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Lexicon {
     /// Whether definition layout is limited to ASCII whitespace. PostgreSQL
@@ -726,6 +745,69 @@ impl Lexicon {
 }
 
 impl Lexicon {
+    /// Whether a declared expression holds anything this engine would parse.
+    ///
+    /// The question a declaration validator asks about a check constraint or
+    /// an index filter. It is not `trim`: **measured** on PostgreSQL 18.6, of
+    /// the Unicode White_Space characters only the six ASCII separators
+    /// separate tokens — `CHECK ( )` with space, tab, LF, **vertical tab**, FF
+    /// or CR between the parentheses is `syntax error at or near ")"`, while
+    /// every non-ASCII member names a column (`column " " does not exist`),
+    /// so a non-breaking space is a legal unquoted expression (DECISIONS 452).
+    /// Rust's `trim_ascii` is the wrong set by exactly one character: its
+    /// ASCII-whitespace class omits the vertical tab (issue #480).
+    ///
+    /// **Comments are layout too**, and they are not whitespace bytes. Measured
+    /// on the same server, `CHECK (/* x */)`, `CHECK (-- x\n)`, the nesting
+    /// form `/* a /* b */ c */` and any mixture of them with whitespace are
+    /// each the same `syntax error at or near ")"`, for a check constraint and
+    /// a partial index's `WHERE` alike (issue #482).
+    ///
+    /// # Why this does not lex the literals
+    ///
+    /// It never needs to. A literal, a quoted identifier and a dollar-quoted
+    /// body are all *content*: the moment one opens, the answer is
+    /// [`Expression::Present`] and the scan is over — so there is no literal
+    /// to skip, and no second lexis to drift from [`code_only`]'s. That is
+    /// what keeps this short enough to be obviously right, and it is why the
+    /// `--` inside `'-- not a comment'` cannot be read as a comment: the
+    /// scan stopped at the quote. Measured, that literal is a valid
+    /// expression the engine refuses on *type* grounds
+    /// (`invalid input syntax for type boolean`), not on syntax, and
+    /// `CHECK ('true')` is accepted outright — so blanking literals the way
+    /// [`code_only`] does would refuse a valid declaration.
+    ///
+    /// [`code_only`]: Lexicon::code_only
+    pub fn expression_in(&self, text: &str) -> Expression {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while let Some(ch) = text[i..].chars().next() {
+            if self.is_definition_whitespace(ch) {
+                i += ch.len_utf8();
+                continue;
+            }
+            if ch == '-' && bytes.get(i + 1) == Some(&b'-') {
+                // To the end of its line, or to the end of the text where
+                // there is no line left to end.
+                i = text[i..].find(['\n', '\r']).map_or(text.len(), |at| i + at);
+                continue;
+            }
+            if ch == '/' && bytes.get(i + 1) == Some(&b'*') {
+                match closing_block_comment(text, i) {
+                    Some(end) => i = end,
+                    // Absent, empty and unreadable are three different things.
+                    // Measured, the engine calls this `unterminated /* comment`
+                    // rather than a missing expression, and saying "empty" here
+                    // would name the wrong cause for text nobody can read.
+                    None => return Expression::Unreadable,
+                }
+                continue;
+            }
+            return Expression::Present;
+        }
+        Expression::Absent
+    }
+
     /// The definition with everything that is not code blanked out, by this
     /// engine's lexis.
     ///
@@ -1415,6 +1497,37 @@ fn quoted_identifier_len(text: &str) -> Option<usize> {
 
 /// Blanks `ch` in `out`, keeping a line break so that line structure and
 /// positions survive.
+/// Where the block comment opening at `at` closes, or `None` where it never
+/// does.
+///
+/// Byte-wise, and safely so: `/` and `*` are ASCII, and a UTF-8 continuation
+/// byte is never an ASCII byte, so no multi-byte character can contain a false
+/// opener or closer. They **nest** on both measured engines, which is why this
+/// counts depth rather than looking for the first `*/`
+/// (see [`Lexicon`]'s own note).
+fn closing_block_comment(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = at;
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 fn blank(out: &mut String, ch: char) {
     if matches!(ch, '\n' | '\r') {
         out.push(ch);
@@ -3191,6 +3304,121 @@ mod code_only_tests {
         regions.iter().fold(text.to_owned(), |out, region| {
             out.replace(region, &" ".repeat(region.chars().count()))
         })
+    }
+
+    /// Every character PostgreSQL separates tokens with, and no other.
+    ///
+    /// **Measured** on 18.6, one `ALTER TABLE … CHECK (<char>)` per character:
+    /// the six ASCII separators are each `syntax error at or near ")"`, and
+    /// every non-ASCII member of Unicode White_Space names a column instead
+    /// (`column " " does not exist`). The vertical tab is the one Rust's
+    /// `trim_ascii` leaves out, and the one that reached the engine as an
+    /// empty `CHECK` (issue #480).
+    #[test]
+    fn only_the_six_ascii_separators_are_absent_expressions_on_postgres() {
+        for ch in ['\u{20}', '\u{9}', '\u{a}', '\u{b}', '\u{c}', '\u{d}'] {
+            assert_eq!(
+                PG.expression_in(&ch.to_string()),
+                Expression::Absent,
+                "{ch:?} separates tokens on this engine"
+            );
+        }
+        // The measured identifier half, which is why this is not a `trim`.
+        for ch in [
+            '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2003}', '\u{2028}', '\u{2029}',
+            '\u{202f}', '\u{205f}', '\u{3000}',
+        ] {
+            assert_eq!(
+                PG.expression_in(&ch.to_string()),
+                Expression::Present,
+                "{ch:?} names a column on this engine"
+            );
+        }
+        // Rust's own classes, for the record: `trim` would refuse the whole
+        // second list, and `trim_ascii` accepts a vertical tab the engine
+        // does not.
+        assert!(!'\u{b}'.is_ascii_whitespace());
+        assert!('\u{a0}'.is_whitespace());
+        // Mixtures are still absent, and a mixture with an identifier is not.
+        assert_eq!(PG.expression_in(" \t\u{b}\r\n\u{c}"), Expression::Absent);
+        assert_eq!(PG.expression_in("\t\u{a0}\n"), Expression::Present);
+        assert_eq!(PG.expression_in(""), Expression::Absent);
+    }
+
+    /// Comments are layout too, and they are not whitespace bytes.
+    ///
+    /// **Measured** on 18.6: a check constraint and a partial index's `WHERE`
+    /// each answer `syntax error at or near ")"` for a line comment, a block
+    /// comment, the nesting form, and any mixture of them with whitespace
+    /// (issue #482).
+    #[test]
+    fn comments_are_absent_expressions_and_what_surrounds_them_is_not() {
+        for text in [
+            "-- nothing\n",
+            "-- nothing",
+            "/* nothing */",
+            "/* a /* b */ c */",
+            "  /* a */ \t\n -- b\n",
+            "-- a\n-- b\n",
+        ] {
+            assert_eq!(PG.expression_in(text), Expression::Absent, "{text:?}");
+        }
+        for text in ["/* a */ true", "true /* a */", "true -- a\n", "-x", "a/b"] {
+            assert_eq!(PG.expression_in(text), Expression::Present, "{text:?}");
+        }
+    }
+
+    /// A literal and a quoted identifier are content, and the scan stops at
+    /// the one that opens first — which is what keeps a `--` inside a literal
+    /// from being read as a comment.
+    ///
+    /// **Measured** on 18.6, and this is the half that would refuse a valid
+    /// declaration if it were wrong: `CHECK ('true')` and `CHECK ("flag")` are
+    /// accepted outright, while `CHECK ('-- not a comment')` is refused on
+    /// *type* grounds (`invalid input syntax for type boolean`) rather than as
+    /// a missing expression.
+    #[test]
+    fn a_literal_or_a_quoted_name_is_an_expression_even_when_it_reads_like_a_comment() {
+        for text in [
+            "'true'",
+            "\"flag\"",
+            "'-- not a comment'",
+            "'/* still data */'",
+            "$q$ -- data $q$::boolean",
+            "E'x'",
+            "  '-- a'  ",
+        ] {
+            assert_eq!(PG.expression_in(text), Expression::Present, "{text:?}");
+        }
+    }
+
+    /// Absent, empty and unreadable are three different things.
+    ///
+    /// **Measured** on 18.6, `CHECK (/* a)` is `unterminated /* comment`, not
+    /// a syntax error about a missing expression — so this must not be called
+    /// empty, and the engine keeps the sentence that names the real cause.
+    #[test]
+    fn text_that_ends_inside_a_block_comment_is_unreadable_rather_than_absent() {
+        for text in ["/* a", "/* a /* b */", "  /* a */ /* b"] {
+            assert_eq!(PG.expression_in(text), Expression::Unreadable, "{text:?}");
+        }
+        // The closed forms of the same shapes, for contrast.
+        assert_eq!(PG.expression_in("/* a */"), Expression::Absent);
+        assert_eq!(PG.expression_in("/* a /* b */ */"), Expression::Absent);
+    }
+
+    /// The other engine takes Unicode White_Space as a separator, so the same
+    /// text is a different answer there (DECISIONS 475). One lexicon field,
+    /// two answers — which is the whole reason this is asked of the lexicon.
+    #[test]
+    fn the_engines_disagree_about_non_ascii_layout_and_agree_about_comments() {
+        assert_eq!(MSSQL.expression_in("\u{a0}"), Expression::Absent);
+        assert_eq!(PG.expression_in("\u{a0}"), Expression::Present);
+        for lexicon in [PG, MSSQL] {
+            assert_eq!(lexicon.expression_in("/* a */"), Expression::Absent);
+            assert_eq!(lexicon.expression_in("-- a\n"), Expression::Absent);
+            assert_eq!(lexicon.expression_in("x > 0"), Expression::Present);
+        }
     }
 
     /// Measured: `SELECT E'x\' , es.a'` is one literal to PostgreSQL. Read

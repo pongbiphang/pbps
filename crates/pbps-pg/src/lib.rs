@@ -1967,6 +1967,100 @@ mod tests {
         assert!(structural_errors(&table).is_empty());
     }
 
+    /// An expression is empty when the *engine* would find nothing in it, and
+    /// this engine's layout is neither Rust's ASCII whitespace class nor its
+    /// Unicode one: it separates tokens with a vertical tab, keeps every
+    /// non-ASCII space inside an identifier, and treats both comment forms as
+    /// layout (issues #480 and #482, DECISIONS 504).
+    ///
+    /// Both call sites, because they are the same question asked twice: a
+    /// check constraint's expression and a partial index's filter.
+    #[test]
+    fn an_expression_is_empty_by_this_engines_layout_not_by_rusts_whitespace() {
+        let empty = [
+            "\u{b}",         // the vertical tab `trim_ascii` leaves out
+            " \t\u{b}\r\n",  // and beside the ones it does not
+            "-- nothing\n",  // a line comment is layout
+            "/* nothing */", // so is a block comment
+            "/* a /* b */ c */",
+            "  /* a */ \t -- b\n",
+        ];
+        for expression in empty {
+            let mut table = structural_table();
+            table.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "a".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: Some(expression.into()),
+                },
+            );
+            let errors = structural_errors(&table);
+            assert_eq!(errors.len(), 2, "{expression:?}: {errors:?}");
+            for expected in ["empty expression", "empty filter"] {
+                assert!(
+                    errors.iter().any(|e| e.contains(expected)),
+                    "{expression:?}: {errors:?}"
+                );
+            }
+        }
+
+        // The negatives, and they are the half that matters: each of these is
+        // a declaration the engine accepts or refuses on its own grounds, so
+        // refusing it here would refuse a valid plan. `\u{a0}` names a column,
+        // `'true'` is a whole expression, and the text that reads like a
+        // comment is inside a literal.
+        let present = [
+            "\u{a0}",
+            "\t\u{a0}\n",
+            "/* a */ a > 0",
+            "a > 0 -- trailing\n",
+            "'true'",
+            "'-- not a comment'",
+            "\"a\"",
+            "/* a", // unreadable, not empty: the engine names that itself
+        ];
+        for expression in present {
+            let mut table = structural_table();
+            table
+                .columns
+                .insert("\u{a0}".into(), pbps_model::Column::new(ty("boolean")));
+            table.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "a".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: Some(expression.into()),
+                },
+            );
+            assert!(
+                structural_errors(&table).is_empty(),
+                "{expression:?}: {:?}",
+                structural_errors(&table)
+            );
+        }
+    }
+
     /// The names a table owns are not only its own and its columns'. Each of
     /// these is emitted as an identifier and truncated by the server at the
     /// same limit, so `validate` has to ask about all of them or a plan fails
