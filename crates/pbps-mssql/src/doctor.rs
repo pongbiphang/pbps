@@ -245,6 +245,18 @@ pub enum Needed {
     /// a child whose constraint is `NOCHECK`ed and a table with no key into
     /// the parent at all.
     ///
+    /// Asked over the child's **foreign-key columns**, not its whole catalog,
+    /// the way an external target is ([`Columns::Referenced`]). The count
+    /// names the child only in the tuple the catalog gives it — `ch.<key
+    /// column> = p.<referenced column>` — and the fragments that name a
+    /// child's own key exist only for a child the *plan* moves, which is a
+    /// declared table and therefore never in this list. Measured: a login
+    /// holding `SELECT` on nothing but the foreign-key column is refused a
+    /// plain `SELECT COUNT(*) FROM app.kid` (error 230, on the key column the
+    /// engine picks for `COUNT(*)`) and **runs the count the probe actually
+    /// writes**. So demanding every catalog column would report a gap against
+    /// an account that can run every statement the declaration produces.
+    ///
     /// A child the managed question already asks about is not asked again —
     /// see [`Held::delete_children`]. DECISIONS 511.
     DeleteChild,
@@ -596,10 +608,12 @@ pub struct Held {
     /// [`Needed::ManagedTable`] at the same securable, and two entries would
     /// print the operator the same `GRANT` twice.
     ///
-    /// Asked for every discovered name, present or invisible, the way the
-    /// foreign-key targets are and for their reason (see [`Existing`]): the
-    /// name came out of the catalog, so an object question that answered
-    /// nothing would drop a demand the count really makes.
+    /// Asked for every discovered name, present or invisible, and over that
+    /// child's foreign-key columns alone — the way the foreign-key targets
+    /// are, and for both of their reasons (see [`Existing`] and
+    /// [`Columns::Referenced`]): the name came out of the catalog, so an
+    /// object question that answered nothing would drop a demand the count
+    /// really makes, and the count reads no other column of it.
     pub delete_children: BTreeMap<ObjectName, BTreeSet<String>>,
 
     /// Whether the project has any role at all — declared, recorded, or being
@@ -1091,6 +1105,12 @@ fn object_statements<'a>(
 /// row; a project that removes none runs no count and this query does not run
 /// (issue #515).
 ///
+/// Returns the columns each child's keys name as well as the child, because
+/// that is the width of the demand: the count compares the child's foreign-key
+/// tuple against the parent row and reads nothing else of it. Unioned across
+/// every enabled key from that child into any of these parents, which is what
+/// `sys.foreign_key_columns` gives the probe at run time.
+///
 /// `is_disabled = 0` matches the probe exactly. `NOCHECK CONSTRAINT` leaves the
 /// constraint in the catalog and stops the engine enforcing it, the probe skips
 /// those children (DECISIONS 144), and demanding a read of one would be asking
@@ -1118,12 +1138,15 @@ fn delete_children_sql(parents: &[ObjectName]) -> (String, Vec<Param<'_>>) {
         slots.push(format!("(@P{}, @P{})", params.len() - 1, params.len()));
     }
     let sql = format!(
-        "SELECT DISTINCT cs.name AS [schema], ct.name AS [object] \
+        "SELECT DISTINCT cs.name AS [schema], ct.name AS [object], cc.name AS [column] \
          FROM (VALUES {}) AS p(s, n) \
          CROSS APPLY (VALUES (QUOTENAME(p.s) + N'.' + QUOTENAME(p.n))) AS x(q) \
          JOIN sys.foreign_keys fk ON fk.referenced_object_id = OBJECT_ID(x.q, N'U') \
          JOIN sys.tables ct ON ct.object_id = fk.parent_object_id \
          JOIN sys.schemas cs ON cs.schema_id = ct.schema_id \
+         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+         JOIN sys.columns cc ON cc.object_id = fkc.parent_object_id \
+                            AND cc.column_id = fkc.parent_column_id \
          WHERE fk.is_disabled = 0;",
         slots.join(", ")
     );
@@ -1133,8 +1156,8 @@ fn delete_children_sql(parents: &[ObjectName]) -> (String, Vec<Param<'_>>) {
 async fn delete_children(
     conn: &mut Conn,
     parents: &[ObjectName],
-) -> Result<Vec<ObjectName>, DbError> {
-    let mut out: BTreeSet<ObjectName> = BTreeSet::new();
+) -> Result<ReferencedColumns, DbError> {
+    let mut out = ReferencedColumns::new();
     // Two slots per parent, and the same reason `object_statements` exists: a
     // list past about a thousand objects is a statement the server refuses.
     for chunk in parents.chunks(MAX_PARAMETERS / 2) {
@@ -1142,10 +1165,13 @@ async fn delete_children(
         for row in &conn.query_with(&sql, &params).await? {
             let schema: &str = get(row, "schema")?;
             let object: &str = get(row, "object")?;
-            out.insert(ObjectName::new(schema, object));
+            let column: &str = get(row, "column")?;
+            out.entry(ObjectName::new(schema, object))
+                .or_default()
+                .insert(column.to_owned());
         }
     }
-    Ok(out.into_iter().collect())
+    Ok(out)
 }
 
 async fn object_permissions(
@@ -1605,6 +1631,10 @@ pub async fn permissions(
     // Deduplicated against the managed names, which already demand `SELECT` on
     // the same securable — a declared child needs no second entry, and a
     // self-referencing key would otherwise report the parent as its own child.
+    // That dedupe is also what makes the narrow column list right: the
+    // fragments naming a child's own key are written only for a child the plan
+    // moves, and such a child is declared, so everything left here is read
+    // through its foreign-key tuple and nothing else.
     let removable: Vec<ObjectName> = data
         .iter()
         .filter(|(_, demand)| demand.removes())
@@ -1612,11 +1642,12 @@ pub async fn permissions(
         .collect();
     let mut delete_children: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
     if !removable.is_empty() {
-        let children: Vec<ObjectName> = self::delete_children(conn, &removable)
+        let columns: ReferencedColumns = self::delete_children(conn, &removable)
             .await?
             .into_iter()
-            .filter(|child| !managed_names.contains(child))
+            .filter(|(child, _)| !managed_names.contains(child))
             .collect();
+        let children: Vec<ObjectName> = columns.keys().cloned().collect();
         let child_perms: Vec<&str> = REQUIRED
             .iter()
             .filter(|r| matches!(r.needed, Needed::DeleteChild))
@@ -1627,7 +1658,7 @@ pub async fn permissions(
             &children,
             &child_perms,
             Existing::OrNot,
-            Columns::Catalog,
+            Columns::Referenced(&columns),
         )
         .await?;
     }
@@ -4108,6 +4139,13 @@ mod tests {
         assert!(
             sql.contains("ct.object_id = fk.parent_object_id"),
             "the child is the referencing table, not the referenced one: {sql}"
+        );
+        // And the columns the count compares, so the demand is the probe's
+        // width rather than the child's whole catalog.
+        assert!(
+            sql.contains("fkc.constraint_object_id = fk.object_id")
+                && sql.contains("cc.column_id = fkc.parent_column_id"),
+            "the child's own foreign-key columns come back with it: {sql}"
         );
         assert_eq!(params.len(), 4, "two bound parts per parent");
     }

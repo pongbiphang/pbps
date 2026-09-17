@@ -253,6 +253,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
              CREATE TABLE app.declared_child (id varchar(20) NOT NULL PRIMARY KEY, \
                CONSTRAINT fk_declared FOREIGN KEY (id) REFERENCES app.t(code)); \
              CREATE TABLE app.unmanaged (id varchar(20) NOT NULL PRIMARY KEY, \
+               secret nvarchar(50) NULL, \
                CONSTRAINT fk_unmanaged FOREIGN KEY (id) REFERENCES app.t(code)); \
              CREATE TABLE other.far (id varchar(20) NOT NULL PRIMARY KEY, \
                CONSTRAINT fk_far FOREIGN KEY (id) REFERENCES app.t(code)); \
@@ -325,8 +326,54 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         );
     }
 
-    // The control, and the remedy: granting the two reads closes the gaps and
-    // the count's own statement runs.
+    // The demand is the **probe's** width, not the child's whole catalog.
+    // `app.unmanaged` has a column no key names, and a grant on the key
+    // column alone authorizes the count the probe really writes — measured
+    // both ways below, because the two `COUNT(*)` shapes differ: the plain
+    // one names a column the engine picks for itself and is refused.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT SELECT ON app.unmanaged(id) TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the key column alone");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    assert!(
+        !holds_at_object_scope(&mut lp, "app.unmanaged", "SELECT").await,
+        "the premise: a column grant answers 0 at object scope"
+    );
+    assert!(
+        lp.query("SELECT COUNT(*) FROM app.unmanaged;")
+            .await
+            .is_err(),
+        "the premise: a bare COUNT(*) names a column this grant does not cover"
+    );
+    lp.query(
+        "SELECT COUNT(*) FROM app.unmanaged AS ch \
+         WHERE EXISTS (SELECT 1 FROM app.t AS p WHERE p.code = 'a' AND p.code = ch.id);",
+    )
+    .await
+    .expect("the count the probe writes runs under the key column alone");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &managed,
+        &["app".to_owned()],
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &declared,
+        &pbps_model::IdsFile::default(),
+    )
+    .await
+    .expect("read permissions");
+    assert_eq!(
+        named_gaps(&held),
+        ["SELECT on OBJECT::[other].[far]"],
+        "the key column is enough for the child that has one: {held:?}"
+    );
+
+    // The control, and the remedy for the one still missing: granting the
+    // reads closes the gaps and the count's own statement runs.
     db.conn
         .execute(&format!(
             "USE [{0}]; GRANT SELECT ON OBJECT::app.unmanaged TO [{login}]; \
@@ -360,6 +407,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
     db.conn
         .execute(&format!(
             "USE [{0}]; REVOKE SELECT ON OBJECT::app.unmanaged FROM [{login}]; \
+             REVOKE SELECT ON app.unmanaged(id) FROM [{login}]; \
              REVOKE SELECT ON OBJECT::other.far FROM [{login}];",
             db.name
         ))

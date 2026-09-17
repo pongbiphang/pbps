@@ -1650,8 +1650,10 @@ on each of those too. They are found the way the probe finds them, in the
 catalog and not in the declarations — a foreign key someone added by hand is
 exactly the one that will refuse the delete — so a child need not be declared,
 recorded, or even in a managed schema. A disabled constraint is skipped, as it
-is by the probe, and a project that removes no row is asked for none of this
-(DECISIONS 511).
+is by the probe, and a project that removes no row is asked for none of this.
+The demand is the child's **foreign-key columns**, not its whole catalog: the
+count reads the child only through the key tuple, so an object grant covers it
+and so does a grant on those columns alone (DECISIONS 511).
 
 For foreign-key targets **the declarations do not hold**, SQL Server asks for
 `REFERENCES` for the key and `SELECT` for its preflight probe on the **union of

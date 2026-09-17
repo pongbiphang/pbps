@@ -13461,8 +13461,24 @@ SPEC is in sync with all of these.
 
      The discovery query matches the probe exactly — `is_disabled = 0`, because
      a `NOCHECK`ed constraint is not enforced and its child is not counted (144)
-     — and runs only for a project that can remove a row at all. A child the
-     managed question already asks about is not asked twice. A child this login
+     — and runs only for a project that can remove a row at all.
+
+     **Asked over the child's foreign-key columns, not its whole catalog**, the
+     way an external target is (466). The count names a child only in the tuple
+     the catalog gives it, and the fragments that name a child's *own* key are
+     written only for a child the plan moves — which is a declared table, and
+     therefore deduplicated out of this list before it is asked about. So
+     everything left here is read through its key tuple and nothing else.
+     Measured on 17.0.4075.5: a login holding `SELECT` on nothing but the
+     foreign-key column is refused a plain `SELECT COUNT(*) FROM app.kid`
+     (error 230, on a column the engine picks for `COUNT(*)` itself) and runs
+     the count the probe actually writes. Demanding every catalog column would
+     have reported a gap against an account that can run every statement the
+     declaration produces, which is the over-demand this whole list exists to
+     avoid.
+
+     A child the managed question already asks about is not asked twice, which
+     is also what makes that narrow column list right. A child this login
      cannot see produces no row and the report is silent about it: that is the
      boundary of a read-only check, not a gap it could print a `GRANT` for, and
      the count's own `VIEW DEFINITION` demands (505) report the visibility half.
