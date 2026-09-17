@@ -197,10 +197,11 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // environment's own recorded state, read where the permission question is
     // actually asked (DECISIONS 439).
     let ids = crate::read_ids(project).unwrap_or_default();
-    let (referenced, referenced_columns) = referenced_targets(project, &managed_schemas);
+    let keys = foreign_keys(project);
     let declared = Declared {
-        referenced,
-        referenced_columns,
+        referenced: keys.referenced,
+        referenced_columns: keys.referenced_columns,
+        declared_keys: keys.declared,
         tables: managed_tables(project),
         granted: grant_targets(project, &ids),
         data: data_tables(project),
@@ -408,19 +409,6 @@ fn managed_schemas(project: &Project) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// Tables a declared foreign key points at that lie **outside** the managed
-/// schemas, for the object-scope question `HAS_PERMS_BY_NAME` answers.
-///
-/// `validate` accepts a foreign key whose target is not declared — the target
-/// is somebody else's table, and pbps is not asked to manage it — but the
-/// emitter still writes `REFERENCES [shared].[parent]`, which SQL Server
-/// authorizes on that table, and the pre-flight probe for the change reads it.
-/// Neither is covered by any question about the managed schemas, so a login
-/// could pass `doctor` and fail during `apply`.
-///
-/// Targets *inside* the managed schemas are left out: the schema-scoped
-/// `REFERENCES` and `SELECT` already cover them, and asking twice would report
-/// the same gap at two securables.
 /// Every table the declarations hold, for the engines that authorize DML
 /// and ownership on the table rather than on its schema.
 fn managed_tables(project: &Project) -> Vec<pbps_model::ObjectName> {
@@ -435,35 +423,63 @@ fn managed_tables(project: &Project) -> Vec<pbps_model::ObjectName> {
         .collect()
 }
 
-/// Tables a declared foreign key points at that lie **outside** the managed
-/// schemas — see the note above `managed_tables` for why they are asked
-/// about at all — together with the columns a declared key actually names on
-/// each one, unioned across every key that points there.
+/// Tables a declared foreign key points at that **this project does not
+/// declare**, together with the columns a declared key actually names on each
+/// one, unioned across every key that points there.
+///
+/// `validate` accepts a foreign key whose target is not declared — the target
+/// is somebody else's table, and pbps is not asked to manage it — but the
+/// emitter still writes `REFERENCES [shared].[parent]`, which the engine
+/// authorizes on that table, and the pre-flight probe for the change reads it.
+///
+/// **Membership of the declared tables, not of the managed schemas** (issues
+/// #510 and #315, DECISIONS 509). The filter used to be the schema, because the managed
+/// `SELECT` was asked there too: a target sharing a schema with the
+/// declarations was covered by that answer, and asking again would have
+/// reported one gap at two securables. Both dialects have since narrowed that
+/// read to the tables — `Needed::ManagedTable` on SQL Server, `SELECT` on each
+/// managed table on PostgreSQL — and an undeclared parent inside a managed
+/// schema fell out of both lists. Measured on both pinned engines: the DDL
+/// half stays covered (SQL Server by `REFERENCES ON SCHEMA::app`, PostgreSQL
+/// by nothing, since a schema grant there is only `USAGE` and `CREATE`), while
+/// nothing covers the `SELECT` the probe needs, so the login passed `doctor`
+/// with no gaps and its probe failed — SQL Server error 229, PostgreSQL
+/// `42501`.
+///
+/// Asking a target inside a managed schema at object scope does not report the
+/// covered half twice. `HAS_PERMS_BY_NAME` accounts for inheritance, so a
+/// `REFERENCES` grant on the schema answers 1 for the table under it; on
+/// PostgreSQL there is no schema-scoped `REFERENCES` to inherit from, so the
+/// object-scope question is the only one that can be asked. A target the
+/// declarations *do* hold stays out either way: it is a managed table, asked
+/// about as one.
 ///
 /// Both engines grant `SELECT` and `REFERENCES` per column (issues #195 and
 /// #215). Passing the union keeps a key's subset distinct from the target's
 /// complete catalog column set, which would demand unrelated grants.
 ///
-/// Declarations that do not load give an empty target list and an empty map,
+/// The whole map of declared keys travels beside the undeclared half, because
+/// the two answer different questions and only one walk of the declarations
+/// answers both: which targets are asked about at object scope, and which keys
+/// the environment holds that the next apply will take away (DECISIONS 513).
+///
+/// Declarations that do not load give an empty target list and empty maps,
 /// for the reason [`managed_schemas`] gives.
-fn referenced_targets(
-    project: &Project,
-    managed: &[String],
-) -> (
-    Vec<pbps_model::ObjectName>,
-    pbps_db::doctor::ReferencedColumns,
-) {
+fn foreign_keys(project: &Project) -> ForeignKeys {
     let Ok(loaded) = crate::load_quiet(project) else {
-        return (Vec::new(), pbps_db::doctor::ReferencedColumns::new());
+        return ForeignKeys::default();
     };
-    let managed: std::collections::BTreeSet<&str> = managed.iter().map(String::as_str).collect();
+    let declared: std::collections::BTreeSet<&pbps_model::TableName> =
+        loaded.schema.tables.keys().collect();
     let mut targets: std::collections::BTreeSet<pbps_model::ObjectName> =
         std::collections::BTreeSet::new();
     let mut columns = pbps_db::doctor::ReferencedColumns::new();
-    for table in loaded.schema.tables.values() {
+    let mut keys = pbps_db::doctor::DeclaredKeys::new();
+    for (name, table) in &loaded.schema.tables {
         for fk in table.foreign_keys.values() {
             let target = &fk.references_table;
-            if managed.contains(target.schema.as_str()) {
+            keys.entry(name.clone()).or_default().insert(target.clone());
+            if declared.contains(target) {
                 continue;
             }
             targets.insert(target.clone());
@@ -473,7 +489,22 @@ fn referenced_targets(
                 .extend(fk.references_columns.iter().cloned());
         }
     }
-    (targets.into_iter().collect(), columns)
+    ForeignKeys {
+        referenced: targets.into_iter().collect(),
+        referenced_columns: columns,
+        declared: keys,
+    }
+}
+
+/// What one walk of the declared foreign keys tells `doctor`.
+#[derive(Debug, Default)]
+struct ForeignKeys {
+    /// Targets the declarations do not hold.
+    referenced: Vec<pbps_model::ObjectName>,
+    /// The columns a declared key names on each of `referenced`'s targets.
+    referenced_columns: pbps_db::doctor::ReferencedColumns,
+    /// Every declared key, by the table that holds it.
+    declared: pbps_db::doctor::DeclaredKeys,
 }
 
 /// The tables whose declarations carry rows, and what each would have written
@@ -608,6 +639,8 @@ struct Declared {
     /// The columns a declared key names on each of `referenced`'s targets
     /// (issue #215, DECISIONS 440).
     referenced_columns: pbps_db::doctor::ReferencedColumns,
+    /// Every declared foreign key, by the table that holds it (DECISIONS 513).
+    declared_keys: pbps_db::doctor::DeclaredKeys,
     /// What the managed roles are granted on (ADR-0005).
     granted: pbps_db::doctor::GrantTargets,
     /// The tables that declare rows, and what each demands (ADR-0004).
@@ -686,6 +719,7 @@ async fn examine(
         referenced_columns: &declared.referenced_columns,
         granted: &declared.granted,
         data: &declared.data,
+        declared_keys: &declared.declared_keys,
     };
     match crate::engine::permissions(&mut conn, &declared.ids, &ask).await {
         Ok(held) => {
@@ -1075,6 +1109,86 @@ fn render_resolver(out: &mut String, discovery: &pbps_db::resolver::Discovery) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A foreign-key target is somebody else's table when the declarations do
+    /// not hold it, whatever schema it sits in (issues #510 and #315).
+    ///
+    /// The filter was the managed schemas, back when the managed `SELECT` was
+    /// asked there. Both dialects now ask it of the tables, so a target the
+    /// declarations do not name has to be asked about at object scope even
+    /// inside a schema this project manages — otherwise nothing covers the
+    /// read the foreign key's own probe makes.
+    #[test]
+    fn foreign_key_targets_are_classified_by_declared_table_not_by_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-doctor-fk510-{}",
+            pbps_model::Uid::generate(pbps_model::UidKind::Table)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("schema")).unwrap();
+        std::fs::write(dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        // Two keys into the same undeclared parent in the managed schema, one
+        // into a declared table, and one outside the managed schemas.
+        std::fs::write(
+            dir.join("schema").join("child.yml"),
+            "table: app.child\ncolumns:\n  id: {type: integer}\n  other: {type: integer}\n  \
+             mine: {type: integer}\n  away: {type: integer}\n\
+             foreign_keys:\n  \
+             near: {columns: [id], references: app.parent(code)}\n  \
+             near_again: {columns: [other], references: app.parent(label)}\n  \
+             declared: {columns: [mine], references: app.t(id)}\n  \
+             far: {columns: [away], references: shared.parent(code)}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("schema").join("t.yml"),
+            "table: app.t\ncolumns:\n  id: {type: integer}\n",
+        )
+        .unwrap();
+        let project = Project::load(&dir.join("pbps.yml")).unwrap();
+        let keys = foreign_keys(&project);
+        let (targets, columns) = (keys.referenced, keys.referenced_columns);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            targets,
+            [
+                "app.parent".parse::<pbps_model::ObjectName>().unwrap(),
+                "shared.parent".parse().unwrap(),
+            ],
+            "the undeclared parent inside the managed schema is asked about, \
+             the declared one is not, and each target is named once"
+        );
+        // And the columns are the union across the keys that point there, not
+        // the target's whole catalog: two keys, two columns, one entry.
+        assert_eq!(
+            columns[&"app.parent".parse::<pbps_model::ObjectName>().unwrap()],
+            ["code".to_owned(), "label".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        // The declared half is the whole map, both classifications together:
+        // the question it answers is which keys this environment holds that
+        // the declarations still name, and a target's own status is beside
+        // the point (DECISIONS 513).
+        assert_eq!(
+            keys.declared[&"app.child".parse::<pbps_model::ObjectName>().unwrap()],
+            [
+                "app.parent".parse::<pbps_model::ObjectName>().unwrap(),
+                "app.t".parse().unwrap(),
+                "shared.parent".parse().unwrap(),
+            ]
+            .into_iter()
+            .collect(),
+            "every target of a declared key, named once"
+        );
+        assert!(
+            !keys
+                .declared
+                .contains_key(&"app.t".parse::<pbps_model::ObjectName>().unwrap()),
+            "a table declaring no key holds no entry"
+        );
+    }
 
     #[test]
     fn adopted_grant_scope_keeps_ids_tables_and_exact_declared_modules() {

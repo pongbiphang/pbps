@@ -13385,3 +13385,188 @@ SPEC is in sync with all of these.
      `nvarchar(max)` is the only conversion that preserves a key there and the
      engine will not take it as a key column, which is why the offline test's
      negative controls are both PostgreSQL's.
+
+509. **A foreign key's target is somebody else's table when the declarations do
+     not hold it, whatever schema it sits in.**
+
+     `doctor`'s foreign-key question used to classify a target by the *managed
+     schemas*: a target inside one was left out, because the managed `SELECT`
+     was asked at schema scope and covered it, and asking again would have
+     reported one gap at two securables. Both dialects have since narrowed that
+     read to the tables — `Needed::ManagedTable` on SQL Server, `SELECT` on each
+     managed table on PostgreSQL — and an undeclared parent inside a managed
+     schema fell out of both lists.
+
+     Classified by **declared table membership** instead (issues #510, #315).
+     The two issues are one change to one function, `pbps-cli`'s
+     `referenced_targets`, and could not be made separately. Measured on both
+     pinned engines: the DDL half stays covered on SQL Server by `REFERENCES ON
+     SCHEMA::app` and is covered by nothing on PostgreSQL, where a schema grant
+     is only `USAGE` and `CREATE` — while nothing covers the `SELECT` the
+     foreign key's own pre-flight probe makes. The login passed `doctor` with no
+     gaps and its probe failed, with error 229 and with `42501`.
+
+     Asking a target inside a managed schema at object scope does not report the
+     covered half twice. `HAS_PERMS_BY_NAME` accounts for inheritance, so a
+     `REFERENCES` grant on the schema answers 1 for a table under it; PostgreSQL
+     has no schema-scoped `REFERENCES` to inherit from, so the object-scope
+     question is the only one there is. A target the declarations *do* hold
+     stays out either way: it is a managed table, asked about as one.
+
+510. **`doctor` asks for the read that closes an apply, over the columns the
+     declaration names.**
+
+     `SELECT` on a managed table is asked over the *catalog's* columns, which is
+     the right list for the pre-flight probes and the wrong one for the row
+     read-back: `apply` reads the managed rows back before it records and
+     commits, and `rows::query` projects the key and the writable cells the
+     **declaration** names. The two lists differ in exactly the case that
+     matters — a plan that adds a column reads it back in the same run that
+     creates it.
+
+     So a `SELECT` requirement of its own, on each table that declares rows
+     (issue #516). Measured on 17.0.4075.5 with `app.t(code, label)` and a
+     declaration adding `extra`: a login granted `SELECT` on `code` and `label`
+     answers 1 on each, 0 on `extra` — a column the catalog does not hold yet
+     answers 0 rather than NULL — runs the `ALTER` itself, and then cannot read
+     what it added (error 230). An object-level grantee answers 1 at object
+     scope, which the question takes before it reaches any column, and its read
+     runs. The remedy the report prints is therefore the grant that actually
+     covers a column added later, which is the same reasoning `Columns::Declared`
+     already carried for `UPDATE`.
+
+     Asked as a second statement rather than by widening the DML question's
+     column list: the read covers the key and the `UPDATE` must not: demanding
+     `UPDATE` on a primary key would refuse every column-level grant a careful
+     DBA would write. One column list per object is all one statement can bind.
+
+511. **The delete count's children are found in the catalog, because that is
+     where the probe finds them.**
+
+     Before removing an undeclared row, `preflight::delete_probe` counts the
+     rows still pointing at it, one `COUNT(*)` per table with an **enabled**
+     foreign key into the parent, read from `sys.foreign_keys` at run time. It
+     deliberately does not trust the declarations to list those children — a
+     foreign key someone added by hand is exactly the one that will refuse the
+     delete — so the readiness question cannot trust them either (issue #515).
+
+     A child need not be declared, recorded, or even in a schema this project
+     manages, and nothing else in the list reaches it: `Needed::ManagedTable`
+     asks about the declared and recorded tables, and `Needed::Referenced` about
+     the targets the declarations point *out* at, which is the opposite
+     direction. Measured on 17.0.4075.5: with `app.t` declared `mode: exact` and
+     an undeclared `app.unmanaged(id)` referencing it, a deployer holding
+     everything else passed `doctor` with no gaps and the count failed with
+     error 229.
+
+     The discovery query matches the probe exactly — `is_disabled = 0`, because
+     a `NOCHECK`ed constraint is not enforced and its child is not counted (144)
+     — and runs only for a project that can remove a row at all.
+
+     **Asked over the child's foreign-key columns, not its whole catalog**, the
+     way an external target is (466). The count names a child only in the tuple
+     the catalog gives it, and the fragments that name a child's *own* key are
+     written only for a child the plan moves — which is a declared table, and
+     therefore deduplicated out of this list before it is asked about. So
+     everything left here is read through its key tuple and nothing else.
+     Measured on 17.0.4075.5: a login holding `SELECT` on nothing but the
+     foreign-key column is refused a plain `SELECT COUNT(*) FROM app.kid`
+     (error 230, on a column the engine picks for `COUNT(*)` itself) and runs
+     the count the probe actually writes. Demanding every catalog column would
+     have reported a gap against an account that can run every statement the
+     declaration produces, which is the over-demand this whole list exists to
+     avoid.
+
+     A child the managed question already asks about is not asked twice, which
+     is also what makes that narrow column list right — **except when this plan
+     moves it to another schema**. The guard a row delete carries
+     (`preflight::still_referenced`) discovers the surviving keys and reads the
+     child inside the delete's own transaction, and a table rename is
+     `order_key` 1 while a row delete is 12: the transfer has already run and
+     taken every permission on that object with it (512). The managed question
+     answers for the source, and a child with no `data:` block has nothing in
+     `data_gaps` to answer for its destination — so that child's destination
+     schema is demanded here, and the dedupe drops only the children that stay
+     put. A child this login
+     cannot see produces no row and the report is silent about it: that is the
+     boundary of a read-only check, not a gap it could print a `GRANT` for, and
+     the count's own `VIEW DEFINITION` demands (505) report the visibility half.
+
+512. **A table moving between schemas is asked about at two securables, because
+     the move drops the permissions on it.**
+
+     Current-name resolution asks about the object this environment still has
+     (439), which is right for every statement that runs *before* the change and
+     silent about the ones after it. For a move between schemas that silence is
+     wrong: `ALTER SCHEMA <dest> TRANSFER <source>.<name>` **drops every
+     permission on the object it moves**. Measured on 17.0.4075.5 — a login
+     holding `SELECT` on `app.old_name` and `ALTER` on both schemas ran the
+     transfer, `HAS_PERMS_BY_NAME` answered 1 before it and 0 after, and the next
+     read failed with error 229.
+
+     So the destination is demanded as well (issue #517). The destination object
+     does not exist yet, so the only securable a grant for it can sit on is the
+     destination *schema*, and `GRANT SELECT ON SCHEMA::dest` was measured to
+     carry the post-transfer read. The source answer is kept too: the probes read
+     the table where it is now. An ordinary rename is unaffected — its schema
+     does not change, so the second question is not asked.
+
+     **Demanded of the tables that are really read there, and of no others.**
+     The first cut asked it of every managed table that moves, and that refused
+     a deployment which would have run: the probes' `SELECT` is spent *before*
+     the transfer — `preflight` runs before `execute_statements` — and the only
+     read that happens afterwards is the row read-back, which `apply_under_lock`
+     scopes to the plan's data tables. A moving table with no `data:` block is
+     therefore never read at its destination, and asking for it there was the
+     over-demand this list exists to avoid, arrived at while fixing an
+     under-demand. The question lives in the data path alone.
+
+     **Every demand the table carries, not only the read.** The transfer drops
+     *all* of the object's permissions, so a report that asked the destination
+     for `SELECT` alone would print a remedy that makes `doctor` go green on an
+     environment where the first row still fails — a misleading all-clear, which
+     is worse than the silence it replaced. Measured on 17.0.4075.5: a login
+     holding `SELECT, INSERT, UPDATE, DELETE` on `app.old_name` and `SELECT` on
+     `SCHEMA::dest` ran the transfer, read the table at its new name, and was
+     refused its `INSERT` with error 229 — `HAS_PERMS_BY_NAME` answering 1 for
+     the destination's `SELECT` and 0 for its `INSERT`. So the data
+     requirements ask at the destination too, and `SELECT` is named there twice,
+     by the probes and by the read-back, which is the "one permission, two
+     reasons" shape the ledger's own `SELECT` already has.
+
+     What this does **not** demand is the `CONTROL` on the source object that the
+     transfer statement itself wants on top of `ALTER` on the destination. That
+     over-demand is a separate question (#352), and this entry deliberately
+     leaves it where it was.
+
+513. **A key the declarations no longer name carries no demand, because the plan
+     drops it before anything reads it.**
+
+     The delete-count child that moves between schemas is demanded at its
+     destination (511, 512), and the discovery that finds it reads the catalog —
+     which still holds the key the next apply is about to take away. A managed
+     child that both moves and drops its key into the parent was therefore asked
+     for a `SELECT` on the destination schema that nothing would ever spend:
+     `DropForeignKey` is `order_key` 2 against `DeleteRow`'s 12, the guard
+     (`preflight::still_referenced`) discovers its children from the catalog
+     *inside* the delete's transaction, and by then the constraint is gone. The
+     probe that runs before the statements does still see it, and leaves it out
+     for itself (128) — but the probe reads the child at its *source* name, from
+     before the transfer, so the destination is nobody's demand.
+
+     `doctor` never looks at a plan (417), and does not have to here: a key the
+     catalog holds that the declarations do not name is a `DropForeignKey` the
+     next apply will write, and the declarations are already in hand. So the
+     declared keys travel with the rest of the ask (`Ask::declared_keys`), and
+     the destination is demanded only for a child whose declaration still names
+     a key into a table this project can delete a row from.
+
+     **This narrows one case and not its neighbour**, deliberately. A child the
+     plan drops outright (`DropTable`, `order_key` 6) is also left out of the
+     guard's read, and `doctor` still demands the count's `SELECT` on it — but
+     that child is *undeclared* by construction, since a dropped table is one the
+     declarations no longer hold, and nothing in a declarations-only reading
+     distinguishes it from somebody else's table that will still be there. The
+     demand is on an object that exists, at the securable it exists on, which is
+     an over-demand this reading cannot see; the destination demand was one it
+     could.

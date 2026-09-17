@@ -1636,12 +1636,54 @@ create-time `ALTER` on the ledger's schema is required only while the ledger
 tables are still missing — per table, since `ensure_tables` recreates whichever
 one is gone.
 
-For foreign-key targets outside the managed schemas, SQL Server asks for
+`SELECT` is also asked for on each table that **declares rows**, over the
+columns that declaration names rather than the catalog's: `apply` reads the
+managed rows back before it records and commits, and a plan that adds a column
+reads that column back in the same run that creates it. A grant on each column
+that exists today answers 1 for all of them and 0 for the new one, so only an
+object-level grant establishes readiness for the read that closes the apply
+(DECISIONS 510).
+
+Under `mode: exact`, the count that precedes a row's removal reads **every table
+the catalog says has an enabled foreign key into it**, so `SELECT` is asked for
+on each of those too. They are found the way the probe finds them, in the
+catalog and not in the declarations — a foreign key someone added by hand is
+exactly the one that will refuse the delete — so a child need not be declared,
+recorded, or even in a managed schema. A disabled constraint is skipped, as it
+is by the probe, and a project that removes no row is asked for none of this. A
+child that is itself a managed table is not asked about twice — unless this plan
+moves it to another schema, in which case its destination is asked about, because
+the guard inside the delete's transaction reads it after the transfer. That
+destination is asked about only while the key **survives the plan**: a key the
+catalog holds and the declarations no longer name is one the same plan drops,
+and the drop runs before the delete, so the guard finds no child to read
+(DECISIONS 513).
+The demand is the child's **foreign-key columns**, not its whole catalog: the
+count reads the child only through the key tuple, so an object grant covers it
+and so does a grant on those columns alone (DECISIONS 511).
+
+For foreign-key targets **the declarations do not hold**, SQL Server asks for
 `REFERENCES` for the key and `SELECT` for its preflight probe on the **union of
 columns named by the declared keys**. An object-level grant covers that demand;
 otherwise every named column must grant the permission. Unrelated target
 columns do not require grants, and an empty subset or an unknown column cannot
-establish column-level readiness (DECISIONS 466).
+establish column-level readiness (DECISIONS 466). Membership is of the managed
+*tables*, not of their schemas: an undeclared parent sharing a schema with the
+declarations is still somebody else's table, and once the probes' `SELECT`
+narrowed from the schema to the tables nothing else covered the read it needs
+(DECISIONS 509). PostgreSQL asks the same question in its own vocabulary, over
+the same list.
+
+A declared table **that declares rows** and whose recorded identity lives in
+another schema is asked about twice: at the object it currently is, which the
+probes read before anything runs, and at the destination schema, because
+`ALTER SCHEMA ... TRANSFER` drops every permission on the object it moves and
+the destination object does not exist yet for a grant to sit on. That second
+question covers every demand the rows carry — the DML as well as the read —
+because the transfer drops all of them, and asking only for the read would
+report a remedy that leaves the first row failing. A moving table with no rows
+is asked only at its source: the probes are spent before the transfer, and
+nothing reads it afterwards (DECISIONS 512).
 
 An existing `__pbps_state` that still needs the timeline columns also requires
 `ALTER` on that object (SQL Server), or ownership/equivalent (PostgreSQL).

@@ -120,12 +120,15 @@ pub enum Needed {
     /// else, and a schema-scoped question would report that as a gap.
     Ledger,
 
-    /// Held on a table a declared foreign key *points at* which lies outside
-    /// the schemas this project manages.
+    /// Held on a table a declared foreign key *points at* which this project
+    /// does not declare.
     ///
     /// `REFERENCES` is authorized on the referenced table, and the pre-flight
     /// probe for an added foreign key reads it — so both are needed there, and
-    /// neither is covered by anything asked about the managed schemas.
+    /// neither is covered by anything asked about the managed schemas. That
+    /// includes a target inside a managed schema: a schema grant here is only
+    /// `USAGE` and `CREATE`, so nothing else covers either half (DECISIONS
+    /// 509).
     Referenced,
 
     /// Held on the schema a referenced table lives in.
@@ -225,10 +228,6 @@ pub const REQUIRED: [Requirement; 13] = [
          authorizes on the referenced table",
         Needed::Referenced,
     ),
-    // The other half of that foreign key, and the entry the SQL Server list
-    // already carries: the probe for an added key reads the referenced table
-    // (`NOT EXISTS (SELECT 1 FROM <parent> ...)`), and `REFERENCES` does not
-    // confer a read.
     // The other half of that foreign key, and the entry the SQL Server list
     // already carries: the probe for an added key reads the referenced table
     // (`NOT EXISTS (SELECT 1 FROM <parent> ...)`), and `REFERENCES` does not
@@ -362,7 +361,7 @@ pub struct Held {
     /// that is not there is absent from the map, like a managed one.
     pub referenced_schemas: BTreeMap<String, SchemaRights>,
 
-    /// Per foreign-key target outside the managed schemas that exists, what is
+    /// Per foreign-key target the declarations do not hold that exists, what is
     /// held on it. A target the database does not have is absent from this map
     /// rather than present and empty: there is no securable to ask about, and
     /// reporting a gap would fire on every project whose referenced table is
@@ -585,6 +584,15 @@ fn values_list(rows: usize, columns: usize) -> String {
 /// Project ids connect pending table/column names to this environment's last
 /// recorded identities; permission gaps name the current grantable securable
 /// (DECISIONS 484). A freed name belongs to a future table, not its old occupant.
+///
+/// [`Ask::declared_keys`] is the field this engine does not read. It says which
+/// keys the next apply takes away, which only a demand made *about a key* can
+/// care about, and there is none here: the children a delete's count reads are
+/// asked about on SQL Server alone (DECISIONS 511), and a schema move carries a
+/// relation's privileges with it, so it demands nothing at its destination —
+/// measured on 18.6, where `ALTER TABLE ... SET SCHEMA` left `relacl` and
+/// `has_table_privilege` unchanged, which is the opposite of what the other
+/// engine's transfer does (DECISIONS 512).
 pub async fn permissions(
     conn: &mut Conn,
     ask: &Ask<'_>,
