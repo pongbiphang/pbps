@@ -1650,7 +1650,10 @@ on each of those too. They are found the way the probe finds them, in the
 catalog and not in the declarations — a foreign key someone added by hand is
 exactly the one that will refuse the delete — so a child need not be declared,
 recorded, or even in a managed schema. A disabled constraint is skipped, as it
-is by the probe, and a project that removes no row is asked for none of this.
+is by the probe, and a project that removes no row is asked for none of this. A
+child that is itself a managed table is not asked about twice — unless this plan
+moves it to another schema, in which case its destination is asked about, because
+the guard inside the delete's transaction reads it after the transfer.
 The demand is the child's **foreign-key columns**, not its whole catalog: the
 count reads the child only through the key tuple, so an object grant covers it
 and so does a grant on those columns alone (DECISIONS 511).

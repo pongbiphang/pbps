@@ -13478,7 +13478,16 @@ SPEC is in sync with all of these.
      avoid.
 
      A child the managed question already asks about is not asked twice, which
-     is also what makes that narrow column list right. A child this login
+     is also what makes that narrow column list right — **except when this plan
+     moves it to another schema**. The guard a row delete carries
+     (`preflight::still_referenced`) discovers the surviving keys and reads the
+     child inside the delete's own transaction, and a table rename is
+     `order_key` 1 while a row delete is 12: the transfer has already run and
+     taken every permission on that object with it (512). The managed question
+     answers for the source, and a child with no `data:` block has nothing in
+     `data_gaps` to answer for its destination — so that child's destination
+     schema is demanded here, and the dedupe drops only the children that stay
+     put. A child this login
      cannot see produces no row and the report is silent about it: that is the
      boundary of a read-only check, not a gap it could print a `GRANT` for, and
      the count's own `VIEW DEFINITION` demands (505) report the visibility half.

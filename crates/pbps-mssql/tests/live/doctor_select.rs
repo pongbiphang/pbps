@@ -413,7 +413,8 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         ))
         .await
         .expect("take the children's reads away again");
-    let ensured: pbps_mssql::doctor::DataTables = [(parent, ensured_table())].into_iter().collect();
+    let ensured: pbps_mssql::doctor::DataTables =
+        [(parent.clone(), ensured_table())].into_iter().collect();
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -431,6 +432,79 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         "an `ensure` declaration discovers no child: {held:?}"
     );
     assert!(named_gaps(&held).is_empty(), "{held:?}");
+
+    // A **managed** child that this plan moves between schemas is the one the
+    // dedupe must not simply drop: the guard reads it inside the delete's own
+    // transaction, long after the transfer has taken its object grants. The
+    // declared child above becomes that case by declaring it in `dest` while
+    // this environment still has it in `app`.
+    let uid: Uid = "t_kd5150".parse().expect("a well-formed table uid");
+    let mut recorded_ids = IdsFile::default();
+    recorded_ids
+        .tables
+        .insert(uid.clone(), "app.declared_child".parse().unwrap());
+    let mut project_ids = IdsFile::default();
+    project_ids
+        .tables
+        .insert(uid, "dest.declared_child".parse().unwrap());
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; EXEC(N'CREATE SCHEMA dest;'); \
+             GRANT VIEW DEFINITION, ALTER ON SCHEMA::dest TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("create the destination schema");
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(
+            pbps_model::StateKind::Apply,
+            &Schema::default(),
+            &recorded_ids,
+        ),
+    )
+    .await
+    .expect("record the environment's own state");
+    let moving = [parent.clone(), "dest.declared_child".parse().unwrap()];
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &moving,
+        &["app".to_owned(), "dest".to_owned()],
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &declared,
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        named_gaps(&held).contains(&"SELECT on SCHEMA::[dest]".to_owned()),
+        "the moved child's destination is demanded: {held:?}"
+    );
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT SELECT ON SCHEMA::dest TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the destination read");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &moving,
+        &["app".to_owned(), "dest".to_owned()],
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &declared,
+        &project_ids,
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        !named_gaps(&held).contains(&"SELECT on SCHEMA::[dest]".to_owned()),
+        "granting it there closes the gap: {held:?}"
+    );
 
     drop(lp);
     drop_login(&login).await;

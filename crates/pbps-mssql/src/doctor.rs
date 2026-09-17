@@ -614,7 +614,7 @@ pub struct Held {
     /// [`Columns::Referenced`]): the name came out of the catalog, so an
     /// object question that answered nothing would drop a demand the count
     /// really makes, and the count reads no other column of it.
-    pub delete_children: BTreeMap<ObjectName, BTreeSet<String>>,
+    pub delete_children: BTreeMap<Securable, BTreeSet<String>>,
 
     /// Whether the project has any role at all — declared, recorded, or being
     /// dropped. `false` switches the role requirements off rather than
@@ -1635,32 +1635,65 @@ pub async fn permissions(
     // fragments naming a child's own key are written only for a child the plan
     // moves, and such a child is declared, so everything left here is read
     // through its foreign-key tuple and nothing else.
+    //
+    // **With one exception, and it is the managed child that moves.** The
+    // guard a row delete carries (`preflight::still_referenced`) discovers the
+    // surviving keys and reads the child *inside the delete's transaction*,
+    // and a table rename is `order_key` 1 while a row delete is 12 — so the
+    // transfer has already run, and with it every permission on that object.
+    // The managed question answers for the source, and this child has no
+    // `data:` block for `data_gaps` to answer for its destination, so nothing
+    // else covers the read. Its destination schema is demanded here instead.
     let removable: Vec<ObjectName> = data
         .iter()
         .filter(|(_, demand)| demand.removes())
         .filter_map(|(declared, _)| data_securable.get(declared).cloned())
         .collect();
-    let mut delete_children: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
+    // The managed tables this plan moves between schemas, by the name the
+    // environment has for them now — which is the name the discovery query
+    // answers with, since it reads the catalog.
+    let moved: BTreeMap<&ObjectName, &ObjectName> = managed_securable
+        .iter()
+        .filter(|(declared, query)| declared.schema != query.schema)
+        .map(|(declared, query)| (query, declared))
+        .collect();
+    let mut delete_children: BTreeMap<Securable, BTreeSet<String>> = BTreeMap::new();
     if !removable.is_empty() {
-        let columns: ReferencedColumns = self::delete_children(conn, &removable)
-            .await?
-            .into_iter()
-            .filter(|(child, _)| !managed_names.contains(child))
-            .collect();
-        let children: Vec<ObjectName> = columns.keys().cloned().collect();
+        let mut columns = ReferencedColumns::new();
+        let mut destinations: BTreeSet<String> = BTreeSet::new();
+        for (child, named) in self::delete_children(conn, &removable).await? {
+            if !managed_names.contains(&child) {
+                columns.insert(child, named);
+            } else if let Some(declared) = moved.get(&child) {
+                destinations.insert(declared.schema.clone());
+            }
+        }
         let child_perms: Vec<&str> = REQUIRED
             .iter()
             .filter(|r| matches!(r.needed, Needed::DeleteChild))
             .map(|r| r.name)
             .collect();
-        delete_children = object_permissions(
+        let children: Vec<ObjectName> = columns.keys().cloned().collect();
+        for (object, granted) in object_permissions(
             conn,
             &children,
             &child_perms,
             Existing::OrNot,
             Columns::Referenced(&columns),
         )
-        .await?;
+        .await?
+        {
+            delete_children.insert(Securable::Object(object), granted);
+        }
+        // Asked at the destination *schema*, the only securable a grant for a
+        // not-yet-existing object can sit on, and only if that schema was
+        // asked about at all — one the database does not have is reported by
+        // `absent_schemas`, not invented as a gap here.
+        for schema in destinations {
+            if let Some(granted) = per_schema.get(&schema) {
+                delete_children.insert(Securable::Schema(schema), granted.clone());
+            }
+        }
     }
 
     // Foreign-key targets the declarations do not hold, also at object scope —
@@ -2244,12 +2277,12 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             // the declarations can remove a row, so a project that only
             // inserts and corrects is never told to hold this.
             Needed::DeleteChild => {
-                for (object, granted) in &held.delete_children {
+                for (securable, granted) in &held.delete_children {
                     if !granted.contains(r.name) {
                         out.push(Gap {
                             permission: r.name,
                             why: r.why,
-                            securable: Securable::Object(object.clone()),
+                            securable: securable.clone(),
                         });
                     }
                 }
@@ -4169,8 +4202,9 @@ mod tests {
         held.data_securable.insert(table("app.t"), table("app.t"));
         held.data_objects.insert(table("app.t"), dml_and_read());
         held.delete_children
-            .insert(table("app.unmanaged"), BTreeSet::new());
-        held.delete_children.insert(table("other.far"), read());
+            .insert(Securable::Object(table("app.unmanaged")), BTreeSet::new());
+        held.delete_children
+            .insert(Securable::Object(table("other.far")), read());
 
         let named: Vec<String> = missing(&held)
             .iter()
@@ -4185,6 +4219,39 @@ mod tests {
             "{:?}",
             missing(&held)
         );
+    }
+
+    /// A managed child that this plan moves between schemas is the one case
+    /// the dedupe must not simply drop. The guard a row delete carries reads
+    /// the surviving children inside the delete's own transaction, and a table
+    /// rename is `order_key` 1 while a row delete is 12 — so the transfer has
+    /// already run and taken the object's permissions with it. The managed
+    /// question answers for the source, and a child with no `data:` block has
+    /// nothing in `data_gaps` to answer for its destination (issue #515,
+    /// round 6).
+    #[test]
+    fn a_delete_count_child_that_moves_is_asked_at_its_destination() {
+        let mut held = everything(&["app", "dest"]);
+        held.data_tables.insert(table("app.t"), exact_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        held.data_objects.insert(table("app.t"), dml_and_read());
+        // The child is managed, so it is not asked about at its object here;
+        // it is moving, so its destination schema is, and that schema holds
+        // nothing the count needs.
+        held.delete_children
+            .insert(Securable::Schema("dest".to_owned()), BTreeSet::new());
+
+        let named: Vec<String> = missing(&held)
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        assert_eq!(named, ["SELECT on SCHEMA::[dest]"], "{named:?}");
+
+        // Granted there, and nothing is reported: the source answer already
+        // carries every read that happens before the transfer.
+        held.delete_children
+            .insert(Securable::Schema("dest".to_owned()), read());
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
     /// A project that removes no row runs no count, so nothing is discovered
