@@ -1104,7 +1104,17 @@ async fn cleanup(control: &mut Control, names: &ScratchNames, cause: Error) -> S
         // the only record of what is left.
         control.pending = None;
     }
-    removal_outcome(removed, cause, names)
+    let mut outcome = removal_outcome(removed, cause, names);
+    // A janitor forwarder `remove` opened but could not confirm gone is a
+    // run-owned container too: dropping the database and login through it does
+    // not make it cleanup-complete. Its name is drained from run-owned state
+    // into the failure so the caller reports it (finding on #640).
+    let unconfirmed = std::mem::take(&mut control.unconfirmed);
+    if !unconfirmed.is_empty() {
+        outcome.cause = Error::Cleanup;
+        outcome.recovery_names.extend(unconfirmed);
+    }
+    outcome
 }
 
 async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
