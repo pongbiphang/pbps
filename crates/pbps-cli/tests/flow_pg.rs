@@ -1831,6 +1831,101 @@ fn two_tables_with_one_index_name_are_refused() {
     );
 }
 
+/// One defect, one finding — through every gate that reads the declarations.
+///
+/// A named primary key and a unique constraint on one table sharing a name is
+/// refused twice over: the table-local constraint-name rule calls it
+/// `dialect.rejected`, and the schema's relation-namespace check, which holds
+/// both of their backing indexes, called it `schema.name-collision` as well.
+/// The declaration was correctly refused and the operator was handed the same
+/// mistake twice, on `validate` and again on the connected gates that run the
+/// same list (issue #498, DECISIONS 141).
+///
+/// The negative controls beside it are what the deduplication must not reach:
+/// a check constraint sharing the name (no backing index, table-local only),
+/// an index sharing it (not a constraint, namespace check only), and the same
+/// two key constraints on two different tables, which no table-local rule can
+/// see. Offline, like the collision tests above.
+#[test]
+fn a_primary_key_and_unique_constraint_sharing_a_name_are_one_finding_not_two() {
+    let collisions = |o: std::process::Output| -> (usize, usize) {
+        let findings = json_output(o);
+        let of = |id: &str| {
+            findings["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["id"] == id)
+                .count()
+        };
+        (of("dialect.rejected"), of("schema.name-collision"))
+    };
+
+    let d = Demo::new("key-name-dedup");
+    d.table(
+        "table: app.t\ncolumns:\n  num: {type: integer, nullable: false}\n\
+         primary_key: {name: shared, columns: [num]}\nunique:\n  shared: [num]\n",
+    );
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_ne!(code(&o), 0, "the declaration is still refused");
+    assert_eq!(
+        collisions(o),
+        (1, 0),
+        "one defect must be one actionable finding"
+    );
+
+    // The connected gate reads the same list *before* it connects
+    // (DECISIONS 141), so an unreachable database still reaches it — and it
+    // counts the problems it would carry. One, not two.
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "host=127.0.0.1 port=1 user=nobody dbname=nope",
+        "--format",
+        "json",
+    ]);
+    let reported = json_output(o);
+    let message = reported["findings"][0]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("the declarations have 1 problem(s)"),
+        "the connected gate counts it once too: {reported}"
+    );
+    assert_eq!(
+        message.matches("both named `shared`").count(),
+        1,
+        "{reported}"
+    );
+
+    // A check constraint of that name is not backed by an index, so it was
+    // never the namespace check's and is unaffected.
+    d.table(
+        "table: app.t\ncolumns:\n  num: {type: integer, nullable: false}\n\
+         primary_key: {name: shared, columns: [num]}\nchecks:\n  shared: num > 0\n",
+    );
+    assert_eq!(collisions(d.run(&["validate", "--format", "json"])), (1, 0));
+
+    // An index of that name is not a constraint, so it was never the
+    // table-local rule's — and it is still reported.
+    d.table(
+        "table: app.t\ncolumns:\n  num: {type: integer, nullable: false}\n\
+         primary_key: {name: shared, columns: [num]}\nindexes:\n  shared: {columns: [num]}\n",
+    );
+    assert_eq!(collisions(d.run(&["validate", "--format", "json"])), (0, 1));
+
+    // And the same two key constraints on two tables: no table-local rule can
+    // see across tables, so this one belongs to the namespace check alone.
+    d.table(
+        "table: app.t\ncolumns:\n  num: {type: integer, nullable: false}\n\
+         primary_key: {name: shared, columns: [num]}\n",
+    );
+    std::fs::write(
+        d.dir.join("schema/app.t2.yml"),
+        "table: app.t2\ncolumns:\n  num: {type: integer, nullable: false}\nunique:\n  shared: [num]\n",
+    )
+    .unwrap();
+    assert_eq!(collisions(d.run(&["validate", "--format", "json"])), (0, 1));
+}
+
 /// The principal belongs to the cluster; bootstrap creates its managed grants
 /// in this database, not the role itself (DECISIONS 211).
 #[test]

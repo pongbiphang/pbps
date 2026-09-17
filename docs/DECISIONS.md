@@ -13252,3 +13252,81 @@ SPEC is in sync with all of these.
      `pbps-test-pg16` precedent exists because the two PostgreSQL servers
      *differ* — pinning a second engine is worth its cost when it disagrees,
      not merely when it is older.
+
+506. **A foreign key's two column lists are two different rules, and its width
+     is neither of them (issues #475, #476).** 452 settled the shape: a rule of
+     this engine is refused offline; a limit of this *build* is left to the
+     server. Two reviews then asked for the two halves of one foreign key, and
+     the answers differ.
+
+     **The referenced list is refused.** Measured on PostgreSQL 18.6,
+     `FOREIGN KEY (a, b) REFERENCES p (x, x)` is `42830: foreign key
+     referenced-columns list must not contain duplicates`, and it is refused
+     even where a unique index really does repeat that key — `CREATE UNIQUE
+     INDEX … (x, x)` is itself legal here — so this is an analysis rule of the
+     engine rather than a missing-key error. It is reported once per repeated
+     name rather than once per repetition: `(x, x, x)` is one mistake and one
+     remedy, while two different repeated names are two mistakes and are each
+     named.
+
+     **The local list is not**, and that is the same measurement 452 already
+     recorded: `FOREIGN KEY (a, a) REFERENCES p (x, y)` against a composite
+     unique key is **accepted**. Refusing it would reject a valid declaration —
+     the one direction these checks may not fail in. Two lists, two rules, and
+     the tests hold the pair side by side so neither can be "tidied" into the
+     other.
+
+     **The width is the server's.** #475 read the validator as checking index
+     widths but not foreign-key widths, and the premise is wrong: neither is
+     checked here, deliberately (452). Measured on 18.6, `SHOW max_index_keys`
+     = 32, a 33-column index is `54011: cannot use more than 32 columns in an
+     index` and a 33-column foreign key is `54011: cannot have more than 32 keys
+     in a foreign key` — the same number, the same SQLSTATE, and the same
+     compile-time constant behind both. An offline refusal at 33 would reject a
+     valid declaration on a server built with a larger `INDEX_MAX_KEYS`, which
+     is exactly what 452 wrote the rule to avoid. SQL Server's validator carries
+     a width rule because there 32 is a product invariant, not a build setting;
+     the asymmetry the review read as a gap is the decision. #475 is closed as
+     wrong rather than deferred, because a `deferred-review` issue would record
+     a fix that must not be made.
+
+     One thing the width measurement adds, and the live test now holds: the
+     refusal comes **before** the referenced-key lookup. A 33-column foreign key
+     against a parent with no matching unique constraint at all — and on this
+     build there cannot be one — is still the width error rather than a missing
+     -key one, so the boundary can be measured without the referenced side
+     confounding it.
+
+     SQL Server refuses duplicates on **both** lists with one message
+     (`Msg 8136`, measured on 17.0.4075.5), and its validator already catches
+     the local half. The referenced half is issue #667, not scope here.
+
+507. **A named primary key and a unique constraint of one table sharing a name
+     is the table-local rule's to report, not the relation namespace's
+     (issue #498).** Two checks saw the same defect. `Table::constraint_name_conflicts`
+     compares a table's primary key, unique, foreign-key and check names against
+     each other; `check_index_names` folds every declared index, named primary
+     key and unique constraint into the schema's relation namespace, because
+     PostgreSQL keeps tables, views and indexes in one (453). Where both a
+     primary key and a unique constraint are named `shared`, both fired: one
+     `dialect.rejected` and one `schema.name-collision`, on `validate` and again
+     on the connected planning and bootstrap gates that run the same list (141).
+     The declaration was correctly refused and the operator was handed the same
+     mistake twice.
+
+     **The table-local rule keeps it**, on two grounds. It is the narrower
+     statement — "constraint names must be distinct within a table" — and it is
+     engine-independent: it holds on SQL Server, where `check_index_names`
+     returns nothing at all because indexes there have no shared namespace. A
+     deduplication in the CLI gate would have had to match prose to find the
+     pair; skipping it where the namespace check can see that both claims are
+     named key constraints *of the same table* is the same decision made where
+     the facts are.
+
+     Nothing else moves, and the tests pin each boundary rather than the
+     implementation: an index against a key constraint on one table, a key
+     constraint against a table or a view, and the same two key constraints on
+     two *different* tables are all still the namespace check's — the last
+     because no table-local rule can see across tables — while a check or
+     foreign key sharing a name was never in that namespace and stays the
+     table-local rule's alone (ADR-0009 §1, 459).

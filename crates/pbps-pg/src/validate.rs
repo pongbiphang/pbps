@@ -62,6 +62,33 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
                 "{what} names no columns on the referenced table"
             )));
         }
+        // The referenced side, and only the referenced side. Measured on
+        // 18.6, `FOREIGN KEY (a, b) REFERENCES p (x, x)` is
+        // `42830: foreign key referenced-columns list must not contain
+        // duplicates` — and it is refused even where a unique index really
+        // does repeat that key, since `CREATE UNIQUE INDEX … (x, x)` is
+        // itself legal here. So this is an analysis rule of the engine rather
+        // than a missing-key error, unlike the 32-column width, which is the
+        // build's `max_index_keys` and stays with the server (DECISIONS 452,
+        // 506).
+        //
+        // The local list is left alone on purpose: 452 measured
+        // `FOREIGN KEY (a, a) REFERENCES p (x, y)` **accepted** against a
+        // composite unique key, and refusing it here would reject a valid
+        // declaration. Two lists, two rules.
+        //
+        // Reported once per repeated name rather than once per repetition:
+        // `(x, x, x)` is one mistake, and the remedy is the same for both
+        // extra copies.
+        let mut seen = BTreeSet::new();
+        let mut said = BTreeSet::new();
+        for column in &fk.references_columns {
+            if !seen.insert(column) && said.insert(column) {
+                found.push(invalid(format!(
+                    "{what} names `{column}` twice on the referenced table;                      the referenced columns must be distinct"
+                )));
+            }
+        }
     }
     for (name, check) in &table.checks {
         // Asked of the engine's lexis rather than of Rust's whitespace class.

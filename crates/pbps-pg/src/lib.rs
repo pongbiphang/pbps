@@ -1821,7 +1821,21 @@ mod tests {
             (vec!["missing"], vec!["a"], "not a column"),
             (vec!["j"], vec!["a"], ""),
             (vec!["a", "b"], vec!["a"], "must line up"),
+            // Measured on 18.6 and left alone: a foreign key accepts repeated
+            // *local* columns against a distinct composite unique key
+            // (DECISIONS 452), so refusing this would reject a valid
+            // declaration.
             (vec!["a", "a"], vec!["a", "b"], ""),
+            // The other list, and the opposite answer: `42830: foreign key
+            // referenced-columns list must not contain duplicates` — an
+            // analysis rule of the engine rather than a missing-key error,
+            // since `CREATE UNIQUE INDEX … (a, a)` is itself legal here
+            // (issue #476).
+            (
+                vec!["a", "b"],
+                vec!["a", "a"],
+                "twice on the referenced table",
+            ),
         ] {
             let mut table = structural_table();
             table.foreign_keys.insert(
@@ -1839,6 +1853,46 @@ mod tests {
                 assert!(errors.is_empty(), "{errors:?}");
             } else {
                 assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+            }
+        }
+    }
+
+    /// One mistake, one sentence. A referenced list repeating a column three
+    /// times is still one thing to fix, and the remedy is the same for both
+    /// extra copies — while two *different* repeated names are two mistakes
+    /// and are each named (issue #476).
+    #[test]
+    fn a_repeated_referenced_column_is_named_once_however_often_it_repeats() {
+        for (remote, expected) in [
+            (vec!["a", "a", "a"], vec!["`a`"]),
+            (vec!["a", "a", "b", "b"], vec!["`a`", "`b`"]),
+        ] {
+            let mut table = structural_table();
+            let local: Vec<String> = (0..remote.len()).map(|i| format!("c{i}")).collect();
+            for column in &local {
+                table.columns.insert(
+                    column.clone(),
+                    pbps_model::Column::new(ty("integer")).not_null(),
+                );
+            }
+            table.foreign_keys.insert(
+                "fk".into(),
+                pbps_model::ForeignKey {
+                    columns: local,
+                    references_table: TableName::new("app", "parent"),
+                    references_columns: remote.iter().map(|c| (*c).to_owned()).collect(),
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            let errors = structural_errors(&table);
+            assert_eq!(errors.len(), expected.len(), "{remote:?}: {errors:?}");
+            for (error, name) in errors.iter().zip(&expected) {
+                assert!(error.contains(name), "{remote:?}: {errors:?}");
+                assert!(
+                    error.contains("twice on the referenced table"),
+                    "{remote:?}: {errors:?}"
+                );
             }
         }
     }
@@ -1881,7 +1935,14 @@ mod tests {
     #[test]
     fn the_server_build_decides_the_index_limit_not_offline_validation() {
         for count in [32, 33] {
-            for kind in ["primary", "unique", "index", "include"] {
+            // `foreign` beside the four index shapes: measured on 18.6, a
+            // 33-column foreign key is `54011: cannot have more than 32 keys
+            // in a foreign key`, the same SQLSTATE and the same number the
+            // index limit answers with, and the same compile-time
+            // `max_index_keys` behind both. So it is the server's answer to
+            // give, not this validator's, for exactly the reason DECISIONS 452
+            // gives for the index limit (issue #475).
+            for kind in ["primary", "unique", "index", "include", "foreign"] {
                 let mut table = structural_table();
                 let columns: Vec<_> = (0..count).map(|i| format!("c{i}")).collect();
                 for column in &columns {
@@ -1901,6 +1962,18 @@ mod tests {
                         table
                             .unique
                             .insert("uq".into(), pbps_model::UniqueConstraint { columns });
+                    }
+                    "foreign" => {
+                        table.foreign_keys.insert(
+                            "fk".into(),
+                            pbps_model::ForeignKey {
+                                columns: columns.clone(),
+                                references_table: TableName::new("app", "parent"),
+                                references_columns: columns,
+                                on_delete: Default::default(),
+                                on_update: Default::default(),
+                            },
+                        );
                     }
                     _ => {
                         let (keys, include) = if kind == "include" {
