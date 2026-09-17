@@ -398,25 +398,6 @@ impl Unchecked {
 /// both answered the same — `SELECT /* a /* b */ c */ 1` returns `1` on either.
 /// A field no implementation varies is a field nobody maintains, and the
 /// abstraction worth having is the one two implementations draw (ADR-0014).
-/// What an engine's lexis finds in a declared check or filter expression.
-///
-/// Three answers rather than a bool, because the third is the one a bool hides:
-/// text that ends inside a block comment holds *unknown*, not *nothing*, and a
-/// validator that refused it as empty would name a cause the engine disagrees
-/// with (DECISIONS 504).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Expression {
-    /// Nothing the engine would parse: this engine's whitespace, and comments
-    /// that close. Measured, the engine refuses this as a syntax error.
-    Absent,
-    /// At least one token — including a literal or a quoted identifier, either
-    /// of which can be a whole valid expression on its own.
-    Present,
-    /// The text ends inside a block comment that never closes, so what it
-    /// holds cannot be read. The engine has its own name for this one.
-    Unreadable,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Lexicon {
     /// Whether definition layout is limited to ASCII whitespace. PostgreSQL
@@ -498,6 +479,25 @@ fn ansi_identifier_continues(c: char) -> bool {
 /// not measured its engine's.
 pub fn never_reserved(_: &str) -> bool {
     false
+}
+
+/// What an engine's lexis finds in a declared check or filter expression.
+///
+/// Three answers rather than a bool, because the third is the one a bool hides:
+/// text that ends inside a block comment holds *unknown*, not *nothing*, and a
+/// validator that refused it as empty would name a cause the engine disagrees
+/// with (DECISIONS 504).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expression {
+    /// Nothing the engine would parse: this engine's whitespace, and comments
+    /// that close. Measured, the engine refuses this as a syntax error.
+    Absent,
+    /// At least one token — including a literal or a quoted identifier, either
+    /// of which can be a whole valid expression on its own.
+    Present,
+    /// The text ends inside a block comment that never closes, so what it
+    /// holds cannot be read. The engine has its own name for this one.
+    Unreadable,
 }
 
 impl Lexicon {
@@ -1495,8 +1495,6 @@ fn quoted_identifier_len(text: &str) -> Option<usize> {
     }
 }
 
-/// Blanks `ch` in `out`, keeping a line break so that line structure and
-/// positions survive.
 /// Where the block comment opening at `at` closes, or `None` where it never
 /// does.
 ///
@@ -1528,6 +1526,8 @@ fn closing_block_comment(text: &str, at: usize) -> Option<usize> {
     None
 }
 
+/// Blanks `ch` in `out`, keeping a line break so that line structure and
+/// positions survive.
 fn blank(out: &mut String, ch: char) {
     if matches!(ch, '\n' | '\r') {
         out.push(ch);
