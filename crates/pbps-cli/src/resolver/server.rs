@@ -899,7 +899,10 @@ impl DedicatedServer {
             analysis.opened = 1;
         }
         if let Err(cause) = inner.check(Some(&scratch)).await {
-            drop(scratch);
+            // Retire rather than drop: dropping only requests the forwarder's
+            // background removal, so a later cleanup could report success
+            // without confirming this container is gone (finding on #640).
+            inner.control.retire(scratch);
             return Err(cleanup(&mut inner.control, &names, cause).await);
         }
         Ok((scratch, names))

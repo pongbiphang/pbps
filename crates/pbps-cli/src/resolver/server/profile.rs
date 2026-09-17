@@ -72,7 +72,9 @@ static PROFILES: &[ServerProfile] = &[
         driver: Driver::Mssql,
         executable: "sqlservr",
         uid: 10001,
-        gid: 10001,
+        // The Microsoft image runs `sqlservr` as `10001:0`: its group is root,
+        // measured, and the Docker profile's own bootstrap uses `--regid=0`.
+        gid: 0,
         // NET_BIND_SERVICE: the Linux image keeps it for the engine's listener.
         capabilities: 0x400,
         port: 1433,
