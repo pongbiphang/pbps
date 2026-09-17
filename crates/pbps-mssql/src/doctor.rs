@@ -84,8 +84,8 @@ pub enum Needed {
     /// advance of a first deployment.
     Ledger,
 
-    /// Needed on a table a declared foreign key *points at* which lies outside
-    /// the schemas this project manages.
+    /// Needed on a table a declared foreign key *points at* which this project
+    /// does not declare.
     ///
     /// `REFERENCES` is authorized on the referenced table, and the pre-flight
     /// probe for an added foreign key reads it (`NOT EXISTS (SELECT 1 FROM
@@ -95,10 +95,14 @@ pub enum Needed {
     /// `REFERENCES [shared].[parent]`, so this is reachable from an ordinary
     /// project rather than a contrived one.
     ///
-    /// Asked at **object** scope, and only for targets outside the managed
-    /// schemas: one inside them is already covered by the `Managed` entries,
-    /// and demanding anything on the whole of someone else's schema is the
-    /// over-demand this enum exists to avoid.
+    /// Asked at **object** scope, and of every undeclared target — including
+    /// one that shares a schema with the declarations, which
+    /// [`Needed::ManagedTable`] does not reach (DECISIONS 509). Asking at
+    /// object scope does not report a covered half twice:
+    /// `HAS_PERMS_BY_NAME` accounts for inheritance, so the schema's own
+    /// `REFERENCES` answers 1 for a table under it. Demanding anything on the
+    /// whole of someone else's schema stays the over-demand this enum exists
+    /// to avoid.
     Referenced,
 
     /// Needed at the database, and only when the declarations have roles
@@ -192,6 +196,59 @@ pub enum Needed {
     /// [`Needed::DataInsert`].
     DataDelete,
 
+    /// Needed on each table whose declaration carries rows, for the read that
+    /// closes an apply (issue #516).
+    ///
+    /// `apply` reads the managed rows back before it records and commits, and
+    /// [`crate::rows::query`] projects the columns the **declaration** names —
+    /// the key and every writable cell ([`DataDemand::data_columns`]) — not
+    /// the ones the catalog holds now. Those two lists differ in exactly the
+    /// case this entry exists for: a plan that adds a column reads it back in
+    /// the same run that creates it.
+    ///
+    /// `SELECT` is already demanded of every managed table
+    /// ([`Needed::ManagedTable`]), but over the catalog's columns, so an
+    /// account granted `SELECT` on each column that exists today answers 1
+    /// there and the closing read still fails. Measured on the pinned image
+    /// (17.0.4075.5) with `app.t(code, label)` and a declaration adding
+    /// `extra`: the column-only grantee answers 1 on `code` and `label`, 0 on
+    /// `extra` — a column the catalog does not have yet answers 0 rather than
+    /// NULL — and its `SELECT code, label, extra` fails with error 230. An
+    /// object-level grantee answers 1 at object scope, which the question
+    /// takes before it reaches any column, and its read runs. So the remedy
+    /// this reports is the grant that actually covers a column added later.
+    ///
+    /// Asked of every table in [`Held::data_tables`], because each of them is
+    /// read back: `exact` reads every row whether or not one is declared, and
+    /// an `ensure` block with no row demands nothing at all and is absent from
+    /// that map. DECISIONS 510.
+    DataRead,
+
+    /// Needed on each table an `exact` declaration's delete count would read
+    /// (issue #515).
+    ///
+    /// Before removing an undeclared row, `preflight::delete_probe` counts the
+    /// rows still pointing at it — one `SELECT COUNT(*)` per table with an
+    /// **enabled** foreign key into the parent, found in `sys.foreign_keys` at
+    /// run time. Those children are not declared, need not be, and need not
+    /// live in a schema this project manages, so nothing else in this list
+    /// covers them: [`Needed::ManagedTable`] asks about the declared and
+    /// recorded tables, and [`Needed::Referenced`] about the targets the
+    /// declarations point *out* at, which is the opposite direction.
+    ///
+    /// Measured on the pinned image (17.0.4075.5): with `app.t` declared
+    /// `mode: exact` and an undeclared `app.unmanaged(id)` referencing it, a
+    /// deployer holding everything else the list asks for passed `doctor` with
+    /// no gaps, and the probe's own count failed with error 229. Discovery
+    /// measured on the same fixture: the query finds the child in the managed
+    /// schema and one in a schema the project does not manage, and leaves out
+    /// a child whose constraint is `NOCHECK`ed and a table with no key into
+    /// the parent at all.
+    ///
+    /// A child the managed question already asks about is not asked again —
+    /// see [`Held::delete_children`]. DECISIONS 511.
+    DeleteChild,
+
     /// Needed at the **database**, and only when the declarations would have a
     /// reference-data row removed: the count that precedes such a delete
     /// refuses to run until it can prove the row-level security policy catalog
@@ -265,7 +322,7 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 23] = [
+pub const REQUIRED: [Requirement; 25] = [
     req(
         "ALTER",
         "adding the timeline columns to an existing pre-migration state ledger",
@@ -409,6 +466,21 @@ pub const REQUIRED: [Requirement; 23] = [
         "removing an undeclared row from a table declared `mode: exact`",
         Needed::DataDelete,
     ),
+    // The read that closes the apply, and the entry `SELECT` needs a third
+    // time: the probes read the catalog's columns, the ledger read is two
+    // tables in `dbo`, and this one reads the columns the declaration names —
+    // including the one the same plan adds.
+    req(
+        "SELECT",
+        "the row read-back that closes an apply, which projects the declared columns",
+        Needed::DataRead,
+    ),
+    req(
+        "SELECT",
+        "the count before removing a row, which reads every table with an enabled foreign key \
+         into it",
+        Needed::DeleteChild,
+    ),
     // The count that precedes that DELETE, which refuses to run until it can
     // prove the policy catalog readable. Two entries for one proof, because
     // the two halves are missing in two different places and a `GRANT` fixes
@@ -503,7 +575,7 @@ pub struct Held {
     /// The existing state table lacks the columns `ensure_tables` adds.
     pub ledger_migration_needed: bool,
 
-    /// Per foreign-key target outside the managed schemas, the permissions
+    /// Per foreign-key target the declarations do not hold, the permissions
     /// effective on that **object**.
     ///
     /// A target the database does not have is absent from this map rather than
@@ -512,6 +584,23 @@ pub struct Held {
     /// by something else's deployment. That the table is missing at all is a
     /// question for `plan --db`, which sees the change; `doctor` sees no plan.
     pub referenced_objects: BTreeMap<ObjectName, BTreeSet<String>>,
+
+    /// Per table an `exact` declaration's delete count would read, the
+    /// permissions effective on that **object** ([`Needed::DeleteChild`]).
+    ///
+    /// Empty for a project that removes no row: the count never runs, and the
+    /// discovery query is not asked either.
+    ///
+    /// A child that is already a managed table is left out rather than
+    /// answered here. `SELECT` on it is demanded by
+    /// [`Needed::ManagedTable`] at the same securable, and two entries would
+    /// print the operator the same `GRANT` twice.
+    ///
+    /// Asked for every discovered name, present or invisible, the way the
+    /// foreign-key targets are and for their reason (see [`Existing`]): the
+    /// name came out of the catalog, so an object question that answered
+    /// nothing would drop a demand the count really makes.
+    pub delete_children: BTreeMap<ObjectName, BTreeSet<String>>,
 
     /// Whether the project has any role at all — declared, recorded, or being
     /// dropped. `false` switches the role requirements off rather than
@@ -989,6 +1078,76 @@ fn object_statements<'a>(
     out
 }
 
+/// The tables a `mode: exact` delete count would read, found in the catalog.
+///
+/// # Why the catalog and not the declarations
+///
+/// `preflight::delete_probe` builds its count from `sys.foreign_keys` at run
+/// time and deliberately does not trust the declarations to list the children:
+/// "a foreign key someone added by hand is exactly the one that will refuse the
+/// delete". So a child does not have to be declared, or even live in a schema
+/// this project manages, and the readiness question has to find them the same
+/// way the probe does. Asked only of the parents whose declaration can remove a
+/// row; a project that removes none runs no count and this query does not run
+/// (issue #515).
+///
+/// `is_disabled = 0` matches the probe exactly. `NOCHECK CONSTRAINT` leaves the
+/// constraint in the catalog and stops the engine enforcing it, the probe skips
+/// those children (DECISIONS 144), and demanding a read of one would be asking
+/// for a permission no statement uses.
+///
+/// # What it cannot see
+///
+/// A child whose metadata this login cannot see produces no row here, and the
+/// report is silent about it. That is the boundary of a read-only readiness
+/// check rather than a gap it could report: the account cannot be told to grant
+/// itself something on a table the catalog will not name for it, and the
+/// count's own `VIEW DEFINITION` demands ([`Needed::DeleteCatalog`]) are what
+/// report the visibility half.
+/// The discovery statement for one chunk of parents.
+///
+/// Each parent is bound as its two parts and the securable assembled by the
+/// server, for the reason [`object_permissions_sql`] gives: joined here with a
+/// dot, a name holding one of its own resolves to the wrong object or to none.
+fn delete_children_sql(parents: &[ObjectName]) -> (String, Vec<Param<'_>>) {
+    let mut params: Vec<Param<'_>> = Vec::new();
+    let mut slots = Vec::new();
+    for o in parents {
+        params.push(Param::from(o.schema.as_str()));
+        params.push(Param::from(o.name.as_str()));
+        slots.push(format!("(@P{}, @P{})", params.len() - 1, params.len()));
+    }
+    let sql = format!(
+        "SELECT DISTINCT cs.name AS [schema], ct.name AS [object] \
+         FROM (VALUES {}) AS p(s, n) \
+         CROSS APPLY (VALUES (QUOTENAME(p.s) + N'.' + QUOTENAME(p.n))) AS x(q) \
+         JOIN sys.foreign_keys fk ON fk.referenced_object_id = OBJECT_ID(x.q, N'U') \
+         JOIN sys.tables ct ON ct.object_id = fk.parent_object_id \
+         JOIN sys.schemas cs ON cs.schema_id = ct.schema_id \
+         WHERE fk.is_disabled = 0;",
+        slots.join(", ")
+    );
+    (sql, params)
+}
+
+async fn delete_children(
+    conn: &mut Conn,
+    parents: &[ObjectName],
+) -> Result<Vec<ObjectName>, DbError> {
+    let mut out: BTreeSet<ObjectName> = BTreeSet::new();
+    // Two slots per parent, and the same reason `object_statements` exists: a
+    // list past about a thousand objects is a statement the server refuses.
+    for chunk in parents.chunks(MAX_PARAMETERS / 2) {
+        let (sql, params) = delete_children_sql(chunk);
+        for row in &conn.query_with(&sql, &params).await? {
+            let schema: &str = get(row, "schema")?;
+            let object: &str = get(row, "object")?;
+            out.insert(ObjectName::new(schema, object));
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
 async fn object_permissions(
     conn: &mut Conn,
     objects: &[ObjectName],
@@ -1243,6 +1402,7 @@ pub async fn permissions(
                     | Needed::DataInsert
                     | Needed::DataUpdate
                     | Needed::DataDelete
+                    | Needed::DataRead
             )
         })
         .map(|r| r.name)
@@ -1340,7 +1500,7 @@ pub async fn permissions(
         .collect();
     let managed_objects = object_permissions(
         conn,
-        &managed_names.into_iter().collect::<Vec<_>>(),
+        &managed_names.iter().cloned().collect::<Vec<_>>(),
         &managed_perms,
         Existing::Only,
         Columns::Catalog,
@@ -1397,7 +1557,7 @@ pub async fn permissions(
                 .map(|demand| (query.clone(), demand.row_columns().to_vec()))
         })
         .collect();
-    let data_objects = object_permissions(
+    let mut data_objects = object_permissions(
         conn,
         &data_names,
         &data_perms,
@@ -1405,8 +1565,74 @@ pub async fn permissions(
         Columns::Declared(&data_columns),
     )
     .await?;
+    // The closing read's own columns, asked separately because they are a
+    // different list: `SELECT` covers the key, which no emitted `UPDATE` ever
+    // names and which a careful DBA's column grants would not carry
+    // (`Needed::DataRead`, `Needed::DataUpdate`). One column list per object
+    // is all the statement can bind, so the two demands are two statements
+    // and their answers are merged — `Existing::Only` on the same names, so
+    // an object present for one is present for the other, and a table this
+    // deployment has still to create is absent from both and falls back to
+    // the schema.
+    let read_perms: Vec<&str> = REQUIRED
+        .iter()
+        .filter(|r| matches!(r.needed, Needed::DataRead))
+        .map(|r| r.name)
+        .collect();
+    let read_columns: BTreeMap<ObjectName, Vec<String>> = data_securable
+        .iter()
+        .filter_map(|(declared, query)| {
+            data.get(declared)
+                .map(|demand| (query.clone(), demand.data_columns().to_vec()))
+        })
+        .collect();
+    for (object, granted) in object_permissions(
+        conn,
+        &data_names,
+        &read_perms,
+        Existing::Only,
+        Columns::Declared(&read_columns),
+    )
+    .await?
+    {
+        data_objects.entry(object).or_default().extend(granted);
+    }
 
-    // Foreign-key targets outside the managed schemas, also at object scope —
+    // The children an `exact` declaration's delete count would read, found in
+    // the catalog rather than in the declarations (`delete_children`). Asked
+    // only when a row could be removed at all: the discovery query costs a
+    // round trip, and a project that never deletes never runs the count.
+    // Deduplicated against the managed names, which already demand `SELECT` on
+    // the same securable — a declared child needs no second entry, and a
+    // self-referencing key would otherwise report the parent as its own child.
+    let removable: Vec<ObjectName> = data
+        .iter()
+        .filter(|(_, demand)| demand.removes())
+        .filter_map(|(declared, _)| data_securable.get(declared).cloned())
+        .collect();
+    let mut delete_children: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
+    if !removable.is_empty() {
+        let children: Vec<ObjectName> = self::delete_children(conn, &removable)
+            .await?
+            .into_iter()
+            .filter(|child| !managed_names.contains(child))
+            .collect();
+        let child_perms: Vec<&str> = REQUIRED
+            .iter()
+            .filter(|r| matches!(r.needed, Needed::DeleteChild))
+            .map(|r| r.name)
+            .collect();
+        delete_children = object_permissions(
+            conn,
+            &children,
+            &child_perms,
+            Existing::OrNot,
+            Columns::Catalog,
+        )
+        .await?;
+    }
+
+    // Foreign-key targets the declarations do not hold, also at object scope —
     // but every named one, present or not, and that difference from the
     // ledger question is deliberate (see `Existing`). For the ledger a hidden
     // table falls back to the schema question, which still reports a gap;
@@ -1671,6 +1897,7 @@ pub async fn permissions(
         ledger_objects,
         ledger_migration_needed,
         referenced_objects,
+        delete_children,
         roles_declared,
         metadata_denials,
         granted_objects,
@@ -1686,6 +1913,22 @@ pub async fn permissions(
 
 /// Keep each declaration's fallback independent from the recorded names that
 /// still exist, and choose the narrowest securable whose answer was read.
+///
+/// # Why a cross-schema move is answered at two securables
+///
+/// A declared table whose recorded identity lives in another schema is moved
+/// by `ALTER SCHEMA <dest> TRANSFER <source>.<name>`, and that statement
+/// **drops every permission on the object** (measured on the pinned image,
+/// 17.0.4075.5: a login holding `SELECT` on `app.old_name` and `ALTER` on both
+/// schemas ran the transfer, and its next read of `dest.old_name` failed with
+/// error 229 — `HAS_PERMS_BY_NAME` answering 1 before the move and 0 after).
+/// So the source object's answer, which is the one the current-name resolution
+/// asks for, says nothing about the read that follows the move. The
+/// destination object does not exist yet, so the only securable a grant can
+/// sit on for it is the destination schema, and a `GRANT SELECT ON
+/// SCHEMA::dest` was measured to carry the post-transfer read. Both answers
+/// are kept: the source one is still needed, because the probes read the table
+/// before the transfer runs (issue #517, DECISIONS 512).
 fn managed_table_rights<'a>(
     declared: &[ObjectName],
     resolved: &BTreeMap<ObjectName, ObjectName>,
@@ -1701,6 +1944,11 @@ fn managed_table_rights<'a>(
     {
         if let Some((query, granted)) = query.and_then(|q| objects.get(q).map(|g| (q, g))) {
             rights.insert(Securable::Object(query.clone()), granted.clone());
+            if query.schema != table.schema
+                && let Some(granted) = schemas.get(&table.schema)
+            {
+                rights.insert(Securable::Schema(table.schema.clone()), granted.clone());
+            }
         } else if let Some(granted) = schemas.get(&table.schema) {
             rights.insert(Securable::Schema(table.schema.clone()), granted.clone());
         }
@@ -1927,6 +2175,24 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             // emits a DELETE, and demanding one would be asking for the
             // permission that mode was chosen to withhold.
             Needed::DataDelete => data_gaps(held, r, DataDemand::removes, &mut out),
+            // Every table that declares rows: see the variant. The predicate
+            // the other three carry is what distinguishes them, and this one
+            // has nothing to distinguish.
+            Needed::DataRead => data_gaps(held, r, |_| true, &mut out),
+            // Per child, because that is where the `GRANT` goes. Empty unless
+            // the declarations can remove a row, so a project that only
+            // inserts and corrects is never told to hold this.
+            Needed::DeleteChild => {
+                for (object, granted) in &held.delete_children {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Object(object.clone()),
+                        });
+                    }
+                }
+            }
             // Only when a row would be removed, and asked at the database
             // because a policy can live in a schema this project does not
             // manage: `Needed::Managed`'s own `VIEW DEFINITION` cannot see it
@@ -2125,6 +2391,7 @@ mod tests {
             ledger_objects: BTreeMap::new(),
             ledger_migration_needed: false,
             referenced_objects: BTreeMap::new(),
+            delete_children: BTreeMap::new(),
             roles_declared: false,
             metadata_denials: BTreeSet::new(),
             granted_objects: BTreeMap::new(),
@@ -2642,6 +2909,19 @@ mod tests {
             .collect()
     }
 
+    /// The read `Needed::DataRead` asks for on a data table's own object: the
+    /// row read-back that closes an apply, which every declaration carrying
+    /// rows makes. Present wherever the premise is an account that holds
+    /// everything but the DML, so that the gaps a test names are its own.
+    fn read() -> BTreeSet<String> {
+        ["SELECT".to_owned()].into_iter().collect()
+    }
+
+    /// Both, for a table whose object answer is meant to leave no gap.
+    fn dml_and_read() -> BTreeSet<String> {
+        dml().union(&read()).cloned().collect()
+    }
+
     /// A declaration that could emit nothing is not a demand of nothing — it
     /// is no entry at all, so `missing` is never asked about it and the three
     /// axes can never all be false.
@@ -2679,7 +2959,7 @@ mod tests {
 
         held.data_tables.insert(table("app.t"), exact_table());
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        held.data_objects.insert(table("app.t"), read());
         let gaps = missing(&held);
         let mut named: Vec<String> = gaps
             .iter()
@@ -2703,7 +2983,7 @@ mod tests {
             "the ledger's reasons must not be reused for reference data: {gaps:?}"
         );
 
-        held.data_objects.insert(table("app.t"), dml());
+        held.data_objects.insert(table("app.t"), dml_and_read());
         assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
@@ -2718,7 +2998,7 @@ mod tests {
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(table("app.t"), exact_table());
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects.insert(table("app.t"), dml());
+        held.data_objects.insert(table("app.t"), dml_and_read());
         assert!(
             held.schemas["app"].is_disjoint(&dml()),
             "the premise: nothing is held on the schema"
@@ -2740,8 +3020,12 @@ mod tests {
         );
         held.data_tables.insert(table("app.t"), ensure_table());
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects
-            .insert(table("app.t"), ["UPDATE".to_owned()].into_iter().collect());
+        held.data_objects.insert(
+            table("app.t"),
+            ["UPDATE".to_owned(), "SELECT".to_owned()]
+                .into_iter()
+                .collect(),
+        );
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "INSERT");
@@ -2803,7 +3087,7 @@ mod tests {
         let mut held = everything_but_the_dml(&["app"]);
         held.data_tables.insert(table("app.t"), ensure_table());
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        held.data_objects.insert(table("app.t"), read());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
         assert_eq!(named, ["INSERT", "UPDATE"], "{:?}", missing(&held));
@@ -2821,7 +3105,7 @@ mod tests {
             demand(pbps_model::DataMode::Exact, &[], &["label"]),
         );
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        held.data_objects.insert(table("app.t"), read());
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "DELETE");
@@ -2971,7 +3255,7 @@ mod tests {
             demand(pbps_model::DataMode::Exact, &["a"], &[]),
         );
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        held.data_objects.insert(table("app.t"), read());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
         assert_eq!(named, ["DELETE", "INSERT"], "{:?}", missing(&held));
@@ -2994,7 +3278,7 @@ mod tests {
             DataDemand::of(&t).expect("it still inserts"),
         );
         held.data_securable.insert(table("app.t"), table("app.t"));
-        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        held.data_objects.insert(table("app.t"), read());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
         assert_eq!(named, ["DELETE", "INSERT"], "{:?}", missing(&held));
@@ -3010,15 +3294,12 @@ mod tests {
         held.data_tables.insert(table("app.seeded"), exact_table());
         held.data_securable
             .insert(table("app.seeded"), table("app.seeded"));
-        held.data_objects
-            .insert(table("app.seeded"), BTreeSet::new());
-        held.data_objects
-            .insert(table("app.plain"), BTreeSet::new());
+        held.data_objects.insert(table("app.seeded"), read());
+        held.data_objects.insert(table("app.plain"), read());
         held.data_tables.insert(table("ref.lookup"), ensure_table());
         held.data_securable
             .insert(table("ref.lookup"), table("ref.lookup"));
-        held.data_objects
-            .insert(table("ref.lookup"), BTreeSet::new());
+        held.data_objects.insert(table("ref.lookup"), read());
         let mut named: Vec<String> = missing(&held)
             .iter()
             .map(|g| format!("{} on {}", g.permission, g.securable()))
@@ -3052,7 +3333,7 @@ mod tests {
         held.data_tables.insert(table("app.new"), exact_table());
         held.data_securable
             .insert(table("app.new"), table("app.old"));
-        held.data_objects.insert(table("app.old"), dml());
+        held.data_objects.insert(table("app.old"), dml_and_read());
         // `app.old` is declared too — the new table a plan can declare under
         // the name the rename above just freed. Its own resolution collided
         // with `app.new`'s confirmed claim on `app.old`, so `permissions`
@@ -3614,6 +3895,7 @@ mod tests {
             ledger_objects: BTreeMap::new(),
             ledger_migration_needed: false,
             referenced_objects: BTreeMap::new(),
+            delete_children: BTreeMap::new(),
             roles_declared: false,
             metadata_denials: BTreeSet::new(),
             granted_objects: BTreeMap::new(),
@@ -3626,7 +3908,9 @@ mod tests {
         // Not the ones that depend on what the project declares: no foreign
         // key out of the managed schemas, no role, and no declared row means
         // none of those are asked about at all — including the two halves of
-        // the delete count's catalog proof, which no row removal demands here.
+        // the delete count's catalog proof, which no row removal demands here,
+        // the read-back that closes an apply, and the children that count
+        // would read.
         let applicable = REQUIRED
             .iter()
             .filter(|r| {
@@ -3640,12 +3924,192 @@ mod tests {
                         | Needed::DataInsert
                         | Needed::DataUpdate
                         | Needed::DataDelete
+                        | Needed::DataRead
+                        | Needed::DeleteChild
                         | Needed::DeleteCatalog
                         | Needed::DeleteCatalogDenied
                 )
             })
             .count();
         assert_eq!(missing(&held).len(), applicable);
+    }
+
+    /// `ALTER SCHEMA ... TRANSFER` drops every permission on the object it
+    /// moves, so the source object's answer — the one current-name resolution
+    /// asks for — proves nothing about the read that follows the move. The
+    /// destination object does not exist yet, so the destination *schema* is
+    /// the only securable a grant for it can sit on (issue #517).
+    #[test]
+    fn a_cross_schema_move_is_asked_about_the_destination_schema_as_well() {
+        let declared = table("dest.old_name");
+        let recorded = table("app.old_name");
+        let resolved = [(declared.clone(), recorded.clone())].into_iter().collect();
+        // The source object is fully readable; the destination schema is not.
+        let objects = [(recorded.clone(), read())].into_iter().collect();
+        let schemas = [
+            ("app".to_owned(), read()),
+            ("dest".to_owned(), BTreeSet::new()),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut held = everything(&["app", "dest"]);
+        held.managed_tables = managed_table_rights(
+            &[declared],
+            &resolved,
+            std::iter::empty(),
+            &objects,
+            &schemas,
+        );
+        let named: Vec<String> = missing(&held)
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        assert_eq!(named, ["SELECT on SCHEMA::[dest]"], "{named:?}");
+
+        // Granting it there closes the gap, and the source answer is still
+        // asked for: the probes read the table before the transfer runs.
+        held.managed_tables = managed_table_rights(
+            &[table("dest.old_name")],
+            &resolved,
+            std::iter::empty(),
+            &objects,
+            &[("app".to_owned(), read()), ("dest".to_owned(), read())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+        assert!(
+            held.managed_tables
+                .contains_key(&Securable::Object(recorded)),
+            "the source object stays asked about: {:?}",
+            held.managed_tables
+        );
+    }
+
+    /// An ordinary rename stays one securable: the name moves, the schema does
+    /// not, and the object the grant sits on is the one that answers.
+    #[test]
+    fn a_same_schema_rename_is_still_asked_at_one_securable() {
+        let declared = table("app.renamed");
+        let recorded = table("app.old");
+        let resolved = [(declared.clone(), recorded.clone())].into_iter().collect();
+        let objects = [(recorded.clone(), read())].into_iter().collect();
+        let schemas = [("app".to_owned(), BTreeSet::new())].into_iter().collect();
+
+        let rights = managed_table_rights(
+            &[declared],
+            &resolved,
+            std::iter::empty(),
+            &objects,
+            &schemas,
+        );
+        assert_eq!(
+            rights.keys().collect::<Vec<_>>(),
+            [&Securable::Object(recorded)],
+            "{rights:?}"
+        );
+    }
+
+    /// `apply` reads the managed rows back before it records, and the read
+    /// projects the columns the **declaration** names — including one the same
+    /// plan adds, which no catalog-sourced question can see. `SELECT` on the
+    /// table is therefore asked for on its own, beside the DML (issue #516).
+    #[test]
+    fn a_table_declaring_rows_is_asked_for_the_read_that_closes_the_apply() {
+        let mut held = everything(&["app"]);
+        held.data_tables.insert(table("app.t"), exact_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        // Every DML, and no read: the shape a column-level `GRANT SELECT` on
+        // the columns that exist today leaves once the declaration adds one.
+        held.data_objects.insert(table("app.t"), dml());
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
+        assert_eq!(gaps[0].securable(), "OBJECT::[app].[t]");
+        assert!(gaps[0].why.contains("read-back"), "{gaps:?}");
+
+        held.data_objects.insert(table("app.t"), dml_and_read());
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+    }
+
+    /// And of every table that declares rows, not only the ones that remove
+    /// them: `ensure` is read back too.
+    #[test]
+    fn an_ensure_table_is_asked_for_the_read_as_well() {
+        let mut held = everything(&["app"]);
+        held.data_tables.insert(table("app.t"), ensure_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        held.data_objects.insert(table("app.t"), dml());
+        let named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
+        assert_eq!(named, ["SELECT"], "{:?}", missing(&held));
+    }
+
+    /// The count before an `exact` delete reads every table with an enabled
+    /// foreign key into the parent, and those children are found in the
+    /// catalog: they need not be declared, or even live in a managed schema
+    /// (issue #515).
+    #[test]
+    fn the_delete_count_asks_about_each_child_it_would_read() {
+        let mut held = everything(&["app"]);
+        held.data_tables.insert(table("app.t"), exact_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        held.data_objects.insert(table("app.t"), dml_and_read());
+        held.delete_children
+            .insert(table("app.unmanaged"), BTreeSet::new());
+        held.delete_children.insert(table("other.far"), read());
+
+        let named: Vec<String> = missing(&held)
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        assert_eq!(named, ["SELECT on OBJECT::[app].[unmanaged]"], "{named:?}");
+        // And nothing wider: the child's schema is somebody else's.
+        assert!(
+            !missing(&held)
+                .iter()
+                .any(|g| g.securable().starts_with("SCHEMA::")),
+            "{:?}",
+            missing(&held)
+        );
+    }
+
+    /// A project that removes no row runs no count, so nothing is discovered
+    /// and nothing is asked for — the same rule the delete's own catalog proof
+    /// follows.
+    #[test]
+    fn a_project_that_removes_no_row_is_asked_about_no_child() {
+        let mut held = everything(&["app"]);
+        held.data_tables.insert(table("app.t"), ensure_table());
+        held.data_securable.insert(table("app.t"), table("app.t"));
+        held.data_objects.insert(table("app.t"), dml_and_read());
+        assert!(
+            held.delete_children.is_empty(),
+            "an `ensure` declaration discovers no child"
+        );
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+    }
+
+    /// The discovery statement names each parent as two bound parts, takes
+    /// only the enabled constraints, and asks about the *referencing* table.
+    #[test]
+    fn the_child_discovery_asks_the_catalog_the_probes_own_question() {
+        let parents = [table("app.t"), ObjectName::new("dbo", "a.b")];
+        let (sql, params) = delete_children_sql(&parents);
+        assert!(
+            sql.contains("QUOTENAME(p.s) + N'.' + QUOTENAME(p.n)"),
+            "the securable is assembled by the server: {sql}"
+        );
+        assert!(
+            sql.contains("fk.is_disabled = 0"),
+            "a `NOCHECK`ed constraint is not enforced and its child is not \
+             counted (DECISIONS 144): {sql}"
+        );
+        assert!(
+            sql.contains("ct.object_id = fk.parent_object_id"),
+            "the child is the referencing table, not the referenced one: {sql}"
+        );
+        assert_eq!(params.len(), 4, "two bound parts per parent");
     }
 
     /// A foreign key into a schema this project does not manage. `REFERENCES`

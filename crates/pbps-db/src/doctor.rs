@@ -27,7 +27,12 @@ pub struct Ask<'a> {
     pub managed_schemas: &'a [String],
     /// Every table the declarations hold, under the managed schemas.
     pub managed_tables: &'a [ObjectName],
-    /// Foreign-key targets outside the managed schemas.
+    /// Foreign-key targets the declarations do not hold.
+    ///
+    /// Membership of the managed *tables*, not of their schemas: an undeclared
+    /// parent sharing a schema with the declarations is still somebody else's
+    /// table, and neither engine's managed-table question reaches it
+    /// (DECISIONS 509).
     pub referenced: &'a [ObjectName],
     /// The columns a declared key names on each of `referenced`'s targets —
     /// the union across every key that points there.
@@ -42,7 +47,7 @@ pub struct Ask<'a> {
     pub data: &'a DataTables,
 }
 
-/// A foreign-key target outside the managed schemas, mapped to the columns a
+/// A foreign-key target the declarations do not hold, mapped to the columns a
 /// declared key names on it — the union across every key that points there.
 /// See [`Ask::referenced_columns`].
 pub type ReferencedColumns = BTreeMap<ObjectName, BTreeSet<String>>;

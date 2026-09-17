@@ -8535,3 +8535,207 @@ fn connected_plan_json_retains_identity_remedies_and_operational_errors() {
     assert_eq!(report["result"], "unanswerable");
     assert_eq!(report["findings"][0]["id"], "plan.failed");
 }
+
+/// A foreign key's target is somebody else's table even when it shares a
+/// schema with the declarations, and the deployer needs `SELECT` and
+/// `REFERENCES` **on it** (issues #315 and #510).
+///
+/// The filter used to be the schema, because the managed `SELECT` was asked
+/// there too. Both dialects have since narrowed that read to the tables, and
+/// an undeclared parent inside a managed schema fell out of both lists: on
+/// this engine a schema carries only `USAGE` and `CREATE`, so nothing covered
+/// either half. Measured here rather than reasoned about — the report, the
+/// exit code, and the statements the two privileges authorize.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_asks_about_an_undeclared_foreign_key_parent_in_a_managed_schema() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_doctor_fk315_{}", std::process::id()),
+    );
+    let deployer = &role.1;
+    let own = OwnDatabase::new(&server, "doctor_fk315");
+    let connection = own.connection();
+    // `app.parent` shares the managed schema and is not declared; `far.parent`
+    // is the case that already worked, outside it. Both are owned by somebody
+    // else, so the deployer holds nothing on them but what is granted below.
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {deployer} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'doctor-test';
+             GRANT CREATE ON SCHEMA public TO {deployer};
+             CREATE SCHEMA app AUTHORIZATION {deployer};
+             CREATE SCHEMA far;
+             GRANT USAGE ON SCHEMA far TO {deployer};
+             CREATE TABLE app.parent (code bigint NOT NULL PRIMARY KEY);
+             CREATE TABLE far.parent (code bigint NOT NULL PRIMARY KEY);
+             GRANT SELECT, REFERENCES ON far.parent TO {deployer}"
+        ),
+    );
+    let login = format!(
+        "{} user={deployer} password=doctor-test",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let d = Demo::new("doctor-fk315");
+    // A declared table pointing at both, and a second key into the same
+    // undeclared parent: the target is asked about once however many keys
+    // name it.
+    d.table(
+        "table: app.child\ncolumns:\n  id: {type: bigint, nullable: false}\n  \
+         other: {type: bigint}\n  away: {type: bigint}\n\
+         primary_key: {name: pk_child, columns: [id]}\n\
+         foreign_keys:\n  \
+         fk_near:\n    columns: [id]\n    references: app.parent(code)\n  \
+         fk_near_again:\n    columns: [other]\n    references: app.parent(code)\n  \
+         fk_far:\n    columns: [away]\n    references: far.parent(code)\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    // Granted for the bootstrap itself, which really does write the key: the
+    // point of the check is that it is needed, so a deployer without it
+    // cannot get as far as having a ledger to ask about.
+    on_server(
+        connection,
+        &format!("GRANT SELECT, REFERENCES ON app.parent TO {deployer}"),
+    );
+    succeeds(d.run(&["bootstrap", "--db", &login]));
+    on_server(
+        connection,
+        &format!("REVOKE SELECT, REFERENCES ON app.parent FROM {deployer}"),
+    );
+
+    let diagnose = || {
+        let out = d.run(&["doctor", "--db", &login, "--format", "json"]);
+        let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        (code(&out), value)
+    };
+    // The report spells a name the way a `GRANT` would.
+    const PARENT: &str = "\"app\".\"parent\"";
+    const FAR: &str = "\"far\".\"parent\"";
+    let named = |report: &serde_json::Value| -> Vec<String> {
+        report["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Neither privilege, and the managed schema's own rights say nothing
+    // about them: two gaps on the one table, and none on the declared child
+    // the deployer owns or on the external target it was granted.
+    let (exit, none) = diagnose();
+    assert_eq!(exit, 2, "{none}");
+    let missing = named(&none);
+    for privilege in ["SELECT", "REFERENCES"] {
+        assert_eq!(
+            missing
+                .iter()
+                .filter(|m| m.contains(privilege) && m.contains(PARENT))
+                .count(),
+            1,
+            "{privilege} on the undeclared parent, named once: {none}"
+        );
+    }
+    assert!(
+        !missing.iter().any(|m| m.contains(FAR)),
+        "the external target is granted and must not be reported: {none}"
+    );
+    assert!(
+        !missing.iter().any(|m| m.contains("\"child\"")),
+        "the declared child is the deployer's own: {none}"
+    );
+
+    // One at a time, so each gap is named for the privilege that is actually
+    // absent rather than for whichever is checked first.
+    on_server(
+        connection,
+        &format!("GRANT SELECT ON app.parent TO {deployer}"),
+    );
+    let (exit, read_only) = diagnose();
+    assert_eq!(exit, 2, "{read_only}");
+    let missing = named(&read_only);
+    assert!(
+        missing
+            .iter()
+            .any(|m| m.contains("REFERENCES") && m.contains(PARENT)),
+        "{read_only}"
+    );
+    assert!(
+        !missing
+            .iter()
+            .any(|m| m.contains("SELECT") && m.contains(PARENT)),
+        "{read_only}"
+    );
+
+    on_server(
+        connection,
+        &format!(
+            "REVOKE SELECT ON app.parent FROM {deployer}; GRANT REFERENCES ON app.parent TO {deployer}"
+        ),
+    );
+    let (exit, write_only) = diagnose();
+    assert_eq!(exit, 2, "{write_only}");
+    let missing = named(&write_only);
+    assert!(
+        missing
+            .iter()
+            .any(|m| m.contains("SELECT") && m.contains(PARENT)),
+        "{write_only}"
+    );
+    assert!(
+        !missing
+            .iter()
+            .any(|m| m.contains("REFERENCES") && m.contains(PARENT)),
+        "{write_only}"
+    );
+
+    // Both, and the report is clean — and the deployer really can do what the
+    // plan will ask of it.
+    on_server(
+        connection,
+        &format!("GRANT SELECT ON app.parent TO {deployer}"),
+    );
+    let (exit, ready) = diagnose();
+    assert_eq!(exit, 0, "{ready}");
+    assert_eq!(
+        ready["data"]["environments"][0]["missing_permissions"],
+        serde_json::json!([]),
+        "{ready}"
+    );
+    // And both gaps were the truth rather than caution: each privilege
+    // authorizes one of the two statements a key into this parent makes.
+    assert_eq!(scalar(&login, "SELECT count(*) FROM app.parent"), 0);
+    on_server(
+        connection,
+        &format!("REVOKE REFERENCES ON app.parent FROM {deployer}"),
+    );
+    assert!(
+        try_on_server(
+            &login,
+            "ALTER TABLE app.child ADD CONSTRAINT fk_probe \
+             FOREIGN KEY (other) REFERENCES app.parent (code)"
+        )
+        .is_err(),
+        "REFERENCES on the parent is what authorizes the key"
+    );
+    on_server(
+        connection,
+        &format!("REVOKE SELECT ON app.parent FROM {deployer}"),
+    );
+    assert!(
+        try_on_server(&login, "SELECT count(*) FROM app.parent").is_err(),
+        "SELECT on the parent is what authorizes the probe's read"
+    );
+}

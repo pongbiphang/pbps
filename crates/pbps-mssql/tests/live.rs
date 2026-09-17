@@ -5203,6 +5203,17 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         )
         .await
         .expect("create the referencing child");
+    // The read the count makes of that child (`Needed::DeleteChild`, issue
+    // #515). Granted here so that the gap this test is about is the
+    // policy-catalog one: the child is a real demand of this fixture's own
+    // declaration, and it has its own test.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT SELECT ON OBJECT::kid.child TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the child's read");
     db.conn
         .execute(
             "CREATE FUNCTION sec.only_owner(@owner_id int) RETURNS TABLE WITH SCHEMABINDING \
@@ -13012,3 +13023,6 @@ mod self_reference;
 
 #[path = "live/key_spelling.rs"]
 mod key_spelling;
+
+#[path = "live/doctor_select.rs"]
+mod doctor_select;
