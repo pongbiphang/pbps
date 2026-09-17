@@ -138,13 +138,7 @@ pub(crate) fn configuration(observed: &Value) -> Result<(), &'static str> {
     // Podman's default `shareable` IPC namespace: it is this container's
     // until another container joins it, which the recipe's `--ipc private`
     // is what forbids (finding on #640).
-    for key in [
-        "PidMode",
-        "IpcMode",
-        "UTSMode",
-        "UsernsMode",
-        "CgroupnsMode",
-    ] {
+    for key in ["PidMode", "UTSMode", "UsernsMode", "CgroupnsMode"] {
         match &host[key] {
             Value::Null => (),
             Value::String(mode) if matches!(mode.as_str(), "" | "private") => (),
@@ -154,6 +148,20 @@ pub(crate) fn configuration(observed: &Value) -> Result<(), &'static str> {
             | Value::Array(_)
             | Value::Object(_) => return Err(key),
         }
+    }
+    // IpcMode is required to be an explicit private value, not absent: a
+    // missing field is no evidence the namespace is private, and the default
+    // on some runtimes is `shareable`, which another container can join.
+    // Refused here rather than trusted, though the kernel IPC accounting is
+    // the enforcement (finding on #640).
+    match &host["IpcMode"] {
+        Value::String(mode) if matches!(mode.as_str(), "" | "private") => (),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_)
+        | Value::Object(_) => return Err("IpcMode"),
     }
     for key in [
         "Binds",
@@ -433,6 +441,11 @@ mod tests {
         );
         assert_eq!(
             weakened(&["HostConfig", "IpcMode"], "shareable".into()),
+            Err("IpcMode")
+        );
+        // A missing IpcMode is no evidence of a private namespace.
+        assert_eq!(
+            weakened(&["HostConfig", "IpcMode"], Value::Null),
             Err("IpcMode")
         );
         assert_eq!(

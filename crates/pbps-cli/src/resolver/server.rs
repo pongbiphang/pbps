@@ -949,8 +949,13 @@ impl DedicatedServer {
         };
         let Some(names) = inner.control.pending.clone() else {
             let unconfirmed = close_control(&mut inner.control).await;
-            self.inner = None;
             return if unconfirmed.is_empty() {
+                // Only now is there nothing left to confirm; keep the run
+                // otherwise so a retried `discard` re-reports the container
+                // `close_control` wrote back into run-owned state (finding on
+                // #640), rather than entering the empty branch and reporting
+                // success.
+                self.inner = None;
                 Ok(())
             } else {
                 Err(ServerFailure {
