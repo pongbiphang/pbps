@@ -12770,9 +12770,13 @@ SPEC is in sync with all of these.
      the catalog is said as that, since an object dropped rather than renamed
      aside is exactly as much of a mismatch.
 
-     The routine arm needs none of this: its lock is `SELECT … FROM pg_proc
-     WHERE p.oid = $1 FOR UPDATE`, taken by oid, with no name between the two
-     statements to move.
+     The routine arm needs none of this *for the question this entry asks*: its
+     lock is `SELECT … FROM pg_proc WHERE p.oid = $1 FOR UPDATE`, taken by oid,
+     so there is no name between the resolve and the lock to move, and the lock
+     cannot land on the wrong row. That is where this entry stopped, and it is
+     only half the question — the `DROP FUNCTION` one statement later still
+     goes by name. 503 asks the other half, for every arm, and the routine arm
+     does the second resolve too.
 
 500. **A still-starting engine's refused login is retried; everything else it
      says is reported once (issue #638).** The private session waits behind the
@@ -13011,3 +13015,88 @@ SPEC is in sync with all of these.
     with green CI is therefore never waiting for an approval — there is none to
     wait for. It is waiting for an unresolved review thread, and looking for a
     reviewer instead has cost time here more than once.
+
+503. **A rebuild's lock pins an object; the `DROP` that follows names a
+     qualified name, and the two halves of that name are held by different
+     things (issues #547, #548).** 499 closed the window between the module's
+     oid resolve and its lock by asking the name again with the lock held. It
+     answered the question for the relation arms and stopped one statement
+     short of the rest of it: what the plan actually runs next is
+     `DROP VIEW <schema>.<view>`, `DROP FUNCTION <schema>.<name>(<args>)` or
+     `DROP TRIGGER <name> ON <schema>.<table>` — emitted at plan time and
+     pinned by the plan's checksum, so the apply cannot substitute an
+     oid-derived identity for it without running a statement the plan does not
+     contain (SPEC 14.3). The name is what runs, so the name is what has to
+     hold still.
+
+     **The local half holds itself.** Measured on PostgreSQL 18.6: with the
+     routine arm's `SELECT … FROM pg_catalog.pg_proc WHERE oid = $1 FOR UPDATE`
+     held, another session's `ALTER FUNCTION r.f(int) RENAME TO f_old` is
+     `canceling statement due to lock timeout … while updating tuple … in
+     relation "pg_proc"`. A rename rewrites the very row the lock holds, so it
+     queues behind it exactly as a relation rename queues behind `ACCESS
+     EXCLUSIVE`.
+
+     That measurement is why the routine arm now asks 499's question too, and
+     why the answer stays `By`. #547 proposed the second resolve but expected
+     it to buy only a narrowed window — "no lock the routine arm can take stops
+     a rename after the check" — and offered `Serialized::Not` as the honest
+     alternative. The engine says otherwise: the row lock does stop it, so the
+     second resolve here pins rather than merely checks. What the lock by oid
+     already guaranteed was that the lock lands on the right *row*; what it
+     never guaranteed was that the *name* still reaches it, and those are two
+     different facts about the same statement.
+
+     **The schema half holds nothing.** `ALTER SCHEMA … RENAME` updates a
+     `pg_namespace` row and takes nothing at all on the relations or routines
+     inside the schema. Measured, with A the rebuild and B another session:
+
+     ```text
+     A: BEGIN; LOCK TABLE q.v IN ACCESS EXCLUSIVE MODE;   -- q.v is 152249
+     B: ALTER SCHEMA q RENAME TO q_old;                   -- accepted
+        CREATE SCHEMA q; CREATE TABLE q.t(i int);
+        CREATE VIEW q.v AS SELECT i * 3 AS i FROM q.t;    -- 152257
+     A: DROP VIEW q.v;  COMMIT;
+        -- 152257 destroyed; 152249, the object A locked and read, survives
+     ```
+
+     The routine arm loses the same way one statement later, measured the same
+     way: with the `pg_proc` row lock held on 152289, B renames the schema and
+     creates a replacement, and A's `DROP FUNCTION m7.f(int)` destroys the
+     replacement while 152289 survives under the old schema's new name. Every
+     arm has this hole, and it is the same hole.
+
+     **So the schema's own row is locked, first.** `SELECT … FROM
+     pg_catalog.pg_namespace WHERE nspname = $1 FOR UPDATE`, before the
+     object's lock and before the second resolve — a pin taken afterwards would
+     leave open exactly the window the second resolve exists to close. Measured
+     on the same server, it costs only what it must: the rename waits, while
+     another session's `CREATE TABLE q.other(i int)` is accepted and the
+     rebuild's own `DROP`/`CREATE` of both a view and a routine in that schema
+     run unaffected. Only a statement that rewrites the schema's own row waits.
+
+     **And it is out of reach for the accounts this tool is built for**, which
+     is the routine lock's problem in a second place. Measured as the
+     non-superuser owner of the schema, every row-lock strength is `permission
+     denied for table pg_namespace` — `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR
+     SHARE` and `FOR KEY SHARE` alike, because a row lock of any strength needs
+     `UPDATE` on the table. There is no weaker request to fall back to, so the
+     fallback is a sentence, not another lock, and the attempt goes inside a
+     savepoint for the reason the routine arm's does: a failed statement dooms
+     a PostgreSQL transaction, and this one is *expected* to fail.
+
+     **The fallback says `Not`, and says which half is held.** A rebuild whose
+     schema can still move is not serialized in the only sense the answer is
+     read for — whether what the `DROP` destroys is what the plan approved —
+     even though its reads are perfectly well held. `By` there would answer a
+     question nobody asked in the words of the one they did. The message names
+     the lock that *is* held beside the one that is not, because either fact
+     alone misleads: "not serialized" would deny a lock this transaction holds,
+     and naming only the missing one would not say what an operator still has.
+     SPEC §7.6's read-back remains the backstop it always was — this prevents
+     for the accounts that can and reports for the accounts that cannot.
+
+     **Not fixed here: the savepoint the routine arm leaves standing.** The new
+     pin releases its marker on both paths; the routine lock beside it rolls
+     back to its own and does not, which is issue #534 and stays there. Two
+     savepoint names, two owners.

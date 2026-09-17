@@ -8130,6 +8130,284 @@ async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than
     drop_schema(&mut a, &s).await;
 }
 
+/// Waits until the rebuild is queued behind `conn`'s own transaction.
+///
+/// The relation arms wait for a lock on a relation oid, which `pg_locks` names
+/// directly. A row lock waits on the *other transaction's* id instead, which
+/// names neither the routine nor the statement — and keying the wait on the
+/// blocked statement's text was measured to be wrong here: the text
+/// `pg_stat_activity` reports for the queued backend is not reliably the one
+/// that is waiting. So this asks the question from the other side, where the
+/// answer is exact: is anything blocked by **this** session?
+///
+/// Run on the session that holds the locks, which is the only one that can
+/// answer it without naming a statement.
+async fn wait_until_something_queues_behind(conn: &mut Conn) {
+    for _ in 0..400 {
+        let waiting = number(
+            conn,
+            "SELECT count(*)::int FROM pg_catalog.pg_stat_activity \
+             WHERE wait_event_type = 'Lock' \
+               AND pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids(pid))",
+        )
+        .await;
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("nothing ever queued behind this session");
+}
+
+/// The routine arm's lock is taken by **oid**, so it never lands on the wrong
+/// row — and that answers only half the question. The `DROP FUNCTION
+/// <schema>.<name>(<args>)` one statement later still goes by name, and a
+/// session that renamed the routine aside and created a replacement under its
+/// name before the lock was taken leaves that name meaning the replacement
+/// (issue #547).
+///
+/// The interleaving is the relation arms' one moved to this arm's lock: B
+/// renames and replaces without committing, so A still resolves the original;
+/// A's row lock then queues behind B's uncommitted update of that very row; B
+/// commits, and A holds a lock on the object its reads describe while the name
+/// now means something else.
+///
+/// Beside it the negative case: with nothing concurrent the answer is
+/// `Serialized::By`, and it names both halves of what it holds.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_routine_replaced_before_its_row_lock_is_refused_rather_than_serialized() {
+    let s = emit_schema("relock_routine");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    a.execute(&format!(
+        "CREATE FUNCTION {s}.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"
+    ))
+    .await
+    .expect("build");
+    let id: pbps_model::ModuleId = format!("{s}.f(integer)").parse().expect("a module id");
+    let find = format!(
+        "SELECT p.oid::int8 FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = '{s}' AND p.proname = 'f'"
+    );
+
+    // Nothing concurrent: both halves of the name are held, and the answer
+    // says which lock holds each.
+    let quiet = read_a_rebuild(
+        &mut a,
+        &id,
+        pbps_model::ModuleKind::Function,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await;
+    match &quiet.serialized {
+        pbps_pg::modules::Serialized::By(what) => {
+            assert!(what.contains("`pg_proc` entry"), "{what}");
+            assert!(what.contains("`pg_namespace` entry"), "{what}");
+        }
+        pbps_pg::modules::Serialized::Not(why) => {
+            panic!("this account can take both of the routine arm's locks: {why}")
+        }
+    }
+
+    let original = oid(&mut a, &find).await;
+    let mut b = connect().await;
+    b.execute("BEGIN").await.expect("the other session's own");
+    for sql in [
+        format!("ALTER FUNCTION {s}.f(int) RENAME TO f_old"),
+        format!("CREATE FUNCTION {s}.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n * 2 $$"),
+    ] {
+        b.execute(&sql).await.expect("rename and replace");
+    }
+
+    let no_changes = pbps_model::ChangeSet::default();
+    in_a_transaction(&mut a).await;
+    let (answered, committed) = tokio::join!(
+        pbps_pg::modules::before_a_rebuild(
+            &mut a,
+            &id,
+            pbps_model::ModuleKind::Function,
+            &no_changes
+        ),
+        async {
+            wait_until_something_queues_behind(&mut b).await;
+            b.execute("COMMIT").await
+        }
+    );
+    committed.expect("the other session commits");
+    rollback(&mut a).await;
+
+    let refused = answered.expect_err("the name means the replacement");
+    let said = format!("{refused}");
+    assert!(
+        said.contains("moved between this rebuild's read and its lock"),
+        "{said}"
+    );
+    // The cause named for this arm is its own: the lock is on the right row,
+    // and it is the *name* that moved. Saying a `LOCK TABLE` resolved late
+    // would send an operator looking for a statement this arm never runs.
+    assert!(said.contains("the row lock is keyed by oid"), "{said}");
+    assert!(said.contains(&format!("oid {original}")), "{said}");
+    let replacement = oid(&mut a, &find).await;
+    assert_ne!(original, replacement, "the race never happened");
+    assert!(said.contains(&format!("oid {replacement}")), "{said}");
+
+    drop_schema(&mut a, &s).await;
+}
+
+/// A relation lock holds the relation, not the qualified name: `ALTER SCHEMA
+/// … RENAME` takes nothing on the relations inside the schema, so the
+/// `<schema>` component of the name the rebuild's `DROP` uses is free to move
+/// after every check has passed (issue #548).
+///
+/// **Measured** on 18.6, and the reason this test asserts a *blocked* rename
+/// rather than a refusal: with the schema's `pg_namespace` row locked, the
+/// rename is the statement that waits, so the window is closed rather than
+/// detected. Without the pin the same interleaving ends with the rebuild's
+/// `DROP VIEW <schema>.<view>` destroying the replacement while the object it
+/// locked and read survives under the old schema's new name.
+///
+/// The negative cases are on both sides of it: the answer names the namespace
+/// lock when nothing is concurrent, and the rename that was refused mid-rebuild
+/// is accepted once the rebuild's transaction is over — the pin costs exactly
+/// its window and nothing past it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_rebuilds_schema_cannot_be_renamed_out_from_under_the_name_its_drop_uses() {
+    let s = emit_schema("nspin");
+    let moved = format!("{s}_moved");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {moved} CASCADE"),
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+    ] {
+        a.execute(&sql).await.expect("build");
+    }
+    let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    let no_changes = pbps_model::ChangeSet::default();
+
+    in_a_transaction(&mut a).await;
+    let held =
+        pbps_pg::modules::before_a_rebuild(&mut a, &id, pbps_model::ModuleKind::View, &no_changes)
+            .await
+            .expect("the rebuild reads");
+    match &held.serialized {
+        pbps_pg::modules::Serialized::By(what) => {
+            assert!(what.contains("the view's own"), "{what}");
+            assert!(what.contains("`pg_namespace` entry"), "{what}");
+        }
+        pbps_pg::modules::Serialized::Not(why) => {
+            panic!("this account can pin the schema: {why}")
+        }
+    }
+
+    // With the pin held, the statement that would move the name waits.
+    let mut b = connect().await;
+    b.execute("SET lock_timeout = '750ms'")
+        .await
+        .expect("bound the wait");
+    let blocked = b
+        .execute(&format!("ALTER SCHEMA {s} RENAME TO {moved}"))
+        .await
+        .expect_err("the pin holds the schema's own row");
+    assert_eq!(sqlstate(&blocked), "55P03", "{blocked:?}");
+    rollback(&mut a).await;
+
+    // And once the rebuild's transaction is over, the same statement is
+    // accepted: what the pin costs is the window, not the schema.
+    b.execute(&format!("ALTER SCHEMA {s} RENAME TO {moved}"))
+        .await
+        .expect("accepted once nothing is rebuilding");
+    b.execute(&format!("ALTER SCHEMA {moved} RENAME TO {s}"))
+        .await
+        .expect("put it back");
+
+    drop_schema(&mut a, &s).await;
+}
+
+/// The account this tool is actually built for cannot pin a schema either, and
+/// what it is told has to say which half of the name is held.
+///
+/// **Measured** as the non-superuser owner of the schema: every row-lock
+/// strength on `pg_namespace` is `permission denied for table pg_namespace`,
+/// `FOR KEY SHARE` included, because a row lock of any strength needs `UPDATE`
+/// on the table. So there is no weaker request to fall back to.
+///
+/// Two halves are asserted, as for the routine lock beside it: the answer is
+/// not `By` — a rebuild whose schema can still move is not serialized — and
+/// the reads after the failed attempt still ran, which is only distinguishable
+/// from "the reads never ran" because they did.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_account_that_cannot_pin_a_schema_says_which_half_is_held() {
+    let s = emit_schema("unpinned");
+    let deployer = format!("{s}_deploy");
+    let mut admin = connect().await;
+    fresh(&mut admin, &s).await;
+    for sql in [
+        format!("DROP ROLE IF EXISTS {deployer}"),
+        format!("CREATE ROLE {deployer} LOGIN PASSWORD 'live-test'"),
+        format!("GRANT CREATE, USAGE ON SCHEMA {s} TO {deployer}"),
+    ] {
+        admin
+            .execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let as_deployer = settings_with(&[("user", deployer.as_str()), ("password", "live-test")]);
+    let mut conn = Conn::connect(Driver::Postgres, &as_deployer)
+        .await
+        .expect("connect as the deploying account");
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+    ] {
+        conn.execute(&sql)
+            .await
+            .expect("the deploying account owns what it creates");
+    }
+
+    let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    let rebuild = read_a_rebuild(
+        &mut conn,
+        &id,
+        pbps_model::ModuleKind::View,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await;
+    match &rebuild.serialized {
+        pbps_pg::modules::Serialized::Not(why) => {
+            assert!(why.contains("serialized only halfway"), "{why}");
+            // Both facts, because either alone would mislead: the view's own
+            // lock *is* held, and the schema's row is what could not be.
+            assert!(
+                why.contains("the view's own ACCESS EXCLUSIVE lock"),
+                "{why}"
+            );
+            assert!(why.contains("pg_namespace"), "{why}");
+            assert!(why.contains(&s), "{why}");
+        }
+        pbps_pg::modules::Serialized::By(what) => {
+            panic!("this account should not be able to lock `pg_namespace`: {what}")
+        }
+    }
+    assert_eq!(rebuild.refusal(), None, "{:?}", rebuild.carries);
+
+    drop(conn);
+    admin
+        .execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    admin
+        .execute(&format!("DROP ROLE {deployer}"))
+        .await
+        .expect("drop the role");
+}
+
 /// The account this tool is actually built for cannot take a routine's lock,
 /// and the attempt must not destroy the transaction it was protecting.
 ///
