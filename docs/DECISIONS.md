@@ -12941,12 +12941,21 @@ SPEC is in sync with all of these.
     this is a deliberate pairing rather than a constraint.
 
     **What it costs, stated rather than discovered later.** A pull request must
-    be green on its *own* head before it can be queued, so `ci.yml` runs twice
-    per merge — once on the pull request, once on the merge group. That is the
-    cheap half of the trade: what disappears is not a run but the *repetition*
-    of runs caused by somebody else merging first, which had no bound. A
-    conflict is still the author's to resolve; the queue ejects a pull request
-    it cannot merge rather than guessing.
+    be green on its *own* head before it can be queued, so a merge costs **two
+    pre-merge runs** of `ci.yml` — one on the pull request, one on the merge
+    group — and 501's `push` trigger adds a third on `master` afterwards, which
+    gates nothing. That is the cheap half of the trade: what disappears is not a
+    run but the *repetition* of runs caused by somebody else merging first,
+    which had no bound. A conflict is still the author's to resolve; the queue
+    ejects a pull request it cannot merge rather than guessing.
+
+    **An ejection is read, not re-rolled.** A merge-group failure is not
+    automatically an interaction with what merged ahead: this repository's CI
+    has a documented resource-shaped engine startup crash, and issue #638 was
+    two genuinely flaky tests. Nor is it automatically a flake — that reading is
+    how a real interaction merges on the second attempt. The rule is therefore
+    procedural rather than a verdict: read the failing job, name which it was,
+    and only then fix or re-queue.
 
     Measured against the field rather than chosen. Of the fifteen projects
     surveyed for 501, the four running a merge queue — rust-analyzer, cargo,

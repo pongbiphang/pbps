@@ -127,14 +127,20 @@ checksum-pinned, and state lives in the database itself.
   land before deleting the branch and removing the worktree — a queued pull
   request is not a merged one.
 - A pull request must be green on its **own** head before it can be queued, so
-  `ci.yml` runs twice per merge: once on the pull request, once on the merge
-  group. That is the price of the queue and it is the cheap half of the trade —
-  what it buys is that neither run has to be repeated because somebody else
+  a merge costs **two pre-merge runs** of `ci.yml` — one on the pull request,
+  one on the merge group — plus the post-merge run on `master`, which gates
+  nothing. That is the price of the queue and it is the cheap half of the trade:
+  what it buys is that none of them has to be repeated because somebody else
   merged first.
-- If the queue ejects the pull request, read why before re-queueing. A conflict
-  is the case above. A failing merge-group check that the pull request's own
-  run passed is a real interaction with what merged ahead of it, not a flake to
-  re-queue through.
+- If the queue ejects the pull request, **read the failing job before
+  re-queueing**, and say which of the two it was. A merge-group failure that
+  reproduces, or that is a test failing on its merits, is a real interaction
+  with what merged ahead of it: fix it, do not re-queue. A merge-group failure
+  whose log shows an infrastructure fault — the resource-shaped engine startup
+  crashes `ci.yml` and docs/PITFALLS.md both record — is transient, and
+  re-queueing is the right move. What is never right is re-queueing without
+  reading, which is how a real interaction gets merged on the second roll.
+  A conflict is the case above.
 - Never bypass the ruleset. It requires green CI on the pull request head and
   green CI on the merge group.
 - Report at each merge: the draft and ready review counts, the qualifying route,

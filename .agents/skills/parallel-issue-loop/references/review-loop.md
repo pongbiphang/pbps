@@ -145,9 +145,14 @@ command **adds the PR to the queue** rather than merging it: GitHub builds
 merge to land before deleting the issue branch and removing its worktree — a
 queued PR is not a merged one, and the queue can still eject it.
 
-If the queue ejects the PR, read why before re-queueing. A conflict is handled
-in §5. A merge-group check that fails where the PR's own run passed is a real
-interaction with what merged ahead of it, not a flake to re-queue through.
+If the queue ejects the PR, read the failing job before re-queueing and say
+which case it was. A conflict is handled in §5. A merge-group failure that
+reproduces, or a test failing on its merits, is a real interaction with what
+merged ahead — fix it rather than re-queue. A merge-group failure whose log
+shows an infrastructure fault (the resource-shaped engine startup crashes
+`ci.yml` and docs/PITFALLS.md record) is transient, and re-queueing is correct.
+Re-queueing without reading is never correct: it is how a real interaction gets
+merged on the second roll.
 
 ## 7. Closeout
 
