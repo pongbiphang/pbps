@@ -125,10 +125,14 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   queue then builds it against `master` like any other behind branch. **Do not
   rebase it** — that rewrites the head that was reviewed and repeats the local
   checks, CI and resulting-head review, which is the work 502 exists to remove.
-  Only a conflict needs you: it ejects the PR from the queue, so resolve it,
-  push with `--force-with-lease`, rerun the required tests, and follow the
-  resulting-head code-review gate in the review reference. Do not automatically
-  repeat the draft or ready streak.
+  Two things do need you, and both begin by rebasing onto current `master`,
+  because neither reproduces on a branch that predates it: a **conflict**,
+  which ejects the PR from the queue, and an **interaction the merge group
+  confirmed** — `master` changed something the branch still calls — which a
+  stale branch cannot even compile. Rebase, fix it, push with
+  `--force-with-lease`, rerun the required tests, and follow the resulting-head
+  code-review gate in the review reference. Do not automatically repeat the
+  draft or ready streak.
 - Never merge a downstream PR while its required upstream issue is unmerged.
   Related issues without a true prerequisite may merge independently.
 

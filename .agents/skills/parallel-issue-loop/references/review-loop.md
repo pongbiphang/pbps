@@ -148,7 +148,9 @@ queued PR is not a merged one, and the queue can still eject it.
 If the queue ejects the PR, read the failing job before re-queueing and say
 which case it was. A conflict is handled in §5. A merge-group failure that
 reproduces, or a test failing on its merits, is a real interaction with what
-merged ahead — fix it rather than re-queue. A merge-group failure whose log
+merged ahead — rebase onto current `master` so the combined tree is in your
+hands, fix it there, and follow §5's resulting-head gate; do not re-queue. A
+merge-group failure whose log
 shows an infrastructure fault (the resource-shaped engine startup crashes
 `ci.yml` and docs/PITFALLS.md record) is transient, and re-queueing is correct.
 Re-queueing without reading is never correct: it is how a real interaction gets

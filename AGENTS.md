@@ -75,7 +75,9 @@ checksum-pinned, and state lives in the database itself.
 - On stopping: kill the watch and post no further `@codex review`, then mark the
   PR ready. Do **not** rebase merely because `master` moved — the queue handles
   that, and rebasing would re-run the local checks and CI and create a new
-  review head for nothing (DECISIONS 502). Rebase only to resolve a conflict;
+  review head for nothing (DECISIONS 502). Rebase only for the two cases that
+  need the combined tree in your hands: a conflict, or an interaction the merge
+  group confirmed;
   that rebase does not repeat the qualified draft gate, but the ready-phase code
   review must then name the resolution head. Marking ready triggers the required
   code review; wait for it. A security review is optional: if run, its findings
@@ -104,10 +106,14 @@ checksum-pinned, and state lives in the database itself.
   ahead of it, so a branch that is merely behind is merged without anyone
   rebasing it. Do not rebase to clear `BEHIND`; the strict policy that made
   that necessary is off (DECISIONS 502).
-- A **conflict** is still yours. The queue cannot resolve one — it ejects the
-  pull request instead. Rebase, resolve it, run the required local tests, push
+- **Two things still put the branch back in your hands**, and both start the
+  same way: rebase onto current `master`, because neither can be reproduced on
+  a branch that predates it. A **conflict**, which the queue cannot resolve and
+  ejects instead. And an **interaction the merge group confirmed** — `master`
+  changed something this branch still calls — which a stale branch cannot even
+  compile, let alone test. Rebase, fix it, run the required local tests, push
   with `git push --force-with-lease`, and obtain a completed code review whose
-  `Reviewed commit:` is the conflict-resolution head. P0 is always fixed;
+  `Reviewed commit:` is the resulting head. P0 is always fixed;
   P1–P3 follow the same three-case finding rules, and P2 may be deferred
   directly to a linked `deferred-review` issue. A P0 or P1 must be addressed
   and followed by another completed resulting-head code review. Once that
@@ -135,7 +141,8 @@ checksum-pinned, and state lives in the database itself.
 - If the queue ejects the pull request, **read the failing job before
   re-queueing**, and say which of the two it was. A merge-group failure that
   reproduces, or that is a test failing on its merits, is a real interaction
-  with what merged ahead of it: fix it, do not re-queue. A merge-group failure
+  with what merged ahead of it: rebase and fix it as above, do not re-queue.
+  A merge-group failure
   whose log shows an infrastructure fault — the resource-shaped engine startup
   crashes `ci.yml` and docs/PITFALLS.md both record — is transient, and
   re-queueing is the right move. What is never right is re-queueing without

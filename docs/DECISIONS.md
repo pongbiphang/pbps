@@ -12972,3 +12972,8 @@ SPEC is in sync with all of these.
     `max_entries_to_build: 5`, which is what makes the validation parallel and
     therefore what actually removes the serialisation; `min_entries_to_merge: 1`
     with no wait, so a ready entry merges instead of waiting to be batched.
+    `check_response_timeout_minutes: 60`, because the engine-backed jobs take
+    tens of minutes and a timeout shorter than the matrix ejects healthy entries
+    for not having answered yet. These values are recorded here because the
+    ruleset lives outside the repository: this entry is the only reproducible
+    record of them.

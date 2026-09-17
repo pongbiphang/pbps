@@ -109,10 +109,13 @@ and merge order.
   against current `master` when it is enqueued, and GitHub retargets a branch
   stacked on the deleted upstream branch onto that PR's base by itself
   (DECISIONS 502). Do not rebase either case — that rewrites the reviewed head
-  and repeats the local checks, CI and resulting-head review. Only a conflict
-  needs you: it ejects the PR from the queue, so resolve it, rerun required
-  tests, and follow the resulting-head code-review gate in the review
-  reference. Do not automatically repeat the earlier draft/ready streak.
+  and repeats the local checks, CI and resulting-head review. Two things do
+  need you, and both begin by rebasing onto current `master`, because neither
+  reproduces on a branch that predates it: a conflict, which ejects the PR from
+  the queue, and an interaction the merge group confirmed, which a stale branch
+  cannot compile. Rebase, fix, rerun required tests, and follow the
+  resulting-head code-review gate in the review reference. Do not automatically
+  repeat the earlier draft/ready streak.
 - Do not merge a downstream PR while its required upstream issue remains
   unmerged. Related issues without a true prerequisite may merge independently.
 
