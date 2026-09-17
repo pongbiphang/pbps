@@ -12994,3 +12994,20 @@ SPEC is in sync with all of these.
     matrix ejects healthy entries for not having answered yet. These values are
     recorded here because the ruleset lives outside the repository: this entry
     is the only reproducible record of them.
+
+    **The ruleset is not sufficient on its own: `allow_auto_merge` has to be
+    enabled on the repository too.** Adding a pull request to the queue goes
+    through the auto-merge API, so with the ruleset in place and that repository
+    setting still off, enqueueing fails outright — measured here as `gh pr merge
+    --merge` answering `Auto merge is not allowed for this repository
+    (enablePullRequestAutoMerge)`. The queue is therefore two switches rather
+    than one, and the second is easy to miss because the ruleset reads as
+    complete without it.
+
+    The rest of the ruleset is unchanged and worth naming, because one of its
+    values is routinely misread: alongside the single required context
+    `ci-gate`, it sets `required_approving_review_count: 0` and
+    `required_review_thread_resolution: true`. A pull request that is `BLOCKED`
+    with green CI is therefore never waiting for an approval — there is none to
+    wait for. It is waiting for an unresolved review thread, and looking for a
+    reviewer instead has cost time here more than once.
