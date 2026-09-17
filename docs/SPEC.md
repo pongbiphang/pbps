@@ -784,6 +784,27 @@ approved plan. SQL Server needs database `VIEW DEFINITION` for that external
 dependency read without overriding metadata denials; insufficient visibility
 is refused (DECISIONS 460).
 
+The same refusal covers a **type change that removes no key at all**. On SQL
+Server a bounded `varchar`/`nvarchar`/`varbinary` widening keeps its key and
+index, so the plan carries no drop to inspect, while the engine still refuses
+the `ALTER` for any foreign key standing on that column — and the plan's own
+key maintenance reaches only the tables this project declares. Every retype
+whose dialect answer demands foreign keys removed therefore asks the catalog
+for the keys that reference its column and the keys its column is part of,
+minus the ones the plan removes first, and names what is left. The name asked
+about is the one the environment has, reversed through the plan's renames by
+column identity. PostgreSQL rebuilds such a key itself and is asked nothing
+(DECISIONS 515).
+
+**Dependency maintenance never relaxes the declared-row boundary.** Recreating
+a foreign key around a retype puts the key back exactly as it was; it does not
+put the key back *early* so that `ON DELETE CASCADE` can remove a child row the
+plan never named. A declared child still pointing at a parent row this plan
+deletes is counted and the delete is refused, with or without a retype in the
+same plan, because a row no declaration names must stay unchanged (7.6) and a
+cascade through a restored key would change it (DECISIONS 55 and 73). A child
+the declarations *do* move or remove goes through as the declared change it is.
+
 Pre-flight also runs **probes derived automatically from the plan itself**.
 The differ's output is a typed `ChangeSet`, so the tool already knows how each
 change can fail, and `Dialect::preflight(change)` turns that knowledge into

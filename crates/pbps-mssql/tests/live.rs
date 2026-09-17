@@ -12266,6 +12266,250 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     db.drop().await;
 }
 
+/// A foreign key this project does not declare is named before the widening
+/// the engine is going to refuse (issue #503).
+///
+/// A bounded `varchar`/`nvarchar`/`varbinary` widening keeps its key and its
+/// index, so the plan carries no key drop for the loop above to inspect, and
+/// the differ's own retype maintenance recreates only the keys inside the
+/// managed projection. An inbound key from a table this project does not
+/// declare is therefore nobody's question until the statement runs. Measured
+/// on 17.0.4075.5: `ALTER TABLE ... ALTER COLUMN` fails with 5074 naming the
+/// constraint and then 4922, in both directions of the key, and the same
+/// column with no key on it widens (DECISIONS 515).
+#[tokio::test]
+#[ignore = "needs a live database; run the engine's live-test script"]
+async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
+    use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
+    let db = TestDb::create("retype503").await;
+    let mut conn = connect_live(&format!(
+        "{};Database={}",
+        conn_str().trim_end_matches(';'),
+        db.name
+    ))
+    .await
+    .unwrap();
+    conn.execute("EXEC(N'CREATE SCHEMA ext;');").await.unwrap();
+    // Outside a transaction, deliberately: the premise below is a statement
+    // the engine refuses, and a refused statement inside a transaction takes
+    // the fixture down with it (`SET XACT_ABORT ON`). The database is thrown
+    // away at the end instead.
+    //
+    // One family per pair: the managed parent holding the key, an undeclared
+    // child pointing at it, and a lone table whose column carries no key at
+    // all — the control that says the refusal is about the key and not about
+    // the widening.
+    for (family, spelling) in [
+        ("varchar", "varchar(10)"),
+        ("nvarchar", "nvarchar(10)"),
+        ("varbinary", "varbinary(10)"),
+    ] {
+        conn.execute(&format!(
+            "CREATE TABLE dbo.p_{family} (code {spelling} NOT NULL CONSTRAINT pk_{family} PRIMARY KEY); \
+             CREATE TABLE ext.c_{family} (id int NOT NULL PRIMARY KEY, code {spelling} NOT NULL \
+               CONSTRAINT fk_{family} FOREIGN KEY REFERENCES dbo.p_{family}(code)); \
+             CREATE TABLE dbo.solo_{family} (code {spelling} NOT NULL CONSTRAINT pk_solo_{family} PRIMARY KEY);"
+        ))
+        .await
+        .unwrap();
+    }
+    let plan = |changes: Vec<Change>| ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    };
+    let widen = |table: &str, column: &str, spelling: &str, wider: &str| Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().unwrap(),
+        column: format!("{table}.{column}").parse().unwrap(),
+        from: ty(spelling),
+        to: ty(wider),
+        from_nullable: false,
+        to_nullable: false,
+    };
+    for (family, spelling, wider) in [
+        ("varchar", "varchar(10)", "varchar(20)"),
+        ("nvarchar", "nvarchar(10)", "nvarchar(20)"),
+        ("varbinary", "varbinary(10)", "varbinary(20)"),
+    ] {
+        // The premise, from the engine: the widening this plan asks for is the
+        // one the engine refuses while the undeclared key stands.
+        let refused = conn
+            .execute(&format!(
+                "ALTER TABLE dbo.p_{family} ALTER COLUMN code {wider} NOT NULL;"
+            ))
+            .await
+            .unwrap_err();
+        // 5074 is what the driver surfaces: the engine raises it first, naming
+        // the constraint, and follows it with the general 4922.
+        assert_eq!(
+            refused.server_error_code().as_deref(),
+            Some("5074"),
+            "{refused}"
+        );
+        let reports = pbps_mssql::impact::key_drop_blockers(
+            &mut conn,
+            &plan(vec![widen(
+                &format!("dbo.p_{family}"),
+                "code",
+                spelling,
+                wider,
+            )]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reports
+                .iter()
+                .flat_map(|r| r.blocking.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            [format!("foreign key `fk_{family}` on ext.c_{family}")],
+            "{family}: the undeclared child and its key are named: {reports:?}"
+        );
+        // The child side of the same key refuses the same way, so it is
+        // reported the same way.
+        let child = pbps_mssql::impact::key_drop_blockers(
+            &mut conn,
+            &plan(vec![widen(
+                &format!("ext.c_{family}"),
+                "code",
+                spelling,
+                wider,
+            )]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            child.iter().any(|r| r
+                .blocking
+                .contains(&format!("foreign key `fk_{family}` on ext.c_{family}"))),
+            "{family}: the key blocks its own child's column too: {child:?}"
+        );
+        // The controls. A column with no key on it is not reported, and it
+        // really does widen; and a plan that takes the key away first — which
+        // is what the differ writes for a key it declares — is not reported
+        // either.
+        let solo = pbps_mssql::impact::key_drop_blockers(
+            &mut conn,
+            &plan(vec![widen(
+                &format!("dbo.solo_{family}"),
+                "code",
+                spelling,
+                wider,
+            )]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            solo.iter().all(|r| r.blocking.is_empty()),
+            "{family}: a column no key names is not blocked: {solo:?}"
+        );
+        conn.execute(&format!(
+            "ALTER TABLE dbo.solo_{family} ALTER COLUMN code {wider} NOT NULL;"
+        ))
+        .await
+        .expect("the control widens, so the refusal above is the key's doing");
+        let dropped = pbps_mssql::impact::key_drop_blockers(
+            &mut conn,
+            &plan(vec![
+                Change::DropForeignKey {
+                    table: TableName::new("ext", format!("c_{family}")),
+                    name: format!("fk_{family}"),
+                },
+                widen(&format!("dbo.p_{family}"), "code", spelling, wider),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dropped.iter().all(|r| r.blocking.is_empty()),
+            "{family}: a key this plan removes first blocks nothing: {dropped:?}"
+        );
+    }
+    // The name the check asks the catalog about is the one the environment
+    // has, not the one the declarations reached: a rename runs at rank 3 and
+    // the retype at 9, so a plan carrying both must reverse the rename before
+    // it can find the key.
+    let renamed = plan(vec![
+        Change::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: TableName::new("dbo", "p_varchar"),
+            to: TableName::new("dbo", "p_renamed"),
+        },
+        Change::RenameColumn {
+            uid: "c_bbbbbb".parse().unwrap(),
+            table: TableName::new("dbo", "p_renamed"),
+            from: "code".into(),
+            to: "renamed".into(),
+        },
+        Change::AlterColumnType {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: "dbo.p_renamed.renamed".parse().unwrap(),
+            from: ty("varchar(10)"),
+            to: ty("varchar(20)"),
+            from_nullable: false,
+            to_nullable: false,
+        },
+    ]);
+    let reports = pbps_mssql::impact::key_drop_blockers(&mut conn, &renamed)
+        .await
+        .unwrap();
+    assert_eq!(
+        reports
+            .iter()
+            .flat_map(|r| r.blocking.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["foreign key `fk_varchar` on ext.c_varchar".to_owned()],
+        "the pre-rename name is what the catalog is asked about: {reports:?}"
+    );
+    // A column the catalog does not have is a failed read, not a report of no
+    // dependencies — the same rule the key side already follows.
+    let absent = pbps_mssql::impact::key_drop_blockers(
+        &mut conn,
+        &plan(vec![widen(
+            "dbo.p_varchar",
+            "missing",
+            "varchar(10)",
+            "varchar(20)",
+        )]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        absent
+            .to_string()
+            .contains("absent from the readable catalog"),
+        "{absent}"
+    );
+    // And the visibility rule the key side established holds here too: an
+    // account that cannot see outside its own tables is refused rather than
+    // told there is nothing there.
+    conn.execute(
+        "CREATE USER retype503_reader WITHOUT LOGIN; \
+         GRANT VIEW DEFINITION, ALTER ON OBJECT::dbo.p_varchar TO retype503_reader; \
+         EXECUTE AS USER='retype503_reader';",
+    )
+    .await
+    .unwrap();
+    let hidden = pbps_mssql::impact::key_drop_blockers(
+        &mut conn,
+        &plan(vec![widen(
+            "dbo.p_varchar",
+            "code",
+            "varchar(10)",
+            "varchar(20)",
+        )]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        hidden.to_string().contains("database VIEW DEFINITION"),
+        "{hidden}"
+    );
+    conn.execute("REVERT").await.unwrap();
+    drop(conn);
+    db.drop().await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn retyping_preserves_adopted_defaults_and_leaves_absence_absent() {
