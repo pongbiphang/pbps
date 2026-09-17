@@ -13611,3 +13611,40 @@ SPEC is in sync with all of these.
      constraint itself. What it refuses is a type the key cannot be implemented
      over at all (`varchar` to `integer`), which is an incompatibility rather
      than a dependency standing in the way, and is not what this check is for.
+
+516. **The guard a narrowing key's probe carries is the condition of a `CASE`,
+     not a conjunct beside the `CAST` it protects (issue #435).**
+
+     A key whose referenced column this plan narrows compares through a `CAST`
+     that can raise, and the row it would raise on is excluded with `AND NOT
+     (<guard>)` (449). On the two parent aliases — the row a delete targets
+     (`p`) and every row that survives it (`q`) — that exclusion sat in the
+     same flat `WHERE`-clause conjunct list as the `CAST`, and a conjunct is
+     not a barrier: PostgreSQL orders the quals of one clause by cost.
+
+     **Measured on 18.6.** With the guard written first and made the costlier
+     of the two, the plan came back reordered — `Filter: (((c)::integer = 7)
+     AND (NOT pricey(c)))` — and the query raised `integer out of range` on a
+     row the guard was there to keep it away from. Written through a `CASE`
+     whose condition is the guard, the same query answers. A probe that raises
+     is reported as *unchecked* rather than as a violation, and `apply`
+     proceeds, so the failure is silent in the direction that matters.
+
+     Today's guards are cheap builtins and today's plans order safely; the
+     change is that the order stops being the planner's to choose. This repo
+     has been here before: DECISIONS 324 records a cast folded to planning time
+     ahead of its `pg_input_is_valid` guard, fenced with `OFFSET 0`. The orphan
+     probe beside this one still uses that fence, which is why the two shapes
+     differ — the fence suits a subquery's target list, the `CASE` suits an
+     expression in a `WHERE`.
+
+     **The exclusion stays a separate term.** A guarded row must be *absent*
+     from the comparison, not merely compare as `NULL`, which already means
+     something else in this query (449): a parent row that silently stopped
+     matching every child would over-count every child pointing at it.
+
+     **The child side is left alone**, and measured rather than assumed. Its
+     guard is not a sibling of the `CAST` but of the whole `EXISTS` the `CAST`
+     sits inside, and on 18.6 that `EXISTS` is pulled up into a join whose
+     condition carries the cast — evaluated after the scan filter that carries
+     the guard. Measured: the same fixture answers rather than raising.
