@@ -998,36 +998,28 @@ impl ScratchRun {
         if self.removed {
             return Ok(());
         }
-        // The scratch session holds the database open; PostgreSQL's FORCE
-        // and SQL Server's SINGLE_USER only reach this run's own sessions.
-        let scratch = self.scratch.take();
-        let mut recovery_names = Vec::new();
-        if let Some(scratch) = scratch {
-            let name = scratch.forwarder.resource_name().to_owned();
-            drop(scratch.connection);
-            if scratch.forwarder.close().await.is_err() {
-                recovery_names.push(name);
-            }
+        // Retire the scratch session into run-owned state rather than
+        // closing it inline: its forwarder's unconfirmed name would otherwise
+        // live only in this call and be lost if `close` is retried (finding
+        // on #640). `close_control` drains it below with the control
+        // forwarder, so a later `close` still reports what is not yet gone.
+        if let Some(scratch) = self.scratch.take() {
+            self.inner.control.retire(scratch);
         }
         let cause = self.inner.refusal.clone().unwrap_or(Error::Cleanup);
         let mut removal = cleanup(&mut self.inner.control, &self.names, cause).await;
+        // The control session and every forwarder this run opened are its own
+        // too, and a caller that keeps the run after closing it must not leave
+        // them on the server: the next admission would find an old connection
+        // as a session it did not open and refuse a valid run (finding on
+        // #640). Success is reported only once their removal is confirmed.
+        let forwarders = close_control(&mut self.inner.control).await;
+        removal.recovery_names.extend(forwarders);
         if removal.recovery_names.is_empty() {
-            // The control session and its forwarder are this run's too, and
-            // a caller that keeps the run after closing it must not leave
-            // them on the server: the next admission would find the old
-            // control connection as a session it did not open and refuse a
-            // valid run (finding on #640). Success is reported only once
-            // their removal is confirmed as well.
-            recovery_names.extend(close_control(&mut self.inner.control).await);
-        }
-        if removal.recovery_names.is_empty() && recovery_names.is_empty() {
             self.removed = true;
             return Ok(());
         }
-        if !recovery_names.is_empty() {
-            removal.cause = Error::Cleanup;
-            removal.recovery_names.extend(recovery_names);
-        }
+        removal.cause = Error::Cleanup;
         Err(removal)
     }
 }
@@ -1079,24 +1071,27 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         if outcome.is_ok() {
             return Ok(());
         }
-        #[cfg(test)]
-        eprintln!(
-            "remove: control-session drop_scratch failed: {:?}",
-            outcome.err()
-        );
         // A session an administrator terminated is not the end of cleanup:
         // the names are still known, and a fresh session can still act.
         if let Some(session) = control.session.take() {
             control.retire(session);
         }
     }
-    // A fresh session for the removal alone. It must reach the same engine
-    // the run created on: the pinned container, reporting the pinned
-    // identity. A restarted container has nothing of this run's on it, but
-    // that cannot be confirmed from here, so it is reported rather than
-    // assumed.
-    let state = control
-        .api
+    // A fresh session for the removal alone, on a fresh daemon connection.
+    // The run's own `control.api` cannot be reused: a check cancelled in
+    // flight is cancelled inside a `control.api` request, and `LocalApi`
+    // invalidates permanently on cancellation, so cleanup after a cancelled
+    // run would inspect the container over a dead connection (finding on
+    // #640). This reconnects, the way the Docker profile's janitor does.
+    //
+    // It must reach the same engine the run created on: the pinned container,
+    // reporting the pinned identity. A restarted container has nothing of
+    // this run's on it, but that cannot be confirmed from here, so it is
+    // reported rather than assumed.
+    let mut api = LocalApi::connect_native(&control.endpoint.daemon)
+        .await
+        .map_err(|_| ())?;
+    let state = api
         .inspect_container(&control.pinned.id)
         .await
         .map_err(|_| ())?
@@ -1105,7 +1100,7 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         return Err(());
     }
     let (forwarder, mut connection) = Forwarder::open(
-        &control.api,
+        &api,
         &control.image,
         control.driver,
         &control.pinned.id,
@@ -1114,28 +1109,18 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
     )
     .await
     .map_err(|failure| {
-        #[cfg(test)]
-        eprintln!("remove: fresh forwarder open failed: {:?}", failure.cause);
-        let _ = failure;
+        // The janitor forwarder's own name is the only record of an orphan
+        // its startup could not confirm gone; keep it in run-owned state.
+        control.unconfirmed.extend(failure.recovery_names);
     })?;
     let outcome = async {
-        let identity = engine::identity(&mut connection).await.map_err(|error| {
-            #[cfg(test)]
-            eprintln!("remove: fresh identity failed: {error:?}");
-            let _ = error;
-        })?;
+        let identity = engine::identity(&mut connection).await.map_err(|_| ())?;
         if identity.instance_key != control.identity.instance_key {
-            #[cfg(test)]
-            eprintln!("remove: fresh identity mismatch");
             return Err(());
         }
         engine::drop_scratch(&mut connection, names)
             .await
-            .map_err(|error| {
-                #[cfg(test)]
-                eprintln!("remove: fresh drop_scratch failed: {error:?}");
-                let _ = error;
-            })
+            .map_err(|_| ())
     }
     .await;
     drop(connection);
