@@ -357,6 +357,27 @@ struct Control {
     /// says the previous await was cancelled mid-exchange, which is the one
     /// way a protocol stream is left in a state nobody can reason about.
     in_flight: bool,
+    /// Forwarders whose session is over but whose removal has not been
+    /// confirmed: a poisoned control session's, a refused scratch session's.
+    /// Dropping one requests its removal; only `close` confirms it, and a
+    /// run-owned container nobody can confirm gone is a recovery name like
+    /// the database and the login (finding on #640).
+    stale: Vec<Forwarder>,
+    /// Forwarder containers already reported unconfirmed.
+    unconfirmed: Vec<String>,
+}
+
+impl Control {
+    /// Ends a session without confirming its forwarder's removal yet.
+    fn retire(&mut self, session: Session) {
+        let Session {
+            connection,
+            forwarder,
+            ..
+        } = session;
+        drop(connection);
+        self.stale.push(forwarder);
+    }
 }
 
 struct Analysis {
@@ -616,7 +637,9 @@ impl Inner {
     /// and a cancelled one is found on the next call by the flag it left set.
     async fn check(&mut self, extra: Option<&Session>) -> Result<(), Error> {
         if self.control.in_flight {
-            self.control.session = None;
+            if let Some(session) = self.control.session.take() {
+                self.control.retire(session);
+            }
             self.control.in_flight = false;
             self.refuse(Error::Cancelled);
         }
@@ -746,6 +769,8 @@ impl DedicatedServer {
                 session: Some(session),
                 pending: None,
                 in_flight: false,
+                stale: Vec::new(),
+                unconfirmed: Vec::new(),
             },
             analysis: Some(Analysis {
                 runtime,
@@ -941,7 +966,9 @@ impl ScratchRun {
     pub async fn check(&mut self) -> Result<(), Error> {
         if self.in_flight {
             self.in_flight = false;
-            self.scratch = None;
+            if let Some(scratch) = self.scratch.take() {
+                self.inner.control.retire(scratch);
+            }
             self.inner.refuse(Error::Cancelled);
         }
         let Some(scratch) = self.scratch.as_ref() else {
@@ -950,8 +977,10 @@ impl ScratchRun {
         self.in_flight = true;
         let outcome = self.inner.check(Some(scratch)).await;
         self.in_flight = false;
-        if outcome.is_err() {
-            self.scratch = None;
+        if outcome.is_err()
+            && let Some(scratch) = self.scratch.take()
+        {
+            self.inner.control.retire(scratch);
         }
         outcome
     }
@@ -1004,21 +1033,17 @@ impl ScratchRun {
 /// the forwarder container if that could not be confirmed. Idempotent: a
 /// control without a session has nothing left to close.
 async fn close_control(control: &mut Control) -> Vec<String> {
-    let Some(session) = control.session.take() else {
-        return Vec::new();
-    };
-    let Session {
-        connection,
-        forwarder,
-        ..
-    } = session;
-    let name = forwarder.resource_name().to_owned();
-    drop(connection);
-    if forwarder.close().await.is_err() {
-        vec![name]
-    } else {
-        Vec::new()
+    if let Some(session) = control.session.take() {
+        control.retire(session);
     }
+    let mut unconfirmed = std::mem::take(&mut control.unconfirmed);
+    for forwarder in std::mem::take(&mut control.stale) {
+        let name = forwarder.resource_name().to_owned();
+        if forwarder.close().await.is_err() {
+            unconfirmed.push(name);
+        }
+    }
+    unconfirmed
 }
 
 /// Cleanup runs on success, failure and cancellation alike. It uses the
@@ -1039,7 +1064,9 @@ async fn cleanup(control: &mut Control, names: &ScratchNames, cause: Error) -> S
 
 async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
     if control.in_flight {
-        control.session = None;
+        if let Some(session) = control.session.take() {
+            control.retire(session);
+        }
         control.in_flight = false;
     }
     if let Some(session) = control.session.as_mut() {
@@ -1051,7 +1078,9 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         }
         // A session an administrator terminated is not the end of cleanup:
         // the names are still known, and a fresh session can still act.
-        control.session = None;
+        if let Some(session) = control.session.take() {
+            control.retire(session);
+        }
     }
     // A fresh session for the removal alone. It must reach the same engine
     // the run created on: the pinned container, reporting the pinned
@@ -1088,7 +1117,10 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
     }
     .await;
     drop(connection);
-    let _ = forwarder.close().await;
+    let name = forwarder.resource_name().to_owned();
+    if forwarder.close().await.is_err() {
+        control.unconfirmed.push(name);
+    }
     outcome
 }
 

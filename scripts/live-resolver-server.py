@@ -53,7 +53,7 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 # creates, the image root is read-only, the network namespace is empty and
 # every privilege the engine does not need is gone before it starts.
 RECIPE = [
-    "--network", "none", "--read-only",
+    "--network", "none", "--ipc", "private", "--read-only",
     "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777",
     "--security-opt", "no-new-privileges",
     "--memory", "3g", "--memory-swap", "3g", "--cpus", "2", "--pids-limit", "512",

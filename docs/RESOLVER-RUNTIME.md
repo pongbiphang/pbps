@@ -68,14 +68,14 @@ names, and a row it does not name is refused as that row (DECISIONS 514).
 
 | Premise | What is measured |
 | --- | --- |
-| Record | The daemon's record of the container: running, not privileged, `NetworkMode: none`, a read-only root, no host, container or shared PID/IPC/UTS/user namespace, no binds, devices, ports, links or volumes, only tmpfs mounts, a memory and PID limit. Its id, init PID, start time and image are pinned, and re-read on every check: a restarted or replaced container is a different runtime |
+| Record | The daemon's record of the container: running, not privileged, `NetworkMode: none`, a read-only root, a private PID, IPC, UTS and user namespace — Podman's default `shareable` IPC namespace is refused, since another container can join it — no binds, devices, ports, links or volumes, only tmpfs mounts, a memory and PID limit. Its id, init PID, start time and image are pinned, and re-read on every check: a restarted or replaced container is a different runtime |
 | Separation | The container's init and engine service are neither the target's service process nor in any of its PID, mount or network namespaces, and the engine's instance identity is not the target's. Decided **before** the record and containment measurements, so an alias of the target refuses as the target |
 | Network | The container's network namespace holds only a loopback device — a real one, by link type and flag — with no IPv4 or IPv6 route and no address but `::1` |
 | Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device: a host procfs or sysfs bound in keeps the type and not these |
 | Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
 | Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network and mount namespaces, judged as found rather than against an earlier listing |
 | Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |
-| Accounting | Nothing shares the container's mount namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here |
+| Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders' processes — the forwarder's guard and its descendants, not its PID namespace. A container joined with `--network container:` is in no process listing and is caught here |
 | Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
 
 The engine is reached the way the Docker profile reaches its own: a
@@ -136,7 +136,9 @@ that cannot be confirmed reports those two generated names and any forwarder
 container whose removal was not confirmed either. The cleanup capability is
 not a live handle: it is the credentials, the daemon path and the container's
 pinned identity, from which a fresh session can be opened to remove exactly
-those names. A check that refuses ends the analysis and not the cleanup; an
+those names. Every forwarder the run opened is removed with the run and its
+removal confirmed before success is reported, including one whose session
+ended early; a forwarder that cannot be confirmed gone is a recovery name too. A check that refuses ends the analysis and not the cleanup; an
 await cancelled mid-exchange leaves a protocol stream in no known state, so
 the session it was on is dropped, the analysis is over, and cleanup opens a
 fresh session to the pinned container — and reports the names if that

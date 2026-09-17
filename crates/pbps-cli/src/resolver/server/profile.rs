@@ -128,9 +128,11 @@ pub(crate) fn configuration(observed: &Value) -> Result<(), &'static str> {
     if host["ReadonlyRootfs"] != true {
         return Err("ReadonlyRootfs");
     }
-    // Docker reports `""` for a private namespace and Podman `"private"`;
-    // `shareable` is Podman's own IPC namespace offered to other containers,
-    // which is still this container's. `host` and `container:<id>` are not.
+    // Docker reports `""` for a private namespace and Podman `"private"`.
+    // `host` and `container:<id>` are somebody else's namespace, and so is
+    // Podman's default `shareable` IPC namespace: it is this container's
+    // until another container joins it, which the recipe's `--ipc private`
+    // is what forbids (finding on #640).
     for key in [
         "PidMode",
         "IpcMode",
@@ -140,7 +142,7 @@ pub(crate) fn configuration(observed: &Value) -> Result<(), &'static str> {
     ] {
         match &host[key] {
             Value::Null => (),
-            Value::String(mode) if matches!(mode.as_str(), "" | "private" | "shareable") => (),
+            Value::String(mode) if matches!(mode.as_str(), "" | "private") => (),
             Value::Bool(_)
             | Value::Number(_)
             | Value::String(_)
@@ -376,7 +378,7 @@ mod tests {
             "State": {"Running": true, "Restarting": false, "Paused": false, "Pid": 3836286},
             "HostConfig": {
                 "Privileged": false, "PublishAllPorts": false, "NetworkMode": "none",
-                "ReadonlyRootfs": true, "PidMode": "private", "IpcMode": "shareable",
+                "ReadonlyRootfs": true, "PidMode": "private", "IpcMode": "private",
                 "UTSMode": "private", "UsernsMode": "", "CgroupnsMode": null,
                 "Binds": [], "Devices": [], "PortBindings": {},
                 "RestartPolicy": {"Name": "", "MaximumRetryCount": 0},
@@ -422,6 +424,10 @@ mod tests {
         );
         assert_eq!(
             weakened(&["HostConfig", "IpcMode"], "container:abc".into()),
+            Err("IpcMode")
+        );
+        assert_eq!(
+            weakened(&["HostConfig", "IpcMode"], "shareable".into()),
             Err("IpcMode")
         );
         assert_eq!(

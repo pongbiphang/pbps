@@ -212,9 +212,9 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
     .map_err(Premise::Occupants.named())
 }
 
-/// Nothing may share the container's network or mount namespace that is not
-/// in its PID namespace, except this run's own forwarders in the network
-/// namespace. A container joined with `--network container:` would otherwise
+/// Nothing may share the container's network, mount or IPC namespace that
+/// is not in its PID namespace, except this run's own forwarders in the
+/// network namespace. A container joined with `--network container:` would otherwise
 /// be invisible to every other check.
 fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Error> {
     // The exception is each forwarder's own processes — its guard and the
@@ -244,14 +244,20 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
         Err(UnqualifiedProcess)
     })
     .map_err(Premise::Accounting.named())?;
-    for_each_occupant(init, "mnt", |occupant| {
-        if init.same_namespace(occupant, "pid")? {
-            Ok(())
-        } else {
-            Err(UnqualifiedProcess)
-        }
-    })
-    .map_err(Premise::Accounting.named())
+    // Mount and IPC alike: a container joined to either reaches the
+    // engine's files or its shared memory without being in any listing the
+    // engine's PID namespace produces.
+    for namespace in ["mnt", "ipc"] {
+        for_each_occupant(init, namespace, |occupant| {
+            if init.same_namespace(occupant, "pid")? {
+                Ok(())
+            } else {
+                Err(UnqualifiedProcess)
+            }
+        })
+        .map_err(Premise::Accounting.named())?;
+    }
+    Ok(())
 }
 
 /// The thread group an occupant task belongs to, as the kernel reports it.
