@@ -120,8 +120,11 @@ claim of peer qualification. It is not a fallback for failed TLS. Engine
 identity SQL remains in `pbps-pg::resolver` and `pbps-mssql::resolver` through
 the sealed query-connection seam. Native process/channel and kernel leases are
 ephemeral CLI capabilities, never semantic schema or saved-plan evidence.
+The supplied-server profile in the same module measures a runtime pbps did not
+provision and owns its scratch resources' lifecycle; its per-engine session and
+scratch-resource SQL stays in the engine crates behind that same seam.
 See [the runtime boundary](RESOLVER-RUNTIME.md) for its staged startup,
-supported profile and the remaining environment/binding gates.
+supported profiles and the remaining environment/binding gates.
 
 ## Inviolable constraints
 

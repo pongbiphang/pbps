@@ -1287,7 +1287,12 @@ only when absent. It is not permission for compiled code to access a network.
 Actual digest/platform, build compatibility, instance separation, transport
 and containment still require qualification in the dependent steps. A server
 profile names a separate credential variable, never an inline connection
-string. No fallback to target credentials exists.
+string. No fallback to target credentials exists. That variable's value also
+carries the externally enforced runtime profile the supplied server is claimed
+to meet and the container that provides it: those describe a running
+deployment, so nothing checked in claims a server meets a profile pbps has not
+measured. An unimplemented profile name is refused by name, per engine, and a
+named one stays a claim until #609's admission measures the actual runtime.
 
 A missing selected profile is a named finding (exit 2) before target access or
 output writes. An unused profile/default is not resolved by offline commands,

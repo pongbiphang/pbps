@@ -183,7 +183,7 @@ pub(crate) fn awaiting_engine(
     Ok(root)
 }
 
-fn guard(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
+pub(crate) fn guard(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
     process.check()?;
     if process.namespace_pid() != 1
         || process
@@ -198,7 +198,7 @@ fn guard(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
     check_status(&status, 0, 0x5e0)
 }
 
-fn private_network(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
+pub(crate) fn private_network(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
     // TCP filtering alone does not bound UDP/DNS or alternate protocols.
     // Only the private loopback device may exist. The workload cannot create
     // an interface or change its namespace: NET_ADMIN and unshare are absent.
@@ -231,7 +231,11 @@ fn status(process: &ProcessLease) -> Result<String, UnqualifiedProcess> {
     Ok(text)
 }
 
-fn security(process: &ProcessLease, uid: u32, capabilities: u64) -> Result<(), UnqualifiedProcess> {
+pub(crate) fn security(
+    process: &ProcessLease,
+    uid: u32,
+    capabilities: u64,
+) -> Result<(), UnqualifiedProcess> {
     process.check()?;
     check_status(&status(process)?, uid, capabilities)?;
     process.check()

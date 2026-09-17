@@ -19,6 +19,7 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 
 mod channel;
+pub(crate) mod forwarder;
 mod lifecycle;
 mod profile;
 mod reserved;
@@ -257,7 +258,7 @@ impl LocalApi {
         Self::connect_peer(&self.socket_path, self.peer.0).await
     }
 
-    async fn additional(&self) -> Result<Self, Error> {
+    pub(crate) async fn additional(&self) -> Result<Self, Error> {
         let lease = self.native_daemon.as_ref().ok_or(Error::NativeDaemon)?;
         lease.check().map_err(|_| Error::NativeDaemon)?;
         let other = Self::connect_native(&self.socket_path).await?;
@@ -398,6 +399,36 @@ impl LocalApi {
             guard.completed = true;
         }
         result
+    }
+
+    /// The daemon's record of a container pbps did not create, or `None` if
+    /// there is no such container. The record is the daemon's word; the
+    /// kernel checks that follow it are the measurement.
+    pub(crate) async fn inspect_container(
+        &mut self,
+        container: &str,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        if container.is_empty() || container.len() > 256 || container.starts_with('-') {
+            return Err(Error::Profile);
+        }
+        lifecycle::inspect(self, container).await
+    }
+
+    /// Stops a container. Test-only: a live test uses it to take the
+    /// supplied server away from a run that still has resources on it.
+    #[cfg(test)]
+    pub(crate) async fn stop_container(&mut self, container: &str) -> Result<(), Error> {
+        let (status, _) = self
+            .request(
+                Method::POST,
+                &format!("{API}/containers/{}/stop?t=2", path_component(container)),
+            )
+            .await?;
+        if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+            Ok(())
+        } else {
+            Err(Error::Response)
+        }
     }
 
     pub async fn inspect_image(&mut self, image: &str) -> Result<Option<CandidateImage>, Error> {

@@ -298,7 +298,14 @@ jobs:
         run: |
           cargo test -p pbps-cli --lib --no-run --message-format=json > /tmp/pbps-resolver-artifacts.jsonl
           PBPS_FIXTURE_BINARY=$(python3 -c 'import json; rows = [json.loads(line) for line in open("/tmp/pbps-resolver-artifacts.jsonl")]; print(next(row["executable"] for row in rows if row.get("executable") and row.get("target", {}).get("name") == "pbps_cli"))')
+          echo "PBPS_FIXTURE_BINARY=$PBPS_FIXTURE_BINARY" >> "$GITHUB_ENV"
           sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
+        env:
+          FIXTURE_ENGINE: ${{ matrix.engine }}
+      # A supplied server pbps did not provision. It runs a target and a
+      # dedicated server at once, so it keeps the same disposable host.
+      - name: Dedicated scratch server lifecycle and exclusivity
+        run: sudo python3 scripts/live-resolver-server.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
 

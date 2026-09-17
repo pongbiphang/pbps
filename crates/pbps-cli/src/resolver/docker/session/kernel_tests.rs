@@ -368,7 +368,14 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
         .await
         .unwrap();
     let owner = token();
-    let launch = Launch::control(&image, driver, &owner, workload.container_id()).unwrap();
+    let launch = Launch::control(
+        &image,
+        driver,
+        &owner,
+        workload.container_id(),
+        super::super::profile::LIFETIME_SECS,
+    )
+    .unwrap();
     let control = CandidateRun::start_launch(
         LocalApi::connect(&path).await.unwrap(),
         image.clone(),

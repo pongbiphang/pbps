@@ -18,7 +18,7 @@ pub(super) const LIFETIME_SECS: u64 = 600;
 // that flag can connect implicitly without passing through connect(2).
 const SECCOMP: &str = include_str!("linux-amd64-v1.json");
 
-pub(super) struct Launch {
+pub(crate) struct Launch {
     pub body: Value,
 }
 
@@ -92,11 +92,15 @@ impl Launch {
         Ok(Self { body })
     }
 
-    pub(super) fn control(
+    /// `lifetime_secs` is the root guard's deadline. The Docker profile passes
+    /// its own run lifetime; a supplied server's run has a longer one, and a
+    /// forwarder that died before the run did would end the run for nothing.
+    pub(crate) fn control(
         image: &CandidateImage,
         driver: Driver,
         owner: &str,
         workload: &str,
+        lifetime_secs: u64,
     ) -> Result<Self, Error> {
         if workload.len() != 64
             || !workload
@@ -117,7 +121,7 @@ impl Launch {
         let body = &mut launch.body;
         body["Cmd"] = json!([
             "--signal=KILL",
-            format!("{LIFETIME_SECS}s"),
+            format!("{lifetime_secs}s"),
             "/usr/bin/setpriv",
             "--reuid=65534",
             "--regid=65534",
@@ -341,7 +345,8 @@ mod tests {
             assert!(env.contains(&json!("BASH_ENV")));
             assert!(env.contains(&json!("LD_PRELOAD")));
             assert!(env.contains(&json!("PATH=/usr/bin:/bin")));
-            let control = Launch::control(&image, driver, "owner", &"a".repeat(64)).unwrap();
+            let control =
+                Launch::control(&image, driver, "owner", &"a".repeat(64), LIFETIME_SECS).unwrap();
             assert!(
                 control.body["Env"]
                     .as_array()

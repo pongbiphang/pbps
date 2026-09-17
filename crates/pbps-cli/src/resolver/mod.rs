@@ -9,3 +9,6 @@ pub mod docker;
 
 #[cfg(target_os = "linux")]
 pub mod native;
+
+#[cfg(target_os = "linux")]
+pub mod server;

@@ -142,7 +142,17 @@ fn cgroup_path(process: &ProcessLease) -> Result<PathBuf, UnqualifiedProcess> {
     if root.kind != "cgroup2" || root.root != "/" {
         return Err(UnqualifiedProcess);
     }
-    let membership = read_bounded(&proc_base(&process.directory).join("cgroup"), 4096)?;
+    Ok(Path::new("/sys/fs/cgroup").join(cgroup_relative(process)?))
+}
+
+/// A process's own cgroup, relative to the v2 root.
+///
+/// The bounds a lease measures belong to one cgroup. A process that joined
+/// the namespace while staying in an unrelated cgroup is inside the run's
+/// reach and outside its ceiling, so callers compare this against the
+/// anchor's: v2 limits bound a whole subtree, so a descendant is bounded too.
+pub(crate) fn cgroup_relative(process: &ProcessLease) -> Result<String, UnqualifiedProcess> {
+    let membership = process.read_proc("cgroup", 4096)?;
     let mut lines = membership.lines();
     let relative = lines
         .next()
@@ -156,7 +166,7 @@ fn cgroup_path(process: &ProcessLease) -> Result<PathBuf, UnqualifiedProcess> {
     {
         return Err(UnqualifiedProcess);
     }
-    Ok(Path::new("/sys/fs/cgroup").join(relative))
+    Ok(relative.to_owned())
 }
 
 struct Mount<'a> {
@@ -294,6 +304,143 @@ fn size(mount: &Mount<'_>) -> Result<u64, UnqualifiedProcess> {
         .ok()
         .and_then(|size| size.checked_mul(factor))
         .ok_or(UnqualifiedProcess)
+}
+
+/// Upper bounds a supplied server's runtime must already enforce.
+///
+/// The provisioned Docker profile asks for exact numbers because it chose
+/// them. An operator's dedicated server chose its own, so the requirement is
+/// different: every relevant bound must exist and be no larger than this.
+/// `max`, a missing controller and an unreadable file are all refusals.
+#[derive(Clone, Copy)]
+pub(crate) struct ResourceCeilings {
+    pub memory: u64,
+    pub nano_cpus: u64,
+    pub pids: u64,
+}
+
+/// Holds the live cgroup directory so that a later replacement of the limits
+/// under the same pathname cannot pass a recheck.
+pub(crate) struct BoundedResourceLease {
+    process: ProcessLease,
+    cgroup: File,
+    cgroup_path: PathBuf,
+    ceilings: ResourceCeilings,
+}
+
+impl BoundedResourceLease {
+    pub(crate) fn capture(
+        process: ProcessLease,
+        ceilings: ResourceCeilings,
+    ) -> Result<Self, UnqualifiedProcess> {
+        let cgroup_path = cgroup_path(&process)?;
+        let cgroup = File::open(&cgroup_path).map_err(|_| UnqualifiedProcess)?;
+        let metadata = cgroup.metadata().map_err(|_| UnqualifiedProcess)?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(UnqualifiedProcess);
+        }
+        let lease = Self {
+            process,
+            cgroup,
+            cgroup_path,
+            ceilings,
+        };
+        lease.check()?;
+        Ok(lease)
+    }
+
+    pub(crate) fn process(&self) -> &ProcessLease {
+        &self.process
+    }
+
+    pub(crate) fn check(&self) -> Result<(), UnqualifiedProcess> {
+        self.process.check()?;
+        if cgroup_path(&self.process)? != self.cgroup_path
+            || FileIdentity::of(&File::open(&self.cgroup_path).map_err(|_| UnqualifiedProcess)?)?
+                != FileIdentity::of(&self.cgroup)?
+        {
+            return Err(UnqualifiedProcess);
+        }
+        let base = proc_base(&self.cgroup);
+        // `max` fails to parse, which is the answer wanted here: an unbounded
+        // controller is not a bound, and neither is an unreadable one.
+        for (name, ceiling) in [
+            ("memory.max", self.ceilings.memory),
+            ("memory.swap.max", 0),
+            ("pids.max", self.ceilings.pids),
+        ] {
+            let actual: u64 = read_bounded(&base.join(name), 128)?
+                .trim()
+                .parse()
+                .map_err(|_| UnqualifiedProcess)?;
+            if actual > ceiling {
+                return Err(UnqualifiedProcess);
+            }
+        }
+        let cpu = read_bounded(&base.join("cpu.max"), 128)?;
+        let fields: Vec<_> = cpu.split_whitespace().collect();
+        if fields.len() != 2 {
+            return Err(UnqualifiedProcess);
+        }
+        let quota: u64 = fields[0].parse().map_err(|_| UnqualifiedProcess)?;
+        let period: u64 = fields[1].parse().map_err(|_| UnqualifiedProcess)?;
+        if quota == 0
+            || period == 0
+            || u128::from(quota) * 1_000_000_000
+                > u128::from(period) * u128::from(self.ceilings.nano_cpus)
+        {
+            return Err(UnqualifiedProcess);
+        }
+        self.process.check()
+    }
+}
+
+/// One row of a mount table, owned so the caller can outlive the parsed text.
+pub(crate) struct MountEntry {
+    pub target: String,
+    pub kind: String,
+    /// `major:minor` of the source filesystem. Two procfs or sysfs instances
+    /// have different ones, which is what tells the engine's own apart from
+    /// the host's when the filesystem type is identical.
+    pub device: String,
+    /// The subtree of the source filesystem this mount exposes. A freshly
+    /// created tmpfs has `/`; anything else is a bind of existing content.
+    pub root: String,
+    pub options: BTreeSet<String>,
+}
+
+/// Every row of a process's mount table, without collapsing the stacked ones.
+///
+/// `mounts` keeps one row per target because the callers that judge a mount
+/// want the one that path carries. A caller asking which filesystems a
+/// runtime can reach wants all of them: the row a collapsed table keeps may
+/// be the hidden one, and dropping it would leave the visible filesystem out
+/// of the answer entirely.
+pub(crate) fn mount_rows(process: &ProcessLease) -> Result<Vec<MountEntry>, UnqualifiedProcess> {
+    let text = process.read_proc("mountinfo", 1024 * 1024)?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let split = fields
+            .iter()
+            .position(|field| *field == "-")
+            .ok_or(UnqualifiedProcess)?;
+        if split < 6 || fields.len() != split + 4 {
+            return Err(UnqualifiedProcess);
+        }
+        rows.push(MountEntry {
+            target: fields[4].to_owned(),
+            kind: fields[split + 1].to_owned(),
+            device: fields[2].to_owned(),
+            root: fields[3].to_owned(),
+            options: fields[5].split(',').map(str::to_owned).collect(),
+        });
+    }
+    if rows.is_empty() {
+        return Err(UnqualifiedProcess);
+    }
+    process.check()?;
+    Ok(rows)
 }
 
 #[cfg(test)]

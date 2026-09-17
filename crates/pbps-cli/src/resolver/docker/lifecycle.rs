@@ -103,7 +103,7 @@ impl CandidateRun {
         Self::start_launch(api, image, token, launch).await
     }
 
-    pub(super) async fn start_launch(
+    pub(crate) async fn start_launch(
         api: LocalApi,
         image: CandidateImage,
         token: String,
@@ -148,7 +148,7 @@ impl CandidateRun {
         &self.id
     }
 
-    pub(super) fn native_pid(&self) -> Result<u32, Error> {
+    pub(crate) fn native_pid(&self) -> Result<u32, Error> {
         self.pid.try_into().map_err(|_| Error::RuntimeChanged)
     }
 
@@ -172,7 +172,7 @@ impl CandidateRun {
     }
 }
 
-async fn inspect(api: &mut LocalApi, resource: &str) -> Result<Option<Value>, Error> {
+pub(super) async fn inspect(api: &mut LocalApi, resource: &str) -> Result<Option<Value>, Error> {
     let (status, body) = api
         .request(
             Method::GET,

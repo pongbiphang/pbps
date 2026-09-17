@@ -43,6 +43,21 @@ struct BoundTarget {
 
 /// Weak ownership prevents scratch from keeping a discarded target binding
 /// alive. Socket continuity still comes from the retained kernel handles.
+/// Names which reading of the target binding refused.
+///
+/// `UnqualifiedProcess` is one value for every step here, which is a fine
+/// answer for a caller and no answer at all for anyone reading a fixture
+/// whose containers are already gone. `docker/session.rs` reports its
+/// startup stages the same way, and for the same reason.
+fn stage(name: &'static str) -> impl Fn(UnqualifiedProcess) -> UnqualifiedProcess {
+    move |error| {
+        #[cfg(test)]
+        eprintln!("native target check stage={name}");
+        let _ = name;
+        error
+    }
+}
+
 pub(crate) struct TargetWitness {
     lease: Weak<SocketOwnerLease>,
     connection: pbps_db::transport::ConnectionId,
@@ -141,18 +156,29 @@ impl NativeTarget {
         // Taking the complete binding before the first await makes failure or
         // cancellation terminal. A later change-and-restore cannot revive it.
         let mut bound = self.current.take().ok_or(UnqualifiedProcess)?;
-        bound.lease.check(&bound.connection)?;
-        if bound.lease.service().has_same_executable_parent()? {
-            return Err(UnqualifiedProcess);
+        bound
+            .lease
+            .check(&bound.connection)
+            .map_err(stage("lease"))?;
+        if bound
+            .lease
+            .service()
+            .has_same_executable_parent()
+            .map_err(stage("service-root-unreadable"))?
+        {
+            return Err(stage("service-root")(UnqualifiedProcess));
         }
         let current = engine::identity(&mut bound.connection)
             .await
-            .map_err(|_| UnqualifiedProcess)?;
+            .map_err(|_| stage("identity-read")(UnqualifiedProcess))?;
         if current != bound.identity {
-            return Err(UnqualifiedProcess);
+            return Err(stage("identity-changed")(UnqualifiedProcess));
         }
-        correlate(&bound.lease, &current)?;
-        bound.lease.check(&bound.connection)?;
+        correlate(&bound.lease, &current).map_err(stage("correlate"))?;
+        bound
+            .lease
+            .check(&bound.connection)
+            .map_err(stage("lease-after"))?;
         self.current = Some(bound);
         Ok(())
     }

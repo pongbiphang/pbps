@@ -70,11 +70,35 @@ identity comparison and instance separation, run binding and invalidation before
 scratch DDL/source transfer. Full ADR cases 11, 19 and 20 remain with those
 profiles. Ordinary connection defaults and discovery qualification are unchanged.
 
+## Dedicated scratch servers (#609)
+
+A server pbps did not provision is admitted by measuring a **named** externally
+enforced profile, not by trusting its URL, its separate database or an
+operator's assertion. `linux-dedicated-v1` covers both engines on native Linux:
+an operator-started container of a known layout — an empty network namespace,
+an unprivileged engine, cgroup bounds within the profile's ceilings, a
+read-only image root and a mount table every row of which the profile names —
+reached through a run-owned forwarder the way the Docker profile reaches its
+own containers. Instance separation is decided from the actual processes
+before the containment measurement and before any database, DDL or
+declaration, so an alias of the target refuses as the target. Exclusivity is
+the kernel's complete census of the engine's namespace plus a cumulative engine
+session counter that only this run may have moved, so a session that opened
+and closed between two checks still ends the run. Run-owned resources are one
+uniquely named database and login, removed on every exit path, with
+unconfirmed removals reporting exactly those names.
+
+This is the lifecycle and exclusivity portion of ADR cases 6, 11, 13, 14 and
+19–21 for supplied servers. It is not engine build or deployment-context
+qualification (#610/#611), source handling (#617) or binding evidence: no
+declaration is transferred and no SQL surface is exposed. See
+[the runtime boundary](RESOLVER-RUNTIME.md) for the measured premises.
+
 ## Ordered implementation issues
 
 Each issue describes its scope, ADR acceptance cases, positive/negative tests
 and dependencies. The issue loop is sequential: the current PR must merge
-before the next issue is claimed. #597 is complete; #606 starts this sequence.
+before the next issue is claimed. #597 is complete; #606 through #609 are delivered.
 
 | Step | Issue | Required outcome |
 |---|---|---|

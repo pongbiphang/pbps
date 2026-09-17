@@ -332,8 +332,14 @@ impl CandidateSession {
         deadline: tokio::time::Instant,
     ) -> Result<(CandidateRun, StreamConn, InstanceObservation), (StartFailure, bool)> {
         let owner = token();
-        let launch = Launch::control(&image, driver, &owner, workload.container_id())
-            .map_err(|cause| (failure(cause), false))?;
+        let launch = Launch::control(
+            &image,
+            driver,
+            &owner,
+            workload.container_id(),
+            super::profile::LIFETIME_SECS,
+        )
+        .map_err(|cause| (failure(cause), false))?;
         let control = CandidateRun::start_launch(api, image, owner, launch)
             .await
             .map_err(|failure| (failure, false))?;

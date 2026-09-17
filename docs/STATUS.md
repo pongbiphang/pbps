@@ -129,8 +129,19 @@ run-private database channel before exposing a source-free session. It owns
 bounded startup, continuity and cleanup for both engines. This library is not
 wired into binding planning: engine build/context qualification (#610/#611)
 and the subsequent source-handling and binding steps remain required. See
-[the runtime boundary and fixtures](RESOLVER-RUNTIME.md). Dedicated scratch
-servers remain #609.
+[the runtime boundary and fixtures](RESOLVER-RUNTIME.md).
+
+A supplied **dedicated scratch server** (#609) is an operator-started container
+of a known layout: pbps reads the runtime's record of it, measures the kernel
+against the named profile — an empty network namespace, an unprivileged engine,
+bounded cgroup resources and a mount table every row of which the profile
+names — after proving from the actual processes that it is not the target's
+instance, and reaches it through a run-owned forwarder as the Docker profile
+does. Exclusivity is the kernel's complete census of that namespace plus each
+engine's cumulative session counter, so a session that opened and closed
+between two checks still invalidates the run. Its run-owned database and login
+are removed on every exit path. Like the Docker runtime, this is not wired into
+binding planning and exposes no SQL surface.
 
 Delivery is split into three stages:
 

@@ -30,7 +30,7 @@ impl LocalApi {
         self.attach_inner(container_id).await
     }
 
-    pub(super) async fn attach_inner(mut self, container_id: &str) -> Result<AttachStream, Error> {
+    pub(crate) async fn attach_inner(mut self, container_id: &str) -> Result<AttachStream, Error> {
         if container_id.len() != 64
             || !container_id
                 .bytes()
