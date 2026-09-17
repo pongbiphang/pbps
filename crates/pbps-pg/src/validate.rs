@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-use pbps_dialect::DialectError;
+use pbps_dialect::{DialectError, Expression};
 use pbps_model::{GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table};
 
 use crate::quote;
@@ -64,9 +64,12 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         }
     }
     for (name, check) in &table.checks {
-        // Non-ASCII whitespace can be an unquoted identifier in PostgreSQL;
-        // Rust's Unicode trim would reject a legal boolean-column expression.
-        if check.expression.trim_ascii().is_empty() {
+        // Asked of the engine's lexis rather than of Rust's whitespace class.
+        // Non-ASCII whitespace can be an unquoted identifier here, so Unicode
+        // `trim` would reject a legal boolean-column expression; `trim_ascii`
+        // keeps those but misses the vertical tab, which this engine does
+        // separate tokens with, and neither sees a comment (DECISIONS 504).
+        if crate::LEXICON.expression_in(&check.expression) == Expression::Absent {
             found.push(invalid(format!(
                 "check constraint `{name}` has an empty expression"
             )));
@@ -83,10 +86,13 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
                 )));
             }
         }
+        // The same question, and the same answer: measured, a partial index's
+        // `WHERE` refuses a comment-only or whitespace-only expression exactly
+        // as a check constraint does.
         if index
             .filter
             .as_ref()
-            .is_some_and(|f| f.trim_ascii().is_empty())
+            .is_some_and(|f| crate::LEXICON.expression_in(f) == Expression::Absent)
         {
             found.push(invalid(format!("{what} has an empty filter expression")));
         }

@@ -3875,34 +3875,57 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         );
         cases.push((format!("include {code:?}"), table, code));
     }
-    for filter in [false, true] {
-        let mut table = base();
-        if filter {
-            table.indexes.insert(
-                "ix".into(),
-                Index {
-                    columns: vec![IndexColumn {
-                        name: "a".into(),
-                        descending: false,
-                    }],
-                    include: vec![],
-                    unique: false,
-                    filter: Some(" \n ".into()),
-                },
-            );
-        } else {
-            table.checks.insert(
-                "ck".into(),
-                CheckConstraint {
-                    expression: " \n ".into(),
-                },
-            );
+    // Every shape of "there is no expression here", against the engine that
+    // decides it. The vertical tab is the one Rust's `trim_ascii` leaves out
+    // (#480) and the comment forms are layout without being whitespace bytes
+    // (#482); the engine answers `42601` to all of them, for a check
+    // constraint and a partial index's `WHERE` alike.
+    //
+    // Beside them the expressions that must survive: a literal is a whole
+    // expression, and `--` inside one is data. `22P02` is the engine judging
+    // a *value*, which is exactly the point — it parsed something.
+    for (expression, expected) in [
+        (" \n ", Some("42601")),
+        ("\u{b}", Some("42601")),
+        (" \t\u{b}\r\n", Some("42601")),
+        ("-- nothing\n", Some("42601")),
+        ("/* nothing */", Some("42601")),
+        ("/* a /* b */ c */", Some("42601")),
+        ("  /* a */ \t -- b\n", Some("42601")),
+        ("/* keep */ a IS NOT NULL", None),
+        ("a IS NOT NULL -- keep\n", None),
+        ("'true'", None),
+        ("'-- not a comment'", Some("22P02")),
+    ] {
+        for filter in [false, true] {
+            let mut table = base();
+            if filter {
+                table.indexes.insert(
+                    "ix".into(),
+                    Index {
+                        columns: vec![IndexColumn {
+                            name: "a".into(),
+                            descending: false,
+                        }],
+                        include: vec![],
+                        unique: false,
+                        filter: Some(expression.into()),
+                    },
+                );
+            } else {
+                table.checks.insert(
+                    "ck".into(),
+                    CheckConstraint {
+                        expression: expression.into(),
+                    },
+                );
+            }
+            cases.push((
+                format!("empty expression {expression:?} filter={filter}"),
+                table,
+                expected,
+            ));
         }
-        cases.push((
-            format!("empty expression filter={filter}"),
-            table,
-            Some("42601"),
-        ));
     }
     for count in [32, 33] {
         for kind in ["primary", "unique", "index", "include"] {
@@ -4022,7 +4045,11 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             // Operator classes and FK type compatibility belong to this
             // server, not to the offline declaration's structure. Stock json
             // is refused here; the custom-opclass test pins the legal case.
-            expected.is_none() || matches!(expected, Some("42704" | "42804" | "54011")),
+            // `22P02` joins them for the same reason one level down: an
+            // expression the engine parsed and then rejected as a *value* is
+            // one the offline validator has no business refusing — it is the
+            // proof that `'-- not a comment'` was read as data, not as layout.
+            expected.is_none() || matches!(expected, Some("22P02" | "42704" | "42804" | "54011")),
             "{label}: {problems:?}"
         );
         let statements = pg
