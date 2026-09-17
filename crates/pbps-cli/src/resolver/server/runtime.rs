@@ -11,6 +11,7 @@ use crate::resolver::native::{
     BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative, for_each_occupant,
     groups, mount_rows, private_network, process_scope, security,
 };
+use std::collections::BTreeSet;
 
 /// The processes the daemon's record names, before anything is measured of
 /// their runtime.
@@ -216,12 +217,27 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
 /// namespace. A container joined with `--network container:` would otherwise
 /// be invisible to every other check.
 fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Error> {
+    // The exception is each forwarder's own processes — its guard and the
+    // guard's descendants, which its session check holds to the fixed
+    // program at the fixed privileges — and not its PID namespace: a
+    // container joined to that namespace and to the engine's network is a
+    // sibling the descendant walk never qualifies (finding on #640).
+    let mut owned = Vec::new();
+    for forwarder in forwarders {
+        let scope: BTreeSet<u32> = process_scope(forwarder)
+            .map_err(Premise::Accounting.named())?
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        owned.push((*forwarder, scope));
+    }
     for_each_occupant(init, "net", |occupant| {
         if init.same_namespace(occupant, "pid")? {
             return Ok(());
         }
-        for forwarder in forwarders {
-            if forwarder.same_namespace(occupant, "pid")? {
+        let group = thread_group(occupant)?;
+        for (forwarder, scope) in &owned {
+            if forwarder.same_namespace(occupant, "pid")? && scope.contains(&group) {
                 return Ok(());
             }
         }
@@ -236,4 +252,17 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
         }
     })
     .map_err(Premise::Accounting.named())
+}
+
+/// The thread group an occupant task belongs to, as the kernel reports it.
+/// Occupants are enumerated by task, and a forwarder's `cat` is a process
+/// while a thread of it would carry the same descriptors.
+fn thread_group(occupant: &ProcessLease) -> Result<u32, UnqualifiedProcess> {
+    let status = occupant.read_proc("status", 65536)?;
+    let mut values = status.lines().filter_map(|line| line.strip_prefix("Tgid:"));
+    let value = values.next().ok_or(UnqualifiedProcess)?;
+    if values.next().is_some() {
+        return Err(UnqualifiedProcess);
+    }
+    value.trim().parse().map_err(|_| UnqualifiedProcess)
 }

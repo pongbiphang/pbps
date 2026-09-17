@@ -888,16 +888,28 @@ impl DedicatedServer {
             return Ok(());
         };
         let Some(names) = inner.control.pending.clone() else {
+            let unconfirmed = close_control(&mut inner.control).await;
             self.inner = None;
-            return Ok(());
+            return if unconfirmed.is_empty() {
+                Ok(())
+            } else {
+                Err(ServerFailure {
+                    cause: Error::Cleanup,
+                    recovery_names: unconfirmed,
+                })
+            };
         };
-        let removal = cleanup(&mut inner.control, &names, Error::Cleanup).await;
+        let mut removal = cleanup(&mut inner.control, &names, Error::Cleanup).await;
         if removal.recovery_names.is_empty() {
-            self.inner = None;
-            Ok(())
-        } else {
-            Err(removal)
+            let unconfirmed = close_control(&mut inner.control).await;
+            if unconfirmed.is_empty() {
+                self.inner = None;
+                return Ok(());
+            }
+            removal.cause = Error::Cleanup;
+            removal.recovery_names = unconfirmed;
         }
+        Err(removal)
     }
 }
 
@@ -967,6 +979,15 @@ impl ScratchRun {
         }
         let cause = self.inner.refusal.clone().unwrap_or(Error::Cleanup);
         let mut removal = cleanup(&mut self.inner.control, &self.names, cause).await;
+        if removal.recovery_names.is_empty() {
+            // The control session and its forwarder are this run's too, and
+            // a caller that keeps the run after closing it must not leave
+            // them on the server: the next admission would find the old
+            // control connection as a session it did not open and refuse a
+            // valid run (finding on #640). Success is reported only once
+            // their removal is confirmed as well.
+            recovery_names.extend(close_control(&mut self.inner.control).await);
+        }
         if removal.recovery_names.is_empty() && recovery_names.is_empty() {
             self.removed = true;
             return Ok(());
@@ -976,6 +997,27 @@ impl ScratchRun {
             removal.recovery_names.extend(recovery_names);
         }
         Err(removal)
+    }
+}
+
+/// Ends the control session, confirming the forwarder's removal, and names
+/// the forwarder container if that could not be confirmed. Idempotent: a
+/// control without a session has nothing left to close.
+async fn close_control(control: &mut Control) -> Vec<String> {
+    let Some(session) = control.session.take() else {
+        return Vec::new();
+    };
+    let Session {
+        connection,
+        forwarder,
+        ..
+    } = session;
+    let name = forwarder.resource_name().to_owned();
+    drop(connection);
+    if forwarder.close().await.is_err() {
+        vec![name]
+    } else {
+        Vec::new()
     }
 }
 
