@@ -165,3 +165,37 @@ fn an_unreadable_engine_answer_is_never_reported_as_a_moved_counter() {
         Signal::Unreadable
     );
 }
+
+#[test]
+fn a_forwarder_left_behind_is_named_without_replacing_the_reason() {
+    let names = generated_names().unwrap();
+    let reason = Error::Exclusivity(Signal::SessionList);
+    // The scratch objects were removed; one forwarder could not be confirmed.
+    let outcome = report(
+        removal_outcome(true, reason.clone(), &names),
+        vec!["pbps-resolver-a".into(), "pbps-resolver-a".into()],
+    );
+    assert!(matches!(
+        outcome.cause,
+        Error::Exclusivity(Signal::SessionList)
+    ));
+    assert_eq!(outcome.recovery_names, vec!["pbps-resolver-a".to_owned()]);
+    // The scratch objects were not removed: that, not the forwarder, is why the
+    // cause becomes `Cleanup`, and both kinds of name are reported once.
+    let outcome = report(
+        removal_outcome(false, reason, &names),
+        vec!["pbps-resolver-a".into(), names.login().to_owned()],
+    );
+    assert!(matches!(outcome.cause, Error::Cleanup));
+    assert_eq!(outcome.recovery_names.len(), 3);
+    assert!(
+        outcome
+            .recovery_names
+            .contains(&names.database().to_owned())
+    );
+    assert!(
+        outcome
+            .recovery_names
+            .contains(&"pbps-resolver-a".to_owned())
+    );
+}

@@ -180,9 +180,12 @@ fn anchors(init: &ProcessLease) -> Result<(), UnqualifiedProcess> {
 /// `noexec`, unlike the other private tmpfs the mount allowlist requires it
 /// of. What keeps a task from placing an executable there instead is that it
 /// is root-owned and writable by nobody else, and every task in the container
-/// is unprivileged (`occupants`). Measured in the container's own mount
-/// namespace, so the mount's host-side super-options and any user-namespace
-/// mapping do not confuse it (finding on #640).
+/// is unprivileged (`occupants`). `open_in_root` follows the container's
+/// mount namespace, but the owner is read as this process sees it, in the
+/// initial user namespace. That is the right view for the root-run
+/// containers this profile admits, where the runtime creates `/dev` as uid 0;
+/// a rootless container maps it to the invoking user and is not admittable
+/// anyway, since the executable and the daemon must be root-owned (#686).
 fn device_not_engine_writable(init: &ProcessLease) -> Result<(), UnqualifiedProcess> {
     use std::os::unix::fs::MetadataExt as _;
     let dev = init.open_in_root("dev")?;
@@ -249,13 +252,15 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     // would race a legitimate child (finding on #640, where matching each
     // task against a captured process tree refused the forwarder itself).
     //
-    // Membership in a forwarder's PID namespace is enough because that
-    // namespace holds nothing but the forwarder: joining it needs
-    // `--pid container:<name>`, and the name is a run-generated 256-bit
-    // token that exists only for this run. A foreign process joining the
-    // engine's network namespace directly is what this refuses, and is the
-    // reachable case. Tightening the exception to the forwarder's exact task
-    // set is #681.
+    // Membership in a forwarder's PID namespace is accepted because joining
+    // it needs `--pid container:<id>` on the same root daemon — and the id is
+    // listable through that socket, so the name's randomness is no defence.
+    // What excludes it is that root access to the daemon socket is
+    // provisioning-administrator access, the trust boundary this profile
+    // does not claim to hold against. A foreign process joining the engine's
+    // network namespace directly is what this refuses, and is the reachable
+    // case. Narrowing the exception to the forwarder's exact task set is
+    // #681.
     //
     // Censused capture-free, by PID-namespace identity: a forwarder shares
     // the engine's network namespace and reaps and respawns its `cat` pipes

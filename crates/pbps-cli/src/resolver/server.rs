@@ -117,7 +117,7 @@ impl std::fmt::Display for Premise {
             Self::Mounts => "the container's mount table is unreadable",
             Self::Device => "the container's /dev is not a root-owned tmpfs an unprivileged task cannot write to",
             Self::Occupants => "a task in the container's PID namespace is not at the profile's uid, group, privileges or cgroup",
-            Self::Accounting => "a process outside the container's PID namespace shares its network or mount namespace",
+            Self::Accounting => "a process outside the container's PID namespace shares its network, mount or IPC namespace",
         })
     }
 }
@@ -974,15 +974,16 @@ impl DedicatedServer {
                 })
             };
         };
-        let mut removal = cleanup(&mut inner.control, &names, Error::Cleanup).await;
+        let removal = cleanup(&mut inner.control, &names, Error::Cleanup).await;
+        // Unconditionally, as `close` does: when `remove` could not confirm
+        // the scratch objects gone, the control session and any retired
+        // forwarder are still this run's and must be closed and named, not
+        // left to a `Drop` that only requests removal (finding on #640).
+        let unconfirmed = close_control(&mut inner.control).await;
+        let removal = report(removal, unconfirmed);
         if removal.recovery_names.is_empty() {
-            let unconfirmed = close_control(&mut inner.control).await;
-            if unconfirmed.is_empty() {
-                self.inner = None;
-                return Ok(());
-            }
-            removal.cause = Error::Cleanup;
-            removal.recovery_names = unconfirmed;
+            self.inner = None;
+            return Ok(());
         }
         Err(removal)
     }
@@ -1054,19 +1055,18 @@ impl ScratchRun {
             self.inner.control.retire(scratch);
         }
         let cause = self.inner.refusal.clone().unwrap_or(Error::Cleanup);
-        let mut removal = cleanup(&mut self.inner.control, &self.names, cause).await;
+        let removal = cleanup(&mut self.inner.control, &self.names, cause).await;
         // The control session and every forwarder this run opened are its own
         // too, and a caller that keeps the run after closing it must not leave
         // them on the server: the next admission would find an old connection
         // as a session it did not open and refuse a valid run (finding on
         // #640). Success is reported only once their removal is confirmed.
         let forwarders = close_control(&mut self.inner.control).await;
-        removal.recovery_names.extend(forwarders);
+        let removal = report(removal, forwarders);
         if removal.recovery_names.is_empty() {
             self.removed = true;
             return Ok(());
         }
-        removal.cause = Error::Cleanup;
         Err(removal)
     }
 }
@@ -1106,17 +1106,17 @@ async fn cleanup(control: &mut Control, names: &ScratchNames, cause: Error) -> S
         // the only record of what is left.
         control.pending = None;
     }
-    let mut outcome = removal_outcome(removed, cause, names);
     // A janitor forwarder `remove` opened but could not confirm gone is a
     // run-owned container too: dropping the database and login through it does
-    // not make it cleanup-complete. Its name is drained from run-owned state
-    // into the failure so the caller reports it (finding on #640).
-    let unconfirmed = std::mem::take(&mut control.unconfirmed);
-    if !unconfirmed.is_empty() {
-        outcome.cause = Error::Cleanup;
-        outcome.recovery_names.extend(unconfirmed);
-    }
-    outcome
+    // not make it cleanup-complete. It is reported here so `create`'s failure
+    // exits name it, and *left* in run-owned state — cloned, not drained — so
+    // a retried `close` or `discard` names it again instead of finding an
+    // apparently clean run (finding on #640). `close_control` is what writes
+    // the set back after each attempt to close what it holds.
+    report(
+        removal_outcome(removed, cause, names),
+        control.unconfirmed.clone(),
+    )
 }
 
 async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
@@ -1196,6 +1196,20 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
 /// Why the run ended and whether its resources went away are two different
 /// facts. Reporting "could not create scratch resources" for a channel that
 /// failed qualification would hide which of them happened.
+/// Adds the forwarder names run-owned state still holds to what one exit
+/// found. The reason the run ended is kept: `Cleanup` is the cause only when
+/// the scratch database and login themselves could not be removed
+/// (`removal_outcome`), and a forwarder that could not be confirmed gone is
+/// named without replacing a refusal such as `Exclusivity` the caller must
+/// still see (finding on #640). Deduplicated because `cleanup` reports the
+/// retained names and `close_control` reports them again.
+fn report(mut outcome: ServerFailure, names: Vec<String>) -> ServerFailure {
+    outcome.recovery_names.extend(names);
+    outcome.recovery_names.sort_unstable();
+    outcome.recovery_names.dedup();
+    outcome
+}
+
 fn removal_outcome(removed: bool, cause: Error, names: &ScratchNames) -> ServerFailure {
     if removed {
         ServerFailure {

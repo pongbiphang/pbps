@@ -555,32 +555,34 @@ mod tests {
     /// (`0:67`), the directory masks are 4k read-only tmpfs, and the `/etc`
     /// files come from the daemon's directory on the root disk.
     const DOCKER: &str = "\
-484 455 0:51 / / ro,relatime - overlay overlay rw,lowerdir=/l/a,upperdir=/var/lib/docker/overlay2/b563/diff,workdir=/var/lib/docker/overlay2/b563/work
-486 484 0:66 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
-487 484 0:67 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
-488 487 0:68 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
-489 484 0:69 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro
-490 489 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw
-491 487 0:64 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
-492 487 0:70 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k,inode64
-493 484 0:71 / /tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,inode64
-494 484 259:1 /var/lib/docker/containers/c27c/resolv.conf /etc/resolv.conf ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30
-495 484 259:1 /var/lib/docker/containers/c27c/hostname /etc/hostname ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30
-496 484 259:1 /var/lib/docker/containers/c27c/hosts /etc/hosts ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30
-497 484 0:72 / /var/lib/postgresql rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k,mode=700,uid=999,gid=999,inode64
-456 486 0:66 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
-457 486 0:66 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
-458 486 0:66 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
-459 486 0:66 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
-460 486 0:66 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
-461 486 0:73 / /proc/acpi ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64
-462 486 0:67 /null /proc/interrupts rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
-463 486 0:67 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
-464 486 0:67 /null /proc/keys rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
-465 486 0:67 /null /proc/latency_stats rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
-466 486 0:67 /null /proc/timer_list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
-467 486 0:73 / /proc/scsi ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64
-468 489 0:73 / /sys/firmware ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64
+483 454 0:51 / / ro,relatime - overlay overlay rw,lowerdir=/l/a,upperdir=/var/lib/docker/overlay2/55e2/diff,workdir=/var/lib/docker/overlay2/55e2/work,nouserxattr
+485 483 0:66 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+486 483 0:67 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+487 486 0:68 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
+488 483 0:69 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro
+489 488 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw
+490 486 0:64 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
+491 486 0:70 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k,inode64
+492 483 0:71 / /tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,inode64
+493 483 0:72 / /run rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+494 483 0:73 / /var/tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,inode64
+495 483 8:1 /var/lib/docker/containers/6874f76da82245358ac0d96d215fb338e4082ceeac032b370a732a808db4cabc/resolv.conf /etc/resolv.conf ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30
+496 483 8:1 /var/lib/docker/containers/6874f76da82245358ac0d96d215fb338e4082ceeac032b370a732a808db4cabc/hostname /etc/hostname ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30
+497 483 8:1 /var/lib/docker/containers/6874f76da82245358ac0d96d215fb338e4082ceeac032b370a732a808db4cabc/hosts /etc/hosts ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30
+498 483 0:74 / /var/lib/postgresql rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k,mode=700,uid=999,gid=999,inode64
+455 485 0:66 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+456 485 0:66 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
+457 485 0:66 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
+458 485 0:66 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+459 485 0:66 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
+460 485 0:75 / /proc/acpi ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64
+461 485 0:67 /null /proc/interrupts rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+462 485 0:67 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+463 485 0:67 /null /proc/keys rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+464 485 0:67 /null /proc/latency_stats rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+465 485 0:67 /null /proc/timer_list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+466 485 0:75 / /proc/scsi ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64
+467 488 0:75 / /sys/firmware ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64
 ";
 
     fn rows(text: &str) -> Vec<MountEntry> {
@@ -648,12 +650,31 @@ mod tests {
         );
     }
 
+    /// The recipe forces `noexec` on every private writable tmpfs; a layout
+    /// that drops it on `/run` — Podman's default — is executable storage.
+    #[test]
+    fn a_private_tmpfs_without_noexec_is_refused() {
+        let exec_run = DOCKER.replace(
+            "493 483 0:72 / /run rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+            "493 483 0:72 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+        );
+        assert_ne!(
+            exec_run, DOCKER,
+            "the anchor row must exist in the pinned table"
+        );
+        assert!(
+            contained(&rows(&exec_run), postgres())
+                .unwrap_err()
+                .starts_with("/run ")
+        );
+    }
+
     #[test]
     fn the_storage_must_be_a_fresh_tmpfs_and_the_root_read_only() {
-        const STORAGE: &str = "497 484 0:72 / /var/lib/postgresql rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k,mode=700,uid=999,gid=999,inode64";
+        const STORAGE: &str = "498 483 0:74 / /var/lib/postgresql rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k,mode=700,uid=999,gid=999,inode64";
         let bound = DOCKER.replace(
             STORAGE,
-            "497 484 259:1 /var/lib/postgresql/18/main /var/lib/postgresql rw,relatime - ext4 /dev/root rw",
+            "498 483 259:1 /var/lib/postgresql/18/main /var/lib/postgresql rw,relatime - ext4 /dev/root rw",
         );
         assert!(
             contained(&rows(&bound), postgres())
@@ -662,7 +683,7 @@ mod tests {
         );
         let subtree = DOCKER.replace(
             STORAGE,
-            "497 484 0:72 /pgdata /var/lib/postgresql rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k",
+            "498 483 0:74 /pgdata /var/lib/postgresql rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k",
         );
         assert!(
             contained(&rows(&subtree), postgres())
@@ -670,8 +691,8 @@ mod tests {
                 .starts_with("/var/lib/postgresql")
         );
         let writable_root = DOCKER.replace(
-            "484 455 0:51 / / ro,relatime",
-            "484 455 0:51 / / rw,relatime",
+            "483 454 0:51 / / ro,relatime",
+            "483 454 0:51 / / rw,relatime",
         );
         assert_eq!(
             contained(&rows(&writable_root), postgres()).unwrap_err(),
@@ -684,8 +705,8 @@ mod tests {
         );
         // A masked /sys is not a real one: the anchor reads through it.
         let masked_sys = DOCKER.replace(
-            "489 484 0:69 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro",
-            "489 484 0:69 / /sys ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro",
+            "488 483 0:69 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro",
+            "488 483 0:69 / /sys ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro",
         );
         assert!(
             contained(&rows(&masked_sys), postgres())
@@ -698,8 +719,8 @@ mod tests {
     fn another_instance_of_a_pseudo_filesystem_is_refused() {
         // A host procfs at a read-only proc target carries a different device.
         let foreign = DOCKER.replace(
-            "459 486 0:66 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
-            "459 486 0:5 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+            "458 485 0:66 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+            "458 485 0:5 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
         );
         assert!(
             contained(&rows(&foreign), postgres())
@@ -708,8 +729,8 @@ mod tests {
         );
         // A runtime file bound from a pseudo-filesystem is not the runtime's file.
         let hosts = DOCKER.replace(
-            "496 484 259:1 /var/lib/docker/containers/c27c/hosts /etc/hosts ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30",
-            "496 484 0:66 /net/hosts /etc/hosts ro,relatime - proc proc rw",
+            "497 483 8:1 /var/lib/docker/containers/6874f76da82245358ac0d96d215fb338e4082ceeac032b370a732a808db4cabc/hosts /etc/hosts ro,relatime - ext4 /dev/root rw,discard,errors=remount-ro,commit=30",
+            "497 483 0:66 /net/hosts /etc/hosts ro,relatime - proc proc rw",
         );
         assert!(
             contained(&rows(&hosts), postgres())
