@@ -14654,6 +14654,166 @@ async fn narrowed_integer_key(from: &str, to: &str, overflow: i64) {
     conn.drop().await;
 }
 
+/// The same guard on the **parent** side of the key, which had no coverage at
+/// all: every narrowing fixture in this file narrows the *child*'s column
+/// (issue #435).
+///
+/// The two parent aliases are the row a delete targets (`p`) and every row
+/// that survives it (`q`), and both compare through a `CAST` the referenced
+/// column's own narrowing builds. Here that `CAST` is reached only through a
+/// `CASE` whose condition is the guard, because `AND NOT (<guard>)` beside it
+/// is a conjunct of the same `WHERE` clause and the engine orders those by
+/// cost — **measured on 18.6**, with the guard made the costlier of the two
+/// the plan came back reordered (`Filter: (((c)::integer = 7) AND (NOT
+/// pricey(c)))`) and raised `integer out of range` (DECISIONS 516).
+///
+/// What this test can hold on a live server is the other half: that the
+/// probes run, answer counts rather than raising, and answer the *same*
+/// counts with an overflowing row on either side of the delete.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
+    let mut conn = TestDb::create("pull_data_parentnarrowing").await;
+    let s = data_schema("parentnarrowing");
+    fresh(&mut conn, &s).await;
+    // `5000000000` cannot become an `integer`, and the parent's own key
+    // column is what this plan narrows.
+    conn.execute(&format!(
+        "CREATE TABLE {s}.parent (code numeric(20,0) PRIMARY KEY, label text);
+         CREATE TABLE {s}.child (code text PRIMARY KEY, parent numeric(20,0));
+         INSERT INTO {s}.parent VALUES (5000000000, 'Big'), (2, 'Keep'), (3, 'Removed');
+         INSERT INTO {s}.child VALUES ('c1', 3);"
+    ))
+    .await
+    .expect("the fixture");
+    let cast = conn
+        .execute("SELECT CAST(5000000000::numeric(20,0) AS integer)")
+        .await
+        .expect_err("the premise: this value cannot be cast to the narrower type");
+    assert_eq!(sqlstate(&cast), "22003", "{cast:?}");
+
+    let parent_name = TableName::new(&s, "parent");
+    let child_name = TableName::new(&s, "child");
+    let declared_parent = |rows: &[(&str, Row)]| {
+        let mut parent = Table::default();
+        parent
+            .columns
+            .insert("code".into(), Column::new(ty("integer")).not_null());
+        parent
+            .columns
+            .insert("label".into(), Column::new(ty("text")));
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".into()],
+        });
+        with_data(&mut parent, DataMode::Exact, rows);
+        parent
+    };
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    child
+        .columns
+        .insert("parent".into(), Column::new(ty("numeric(20,0)")));
+    child.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    // Declared and not in the database, so this plan adds it — which is what
+    // gives the key a probe of its own to carry the guard.
+    child.foreign_keys.insert(
+        "child_parent_fkey".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent_name.clone(),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let has_its_own_probe = "the key cannot be added once the row is gone";
+
+    // The overflowing row **survives**, so it is in the survivor scan `q`.
+    let keep = row(&[("label", Value::Text("Big".into()))]);
+    let mut declared = Schema::default();
+    declared.tables.insert(
+        parent_name.clone(),
+        declared_parent(&[
+            ("2", row(&[("label", Value::Text("Keep".into()))])),
+            ("5000000000", keep),
+        ]),
+    );
+    declared.tables.insert(child_name.clone(), child.clone());
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. })),
+        "the referenced column is what narrows: {cs:#?}"
+    );
+    let pg = Postgres::new();
+    let probes = pg.preflight(&cs).probes;
+    for alias in ["p", "q"] {
+        assert!(
+            probes
+                .iter()
+                .any(|p| p.description.contains(has_its_own_probe)
+                    && p.sql.contains(&format!(
+                        "CASE WHEN NOT (round(({alias}.\"code\")::numeric) > 2147483647 \
+                     OR round(({alias}.\"code\")::numeric) < -2147483648) \
+                     THEN CAST({alias}.\"code\" AS integer) END"
+                    ))),
+            "{alias}: the parent-side cast sits behind its guard: {probes:#?}"
+        );
+    }
+    let named = counts(&mut conn, &cs).await;
+    assert_eq!(
+        one(&named, has_its_own_probe),
+        1,
+        "the child really does reference the row this plan deletes: {named:#?}"
+    );
+    assert_eq!(
+        one(&named, "cannot become"),
+        1,
+        "and the overflowing survivor is named by the conversion probe, \
+         which is the check that refuses this plan: {named:#?}"
+    );
+
+    // And with the overflowing row **deleted** instead, so that it is the
+    // `p` a key probe asks about by primary key.
+    let mut declared = Schema::default();
+    declared.tables.insert(
+        parent_name,
+        declared_parent(&[("2", row(&[("label", Value::Text("Keep".into()))]))]),
+    );
+    declared.tables.insert(child_name, child);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let base = connected_base(&mut conn, &declared, &s).await;
+    let cs = plan(&base, &ids, &declared, &ids);
+    let named = counts(&mut conn, &cs).await;
+    let key_counts: Vec<i64> = named
+        .iter()
+        .filter(|(description, _)| description.contains(has_its_own_probe))
+        .map(|(_, count)| *count)
+        .collect();
+    assert_eq!(key_counts.len(), 2, "one key probe per deleted parent row");
+    assert_eq!(
+        key_counts.iter().sum::<i64>(),
+        1,
+        "the fitting orphan is still counted, and the overflowing row — \
+         whose own `p` the guard excludes — adds nothing: {named:#?}"
+    );
+    assert_eq!(one(&named, "cannot become"), 1, "{named:#?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.drop().await;
+}
+
 /// The regression a narrowing key's probe must not lose: a table whose rows
 /// all *fit* the narrower type still needs its orphan check to work, exactly
 /// as it did before this plan retyped anything.

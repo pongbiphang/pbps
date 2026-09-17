@@ -1894,17 +1894,42 @@ fn planned_key_probes(
                     let column = a.parent.column(r);
                     let quoted = quote(&stored_r.name)?;
                     let (p_raw, q_raw) = (format!("p.{quoted}"), format!("q.{quoted}"));
-                    // A narrowing here builds a plain `CAST`; a row it could
+                    // A narrowing here builds a `CAST`, and the row it would
                     // raise on is excluded below rather than compared, on
                     // whichever alias the row belongs to (DECISIONS 449).
-                    let (p, q) = (
-                        names.converted(&column, p_raw.clone()),
-                        names.converted(&column, q_raw.clone()),
+                    //
+                    // That exclusion is a conjunct of the same `WHERE` clause
+                    // as the `CAST` beside it, and a conjunct is not a
+                    // barrier: the engine orders the quals of one clause by
+                    // cost, so the cheaper `CAST` can be evaluated first and
+                    // raise on a row the guard was there to keep it away from.
+                    // **Measured on 18.6**, with the guard written first and
+                    // made the costlier of the two: `Filter: (((c)::integer =
+                    // 7) AND (NOT pricey(c)))` — reordered — and the query
+                    // raised `integer out of range`. So the `CAST` is reached
+                    // only through a `CASE` whose condition is the guard,
+                    // which is the documented way to force the order, and the
+                    // same query then answers rather than raising. The row
+                    // exclusion stays a separate term: a guarded row must be
+                    // *absent* from the comparison, not merely compare as
+                    // NULL, which is a value that already means something else
+                    // here (DECISIONS 516).
+                    let (guard_p, guard_q) = (
+                        names.raise_guard(&column, &p_raw),
+                        names.raise_guard(&column, &q_raw),
                     );
-                    if let Some(g) = names.raise_guard(&column, &p_raw) {
+                    let barrier = |guard: Option<&String>, cast: String| match guard {
+                        Some(g) => format!("CASE WHEN NOT ({g}) THEN {cast} END"),
+                        None => cast,
+                    };
+                    let (p, q) = (
+                        barrier(guard_p.as_ref(), names.converted(&column, p_raw.clone())),
+                        barrier(guard_q.as_ref(), names.converted(&column, q_raw.clone())),
+                    );
+                    if let Some(g) = guard_p {
                         parent_guards_p.push(g);
                     }
-                    if let Some(g) = names.raise_guard(&column, &q_raw) {
+                    if let Some(g) = guard_q {
                         parent_guards_q.push(g);
                     }
                     // A column this plan retypes carries its collation into
@@ -4103,6 +4128,121 @@ mod tests {
                     .all(|p| !p.description.contains("excludes a row")),
             "an unguarded probe's description carries no exclusion note: \
              {widened:#?}"
+        );
+    }
+
+    /// The guard on the **parent** side of the key is reached before the
+    /// `CAST` it protects, because it is the condition of the `CASE` the
+    /// `CAST` sits in — not merely a conjunct written beside it (issue #435).
+    ///
+    /// `AND NOT (<guard>)` and `CAST(p.<column> AS …)` are two quals of one
+    /// `WHERE` clause, and the engine orders those by cost. **Measured on
+    /// 18.6**, with the guard written first and made the costlier of the two,
+    /// the plan came back as `Filter: (((c)::integer = 7) AND (NOT
+    /// pricey(c)))` — reordered — and the query raised `integer out of
+    /// range`; through the `CASE` the same query answers. This repo has been
+    /// bitten by the same class before, where a cast was folded to planning
+    /// time ahead of its `pg_input_is_valid` guard and needed an `OFFSET 0`
+    /// fence (DECISIONS 324).
+    ///
+    /// The exclusion stays beside it: a guarded row must be absent from the
+    /// comparison, not merely compare as `NULL` (DECISIONS 449, 516).
+    #[test]
+    fn a_narrowed_parent_column_is_cast_only_inside_the_guard_that_protects_it() {
+        let child: TableName = "app.child".parse().expect("a table name");
+        let parent: TableName = "app.status".parse().expect("a table name");
+        let key = pbps_model::ForeignKey {
+            columns: vec!["status".to_owned()],
+            references_table: parent.clone(),
+            references_columns: vec!["code".to_owned()],
+            on_delete: pbps_model::ReferentialAction::NoAction,
+            on_update: pbps_model::ReferentialAction::NoAction,
+        };
+        // The referenced column narrows, which is the case the child-side
+        // test above does not reach: the guard then lands on `p` and `q`.
+        let narrowed = probes(&set(vec![
+            Change::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: parent.column("code"),
+                from: "bigint".parse().expect("a type"),
+                to: "integer".parse().expect("a type"),
+                from_nullable: true,
+                to_nullable: true,
+            },
+            Change::AddForeignKey {
+                table: child.clone(),
+                name: "child_status_fkey".to_owned(),
+                constraint: Box::new(key),
+            },
+            deleting("app.status", "old"),
+        ]));
+        let guard = |alias: &str| {
+            format!("{alias}.\"code\" > 2147483647 OR {alias}.\"code\" < -2147483648")
+        };
+        // This key's own count, and only it. The orphan probe beside it casts
+        // the same column in a subquery's target list behind an `OFFSET 0`
+        // fence, which is the other answer to the same hazard and the one
+        // DECISIONS 324 already records.
+        let own: Vec<&Probe> = narrowed
+            .iter()
+            .filter(|p| {
+                p.description
+                    .contains("the key cannot be added once the row is gone")
+            })
+            .collect();
+        assert!(!own.is_empty(), "{narrowed:#?}");
+        for alias in ["p", "q"] {
+            let cast = format!("CAST({alias}.\"code\" AS integer)");
+            assert!(
+                own.iter().any(|p| p
+                    .sql
+                    .contains(&format!("CASE WHEN NOT ({}) THEN {cast} END", guard(alias)))),
+                "{alias}: the cast is reached only through the guard: {own:#?}"
+            );
+            // And nowhere else. A second, unguarded spelling would be the
+            // whole defect wearing a barrier somewhere else in the query.
+            for probe in &own {
+                for (at, _) in probe.sql.match_indices(&cast) {
+                    assert!(
+                        probe.sql[..at].ends_with("THEN "),
+                        "{alias}: an unguarded cast at {at}: {}",
+                        probe.sql
+                    );
+                }
+            }
+            // The row exclusion is still its own term: excluded, not NULL.
+            assert!(
+                own.iter()
+                    .any(|p| p.sql.contains(&format!("AND NOT ({})", guard(alias)))),
+                "{alias}: the exclusion must remain: {own:#?}"
+            );
+        }
+        // The negative: a column this plan *widens* carries no guard, so it
+        // carries no `CASE` either — the barrier appears where the raise can.
+        let widened = probes(&set(vec![
+            Change::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: parent.column("code"),
+                from: "integer".parse().expect("a type"),
+                to: "bigint".parse().expect("a type"),
+                from_nullable: true,
+                to_nullable: true,
+            },
+            deleting("app.status", "old"),
+        ]));
+        assert!(
+            widened
+                .iter()
+                .all(|p| !p.sql.contains("CASE WHEN NOT (p.\"code\"")),
+            "a widening has nothing to guard against: {widened:#?}"
+        );
+        // And the fenced neighbour is left as it was: this change is about
+        // the one shape that had no barrier at all.
+        assert!(
+            narrowed.iter().any(
+                |p| p.sql.contains("OFFSET 0") && p.sql.contains("CAST(p.\"code\" AS integer)")
+            ),
+            "the orphan probe keeps its own fence: {narrowed:#?}"
         );
     }
 
