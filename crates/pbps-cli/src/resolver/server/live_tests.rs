@@ -714,6 +714,18 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     if driver() != Driver::Postgres {
         return; // SQL Server scope qualification is #611.
     }
+    // A write-path extra outside `schemas`: its authorization is part of the
+    // scope (SPEC §7.3), so verification must cover it too, or a faithful
+    // reproduction is refused as missing the schema (finding on #688).
+    let mut setup =
+        PeerVerifiedConn::connect(driver(), &std::env::var("PBPS_NATIVE_CONNECTION").unwrap())
+            .await
+            .unwrap();
+    setup
+        .query("DROP SCHEMA IF EXISTS pbps_extra_688")
+        .await
+        .unwrap();
+    setup.query("CREATE SCHEMA pbps_extra_688").await.unwrap();
     let mut target = native_target().await;
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     let mut run = server
@@ -723,7 +735,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
 
     let request = crate::resolver::server::ScopeRequest {
         schemas: vec!["public".to_owned()],
-        write_path_extras: Vec::new(),
+        write_path_extras: vec!["pbps_extra_688".to_owned()],
         planned: Vec::new(),
     };
     let verdict = run
@@ -749,4 +761,5 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     run.close()
         .await
         .expect("cleanup confirms the run-local roles gone");
+    setup.query("DROP SCHEMA pbps_extra_688").await.unwrap();
 }

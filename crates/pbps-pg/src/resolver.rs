@@ -4,12 +4,12 @@ pub mod authorization;
 pub mod compatibility;
 pub mod environment;
 
-use pbps_db::resolver::environment::{DatabaseRecipe, LocaleProvider};
+use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, LocaleProvider};
 use pbps_db::resolver::{
     Candidate, Discovery, Extension, Observation, OwnSession, ScratchNames, SessionCounter,
     SessionInventory,
 };
-use pbps_db::transport::StreamConn;
+use pbps_db::transport::{QueryConnection, StreamConn};
 use pbps_db::{Conn, DbError};
 
 /// The cluster identifier is observed alongside, never instead of, qualified
@@ -217,6 +217,42 @@ FROM pg_catalog.pg_stat_activity a",
         clients,
         counter,
     })
+}
+
+/// Both target-side reads of an analysis scope in one `REPEATABLE READ READ
+/// ONLY` snapshot: the catalog facts and the deployer's authorization are
+/// sealed and compared together, so they must describe one catalog state. As
+/// two autocommit sequences, an extension or a grant committed between them
+/// would seal half of a change as the whole target (finding on #688).
+///
+/// Authorization is read first: the visibility read sets a transaction-local
+/// `search_path` per write path, and inside one transaction that setting now
+/// outlives its statement. The transaction ends either way, so a failed read
+/// cannot leave the planning connection inside a block that the next check
+/// would trip over.
+pub async fn scope_facts(
+    conn: &mut impl QueryConnection,
+    scope: &environment::Scope<'_>,
+    authorization_schemas: &[String],
+) -> Result<(CatalogFacts, authorization::AuthorizationContext), DbError> {
+    conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
+    let outcome = async {
+        let authorization = authorization::read(conn, authorization_schemas).await?;
+        let catalog = environment::read(conn, scope).await?;
+        Ok::<_, DbError>((catalog, authorization))
+    }
+    .await;
+    let ended = conn
+        .query(if outcome.is_ok() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        })
+        .await;
+    let facts = outcome?;
+    ended?;
+    Ok(facts)
 }
 
 /// Creates only this run's own resources. `CREATE DATABASE` cannot run inside

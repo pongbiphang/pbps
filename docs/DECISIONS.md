@@ -13956,6 +13956,10 @@ SPEC is in sync with all of these.
      and memberships, reachable only under an explicit `SET ROLE`. Compilation
      as the setup administrator fails the negative control. The reproduction is
      verified by re-reading it as the mapped deployer; anything unreproduced is
-     a mismatch. The scope is sealed to the target and scratch connections, so
-     a reopened session cannot inherit it, and requalified on every check so an
-     in-place change invalidates the run. SQL Server is the twin step #611.
+     a mismatch, and the plan's own preceding grants run on scratch as that
+     deployer, so a grant it could not make on the target does not take there
+     either. The target's facts and authorization are read in one catalog
+     snapshot, so the sealed scope never holds half of a change committed
+     between them. The scope is sealed to the target and scratch connections,
+     so a reopened session cannot inherit it, and requalified on every check so
+     an in-place change invalidates the run. SQL Server is the twin step #611.

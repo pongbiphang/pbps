@@ -188,37 +188,31 @@ impl NativeTarget {
             .map_err(|error| EnvironmentError::Catalog(pbps_db::DbError::BadRow(error.to_string())))
     }
 
-    /// The deployer's authorization context for the in-scope schemas, read as
-    /// the target's own principal and bracketed by the binding check.
-    pub async fn authorization(
-        &mut self,
-        schemas: &[String],
-    ) -> Result<AuthorizationContext, EnvironmentError> {
-        self.check().await.map_err(|_| EnvironmentError::Binding)?;
-        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
-        let context = engine::authorization(&mut bound.connection, schemas)
-            .await
-            .map_err(EnvironmentError::Catalog)?;
-        self.check().await.map_err(|_| EnvironmentError::Binding)?;
-        Ok(context)
-    }
-
-    /// The analysis-scope facts of the target as its own deployer sees them:
-    /// the catalog facts read over the connection, and the content of the
-    /// engine executable and the native libraries its extensions name, read
-    /// from the running postmaster by the native observer. Bracketed by the
+    /// The analysis-scope facts of the target as its own deployer sees them,
+    /// and that deployer's authorization context over `authorization_schemas`:
+    /// both read over the connection in one catalog snapshot, so the sealed
+    /// scope never holds half of a change committed between them (finding on
+    /// #688). The content of the engine executable and the native libraries
+    /// its extensions name is read from the connected backend by the native
+    /// observer — kernel state, outside any snapshot. Bracketed by the
     /// ordinary binding check, so a facts read is of the same qualified
     /// backend as everything else (ADR-0016 §5, §23; SPEC §9.3.3).
-    pub async fn environment(
+    pub async fn scope_facts(
         &mut self,
         schemas: &[String],
         write_path_extras: &[String],
-    ) -> Result<EnvironmentFacts, EnvironmentError> {
+        authorization_schemas: &[String],
+    ) -> Result<(EnvironmentFacts, AuthorizationContext), EnvironmentError> {
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
-        let catalog = engine::environment(&mut bound.connection, schemas, write_path_extras)
-            .await
-            .map_err(EnvironmentError::Catalog)?;
+        let (catalog, authorization) = engine::scope_facts(
+            &mut bound.connection,
+            schemas,
+            write_path_extras,
+            authorization_schemas,
+        )
+        .await
+        .map_err(EnvironmentError::Catalog)?;
         let required = executables::required_libraries(&catalog);
         let library_path = catalog
             .settings
@@ -231,10 +225,13 @@ impl NativeTarget {
         let set = executables::executables(bound.lease.owner(), &required, &library_path)
             .map_err(|_| EnvironmentError::Executables)?;
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
-        Ok(EnvironmentFacts {
-            catalog,
-            executables: set,
-        })
+        Ok((
+            EnvironmentFacts {
+                catalog,
+                executables: set,
+            },
+            authorization,
+        ))
     }
 
     pub async fn check(&mut self) -> Result<(), UnqualifiedProcess> {

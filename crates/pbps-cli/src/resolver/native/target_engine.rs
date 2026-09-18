@@ -45,17 +45,26 @@ pub(super) async fn environment(
     }
 }
 
-/// Reads the deployment authorization context for the in-scope schemas as the
-/// connection's own principal. PostgreSQL is #610; SQL Server is #611 and
-/// refuses by name.
-pub(super) async fn authorization(
+/// Reads the analysis-scope catalog facts and the deployment authorization
+/// context for `authorization_schemas` together, in one catalog snapshot, as
+/// the connection's own principal (finding on #688). PostgreSQL is #610; SQL
+/// Server is #611 and refuses by name.
+pub(super) async fn scope_facts(
     connection: &mut PeerVerifiedConn,
     schemas: &[String],
-) -> Result<AuthorizationContext, DbError> {
+    extras: &[String],
+    authorization_schemas: &[String],
+) -> Result<(CatalogFacts, AuthorizationContext), DbError> {
     match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::authorization::read(connection, schemas).await,
+        Driver::Postgres => {
+            let scope = pbps_pg::resolver::environment::Scope {
+                schemas,
+                write_path_extras: extras,
+            };
+            pbps_pg::resolver::scope_facts(connection, &scope, authorization_schemas).await
+        }
         Driver::Mssql => Err(DbError::BadRow(
-            "SQL Server deployment-authorization qualification is not implemented (#611)".into(),
+            "SQL Server analysis-scope qualification is not implemented (#611)".into(),
         )),
     }
 }

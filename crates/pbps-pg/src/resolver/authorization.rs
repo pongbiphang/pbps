@@ -169,7 +169,8 @@ async fn schema_acl(
         .query(&format!(
             "SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' \
                          ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
-                    a.privilege_type AS privilege \
+                    a.privilege_type AS privilege, \
+                    a.is_grantable::text AS grantable \
              FROM pg_catalog.pg_namespace n \
              CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS a \
              WHERE n.nspname = {} ORDER BY 1, 2",
@@ -178,9 +179,17 @@ async fn schema_acl(
         .await?;
     let mut acl: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for row in &rows {
+        // Grant option is kept, encoded as a trailing `*`, so a grantee that
+        // may re-grant is distinguished from one that may not (finding on
+        // #688); reconstruction restores it and a planned grant the deployer
+        // lacks the option for then fails as apply would.
+        let mut privilege = required(row, "privilege", "a privilege type")?;
+        if flag(row, "grantable")? {
+            privilege.push('*');
+        }
         acl.entry(required(row, "grantee", "a grantee")?)
             .or_default()
-            .push(required(row, "privilege", "a privilege type")?);
+            .push(privilege);
     }
     Ok(acl)
 }
@@ -256,7 +265,8 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
                     e.entry AS entry \
              FROM pg_catalog.pg_db_role_setting s \
              CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS e(entry) \
-             WHERE (s.setrole = 0 OR s.setrole = current_user::regrole) \
+             WHERE (s.setrole = 0 OR s.setrole = current_user::regrole \
+                    OR s.setrole = session_user::regrole) \
                AND (s.setdatabase = 0 OR s.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()))",
         )
         .await?;
@@ -483,14 +493,38 @@ pub async fn reconstruct(
             } else {
                 quote_ident(&target)
             };
-            admin
-                .query(&format!(
-                    "GRANT {} ON SCHEMA {} TO {}",
-                    privileges.join(", "),
-                    quote_ident(name),
-                    recipient,
-                ))
-                .await?;
+            // A `*`-marked privilege was granted WITH GRANT OPTION; restore it
+            // so the mapped deployer can perform a planned re-grant.
+            let plain: Vec<&str> = privileges
+                .iter()
+                .filter(|p| !p.ends_with('*'))
+                .map(String::as_str)
+                .collect();
+            let grantable: Vec<String> = privileges
+                .iter()
+                .filter(|p| p.ends_with('*'))
+                .map(|p| p.trim_end_matches('*').to_owned())
+                .collect();
+            if !plain.is_empty() {
+                admin
+                    .query(&format!(
+                        "GRANT {} ON SCHEMA {} TO {}",
+                        plain.join(", "),
+                        quote_ident(name),
+                        recipient,
+                    ))
+                    .await?;
+            }
+            if !grantable.is_empty() {
+                admin
+                    .query(&format!(
+                        "GRANT {} ON SCHEMA {} TO {} WITH GRANT OPTION",
+                        grantable.join(", "),
+                        quote_ident(name),
+                        recipient,
+                    ))
+                    .await?;
+            }
         }
     }
     // Settings: role-, database- and database-role-scoped, on the mapped
@@ -553,6 +587,26 @@ pub async fn reconstruct(
 pub async fn apply_planned(
     admin: &mut impl QueryConnection,
     map: &RoleMap,
+    deployer: &str,
+    grants: &[PlannedGrant],
+) -> Result<(), DbError> {
+    if grants.is_empty() {
+        return Ok(());
+    }
+    // Run the plan's grants as the mapped deployer, not the reconstruction
+    // administrator: a grant the deployer lacks ownership or grant option for
+    // must fail here exactly as it would at apply (finding on #688).
+    admin
+        .query(&format!("SET ROLE {}", quote_ident(deployer)))
+        .await?;
+    let outcome = apply_planned_grants(admin, map, grants).await;
+    admin.query("RESET ROLE").await?;
+    outcome
+}
+
+async fn apply_planned_grants(
+    admin: &mut impl QueryConnection,
+    map: &RoleMap,
     grants: &[PlannedGrant],
 ) -> Result<(), DbError> {
     for grant in grants {
@@ -602,9 +656,20 @@ pub fn with_planned(
             continue;
         };
         let entry = schema.acl.entry(grant.role.clone()).or_default();
-        entry.retain(|p| p != &grant.privilege);
+        // The ACL spells a grantable privilege `X*` (see `schema_acl`). A
+        // revoke of X takes the option with it, and a plain grant of X to a
+        // holder of `X*` changes nothing on the engine, so the starred entry
+        // stays; comparing the bare privilege name here is what keeps an
+        // expected context comparable to the read-back one.
+        let starred = format!("{}*", grant.privilege);
+        let had_option = entry.iter().any(|p| p == &starred);
+        entry.retain(|p| privilege_name(p) != grant.privilege);
         if !grant.revoke {
-            entry.push(grant.privilege.clone());
+            entry.push(if had_option {
+                starred
+            } else {
+                grant.privilege.clone()
+            });
             entry.sort();
         }
         if entry.is_empty() {
@@ -635,15 +700,19 @@ fn recompute_schema_effective(context: &mut AuthorizationContext) {
     for schema in context.schemas.values_mut() {
         let owns = schema.owner == deployer || inherited.contains(&schema.owner);
         for privilege in ["USAGE", "CREATE"] {
-            let granted = schema
-                .acl
-                .iter()
-                .any(|(grantee, privs)| holders(grantee) && privs.iter().any(|p| p == privilege));
+            let granted = schema.acl.iter().any(|(grantee, privs)| {
+                holders(grantee) && privs.iter().any(|p| privilege_name(p) == privilege)
+            });
             schema
                 .privileges
                 .insert(privilege.to_owned(), owns || granted);
         }
     }
+}
+
+/// The privilege an ACL entry names, with the grant-option marker off.
+fn privilege_name(entry: &str) -> &str {
+    entry.strip_suffix('*').unwrap_or(entry)
 }
 
 /// Reads the reconstructed context as the mapped deployer and names every
@@ -794,6 +863,41 @@ mod tests {
             .into_iter()
             .collect(),
         }
+    }
+
+    /// The ACL spells a grantable privilege `X*`. The recomputed standing
+    /// still reads it as X; a plain grant of X to its holder changes nothing,
+    /// as the engine's ACL keeps the starred entry (measured on 18); and a
+    /// revoke of X takes the option with it. Read as a different privilege,
+    /// a deployer whose only route to a schema is its own grant option would
+    /// be expected not to see it, and a faithful reproduction refused.
+    #[test]
+    fn a_grant_option_entry_is_still_the_privilege_it_names() {
+        let mut base = context();
+        base.schemas.get_mut("app").unwrap().acl = [("dep".to_owned(), vec!["USAGE*".to_owned()])]
+            .into_iter()
+            .collect();
+        base.roles.clear();
+        let grant = |revoke| PlannedGrant {
+            role: "dep".into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke,
+        };
+        let same = with_planned(base.clone(), &[]);
+        assert!(
+            same.schemas["app"].privileges["USAGE"],
+            "a starred entry lost its privilege"
+        );
+        let regranted = with_planned(base.clone(), &[grant(false)]);
+        assert_eq!(
+            regranted.schemas["app"].acl["dep"],
+            vec!["USAGE*".to_owned()]
+        );
+        assert!(regranted.schemas["app"].privileges["USAGE"]);
+        let revoked = with_planned(base, &[grant(true)]);
+        assert!(!revoked.schemas["app"].acl.contains_key("dep"));
+        assert!(!revoked.schemas["app"].privileges["USAGE"]);
     }
 
     #[test]

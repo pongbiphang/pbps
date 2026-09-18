@@ -488,6 +488,59 @@ mod scope610 {
             .await
             .unwrap();
     }
+
+    /// #688: the two target-side reads share one snapshot, and the
+    /// transaction that gives them it ends with the call — after a completed
+    /// read and after a refused one alike — so the planning connection is
+    /// never left inside a block for the next read to trip over.
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn scope_facts_end_their_snapshot_whether_the_read_completes_or_is_refused() {
+        use pbps_pg::resolver::scope_facts;
+        async fn isolation(conn: &mut Conn) -> String {
+            conn.query("SELECT pg_catalog.current_setting('transaction_isolation') AS level")
+                .await
+                .unwrap()[0]
+                .try_get::<&str>("level")
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        }
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let mut conn = connect(&server).await;
+        // Outside any transaction the probe answers the session default; a
+        // read's own snapshot, still open, would answer `repeatable read`.
+        let outside = isolation(&mut conn).await;
+        assert_ne!(outside, "repeatable read");
+        let schemas = ["public".to_owned()];
+        let scope = Scope {
+            schemas: &schemas,
+            write_path_extras: &[],
+        };
+        let (catalog, authorization) = scope_facts(&mut conn, &scope, &schemas).await.unwrap();
+        assert!(catalog.visibility.contains_key("public"));
+        assert!(authorization.schemas.contains_key("public"));
+        assert_eq!(
+            isolation(&mut conn).await,
+            outside,
+            "the snapshot outlived a completed read"
+        );
+        // A schema the principal cannot see refuses the read part-way; the
+        // transaction still ends, so the next read on this connection is its
+        // own snapshot and not a statement inside the refused one.
+        let unseen = ["pbps_no_such_schema_688".to_owned()];
+        scope_facts(&mut conn, &scope, &unseen)
+            .await
+            .expect_err("an unseen schema refuses the read");
+        assert_eq!(
+            isolation(&mut conn).await,
+            outside,
+            "the snapshot outlived a refused read"
+        );
+        scope_facts(&mut conn, &scope, &schemas)
+            .await
+            .expect("the connection reads again after a refusal");
+    }
 }
 
 mod auth610 {
@@ -663,7 +716,7 @@ mod auth610 {
 mod recon610 {
     use super::*;
     use pbps_pg::resolver::authorization::{
-        PlannedGrant, RoleMap, apply_planned, read, reconstruct, verify,
+        PlannedGrant, RoleMap, apply_planned, read, reconstruct, verify, with_planned,
     };
 
     #[tokio::test]
@@ -673,9 +726,11 @@ mod recon610 {
         let pid = std::process::id();
         let target_db = format!("pbps_recon_t_{pid}");
         let scratch_db = format!("pbps_recon_s_{pid}");
-        let dep = format!("pbps_dep_{pid}");
-        let owner = format!("pbps_owner_{pid}");
-        let reader = format!("pbps_reader_{pid}");
+        // Distinct from auth610's role names: the suites share one process and
+        // its pid, and two tests creating the same role race on "already exists".
+        let dep = format!("pbps_rdep_{pid}");
+        let owner = format!("pbps_rowner_{pid}");
+        let reader = format!("pbps_rreader_{pid}");
         let run_login = format!("pbps_run_{pid}");
         let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
         for db in [&target_db, &scratch_db] {
@@ -804,26 +859,60 @@ mod recon610 {
             "{admin_differences:?}"
         );
 
-        // A planned CREATE grant makes the deployer able to create in `app`;
-        // the reproduced effective answer flips, and matches a target that
-        // has it.
+        // The plan's grants run as the reproduced deployer, not the
+        // administrator (finding on #688). One the deployer holds the grant
+        // option for — USAGE on `secret`, granted to it WITH GRANT OPTION —
+        // reaches `reader`, and the reproduction matches what the plan is
+        // meant to leave behind, the deployer's own starred entry included.
+        let deployer_role = map.deployer(&target).unwrap();
+        let usable = [PlannedGrant {
+            role: reader.clone(),
+            schema: "secret".into(),
+            privilege: "USAGE".into(),
+            revoke: false,
+        }];
+        apply_planned(&mut scratch_admin, &map, &deployer_role, &usable)
+            .await
+            .unwrap();
+        let expected = with_planned(target.clone(), &usable);
+        assert!(expected.schemas["secret"].privileges["USAGE"]);
+        let differences = verify(&mut run, &map, &expected, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "an authorized planned grant did not reproduce: {differences:?}"
+        );
+        // One the deployer cannot make — CREATE on `app`, which it neither
+        // owns nor holds the grant option for — is not an error on the
+        // engine: holding some privilege on the schema, the grant is a
+        // warning and a no-op. The reproduction then lacks what the plan
+        // assumed, and verification refuses it, where the administrator
+        // running the grant would have made it quietly succeed.
         assert!(!target.schemas["app"].privileges["CREATE"]);
-        apply_planned(
-            &mut scratch_admin,
+        let unusable = [PlannedGrant {
+            role: reader.clone(),
+            schema: "app".into(),
+            privilege: "CREATE".into(),
+            revoke: false,
+        }];
+        apply_planned(&mut scratch_admin, &map, &deployer_role, &unusable)
+            .await
+            .unwrap();
+        let after = read(&mut run, &schemas).await.unwrap();
+        assert!(
+            !after.schemas["app"].privileges["CREATE"],
+            "a grant the deployer cannot make took effect"
+        );
+        let refused = verify(
+            &mut run,
             &map,
-            &[PlannedGrant {
-                role: reader.clone(),
-                schema: "app".into(),
-                privilege: "CREATE".into(),
-                revoke: false,
-            }],
+            &with_planned(target.clone(), &unusable),
+            &schemas,
         )
         .await
         .unwrap();
-        let after = read(&mut run, &schemas).await.unwrap();
         assert!(
-            after.schemas["app"].privileges["CREATE"],
-            "planned grant did not flip CREATE"
+            refused.contains(&"schema:app:acl".to_owned()),
+            "{refused:?}"
         );
 
         drop(planning);
@@ -853,7 +942,7 @@ mod recon610_public {
 
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-    async fn scratch_reuses_public_and_reproduces_planned_grants() {
+    async fn scratch_reuses_public_and_refuses_a_planned_grant_the_deployer_cannot_make() {
         let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
         let pid = std::process::id();
         let target_db = format!("pbps_pub_t_{pid}");
@@ -928,9 +1017,12 @@ mod recon610_public {
             "public schema not reproduced"
         );
 
-        // A planned CREATE grant to the deployer: the expected post-plan
-        // context has CREATE, scratch runs the grant, and verifying against
-        // the expected context (not the pre-plan one) holds.
+        // A planned CREATE grant the deployer cannot make: it neither owns
+        // `public` nor holds the grant option, so run as the reproduced
+        // deployer (finding on #688) the grant is a warning and a no-op on
+        // the engine, not the administrator's silent success. The expected
+        // post-plan context has CREATE, the reproduction does not, and
+        // verifying against the expectation refuses it.
         let planned = [PlannedGrant {
             role: dep.clone(),
             schema: "public".into(),
@@ -939,23 +1031,18 @@ mod recon610_public {
         }];
         let expected = with_planned(target.clone(), &planned);
         assert!(expected.schemas["public"].privileges["CREATE"]);
-        // Verifying the pre-plan reproduction against the post-plan expectation
-        // must differ until the grant is applied.
-        assert!(
-            !verify(&mut run, &map, &expected, &schemas)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        apply_planned(&mut scratch_admin, &map, &planned)
+        apply_planned(&mut scratch_admin, &map, &deployer_role, &planned)
             .await
             .unwrap();
+        let after = read(&mut run, &schemas).await.unwrap();
         assert!(
-            verify(&mut run, &map, &expected, &schemas)
-                .await
-                .unwrap()
-                .is_empty(),
-            "planned grant not reproduced against the expected context"
+            !after.schemas["public"].privileges["CREATE"],
+            "a grant the deployer cannot make took effect"
+        );
+        let refused = verify(&mut run, &map, &expected, &schemas).await.unwrap();
+        assert!(
+            refused.contains(&"schema:public:acl".to_owned()),
+            "{refused:?}"
         );
 
         drop(planning);

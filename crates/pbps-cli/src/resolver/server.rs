@@ -1118,11 +1118,10 @@ impl ScratchRun {
                 scope_schemas.push(extra.clone());
             }
         }
-        let mut target_facts = target
-            .environment(&request.schemas, &request.write_path_extras)
+        let (mut target_facts, target_auth) = target
+            .scope_facts(&request.schemas, &request.write_path_extras, &scope_schemas)
             .await
             .map_err(read)?;
-        let target_auth = target.authorization(&scope_schemas).await.map_err(read)?;
         let target_connection = target
             .connection_id()
             .map_err(|_| Error::Scope("the target binding is unreadable".into()))?;
@@ -1133,6 +1132,12 @@ impl ScratchRun {
         let token = login[login.len().saturating_sub(16)..].to_owned();
         let map = RoleMap::generate(&target_auth, &request.planned, &login, &token);
         self.inner.control.roles = map.run_local_names();
+        // The mapped deployer runs the plan's grants on scratch and is the
+        // role every scratch read below runs as; its name follows from the
+        // principal alone, which the planned grants do not change.
+        let deployer = map
+            .deployer(&target_auth)
+            .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
         // Reconstruction's schema and grant DDL is database-local, so it must
         // run *in* the scratch database — the control session is on the
         // maintenance database and its `CREATE SCHEMA`/`GRANT ON SCHEMA` would
@@ -1172,9 +1177,14 @@ impl ScratchRun {
             )
             .await
             .map_err(db)?;
-            authorization::apply_planned(&mut reconstruction.connection, &map, &request.planned)
-                .await
-                .map_err(db)
+            authorization::apply_planned(
+                &mut reconstruction.connection,
+                &map,
+                &deployer,
+                &request.planned,
+            )
+            .await
+            .map_err(db)
         }
         .await;
         // The admin session is done either way; retire it so cleanup closes
@@ -1226,9 +1236,6 @@ impl ScratchRun {
         // (finding on #688).
         target_facts.catalog.visibility =
             expected_visibility(&expected_auth, &request.schemas, &request.write_path_extras);
-        let deployer = map
-            .deployer(&expected_auth)
-            .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
         // The libraries to look for on scratch are the target's, not the fresh
         // scratch catalog's, which has no extensions installed yet.
         let required =
@@ -1251,11 +1258,15 @@ impl ScratchRun {
             let catalog = pg_environment::read(&mut scratch.connection, &scope)
                 .await
                 .map_err(db)?;
+            // Over the full scope, extras included: the expected context
+            // covers every schema reconstruction created, and a read of the
+            // in-scope schemas alone would report the extras absent and
+            // refuse a faithful reproduction (finding on #688).
             let differences = authorization::verify(
                 &mut scratch.connection,
                 &map,
                 &expected_auth,
-                &request.schemas,
+                &scope_schemas,
             )
             .await
             .map_err(db)?;
@@ -1351,8 +1362,10 @@ impl ScratchRun {
                 scope_schemas.push(extra.clone());
             }
         }
-        let mut target_facts = target.environment(&schemas, &extras).await.map_err(read)?;
-        let target_auth = target.authorization(&scope_schemas).await.map_err(read)?;
+        let (mut target_facts, target_auth) = target
+            .scope_facts(&schemas, &extras, &scope_schemas)
+            .await
+            .map_err(read)?;
         let expected_auth = authorization::with_planned(target_auth, &planned);
         target_facts.catalog.visibility = expected_visibility(&expected_auth, &schemas, &extras);
         let deployer = map
@@ -1379,10 +1392,14 @@ impl ScratchRun {
             let catalog = pg_environment::read(&mut scratch.connection, &scope)
                 .await
                 .map_err(db)?;
-            let differences =
-                authorization::verify(&mut scratch.connection, &map, &expected_auth, &schemas)
-                    .await
-                    .map_err(db)?;
+            let differences = authorization::verify(
+                &mut scratch.connection,
+                &map,
+                &expected_auth,
+                &scope_schemas,
+            )
+            .await
+            .map_err(db)?;
             let library_path = catalog
                 .settings
                 .get("dynamic_library_path")
@@ -1687,7 +1704,12 @@ fn expected_visibility(
 /// a schema name with such a character serialises identically to
 /// `current_schemas(true)::text` (finding on #688).
 fn array_element(value: &str) -> String {
+    // The engine also quotes an element that spells the array NULL sentinel,
+    // case-insensitively, so it cannot be read back as a null: a schema named
+    // `null` renders as `{pg_catalog,"null"}` (measured on 18; finding on
+    // #688). Anything longer than the sentinel, such as `Null2`, stays bare.
     let needs_quotes = value.is_empty()
+        || value.eq_ignore_ascii_case("null")
         || value
             .chars()
             .any(|c| matches!(c, ',' | '"' | '\\' | '{' | '}') || c.is_whitespace());
