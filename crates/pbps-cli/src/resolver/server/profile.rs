@@ -193,11 +193,15 @@ pub(crate) fn configuration(observed: &Value) -> Result<(), &'static str> {
         | Value::Array(_)
         | Value::Object(_) => return Err("RestartPolicy"),
     }
-    // Docker lists its tmpfs mounts here; Podman lists none. Anything with a
-    // source on the host — a volume, a bind — is not a tmpfs.
-    if let Some(mounts) = observed["Mounts"].as_array()
-        && mounts.iter().any(|mount| mount["Type"] != "tmpfs")
-    {
+    // Docker lists its tmpfs mounts here; Podman lists an empty array. Anything
+    // with a source on the host — a volume, a bind — is not a tmpfs. The array
+    // is required: absent or malformed is unreadable, not "no mounts", and
+    // this is the only record-level check that tells a runtime-generated file
+    // from an operator bind at the same target (finding on #640).
+    let Some(mounts) = observed["Mounts"].as_array() else {
+        return Err("Mounts");
+    };
+    if mounts.iter().any(|mount| mount["Type"] != "tmpfs") {
         return Err("Mounts");
     }
     for key in ["Memory", "PidsLimit"] {
@@ -420,6 +424,14 @@ mod tests {
             *cursor = value;
             configuration(&record)
         };
+        // Absent and malformed are not "no mounts": the array is the only
+        // record-level check that tells a runtime-generated file from an
+        // operator bind at the same target (finding on #640).
+        assert_eq!(weakened(&["Mounts"], Value::Null), Err("Mounts"));
+        assert_eq!(
+            weakened(&["Mounts"], Value::String("bind".into())),
+            Err("Mounts")
+        );
         assert_eq!(
             weakened(&["HostConfig", "Privileged"], Value::Bool(true)),
             Err("Privileged")
