@@ -2859,6 +2859,47 @@ fn statements(
     Ok(statements)
 }
 
+/// How many changes `--staged` sees, which is not how many entries the plan
+/// holds.
+///
+/// A `PublicExecution` is not a change anybody chose: the differ appends one
+/// to every routine the plan creates or rebuilds (DECISIONS 517), so counting
+/// it separately would make a single routine two changes and refuse a staged
+/// creation that was legal before the decision existed. It belongs to that
+/// create the way the statement it renders belongs to the `CREATE`, so it is
+/// counted with it.
+///
+/// Only where the plan really does carry that create. A decision naming a
+/// routine no change in this plan builds has nothing to be a companion of,
+/// and counting it on its own is then the honest answer.
+pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
+    let mut built = std::collections::BTreeSet::new();
+    for planned in &cs.changes {
+        // `if let` rather than a match with a wildcard: no other change
+        // brings a routine into being, so there is no list to enumerate and
+        // none to keep up to date.
+        let id = if let pbps_model::Change::CreateModule { id, .. } = &planned.change {
+            id
+        } else if let pbps_model::Change::AlterModule { id, .. } = &planned.change {
+            id
+        } else {
+            continue;
+        };
+        if let pbps_model::ModuleId::Routine(routine) = id {
+            built.insert(routine);
+        }
+    }
+    cs.changes
+        .iter()
+        .filter(|planned| {
+            !matches!(
+                &planned.change,
+                pbps_model::Change::PublicExecution { routine, .. } if built.contains(routine)
+            )
+        })
+        .count()
+}
+
 /// Validates the parts of a saved artifact that must not be trusted merely
 /// because they deserialize.
 ///
@@ -2873,13 +2914,15 @@ pub(crate) fn validate_saved_plan(
 ) -> anyhow::Result<()> {
     // A matching checksum approves these bytes, not a broader execution mode
     // than the planner accepts. Count logical changes, since one rename may
-    // emit a schema transfer and a rename (ADR-0003, decision 2).
-    if plan.mode.is_staged() && plan.changes.changes.len() != 1 {
+    // emit a schema transfer and a rename (ADR-0003, decision 2) — and the
+    // same count as the planner used, or an artifact the planner wrote would
+    // be refused by the command that reads it back.
+    let logical = logical_changes(&plan.changes);
+    if plan.mode.is_staged() && logical != 1 {
         bail!(
-            "a staged plan must contain exactly one logical change; this artifact has {}.\n\
+            "a staged plan must contain exactly one logical change; this artifact has {logical}.\n\
              Regenerate it with `pbps plan --db --staged`, isolating the change in its own \
-             revision; use a transactional plan for multiple changes.",
-            plan.changes.changes.len()
+             revision; use a transactional plan for multiple changes."
         );
     }
     plan.ids

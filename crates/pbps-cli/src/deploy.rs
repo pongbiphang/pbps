@@ -3855,12 +3855,12 @@ pub fn cmd_plan_db(
         // back must not be able to take four unrelated changes down with it,
         // and a resume that had to reason about which of five changes were
         // half-done would be guessing.
-        if cs.changes.len() > 1 {
+        let logical = crate::logical_changes(&cs);
+        if logical > 1 {
             bail!(
-                "--staged applies one logical change, and this plan has {}.\n\
+                "--staged applies one logical change, and this plan has {logical}.\n\
                  Stage the change that needs it in a revision of its own; the rest can go \
-                 through an ordinary transactional apply.",
-                cs.changes.len()
+                 through an ordinary transactional apply."
             );
         }
         if cs.is_empty() {
@@ -5621,6 +5621,69 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `--staged` applies one logical change (ADR-0003), and the differ's own
+    /// companion to a routine is not a second one. A routine that declares
+    /// `public_execute: true` arrives with a `PublicExecution` beside its
+    /// `CreateModule`, and counting entries would refuse a staged creation
+    /// that was legal before that decision existed.
+    ///
+    /// The negative cases are the point: two routines are two changes, and a
+    /// decision whose routine this plan does not build is counted on its own
+    /// because it has nothing to be a companion of.
+    #[test]
+    fn a_routines_public_decision_is_counted_with_the_create_it_belongs_to() {
+        use pbps_model::{
+            Change, ChangeSet, Module, ModuleKind, PlannedChange, PublicAccess, RoutineOrigin,
+        };
+        let create = |name: &str| Change::CreateModule {
+            id: name.parse().unwrap(),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+            }),
+        };
+        let decided = |name: &str, access| Change::PublicExecution {
+            routine: name.parse().unwrap(),
+            access,
+            origin: RoutineOrigin::Created,
+        };
+        let count = |changes: Vec<Change>| {
+            let mut cs = ChangeSet::default();
+            cs.changes
+                .extend(changes.into_iter().map(PlannedChange::new));
+            crate::logical_changes(&cs)
+        };
+
+        for access in [PublicAccess::Kept, PublicAccess::Revoked] {
+            assert_eq!(
+                count(vec![
+                    create("app.f(integer)"),
+                    decided("app.f(integer)", access)
+                ]),
+                1,
+                "{access:?}"
+            );
+        }
+        assert_eq!(
+            count(vec![
+                create("app.f(integer)"),
+                decided("app.f(integer)", PublicAccess::Kept),
+                create("app.g(integer)"),
+                decided("app.g(integer)", PublicAccess::Kept),
+            ]),
+            2
+        );
+        // Nothing in this plan builds `app.h`, so its decision stands alone.
+        assert_eq!(
+            count(vec![
+                create("app.f(integer)"),
+                decided("app.h(integer)", PublicAccess::Revoked),
+            ]),
+            2
+        );
+    }
 
     /// DECISIONS 415: a probe is answered under the settings the statement it
     /// clears will run under, because [`run_probes`] pins them itself.

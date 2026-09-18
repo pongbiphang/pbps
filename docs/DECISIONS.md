@@ -13747,6 +13747,17 @@ SPEC is in sync with all of these.
      than somebody else's privileges — so staging it is merely slow, and it is
      allowed.
 
+     **It is counted with the routine it belongs to.** `--staged` applies one
+     logical change (ADR-0003), and the differ appends this decision to every
+     routine a plan creates or rebuilds — so counting plan entries would make
+     a single routine two changes and refuse a staged creation that was legal
+     before the decision existed. Both guards that enforce the rule, the one
+     in the planner and the one that re-reads the saved artifact, count
+     through the same helper: a count that differed between them would refuse
+     the very file the planner had just written. A decision naming a routine
+     the plan does not build is counted on its own, having nothing to be a
+     companion of.
+
      **What a pull does with it.** The routines the database lets `PUBLIC`
      execute ride beside the pulled schema and are written into those
      declarations as `public_execute: true`. Still not a grant and still not

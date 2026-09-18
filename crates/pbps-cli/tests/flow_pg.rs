@@ -1650,6 +1650,69 @@ fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// `--staged` applies one logical change (ADR-0003), and the decision the
+/// differ appends to a routine it creates is not a second one. Creating one
+/// routine in a staged revision was legal before issue #318, and the routine
+/// that declares `public_execute: true` is the case where it has to stay so:
+/// the other decision is refused for its own reason, by its own message.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_revision_may_still_create_one_routine() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-staged");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-staged");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    let open = d.dir.join("schema/open.yml");
+    std::fs::write(
+        &open,
+        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    succeeds(approved_apply(&d, connection, &plan, &["--staged"]));
+    assert!(public_executes(connection, "app.open()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // The closed answer is refused, and by the rule that is actually about
+    // it: the window between the `CREATE` and the revoke, not the count.
+    std::fs::write(
+        d.dir.join("schema/shut.yml"),
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", connection, "--staged"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("a staged run commits each statement on its own"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
 /// The engine's default is not the last word on what a new routine arrives
 /// holding. A cluster whose deployment role has run `ALTER DEFAULT PRIVILEGES
 /// REVOKE EXECUTE ON ROUTINES FROM PUBLIC` creates routines with an explicit
