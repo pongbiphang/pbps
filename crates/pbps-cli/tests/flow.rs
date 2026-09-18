@@ -2363,6 +2363,68 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
     );
 }
 
+/// The cheaper edit on the same artifact: delete the decision rather than
+/// relabel it.
+///
+/// Nothing is left inconsistent — the `CreateModule` derives the risks it
+/// always did — and the routine would be created holding this engine'"'"'s
+/// default `EXECUTE` to `PUBLIC`, which `verify` cannot report because what
+/// `PUBLIC` holds is never compared (DECISIONS 371). An absence is not
+/// evidence of a decision.
+#[test]
+fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public() {
+    let d = Demo::new("apply-silent");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let plan_path = d.dir.join("silent.json");
+    let plan = pbps_model::SavedPlan::new(
+        pbps_model::PlanOrigin::Database,
+        "postgres",
+        "2026-09-18T00:00:00Z",
+        pbps_model::PlanBaseline {
+            description: "test as queried".into(),
+            checksum: "0".repeat(64),
+        },
+        pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange {
+                change: pbps_model::Change::CreateModule {
+                    id: "app.f(integer)".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::Function,
+                        description: None,
+                        definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"
+                            .into(),
+                    }),
+                },
+                risks: Default::default(),
+                strategy: Default::default(),
+                findings: Default::default(),
+            }],
+        },
+        pbps_model::IdsFile::default(),
+    );
+    std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+    let checksum = plan.checksum();
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "host=127.0.0.1 port=1 user=u password=p dbname=nowhere",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("app.f(integer)"), "{err}");
+    assert!(err.contains("settles nothing about that"), "{err}");
+    assert!(
+        !err.contains("connect"),
+        "the target must not be contacted: {err}"
+    );
+}
+
 /// `risks` is reviewer-facing redundant data. Recompute it from the typed
 /// change so changing both the artifact and the command-line checksum cannot
 /// turn a DROP into an ungated operation.

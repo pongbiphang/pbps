@@ -13772,6 +13772,17 @@ SPEC is in sync with all of these.
      bear out. A decision with no companion at all is refused rather than
      guessed at: the differ never writes one.
 
+     **And the plan is asked for a decision on every routine it builds.**
+     Deleting the entry is the cheaper edit and leaves nothing inconsistent
+     behind — the `CreateModule` derives the risks it always did — so every
+     other check passes and the routine arrives holding the default, which
+     371 keeps `verify` from reporting. An absence is not evidence of a
+     decision, and on an engine whose `CREATE` hands a routine to `PUBLIC`
+     there is no such thing as a routine the plan has no opinion about, so
+     the absence is the finding. Asked of the dialect both times: only such
+     an engine has a decision to make, and only one that rebuilds modules
+     makes an `AlterModule` another `CREATE`.
+
      **The saved-plan version moves.** A version 8 plan is not broken, which
      is exactly the trouble: it was written before the grantee was anybody's
      decision, so it creates a routine and says nothing, and every check the

@@ -2900,52 +2900,89 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
         .count()
 }
 
-/// The half of a `PublicExecution` that risk derivation trusts, checked
-/// against the plan it sits in.
+/// Every `PublicExecution` matched to the module change it belongs to, and
+/// every routine this plan brings into being matched to a decision.
+///
+/// # Why the origin is checked rather than believed
 ///
 /// `RoutineOrigin` decides whether closing a routine to `PUBLIC` is gated:
 /// nobody held `EXECUTE` on an object that did not exist a statement earlier,
 /// so a fresh create carries no risk, while a rebuild carries `revoke`
-/// (DECISIONS 517). Re-deriving the risks above cannot catch an edit to it —
-/// the derivation reads the very field that was edited, agrees with itself,
-/// and an artifact saying `created` over a rebuild performs an ungated
-/// revocation on a routine somebody was using. That is the bypass
-/// [`validate_saved_plan`] exists to prevent, and this is the field that
-/// would otherwise be the one input to a risk that the file itself supplies.
+/// (DECISIONS 517). Re-deriving the risks in [`validate_saved_plan`] cannot
+/// catch an edit to it — the derivation reads the very field that was edited,
+/// agrees with itself, and an artifact saying `created` over a rebuild
+/// performs an ungated revocation on a routine somebody was using. This is
+/// the one input to a risk that the file itself supplies.
 ///
-/// The plan already says which it is, so the field is checked rather than
-/// believed: a routine whose module change is an `AlterModule`, or whose
-/// `CreateModule` is preceded by a `DropModule` of the same identity — the
-/// shape a changed kind takes (ADR-0009 §1) — existed before this plan. One
-/// that no change in the plan brings into being has no companion at all, and
-/// is refused rather than guessed at: the differ emits this decision beside a
-/// create or a rebuild and never alone.
-fn public_execution_origins_match_their_companion(
+/// The plan already says which it is: a routine whose module change is an
+/// `AlterModule`, or whose `CreateModule` is accompanied by a `DropModule` of
+/// the same identity — the shape a changed kind takes (ADR-0009 §1) — existed
+/// before this plan. One that no change in the plan brings into being has no
+/// companion at all, and is refused rather than guessed at.
+///
+/// # Why the other direction is checked too
+///
+/// Deleting the decision is the cheaper attack, and it leaves nothing
+/// inconsistent behind: the `CreateModule` still derives the risks it always
+/// did, so every other check here passes and the routine is created holding
+/// the engine's default — which `verify` cannot report, because what `PUBLIC`
+/// holds is never compared (DECISIONS 371). An absence is not evidence of a
+/// decision, and on this engine there is no such thing as a routine the plan
+/// has no opinion about, so the absence is the finding.
+///
+/// Asked of the dialect rather than assumed, twice over: only an engine whose
+/// `CREATE` hands a routine to `PUBLIC` has a decision to make, and only one
+/// that rebuilds modules makes an `AlterModule` another `CREATE`.
+fn public_execution_decisions_match_their_modules(
     cs: &pbps_model::ChangeSet,
+    dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {
     use pbps_model::{Change, ModuleId, RoutineOrigin};
 
-    let mut created = std::collections::BTreeSet::new();
-    let mut rebuilt = std::collections::BTreeSet::new();
-    for planned in &cs.changes {
+    let routine_of = |change: &Change| -> Option<(u8, pbps_model::RoutineId)> {
         // `if let` rather than a match with a wildcard: these are the three
-        // changes that decide whether an object is there afterwards, and no
-        // list of the rest would stay current.
-        if let Change::CreateModule { id, .. } = &planned.change
-            && let ModuleId::Routine(routine) = id
-        {
-            created.insert(routine.clone());
-        } else if let Change::AlterModule { id, .. } = &planned.change
-            && let ModuleId::Routine(routine) = id
-        {
-            rebuilt.insert(routine.clone());
-        } else if let Change::DropModule { id, .. } = &planned.change
-            && let ModuleId::Routine(routine) = id
-        {
-            rebuilt.insert(routine.clone());
+        // changes that decide whether an object is there afterwards, and a
+        // list of all the rest would need maintaining for nothing.
+        let (rank, id) = if let Change::CreateModule { id, .. } = change {
+            (0u8, id)
+        } else if let Change::AlterModule { id, .. } = change {
+            (1, id)
+        } else if let Change::DropModule { id, .. } = change {
+            (2, id)
+        } else {
+            return None;
+        };
+        match id {
+            ModuleId::Routine(routine) => Some((rank, routine.clone())),
+            ModuleId::Named(_) | ModuleId::Trigger { .. } => None,
         }
-    }
+    };
 
+    let mut created = std::collections::BTreeSet::new();
+    let mut altered = std::collections::BTreeSet::new();
+    let mut dropped = std::collections::BTreeSet::new();
+    for planned in &cs.changes {
+        match routine_of(&planned.change) {
+            Some((0, routine)) => created.insert(routine),
+            Some((1, routine)) => altered.insert(routine),
+            Some((_, routine)) => dropped.insert(routine),
+            None => continue,
+        };
+    }
+    // A create whose identity this plan also drops is a changed kind, which
+    // is a rebuild however the two statements are spelled.
+    let origin_of = |routine: &pbps_model::RoutineId| -> Option<RoutineOrigin> {
+        if altered.contains(routine) || (created.contains(routine) && dropped.contains(routine)) {
+            Some(RoutineOrigin::Rebuilt)
+        } else if created.contains(routine) {
+            Some(RoutineOrigin::Created)
+        } else {
+            None
+        }
+    };
+
+    let mut decided: std::collections::BTreeMap<&pbps_model::RoutineId, usize> =
+        std::collections::BTreeMap::new();
     for (index, planned) in cs.changes.iter().enumerate() {
         let Change::PublicExecution {
             routine, origin, ..
@@ -2953,13 +2990,17 @@ fn public_execution_origins_match_their_companion(
         else {
             continue;
         };
-        let derived = if rebuilt.contains(routine) {
-            Some(RoutineOrigin::Rebuilt)
-        } else if created.contains(routine) {
-            Some(RoutineOrigin::Created)
-        } else {
-            None
-        };
+        if let Some(first) = decided.insert(routine, index) {
+            bail!(
+                "changes {} and {} both decide `PUBLIC` execution on `{routine}`; a plan settles \
+                 that once.\n\
+                 The artifact was edited or produced by a broken planner; regenerate it with \
+                 `pbps plan --db`.",
+                first + 1,
+                index + 1
+            );
+        }
+        let derived = origin_of(routine);
         if derived != Some(*origin) {
             bail!(
                 "change {} decides `PUBLIC` execution on `{routine}` as `{}`, which the rest of \
@@ -2978,6 +3019,33 @@ fn public_execution_origins_match_their_companion(
                 }
             );
         }
+    }
+
+    if !dialect.creates_public_executable_routines() {
+        return Ok(());
+    }
+    let mut owed: Vec<&pbps_model::RoutineId> = created.iter().collect();
+    if dialect.rebuilds_modules() {
+        owed.extend(altered.iter());
+    }
+    let silent: Vec<String> = owed
+        .into_iter()
+        .filter(|routine| !decided.contains_key(routine))
+        .map(ToString::to_string)
+        .collect();
+    if !silent.is_empty() {
+        bail!(
+            "this plan brings {} into being on an engine whose `CREATE` hands a routine to \
+             `PUBLIC`, and settles nothing about that: {}.\n\
+             The artifact was edited or produced by a broken planner; regenerate it with \
+             `pbps plan --db`.",
+            if silent.len() == 1 {
+                "1 routine".to_owned()
+            } else {
+                format!("{} routines", silent.len())
+            },
+            silent.join(", ")
+        );
     }
     Ok(())
 }
@@ -3010,7 +3078,7 @@ pub(crate) fn validate_saved_plan(
     plan.ids
         .validate()
         .context("the plan's post-apply identity mapping is inconsistent")?;
-    public_execution_origins_match_their_companion(&plan.changes)?;
+    public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
 
     for (index, planned) in plan.changes.changes.iter().enumerate() {
         let expected = dialect.change_risks(&planned.change);
@@ -3104,85 +3172,167 @@ mod tests {
     use super::*;
 
     /// The one input to a risk that the artifact itself supplies, and so the
-    /// one the re-derivation above cannot check: `change_risks` reads
-    /// `origin`, agrees with whatever the file says, and an edit to
-    /// `created` over a rebuild turns a gated revocation into an ungated one
-    /// while the emitted SQL still revokes (DECISIONS 517).
+    /// one the re-derivation cannot check: `change_risks` reads `origin`,
+    /// agrees with whatever the file says, and an edit to `created` over a
+    /// rebuild turns a gated revocation into an ungated one while the emitted
+    /// SQL still revokes (DECISIONS 517).
     ///
     /// The negative cases are the point, and the changed kind is the one that
     /// is easy to get wrong: a `DropModule` plus a `CreateModule` of the same
     /// identity is a routine that existed a statement earlier.
     #[test]
     fn a_public_decision_is_believed_only_where_the_plan_bears_out_its_origin() {
-        use pbps_model::{
-            Change, ChangeSet, Module, ModuleKind, PlannedChange, PublicAccess, RoutineOrigin,
-        };
-        let module = || {
-            Box::new(Module {
-                kind: ModuleKind::Function,
-                description: None,
-                definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
-            })
-        };
-        let create = Change::CreateModule {
-            id: "app.f(integer)".parse().unwrap(),
-            module: module(),
-        };
-        let alter = Change::AlterModule {
-            id: "app.f(integer)".parse().unwrap(),
-            module: module(),
-        };
-        let drop = Change::DropModule {
-            id: "app.f(integer)".parse().unwrap(),
-            kind: ModuleKind::Function,
-        };
-        let decided = |origin| Change::PublicExecution {
-            routine: "app.f(integer)".parse().unwrap(),
-            access: PublicAccess::Revoked,
-            origin,
-        };
-        let verdict = |changes: Vec<Change>| {
-            let mut cs = ChangeSet::default();
-            cs.changes
-                .extend(changes.into_iter().map(PlannedChange::new));
-            public_execution_origins_match_their_companion(&cs)
-        };
+        use pbps_model::{Change, PublicAccess, RoutineOrigin};
 
         // What the differ writes, each of the three shapes.
-        assert!(verdict(vec![create.clone(), decided(RoutineOrigin::Created)]).is_ok());
-        assert!(verdict(vec![alter.clone(), decided(RoutineOrigin::Rebuilt)]).is_ok());
+        assert!(pg_verdict(vec![create(), decided(RoutineOrigin::Created)]).is_ok());
+        assert!(pg_verdict(vec![alter(), decided(RoutineOrigin::Rebuilt)]).is_ok());
         assert!(
-            verdict(vec![
-                drop.clone(),
-                create.clone(),
-                decided(RoutineOrigin::Rebuilt)
-            ])
-            .is_ok(),
+            pg_verdict(vec![drop_it(), create(), decided(RoutineOrigin::Rebuilt)]).is_ok(),
             "a changed kind is a rebuild"
         );
 
         // The edit the gate is about: an existing routine relabelled as
         // fresh, which derives no risk and still emits the revoke.
-        let e = verdict(vec![alter, decided(RoutineOrigin::Created)])
+        let e = pg_verdict(vec![alter(), decided(RoutineOrigin::Created)])
             .expect_err("a rebuild claiming to be a create")
             .to_string();
         assert!(e.contains("app.f(integer)"), "{e}");
         assert!(e.contains("this plan rebuilds that routine"), "{e}");
         assert!(
-            verdict(vec![drop, create.clone(), decided(RoutineOrigin::Created)]).is_err(),
+            pg_verdict(vec![drop_it(), create(), decided(RoutineOrigin::Created)]).is_err(),
             "a changed kind claiming to be a create"
         );
         // And the other direction, which would demand a flag for nothing.
-        assert!(verdict(vec![create, decided(RoutineOrigin::Rebuilt)]).is_err());
+        assert!(pg_verdict(vec![create(), decided(RoutineOrigin::Rebuilt)]).is_err());
         // A decision with nothing to accompany is refused rather than
         // guessed at; the differ never writes one.
-        let e = verdict(vec![decided(RoutineOrigin::Created)])
+        let e = pg_verdict(vec![decided(RoutineOrigin::Created)])
             .expect_err("a standalone decision")
             .to_string();
         assert!(
             e.contains("no change in this plan creates or rebuilds it"),
             "{e}"
         );
+        // Two of them settle nothing between them.
+        let e = pg_verdict(vec![
+            create(),
+            decided(RoutineOrigin::Created),
+            Change::PublicExecution {
+                routine: "app.f(integer)".parse().unwrap(),
+                access: PublicAccess::Kept,
+                origin: RoutineOrigin::Created,
+            },
+        ])
+        .expect_err("two decisions on one routine")
+        .to_string();
+        assert!(e.contains("a plan settles that once"), "{e}");
+    }
+
+    /// The cheaper attack on the same artifact, and the one that leaves
+    /// nothing inconsistent behind: delete the decision. The `CreateModule`
+    /// still derives the risks it always did, so every other check passes,
+    /// and the routine is created holding the engine's default — which
+    /// `verify` cannot report, because what `PUBLIC` holds is never compared
+    /// (DECISIONS 371). An absence is not evidence of a decision.
+    ///
+    /// Both halves of "asked of the dialect" are negative cases here: SQL
+    /// Server grants no such default, and nothing but a routine has an
+    /// `EXECUTE` privilege to decide about.
+    #[test]
+    fn a_routine_this_plan_builds_must_carry_a_public_decision() {
+        use pbps_model::{Change, ModuleKind, RoutineOrigin};
+
+        for silent in [vec![create()], vec![alter()]] {
+            let e = pg_verdict(silent)
+                .expect_err("a routine built with no decision")
+                .to_string();
+            assert!(e.contains("app.f(integer)"), "{e}");
+            assert!(e.contains("settles nothing about that"), "{e}");
+        }
+        // A routine this plan only removes is not one it brings into being.
+        assert!(pg_verdict(vec![drop_it()]).is_ok());
+        // Nothing but a routine has an `EXECUTE` privilege to settle.
+        assert!(
+            pg_verdict(vec![Change::CreateModule {
+                id: "app.v".parse().unwrap(),
+                module: Box::new(pbps_model::Module {
+                    kind: ModuleKind::View,
+                    description: None,
+                    definition: "AS SELECT 1 AS one".into(),
+                }),
+            }])
+            .is_ok()
+        );
+        // And an engine that grants no such default has no decision to make,
+        // so the same plan is complete there.
+        let mut cs = pbps_model::ChangeSet::default();
+        cs.changes.push(pbps_model::PlannedChange::new(create()));
+        assert!(
+            public_execution_decisions_match_their_modules(
+                &cs,
+                dialect_for(DialectName::Mssql).as_ref()
+            )
+            .is_ok()
+        );
+        // The decision itself still has to add up there, if one is present.
+        cs.changes.push(pbps_model::PlannedChange::new(decided(
+            RoutineOrigin::Rebuilt,
+        )));
+        assert!(
+            public_execution_decisions_match_their_modules(
+                &cs,
+                dialect_for(DialectName::Mssql).as_ref()
+            )
+            .is_err()
+        );
+    }
+
+    fn routine_module() -> Box<pbps_model::Module> {
+        Box::new(pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$".into(),
+        })
+    }
+
+    fn create() -> pbps_model::Change {
+        pbps_model::Change::CreateModule {
+            id: "app.f(integer)".parse().unwrap(),
+            module: routine_module(),
+        }
+    }
+
+    fn alter() -> pbps_model::Change {
+        pbps_model::Change::AlterModule {
+            id: "app.f(integer)".parse().unwrap(),
+            module: routine_module(),
+        }
+    }
+
+    fn drop_it() -> pbps_model::Change {
+        pbps_model::Change::DropModule {
+            id: "app.f(integer)".parse().unwrap(),
+            kind: pbps_model::ModuleKind::Function,
+        }
+    }
+
+    fn decided(origin: pbps_model::RoutineOrigin) -> pbps_model::Change {
+        pbps_model::Change::PublicExecution {
+            routine: "app.f(integer)".parse().unwrap(),
+            access: pbps_model::PublicAccess::Revoked,
+            origin,
+        }
+    }
+
+    fn pg_verdict(changes: Vec<pbps_model::Change>) -> anyhow::Result<()> {
+        let mut cs = pbps_model::ChangeSet::default();
+        cs.changes
+            .extend(changes.into_iter().map(pbps_model::PlannedChange::new));
+        public_execution_decisions_match_their_modules(
+            &cs,
+            dialect_for(DialectName::Postgres).as_ref(),
+        )
     }
 
     /// Everything keyed by a routine identity is rewritten together, or the
