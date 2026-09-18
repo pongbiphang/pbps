@@ -2900,6 +2900,88 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
         .count()
 }
 
+/// The half of a `PublicExecution` that risk derivation trusts, checked
+/// against the plan it sits in.
+///
+/// `RoutineOrigin` decides whether closing a routine to `PUBLIC` is gated:
+/// nobody held `EXECUTE` on an object that did not exist a statement earlier,
+/// so a fresh create carries no risk, while a rebuild carries `revoke`
+/// (DECISIONS 517). Re-deriving the risks above cannot catch an edit to it —
+/// the derivation reads the very field that was edited, agrees with itself,
+/// and an artifact saying `created` over a rebuild performs an ungated
+/// revocation on a routine somebody was using. That is the bypass
+/// [`validate_saved_plan`] exists to prevent, and this is the field that
+/// would otherwise be the one input to a risk that the file itself supplies.
+///
+/// The plan already says which it is, so the field is checked rather than
+/// believed: a routine whose module change is an `AlterModule`, or whose
+/// `CreateModule` is preceded by a `DropModule` of the same identity — the
+/// shape a changed kind takes (ADR-0009 §1) — existed before this plan. One
+/// that no change in the plan brings into being has no companion at all, and
+/// is refused rather than guessed at: the differ emits this decision beside a
+/// create or a rebuild and never alone.
+fn public_execution_origins_match_their_companion(
+    cs: &pbps_model::ChangeSet,
+) -> anyhow::Result<()> {
+    use pbps_model::{Change, ModuleId, RoutineOrigin};
+
+    let mut created = std::collections::BTreeSet::new();
+    let mut rebuilt = std::collections::BTreeSet::new();
+    for planned in &cs.changes {
+        // `if let` rather than a match with a wildcard: these are the three
+        // changes that decide whether an object is there afterwards, and no
+        // list of the rest would stay current.
+        if let Change::CreateModule { id, .. } = &planned.change
+            && let ModuleId::Routine(routine) = id
+        {
+            created.insert(routine.clone());
+        } else if let Change::AlterModule { id, .. } = &planned.change
+            && let ModuleId::Routine(routine) = id
+        {
+            rebuilt.insert(routine.clone());
+        } else if let Change::DropModule { id, .. } = &planned.change
+            && let ModuleId::Routine(routine) = id
+        {
+            rebuilt.insert(routine.clone());
+        }
+    }
+
+    for (index, planned) in cs.changes.iter().enumerate() {
+        let Change::PublicExecution {
+            routine, origin, ..
+        } = &planned.change
+        else {
+            continue;
+        };
+        let derived = if rebuilt.contains(routine) {
+            Some(RoutineOrigin::Rebuilt)
+        } else if created.contains(routine) {
+            Some(RoutineOrigin::Created)
+        } else {
+            None
+        };
+        if derived != Some(*origin) {
+            bail!(
+                "change {} decides `PUBLIC` execution on `{routine}` as `{}`, which the rest of \
+                 the plan does not bear out ({}).\n\
+                 The artifact was edited or produced by a broken planner; regenerate it with \
+                 `pbps plan --db`.",
+                index + 1,
+                match origin {
+                    RoutineOrigin::Created => "created",
+                    RoutineOrigin::Rebuilt => "rebuilt",
+                },
+                match derived {
+                    Some(RoutineOrigin::Rebuilt) => "this plan rebuilds that routine",
+                    Some(RoutineOrigin::Created) => "this plan creates that routine",
+                    None => "no change in this plan creates or rebuilds it",
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validates the parts of a saved artifact that must not be trusted merely
 /// because they deserialize.
 ///
@@ -2928,6 +3010,7 @@ pub(crate) fn validate_saved_plan(
     plan.ids
         .validate()
         .context("the plan's post-apply identity mapping is inconsistent")?;
+    public_execution_origins_match_their_companion(&plan.changes)?;
 
     for (index, planned) in plan.changes.changes.iter().enumerate() {
         let expected = dialect.change_risks(&planned.change);
@@ -3019,6 +3102,88 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one input to a risk that the artifact itself supplies, and so the
+    /// one the re-derivation above cannot check: `change_risks` reads
+    /// `origin`, agrees with whatever the file says, and an edit to
+    /// `created` over a rebuild turns a gated revocation into an ungated one
+    /// while the emitted SQL still revokes (DECISIONS 517).
+    ///
+    /// The negative cases are the point, and the changed kind is the one that
+    /// is easy to get wrong: a `DropModule` plus a `CreateModule` of the same
+    /// identity is a routine that existed a statement earlier.
+    #[test]
+    fn a_public_decision_is_believed_only_where_the_plan_bears_out_its_origin() {
+        use pbps_model::{
+            Change, ChangeSet, Module, ModuleKind, PlannedChange, PublicAccess, RoutineOrigin,
+        };
+        let module = || {
+            Box::new(Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+            })
+        };
+        let create = Change::CreateModule {
+            id: "app.f(integer)".parse().unwrap(),
+            module: module(),
+        };
+        let alter = Change::AlterModule {
+            id: "app.f(integer)".parse().unwrap(),
+            module: module(),
+        };
+        let drop = Change::DropModule {
+            id: "app.f(integer)".parse().unwrap(),
+            kind: ModuleKind::Function,
+        };
+        let decided = |origin| Change::PublicExecution {
+            routine: "app.f(integer)".parse().unwrap(),
+            access: PublicAccess::Revoked,
+            origin,
+        };
+        let verdict = |changes: Vec<Change>| {
+            let mut cs = ChangeSet::default();
+            cs.changes
+                .extend(changes.into_iter().map(PlannedChange::new));
+            public_execution_origins_match_their_companion(&cs)
+        };
+
+        // What the differ writes, each of the three shapes.
+        assert!(verdict(vec![create.clone(), decided(RoutineOrigin::Created)]).is_ok());
+        assert!(verdict(vec![alter.clone(), decided(RoutineOrigin::Rebuilt)]).is_ok());
+        assert!(
+            verdict(vec![
+                drop.clone(),
+                create.clone(),
+                decided(RoutineOrigin::Rebuilt)
+            ])
+            .is_ok(),
+            "a changed kind is a rebuild"
+        );
+
+        // The edit the gate is about: an existing routine relabelled as
+        // fresh, which derives no risk and still emits the revoke.
+        let e = verdict(vec![alter, decided(RoutineOrigin::Created)])
+            .expect_err("a rebuild claiming to be a create")
+            .to_string();
+        assert!(e.contains("app.f(integer)"), "{e}");
+        assert!(e.contains("this plan rebuilds that routine"), "{e}");
+        assert!(
+            verdict(vec![drop, create.clone(), decided(RoutineOrigin::Created)]).is_err(),
+            "a changed kind claiming to be a create"
+        );
+        // And the other direction, which would demand a flag for nothing.
+        assert!(verdict(vec![create, decided(RoutineOrigin::Rebuilt)]).is_err());
+        // A decision with nothing to accompany is refused rather than
+        // guessed at; the differ never writes one.
+        let e = verdict(vec![decided(RoutineOrigin::Created)])
+            .expect_err("a standalone decision")
+            .to_string();
+        assert!(
+            e.contains("no change in this plan creates or rebuilds it"),
+            "{e}"
+        );
+    }
 
     /// Everything keyed by a routine identity is rewritten together, or the
     /// halves stop matching. The loader is dialect-free, so a declaration may

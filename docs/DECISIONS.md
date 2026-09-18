@@ -13758,6 +13758,29 @@ SPEC is in sync with all of these.
      the plan does not build is counted on its own, having nothing to be a
      companion of.
 
+     **The origin is checked against the plan, not believed.** Re-deriving a
+     saved plan's risks is what stops an edited `risks: []` from turning a
+     destructive change into an ungated one, and it works because the
+     derivation reads the typed change rather than the file's claim about it.
+     `RoutineOrigin` is the first field that is *both*: the derivation reads
+     it, so an artifact saying `created` over a rebuild derives no risk,
+     agrees with itself, and still emits the revoke against a routine
+     somebody was using. The plan already says which it is — an `AlterModule`
+     for that routine, or a `DropModule` before its `CreateModule`, which is
+     the shape a changed kind takes — so `validate_saved_plan` derives the
+     origin the same way and refuses a decision the rest of the plan does not
+     bear out. A decision with no companion at all is refused rather than
+     guessed at: the differ never writes one.
+
+     **The saved-plan version moves.** A version 8 plan is not broken, which
+     is exactly the trouble: it was written before the grantee was anybody's
+     decision, so it creates a routine and says nothing, and every check the
+     new build runs on it passes. Applying it would leave open what this
+     entry exists to close, and say nothing about that either. The version
+     turns it away as a stale format instead, and the remedy is the one a
+     stale artifact always had — plan again, and take the new plan through
+     the gate.
+
      **What a pull does with it.** The routines the database lets `PUBLIC`
      execute ride beside the pulled schema and are written into those
      declarations as `public_execute: true`. Still not a grant and still not

@@ -2287,6 +2287,82 @@ fn apply_refuses_an_artifact_that_does_not_match_the_approved_checksum() {
     );
 }
 
+/// The same rule where the risk is derived from a field the file supplies.
+///
+/// Closing a routine to `PUBLIC` is gated on a rebuild and not on a fresh
+/// create, because nobody held `EXECUTE` on an object that did not exist a
+/// statement earlier (DECISIONS 517). Recomputing the risks cannot catch an
+/// edit to `origin`: the derivation reads that field, agrees with itself, and
+/// the emitted `REVOKE` still runs against a routine somebody was using. So
+/// the plan is asked to bear its own claim out, and here it does not — the
+/// module change beside the decision is a rebuild.
+#[test]
+fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
+    let d = Demo::new("apply-origin");
+    d.table(ONE_COLUMN);
+    // The decision exists only on the engine whose `CREATE` hands a routine
+    // to `PUBLIC`, so the project has to be that one.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let plan_path = d.dir.join("relabelled.json");
+    let id: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+    let planned = |change| pbps_model::PlannedChange {
+        change,
+        risks: Default::default(),
+        strategy: Default::default(),
+        findings: Default::default(),
+    };
+    let plan = pbps_model::SavedPlan::new(
+        pbps_model::PlanOrigin::Database,
+        "postgres",
+        "2026-09-18T00:00:00Z",
+        pbps_model::PlanBaseline {
+            description: "test as queried".into(),
+            checksum: "0".repeat(64),
+        },
+        pbps_model::ChangeSet {
+            changes: vec![
+                planned(pbps_model::Change::AlterModule {
+                    id: id.clone(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::Function,
+                        description: None,
+                        definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"
+                            .into(),
+                    }),
+                }),
+                // `risks: []` is consistent with what this says, which is the
+                // whole trouble: the lie is in the origin, not the risks.
+                planned(pbps_model::Change::PublicExecution {
+                    routine: "app.f(integer)".parse().unwrap(),
+                    access: pbps_model::PublicAccess::Revoked,
+                    origin: pbps_model::RoutineOrigin::Created,
+                }),
+            ],
+        },
+        pbps_model::IdsFile::default(),
+    );
+    std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+    let checksum = plan.checksum();
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "host=127.0.0.1 port=1 user=u password=p dbname=nowhere",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("app.f(integer)"), "{err}");
+    assert!(err.contains("this plan rebuilds that routine"), "{err}");
+    assert!(
+        !err.contains("connect"),
+        "the target must not be contacted: {err}"
+    );
+}
+
 /// `risks` is reviewer-facing redundant data. Recompute it from the typed
 /// change so changing both the artifact and the command-line checksum cannot
 /// turn a DROP into an ungated operation.
