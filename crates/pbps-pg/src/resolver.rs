@@ -1,5 +1,7 @@
 //! Advisory environment observations, never resolver qualification (ADR-0016).
 
+pub mod compatibility;
+
 use pbps_db::resolver::{
     Candidate, Discovery, Extension, Observation, OwnSession, ScratchNames, SessionCounter,
     SessionInventory,
