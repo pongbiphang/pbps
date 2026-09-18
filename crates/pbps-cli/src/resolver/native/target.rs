@@ -6,6 +6,7 @@ use super::{SocketOwnerLease, UnqualifiedProcess};
 use pbps_db::resolver::environment::{DatabaseRecipe, EnvironmentFacts};
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::PeerVerifiedConn;
+use pbps_pg::resolver::authorization::AuthorizationContext;
 use std::sync::{Arc, Weak};
 
 #[path = "target_engine.rs"]
@@ -179,6 +180,21 @@ impl NativeTarget {
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         DatabaseRecipe::from_catalog(&catalog)
             .map_err(|error| EnvironmentError::Catalog(pbps_db::DbError::BadRow(error.to_string())))
+    }
+
+    /// The deployer's authorization context for the in-scope schemas, read as
+    /// the target's own principal and bracketed by the binding check.
+    pub async fn authorization(
+        &mut self,
+        schemas: &[String],
+    ) -> Result<AuthorizationContext, EnvironmentError> {
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        let context = engine::authorization(&mut bound.connection, schemas)
+            .await
+            .map_err(EnvironmentError::Catalog)?;
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        Ok(context)
     }
 
     /// The analysis-scope facts of the target as its own deployer sees them:

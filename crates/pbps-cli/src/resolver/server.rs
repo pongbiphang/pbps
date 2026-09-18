@@ -17,9 +17,15 @@ use crate::resolver::native::{
     NativeTarget, ProcessLease, TargetWitness, guard, observe_incidental, process_scope, security,
 };
 use pbps_db::Driver;
+use pbps_db::resolver::environment::{
+    AuthorizationFingerprint, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Verdict,
+};
 use pbps_db::resolver::{InstanceObservation, ScratchNames};
 use pbps_db::transport::{StreamConn, StreamLogin};
+use pbps_pg::resolver::authorization::{self, AuthorizationContext, PlannedGrant, RoleMap};
+use pbps_pg::resolver::{compatibility, environment as pg_environment};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -81,6 +87,8 @@ pub enum Error {
     Cleanup,
     #[error("this resolver run has already been consumed or closed")]
     Consumed,
+    #[error("the analysis scope could not be qualified or changed under the run: {0}")]
+    Scope(String),
 }
 
 /// Which premise of the named profile a refusal is about.
@@ -367,6 +375,11 @@ struct Control {
     stale: Vec<Forwarder>,
     /// Forwarder containers already reported unconfirmed.
     unconfirmed: Vec<String>,
+    /// Run-local authorization roles this run created on the shared server,
+    /// recorded before they are created so cleanup drops them and names any it
+    /// cannot (finding-family #652). Global to the cluster, so the scratch
+    /// database being dropped does not remove them.
+    roles: Vec<String>,
 }
 
 impl Control {
@@ -813,6 +826,7 @@ impl DedicatedServer {
                 in_flight: false,
                 stale: Vec::new(),
                 unconfirmed: Vec::new(),
+                roles: Vec::new(),
             },
             analysis: Some(Analysis {
                 runtime,
@@ -890,6 +904,7 @@ impl DedicatedServer {
             names,
             in_flight: false,
             removed: false,
+            scope: None,
         })
     }
 
@@ -1005,11 +1020,265 @@ pub struct ScratchRun {
     names: ScratchNames,
     in_flight: bool,
     removed: bool,
+    /// The qualified analysis scope, once `qualify` has established it. Bound
+    /// to the scratch session, so a reopened session cannot inherit it.
+    scope: Option<QualifiedScope>,
+}
+
+/// What a run is asked to qualify: the schemas its plan writes to, the extras
+/// the dialect appends after each on the write path, and the grants the plan
+/// performs before its DDL. Pure data supplied by the caller.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeRequest {
+    pub schemas: Vec<String>,
+    pub write_path_extras: Vec<String>,
+    pub planned: Vec<PlannedGrant>,
+}
+
+/// A scope the run has qualified: the compatibility report, the deployment
+/// authorization fingerprint, and everything requalification re-compares
+/// against. Only `qualify` builds it; it is bound to the target and scratch
+/// connections so no other run or reopened session can present it as its own.
+struct QualifiedScope {
+    report: ScopeReport,
+    authorization: AuthorizationFingerprint,
+    target_facts: EnvironmentFacts,
+    target_auth: AuthorizationContext,
+    map: RoleMap,
+    schemas: Vec<String>,
+    write_path_extras: Vec<String>,
+    target_connection: pbps_db::transport::ConnectionId,
+    scratch_connection: pbps_db::transport::ConnectionId,
 }
 
 impl ScratchRun {
     pub fn database(&self) -> &str {
         self.names.database()
+    }
+
+    /// The verdict of the qualified scope, if `qualify` has run. `Verified`
+    /// is the only value a later delivery step may build evidence on.
+    pub fn verdict(&self) -> Option<Verdict> {
+        self.scope.as_ref().map(|scope| scope.report.verdict())
+    }
+
+    /// The deployment authorization fingerprint of the qualified scope, which
+    /// later steps seal (#614) and apply rechecks against its own session
+    /// (#616). Present once `qualify` has run.
+    pub fn authorization_fingerprint(&self) -> Option<&AuthorizationFingerprint> {
+        self.scope.as_ref().map(|scope| &scope.authorization)
+    }
+
+    /// The target and scratch connections the scope is bound to, so a caller
+    /// can confirm a reused scope belongs to the connections in hand.
+    pub fn scope_connections(
+        &self,
+    ) -> Option<(
+        pbps_db::transport::ConnectionId,
+        pbps_db::transport::ConnectionId,
+    )> {
+        self.scope
+            .as_ref()
+            .map(|scope| (scope.target_connection, scope.scratch_connection))
+    }
+
+    /// Qualifies the analysis scope: reads the target's environment and
+    /// deployment authorization, reproduces that authorization on the scratch
+    /// database, reads the scratch environment as the reproduced deployer, and
+    /// compares the two under the versioned rule (ADR-0016 cases 5, 16, 23;
+    /// SPEC §9.3.3). The result is sealed and bound to both connections. No
+    /// declaration is transferred and no SQL surface is exposed here.
+    ///
+    /// PostgreSQL only; a SQL Server dedicated server refuses by name (#611).
+    pub async fn qualify(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &ScopeRequest,
+    ) -> Result<Verdict, Error> {
+        if self.inner.control.driver != Driver::Postgres {
+            return Err(Error::Scope(
+                "dedicated-server scope qualification is not implemented for this engine (#611)"
+                    .into(),
+            ));
+        }
+        let read =
+            |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
+        let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
+        // The target as its own deployer sees it.
+        let target_facts = target
+            .environment(&request.schemas, &request.write_path_extras)
+            .await
+            .map_err(read)?;
+        let target_auth = target.authorization(&request.schemas).await.map_err(read)?;
+        let target_connection = target
+            .connection_id()
+            .map_err(|_| Error::Scope("the target binding is unreadable".into()))?;
+        // Reproduce that authorization on the scratch database through the
+        // control session; the role names are recorded before creation so
+        // cleanup drops them even if reconstruction fails part-way.
+        let login = self.names.login().to_owned();
+        let token = login[login.len().saturating_sub(16)..].to_owned();
+        let map = RoleMap::generate(&target_auth, &login, &token);
+        self.inner.control.roles = map.run_local_names();
+        {
+            let admin = self
+                .inner
+                .control
+                .session
+                .as_mut()
+                .ok_or(Error::Cancelled)?;
+            authorization::reconstruct(
+                &mut admin.connection,
+                &map,
+                &target_auth,
+                self.names.database(),
+            )
+            .await
+            .map_err(db)?;
+            authorization::apply_planned(&mut admin.connection, &map, &request.planned)
+                .await
+                .map_err(db)?;
+        }
+        let deployer = map
+            .deployer(&target_auth)
+            .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
+        // Read the scratch side as the reproduced deployer, then its engine's
+        // executables. Two disjoint borrows, sequenced so neither overlaps.
+        let (scratch_catalog, auth_differences, scratch_connection) = {
+            let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
+            let connection = scratch.connection.id();
+            scratch
+                .connection
+                .execute(&format!("SET ROLE \"{}\"", deployer.replace('"', "\"\"")))
+                .await
+                .map_err(db)?;
+            let scope = pg_environment::Scope {
+                schemas: &request.schemas,
+                write_path_extras: &request.write_path_extras,
+            };
+            let catalog = pg_environment::read(&mut scratch.connection, &scope)
+                .await
+                .map_err(db)?;
+            let differences = authorization::verify(
+                &mut scratch.connection,
+                &map,
+                &target_auth,
+                &request.schemas,
+            )
+            .await
+            .map_err(db)?;
+            (catalog, differences, connection)
+        };
+        let required = crate::resolver::native::executables::required_libraries(&scratch_catalog);
+        let executables = {
+            let engine = self.inner.live()?.runtime.engine();
+            crate::resolver::native::executables::executables(engine, &required).map_err(|_| {
+                Error::Scope("the scratch engine's executables are unreadable".into())
+            })?
+        };
+        let scratch_facts = EnvironmentFacts {
+            catalog: scratch_catalog,
+            executables,
+        };
+        // Compare, folding the authorization reproduction into the report so a
+        // deployer the scratch could not reproduce is a mismatch, not a pass.
+        let mut report = compatibility::compare(&target_facts, &scratch_facts, &[]);
+        for key in &auth_differences {
+            report.facts.insert(
+                format!("authorization:{key}"),
+                FactStatus::Mismatch {
+                    target: "the target deployer's authorization".into(),
+                    resolver: "not reproduced on scratch".into(),
+                },
+            );
+        }
+        let verdict = report.verdict();
+        let authorization = AuthorizationFingerprint {
+            rule: RuleVersion::new(authorization::RULE),
+            digest: format!("{:x}", Sha256::digest(target_auth.canonical())),
+        };
+        self.scope = Some(QualifiedScope {
+            report,
+            authorization,
+            target_facts,
+            target_auth,
+            map,
+            schemas: request.schemas.clone(),
+            write_path_extras: request.write_path_extras.clone(),
+            target_connection,
+            scratch_connection,
+        });
+        Ok(verdict)
+    }
+
+    /// Re-reads the scratch side as the reproduced deployer and refuses if the
+    /// scope no longer holds: an in-place change between checks that alters an
+    /// extension, a setting, a collation or the deployer's reproduced
+    /// authorization invalidates the run (ADR-0016 case 21). Only a scope that
+    /// qualified as `Verified` is guarded; a run that never verified is already
+    /// refused. The sealed scratch connection must still be the one in hand, so
+    /// a reopened session cannot present the old scope as its own (case 14).
+    async fn requalify(&mut self) -> Result<(), Error> {
+        let Some(scope) = self.scope.as_ref() else {
+            return Ok(());
+        };
+        if scope.report.verdict() != Verdict::Verified {
+            return Ok(());
+        }
+        let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
+        let deployer = scope
+            .map
+            .deployer(&scope.target_auth)
+            .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
+        let target_facts = scope.target_facts.clone();
+        let target_auth = scope.target_auth.clone();
+        let map = scope.map.clone();
+        let schemas = scope.schemas.clone();
+        let extras = scope.write_path_extras.clone();
+        let sealed_connection = scope.scratch_connection;
+        let (scratch_catalog, auth_differences) = {
+            let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
+            if scratch.connection.id() != sealed_connection {
+                return Err(Error::Scope(
+                    "the scratch session was replaced; the qualified scope cannot be reused".into(),
+                ));
+            }
+            scratch
+                .connection
+                .execute(&format!("SET ROLE \"{}\"", deployer.replace('"', "\"\"")))
+                .await
+                .map_err(db)?;
+            let scope = pg_environment::Scope {
+                schemas: &schemas,
+                write_path_extras: &extras,
+            };
+            let catalog = pg_environment::read(&mut scratch.connection, &scope)
+                .await
+                .map_err(db)?;
+            let differences =
+                authorization::verify(&mut scratch.connection, &map, &target_auth, &schemas)
+                    .await
+                    .map_err(db)?;
+            (catalog, differences)
+        };
+        let required = crate::resolver::native::executables::required_libraries(&scratch_catalog);
+        let executables = {
+            let engine = self.inner.live()?.runtime.engine();
+            crate::resolver::native::executables::executables(engine, &required).map_err(|_| {
+                Error::Scope("the scratch engine's executables are unreadable".into())
+            })?
+        };
+        let scratch_facts = EnvironmentFacts {
+            catalog: scratch_catalog,
+            executables,
+        };
+        let report = compatibility::compare(&target_facts, &scratch_facts, &[]);
+        if report.verdict() != Verdict::Verified || !auth_differences.is_empty() {
+            return Err(Error::Scope(
+                "the analysis scope changed under the run and no longer qualifies".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Re-qualifies the supplied server, the channels, exclusivity and the
@@ -1028,18 +1297,31 @@ impl ScratchRun {
             }
             self.inner.refuse(Error::Cancelled);
         }
-        let Some(scratch) = self.scratch.as_ref() else {
+        if self.scratch.is_none() {
             return Err(self.inner.refusal.clone().unwrap_or(Error::Cancelled));
-        };
-        self.in_flight = true;
-        let outcome = self.inner.check(Some(scratch)).await;
-        self.in_flight = false;
-        if outcome.is_err()
-            && let Some(scratch) = self.scratch.take()
-        {
-            self.inner.control.retire(scratch);
         }
-        outcome
+        self.in_flight = true;
+        let outcome = {
+            let scratch = self.scratch.as_ref().expect("scratch is present");
+            self.inner.check(Some(scratch)).await
+        };
+        self.in_flight = false;
+        if let Err(cause) = outcome {
+            if let Some(scratch) = self.scratch.take() {
+                self.inner.control.retire(scratch);
+            }
+            return Err(cause);
+        }
+        // The runtime, channel, exclusivity and target held; the qualified
+        // scope must still hold too, or an in-place change has invalidated it.
+        if let Err(cause) = self.requalify().await {
+            self.inner.refuse(cause.clone());
+            if let Some(scratch) = self.scratch.take() {
+                self.inner.control.retire(scratch);
+            }
+            return Err(cause);
+        }
+        Ok(())
     }
 
     /// Removes exactly this run's two objects, on every exit path. A failure
@@ -1119,10 +1401,11 @@ async fn cleanup(control: &mut Control, names: &ScratchNames, cause: Error) -> S
     // a retried `close` or `discard` names it again instead of finding an
     // apparently clean run (finding on #640). `close_control` is what writes
     // the set back after each attempt to close what it holds.
-    report(
-        removal_outcome(removed, cause, names),
-        control.unconfirmed.clone(),
-    )
+    // Both a forwarder that could not be confirmed gone and a run-local role
+    // that could not be dropped are run-owned things a human must remove.
+    let mut recovery = control.unconfirmed.clone();
+    recovery.extend(control.roles.clone());
+    report(removal_outcome(removed, cause, names), recovery)
 }
 
 async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
@@ -1132,11 +1415,23 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         }
         control.in_flight = false;
     }
+    // The run-local roles are dropped after the scratch database that they
+    // own. They stay in `control.roles` until confirmed gone, so a cleanup
+    // that fails before dropping them still reports them as recovery names
+    // (finding-family #652); a successful drop leaves only what it could not
+    // remove.
+    let roles = control.roles.clone();
     if let Some(session) = control.session.as_mut() {
         control.in_flight = true;
-        let outcome = engine::drop_scratch(&mut session.connection, names).await;
+        let dropped = engine::drop_scratch(&mut session.connection, names).await;
+        let role_failures = if dropped.is_ok() {
+            Some(engine::drop_roles(&mut session.connection, &roles).await)
+        } else {
+            None
+        };
         control.in_flight = false;
-        if outcome.is_ok() {
+        if let Some(failures) = role_failures {
+            control.roles = failures;
             return Ok(());
         }
         // A session an administrator terminated is not the end of cleanup:
@@ -1188,9 +1483,17 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
         }
         engine::drop_scratch(&mut connection, names)
             .await
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        Ok(engine::drop_roles(&mut connection, &roles).await)
     }
     .await;
+    let outcome = match outcome {
+        Ok(role_failures) => {
+            control.roles = role_failures;
+            Ok(())
+        }
+        Err(()) => Err(()),
+    };
     drop(connection);
     let name = forwarder.resource_name().to_owned();
     if forwarder.close().await.is_err() {

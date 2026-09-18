@@ -21,6 +21,9 @@ use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The versioned name of this authorization rule, measured on 16 and 18.
+pub const RULE: &str = "pg-auth-v1";
+
 /// The privileges the context measures for each kind of object. Enough to
 /// bind a creation against existing objects; not an audit of every grant.
 const SCHEMA_PRIVILEGES: &[&str] = &["USAGE", "CREATE"];
@@ -371,6 +374,7 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
 /// pre-existing on a shared server is touched, shadowed, or left behind. The
 /// mapping is total over the deployer, its role closure, every in-scope owner
 /// and every schema grantee.
+#[derive(Debug, Clone)]
 pub struct RoleMap {
     to_run_local: BTreeMap<String, String>,
     run_login: String,
@@ -430,12 +434,19 @@ impl RoleMap {
     pub fn run_local_names(&self) -> Vec<String> {
         self.to_run_local.values().cloned().collect()
     }
+
+    /// The run-local role the compilation session must `SET ROLE` to: the
+    /// mapping of the target's deployer principal.
+    pub fn deployer(&self, context: &AuthorizationContext) -> Option<String> {
+        self.run_local(&context.principal.effective)
+    }
 }
 
 /// A planned authorization change the plan performs before its DDL, applied
 /// to scratch so the deployer's effective privileges match what apply will
 /// see (SPEC §7.6). Only schema grants and revokes; role creation in a plan
 /// is refused by the emitter, so it cannot reach here.
+#[derive(Debug, Clone)]
 pub struct PlannedGrant {
     pub role: String,
     pub schema: String,

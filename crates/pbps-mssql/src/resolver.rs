@@ -221,6 +221,13 @@ pub async fn create_scratch(
 
 /// Removes exactly the two run-owned objects. SINGLE_USER only rolls back
 /// sessions inside this run's own scratch database.
+/// SQL Server reconstruction creates no run-local roles yet (#611), so there
+/// is nothing to drop; the signature matches PostgreSQL's so the router does
+/// not branch on more than the engine.
+pub async fn drop_roles(_conn: &mut StreamConn, _roles: &[String]) -> Vec<String> {
+    Vec::new()
+}
+
 pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
     let database = conn
         .execute(&format!(

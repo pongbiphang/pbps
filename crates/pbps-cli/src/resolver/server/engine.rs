@@ -53,6 +53,13 @@ pub(super) async fn create_scratch(
     }
 }
 
+pub(super) async fn drop_roles(connection: &mut StreamConn, roles: &[String]) -> Vec<String> {
+    match connection.driver() {
+        Driver::Postgres => pbps_pg::resolver::drop_roles(connection, roles).await,
+        Driver::Mssql => pbps_mssql::resolver::drop_roles(connection, roles).await,
+    }
+}
+
 pub(super) async fn drop_scratch(
     connection: &mut StreamConn,
     names: &ScratchNames,

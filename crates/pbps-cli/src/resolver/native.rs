@@ -27,7 +27,7 @@ pub(crate) use private_channel::{
     PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guard, private_network, security,
 };
 pub(crate) use target::TargetWitness;
-pub use target::{NativeTarget, NativeTargetError};
+pub use target::{EnvironmentError, NativeTarget, NativeTargetError};
 
 #[derive(Debug, thiserror::Error)]
 #[error("the actual Linux peer process or its protected executable cannot be established")]

@@ -299,6 +299,21 @@ pub fn scratch_database_ddl(names: &ScratchNames, recipe: &DatabaseRecipe) -> St
 
 /// Removes exactly the two run-owned objects. FORCE closes this run's own
 /// scratch sessions; it cannot reach anything the run did not create.
+/// Drops the run-local authorization roles, after the scratch database they
+/// owned is gone. Each drop is independent: a role that cannot be dropped is
+/// returned so the caller can report it, and does not stop the others. Uses
+/// `IF EXISTS` so a role a retry already removed is not an error.
+pub async fn drop_roles(conn: &mut StreamConn, roles: &[String]) -> Vec<String> {
+    let mut failed = Vec::new();
+    for role in roles {
+        let statement = format!("DROP ROLE IF EXISTS \"{}\"", role.replace('"', "\"\""));
+        if conn.execute(&statement).await.is_err() {
+            failed.push(role.clone());
+        }
+    }
+    failed
+}
+
 pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
     let database = conn
         .execute(&format!(

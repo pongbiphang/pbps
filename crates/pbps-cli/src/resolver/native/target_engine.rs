@@ -4,6 +4,7 @@ use pbps_db::resolver::InstanceObservation;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::transport::PeerVerifiedConn;
 use pbps_db::{DbError, Driver};
+use pbps_pg::resolver::authorization::AuthorizationContext;
 
 pub(super) fn native_executable(driver: Driver) -> &'static str {
     match driver {
@@ -40,6 +41,21 @@ pub(super) async fn environment(
         }
         Driver::Mssql => Err(DbError::BadRow(
             "SQL Server analysis-scope qualification is not implemented (#611)".into(),
+        )),
+    }
+}
+
+/// Reads the deployment authorization context for the in-scope schemas as the
+/// connection's own principal. PostgreSQL is #610; SQL Server is #611 and
+/// refuses by name.
+pub(super) async fn authorization(
+    connection: &mut PeerVerifiedConn,
+    schemas: &[String],
+) -> Result<AuthorizationContext, DbError> {
+    match connection.driver() {
+        Driver::Postgres => pbps_pg::resolver::authorization::read(connection, schemas).await,
+        Driver::Mssql => Err(DbError::BadRow(
+            "SQL Server deployment-authorization qualification is not implemented (#611)".into(),
         )),
     }
 }
