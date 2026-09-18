@@ -233,23 +233,11 @@ fn expected_visibility_is_pg_catalog_then_the_usable_path_schemas_in_order() {
     // app is usable and ext (an extra) is usable, in path order after pg_catalog.
     assert_eq!(
         visibility["app"],
-        pbps_db::resolver::Observation::reported(Some("{pg_catalog,app,ext}"))
+        pbps_db::resolver::Observation::reported(Some(r#"["pg_catalog","app","ext"]"#))
     );
     // secret is not usable, so only pg_catalog and the usable extra remain.
     assert_eq!(
         visibility["secret"],
-        pbps_db::resolver::Observation::reported(Some("{pg_catalog,ext}"))
+        pbps_db::resolver::Observation::reported(Some(r#"["pg_catalog","ext"]"#))
     );
-}
-
-/// The engine quotes an array element that spells the NULL sentinel, in any
-/// case, and nothing that merely starts with it (measured on 18; finding on
-/// #688). Predicting `{pg_catalog,null}` for a schema named `null` would
-/// refuse a scope the engine renders as `{pg_catalog,"null"}`.
-#[test]
-fn array_elements_spelling_null_are_quoted_as_the_engine_renders_them() {
-    assert_eq!(super::array_element("null"), "\"null\"");
-    assert_eq!(super::array_element("NULL"), "\"NULL\"");
-    assert_eq!(super::array_element("Null2"), "Null2");
-    assert_eq!(super::array_element("app"), "app");
 }

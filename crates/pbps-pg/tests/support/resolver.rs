@@ -249,11 +249,11 @@ mod scope610 {
         // dropped; `b` is kept.
         assert_eq!(
             seen_by_deployer.visibility["a"],
-            Observation::reported(Some("{pg_catalog}"))
+            Observation::reported(Some(r#"["pg_catalog"]"#))
         );
         assert_eq!(
             seen_by_deployer.visibility["b"],
-            Observation::reported(Some("{pg_catalog,b}"))
+            Observation::reported(Some(r#"["pg_catalog","b"]"#))
         );
         // A libc database: provider `c`, no ICU locale or rules, and the
         // provider's actual version is a value, not NULL.
@@ -299,8 +299,8 @@ mod scope610 {
         assert_eq!(
             report.facts["visibility:a"],
             FactStatus::Mismatch {
-                target: "{pg_catalog}".into(),
-                resolver: "{pg_catalog,a}".into()
+                target: r#"["pg_catalog"]"#.into(),
+                resolver: r#"["pg_catalog","a"]"#.into()
             }
         );
         assert_eq!(report.facts["visibility:b"], FactStatus::Match);
@@ -485,6 +485,52 @@ mod scope610 {
             .unwrap();
         old_admin
             .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+    }
+
+    /// #688: a schema name is one element of the visibility whatever it
+    /// contains — a comma-separated fragment that looks like a temporary
+    /// namespace, or the array NULL sentinel — because the order is taken as
+    /// a JSON array and rendered by the shared renderer, not parsed out of
+    /// the engine's array text. The session's own temporary namespace still
+    /// goes.
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn a_schema_name_is_one_visibility_element_whatever_it_contains() {
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let database = format!("pbps_vis688_{}", std::process::id());
+        let mut admin = connect(&server).await;
+        admin
+            .execute(&format!(
+                "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            ))
+            .await
+            .unwrap();
+        let mut conn = connect(&format!("{server} dbname={database}")).await;
+        conn.execute(
+            "CREATE SCHEMA \"x,pg_temp_3,y\"; CREATE SCHEMA \"null\"; CREATE TEMP TABLE t (i int)",
+        )
+        .await
+        .unwrap();
+        let schemas = ["public".to_owned()];
+        let extras = ["x,pg_temp_3,y".to_owned(), "null".to_owned()];
+        let facts = read(
+            &mut conn,
+            &Scope {
+                schemas: &schemas,
+                write_path_extras: &extras,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            facts.visibility["public"],
+            Observation::reported(Some(r#"["pg_catalog","public","x,pg_temp_3,y","null"]"#))
+        );
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
             .await
             .unwrap();
     }
@@ -713,6 +759,87 @@ mod auth610 {
     }
 }
 
+mod auth688 {
+    use super::*;
+    use pbps_pg::resolver::authorization::read;
+
+    /// Role defaults apply at login, not on `SET ROLE`: after a switch the
+    /// session's values are still the login's, and the effective role's own
+    /// defaults apply nowhere (measured: `SHOW` agrees). The context records
+    /// the login's, so a session whose two roles both pin one GUC is not
+    /// reproduced with the wrong one and refused (finding on #688).
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn role_defaults_are_the_logins_not_the_effective_roles_after_set_role() {
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let pid = std::process::id();
+        let database = format!("pbps_auth688_{pid}");
+        let login = format!("pbps_alogin_{pid}");
+        let effective = format!("pbps_aeff_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        admin
+            .execute(&format!(
+                "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            ))
+            .await
+            .unwrap();
+        // The login's default first and the effective role's second, so a
+        // read that took both under one key would keep the wrong one.
+        admin
+            .execute(&format!(
+                "CREATE ROLE {login} LOGIN PASSWORD 'pbps-login'; \
+                 CREATE ROLE {effective} NOLOGIN; GRANT {effective} TO {login}; \
+                 ALTER ROLE {login} SET search_path = 'login_path'; \
+                 ALTER ROLE {effective} SET search_path = 'effective_path'; \
+                 GRANT CONNECT ON DATABASE {database} TO {login}"
+            ))
+            .await
+            .unwrap();
+        let login_url = server
+            .split_whitespace()
+            .filter(|part| !part.starts_with("user=") && !part.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut planning = Conn::connect(
+            Driver::Postgres,
+            &format!("{login_url} dbname={database} user={login} password=pbps-login"),
+        )
+        .await
+        .unwrap();
+        planning
+            .execute(&format!("SET ROLE {effective}"))
+            .await
+            .unwrap();
+        let shown = planning
+            .query("SELECT pg_catalog.current_setting('search_path') AS p")
+            .await
+            .unwrap()[0]
+            .try_get::<&str>("p")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_eq!(shown, "login_path", "the engine keeps the login's default");
+        let context = read(&mut planning, &[]).await.unwrap();
+        assert_eq!(context.principal.login, login);
+        assert_eq!(context.principal.effective, effective);
+        assert_eq!(
+            context.settings.get("role:search_path").map(String::as_str),
+            Some("login_path"),
+            "{:?}",
+            context.settings
+        );
+        drop(planning);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .unwrap();
+        admin
+            .execute(&format!("DROP ROLE {login}, {effective}"))
+            .await
+            .unwrap();
+    }
+}
+
 mod recon610 {
     use super::*;
     use pbps_pg::resolver::authorization::{
@@ -763,11 +890,15 @@ mod recon610 {
             .execute(&format!(
                 "GRANT CONNECT ON DATABASE {target_db} TO {dep}; \
                  CREATE SCHEMA app AUTHORIZATION {owner}; CREATE SCHEMA secret; \
+                 CREATE SCHEMA plain AUTHORIZATION {owner}; \
                  GRANT USAGE ON SCHEMA app TO {reader}"
             ))
             .await
             .unwrap();
-        let schemas = ["app".to_owned(), "secret".to_owned()];
+        // `plain` has no grants at all: a NULL ACL, the commonest schema on
+        // a real target, which reconstruction must not turn into one with
+        // the owner's entry materialized (finding on #688).
+        let schemas = ["app".to_owned(), "secret".to_owned(), "plain".to_owned()];
         // secret is unreadable to the deployer, so it is not an in-scope
         // schema for it; the reproduction covers only what the deployer sees.
         setup
@@ -787,6 +918,11 @@ mod recon610 {
         .await
         .unwrap();
         let target = read(&mut planning, &schemas).await.unwrap();
+        assert!(
+            target.schemas["plain"].acl.is_empty(),
+            "{:?}",
+            target.schemas["plain"]
+        );
 
         // Reconstruct on scratch as the admin.
         let map = RoleMap::generate(&target, &[], &run_login, &format!("t{pid}"));

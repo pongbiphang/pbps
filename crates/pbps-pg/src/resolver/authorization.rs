@@ -252,9 +252,13 @@ async fn role_attributes(
     Ok(roles)
 }
 
-/// Role- and database-scoped settings that pin one of the rule's GUCs for
-/// this deployer. Read from `pg_db_role_setting`, restricted to the deployer,
-/// the current database, and their combination.
+/// Role- and database-scoped defaults that pin one of the rule's GUCs for
+/// this session. Read from `pg_db_role_setting`: the database's, the login
+/// role's (`session_user`), and their combination. The effective role's own
+/// defaults are not part of the session: PostgreSQL applies role defaults at
+/// login and not on `SET ROLE`, so after a switch they apply nowhere, and
+/// reading them under the same key as the login's would let one overwrite
+/// the other (finding on #688).
 async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, String>, DbError> {
     let rows = conn
         .query(
@@ -265,8 +269,7 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
                     e.entry AS entry \
              FROM pg_catalog.pg_db_role_setting s \
              CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS e(entry) \
-             WHERE (s.setrole = 0 OR s.setrole = current_user::regrole \
-                    OR s.setrole = session_user::regrole) \
+             WHERE (s.setrole = 0 OR s.setrole = session_user::regrole) \
                AND (s.setdatabase = 0 OR s.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()))",
         )
         .await?;
@@ -477,12 +480,23 @@ pub async fn reconstruct(
                 quote_ident(&owner),
             ))
             .await?;
-        admin
-            .query(&format!(
-                "REVOKE ALL ON SCHEMA {} FROM PUBLIC",
-                quote_ident(name)
-            ))
-            .await?;
+        // A schema nobody granted anything on has a NULL ACL on the target —
+        // the owner's implicit rights alone, read as no entries — and a schema
+        // this run just created reads the same until something touches its
+        // ACL. `REVOKE ... FROM PUBLIC` is such a touch: on a NULL ACL the
+        // engine first materializes the owner's own entry (measured on 18),
+        // which the target does not have, so the commonest schema of all
+        // would never reproduce (finding on #688). It runs only where the
+        // target has entries to reproduce, an ACL the engine materialized the
+        // same way when the first of them was granted.
+        if !schema.acl.is_empty() {
+            admin
+                .query(&format!(
+                    "REVOKE ALL ON SCHEMA {} FROM PUBLIC",
+                    quote_ident(name)
+                ))
+                .await?;
+        }
         for (grantee, privileges) in &schema.acl {
             if privileges.is_empty() {
                 continue;
@@ -527,50 +541,40 @@ pub async fn reconstruct(
             }
         }
     }
-    // Settings: role-, database- and database-role-scoped, on the mapped
-    // deployer and this run's own database.
-    let deployer_role = map
-        .run_local(&context.principal.effective)
-        .ok_or_else(|| missing(&context.principal.effective))?;
+    // Settings: role-, database- and database-role-scoped, on the run login
+    // and this run's own database.
     for (key, value) in &context.settings {
         let (scope, name) = key
             .split_once(':')
             .ok_or_else(|| DbError::BadRow(format!("a setting key without a scope: {key}")))?;
-        // Role- and database-role defaults go on two roles for two reasons:
-        // on the run login, because it is what opens the scratch session and
-        // PostgreSQL applies role SET defaults at login (not on SET ROLE), so
-        // this is how they actually load; and on the mapped deployer, so that
-        // reading the reproduced context back as that role sees the same
-        // settings the target's deployer had (finding on #688).
+        // Role- and database-role defaults are the target login's, and go on
+        // the run login: it is what opens the scratch session, and PostgreSQL
+        // applies role defaults at login and not on SET ROLE, so this is how
+        // they load on the target and the only way they load here; reading
+        // the reproduction back finds them under `session_user`. On the
+        // mapped deployer they would apply nowhere, since it never logs in
+        // (finding on #688).
         let mut statements = Vec::new();
         match scope {
-            "role" => {
-                for role in [&map.run_login, &deployer_role] {
-                    statements.push(format!(
-                        "ALTER ROLE {} SET {} = {}",
-                        quote_ident(role),
-                        quote_ident(name),
-                        literal(value)
-                    ));
-                }
-            }
+            "role" => statements.push(format!(
+                "ALTER ROLE {} SET {} = {}",
+                quote_ident(&map.run_login),
+                quote_ident(name),
+                literal(value)
+            )),
             "database" => statements.push(format!(
                 "ALTER DATABASE {} SET {} = {}",
                 quote_ident(database),
                 quote_ident(name),
                 literal(value)
             )),
-            "database-role" => {
-                for role in [&map.run_login, &deployer_role] {
-                    statements.push(format!(
-                        "ALTER ROLE {} IN DATABASE {} SET {} = {}",
-                        quote_ident(role),
-                        quote_ident(database),
-                        quote_ident(name),
-                        literal(value)
-                    ));
-                }
-            }
+            "database-role" => statements.push(format!(
+                "ALTER ROLE {} IN DATABASE {} SET {} = {}",
+                quote_ident(&map.run_login),
+                quote_ident(database),
+                quote_ident(name),
+                literal(value)
+            )),
             other => {
                 return Err(DbError::BadRow(format!("unknown setting scope {other}")));
             }

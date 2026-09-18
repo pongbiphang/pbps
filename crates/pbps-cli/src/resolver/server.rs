@@ -1682,42 +1682,13 @@ fn expected_visibility(
                     visible.push(schema.clone());
                 }
             }
-            let rendered = format!(
-                "{{{}}}",
-                visible
-                    .iter()
-                    .map(|element| array_element(element))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let rendered = pbps_db::resolver::environment::render_visibility(&visible);
             (
                 start.clone(),
                 pbps_db::resolver::Observation::reported(Some(&rendered)),
             )
         })
         .collect()
-}
-
-/// One element of a PostgreSQL array text, quoted the way the engine's own
-/// `::text` renders it: an element with a comma, quote, backslash, brace or
-/// whitespace, or an empty one, is double-quoted with `"` and `\` escaped, so
-/// a schema name with such a character serialises identically to
-/// `current_schemas(true)::text` (finding on #688).
-fn array_element(value: &str) -> String {
-    // The engine also quotes an element that spells the array NULL sentinel,
-    // case-insensitively, so it cannot be read back as a null: a schema named
-    // `null` renders as `{pg_catalog,"null"}` (measured on 18; finding on
-    // #688). Anything longer than the sentinel, such as `Null2`, stays bare.
-    let needs_quotes = value.is_empty()
-        || value.eq_ignore_ascii_case("null")
-        || value
-            .chars()
-            .any(|c| matches!(c, ',' | '"' | '\\' | '{' | '}') || c.is_whitespace());
-    if needs_quotes {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 /// Adds the forwarder names run-owned state still holds to what one exit

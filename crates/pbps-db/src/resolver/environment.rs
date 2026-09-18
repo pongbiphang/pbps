@@ -350,6 +350,16 @@ pub struct AuthorizationFingerprint {
     pub digest: String,
 }
 
+/// The rendering of one write path's effective schema order, shared by the
+/// reader and the predictor: a JSON array of the schema names in order. Both
+/// sides produce it from the same elements, so a name containing a comma or a
+/// quote, or spelling the array NULL sentinel, needs no emulation of the
+/// engine's array text, whose quoting rules two renderers can disagree on
+/// (finding on #688).
+pub fn render_visibility(elements: &[String]) -> String {
+    serde_json::to_string(elements).expect("a list of strings serializes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +426,16 @@ mod tests {
             report(&[("a", FactStatus::Match), ("b", FactStatus::Match)]).verdict(),
             Verdict::Verified
         );
+    }
+
+    #[test]
+    fn a_visibility_rendering_keeps_every_name_whole_and_in_order() {
+        let names = ["pg_catalog", "x,pg_temp_3,y", "null", "odd\"name"].map(str::to_owned);
+        assert_eq!(
+            render_visibility(&names),
+            r#"["pg_catalog","x,pg_temp_3,y","null","odd\"name"]"#
+        );
+        assert_eq!(render_visibility(&[]), "[]");
     }
 
     #[test]

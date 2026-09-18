@@ -15,7 +15,9 @@
 use super::compatibility::{OPTIONAL_SETTINGS, SETTINGS};
 use pbps_db::DbError;
 use pbps_db::resolver::Observation;
-use pbps_db::resolver::environment::{CatalogFacts, CollationFact, ExtensionFact, SettingFact};
+use pbps_db::resolver::environment::{
+    CatalogFacts, CollationFact, ExtensionFact, SettingFact, render_visibility,
+};
 use pbps_db::transport::QueryConnection;
 use std::collections::BTreeMap;
 
@@ -223,12 +225,15 @@ pub async fn read(
 
 /// The engine's own effective schema order for one write path, as the
 /// current principal: `current_schemas(true)` after `set_config(...,
-/// is_local = true)`. The engine applies the USAGE filter and drops schemas
-/// that do not exist; re-deriving that from ACLs would be a second
-/// implementation of `recomputeNamespacePath` to keep in step. Local scope
-/// means the setting ends with the statement's own transaction, so the
-/// connection's search path is not left changed for what runs next
-/// (measured on 16 and 18).
+/// is_local = true)`, taken as a JSON array so that a name containing a comma
+/// or a quote, or spelling the array NULL sentinel, is one element and not a
+/// parse of the engine's array text (finding on #688). The engine applies the
+/// USAGE filter and drops schemas that do not exist; re-deriving that from
+/// ACLs would be a second implementation of `recomputeNamespacePath` to keep
+/// in step. Local scope means the setting ends with the enclosing
+/// transaction — the statement's own outside one, the snapshot's inside
+/// `scope_facts` — so the connection's search path is not left changed for
+/// what runs after (measured on 16 and 18).
 async fn effective_schemas(
     conn: &mut impl QueryConnection,
     schema: &str,
@@ -236,7 +241,7 @@ async fn effective_schemas(
 ) -> Result<String, DbError> {
     let rows = conn
         .query(&format!(
-            "SELECT pg_catalog.current_schemas(true)::text AS path \
+            "SELECT pg_catalog.array_to_json(pg_catalog.current_schemas(true))::text AS path \
              FROM (SELECT pg_catalog.set_config('search_path', '{}', true)) AS s",
             render_path(schema, extras).replace('\'', "''")
         ))
@@ -246,11 +251,13 @@ async fn effective_schemas(
             "effective schema order expected one row".into(),
         ));
     };
-    Ok(without_temp_schemas(&required(
-        row,
-        "path",
-        "the effective schema order",
-    )?))
+    let path = required(row, "path", "the effective schema order")?;
+    let elements: Vec<String> = serde_json::from_str(&path).map_err(|error| {
+        DbError::BadRow(format!(
+            "the effective schema order is not a JSON array of names: {error}"
+        ))
+    })?;
+    Ok(render_visibility(&without_temp_schemas(elements)))
 }
 
 /// Drops the session's own temporary schemas from an effective order.
@@ -259,15 +266,11 @@ async fn effective_schemas(
 /// exists, and that number is per backend, so two sessions that see exactly
 /// the same schemas would otherwise compare as different. `pg_temp` is on
 /// every write path by construction (SPEC §7.3), so its presence is never
-/// the visibility difference this fact exists to catch.
-fn without_temp_schemas(path: &str) -> String {
-    let inner = path
-        .strip_prefix('{')
-        .and_then(|rest| rest.strip_suffix('}'))
-        .unwrap_or(path);
-    let kept: Vec<&str> = inner
-        .split(',')
-        .filter(|part| !part.is_empty())
+/// the visibility difference this fact exists to catch. Whole elements only:
+/// a schema whose name merely contains such a fragment is kept.
+fn without_temp_schemas(elements: Vec<String>) -> Vec<String> {
+    elements
+        .into_iter()
         .filter(|part| {
             let temp = |prefix: &str| {
                 part.strip_prefix(prefix)
@@ -275,8 +278,7 @@ fn without_temp_schemas(path: &str) -> String {
             };
             !(temp("pg_temp_") || temp("pg_toast_temp_"))
         })
-        .collect();
-    format!("{{{}}}", kept.join(","))
+        .collect()
 }
 
 /// The write path as the dialect renders it: every part quoted, so a schema
@@ -301,23 +303,33 @@ fn required(row: &pbps_db::Row, field: &str, what: &str) -> Result<String, DbErr
 mod tests {
     use super::{render_path, without_temp_schemas};
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
     #[test]
     fn a_sessions_own_temporary_schema_is_not_part_of_its_visibility() {
         assert_eq!(
-            without_temp_schemas("{pg_catalog,pg_temp_3}"),
-            "{pg_catalog}"
+            without_temp_schemas(names(&["pg_catalog", "pg_temp_3"])),
+            names(&["pg_catalog"])
         );
         assert_eq!(
-            without_temp_schemas("{pg_catalog,b,pg_toast_temp_12,pg_temp_12}"),
-            "{pg_catalog,b}"
+            without_temp_schemas(names(&[
+                "pg_catalog",
+                "b",
+                "pg_toast_temp_12",
+                "pg_temp_12"
+            ])),
+            names(&["pg_catalog", "b"])
         );
         // Only the numbered temporary namespaces go; a user schema that
-        // merely starts with the prefix stays, as does order.
+        // merely starts with the prefix stays, as does order, and so does a
+        // name that only contains such a fragment (finding on #688).
         assert_eq!(
-            without_temp_schemas("{pg_temp_archive,b,a}"),
-            "{pg_temp_archive,b,a}"
+            without_temp_schemas(names(&["pg_temp_archive", "b", "a", "x,pg_temp_3,y"])),
+            names(&["pg_temp_archive", "b", "a", "x,pg_temp_3,y"])
         );
-        assert_eq!(without_temp_schemas("{}"), "{}");
+        assert_eq!(without_temp_schemas(Vec::new()), Vec::<String>::new());
     }
 
     #[test]
