@@ -224,7 +224,6 @@ fn expected_visibility_is_pg_catalog_then_the_usable_path_schemas_in_order() {
         ]
         .into_iter()
         .collect(),
-        objects: BTreeMap::new(),
         roles: BTreeMap::new(),
         settings: BTreeMap::new(),
     };

@@ -27,16 +27,6 @@ pub const RULE: &str = "pg-auth-v1";
 /// The privileges the context measures for each kind of object. Enough to
 /// bind a creation against existing objects; not an audit of every grant.
 const SCHEMA_PRIVILEGES: &[&str] = &["USAGE", "CREATE"];
-const TABLE_PRIVILEGES: &[&str] = &[
-    "SELECT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "REFERENCES",
-    "TRIGGER",
-];
-const FUNCTION_PRIVILEGES: &[&str] = &["EXECUTE"];
-
 /// The GUCs a role- or database-level setting may pin that change binding or
 /// loaded code; the same list the compatibility rule compares, so a
 /// role-scoped `session_preload_libraries` is part of the context.
@@ -62,14 +52,6 @@ pub struct SchemaAuthorization {
     pub acl: BTreeMap<String, Vec<String>>,
 }
 
-/// What one in-scope object grants the deployer.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ObjectAuthorization {
-    pub kind: String,
-    pub owner: String,
-    pub privileges: BTreeMap<String, bool>,
-}
-
 /// A role in the deployer's authorization closure, and what about it a
 /// reproduction must mirror.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -88,7 +70,6 @@ pub struct RoleAttributes {
 pub struct AuthorizationContext {
     pub principal: DeploymentPrincipal,
     pub schemas: BTreeMap<String, SchemaAuthorization>,
-    pub objects: BTreeMap<String, ObjectAuthorization>,
     pub roles: BTreeMap<String, RoleAttributes>,
     /// Effective role- and database-scoped settings for the deployer, keyed
     /// `<scope>:<name>` where scope is `role`, `database` or `database-role`.
@@ -133,7 +114,6 @@ pub async fn read(
 ) -> Result<AuthorizationContext, DbError> {
     let principal = principal(conn).await?;
     let mut schema_auth = BTreeMap::new();
-    let mut objects = BTreeMap::new();
     for schema in schemas {
         let owner = schema_owner(conn, schema).await?;
         schema_auth.insert(
@@ -144,12 +124,13 @@ pub async fn read(
                 acl: schema_acl(conn, schema).await?,
             },
         );
-        objects.extend(object_privileges(conn, schema).await?);
     }
+    // In-scope object privileges are reconstructed and verified once the
+    // objects exist on scratch, which is #613; a fresh scratch database has
+    // none to compare here, so they are not captured in this step.
     Ok(AuthorizationContext {
         principal,
         schemas: schema_auth,
-        objects,
         roles: role_attributes(conn).await?,
         settings: settings(conn).await?,
     })
@@ -220,83 +201,6 @@ async fn schema_privileges(
         privileges.insert((*privilege).to_owned(), boolean(&rows, "allowed")?);
     }
     Ok(privileges)
-}
-
-async fn object_privileges(
-    conn: &mut impl QueryConnection,
-    schema: &str,
-) -> Result<BTreeMap<String, ObjectAuthorization>, DbError> {
-    let mut objects = BTreeMap::new();
-    // Relations: tables, views, materialised views, partitioned tables.
-    let relations = conn
-        .query(&format!(
-            "SELECT c.relname::text AS name, c.relkind::text AS kind, \
-                    pg_catalog.pg_get_userbyid(c.relowner) AS owner \
-             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = {} AND c.relkind IN ('r','v','m','p') ORDER BY 1",
-            literal(schema)
-        ))
-        .await?;
-    for row in &relations {
-        let name = required(row, "name", "a relation's name")?;
-        let qualified = format!("{schema}.{name}");
-        let mut privileges = BTreeMap::new();
-        for privilege in TABLE_PRIVILEGES {
-            let rows = conn
-                .query(&format!(
-                    "SELECT pg_catalog.has_table_privilege({}, {})::text AS allowed",
-                    literal(&qualified_literal(schema, &name)),
-                    literal(privilege)
-                ))
-                .await?;
-            privileges.insert((*privilege).to_owned(), boolean(&rows, "allowed")?);
-        }
-        objects.insert(
-            qualified,
-            ObjectAuthorization {
-                kind: required(row, "kind", "a relation's kind")?,
-                owner: required(row, "owner", "a relation's owner")?,
-                privileges,
-            },
-        );
-    }
-    // Routines, addressed by OID so overloads stay distinct.
-    let routines = conn
-        .query(&format!(
-            "SELECT p.oid::bigint AS oid, \
-                    (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')') AS name, \
-                    pg_catalog.pg_get_userbyid(p.proowner) AS owner \
-             FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = {} ORDER BY 2",
-            literal(schema)
-        ))
-        .await?;
-    for row in &routines {
-        let oid: i64 = required(row, "oid", "a routine's oid")?
-            .parse()
-            .map_err(|_| DbError::BadRow("a routine oid was not an integer".into()))?;
-        let name = required(row, "name", "a routine's identity")?;
-        let mut privileges = BTreeMap::new();
-        for privilege in FUNCTION_PRIVILEGES {
-            let rows = conn
-                .query(&format!(
-                    "SELECT pg_catalog.has_function_privilege({}::oid, {})::text AS allowed",
-                    oid,
-                    literal(privilege)
-                ))
-                .await?;
-            privileges.insert((*privilege).to_owned(), boolean(&rows, "allowed")?);
-        }
-        objects.insert(
-            format!("{schema}.{name}"),
-            ObjectAuthorization {
-                kind: "routine".into(),
-                owner: required(row, "owner", "a routine's owner")?,
-                privileges,
-            },
-        );
-    }
-    Ok(objects)
 }
 
 /// Every role the deployer inherits from or can switch to, with what a
@@ -385,7 +289,12 @@ impl RoleMap {
     /// `token` is the run's unique suffix (the scratch names' token); run-local
     /// roles are `pbps_role_<n>_<token>`, which the identifier rules refuse to
     /// confuse with a production name.
-    pub fn generate(context: &AuthorizationContext, run_login: &str, token: &str) -> Self {
+    pub fn generate(
+        context: &AuthorizationContext,
+        planned: &[PlannedGrant],
+        run_login: &str,
+        token: &str,
+    ) -> Self {
         let mut logical = BTreeSet::new();
         logical.insert(context.principal.effective.clone());
         logical.extend(context.roles.keys().cloned());
@@ -395,6 +304,14 @@ impl RoleMap {
                 if grantee != "PUBLIC" {
                     logical.insert(grantee.clone());
                 }
+            }
+        }
+        // A plan's grant may name a role that is neither in the deployer's
+        // closure nor already a grantee, so it must be mapped too or
+        // `apply_planned` has no run-local role for it (finding on #688).
+        for grant in planned {
+            if grant.role != "PUBLIC" {
+                logical.insert(grant.role.clone());
             }
         }
         let to_run_local = logical
@@ -757,6 +674,26 @@ pub async fn verify(
             differences.push(format!("schema:{name}:acl"));
         }
     }
+    // Role attributes, mapped back to logical names: a reproduction must give
+    // the deployer the same closure with the same superuser/inherit/switch
+    // standing, or a privilege answer could match today and diverge later.
+    let got_roles: BTreeMap<String, &RoleAttributes> = reproduced
+        .roles
+        .iter()
+        .filter_map(|(name, attrs)| map.logical_of(name).map(|logical| (logical, attrs)))
+        .collect();
+    for (name, want) in &target.roles {
+        match got_roles.get(name) {
+            Some(got) if *got == want => {}
+            Some(_) => differences.push(format!("role:{name}")),
+            None => differences.push(format!("role:{name}:absent")),
+        }
+    }
+    // Role- and database-scoped settings must reproduce exactly; their keys
+    // name a scope and GUC, not a role, so they compare directly.
+    if reproduced.settings != target.settings {
+        differences.push("settings".into());
+    }
     Ok(differences)
 }
 
@@ -766,17 +703,6 @@ pub async fn verify(
 /// ending the literal.
 fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
-}
-
-/// `has_table_privilege` takes one text argument naming the relation; a
-/// schema or table containing a dot or a quote is quoted as two identifiers
-/// so it resolves to exactly that object.
-fn qualified_literal(schema: &str, name: &str) -> String {
-    format!(
-        "\"{}\".\"{}\"",
-        schema.replace('"', "\"\""),
-        name.replace('"', "\"\"")
-    )
 }
 
 fn boolean(rows: &[Row], field: &str) -> Result<bool, DbError> {
@@ -829,7 +755,6 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            objects: BTreeMap::new(),
             roles: [(
                 "app_reader".to_owned(),
                 RoleAttributes {

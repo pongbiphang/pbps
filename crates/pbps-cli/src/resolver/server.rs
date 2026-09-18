@@ -1127,7 +1127,7 @@ impl ScratchRun {
         // cleanup drops them even if reconstruction fails part-way.
         let login = self.names.login().to_owned();
         let token = login[login.len().saturating_sub(16)..].to_owned();
-        let map = RoleMap::generate(&target_auth, &login, &token);
+        let map = RoleMap::generate(&target_auth, &request.planned, &login, &token);
         self.inner.control.roles = map.run_local_names();
         // Reconstruction's schema and grant DDL is database-local, so it must
         // run *in* the scratch database — the control session is on the
@@ -1177,6 +1177,40 @@ impl ScratchRun {
         // its forwarder and reports it if that cannot be confirmed.
         self.inner.control.retire(reconstruction);
         outcome?;
+        // The scratch session opened before reconstruction, so it did not load
+        // the role and database defaults reconstruction set — an `ALTER ROLE
+        // ... SET`, and `session_preload_libraries`, which a live session
+        // cannot load at all. Reopen it so the environment read observes the
+        // reproduced settings and any preloaded code (finding on #688).
+        {
+            let stale = self.scratch.take().ok_or(Error::Cancelled)?;
+            self.inner.control.retire(stale);
+            let reopened = {
+                let analysis = self.inner.live()?;
+                let control_pair = &self
+                    .inner
+                    .control
+                    .session
+                    .as_ref()
+                    .ok_or(Error::Cancelled)?
+                    .pair;
+                Session::open(
+                    self.inner.control.channel(),
+                    &analysis.runtime,
+                    StreamLogin {
+                        user: self.names.login().to_owned(),
+                        password: self.names.password().to_owned(),
+                        database: self.names.database().to_owned(),
+                    },
+                    &[control_pair],
+                )
+                .await?
+            };
+            if let Some(analysis) = self.inner.analysis.as_mut() {
+                analysis.opened += 1;
+            }
+            self.scratch = Some(reopened);
+        }
         // The authorization the reproduction is meant to have *after* the
         // plan's preceding grants, which scratch has already run; verification
         // and the fingerprint compare against this, not the pre-plan state.
@@ -1612,15 +1646,37 @@ fn expected_visibility(
                     visible.push(schema.clone());
                 }
             }
+            let rendered = format!(
+                "{{{}}}",
+                visible
+                    .iter()
+                    .map(|element| array_element(element))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             (
                 start.clone(),
-                pbps_db::resolver::Observation::reported(Some(&format!(
-                    "{{{}}}",
-                    visible.join(",")
-                ))),
+                pbps_db::resolver::Observation::reported(Some(&rendered)),
             )
         })
         .collect()
+}
+
+/// One element of a PostgreSQL array text, quoted the way the engine's own
+/// `::text` renders it: an element with a comma, quote, backslash, brace or
+/// whitespace, or an empty one, is double-quoted with `"` and `\` escaped, so
+/// a schema name with such a character serialises identically to
+/// `current_schemas(true)::text` (finding on #688).
+fn array_element(value: &str) -> String {
+    let needs_quotes = value.is_empty()
+        || value
+            .chars()
+            .any(|c| matches!(c, ',' | '"' | '\\' | '{' | '}') || c.is_whitespace());
+    if needs_quotes {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 /// Adds the forwarder names run-owned state still holds to what one exit

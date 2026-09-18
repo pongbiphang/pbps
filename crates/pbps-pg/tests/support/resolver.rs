@@ -560,15 +560,11 @@ mod auth610 {
         assert_eq!(context.principal.login, dep);
         assert!(!context.principal.superuser);
         // The engine's own effective answers: USAGE via the inherited reader,
-        // no CREATE, SELECT on the table but not INSERT.
+        // no CREATE. In-scope object privileges are #613, not captured here.
         let app = &context.schemas["app"];
         assert_eq!(app.owner, owner);
         assert!(app.privileges["USAGE"]);
         assert!(!(app.privileges["CREATE"]));
-        let table = &context.objects["app.t"];
-        assert_eq!(table.owner, owner);
-        assert!(table.privileges["SELECT"]);
-        assert!(!(table.privileges["INSERT"]));
         // The owner is switchable (SET, no inherit); the reader is inherited.
         assert!(context.roles[&owner].can_set);
         assert!(!context.roles[&owner].inherits);
@@ -738,7 +734,7 @@ mod recon610 {
         let target = read(&mut planning, &schemas).await.unwrap();
 
         // Reconstruct on scratch as the admin.
-        let map = RoleMap::generate(&target, &run_login, &format!("t{pid}"));
+        let map = RoleMap::generate(&target, &[], &run_login, &format!("t{pid}"));
         // Every run-local name is a fresh pbps_role_ identifier, never a
         // production name.
         assert!(
@@ -904,7 +900,7 @@ mod recon610_public {
         assert!(!target.schemas["public"].privileges["CREATE"]);
         assert!(target.schemas["public"].acl.contains_key("PUBLIC"));
 
-        let map = RoleMap::generate(&target, &run_login, &format!("p{pid}"));
+        let map = RoleMap::generate(&target, &[], &run_login, &format!("p{pid}"));
         let mut scratch_admin =
             Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
                 .await
@@ -1016,7 +1012,7 @@ mod recon610_super {
         assert!(target.principal.superuser);
         assert_eq!(target.schemas["public"].owner, "pg_database_owner");
 
-        let map = RoleMap::generate(&target, &run_login, &format!("s{pid}"));
+        let map = RoleMap::generate(&target, &[], &run_login, &format!("s{pid}"));
         let mut scratch_admin =
             Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
                 .await
