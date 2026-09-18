@@ -1713,7 +1713,108 @@ fn a_staged_revision_may_still_create_one_routine() {
     );
 }
 
-/// The engine's default is not the last word on what a new routine arrives
+/// SPEC §7.6, the case it names and the read it names it at.
+///
+/// A staged run commits each statement on its own, so another session can
+/// reverse what a statement just wrote before the checkpoint reads it back.
+/// §7.6 does not promise the checkpoint catches that — the field is expected
+/// to move there, and the checkpoint cannot tell the plan'"'"'s statement from the
+/// other session'"'"'s — it promises the **closing** read does, by holding the
+/// field to the value the plan promised.
+///
+/// The other session is a DDL event trigger, which is how this suite stands
+/// one in: measured, `ddl_command_end` fires on `GRANT`, so the revoke lands
+/// after the plan'"'"'s own grant and before anything reads the catalog back.
+/// What `PUBLIC` holds is in no `Schema` (DECISIONS 371), so nothing in the
+/// movement comparison could have caught it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_routine_reopened_or_closed_behind_the_plan_refuses_to_close_the_run() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-public-snatch");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-public-snatch");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+
+    // The concurrent writer: it takes back exactly what the plan'"'"'s `GRANT`
+    // just wrote, in the moment after it commits.
+    on_server(
+        connection,
+        "CREATE FUNCTION public.snatch() RETURNS event_trigger LANGUAGE plpgsql AS $$          BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE command_tag = 'GRANT')          AND to_regprocedure('app.open()') IS NOT NULL          THEN REVOKE EXECUTE ON ROUTINE app.open() FROM PUBLIC; END IF; END $$;          CREATE EVENT TRIGGER snatch_grant ON ddl_command_end EXECUTE FUNCTION public.snatch()",
+    );
+
+    let refused = approved_apply(&d, connection, &plan, &["--staged"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("app.open()"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("declared it would stay"),
+        "{}",
+        stderr(&refused)
+    );
+    // The routine is there — the statements ran and committed — and it is the
+    // *closing* that refused, which is the honest answer: the ledger keeps
+    // the last checkpoint rather than recording a success it cannot vouch for.
+    assert_eq!(scalar(connection, "SELECT app.open()::bigint"), 1);
+    assert!(!public_executes(connection, "app.open()"));
+
+    // A resume alone does not mend it, and should not pretend to: every
+    // statement has already run, so there is no `GRANT` left to re-issue and
+    // the read finds the same thing again. The refusal is not a retryable
+    // hiccup, it is a report that somebody else moved the field.
+    on_server(connection, "DROP EVENT TRIGGER snatch_grant");
+    let again = approved_apply(&d, connection, &plan, &["--staged", "--resume"]);
+    assert_eq!(code(&again), 1, "{}{}", stdout(&again), stderr(&again));
+    assert!(
+        stderr(&again).contains("declared it would stay"),
+        "{}",
+        stderr(&again)
+    );
+
+    // Settling what moved is the operator's step, and then it closes — which
+    // is what the refusal told them to do.
+    on_server(connection, "GRANT EXECUTE ON ROUTINE app.open() TO PUBLIC");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--staged", "--resume"],
+    ));
+    assert!(public_executes(connection, "app.open()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// The engine'"'"'s default is not the last word on what a new routine arrives
 /// holding. A cluster whose deployment role has run `ALTER DEFAULT PRIVILEGES
 /// REVOKE EXECUTE ON ROUTINES FROM PUBLIC` creates routines with an explicit
 /// ACL that `PUBLIC` is not in — so an opt-in that emitted nothing, trusting

@@ -57,6 +57,14 @@ pub struct Scoped {
 
     /// Roles the identity file names that the database does not have.
     pub missing_roles: Vec<String>,
+
+    /// The managed routines this read found `PUBLIC` able to execute
+    /// (ADR-0010 §5). Filled by the caller from what introspection reported,
+    /// for the same reason `unexpressible` is: what `PUBLIC` holds is never
+    /// part of the comparison (DECISIONS 371), so it cannot live in
+    /// [`Scoped::schema`] — and a postcondition that has to ask what a plan
+    /// achieved about `PUBLIC` has nowhere else to read it from.
+    pub public_execute: pbps_model::PublicExecute,
 }
 
 /// Cuts a live schema down to the managed set.
@@ -159,6 +167,7 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
         unmanaged_roles,
         missing_roles,
         unexpressible: Vec::new(),
+        public_execute: Default::default(),
     }
 }
 

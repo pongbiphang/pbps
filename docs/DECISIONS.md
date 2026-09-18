@@ -13792,6 +13792,20 @@ SPEC is in sync with all of these.
      stale artifact always had — plan again, and take the new plan through
      the gate.
 
+     **The closing read holds the routine to it.** SPEC §7.6 does not promise
+     a checkpoint catches a concurrent change to the field the plan is itself
+     changing — the field is expected to move there, and the checkpoint cannot
+     tell the plan's statement from the other session's — but it does promise
+     the closing read catches it. A staged run commits the `CREATE` and the
+     decision's own statement separately, so another session can reverse what
+     the plan just wrote; and 371 keeps what `PUBLIC` holds out of every
+     `Schema`, so the movement comparison had nowhere to see it. The decision
+     is therefore checked against the read's own `public_execute` context, a
+     postcondition of its own carried beside the comparison exactly as a
+     `WITH GRANT OPTION` is (95). A resume does not mend it and does not
+     pretend to: every statement has run, so what the read reports is a fact
+     about the database and not a retryable hiccup.
+
      **What a pull does with it.** The routines the database lets `PUBLIC`
      execute ride beside the pulled schema and are written into those
      declarations as `public_execute: true`. Still not a grant and still not
