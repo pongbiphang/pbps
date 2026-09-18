@@ -432,12 +432,22 @@ pub struct RawGrant {
     /// tool can remove: holding `WITH GRANT OPTION`, it grants onward and the
     /// entry records *itself*, not the owner. Measured on 18.6:
     /// `go_deployer` granted `go_reader` (`go_reader=r/go_deployer`) and its
-    /// own `REVOKE` took it back. So the exemption is the connection's own
-    /// role, [`RawCatalog::session_role`], and **not** the roles it is a
-    /// member of: also measured, `go_deployer` inheriting `go_mid`
-    /// (`pg_has_role` true) revoked nothing of `go_reader=r/go_mid`, and
-    /// reported success doing it.
+    /// own `REVOKE` took it back.
+    ///
+    /// The name alone does not decide it, which is why
+    /// [`RawGrant::revocable`] exists beside it. An inherited grantor counts
+    /// too when nothing competes with it — measured, `ih_deploy` inheriting
+    /// `ih_mid` and holding no direct option removed `ih_reader=r/ih_mid`,
+    /// while the same revoke with a competing direct option in place removed
+    /// nothing and reported success (DECISIONS 483). This field is what the
+    /// report names; the decision is the engine's.
     pub grantor: String,
+    /// Whether a `REVOKE` from this connection would remove this entry — the
+    /// question [`crate::catalog::revocable_by_current_role`] puts to the
+    /// engine, because only the engine knows which grantor it would select.
+    ///
+    /// The grantor's *name* is beside it for the report; this is the answer.
+    pub revocable: bool,
 }
 
 /// A routine with an explicitly empty ACL: no grant row can represent it.
@@ -1054,36 +1064,44 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // is built, run, and refused by its own read-back — the right answer
         // at the wrong end of the apply.
         //
-        // Two grantors are exempt, and they are the two whose entries a
-        // statement from this connection can actually remove.
+        // A `REVOKE` removes only the entries its own grantor put there, and
+        // which grantor a statement from this connection carries is the
+        // engine's decision rather than a name comparison: a direct grant
+        // option selects this role, and a *unique* inherited option selects
+        // the role it came through — measured, and recorded as DECISIONS 483.
+        // So the question goes to the engine beside the read
+        // (`revocable_by_current_role`), the same expression `doctor` asks it
+        // with.
         //
-        // The **owner**, which is the grantor of every entry `acldefault`
-        // supplies and of every grant this tool makes through a superuser, on
-        // somebody else's object included (both measured on 18.6).
+        // The **owner**'s own entries are exempt ahead of that answer, and
+        // deliberately: they are what `acldefault` supplies and what a
+        // superuser's grant on somebody else's object is recorded as (both
+        // measured on 18.6). A least-privilege deployer cannot revoke them
+        // either — the pull is *run* as that account, by design (DECISIONS
+        // 375) — and reporting them here would refuse to read the databases
+        // this tool is built to deploy into. That narrowing is #696's, with
+        // the deployment-privilege question it needs answering first.
         //
-        // And **this connection's own role**: a least-privilege deployer
-        // holding `WITH GRANT OPTION` grants onward under its own name, and
-        // takes it back the same way (measured). Its own grants are ordinary
-        // managed grants, and reporting them would refuse the narrowing plan
-        // it is entitled to run.
-        //
-        // Membership is not a third case. `go_deployer`, an inheriting member
-        // of the grantor `go_mid`, revoked nothing and said it had — so the
-        // test is the session's role, not `pg_has_role` (measured).
-        if g.grantor != g.owner && g.grantor != raw.session_role {
+        // Folded in regardless, a grant this connection cannot revoke
+        // produces a plan that narrows the role, an apply that runs, and a
+        // closing read that refuses it for not having achieved its own
+        // postcondition — the right answer at the wrong end of the apply
+        // (#251).
+        if g.grantor != g.owner && !g.revocable {
             unexpressible(
                 pulled,
                 Some(target),
                 format!(
-                    "role {grantee}: {} on {} was granted by `{}`, which is neither the \
-                     object's owner `{}` nor this connection's own role `{}` — and a \
-                     `REVOKE` removes only what its own grantor granted, so nothing this \
-                     tool can run takes it away (ADR-0010 §1, measured)",
+                    "role {grantee}: {} on {} was granted by `{}`, and a `REVOKE` from \
+                     `{}` would not carry that grantor — so nothing this tool can run \
+                     takes it away. Select `{}` explicitly, or have its owner `{}` revoke \
+                     it (ADR-0010 §1, DECISIONS 483, measured)",
                     g.permission,
                     target_label(g, &signatures),
                     g.grantor,
-                    g.owner,
-                    raw.session_role
+                    raw.session_role,
+                    g.grantor,
+                    g.owner
                 ),
             );
             continue;
@@ -2684,6 +2702,11 @@ mod tests {
             defaulted: false,
             owner: "deploy".to_owned(),
             grantor: "deploy".to_owned(),
+            // The engine's answer, which the fixtures set directly: what
+            // `add_roles` does with an entry it cannot revoke is this file's
+            // business, and which entries those are is
+            // `catalog::revocable_by_current_role`'s.
+            revocable: true,
         }
     }
 
@@ -3103,7 +3126,7 @@ mod tests {
     /// grant and not pbps's own.
     #[test]
     fn a_grant_made_by_a_third_role_is_reported_rather_than_folded_into_the_set() {
-        let third = |grantor: &str| {
+        let third = |grantor: &str, revocable: bool| {
             let mut g = grant(
                 Some("app_reader"),
                 Some("customer"),
@@ -3111,20 +3134,24 @@ mod tests {
                 "SELECT",
             );
             g.grantor = grantor.to_owned();
+            g.revocable = revocable;
             g
         };
 
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
-            grants: vec![third("app_mid")],
+            grants: vec![third("app_mid", false)],
             ..declaring('f', &[])
         });
         assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
         assert_eq!(pulled.unexpressible.len(), 1);
         let what = &pulled.unexpressible[0].what;
         assert!(what.contains("granted by `app_mid`"), "{what}");
-        assert!(what.contains("`deploy`"), "{what}");
-        assert!(what.contains("removes only what its own grantor"), "{what}");
+        assert!(what.contains("`deployer`"), "{what}");
+        assert!(
+            what.contains("nothing this tool can run takes it away"),
+            "{what}"
+        );
         assert!(
             pulled.unexpressible[0].target.is_some(),
             "the object is nameable, so the finding carries it"
@@ -3134,7 +3161,7 @@ mod tests {
         // somebody else's object is recorded as — is an ordinary grant.
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
-            grants: vec![third("deploy")],
+            grants: vec![third("deploy", true)],
             ..declaring('f', &[])
         });
         assert!(
@@ -3154,7 +3181,7 @@ mod tests {
         // entitled to run would be refused instead.
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
-            grants: vec![third("deployer")],
+            grants: vec![third("deployer", true)],
             ..declaring('f', &[])
         });
         assert!(

@@ -2205,6 +2205,109 @@ fn a_grant_on_a_table_this_plan_creates_is_checked_against_its_coming_owner() {
     );
 }
 
+/// Issue #251, and the reason the grantor rule asks the engine rather than
+/// comparing names.
+///
+/// A `REVOKE` carries the grantor PostgreSQL selects for it, and an inherited
+/// one counts when nothing competes with it (DECISIONS 483). **Measured** on
+/// 18.6: `ih_deploy`, an inheriting member of `ih_mid` and holding no direct
+/// option of its own, removed `ih_reader=r/ih_mid`; with a competing direct
+/// option in place the same statement removed nothing and reported success.
+///
+/// So the deployer here can narrow a role whose grants a role it inherits
+/// made, and a name comparison would refuse that valid plan.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_from_a_role_the_deployer_inherits_is_one_it_can_still_narrow() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_ih_owner_{pid}");
+    let mid = format!("pbps_ih_mid_{pid}");
+    let deployer = format!("pbps_ih_deploy_{pid}");
+    let reader = format!("pbps_ih_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), mid.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; CREATE ROLE {mid} LOGIN NOSUPERUSER \
+             PASSWORD 'trigger-test'; CREATE ROLE {deployer} LOGIN NOSUPERUSER INHERIT \
+             PASSWORD 'trigger-test'; CREATE ROLE {reader} NOSUPERUSER; \
+             GRANT {mid} TO {deployer}"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "inherited-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT SELECT, INSERT ON app.t TO {mid} WITH GRANT OPTION; \
+             GRANT USAGE ON SCHEMA app TO {reader}, {mid}"
+        ),
+    );
+    // The entry this test is about: made by `mid`, which the deployer
+    // inherits and holds no competing direct option against.
+    on_server(
+        &as_role(connection, &mid),
+        &format!("GRANT SELECT, INSERT ON app.t TO {reader}"),
+    );
+    let deployment = as_role(connection, &deployer);
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+    assert_eq!(granted("INSERT"), 1);
+
+    let d = Demo::new("inherited-grantor");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database a role this deployer inherits granted into",
+    ]));
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("revoke insert on app.t"),
+        "{}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 0);
+    succeeds(d.run(&["verify", "--db", &deployment]));
+}
+
 /// Issue #251, the other half of the grantor rule. A `REVOKE` matches on the
 /// grantor, and a least-privilege deployer holding `WITH GRANT OPTION` is the
 /// second grantor whose entries this connection can match: it granted them

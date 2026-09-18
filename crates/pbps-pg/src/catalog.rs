@@ -1117,6 +1117,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             defaulted: flag(row, "defaulted")?,
             owner: text(row, "owner")?,
             grantor: text(row, "grantor")?,
+            revocable: flag(row, "revocable")?,
         });
     }
     for row in batch
@@ -1296,6 +1297,19 @@ SELECT r.rolname AS name, r.rolsuper AS superuser
 /// role as holding nothing on a table it can read a column of.
 fn grants_query() -> String {
     let not_one_of_our_tables = not_one_of_our_tables();
+    let relation_revocable = revocable_by_current_role(
+        "c.relowner",
+        "COALESCE(c.relacl, pg_catalog.acldefault(\
+         (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))",
+    );
+    let routine_revocable = revocable_by_current_role(
+        "p.proowner",
+        "COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))",
+    );
+    let schema_revocable = revocable_by_current_role(
+        "n.nspowner",
+        "COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))",
+    );
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS object_name,
                 'rel' AS source, c.relkind::text AS kind,
@@ -1305,13 +1319,16 @@ fn grants_query() -> String {
                 a.privilege_type, a.is_grantable,
                 c.relacl IS NULL AS defaulted,
                 pg_catalog.pg_get_userbyid(c.relowner) AS owner,
-                pg_catalog.pg_get_userbyid(a.grantor) AS grantor
+                pg_catalog.pg_get_userbyid(a.grantor) AS grantor,
+                {relation_revocable} AS revocable
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(c.relacl, pg_catalog.acldefault(
                     (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))) AS a
-          WHERE {NOT_AN_INDEX_OR_TOAST}
+           CROSS JOIN pg_catalog.pg_roles me
+          WHERE me.rolname = current_user
+            AND {NOT_AN_INDEX_OR_TOAST}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {not_one_of_our_tables}
          UNION ALL
@@ -1321,7 +1338,10 @@ fn grants_query() -> String {
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
                 false, pg_catalog.pg_get_userbyid(c.relowner),
-                pg_catalog.pg_get_userbyid(a.grantor)
+                pg_catalog.pg_get_userbyid(a.grantor),
+                -- A column-level grant is outside the model whatever its
+                -- grantor, and is reported before this is read (DECISIONS 97).
+                false
            FROM pg_catalog.pg_attribute at
            JOIN pg_catalog.pg_class c ON c.oid = at.attrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1336,12 +1356,14 @@ fn grants_query() -> String {
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
                 p.proacl IS NULL, pg_catalog.pg_get_userbyid(p.proowner),
-                pg_catalog.pg_get_userbyid(a.grantor)
+                pg_catalog.pg_get_userbyid(a.grantor),
+                {routine_revocable}
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))) AS a
-          WHERE {NOT_A_PROJECTS_SCHEMA}
+           CROSS JOIN pg_catalog.pg_roles me
+          WHERE me.rolname = current_user AND {NOT_A_PROJECTS_SCHEMA}
          UNION ALL
          SELECT n.nspname, NULL::text, 'nsp', '',
                 NULL::int8, NULL::text,
@@ -1349,11 +1371,13 @@ fn grants_query() -> String {
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
                 n.nspacl IS NULL, pg_catalog.pg_get_userbyid(n.nspowner),
-                pg_catalog.pg_get_userbyid(a.grantor)
+                pg_catalog.pg_get_userbyid(a.grantor),
+                {schema_revocable}
            FROM pg_catalog.pg_namespace n
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))) AS a
-          WHERE {NOT_A_PROJECTS_SCHEMA}
+           CROSS JOIN pg_catalog.pg_roles me
+          WHERE me.rolname = current_user AND {NOT_A_PROJECTS_SCHEMA}
          ORDER BY 1, 2, 6, 7, 8"
     )
 }
@@ -1421,6 +1445,44 @@ fn owners_query() -> String {
            FROM pg_catalog.pg_namespace n
           WHERE {NOT_A_PROJECTS_SCHEMA}
          ORDER BY 1, 2, 5"
+    )
+}
+
+/// Whether a `REVOKE` from this connection would remove an ACL entry.
+///
+/// An effective grant option answers `GRANT`, not `REVOKE`: PostgreSQL only
+/// changes the entries attributed to the grantor it selects. Owner and
+/// superuser act as the owner; otherwise the current role wins when it holds a
+/// **direct** option, and a **unique inherited** option is sufficient too —
+/// measured on 18.6, `ih_deploy` inheriting `ih_mid` and holding no direct
+/// option of its own revoked `ih_reader=r/ih_mid`, while the same revoke with
+/// a competing direct option in place removed nothing and reported success.
+/// Competing inherited paths need explicit role selection, because PostgreSQL
+/// does not promise which one wins (DECISIONS 483).
+///
+/// One original grantor per grantee and target as well: a single emitted
+/// `REVOKE` cannot combine two grantors' authority, so a grantee holding
+/// entries from two of them is not narrowable by one statement.
+///
+/// `owner` and `acl` are the catalog columns of the securable in the caller's
+/// query; the caller supplies `me` as a `pg_roles` row for `current_user`.
+pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
+    format!(
+        "COALESCE(a.grantor = CASE
+             WHEN me.rolsuper OR me.oid = {owner} THEN {owner}
+             WHEN EXISTS (SELECT FROM pg_catalog.aclexplode({acl}) own
+                 WHERE own.grantee = me.oid AND own.is_grantable
+                   AND own.privilege_type = a.privilege_type) THEN me.oid
+             ELSE (SELECT min(candidate.oid::bigint)::oid FROM (
+                 SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
+                 UNION
+                 SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
+                  WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
+                    AND opt.grantee <> 0
+                    AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
+             ) candidate HAVING count(*) = 1)
+         END, false) AND (SELECT count(DISTINCT grantor)
+             FROM pg_catalog.aclexplode({acl}) WHERE grantee = a.grantee) = 1"
     )
 }
 
