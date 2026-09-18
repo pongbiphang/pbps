@@ -1043,7 +1043,9 @@ struct QualifiedScope {
     report: ScopeReport,
     authorization: AuthorizationFingerprint,
     target_facts: EnvironmentFacts,
-    target_auth: AuthorizationContext,
+    /// The deployer's authorization as it is meant to be after the plan's
+    /// preceding grants — what a reproduction is verified against.
+    expected_auth: AuthorizationContext,
     map: RoleMap,
     schemas: Vec<String>,
     write_path_extras: Vec<String>,
@@ -1139,12 +1141,21 @@ impl ScratchRun {
                 .await
                 .map_err(db)?;
         }
+        // The authorization the reproduction is meant to have *after* the
+        // plan's preceding grants, which scratch has already run; verification
+        // and the fingerprint compare against this, not the pre-plan state.
+        let expected_auth = authorization::with_planned(target_auth, &request.planned);
         let deployer = map
-            .deployer(&target_auth)
+            .deployer(&expected_auth)
             .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
-        // Read the scratch side as the reproduced deployer, then its engine's
-        // executables. Two disjoint borrows, sequenced so neither overlaps.
-        let (scratch_catalog, auth_differences, scratch_connection) = {
+        // The libraries to look for on scratch are the target's, not the fresh
+        // scratch catalog's, which has no extensions installed yet.
+        let required =
+            crate::resolver::native::executables::required_libraries(&target_facts.catalog);
+        // Read the scratch side as the reproduced deployer: catalog and the
+        // reproduced authorization over the connection, then the backend's
+        // executables, which include any session-preloaded code.
+        let (scratch_facts, auth_differences, scratch_connection) = {
             let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
             let connection = scratch.connection.id();
             scratch
@@ -1162,23 +1173,24 @@ impl ScratchRun {
             let differences = authorization::verify(
                 &mut scratch.connection,
                 &map,
-                &target_auth,
+                &expected_auth,
                 &request.schemas,
             )
             .await
             .map_err(db)?;
-            (catalog, differences, connection)
-        };
-        let required = crate::resolver::native::executables::required_libraries(&scratch_catalog);
-        let executables = {
-            let engine = self.inner.live()?.runtime.engine();
-            crate::resolver::native::executables::executables(engine, &required).map_err(|_| {
-                Error::Scope("the scratch engine's executables are unreadable".into())
-            })?
-        };
-        let scratch_facts = EnvironmentFacts {
-            catalog: scratch_catalog,
-            executables,
+            let executables =
+                crate::resolver::native::executables::executables(&scratch.backend, &required)
+                    .map_err(|_| {
+                        Error::Scope("the scratch backend's executables are unreadable".into())
+                    })?;
+            (
+                EnvironmentFacts {
+                    catalog,
+                    executables,
+                },
+                differences,
+                connection,
+            )
         };
         // Compare, folding the authorization reproduction into the report so a
         // deployer the scratch could not reproduce is a mismatch, not a pass.
@@ -1195,13 +1207,13 @@ impl ScratchRun {
         let verdict = report.verdict();
         let authorization = AuthorizationFingerprint {
             rule: RuleVersion::new(authorization::RULE),
-            digest: format!("{:x}", Sha256::digest(target_auth.canonical())),
+            digest: format!("{:x}", Sha256::digest(expected_auth.canonical())),
         };
         self.scope = Some(QualifiedScope {
             report,
             authorization,
             target_facts,
-            target_auth,
+            expected_auth,
             map,
             schemas: request.schemas.clone(),
             write_path_extras: request.write_path_extras.clone(),
@@ -1228,15 +1240,17 @@ impl ScratchRun {
         let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
         let deployer = scope
             .map
-            .deployer(&scope.target_auth)
+            .deployer(&scope.expected_auth)
             .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
         let target_facts = scope.target_facts.clone();
-        let target_auth = scope.target_auth.clone();
+        let expected_auth = scope.expected_auth.clone();
         let map = scope.map.clone();
         let schemas = scope.schemas.clone();
         let extras = scope.write_path_extras.clone();
         let sealed_connection = scope.scratch_connection;
-        let (scratch_catalog, auth_differences) = {
+        let required =
+            crate::resolver::native::executables::required_libraries(&target_facts.catalog);
+        let (scratch_facts, auth_differences) = {
             let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
             if scratch.connection.id() != sealed_connection {
                 return Err(Error::Scope(
@@ -1256,21 +1270,21 @@ impl ScratchRun {
                 .await
                 .map_err(db)?;
             let differences =
-                authorization::verify(&mut scratch.connection, &map, &target_auth, &schemas)
+                authorization::verify(&mut scratch.connection, &map, &expected_auth, &schemas)
                     .await
                     .map_err(db)?;
-            (catalog, differences)
-        };
-        let required = crate::resolver::native::executables::required_libraries(&scratch_catalog);
-        let executables = {
-            let engine = self.inner.live()?.runtime.engine();
-            crate::resolver::native::executables::executables(engine, &required).map_err(|_| {
-                Error::Scope("the scratch engine's executables are unreadable".into())
-            })?
-        };
-        let scratch_facts = EnvironmentFacts {
-            catalog: scratch_catalog,
-            executables,
+            let executables =
+                crate::resolver::native::executables::executables(&scratch.backend, &required)
+                    .map_err(|_| {
+                        Error::Scope("the scratch backend's executables are unreadable".into())
+                    })?;
+            (
+                EnvironmentFacts {
+                    catalog,
+                    executables,
+                },
+                differences,
+            )
         };
         let report = compatibility::compare(&target_facts, &scratch_facts, &[]);
         if report.verdict() != Verdict::Verified || !auth_differences.is_empty() {

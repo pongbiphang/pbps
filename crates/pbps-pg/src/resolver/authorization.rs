@@ -186,7 +186,8 @@ async fn schema_acl(
 ) -> Result<BTreeMap<String, Vec<String>>, DbError> {
     let rows = conn
         .query(&format!(
-            "SELECT COALESCE(pg_catalog.pg_get_userbyid(a.grantee), 'PUBLIC') AS grantee, \
+            "SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' \
+                         ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
                     a.privilege_type AS privilege \
              FROM pg_catalog.pg_namespace n \
              CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS a \
@@ -532,11 +533,27 @@ pub async fn reconstruct(
         let owner = map
             .run_local(&schema.owner)
             .ok_or_else(|| missing(&schema.owner))?;
+        // A fresh database from template0 already has `public`; recreating it
+        // fails. Create the schema only if absent, then set its owner and
+        // clear the default PUBLIC grants, so the ACL reproduced below is the
+        // target's exactly and not the template's defaults (finding on #610).
         admin
             .query(&format!(
-                "CREATE SCHEMA {} AUTHORIZATION {}",
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                quote_ident(name)
+            ))
+            .await?;
+        admin
+            .query(&format!(
+                "ALTER SCHEMA {} OWNER TO {}",
                 quote_ident(name),
                 quote_ident(&owner),
+            ))
+            .await?;
+        admin
+            .query(&format!(
+                "REVOKE ALL ON SCHEMA {} FROM PUBLIC",
+                quote_ident(name)
             ))
             .await?;
         for (grantee, privileges) in &schema.acl {
@@ -631,6 +648,65 @@ pub async fn apply_planned(
         admin.query(&statement).await?;
     }
     Ok(())
+}
+
+/// Applies the plan's preceding grants to a copy of the target context, so a
+/// scratch reproduction that ran those grants is compared against what the
+/// deployer's authorization is *meant* to be after them, not before (SPEC
+/// §7.6). The ACL is updated for each grant or revoke, and the deployer's
+/// effective schema answers are recomputed from the updated ACL, ownership
+/// and membership — the same inputs the engine uses for `has_schema_privilege`.
+pub fn with_planned(
+    mut context: AuthorizationContext,
+    grants: &[PlannedGrant],
+) -> AuthorizationContext {
+    for grant in grants {
+        let Some(schema) = context.schemas.get_mut(&grant.schema) else {
+            continue;
+        };
+        let entry = schema.acl.entry(grant.role.clone()).or_default();
+        entry.retain(|p| p != &grant.privilege);
+        if !grant.revoke {
+            entry.push(grant.privilege.clone());
+            entry.sort();
+        }
+        if entry.is_empty() {
+            schema.acl.remove(&grant.role);
+        }
+    }
+    recompute_schema_effective(&mut context);
+    context
+}
+
+/// Recomputes the deployer's effective USAGE/CREATE for each schema from the
+/// ACL, ownership and the deployer's role closure: a schema is usable if the
+/// deployer owns it, inherits its owner, or holds the privilege through
+/// PUBLIC, itself, or a role it inherits. This mirrors what the engine answers
+/// for schema privileges, so an expected context stays comparable to one read
+/// back from a real server.
+fn recompute_schema_effective(context: &mut AuthorizationContext) {
+    let deployer = context.principal.effective.clone();
+    let inherited: BTreeSet<String> = context
+        .roles
+        .iter()
+        .filter(|(_, attrs)| attrs.inherits)
+        .map(|(role, _)| role.clone())
+        .collect();
+    let holders = |grantee: &str| -> bool {
+        grantee == "PUBLIC" || grantee == deployer || inherited.contains(grantee)
+    };
+    for schema in context.schemas.values_mut() {
+        let owns = schema.owner == deployer || inherited.contains(&schema.owner);
+        for privilege in ["USAGE", "CREATE"] {
+            let granted = schema
+                .acl
+                .iter()
+                .any(|(grantee, privs)| holders(grantee) && privs.iter().any(|p| p == privilege));
+            schema
+                .privileges
+                .insert(privilege.to_owned(), owns || granted);
+        }
+    }
 }
 
 /// Reads the reconstructed context as the mapped deployer and names every

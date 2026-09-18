@@ -848,3 +848,137 @@ mod recon610 {
         }
     }
 }
+
+mod recon610_public {
+    use super::*;
+    use pbps_pg::resolver::authorization::{
+        PlannedGrant, RoleMap, apply_planned, read, reconstruct, verify, with_planned,
+    };
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn scratch_reuses_public_and_reproduces_planned_grants() {
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let pid = std::process::id();
+        let target_db = format!("pbps_pub_t_{pid}");
+        let scratch_db = format!("pbps_pub_s_{pid}");
+        let dep = format!("pbps_pdep_{pid}");
+        let run_login = format!("pbps_prun_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        for db in [&target_db, &scratch_db] {
+            admin
+                .execute(&format!(
+                    "CREATE DATABASE {db} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+                ))
+                .await
+                .unwrap();
+        }
+        admin
+            .execute(&format!(
+                "CREATE ROLE {dep} LOGIN PASSWORD 'd'; CREATE ROLE {run_login} LOGIN PASSWORD 'r'"
+            ))
+            .await
+            .unwrap();
+        admin
+            .execute(&format!("GRANT CONNECT ON DATABASE {target_db} TO {dep}"))
+            .await
+            .unwrap();
+        let schemas = ["public".to_owned()];
+
+        let deployer_url = server
+            .split_whitespace()
+            .filter(|p| !p.starts_with("user=") && !p.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut planning = Conn::connect(
+            Driver::Postgres,
+            &format!("{deployer_url} dbname={target_db} user={dep} password=d"),
+        )
+        .await
+        .unwrap();
+        // The default public schema: owned by pg_database_owner, USAGE to
+        // PUBLIC, no CREATE for the deployer.
+        let target = read(&mut planning, &schemas).await.unwrap();
+        assert_eq!(target.schemas["public"].owner, "pg_database_owner");
+        assert!(target.schemas["public"].privileges["USAGE"]);
+        assert!(!target.schemas["public"].privileges["CREATE"]);
+        assert!(target.schemas["public"].acl.contains_key("PUBLIC"));
+
+        let map = RoleMap::generate(&target, &run_login, &format!("p{pid}"));
+        let mut scratch_admin =
+            Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
+                .await
+                .unwrap();
+        // Reusing the existing public schema must not fail on "already exists".
+        reconstruct(&mut scratch_admin, &map, &target, &scratch_db)
+            .await
+            .unwrap();
+
+        let mut run = Conn::connect(
+            Driver::Postgres,
+            &format!("{deployer_url} dbname={scratch_db} user={run_login} password=r"),
+        )
+        .await
+        .unwrap();
+        let deployer_role = map.deployer(&target).unwrap();
+        run.execute(&format!("SET ROLE \"{deployer_role}\""))
+            .await
+            .unwrap();
+        assert!(
+            verify(&mut run, &map, &target, &schemas)
+                .await
+                .unwrap()
+                .is_empty(),
+            "public schema not reproduced"
+        );
+
+        // A planned CREATE grant to the deployer: the expected post-plan
+        // context has CREATE, scratch runs the grant, and verifying against
+        // the expected context (not the pre-plan one) holds.
+        let planned = [PlannedGrant {
+            role: dep.clone(),
+            schema: "public".into(),
+            privilege: "CREATE".into(),
+            revoke: false,
+        }];
+        let expected = with_planned(target.clone(), &planned);
+        assert!(expected.schemas["public"].privileges["CREATE"]);
+        // Verifying the pre-plan reproduction against the post-plan expectation
+        // must differ until the grant is applied.
+        assert!(
+            !verify(&mut run, &map, &expected, &schemas)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        apply_planned(&mut scratch_admin, &map, &planned)
+            .await
+            .unwrap();
+        assert!(
+            verify(&mut run, &map, &expected, &schemas)
+                .await
+                .unwrap()
+                .is_empty(),
+            "planned grant not reproduced against the expected context"
+        );
+
+        drop(planning);
+        drop(run);
+        drop(scratch_admin);
+        for db in [&target_db, &scratch_db] {
+            admin
+                .execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+                .await
+                .unwrap();
+        }
+        for role in map.run_local_names() {
+            admin
+                .execute(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .await
+                .unwrap();
+        }
+        for role in [&run_login, &dep] {
+            admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
+        }
+    }
+}

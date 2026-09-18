@@ -214,7 +214,10 @@ impl NativeTarget {
             .await
             .map_err(EnvironmentError::Catalog)?;
         let required = executables::required_libraries(&catalog);
-        let set = executables::executables(bound.lease.service(), &required)
+        // The backend, not the postmaster: `session_preload_libraries` and
+        // `local_preload_libraries` are loaded into the connected backend, so
+        // hashing the service process would miss them (finding on #610).
+        let set = executables::executables(bound.lease.owner(), &required)
             .map_err(|_| EnvironmentError::Executables)?;
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         Ok(EnvironmentFacts {
