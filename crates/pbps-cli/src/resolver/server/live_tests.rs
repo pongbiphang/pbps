@@ -700,3 +700,53 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
     );
     target.check().await.unwrap();
 }
+
+/// #610: a run reads the target's environment and deployer authorization,
+/// reproduces them on its scratch database, and compares the two through the
+/// lifecycle. Both the target and the supplied server are the same pinned
+/// image, so a fresh scratch reproduces the target and the scope verifies;
+/// the scope is bound to distinct connections, requalifies on a later check,
+/// and cleanup drops the run-local roles it created with nothing left over.
+#[tokio::test]
+#[ignore = "needs the dedicated-server fixture; run scripts/live-resolver-server.py"]
+async fn a_run_qualifies_its_analysis_scope_against_the_target() {
+    fixture();
+    if driver() != Driver::Postgres {
+        return; // SQL Server scope qualification is #611.
+    }
+    let mut target = native_target().await;
+    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .expect("scratch resources");
+
+    let request = crate::resolver::server::ScopeRequest {
+        schemas: vec!["public".to_owned()],
+        write_path_extras: Vec::new(),
+        planned: Vec::new(),
+    };
+    let verdict = run
+        .qualify(&mut target, &request)
+        .await
+        .expect("qualify runs");
+    assert_eq!(
+        verdict,
+        pbps_db::resolver::environment::Verdict::Verified,
+        "the scratch reproduces the target: {verdict:?}"
+    );
+    // The scope is sealed with a fingerprint and bound to two distinct
+    // connections, so a reopened session cannot present it as its own.
+    assert!(run.authorization_fingerprint().is_some());
+    let (target_conn, scratch_conn) = run.scope_connections().expect("bound connections");
+    assert_ne!(target_conn, scratch_conn);
+
+    // A later check requalifies the sealed scope and holds.
+    run.check().await.expect("requalification holds");
+
+    // Cleanup removes the scratch objects and every run-local role it created,
+    // reporting nothing left over.
+    run.close()
+        .await
+        .expect("cleanup confirms the run-local roles gone");
+}
