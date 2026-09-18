@@ -13925,3 +13925,37 @@ SPEC is in sync with all of these.
      `int8`, and measured, they keep their index scans. `ATTNUM` loses its own
      existence question with this: an empty result there now means the column
      is absent and nothing else (#269).
+
+520. **The analysis scope is qualified by comparing measured facts, reproducing
+     the deployer, and reading loaded executable content — not by trusting
+     versions (issue #610, ADR-0016 cases 5, 14, 16, 21, 23).**
+
+     A resolver run compiles only in a scratch environment measured equivalent
+     to the target's, as its own deployer would see it. `pg-analysis-scope-v1`
+     compares patch-level version, encoding, the provider's *actual* collation
+     version, every installable extension and its native libraries, the
+     effective settings the dialect does not pin, and the deployer's effective
+     visibility — all as three verdicts, where `Unknown` (a fact a side could
+     not read) refuses like a provisioning failure and never reads as a match.
+     A version string or an image tag is not an input to the rule, so neither
+     can pass a check.
+
+     Executable identity is content, not version: the engine image is hashed
+     through the held `/proc/<pid>/exe`, a loaded library through
+     `/proc/<pid>/map_files` (root, which the inspector has), and a required
+     but unloaded library as a disk candidate resolved the way the loader
+     would; a library replaced under a running process is caught by inode
+     identity between `maps` and the path, never by device number, which
+     overlayfs reports from different filesystems.
+
+     The deployer is the planning connection's `current_user`, never the
+     scratch administrator. Its authorization is reproduced on scratch with
+     run-local roles named `pbps_role_<n>_<token>` — renamed freely because the
+     emitter's write path cannot contain `"$user"`, so identity is carried by
+     a role map, not the name — created NOLOGIN with the measured attributes
+     and memberships, reachable only under an explicit `SET ROLE`. Compilation
+     as the setup administrator fails the negative control. The reproduction is
+     verified by re-reading it as the mapped deployer; anything unreproduced is
+     a mismatch. The scope is sealed to the target and scratch connections, so
+     a reopened session cannot inherit it, and requalified on every check so an
+     in-place change invalidates the run. SQL Server is the twin step #611.

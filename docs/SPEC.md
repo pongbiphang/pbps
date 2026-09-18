@@ -1446,9 +1446,11 @@ the confidential path.
 #### 9.3.3 Resolver environment discovery (partial delivery)
 
 **Delivery status:** the initial read-only `doctor` subset is implemented
-(#597), followed by named profile selection/policy (#606). Resolver acquisition,
-compatibility qualification and binding evidence remain planned under #595; the requirements below still
-govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
+(#597), followed by named profile selection/policy (#606) and the Docker
+(#608) and dedicated-server (#609) runtime profiles. PostgreSQL analysis-scope
+compatibility and deployment-context qualification is implemented (#610);
+SQL Server's is #611. Binding evidence and the remaining steps stay planned
+under #595; the requirements below still govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
 
 `pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
 database locale/encoding and installed extension metadata on PostgreSQL;
