@@ -1234,7 +1234,9 @@ mod recon610_public {
 
 mod recon610_super {
     use super::*;
-    use pbps_pg::resolver::authorization::{RoleMap, read, reconstruct, verify};
+    use pbps_pg::resolver::authorization::{
+        PlannedGrant, RoleMap, apply_planned, read, reconstruct, verify, with_planned,
+    };
 
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
@@ -1259,13 +1261,28 @@ mod recon610_super {
             .unwrap();
 
         // Read as the superuser (the server's own admin user), against the
-        // database the connection string names.
+        // database the connection string names. A second schema nobody has
+        // granted anything on: its ACL is NULL, and the plan's first grant on
+        // it is the case where the engine materializes the owner's entries.
+        let fresh = format!("pbps_fresh_{pid}");
+        admin
+            .execute(&format!("CREATE SCHEMA {fresh}"))
+            .await
+            .unwrap();
+        let schemas = ["public".to_owned(), fresh.clone()];
         let mut planning = Conn::connect(Driver::Postgres, &server).await.unwrap();
-        let target = read(&mut planning, &["public".to_owned()]).await.unwrap();
+        let target = read(&mut planning, &schemas).await.unwrap();
         assert!(target.principal.superuser);
         assert_eq!(target.schemas["public"].owner, "pg_database_owner");
+        assert!(target.schemas[&fresh].acl.is_empty());
 
-        let map = RoleMap::generate(&target, &[], &run_login, &format!("s{pid}"));
+        let planned = [PlannedGrant {
+            role: "PUBLIC".into(),
+            schema: fresh.clone(),
+            privilege: "USAGE".into(),
+            revoke: false,
+        }];
+        let map = RoleMap::generate(&target, &planned, &run_login, &format!("s{pid}"));
         let mut scratch_admin =
             Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
                 .await
@@ -1291,17 +1308,32 @@ mod recon610_super {
         run.execute(&format!("SET ROLE \"{deployer}\""))
             .await
             .unwrap();
-        let differences = verify(&mut run, &map, &target, &["public".to_owned()])
-            .await
-            .unwrap();
+        let differences = verify(&mut run, &map, &target, &schemas).await.unwrap();
         assert!(
             differences.is_empty(),
             "public owner not reproduced for a superuser deployer: {differences:?}"
+        );
+        // The plan's first grant on the fresh schema, run as the reproduced
+        // deployer, materializes the owner's entries on scratch as it would on
+        // the target; the expected context carries them too (finding on #688).
+        apply_planned(&mut scratch_admin, &map, &deployer, &planned)
+            .await
+            .unwrap();
+        let expected = with_planned(target.clone(), &planned);
+        assert!(expected.schemas[&fresh].acl.contains_key("PUBLIC"));
+        let after = verify(&mut run, &map, &expected, &schemas).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "a first grant on a default ACL did not reproduce: {after:?}"
         );
 
         drop(planning);
         drop(run);
         drop(scratch_admin);
+        admin
+            .execute(&format!("DROP SCHEMA {fresh}"))
+            .await
+            .unwrap();
         admin
             .execute(&format!("DROP DATABASE {scratch_db} WITH (FORCE)"))
             .await

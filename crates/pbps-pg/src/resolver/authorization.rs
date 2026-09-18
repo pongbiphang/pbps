@@ -713,6 +713,25 @@ pub fn with_planned(
         let Some(schema) = context.schemas.get_mut(&grant.schema) else {
             continue;
         };
+        // A schema nobody granted anything on has a NULL ACL, read as no
+        // entries. The engine's first grant or revoke on it materializes the
+        // owner's default entries beside whatever it changes (measured on 18:
+        // `{owner=UC/owner,=U/owner}` after one `GRANT USAGE ... TO PUBLIC`),
+        // so the expected context must gain them too, or a valid first grant
+        // reads as an unexpected owner entry on scratch (finding on #688).
+        if schema.acl.is_empty() {
+            let owner = schema.owner.clone();
+            let mut defaults: Vec<Grant> = ["CREATE", "USAGE"]
+                .into_iter()
+                .map(|privilege| Grant {
+                    privilege: privilege.into(),
+                    grantable: false,
+                    grantor: owner.clone(),
+                })
+                .collect();
+            defaults.sort();
+            schema.acl.insert(owner, defaults);
+        }
         let entry = schema.acl.entry(grant.role.clone()).or_default();
         let had_option = entry
             .iter()
@@ -1044,6 +1063,49 @@ mod tests {
             owner_revoked.schemas["app"].acl["app_reader"],
             vec![grant("USAGE", false, "dep")]
         );
+    }
+
+    /// The first planned grant on a schema with no explicit grants gains
+    /// the owner's default entries beside the granted one, as the engine
+    /// materializes them (measured on 18); a revoke on one gains them and
+    /// changes nothing else; a schema that already has entries gains none.
+    #[test]
+    fn a_first_planned_grant_on_a_default_acl_materializes_the_owners_entries() {
+        let planned = |role: &str, revoke: bool| PlannedGrant {
+            role: role.into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke,
+        };
+        let mut base = context();
+        base.principal.effective = "app_owner".into();
+        base.roles.clear();
+        base.schemas.get_mut("app").unwrap().acl.clear();
+        let defaults = vec![
+            grant("CREATE", false, "app_owner"),
+            grant("USAGE", false, "app_owner"),
+        ];
+        let granted = with_planned(base.clone(), &[planned("app_reader", false)]);
+        assert_eq!(granted.schemas["app"].acl["app_owner"], defaults);
+        assert_eq!(
+            granted.schemas["app"].acl["app_reader"],
+            vec![grant("USAGE", false, "app_owner")]
+        );
+        let revoked = with_planned(base.clone(), &[planned("app_reader", true)]);
+        assert_eq!(revoked.schemas["app"].acl.len(), 1);
+        assert_eq!(revoked.schemas["app"].acl["app_owner"], defaults);
+        // Already explicit: the owner's entry is whatever the target has,
+        // here none, and a grant adds only itself.
+        let mut explicit = base;
+        explicit
+            .schemas
+            .get_mut("app")
+            .unwrap()
+            .acl
+            .insert("other".into(), vec![grant("USAGE", false, "app_owner")]);
+        let added = with_planned(explicit, &[planned("app_reader", false)]);
+        assert!(!added.schemas["app"].acl.contains_key("app_owner"));
+        assert_eq!(added.schemas["app"].acl.len(), 2);
     }
 
     #[test]

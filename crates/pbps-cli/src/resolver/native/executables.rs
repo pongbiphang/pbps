@@ -60,7 +60,19 @@ pub(crate) fn required_libraries(catalog: &CatalogFacts) -> Vec<String> {
                     .split(',')
                     .map(str::trim)
                     .filter(|entry| !entry.is_empty())
-                    .map(str::to_owned),
+                    .map(|entry| {
+                        // `local_preload_libraries` is the one preload setting
+                        // that does not search `dynamic_library_path`: the
+                        // engine loads its names from `$libdir/plugins` alone
+                        // and refuses a directory component, so a bare `foo`
+                        // there is `$libdir/plugins/foo`, not `$libdir/foo`
+                        // (finding on #688).
+                        if setting == "local_preload_libraries" && !entry.contains('/') {
+                            format!("$libdir/plugins/{entry}")
+                        } else {
+                            entry.to_owned()
+                        }
+                    }),
             );
         }
     }
@@ -437,6 +449,13 @@ mod tests {
                     setting("auto_explain, $libdir/hstore"),
                 ),
                 ("session_preload_libraries".to_owned(), setting("")),
+                // A local preload is loaded from `$libdir/plugins`, so the
+                // same bare name as the shared one is a different library
+                // (finding on #688).
+                (
+                    "local_preload_libraries".to_owned(),
+                    setting("auto_explain, plugin_hook"),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -445,7 +464,12 @@ mod tests {
         let _ = Observation::NotReported;
         assert_eq!(
             required_libraries(&catalog),
-            vec!["$libdir/hstore".to_owned(), "auto_explain".to_owned()]
+            vec![
+                "$libdir/hstore".to_owned(),
+                "$libdir/plugins/auto_explain".to_owned(),
+                "$libdir/plugins/plugin_hook".to_owned(),
+                "auto_explain".to_owned()
+            ]
         );
     }
 
