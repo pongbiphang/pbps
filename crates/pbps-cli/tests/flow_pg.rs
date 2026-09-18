@@ -2080,6 +2080,31 @@ fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs(
     );
     assert!(!plan.exists(), "a refused plan writes no artifact");
 
+    // The same declaration against an object whose ACL holds nothing at all.
+    // `aclexplode` returns no rows for `{}`, so a reader that learned owners
+    // from ACL rows would have this object owned by nobody and would accept
+    // the very declaration refused above.
+    on_server(connection, &format!("REVOKE ALL ON app.t FROM {}", role.1));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT CASE WHEN relacl IS NOT NULL AND cardinality(relacl) = 0 \
+             THEN 1 ELSE 0 END::bigint FROM pg_class WHERE relname = 't'"
+        ),
+        1,
+        "the ACL has to be explicitly empty for this case to exist"
+    );
+    // The declaration is the one already committed above; only the database
+    // has moved.
+    let still = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&still), 1, "{}{}", stdout(&still), stderr(&still));
+    assert!(
+        stderr(&still).contains("owned_targets") && stderr(&still).contains("app.t"),
+        "{}",
+        stderr(&still)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
     // The same ownership, granted nothing: an ordinary project.
     std::fs::write(
         d.dir.join("schema/owner.yml"),

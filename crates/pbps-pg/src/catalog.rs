@@ -36,7 +36,7 @@ pub use pbps_db::catalog::Spellings;
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
     RawDefaultAcl, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg,
-    RawOtherGrant, RawRole, RawSharedDependency, RawTable, assemble,
+    RawOtherGrant, RawOwner, RawRole, RawSharedDependency, RawTable, assemble,
 };
 
 /// The emitter quotes both parts of every table name. PostgreSQL compares
@@ -819,6 +819,7 @@ fn batch_query() -> String {
         ("default_acls", DEFAULT_ACLS.to_owned(), "grantor, in_schema, objtype"),
         ("unheld_modules", unheld_modules_query(), "schema_name, name"),
         ("session", SESSION.to_owned(), "role"),
+        ("owners", owners_query(), "schema_name, object_name, routine_oid, kind"),
     ]
     .into_iter()
     .map(|(part, query, order)| format!(
@@ -1090,6 +1091,15 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             .ok_or_else(|| DbError::BadRow("catalog batch part session is empty".to_owned()))?,
         "role",
     )?;
+    for row in batch.get("owners").ok_or_else(|| missing("owners"))? {
+        raw.owners.push(RawOwner {
+            schema: text(row, "schema_name")?,
+            object: optional_text(row, "object_name")?,
+            kind: granted_kind(&text(row, "source")?, &text(row, "kind")?),
+            routine_oid: row.integer("routine_oid")?,
+            owner: text(row, "owner")?,
+        });
+    }
     for row in batch.get("grants").ok_or_else(|| missing("grants"))? {
         raw.grants.push(RawGrant {
             // `None` is PUBLIC, which the query spells as a NULL rather than
@@ -1374,6 +1384,46 @@ fn empty_routine_acls_query() -> String {
 /// `GRANT SELECT ON mk.parent` (a partitioned table) both land in `relacl`. A
 /// filter that named only the declarable kinds reported the role as holding
 /// nothing there, which is *absent* reading as *empty*.
+/// Who owns each securable a grant can name — read from the object catalogs,
+/// not from the ACLs.
+///
+/// An ACL row is the wrong source for this. `aclexplode` returns nothing for
+/// an ACL that is explicitly empty, and an ACL that holds only other
+/// principals' entries has no owner row in it either. **Measured** on 18.6:
+/// `REVOKE ALL ON s.t FROM a2_owner` leaves `relacl = '{}'`, and the same
+/// revoke beside one grant leaves `{a2_reader=r/a2_owner}`. Either way the
+/// object is owned, and a reader that learned owners from ACL rows alone
+/// would report those two as owned by nobody — absent reading as empty, and
+/// `owned_targets` accepting a declaration that cannot converge (#261).
+///
+/// Three arms rather than four: a column-level grant is on its table, and
+/// takes that table's owner.
+fn owners_query() -> String {
+    let not_one_of_our_tables = not_one_of_our_tables();
+    format!(
+        "SELECT n.nspname AS schema_name, c.relname AS object_name,
+                'rel' AS source, c.relkind::text AS kind, NULL::int8 AS routine_oid,
+                pg_catalog.pg_get_userbyid(c.relowner) AS owner
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE {NOT_AN_INDEX_OR_TOAST}
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {not_one_of_our_tables}
+         UNION ALL
+         SELECT n.nspname, p.proname, 'pro', p.prokind::text, p.oid::int8,
+                pg_catalog.pg_get_userbyid(p.proowner)
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+         UNION ALL
+         SELECT n.nspname, NULL::text, 'nsp', '', NULL::int8,
+                pg_catalog.pg_get_userbyid(n.nspowner)
+           FROM pg_catalog.pg_namespace n
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+         ORDER BY 1, 2, 5"
+    )
+}
+
 const NOT_AN_INDEX_OR_TOAST: &str = "c.relkind NOT IN ('i', 'I', 't')";
 
 /// The argument types of every routine a grant can name, one row per
@@ -2342,6 +2392,7 @@ mod tests {
             "held_elsewhere",
             "default_acls",
             "unheld_modules",
+            "owners",
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }
