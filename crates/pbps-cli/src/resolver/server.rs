@@ -872,12 +872,15 @@ impl DedicatedServer {
     /// something: the names are recorded before the first statement runs, and
     /// `discard` removes whatever landed. The server moves into the run only
     /// once creation has completed.
-    pub async fn open_scratch(&mut self) -> Result<ScratchRun, ServerFailure> {
+    pub async fn open_scratch(
+        &mut self,
+        recipe: &pbps_db::resolver::environment::DatabaseRecipe,
+    ) -> Result<ScratchRun, ServerFailure> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| failure(Error::Consumed))?;
-        let (scratch, names) = Self::create(inner).await?;
+        let (scratch, names) = Self::create(inner, recipe).await?;
         // Nothing awaits between here and the move, so a cancellation cannot
         // strike a run that exists in neither place.
         let inner = self.inner.take().ok_or_else(|| failure(Error::Consumed))?;
@@ -890,7 +893,10 @@ impl DedicatedServer {
         })
     }
 
-    async fn create(inner: &mut Inner) -> Result<(Session, ScratchNames), ServerFailure> {
+    async fn create(
+        inner: &mut Inner,
+        recipe: &pbps_db::resolver::environment::DatabaseRecipe,
+    ) -> Result<(Session, ScratchNames), ServerFailure> {
         inner.check(None).await.map_err(failure)?;
         let names = generated_names().map_err(failure)?;
         inner.control.pending = Some(names.clone());
@@ -901,7 +907,7 @@ impl DedicatedServer {
                 .as_mut()
                 .ok_or_else(|| failure(Error::Cancelled))?;
             inner.control.in_flight = true;
-            let created = engine::create_scratch(&mut session.connection, &names).await;
+            let created = engine::create_scratch(&mut session.connection, &names, recipe).await;
             inner.control.in_flight = false;
             created
         };

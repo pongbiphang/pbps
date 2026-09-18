@@ -3,6 +3,7 @@
 //! Instance SQL stays in the engine crates; this file only chooses which one
 //! answers. Nothing here consumes declarations or produces binding evidence.
 
+use pbps_db::resolver::environment::DatabaseRecipe;
 use pbps_db::resolver::{
     InstanceObservation, OwnSession, ScratchNames, SessionCounter, SessionInventory,
 };
@@ -44,10 +45,11 @@ pub(super) async fn session_counter(
 pub(super) async fn create_scratch(
     connection: &mut StreamConn,
     names: &ScratchNames,
+    recipe: &DatabaseRecipe,
 ) -> Result<(), DbError> {
     match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::create_scratch(connection, names).await,
-        Driver::Mssql => pbps_mssql::resolver::create_scratch(connection, names).await,
+        Driver::Postgres => pbps_pg::resolver::create_scratch(connection, names, recipe).await,
+        Driver::Mssql => pbps_mssql::resolver::create_scratch(connection, names, recipe).await,
     }
 }
 

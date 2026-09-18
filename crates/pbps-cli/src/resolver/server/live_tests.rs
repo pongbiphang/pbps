@@ -25,6 +25,15 @@ fn endpoint(variable: &str) -> ScratchEndpoint {
     ScratchEndpoint::parse(&std::env::var(variable).unwrap()).unwrap()
 }
 
+async fn scratch_recipe(
+    target: &mut NativeTarget,
+) -> pbps_db::resolver::environment::DatabaseRecipe {
+    target
+        .database_recipe()
+        .await
+        .expect("the target reports a database recipe")
+}
+
 async fn native_target() -> NativeTarget {
     let peer =
         PeerVerifiedConn::connect(driver(), &std::env::var("PBPS_NATIVE_CONNECTION").unwrap())
@@ -179,7 +188,10 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
     // No inspection session is open here on purpose: one would be a session
     // this run did not open, and admission is required to refuse it.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server.open_scratch().await.expect("scratch resources");
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .expect("scratch resources");
     let database = run.database().to_owned();
     // Reaching into the run's own state: this step exposes no SQL surface,
     // so a declaration path cannot be opened by accident from outside it.
@@ -323,7 +335,10 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // resources are still removed.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     server.check().await.unwrap();
-    let mut run = server.open_scratch().await.unwrap();
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .unwrap();
     run.check().await.unwrap();
     session(&configured, maintenance()).await.close().await;
     assert!(matches!(
@@ -352,7 +367,10 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // and the login on someone else's server.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     server.check().await.unwrap();
-    let mut run = server.open_scratch().await.unwrap();
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .unwrap();
     let database = run.database().to_owned();
     assert!(
         tokio::time::timeout(std::time::Duration::from_nanos(1), run.check())
@@ -380,9 +398,12 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // holding something that can still remove the run-owned objects.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1), server.open_scratch())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            server.open_scratch(&scratch_recipe(&mut target).await)
+        )
+        .await
+        .is_err(),
         "creation must still have been in flight"
     );
     // The cancelled creation is terminal for the server, and everything but
@@ -391,7 +412,9 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     assert!(matches!(server.check().await, Err(Error::Cancelled)));
     assert!(matches!(server.identity(), Err(Error::Cancelled)));
     assert!(matches!(
-        server.open_scratch().await,
+        server
+            .open_scratch(&scratch_recipe(&mut target).await)
+            .await,
         Err(ServerFailure {
             cause: Error::Cancelled,
             ..
@@ -638,7 +661,10 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
     let configured = endpoint("PBPS_SERVER_ENDPOINT");
     let mut target = native_target().await;
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server.open_scratch().await.unwrap();
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .unwrap();
     let database = run.database().to_owned();
     let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
     api.stop_container(&configured.container).await.unwrap();

@@ -222,15 +222,24 @@ FROM pg_catalog.pg_stat_activity a",
 /// Creates only this run's own resources. `CREATE DATABASE` cannot run inside
 /// a transaction block, so each statement is separate and the caller removes
 /// whatever was created when a later one fails.
-pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
+pub async fn create_scratch(
+    conn: &mut StreamConn,
+    names: &ScratchNames,
+    recipe: &DatabaseRecipe,
+) -> Result<(), DbError> {
     conn.execute(&format!(
         "CREATE ROLE \"{}\" LOGIN PASSWORD '{}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
         names.login(),
         names.password()
     ))
     .await?;
+    // The scratch database reproduces the target's encoding and locale so it
+    // sorts, compares and encodes the same way (SPEC §9.3.3); an owner is set
+    // after creation because the locale clauses and OWNER cannot both follow
+    // TEMPLATE cleanly on every version.
+    conn.execute(&scratch_database_ddl(names, recipe)).await?;
     conn.execute(&format!(
-        "CREATE DATABASE \"{}\" OWNER \"{}\"",
+        "ALTER DATABASE \"{}\" OWNER TO \"{}\"",
         names.database(),
         names.login()
     ))
@@ -253,9 +262,8 @@ pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Resu
 pub fn scratch_database_ddl(names: &ScratchNames, recipe: &DatabaseRecipe) -> String {
     let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
     let mut ddl = format!(
-        "CREATE DATABASE \"{}\" OWNER \"{}\" TEMPLATE template0 ENCODING {}",
+        "CREATE DATABASE \"{}\" TEMPLATE template0 ENCODING {}",
         names.database(),
-        names.login(),
         literal(&recipe.encoding)
     );
     match (recipe.provider, recipe.locale.as_deref()) {
@@ -465,7 +473,7 @@ mod tests {
         };
         assert_eq!(
             scratch_database_ddl(&names(), &libc),
-            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" OWNER \"pbps_run_0123456789abcdef\" \
+            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" \
              TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER libc LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
         );
         let icu = DatabaseRecipe {
@@ -476,7 +484,7 @@ mod tests {
         };
         assert_eq!(
             scratch_database_ddl(&names(), &icu),
-            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" OWNER \"pbps_run_0123456789abcdef\" \
+            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" \
              TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'en-US' ICU_RULES '&a < b' \
              LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
         );

@@ -3,7 +3,7 @@
 
 use super::executables;
 use super::{SocketOwnerLease, UnqualifiedProcess};
-use pbps_db::resolver::environment::EnvironmentFacts;
+use pbps_db::resolver::environment::{DatabaseRecipe, EnvironmentFacts};
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::PeerVerifiedConn;
 use std::sync::{Arc, Weak};
@@ -164,6 +164,21 @@ impl NativeTarget {
             .as_ref()
             .map(|current| &current.identity)
             .ok_or(UnqualifiedProcess)
+    }
+
+    /// The `CREATE DATABASE` recipe that reproduces the target's encoding and
+    /// locale on the scratch server, read before any scratch database exists.
+    /// Catalog-only: no executables and no visibility, because a recipe needs
+    /// neither.
+    pub async fn database_recipe(&mut self) -> Result<DatabaseRecipe, EnvironmentError> {
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        let catalog = engine::environment(&mut bound.connection, &[], &[])
+            .await
+            .map_err(EnvironmentError::Catalog)?;
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        DatabaseRecipe::from_catalog(&catalog)
+            .map_err(|error| EnvironmentError::Catalog(pbps_db::DbError::BadRow(error.to_string())))
     }
 
     /// The analysis-scope facts of the target as its own deployer sees them:
