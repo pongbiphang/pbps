@@ -1481,6 +1481,16 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
         .iter()
         .map(|(id, on)| (spell(id), on.iter().map(&spell).collect()))
         .collect();
+    // Every set keyed by a module identity goes through the same pass, and
+    // this one is keyed by it too. A declaration spelling `app.f(int)` has
+    // its module key rewritten to `app.f(integer)` above; an opt-in left in
+    // the file's spelling would then match nothing, and the differ reads a
+    // miss as "close this routine to PUBLIC" — the declaration applied as
+    // its own opposite. Two spellings that collapse to one identity merge
+    // here rather than being reported again: the module loop above has
+    // already named that pair, and saying it twice tells a reader nothing
+    // new.
+    hints.public_execute = hints.public_execute.iter().map(&spell).collect();
     for (name, role) in schema.roles.iter_mut() {
         // Two targets that spell one routine are reported, as two modules
         // are: a map that kept the later permission set would drop the
@@ -2966,6 +2976,64 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything keyed by a routine identity is rewritten together, or the
+    /// halves stop matching. The loader is dialect-free, so a declaration may
+    /// spell `app.f(int)`; the module key becomes `app.f(integer)`, and an
+    /// opt-in or a dependency edge left in the file's spelling would match
+    /// nothing afterwards.
+    ///
+    /// The opt-in is the one where a miss is not merely a lost annotation:
+    /// the differ reads "not in the set" as the closed answer, so the plan
+    /// would revoke `PUBLIC`'s execution from a routine whose declaration
+    /// asked to keep it — the declaration applied as its own opposite.
+    #[test]
+    fn every_routine_keyed_hint_is_rewritten_with_the_module_keys() {
+        let dialect = dialect_for(DialectName::Postgres);
+        let written: pbps_model::ModuleId = "app.f(int)".parse().unwrap();
+        let spelled: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+        let helper: pbps_model::ModuleId = "app.h(int8)".parse().unwrap();
+
+        let mut schema = pbps_model::Schema::default();
+        for id in [&written, &helper] {
+            schema.modules.insert(
+                id.clone(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+                },
+            );
+        }
+        let mut hints = pbps_model::Hints::default();
+        hints.public_execute.insert(written.clone());
+        hints
+            .module_deps
+            .insert(written.clone(), [helper.clone()].into_iter().collect());
+
+        let collisions =
+            routine_ids_as_the_dialect_spells_them(&mut schema, &mut hints, dialect.as_ref());
+        assert!(collisions.is_empty(), "{collisions:?}");
+
+        let helper_spelled: pbps_model::ModuleId = "app.h(bigint)".parse().unwrap();
+        assert!(schema.modules.contains_key(&spelled));
+        assert!(schema.modules.contains_key(&helper_spelled));
+        // The point of the test: the opt-in answers to the key the differ
+        // will look it up by, not the one the file used.
+        assert!(
+            hints.public_execute.contains(&spelled),
+            "{:?}",
+            hints.public_execute
+        );
+        assert!(!hints.public_execute.contains(&written));
+        assert_eq!(
+            hints
+                .module_deps
+                .get(&spelled)
+                .map(|d| d.iter().collect::<Vec<_>>()),
+            Some(vec![&helper_spelled])
+        );
+    }
 
     #[test]
     fn saved_add_column_risks_use_the_selected_dialect_and_reject_edits() {

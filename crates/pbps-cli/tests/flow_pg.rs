@@ -1417,6 +1417,17 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
         "function: app.open()\npublic_execute: true\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 8 $$\n",
     )
     .unwrap();
+    // The same line, on a signature the loader and the engine spell
+    // differently. The loader is dialect-free, so this file says `int`; the
+    // module key becomes `app.alias(integer)` before the differ runs, and an
+    // opt-in that kept the file's spelling would match nothing — which the
+    // differ reads as the closed answer, applying the declaration as its own
+    // opposite.
+    std::fs::write(
+        d.dir.join("schema/alias.yml"),
+        "function: app.alias(int)\npublic_execute: true\ndefinition: |-\n  (int) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$\n",
+    )
+    .unwrap();
     // The positive control: access granted the ordinary way, to a role the
     // declarations name. Closing `PUBLIC` must not close this.
     std::fs::write(
@@ -1455,8 +1466,9 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
     let denied = try_on_server(&login, "CALL app.touch()").expect_err("a procedure is closed too");
     assert!(denied.contains("permission denied"), "{denied}");
 
-    // The two that stay open, each for its own reason.
+    // The three that stay open, each for its own reason.
     on_server(&login, "SELECT app.open()");
+    on_server(&login, "SELECT app.alias(1)");
     on_server(&login, "SELECT app.granted()");
 
     // And the catalog agrees with the engine's own answer, `ALTER DEFAULT
@@ -1465,6 +1477,7 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
         assert!(!public_executes(connection, closed), "{closed} is open");
     }
     assert!(public_executes(connection, "app.open()"));
+    assert!(public_executes(connection, "app.alias(integer)"));
     succeeds(d.run(&["verify", "--db", connection]));
 
     // A pull of this database writes the key back, or the project it hands
@@ -1486,11 +1499,13 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
             .find(|text| wanted.iter().any(|w| text.starts_with(w)))
             .unwrap_or_else(|| panic!("no pulled declaration for {routine}"))
     };
-    assert!(
-        pulled("app.open()").contains("public_execute: true"),
-        "{}",
-        pulled("app.open()")
-    );
+    for open in ["app.open()", "app.alias(integer)"] {
+        assert!(
+            pulled(open).contains("public_execute: true"),
+            "{open}: {}",
+            pulled(open)
+        );
+    }
     for closed in ["app.mark()", "app.plain()", "app.granted()", "app.touch()"] {
         assert!(
             !pulled(closed).contains("public_execute"),
