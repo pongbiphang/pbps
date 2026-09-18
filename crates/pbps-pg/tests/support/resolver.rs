@@ -489,3 +489,177 @@ mod scope610 {
             .unwrap();
     }
 }
+
+mod auth610 {
+    use super::*;
+    use pbps_pg::resolver::authorization::{AuthorizationContext, read};
+
+    fn fingerprint(context: &AuthorizationContext) -> Vec<u8> {
+        context.canonical()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn the_deployers_authorization_is_the_engines_own_answers_not_the_admins() {
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let pid = std::process::id();
+        let database = format!("pbps_auth610_{pid}");
+        let dep = format!("pbps_dep_{pid}");
+        let owner = format!("pbps_owner_{pid}");
+        let reader = format!("pbps_reader_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        admin
+            .execute(&format!(
+                "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            ))
+            .await
+            .unwrap();
+        for role in [&owner, &reader] {
+            admin
+                .execute(&format!("CREATE ROLE {role} NOLOGIN"))
+                .await
+                .unwrap();
+        }
+        admin
+            .execute(&format!(
+                "CREATE ROLE {dep} LOGIN PASSWORD 'pbps-dep' IN ROLE {reader}; \
+                 GRANT {owner} TO {dep} WITH INHERIT FALSE, SET TRUE"
+            ))
+            .await
+            .unwrap();
+        let mut setup = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}"))
+            .await
+            .unwrap();
+        setup
+            .execute(&format!(
+                "GRANT CONNECT ON DATABASE {database} TO {dep}; \
+                 CREATE SCHEMA app AUTHORIZATION {owner}; \
+                 CREATE TABLE app.t (x int); ALTER TABLE app.t OWNER TO {owner}; \
+                 GRANT USAGE ON SCHEMA app TO {reader}; GRANT SELECT ON app.t TO {reader}; \
+                 ALTER ROLE {dep} IN DATABASE {database} SET search_path = app, public"
+            ))
+            .await
+            .unwrap();
+        let schemas = ["app".to_owned()];
+
+        let deployer_url = server
+            .split_whitespace()
+            .filter(|part| !part.starts_with("user=") && !part.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut planning = Conn::connect(
+            Driver::Postgres,
+            &format!("{deployer_url} dbname={database} user={dep} password=pbps-dep"),
+        )
+        .await
+        .unwrap();
+
+        let context = read(&mut planning, &schemas).await.unwrap();
+        // The deployer is the planning connection's user, not a superuser.
+        assert_eq!(context.principal.effective, dep);
+        assert_eq!(context.principal.login, dep);
+        assert!(!context.principal.superuser);
+        // The engine's own effective answers: USAGE via the inherited reader,
+        // no CREATE, SELECT on the table but not INSERT.
+        let app = &context.schemas["app"];
+        assert_eq!(app.owner, owner);
+        assert!(app.privileges["USAGE"]);
+        assert!(!(app.privileges["CREATE"]));
+        let table = &context.objects["app.t"];
+        assert_eq!(table.owner, owner);
+        assert!(table.privileges["SELECT"]);
+        assert!(!(table.privileges["INSERT"]));
+        // The owner is switchable (SET, no inherit); the reader is inherited.
+        assert!(context.roles[&owner].can_set);
+        assert!(!context.roles[&owner].inherits);
+        assert!(context.roles[&reader].inherits);
+        // The database-role search_path pin is part of the context.
+        assert_eq!(
+            context
+                .settings
+                .get("database-role:search_path")
+                .map(String::as_str),
+            Some("app, public")
+        );
+
+        // The setup administrator is a different context: it owns nothing here
+        // but sees and may create everything, so its fingerprint differs and a
+        // compilation run as it would not reproduce the deployer's binding.
+        let admin_context = read(&mut setup, &schemas).await.unwrap();
+        assert!(admin_context.principal.superuser);
+        assert_ne!(fingerprint(&admin_context), fingerprint(&context));
+        assert!(admin_context.schemas["app"].privileges["CREATE"]);
+
+        // A granted CREATE changes the deployer's own fingerprint: authorization
+        // is measured, not assumed stable.
+        setup
+            .execute(&format!("GRANT CREATE ON SCHEMA app TO {reader}"))
+            .await
+            .unwrap();
+        let after = read(&mut planning, &schemas).await.unwrap();
+        assert!(after.schemas["app"].privileges["CREATE"]);
+        assert_ne!(fingerprint(&after), fingerprint(&context));
+
+        drop(planning);
+        drop(setup);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .unwrap();
+        for role in [&dep, &owner, &reader] {
+            admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn an_in_scope_schema_the_deployer_cannot_see_refuses_rather_than_reading_empty() {
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let pid = std::process::id();
+        let database = format!("pbps_auth610_hidden_{pid}");
+        let dep = format!("pbps_dep_hidden_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        admin
+            .execute(&format!(
+                "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            ))
+            .await
+            .unwrap();
+        admin
+            .execute(&format!("CREATE ROLE {dep} LOGIN PASSWORD 'pbps-dep'"))
+            .await
+            .unwrap();
+        let mut setup = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}"))
+            .await
+            .unwrap();
+        setup
+            .execute(&format!("GRANT CONNECT ON DATABASE {database} TO {dep}"))
+            .await
+            .unwrap();
+        let deployer_url = server
+            .split_whitespace()
+            .filter(|part| !part.starts_with("user=") && !part.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut planning = Conn::connect(
+            Driver::Postgres,
+            &format!("{deployer_url} dbname={database} user={dep} password=pbps-dep"),
+        )
+        .await
+        .unwrap();
+        // A schema that does not exist is not visible; the read refuses instead
+        // of returning a context with an empty schema map.
+        assert!(
+            read(&mut planning, &["nonexistent".to_owned()])
+                .await
+                .is_err()
+        );
+        drop(planning);
+        drop(setup);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .unwrap();
+        admin.execute(&format!("DROP ROLE {dep}")).await.unwrap();
+    }
+}
