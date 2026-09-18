@@ -495,35 +495,55 @@ pub async fn reconstruct(
     }
     // Settings: role-, database- and database-role-scoped, on the mapped
     // deployer and this run's own database.
+    let deployer_role = map
+        .run_local(&context.principal.effective)
+        .ok_or_else(|| missing(&context.principal.effective))?;
     for (key, value) in &context.settings {
         let (scope, name) = key
             .split_once(':')
             .ok_or_else(|| DbError::BadRow(format!("a setting key without a scope: {key}")))?;
-        let statement = match scope {
-            "role" => format!(
-                "ALTER ROLE {} SET {} = {}",
-                quote_ident(&deployer),
-                quote_ident(name),
-                literal(value)
-            ),
-            "database" => format!(
+        // Role- and database-role defaults go on two roles for two reasons:
+        // on the run login, because it is what opens the scratch session and
+        // PostgreSQL applies role SET defaults at login (not on SET ROLE), so
+        // this is how they actually load; and on the mapped deployer, so that
+        // reading the reproduced context back as that role sees the same
+        // settings the target's deployer had (finding on #688).
+        let mut statements = Vec::new();
+        match scope {
+            "role" => {
+                for role in [&map.run_login, &deployer_role] {
+                    statements.push(format!(
+                        "ALTER ROLE {} SET {} = {}",
+                        quote_ident(role),
+                        quote_ident(name),
+                        literal(value)
+                    ));
+                }
+            }
+            "database" => statements.push(format!(
                 "ALTER DATABASE {} SET {} = {}",
                 quote_ident(database),
                 quote_ident(name),
                 literal(value)
-            ),
-            "database-role" => format!(
-                "ALTER ROLE {} IN DATABASE {} SET {} = {}",
-                quote_ident(&deployer),
-                quote_ident(database),
-                quote_ident(name),
-                literal(value)
-            ),
+            )),
+            "database-role" => {
+                for role in [&map.run_login, &deployer_role] {
+                    statements.push(format!(
+                        "ALTER ROLE {} IN DATABASE {} SET {} = {}",
+                        quote_ident(role),
+                        quote_ident(database),
+                        quote_ident(name),
+                        literal(value)
+                    ));
+                }
+            }
             other => {
                 return Err(DbError::BadRow(format!("unknown setting scope {other}")));
             }
-        };
-        admin.query(&statement).await?;
+        }
+        for statement in statements {
+            admin.query(&statement).await?;
+        }
     }
     Ok(())
 }

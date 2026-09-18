@@ -1110,7 +1110,11 @@ impl ScratchRun {
         // #688).
         let mut scope_schemas = request.schemas.clone();
         for extra in &request.write_path_extras {
-            if !scope_schemas.contains(extra) {
+            // `pg_temp` is a path alias for the session's temporary namespace,
+            // not a persistent schema to read or reconstruct authorization for
+            // (finding on #688); it is normalized out of the scope, though it
+            // stays on the write path the visibility read evaluates.
+            if extra != "pg_temp" && !scope_schemas.contains(extra) {
                 scope_schemas.push(extra.clone());
             }
         }
@@ -1337,7 +1341,7 @@ impl ScratchRun {
         }
         let mut scope_schemas = schemas.clone();
         for extra in &extras {
-            if !scope_schemas.contains(extra) {
+            if extra != "pg_temp" && !scope_schemas.contains(extra) {
                 scope_schemas.push(extra.clone());
             }
         }
