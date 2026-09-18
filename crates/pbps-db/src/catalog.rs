@@ -92,6 +92,14 @@ pub struct Pulled {
     ///
     /// Empty on an engine whose reader does not carry an owner.
     pub owners: std::collections::BTreeMap<pbps_model::GrantTarget, String>,
+    /// The role this connection runs its statements as, and therefore the
+    /// role that will own whatever the plan creates — measured on 18.6, a
+    /// table created in somebody else's schema is owned by its creator, not
+    /// by the schema's owner. The owner of a target a plan replaces is
+    /// tomorrow's owner, not the one in [`Pulled::owners`] (#261).
+    ///
+    /// Empty on an engine whose reader does not carry one.
+    pub session_role: String,
 }
 
 /// One permission the model cannot hold, and enough about it for the caller

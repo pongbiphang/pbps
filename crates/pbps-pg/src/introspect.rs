@@ -620,7 +620,10 @@ impl Parts<'_> {
 /// Pure: every decision here is a function of `raw`, and every one of them is
 /// reachable from a unit test.
 pub fn assemble(raw: &RawCatalog) -> Pulled {
-    let mut pulled = Pulled::default();
+    let mut pulled = Pulled {
+        session_role: raw.session_role.clone(),
+        ..Pulled::default()
+    };
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
 

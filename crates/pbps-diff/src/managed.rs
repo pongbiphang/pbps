@@ -71,6 +71,9 @@ pub struct Scoped {
     /// not a grant, and the owner's own ACL entry is the zero point every
     /// object of that kind starts from (DECISIONS 371).
     pub owners: BTreeMap<pbps_model::GrantTarget, String>,
+    /// The role the deployment connection runs as, and so the owner of
+    /// everything this plan creates (see `pbps_db::catalog::Pulled`).
+    pub session_role: String,
 }
 
 /// Cuts a live schema down to the managed set.
@@ -175,6 +178,7 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
         unexpressible: Vec::new(),
         public_execute: Default::default(),
         owners: BTreeMap::new(),
+        session_role: String::new(),
     }
 }
 

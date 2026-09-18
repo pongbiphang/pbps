@@ -235,6 +235,24 @@ fn scalar(connection: &str, sql: &str) -> i64 {
         })
 }
 
+/// One text cell, for the catalog questions a test asks in passing.
+fn text_of(connection: &str, sql: &str) -> String {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            c.query(sql).await.unwrap()[0]
+                .try_get_at::<&str>(0)
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        })
+}
+
 fn latest_snapshot(connection: &str) -> pbps_model::StateSnapshot {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1903,6 +1921,101 @@ fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
 /// Refused at `plan --db` instead, with the line to delete. The second half is
 /// what keeps the rule scoped to the declaration: the same role owning the
 /// same table, granted nothing on it, is an ordinary project.
+/// Issue #261. The owner a grant has to be checked against is the one the
+/// object will have when the statement runs, not the one the baseline read
+/// carries — and for an object the plan creates, the baseline has no owner
+/// for it at all.
+///
+/// **Measured** on 18.6: a table created in somebody else's schema is owned
+/// by its creator, not by the schema's owner. So the role that runs the plan
+/// owns what the plan creates, and a declaration granting that role something
+/// on it is the same impossible line as on a table that already stands.
+///
+/// The other half of this — a target the plan *replaces* — cannot reach this
+/// check: `before_a_rebuild` refuses a rebuild whose object somebody else
+/// owns, precisely because the rebuild would hand it to the deploying
+/// account. The created case is the one that gets here.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_on_a_table_this_plan_creates_is_checked_against_its_coming_owner() {
+    let server = server();
+    let other = format!("pbps_other_reader_{}", std::process::id());
+    // The schema belongs to neither the deployment role nor the grantee, so
+    // that the `usage` line every grant here needs is not itself the
+    // impossible one this test is about.
+    let holder = format!("pbps_schema_holder_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: server.clone(),
+        names: vec![other.clone(), holder.clone()],
+    };
+    on_server(
+        &server,
+        &format!("CREATE ROLE {other} NOSUPERUSER; CREATE ROLE {holder} NOSUPERUSER"),
+    );
+    let own = OwnDatabase::new(&server, "owner-after-plan");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE SCHEMA app AUTHORIZATION {holder}"),
+    );
+
+    let d = Demo::new("owner-after-plan");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    // A table that does not exist yet, granted to the role that will own it
+    // the moment the plan creates it.
+    let deployer = text_of(connection, "SELECT current_user");
+    let new_table = "table: app.n\ncolumns:\n  id: {type: bigint, nullable: false}\n\
+                     primary_key: {name: pk_n, columns: [id]}\n";
+    std::fs::write(d.dir.join("schema/n.yml"), new_table).unwrap();
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n  app.n: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("owned_targets") && stderr(&refused).contains("will own"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.n"), "{}", stderr(&refused));
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
+    // The negative case: the same new table, granted to somebody who will not
+    // own it. A plan that creates a table and grants on it is ordinary work.
+    // Kept, not deleted: a role file that vanishes while another appears is
+    // a rename to the resolver, and this test is not about identity.
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/other.yml"),
+        format!("role: {other}\ngrants:\n  schema::app: [usage]\n  app.n: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// Issue #251, the other half of the grantor rule. A `REVOKE` matches on the
 /// grantor, and a least-privilege deployer holding `WITH GRANT OPTION` is the
 /// second grantor whose entries this connection can match: it granted them

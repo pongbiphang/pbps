@@ -1449,6 +1449,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // grantor rather than the owner — so the question #261 asks of
         // PostgreSQL has a different answer here and no caller asks it yet.
         owners: Default::default(),
+        // This reader carries no object owner and no session role; both
+        // belong to the PostgreSQL grantor rules (ADR-0010 §1).
+        session_role: String::new(),
     }
 }
 

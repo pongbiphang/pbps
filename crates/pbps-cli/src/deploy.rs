@@ -422,6 +422,7 @@ fn cut(
     // this map lacks is an object the read did not see, which is a different
     // finding from one whose owner is somebody else.
     scoped.owners = pulled.owners.clone();
+    scoped.session_role = pulled.session_role.clone();
     report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
     Ok(scoped)
 }
@@ -3826,7 +3827,8 @@ pub fn cmd_plan_db(
         // Asked of the read this plan was built from, not of the connection
         // again: the owners came out of the same statement snapshot as the
         // schema, so the two cannot disagree (DECISIONS 174).
-        let owned_targets = crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners)?;
+        let owned_targets =
+        crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners, &scoped.session_role)?;
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
@@ -6146,6 +6148,7 @@ mod tests {
             unmanaged_modules: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
+            session_role: String::new(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
                 entry(
@@ -9649,6 +9652,7 @@ mod tests {
             ],
             public_execute: Default::default(),
             owners: Default::default(),
+            session_role: String::new(),
         }
     }
 

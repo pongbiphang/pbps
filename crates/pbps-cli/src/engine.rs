@@ -764,10 +764,14 @@ fn refuse_drop_reports(
 /// A managed role that owns objects and is granted nothing on them is an
 /// ordinary, plannable project. Only the grant is impossible, and only that
 /// is refused.
+// The complement is intentionally every change that does not create a
+// securable a grant can name.
+#[allow(clippy::wildcard_enum_match_arm)]
 pub fn owned_targets(
     driver: Driver,
     changes: &ChangeSet,
     owners: &std::collections::BTreeMap<pbps_model::GrantTarget, String>,
+    session_role: &str,
 ) -> anyhow::Result<ConnectedCheck> {
     // The map is empty on a reader that carries no owner, so the loop would
     // find nothing anyway — named here so that "this engine was not asked"
@@ -783,6 +787,38 @@ pub fn owned_targets(
                 .to_owned(),
         });
     }
+    // Who will own each target when the `GRANT` runs, which is not always who
+    // owns it now. A plan that creates a target — or replaces one, which this
+    // model spells as a drop and a create — leaves it owned by the role that
+    // ran the statements, **measured** on 18.6: a table created in somebody
+    // else's schema is owned by its creator, not by the schema's owner.
+    //
+    // Both directions matter. Asking the baseline about a replaced object
+    // refuses a valid plan, because the old object's owner is gone with it;
+    // asking it about a created one finds nothing and lets through the grant
+    // whose closing read then refuses the apply.
+    let created: std::collections::BTreeSet<pbps_model::GrantTarget> = changes
+        .changes
+        .iter()
+        .filter_map(|planned| match &planned.change {
+            pbps_model::Change::CreateTable { name, .. } => {
+                Some(pbps_model::GrantTarget::Object(name.clone()))
+            }
+            pbps_model::Change::CreateModule { id, .. } => match id {
+                pbps_model::ModuleId::Routine(r) => {
+                    Some(pbps_model::GrantTarget::Routine(r.clone()))
+                }
+                pbps_model::ModuleId::Named(n) => Some(pbps_model::GrantTarget::Object(n.clone())),
+                // A trigger is not a securable a grant can name.
+                pbps_model::ModuleId::Trigger { .. } => None,
+            },
+            // Every other change either leaves the target where it was or
+            // takes it away, and a grant on something this plan drops is a
+            // different finding.
+            _ => None,
+        })
+        .collect();
+
     let mut impossible = Vec::new();
     for planned in &changes.changes {
         let pbps_model::Change::Grant {
@@ -793,17 +829,30 @@ pub fn owned_targets(
         else {
             continue;
         };
-        // An owner this read did not see is an object that is not there yet —
-        // one this plan creates, whose owner will be whoever runs it. That is
-        // not this check's business.
-        if owners.get(target).is_some_and(|owner| owner == role) {
+        // An owner neither the plan nor the read supplies is an object this
+        // read did not cover. Absent, not empty — and not something this
+        // check can refuse on.
+        let owner = if created.contains(target) {
+            (!session_role.is_empty()).then_some(session_role)
+        } else {
+            owners.get(target).map(String::as_str)
+        };
+        if owner == Some(role.as_str()) {
+            let when = if created.contains(target) {
+                format!(
+                    "role `{role}` will own `{target}`, because this plan creates it and \
+                         the role that runs the statements owns what they create (measured)"
+                )
+            } else {
+                format!("role `{role}` owns `{target}`")
+            };
             impossible.push(format!(
-                "role `{role}` owns `{target}`, so `{}` on it is a grant that cannot change \
-                 what the role holds: an owner already holds every privilege on its own \
-                 object, and this engine records the whole default set rather than the one \
-                 permission (ADR-0010 §1, measured). The pull reads that entry as the zero \
-                 point rather than a grant (DECISIONS 371), so nothing would ever satisfy \
-                 this line — delete it from role `{role}`",
+                "{when}, so `{}` on it is a grant that cannot change what the role holds: an \
+                 owner already holds every privilege on its own object, and this engine \
+                 records the whole default set rather than the one permission (ADR-0010 §1, \
+                 measured). The pull reads that entry as the zero point rather than a grant \
+                 (DECISIONS 371), so nothing would ever satisfy this line — delete it from \
+                 role `{role}`",
                 permissions
                     .iter()
                     .map(|p| p.as_str())
