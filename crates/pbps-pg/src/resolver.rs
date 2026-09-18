@@ -1,6 +1,10 @@
 //! Advisory environment observations, never resolver qualification (ADR-0016).
 
-use pbps_db::resolver::{Candidate, Discovery, Extension, Observation};
+use pbps_db::resolver::{
+    Candidate, Discovery, Extension, Observation, OwnSession, ScratchNames, SessionCounter,
+    SessionInventory,
+};
+use pbps_db::transport::StreamConn;
 use pbps_db::{Conn, DbError};
 
 /// The cluster identifier is observed alongside, never instead of, qualified
@@ -28,6 +32,226 @@ pub async fn instance_identity(
         instance_key: key.to_owned(),
         process: pbps_db::resolver::BackendProcess::NativePid(process),
     })
+}
+
+/// This session's own key, readable by any login.
+///
+/// PostgreSQL's backend pid is both the session key in `pg_stat_activity` and
+/// the process that holds this connection's socket, so one read answers the
+/// census and the correlation with the qualified runtime.
+pub async fn own_session(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+) -> Result<OwnSession, DbError> {
+    let rows = conn
+        .query("SELECT pg_catalog.pg_backend_pid()::text AS key")
+        .await?;
+    let [row] = rows.as_slice() else {
+        return Err(DbError::BadRow(
+            "PostgreSQL expected exactly one backend row".into(),
+        ));
+    };
+    let process = row
+        .try_get::<&str>("key")?
+        .and_then(|value| value.parse::<std::num::NonZeroU32>().ok())
+        .ok_or_else(|| DbError::BadRow("PostgreSQL did not report this backend".into()))?;
+    Ok(OwnSession {
+        key: process.to_string(),
+        process: pbps_db::resolver::BackendProcess::NativePid(process),
+    })
+}
+
+/// The cumulative counter, its origin, and the rows it is summed over.
+///
+/// Callers use it on its own to close a qualification window: the inventory
+/// they took at the start is only as fresh as the last read of this.
+///
+/// The per-database rows come back with it because the sum can be made to
+/// fall: dropping a database removes its `pg_stat_database` row and its
+/// share of the total, so a session could hide its own increment behind a
+/// drop of a database whose count matched. A row that disappears is visible
+/// even when the arithmetic is not.
+pub async fn session_counter(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+) -> Result<SessionCounter, DbError> {
+    let rows = conn
+        .query(
+            "\
+SELECT d.datid::text AS datid, d.sessions::text AS sessions,
+       (SELECT COALESCE(max(x.stats_reset)::text, 'never')
+        FROM pg_catalog.pg_stat_database x) AS epoch,
+       (pg_catalog.pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER')
+        OR COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r
+                     WHERE r.rolname = current_user), false))::text AS complete
+FROM pg_catalog.pg_stat_database d",
+        )
+        .await?;
+    if rows.is_empty() {
+        return Err(DbError::BadRow(
+            "PostgreSQL reported no statistics rows at all".into(),
+        ));
+    }
+    let mut total: u64 = 0;
+    let mut epoch: Option<String> = None;
+    let mut continuity = Vec::new();
+    for row in &rows {
+        if row.try_get::<&str>("complete")? != Some("true") {
+            return Err(DbError::Refused(
+                "this scratch role cannot observe every PostgreSQL backend; the server's client sessions are unreadable, not absent".into(),
+            ));
+        }
+        let datid = row
+            .try_get::<&str>("datid")?
+            .ok_or_else(|| DbError::BadRow("a PostgreSQL statistics row has no datid".into()))?;
+        let sessions = row
+            .try_get::<&str>("sessions")?
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                DbError::BadRow("a PostgreSQL statistics row has no session count".into())
+            })?;
+        // The epoch is one server-computed `max` repeated on every row, not a
+        // per-row value folded here: `max` over a timestamp ignores the nulls
+        // a never-reset database has, where folding the text would let the
+        // literal 'never' outrank every real reset and pin the epoch there.
+        let reported = row.try_get::<&str>("epoch")?.ok_or_else(|| {
+            DbError::BadRow("PostgreSQL did not report its statistics epoch".into())
+        })?;
+        if epoch.get_or_insert_with(|| reported.to_owned()) != reported {
+            return Err(DbError::BadRow(
+                "PostgreSQL reported two statistics epochs in one read".into(),
+            ));
+        }
+        total = total.checked_add(sessions).ok_or_else(|| {
+            DbError::BadRow("PostgreSQL's cumulative session count overflowed".into())
+        })?;
+        continuity.push(datid.to_owned());
+    }
+    continuity.sort();
+    Ok(SessionCounter {
+        total,
+        epoch: epoch.unwrap_or_else(|| "never".into()),
+        continuity,
+    })
+}
+
+/// Complete client-session inventory for the dedicated-server exclusion
+/// check, with the cumulative session counter that makes a session which
+/// opened and closed between two reads visible anyway.
+///
+/// A client is a backend something connected to, which `client_port` says and
+/// `backend_type` does not: measured on PostgreSQL 18.6, every background
+/// process reports a null port while both an ordinary session and a
+/// `replication=database` one report -1 over the Unix socket. Naming the
+/// backend types instead would be a list to keep current, and a type added by
+/// a later release or an extension would read as a background process.
+///
+/// Measured on the same engine: autovacuum workers, launched parallel workers
+/// and this run's own DDL leave `pg_stat_database.sessions` unchanged, while
+/// an ordinary client session increments it and is still counted once it has
+/// disconnected. A `walsender` is the exception and moves it by nothing at
+/// all, so a replication connection is caught here while it is open and by
+/// nothing once it has closed (#651).
+///
+/// A role that cannot see other backends returns an error: an incomplete view
+/// of `pg_stat_activity` must never read as an idle server.
+pub async fn client_sessions(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+) -> Result<SessionInventory, DbError> {
+    let counter = session_counter(conn).await?;
+    let rows = conn
+        .query(
+            "\
+SELECT a.pid::text AS session_key, a.backend_type AS backend_type,
+       (a.client_port IS NOT NULL)::text AS client,
+       (a.pid = pg_catalog.pg_backend_pid())::text AS own
+FROM pg_catalog.pg_stat_activity a",
+        )
+        .await?;
+    // Bracket: a session that was connected for the first counter read and
+    // gone by the list would otherwise have its count absorbed silently.
+    if session_counter(conn).await? != counter {
+        return Err(DbError::Refused(
+            "PostgreSQL's session counter moved while its session list was read; this server is not exclusively this run's".into(),
+        ));
+    }
+    let mut own = None;
+    let mut clients = Vec::new();
+    for row in &rows {
+        let key = row
+            .try_get::<&str>("session_key")?
+            .ok_or_else(|| DbError::BadRow("a PostgreSQL backend reported no pid".into()))?;
+        // NULL here means the row exists but its kind is hidden. Treating it
+        // as "not a client" would let an unreadable session pass as absence.
+        // The value itself decides nothing; `client_port` does.
+        row.try_get::<&str>("backend_type")?.ok_or_else(|| {
+            DbError::BadRow("a PostgreSQL backend reported no backend_type".into())
+        })?;
+        let client = row.try_get::<&str>("client")?.ok_or_else(|| {
+            DbError::BadRow("a PostgreSQL backend reported no client port".into())
+        })?;
+        let mine = row.try_get::<&str>("own")? == Some("true");
+        if mine && own.replace(key.to_owned()).is_some() {
+            return Err(DbError::BadRow(
+                "PostgreSQL reported this backend pid more than once".into(),
+            ));
+        }
+        if client == "true" {
+            clients.push(key.to_owned());
+        }
+    }
+    let own = own.ok_or_else(|| {
+        DbError::BadRow("PostgreSQL did not report this connection's own backend".into())
+    })?;
+    if !clients.contains(&own) {
+        return Err(DbError::BadRow(
+            "PostgreSQL did not report this connection as a client of its own".into(),
+        ));
+    }
+    clients.sort();
+    Ok(SessionInventory {
+        own,
+        clients,
+        counter,
+    })
+}
+
+/// Creates only this run's own resources. `CREATE DATABASE` cannot run inside
+/// a transaction block, so each statement is separate and the caller removes
+/// whatever was created when a later one fails.
+pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "CREATE ROLE \"{}\" LOGIN PASSWORD '{}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+        names.login(),
+        names.password()
+    ))
+    .await?;
+    conn.execute(&format!(
+        "CREATE DATABASE \"{}\" OWNER \"{}\"",
+        names.database(),
+        names.login()
+    ))
+    .await?;
+    // Only this run's own database is narrowed. Pre-existing grants, roles
+    // and server settings are never altered to make a server qualify.
+    conn.execute(&format!(
+        "REVOKE ALL ON DATABASE \"{}\" FROM PUBLIC",
+        names.database()
+    ))
+    .await
+}
+
+/// Removes exactly the two run-owned objects. FORCE closes this run's own
+/// scratch sessions; it cannot reach anything the run did not create.
+pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
+    let database = conn
+        .execute(&format!(
+            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+            names.database()
+        ))
+        .await;
+    let login = conn
+        .execute(&format!("DROP ROLE IF EXISTS \"{}\"", names.login()))
+        .await;
+    database.and(login)
 }
 
 // Version-dependent locale fields are projected by name from this one catalog

@@ -1,9 +1,11 @@
 # ADR-0016: Engine-assisted planning with optional, verified resolver environments
 
-- Status: accepted design; initial read-only doctor discovery implemented
-  (#597), with named selection/policy (#606). Resolver qualification, acquisition
-  and binding resolution remain
-  unimplemented. See [delivery tracking](RESOLVER-DELIVERY.md).
+- Status: accepted design; read-only doctor discovery implemented (#597) with
+  named selection/policy (#606); run-owned Docker environments acquired and
+  contained (#608); dedicated scratch-server lifecycle and exclusivity
+  qualified (#609). Binding resolution, source handling and the evidence a
+  plan may rest on remain unimplemented, and no qualification yet changes what
+  a plan is allowed to claim. See [delivery tracking](RESOLVER-DELIVERY.md).
 - Date: 2026-09-15
 - Related: [SPEC §9.3](SPEC.md#93-the-dev-database-optional), §7.3, §7.6,
   §8.2, §9.8 and §11.5; [ARCHITECTURE.md](ARCHITECTURE.md);

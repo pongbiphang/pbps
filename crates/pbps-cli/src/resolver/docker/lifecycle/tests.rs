@@ -1,4 +1,5 @@
 use super::*;
+use crate::resolver::docker::profile::LIFETIME_SECS;
 use crate::resolver::docker::{ImageIdentity, profile::PROFILE};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -564,7 +565,7 @@ async fn the_root_deadline_removes_even_a_detached_descendant() {
         .unwrap()
         .last_mut()
         .unwrap() = serde_json::json!("setsid /bin/sleep 600 & wait");
-    let run = CandidateRun::start_launch(api, image, owner, launch)
+    let run = CandidateRun::start_launch(api, image, owner, launch, LIFETIME_SECS)
         .await
         .unwrap();
     let host = format!("unix://{}", socket.display());

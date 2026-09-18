@@ -1,6 +1,6 @@
-# Docker resolver runtime boundary
+# Resolver runtime boundary
 
-This describes the internal runtime layer for #608. Named selection is exposed
+This describes the internal runtime layer for #608 and #609. Named selection is exposed
 by the CLI (#606); binding planning is still gated on the later #595 steps.
 Acquisition and a live candidate are not environment compatibility, deployment
 authorization, retained-source permission or sealed binding evidence.
@@ -45,6 +45,110 @@ The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
 claim protection from a compromised kernel or provisioning administrator.
+
+## Dedicated scratch servers (#609)
+
+A supplied server is not provisioned by pbps, so it cannot be asked for exact
+controls; it is asked to already be a **known layout**: a container, started
+by the operator from the documented recipe under a Docker-API runtime pbps
+can reach as root, named by the endpoint together with the externally
+enforced profile it is claimed to meet. The name lives with the credentials
+rather than in `pbps.yml`, so nothing in git claims a server meets a profile
+pbps has not measured. An unimplemented name is refused by name, per engine.
+
+This is deliberately not a proof that an arbitrary container is contained.
+That question has no bottom — every round of review of an earlier shape of
+this profile found one more arrangement of the kernel's tables that hid
+something, because the tables of a container someone else assembled can be
+arranged in any number of ways. Equality with a layout is decidable: the
+daemon's record is read, the kernel is measured against the rows the profile
+names, and a row it does not name is refused as that row (DECISIONS 514).
+
+Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-authenticated local channel the Docker profile uses; the record and mount rules are measured against both Docker's and Podman's container layouts so they are not over-fit to one runtime's exact output, but a Podman-native daemon is not yet an admittable peer (#686).
+
+`linux-dedicated-v1` requires, of a container on the same native Linux kernel:
+
+| Premise | What is measured |
+| --- | --- |
+| Record | The daemon's record of the container: running, not privileged, `NetworkMode: none`, a read-only root, a private PID, IPC, UTS and user namespace — Podman's default `shareable` IPC namespace is refused, since another container can join it — no binds, devices, ports, links or volumes, only tmpfs mounts, a memory and PID limit. Its id, init PID, start time and image are pinned, and re-read on every check: a restarted or replaced container is a different runtime |
+| Separation | The container's init and engine service are neither the target's service process nor in any of its PID, mount or network namespaces, and the engine's instance identity is not the target's. Decided **before** the record and containment measurements, so an alias of the target refuses as the target |
+| Network | The container's network namespace holds only a loopback device — a real one, by link type and flag — with no IPv4 or IPv6 route and no address but `::1` |
+| Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device: a host procfs or sysfs bound in keeps the type and not these |
+| Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
+| Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network and mount namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, tracked in #684 |
+| Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |
+| Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
+| Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
+
+The engine is reached the way the Docker profile reaches its own: a
+run-owned **forwarder**, launched from the supplied container's image into
+its network namespace with its own PID and mount namespaces, piping exactly
+one TCP session to the engine's loopback port through an authenticated
+attach stream. The operator supplies no relay, no socket directory and no
+process id; PostgreSQL listens on loopback with no Unix socket, SQL Server on
+its port. Each session is bound to the kernel: the one established pair to
+the engine's port whose client end the forwarder's processes hold, and whose
+server end exactly one engine process holds — on PostgreSQL the backend the
+engine itself reports for the session. The forwarder's tasks are checked
+against the fixed program at the fixed privileges, as in the Docker profile.
+
+Exclusivity is decided by the kernel and confirmed by the engine. Because the
+namespace has no route out, every session to the engine is a TCP connection
+whose both ends are in that namespace's own table, so the census is complete
+for what reaches the engine: a listener is the engine's, a row with no inode
+is a connection already gone, and any other row is one end of a session this
+run opened or a refusal. Any Unix socket at all is a refusal — the recipe
+gives the engine no Unix listener. What that cannot see is a session that
+opened and closed between two reads, so each engine also supplies a
+**cumulative** session counter, and only this run's own sessions may have
+moved it:
+
+- PostgreSQL sums `pg_stat_database.sessions` with `max(stats_reset)` as the
+  counter's origin. Measured on PostgreSQL 18: autovacuum workers, launched
+  parallel workers and this run's own DDL leave it unchanged, while a client
+  session that has already disconnected is still counted — with one exception
+  measured on the same engine: a `walsender` moves it by nothing at all, so a
+  replication connection is caught by the session list and the kernel census
+  while it is open and by neither once it has closed (#651). A database
+  created, used and dropped entirely between two checks is invisible the same
+  way — its row and its share of the sum are gone before either is sampled
+  (#682). A sum has a way
+  back down that a single counter does not: the row is per database, and
+  dropping one takes its share away. The rows the total was summed over
+  therefore come back with it, and the set may only grow.
+- SQL Server reads the General Statistics `Logins/sec` counter, which is
+  cumulative despite its name, with `sqlserver_start_time` as its origin.
+  `@@CONNECTIONS` is unusable here: it also counts the engine's internal
+  connections, and rose by eighteen during one `CREATE DATABASE`.
+
+Neither counter is readable without the privilege to see other sessions, and
+an unreadable counter refuses rather than reporting an idle server; so does a
+refusal the adapter raises for a login without that privilege, which is a
+credential problem and never an intrusion. The privileged reads belong to the
+control session, which connects with the operator's administrative
+credentials; a run-owned login sees only its own row and supplies its own
+session key, which is all the census needs from it. The first inventory is
+the baseline every later total is measured against, so a session this run
+did not open is refused there rather than absorbed into it. Every check reads
+the engine's list between two kernel censuses and closes with one more read
+of the counter, so what holds over the whole check is the session premise and
+not an instant inside it; the kernel premises hold at the instants they are
+measured, and the run's bounded lifetime limits how far apart those are.
+
+Run-owned resources are one uniquely named database and one login, created
+only after every gate above and removed on every exit path, and a removal
+that cannot be confirmed reports those two generated names and any forwarder
+container whose removal was not confirmed either. The cleanup capability is
+not a live handle: it is the credentials, the daemon path and the container's
+pinned identity, from which a fresh session can be opened to remove exactly
+those names. Every forwarder the run opened is removed with the run and its
+removal confirmed before success is reported, including one whose session
+ended early; a forwarder that cannot be confirmed gone is a recovery name too. A check that refuses ends the analysis and not the cleanup; an
+await cancelled mid-exchange leaves a protocol stream in no known state, so
+the session it was on is dropped, the analysis is over, and cleanup opens a
+fresh session to the pinned container — and reports the names if that
+container is gone. No pre-existing logging, audit policy, grant or database is
+altered to make a server qualify.
 
 ## Startup and continuity
 
@@ -116,6 +220,20 @@ and receives only read-only proc directories from its owned workload/control
 trees. It receives no host PID namespace, runtime socket or external network.
 The root-control inspector separately measures its one owned root guard and
 read-only cgroup controls. These test access paths are not production adapters.
+
+`scripts/live-resolver-server.py <pg|mssql>` builds a disposable TLS target and
+a supplied scratch server this script — not pbps — starts from the documented
+recipe, plus an alias endpoint naming the target's own container and, for one
+test, a second supplied server on an ordinary bridge network. It compiles a
+table and a view in the run's own scratch database, and covers same-instance
+aliases, an unimplemented profile name, a session the run did not open that
+closes again before the next check, a session present at admission, a
+statistics row removed to pay for an intruder, a privileged process the engine
+did not start inside its namespaces, a container joined to its network
+namespace, target replacement and loss, and a server stopped under a live run
+so that cleanup cannot be confirmed. It prints the daemon's record and the
+kernel's tables of the supplied server once at startup, which is where the
+unit tests' pinned layouts come from.
 
 `scripts/live-resolver-target.py <pg|mssql>` creates disposable TLS targets and
 confines each inspector to its owned target's PID/network namespaces. It checks

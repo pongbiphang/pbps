@@ -332,11 +332,18 @@ impl CandidateSession {
         deadline: tokio::time::Instant,
     ) -> Result<(CandidateRun, StreamConn, InstanceObservation), (StartFailure, bool)> {
         let owner = token();
-        let launch = Launch::control(&image, driver, &owner, workload.container_id())
-            .map_err(|cause| (failure(cause), false))?;
-        let control = CandidateRun::start_launch(api, image, owner, launch)
-            .await
-            .map_err(|failure| (failure, false))?;
+        let launch = Launch::control(
+            &image,
+            driver,
+            &owner,
+            workload.container_id(),
+            super::profile::LIFETIME_SECS,
+        )
+        .map_err(|cause| (failure(cause), false))?;
+        let control =
+            CandidateRun::start_launch(api, image, owner, launch, super::profile::LIFETIME_SECS)
+                .await
+                .map_err(|failure| (failure, false))?;
         // Set by the login's own error arm and read after the future has been
         // driven to completion, which is the only place that can tell a
         // still-starting engine from a refusal that will not change.

@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Qualify the dedicated scratch-server profile against actual engines.
+
+Builds disposable deployments on a native Linux host: a TLS target, one
+supplied scratch server contained exactly as `linux-dedicated-v1` requires, an
+alias endpoint whose container *is* the target's, and one whose container is
+on a bridge network. Requires root, because reading another service's process,
+namespace and cgroup facts does, and a container runtime on the Docker API.
+
+The supplied servers are started by this script, not by pbps: that is the
+point. pbps reads the daemon's record of them and measures the kernel, the way
+it would for a container an operator started from the documented recipe. No
+host path, volume or runtime socket is mounted into any of them.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import uuid
+
+IMAGES = {
+    "pg": "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+    "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
+}
+PASSWORD = "Pbps!DedicatedFixture12345"
+MARKER = "pbps_marker_preexisting"
+ENGINE_UID = {"pg": 999, "mssql": 10001}
+EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
+QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+TESTS = [
+    "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+    "a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
+    # Runs with the exposed control started; see below.
+    "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
+    "a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
+    "a_session_present_at_admission_is_refused_rather_than_counted",
+    "a_removed_statistics_row_cannot_pay_for_an_intruding_session",
+    # Runs with a deliberate intruder in the engine's namespaces; see below.
+    "a_process_the_engine_did_not_start_refuses_its_namespaces",
+    # Runs with a container joined to the engine's network namespace.
+    "a_container_joined_to_the_engines_network_refuses_the_run",
+    "replacing_or_dropping_the_target_binding_discards_the_run",
+    # Stops the supplied server under a live run, so it is last.
+    "an_unconfirmed_cleanup_reports_only_the_run_owned_names",
+]
+DOCKER_SOCKET = "/var/run/docker.sock"
+
+# The recipe an operator follows. Everything writable is a tmpfs the runtime
+# creates, the image root is read-only, the network namespace is empty and
+# every privilege the engine does not need is gone before it starts.
+RECIPE = [
+    "--network", "none", "--ipc", "private", "--read-only",
+    "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777",
+    # /run and /var/tmp forced to noexec: Podman auto-mounts them rw without
+    # noexec, and the profile requires no executable private storage.
+    "--tmpfs", "/run:rw,nosuid,nodev,noexec,size=67108864,mode=755",
+    "--tmpfs", "/var/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777",
+    "--security-opt", "no-new-privileges",
+    "--memory", "3g", "--memory-swap", "3g", "--cpus", "2", "--pids-limit", "512",
+]
+STORAGE = {
+    "pg": "/var/lib/postgresql:rw,nosuid,nodev,noexec,size=268435456,uid=999,gid=999,mode=700",
+    "mssql": "/var/opt/mssql:rw,nosuid,nodev,noexec,size=1073741824,uid=10001,gid=0,mode=700",
+}
+
+# initdb then exec: the engine is PID 1 of its own namespace, so the bootstrap
+# shell is not left inside the scope admission walks. It listens on loopback
+# only and opens no Unix socket: the forwarder is the one way in.
+POSTGRES_BOOT = """
+set -e
+install -d -o 999 -g 999 -m 700 /var/lib/postgresql/run-data
+printf '%s' "$PBPS_FIXTURE_PASSWORD" > /var/lib/postgresql/pw
+chown 999:999 /var/lib/postgresql/pw
+chmod 600 /var/lib/postgresql/pw
+setpriv --reuid=999 --regid=999 --clear-groups /usr/lib/postgresql/18/bin/initdb \
+  -D /var/lib/postgresql/run-data --auth-local=reject --auth-host=scram-sha-256 \
+  --pwfile=/var/lib/postgresql/pw >/dev/null
+rm /var/lib/postgresql/pw
+exec setpriv --reuid=999 --regid=999 --clear-groups --bounding-set=-all --inh-caps=-all \
+  --ambient-caps=-all /usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/run-data \
+  -c listen_addresses=127.0.0.1 -c unix_socket_directories=
+"""
+
+
+def run(*args, **kwargs):
+    if args[0] == "docker":
+        args = ("docker", "--host", "unix://" + DOCKER_SOCKET, *args[1:])
+    kwargs.setdefault("check", True)
+    kwargs.setdefault("text", True)
+    return subprocess.run(args, **kwargs)
+
+
+def certificates(root):
+    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+        "-subj", "/CN=pbps dedicated test CA", "-keyout", str(root / "ca.key"),
+        "-out", str(root / "ca.pem"), **QUIET)
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
+        "-keyout", str(root / "peer.key"), "-out", str(root / "peer.csr"), **QUIET)
+    (root / "extensions").write_text(
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n"
+        "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+    run("openssl", "x509", "-req", "-in", str(root / "peer.csr"), "-CA", str(root / "ca.pem"),
+        "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "2", "-extfile",
+        str(root / "extensions"), "-out", str(root / "peer.pem"), **QUIET)
+    (root / "empty-ca").mkdir()
+
+
+def service_pid(container, executable):
+    rows = [line.split() for line in run(
+        "docker", "top", container, "-eo", "pid,ppid,comm",
+        stdout=subprocess.PIPE).stdout.splitlines()[1:]]
+    processes = {row[0] for row in rows if row[2] == executable}
+    roots = [row[0] for row in rows if row[0] in processes and row[1] not in processes]
+    if len(roots) != 1:
+        raise RuntimeError(f"ambiguous service process in {container}")
+    return roots[0]
+
+
+def await_engine(container, engine):
+    if engine == "pg":
+        probe = ["pg_isready", "-h", "127.0.0.1"]
+    else:
+        probe = ["/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "127.0.0.1", "-U", "sa",
+                 "-P", PASSWORD, "-Q", "SELECT 1"]
+    for _ in range(90):
+        if run("docker", "exec", container, *probe, check=False, **QUIET).returncode == 0:
+            return
+        time.sleep(2)
+    # Say why. The cleanup below removes the container, so a bare "did not
+    # become ready" is the last thing anyone reading CI ever sees of it.
+    state = run("docker", "inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}}",
+                container, stdout=subprocess.PIPE, check=False).stdout.strip()
+    logs = run("docker", "logs", "--tail", "40", container, stdout=subprocess.PIPE,
+               stderr=subprocess.STDOUT, check=False).stdout
+    raise RuntimeError(
+        f"owned fixture {container} did not become ready ({state})\n{logs}")
+
+
+def start_dedicated(engine, name, owned, network=None):
+    """One supplied server, contained as `linux-dedicated-v1` requires."""
+    owned.append(name)
+    recipe = list(RECIPE)
+    if network is not None:
+        recipe[recipe.index("none")] = network
+    common = ["--name", name, "--pull", "never", *recipe, "--tmpfs", STORAGE[engine]]
+    if engine == "pg":
+        run("docker", "create", *common, "--user", "0",
+            "-e", f"PBPS_FIXTURE_PASSWORD={PASSWORD}",
+            "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", POSTGRES_BOOT, **QUIET)
+    else:
+        # sqlservr carries cap_net_bind_service as a file capability, so an
+        # empty bounding set makes its exec fail outright. The profile's
+        # capability ceiling is exactly that one bit.
+        run("docker", "create", *common, "--user", str(ENGINE_UID[engine]),
+            "--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE",
+            "-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
+            "-e", "MSSQL_MEMORY_LIMIT_MB=1024", IMAGES[engine], **QUIET)
+    run("docker", "start", name, **QUIET)
+
+
+def start_target(engine, name, root, owned):
+    owned.append(name)
+    if engine == "pg":
+        environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}"]
+        boot = ("chown postgres:postgres /tmp/peer.key; chmod 600 /tmp/peer.key; "
+                "exec docker-entrypoint.sh postgres -c listen_addresses=127.0.0.1 "
+                "-c ssl=on -c ssl_cert_file=/tmp/peer.pem -c ssl_key_file=/tmp/peer.key")
+    else:
+        environment = ["-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
+                       "-e", "MSSQL_MEMORY_LIMIT_MB=1024"]
+        boot = ("chown mssql:root /tmp/peer.key; chmod 600 /tmp/peer.key; "
+                "exec su -s /bin/bash mssql -c /opt/mssql/bin/sqlservr")
+        (root / "mssql.conf").write_text(
+            "[network]\nipaddress=127.0.0.1\ntlscert=/tmp/peer.pem\n"
+            "tlskey=/tmp/peer.key\nforceencryption=0\n")
+    run("docker", "create", "--name", name, "--pull", "never", "--network", "host",
+        "--user", "0", "--memory", "3g", "--cpus", "2", "--pids-limit", "512",
+        *environment, "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", boot, **QUIET)
+    for leaf in ("peer.key", "peer.pem"):
+        run("docker", "cp", str(root / leaf), name + ":/tmp/" + leaf, **QUIET)
+    if engine == "mssql":
+        run("docker", "cp", str(root / "mssql.conf"),
+            name + ":/var/opt/mssql/mssql.conf", **QUIET)
+    run("docker", "start", name, **QUIET)
+
+
+def describe(container):
+    """The daemon's record and the kernel's tables, as the profile reads them.
+
+    Printed once at startup on purpose: the unit tests pin the measured
+    layouts of both runtimes, and this is where a new runtime version's
+    layout is read from.
+    """
+    print(f"--- {container}: what the profile reads ---", flush=True)
+    version = run("docker", "version", "--format", "{{.Server.Version}}",
+                  stdout=subprocess.PIPE, check=False).stdout.strip()
+    print(f"docker server {version}", flush=True)
+    record = run("docker", "inspect", container, stdout=subprocess.PIPE, check=False).stdout
+    try:
+        record = json.loads(record)[0]
+        host = record["HostConfig"]
+        print("== HostConfig ==", json.dumps({key: host.get(key) for key in (
+            "Privileged", "NetworkMode", "ReadonlyRootfs", "PidMode", "IpcMode", "UTSMode",
+            "UsernsMode", "CgroupnsMode", "CapDrop", "CapAdd", "SecurityOpt", "Memory",
+            "MemorySwap", "NanoCpus", "PidsLimit", "Tmpfs", "Binds", "RestartPolicy")}),
+            flush=True)
+        print("== Mounts ==", json.dumps(record.get("Mounts")), flush=True)
+    except (ValueError, KeyError, IndexError):
+        print("== inspect == unreadable", flush=True)
+    for label, command in [
+        ("mountinfo", ["cat", "/proc/1/mountinfo"]),
+        ("status", ["cat", "/proc/1/status"]),
+        ("cgroup", ["cat", "/proc/1/cgroup"]),
+        ("net/dev", ["cat", "/proc/net/dev"]),
+        ("net/tcp", ["cat", "/proc/net/tcp"]),
+        ("net/unix", ["cat", "/proc/net/unix"]),
+    ]:
+        output = run("docker", "exec", "--user", "0", container, *command,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False).stdout
+        print(f"== {label} ==\n{output}", end="", flush=True)
+
+
+def endpoint(container):
+    return (f"profile=linux-dedicated-v1 container={container} daemon={DOCKER_SOCKET} "
+            f"user={'postgres' if ENGINE == 'pg' else 'sa'} password={PASSWORD}")
+
+
+def statement(container, engine, sql, database=None):
+    if engine == "pg":
+        run("docker", "exec", "-e", f"PGPASSWORD={PASSWORD}", container, "psql",
+            "-h", "127.0.0.1", "-U", "postgres", "-v", "ON_ERROR_STOP=1",
+            "-d", database or "postgres", "-c", sql, **QUIET)
+    else:
+        run("docker", "exec", container, "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S",
+            "127.0.0.1", "-U", "sa", "-P", PASSWORD, "-d", database or "master", "-b",
+            "-Q", sql, **QUIET)
+
+
+ENGINE = None
+
+
+def fixture(args, binary, root, owned):
+    global ENGINE
+    ENGINE = engine = args.engine
+    certificates(root)
+    unique = uuid.uuid4().hex[:12]
+
+    target = f"pbps-dedicated-target-{unique}"
+    start_target(engine, target, root, owned)
+    supplied = f"pbps-dedicated-server-{unique}"
+    start_dedicated(engine, supplied, owned)
+    await_engine(target, engine)
+    await_engine(supplied, engine)
+    describe(supplied)
+    # A pre-existing database no run may touch, and the counter's baseline.
+    statement(supplied, engine, f"CREATE DATABASE {MARKER}")
+    exposed = f"pbps-dedicated-exposed-{unique}"
+    joined = f"pbps-dedicated-joined-{unique}"
+
+    if engine == "pg":
+        primary = (f"host=localhost port=5432 user=postgres password={PASSWORD} "
+                   "dbname=postgres sslmode=require")
+    else:
+        primary = (f"Server=localhost,1433;User Id=sa;Password={PASSWORD};Database=master;"
+                   # The issuer, not the leaf: rustls builds a chain to a
+                   # trust anchor, and handing it the peer's own certificate
+                   # leaves that chain unrooted — "UnknownIssuer".
+                   f"Encrypt=true;TrustServerCertificateCA={root / 'ca.pem'}")
+
+    environment = dict(
+        PBPS_SERVER_FIXTURE="1",
+        PBPS_SERVER_DRIVER=engine,
+        PBPS_NATIVE_CONNECTION=primary,
+        PBPS_NATIVE_SERVICE_PID=service_pid(target, EXECUTABLE[engine]),
+        PBPS_SERVER_ENDPOINT=endpoint(supplied),
+        PBPS_SERVER_ALIAS_ENDPOINT=endpoint(target),
+        PBPS_SERVER_EXPOSED_ENDPOINT=endpoint(exposed),
+        PBPS_SERVER_MARKER_DATABASE=MARKER,
+        SSL_CERT_FILE=str(root / "ca.pem"),
+        SSL_CERT_DIR=str(root / "empty-ca"),
+        PATH="/pbps-no-external-tools",
+    )
+    exposing = "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name"
+    intruding = "a_process_the_engine_did_not_start_refuses_its_namespaces"
+    joining = "a_container_joined_to_the_engines_network_refuses_the_run"
+    for test in TESTS:
+        # The exposed control is a second supplied server whose runtime does
+        # not give it a private network; everything else about it qualifies.
+        # Started only for its own test and removed after it, so that only
+        # one extra engine's startup is ever in flight.
+        if test == exposing:
+            start_dedicated(engine, exposed, owned, network="bridge")
+            await_engine(exposed, engine)
+        # One test needs a process the engine never started, sharing its
+        # namespaces: `docker exec` joins them without becoming a descendant,
+        # which is exactly the shape a subtree walk cannot see. Root, so it
+        # also carries privileges the profile says the runtime removed.
+        if test == intruding:
+            run("docker", "exec", "-d", "--user", "0", supplied,
+                "/bin/sleep", "120", **QUIET)
+        # And one needs a container in the engine's network namespace that
+        # is in none of its process listings.
+        if test == joining:
+            owned.append(joined)
+            run("docker", "run", "-d", "--name", joined, "--pull", "never",
+                "--network", "container:" + supplied, "--entrypoint", "/bin/sleep",
+                IMAGES[engine], "120", **QUIET)
+        result = run(binary, "--ignored", "--exact",
+                     f"resolver::server::live_tests::{test}", "--nocapture",
+                     env=dict(os.environ, **environment), stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, check=False)
+        if test == intruding:
+            run("docker", "exec", "--user", "0", supplied,
+                "/usr/bin/pkill", "-f", "sleep 120", check=False, **QUIET)
+        if test == joining:
+            run("docker", "rm", "--force", joined, check=False, **QUIET)
+        if test == exposing:
+            run("docker", "rm", "--force", exposed, check=False, **QUIET)
+        print(result.stdout, end="", flush=True)
+        if result.returncode or "test result: ok. 1 passed" not in result.stdout:
+            describe(supplied)
+            print(run("docker", "ps", "-a", "--filter", "name=pbps-", stdout=subprocess.PIPE,
+                      check=False).stdout, flush=True)
+            raise RuntimeError(f"dedicated-server fixture failed: {test}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("engine", choices=["pg", "mssql"])
+    parser.add_argument("--test-binary", required=True,
+                        help="the pbps-cli unit test binary carrying the live tests")
+    parser.add_argument("--socket", default="/var/run/docker.sock")
+    args = parser.parse_args()
+    global DOCKER_SOCKET
+    DOCKER_SOCKET = args.socket
+    if os.geteuid() != 0:
+        sys.exit("the dedicated-server fixture must run as root")
+    binary = str(Path(args.test_binary).resolve())
+    root = Path(f"/tmp/pbps-dedicated-{uuid.uuid4().hex[:8]}")
+    root.mkdir(mode=0o700)
+    owned = []
+    try:
+        fixture(args, binary, root, owned)
+    finally:
+        for resource in owned:
+            run("docker", "rm", "--force", "--volumes", resource, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["rm", "-rf", str(root)], check=False)
+
+
+if __name__ == "__main__":
+    main()

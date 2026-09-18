@@ -364,16 +364,30 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
     let owner = token();
     let password = format!("Pbps!{:032x}", rand::random::<u128>());
     let launch = Launch::with_password(&image, driver, &owner, &password).unwrap();
-    let workload = CandidateRun::start_launch(api, image.clone(), owner, launch)
-        .await
-        .unwrap();
+    let workload = CandidateRun::start_launch(
+        api,
+        image.clone(),
+        owner,
+        launch,
+        super::super::profile::LIFETIME_SECS,
+    )
+    .await
+    .unwrap();
     let owner = token();
-    let launch = Launch::control(&image, driver, &owner, workload.container_id()).unwrap();
+    let launch = Launch::control(
+        &image,
+        driver,
+        &owner,
+        workload.container_id(),
+        super::super::profile::LIFETIME_SECS,
+    )
+    .unwrap();
     let control = CandidateRun::start_launch(
         LocalApi::connect(&path).await.unwrap(),
         image.clone(),
         owner,
         launch,
+        super::super::profile::LIFETIME_SECS,
     )
     .await;
     let control = match control {

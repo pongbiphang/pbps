@@ -13571,6 +13571,46 @@ SPEC is in sync with all of these.
      an over-demand this reading cannot see; the destination demand was one it
      could.
 
+514. **A supplied scratch server is a known container layout reached through
+    the Docker profile's forwarder, not an arbitrary runtime proved contained
+    from outside.** An earlier shape of #609 admitted whatever container an
+    operator had assembled and set out to prove, from `/proc`, that nothing in
+    it could reach the target or be reached by anyone else. Forty-nine review
+    findings later that proof was still open, and each finding was real: a
+    bind under an allowed prefix, a tmpfs whose root proves nothing, a mount
+    stacked on a safe one, a task in no top-level listing, a socket carried in
+    from another namespace, a relay forgotten by one check in three. The
+    tables of a container someone else built can be arranged in any number of
+    ways, so the question has no bottom, and five of its holes were being
+    recorded as limits rather than closed. What was being verified was, in
+    practice, the Docker profile's own container started by the operator
+    instead of by pbps — so the profile now says exactly that. The operator
+    names a container under a Docker-API runtime pbps can reach as root;
+    admission reads the daemon's record (no privilege, no network, read-only
+    root, tmpfs mounts only, bounds present), pins its id, init, start time
+    and image, decides target separation on the actual processes before
+    anything else, and measures the kernel against the rows the profile names:
+    every mount must be one of them, every task at the profile's identity and
+    privileges inside the init's cgroup, only loopback in the network
+    namespace, and nothing sharing its namespaces that is not in its PID
+    namespace except this run's own forwarders. Equality with a layout is
+    decidable where containment of an arbitrary one is not, and Docker's and
+    Podman's layouts were measured and pinned. The engine is reached as the
+    Docker profile reaches its own: a run-owned forwarder from the container's
+    image into its network namespace, one TCP session, bound to the one
+    established pair the forwarder's processes hold and exactly one engine
+    process serves. Because that namespace has no route out, the kernel's
+    census of it is complete for what reaches the engine, which the earlier
+    shape's Unix-socket channel could never be (its accepted end lived in the
+    caller's tables); the engine's session list and cumulative counter remain
+    the second signal, since a session that opened and closed between reads
+    leaves no row. The cleanup capability is data, not a handle — the
+    credentials, the daemon path and the pinned container — so no failure of
+    the analysis can drop it; a cancelled await drops only the session it was
+    on, and cleanup opens a fresh one. The operator gives up nothing that a
+    scratch server needs: storage is a tmpfs bounded by the container's memory,
+    and the container stays warm across runs.
+
 515. **A retype asks the catalog for the keys standing on its column, not only
      for the keys the plan drops (issue #503).**
 

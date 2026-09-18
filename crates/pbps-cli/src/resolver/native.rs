@@ -18,8 +18,13 @@ mod execution;
 mod private_channel;
 mod target;
 pub(crate) use daemon::DaemonLease;
-pub(crate) use execution::{ExecutionLease, ExecutionProfile};
-pub(crate) use private_channel::{PrivateChannelLease, PrivateChannelProfile, awaiting_engine};
+pub(crate) use execution::{
+    BoundedResourceLease, ExecutionLease, ExecutionProfile, MountEntry, ResourceCeilings,
+    cgroup_relative, mount_rows,
+};
+pub(crate) use private_channel::{
+    PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guard, private_network, security,
+};
 pub(crate) use target::TargetWitness;
 pub use target::{NativeTarget, NativeTargetError};
 
@@ -27,14 +32,14 @@ pub use target::{NativeTarget, NativeTargetError};
 #[error("the actual Linux peer process or its protected executable cannot be established")]
 pub struct UnqualifiedProcess;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
 impl FileIdentity {
-    fn of(file: &File) -> Result<Self, UnqualifiedProcess> {
+    pub(crate) fn of(file: &File) -> Result<Self, UnqualifiedProcess> {
         let metadata = file.metadata().map_err(|_| UnqualifiedProcess)?;
         Ok(Self {
             device: metadata.dev(),
@@ -82,7 +87,12 @@ impl ProcessLease {
             return Err(UnqualifiedProcess);
         }
         let mut namespaces = Vec::new();
-        for name in ["pid", "mnt", "net", "user"] {
+        // `ipc` is here for the dedicated-server profile's occupant accounting:
+        // a container sharing the engine's IPC namespace reaches its shared
+        // memory. The Docker profile only ever asks about pid/mnt/net/user, so
+        // this is additive — `same_process` and `check` iterate whatever was
+        // captured, and no caller assumes the set's size.
+        for name in ["pid", "mnt", "net", "user", "ipc"] {
             let file = File::open(base.join("ns").join(name)).map_err(|_| UnqualifiedProcess)?;
             let identity = FileIdentity::of(&file)?;
             namespaces.push((name, file, identity));
@@ -102,6 +112,85 @@ impl ProcessLease {
 
     pub fn executable_path(&self) -> &Path {
         &self.executable_path
+    }
+
+    /// Opens a path inside this process's own mount namespace, through the
+    /// held proc directory, so a reused numeric PID cannot answer for it.
+    pub(crate) fn open_in_root(&self, relative: &str) -> Result<File, UnqualifiedProcess> {
+        self.check()?;
+        let file = File::open(proc_base(&self.directory).join("root").join(relative))
+            .map_err(|_| UnqualifiedProcess)?;
+        self.check()?;
+        Ok(file)
+    }
+
+    /// One bounded file inside this process's own mount namespace.
+    pub(crate) fn read_root_file(
+        &self,
+        relative: &str,
+        limit: usize,
+    ) -> Result<String, UnqualifiedProcess> {
+        self.check()?;
+        let text = read_bounded(
+            &proc_base(&self.directory).join("root").join(relative),
+            limit,
+        )?;
+        self.check()?;
+        Ok(text)
+    }
+
+    /// The entries of a directory inside this process's mount namespace.
+    pub(crate) fn read_root_dir(
+        &self,
+        relative: &str,
+    ) -> Result<BTreeSet<String>, UnqualifiedProcess> {
+        self.check()?;
+        let mut names = BTreeSet::new();
+        for entry in std::fs::read_dir(proc_base(&self.directory).join("root").join(relative))
+            .map_err(|_| UnqualifiedProcess)?
+        {
+            let entry = entry.map_err(|_| UnqualifiedProcess)?;
+            names.insert(
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| UnqualifiedProcess)?,
+            );
+        }
+        self.check()?;
+        Ok(names)
+    }
+
+    /// Whether a namespace handle opened elsewhere is this process's own.
+    ///
+    /// A `/proc` or `/sys` mount cannot be told apart from the host's by its
+    /// filesystem type; what distinguishes them is the namespace the instance
+    /// belongs to, and this is how that comparison is made.
+    pub(crate) fn owns_namespace(
+        &self,
+        name: &str,
+        other: &File,
+    ) -> Result<bool, UnqualifiedProcess> {
+        self.check()?;
+        let held = self
+            .namespaces
+            .iter()
+            .find(|(key, _, _)| *key == name)
+            .map(|(_, _, identity)| *identity)
+            .ok_or(UnqualifiedProcess)?;
+        let same = FileIdentity::of(other)? == held;
+        self.check()?;
+        Ok(same)
+    }
+
+    /// Reads one bounded file through the *held* proc directory, so a reused
+    /// numeric PID cannot answer for the process this lease captured.
+    pub(crate) fn read_proc(
+        &self,
+        relative: &str,
+        limit: usize,
+    ) -> Result<String, UnqualifiedProcess> {
+        read_bounded(&proc_base(&self.directory).join(relative), limit)
     }
 
     pub fn pid(&self) -> u32 {
@@ -303,7 +392,7 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
     found.ok_or(UnqualifiedProcess)
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
+pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
     let mut text = String::new();
     File::open(path)
         .map_err(|_| UnqualifiedProcess)?
@@ -350,7 +439,7 @@ fn exited_stat(stat: &str) -> Result<bool, UnqualifiedProcess> {
     Ok(matches!(*state, "Z" | "X") && threads == 1)
 }
 
-fn observe_incidental<T>(
+pub(crate) fn observe_incidental<T>(
     pid: u32,
     directory: &File,
     inspect: impl FnOnce(ProcessLease) -> Result<T, UnqualifiedProcess>,
@@ -381,7 +470,7 @@ fn observe_incidental<T>(
     }
 }
 
-fn open_process(pid: u32) -> std::io::Result<File> {
+pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
     // The opt-in kernel fixture mounts only its two owned process trees into
     // a private PID namespace. Production always uses the real proc mount.
     #[cfg(test)]
@@ -400,7 +489,9 @@ fn open_process(pid: u32) -> std::io::Result<File> {
     File::open(format!("/proc/{pid}"))
 }
 
-fn process_scope(service: &ProcessLease) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
+pub(crate) fn process_scope(
+    service: &ProcessLease,
+) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
     let mut scope = vec![(
         service.pid,
         service
@@ -441,7 +532,13 @@ fn process_scope(service: &ProcessLease) -> Result<Vec<(u32, File)>, Unqualified
             if !seen.insert(pid) {
                 continue;
             }
-            if scope.len() >= 1024 {
+            // A bound against a pathological /proc, not a profile limit: it
+            // must exceed the largest `pids.max` any profile admits (the
+            // dedicated-server profile allows 2048) so that a runtime meeting
+            // its named ceiling is never refused for reaching this instead —
+            // `process_scope` counts processes, and threads do not add entries
+            // here, so real engines stay far below it (finding on #640).
+            if scope.len() >= 4096 {
                 return Err(UnqualifiedProcess);
             }
             let directory = match open_process(pid) {
@@ -467,6 +564,169 @@ fn process_scope(service: &ProcessLease) -> Result<Vec<(u32, File)>, Unqualified
         cursor += 1;
     }
     Ok(scope)
+}
+
+/// The tasks sharing one of a lease's namespaces, by kernel id.
+///
+/// Tasks, not processes. Linux keeps credentials, the seccomp and
+/// no-new-privileges state, the namespaces and the descriptor table per task,
+/// so a thread can differ from its group's leader — measured: SQL Server's
+/// engine runs 116 of them. Scanning only `/proc`'s top level would observe
+/// the leader and qualify the rest by association.
+///
+/// Ids rather than leases: a lease holds six descriptors, and holding one per
+/// task would exhaust a process's file-descriptor limit on an engine like
+/// that. Callers capture them one at a time.
+pub(crate) fn namespace_task_ids(
+    anchor: &ProcessLease,
+    namespace: &str,
+) -> Result<Vec<u32>, UnqualifiedProcess> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir("/proc").map_err(|_| UnqualifiedProcess)? {
+        let entry = entry.map_err(|_| UnqualifiedProcess)?;
+        let Some(group) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let directory = match open_process(group) {
+            Ok(directory) => directory,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        let tasks = match std::fs::read_dir(proc_base(&directory).join("task")) {
+            Ok(tasks) => tasks,
+            Err(error) if process_gone(&error) => {
+                // A leader can exit while its threads live, and the task
+                // directory goes with it; the surviving tasks are then in no
+                // listing at all (DECISIONS 497 measured the same shape).
+                if process_exited(&directory)? {
+                    continue;
+                }
+                // They cannot be enumerated, so the only sound answers are
+                // "demonstrably not in this namespace" or a refusal. A thread
+                // could in principle have entered it alone, which needs
+                // privilege the provisioning boundary already assumes.
+                match File::open(proc_base(&directory).join("ns").join(namespace)) {
+                    Ok(handle) if !anchor.owns_namespace(namespace, &handle)? => continue,
+                    Ok(_) | Err(_) => return Err(UnqualifiedProcess),
+                }
+            }
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        for task in tasks {
+            let task = task.map_err(|_| UnqualifiedProcess)?;
+            let Some(id) = task
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // Through the leader's held directory, so a reused group id
+            // cannot answer for the tasks of another process.
+            let handle = match File::open(task.path().join("ns").join(namespace)) {
+                Ok(handle) => handle,
+                Err(error) if process_gone(&error) => continue,
+                Err(_) => return Err(UnqualifiedProcess),
+            };
+            if anchor.owns_namespace(namespace, &handle)? {
+                ids.push(id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        // The anchor is in its own namespace, so an empty answer means the
+        // scan saw nothing at all rather than that nothing is there.
+        return Err(UnqualifiedProcess);
+    }
+    anchor.check()?;
+    Ok(ids)
+}
+
+/// The tasks sharing a lease's network namespace whose PID namespace is none
+/// of the given anchors'.
+///
+/// A capture-free census: it compares namespace identity rather than
+/// qualifying each task, so a short-lived occupant — a forwarder's `cat` pipe
+/// being reaped and respawned while it forwards — is skipped as it vanishes
+/// rather than refused for having, at the instant of capture, no executable to
+/// read. `for_each_occupant` cannot serve here for exactly that reason: it
+/// captures a `ProcessLease` for every occupant, and a zombie between reap and
+/// wait has none. The caller decides what an unaccounted task means.
+pub(crate) fn foreign_network_tasks(
+    net_anchor: &ProcessLease,
+    pid_anchors: &[&ProcessLease],
+) -> Result<Vec<u32>, UnqualifiedProcess> {
+    let mut foreign = Vec::new();
+    for id in namespace_task_ids(net_anchor, "net")? {
+        let directory = match open_process(id) {
+            Ok(directory) => directory,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        let handle = match File::open(proc_base(&directory).join("ns").join("pid")) {
+            Ok(handle) => handle,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        let mut owned = false;
+        for anchor in pid_anchors {
+            if anchor.owns_namespace("pid", &handle)? {
+                owned = true;
+                break;
+            }
+        }
+        if !owned {
+            foreign.push(id);
+        }
+    }
+    net_anchor.check()?;
+    Ok(foreign)
+}
+
+/// Applies one check to every task sharing a lease's namespace, capturing
+/// each in turn and letting it go before the next.
+pub(crate) fn for_each_occupant(
+    anchor: &ProcessLease,
+    namespace: &str,
+    mut inspect: impl FnMut(&ProcessLease) -> Result<(), UnqualifiedProcess>,
+) -> Result<(), UnqualifiedProcess> {
+    for id in namespace_task_ids(anchor, namespace)? {
+        let directory = match open_process(id) {
+            Ok(directory) => directory,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        if let Some(()) = observe_incidental(id, &directory, |lease| inspect(&lease))? {
+            continue;
+        }
+    }
+    anchor.check()
+}
+
+pub(crate) fn groups(process: &ProcessLease) -> Result<(Vec<u32>, Vec<u32>), UnqualifiedProcess> {
+    let status = process.read_proc("status", 65536)?;
+    let field = |name: &str| -> Result<Vec<u32>, UnqualifiedProcess> {
+        let mut values = status.lines().filter_map(|line| line.strip_prefix(name));
+        let value = values.next().ok_or(UnqualifiedProcess)?;
+        if values.next().is_some() {
+            return Err(UnqualifiedProcess);
+        }
+        value
+            .split_whitespace()
+            .map(|entry| entry.parse::<u32>().map_err(|_| UnqualifiedProcess))
+            .collect()
+    };
+    let gids = field("Gid:")?;
+    if gids.len() != 4 {
+        return Err(UnqualifiedProcess);
+    }
+    let supplementary = field("Groups:")?;
+    process.check()?;
+    Ok((gids, supplementary))
 }
 
 fn socket_owner(
@@ -496,7 +756,7 @@ fn socket_owner(
     Ok((owners.remove(0), inode))
 }
 
-fn socket_owners(
+pub(crate) fn socket_owners(
     service: &ProcessLease,
     inode: u64,
 ) -> Result<Vec<ProcessLease>, UnqualifiedProcess> {

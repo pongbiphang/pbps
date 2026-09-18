@@ -2,7 +2,7 @@
 //! one job: launch one candidate, supervise it, and remove only that resource.
 //! It never reconnects a run. A separate connection may only perform cleanup.
 
-use super::profile::{LIFETIME_SECS, Launch, OWNER_LABEL};
+use super::profile::{Launch, OWNER_LABEL};
 use super::{API, CandidateImage, Error, LocalApi, path_component};
 use bytes::Bytes;
 use hyper::{Method, StatusCode};
@@ -100,14 +100,19 @@ impl CandidateRun {
             cause,
             recovery_names: Vec::new(),
         })?;
-        Self::start_launch(api, image, token, launch).await
+        Self::start_launch(api, image, token, launch, super::profile::LIFETIME_SECS).await
     }
 
-    pub(super) async fn start_launch(
+    /// `lifetime_secs` bounds the supervision as well as the container's own
+    /// root guard: a supervisor that removed the container on a shorter
+    /// deadline than the guard's would end a run the recipe still allowed
+    /// (finding on #640).
+    pub(crate) async fn start_launch(
         api: LocalApi,
         image: CandidateImage,
         token: String,
         launch: Launch,
+        lifetime_secs: u64,
     ) -> Result<Self, StartFailure> {
         let owner = Owner {
             name: format!("pbps-resolver-{token}"),
@@ -123,6 +128,7 @@ impl CandidateRun {
             api,
             owner,
             launch,
+            lifetime_secs,
             receiver,
             ready,
             cleanup_report,
@@ -148,7 +154,7 @@ impl CandidateRun {
         &self.id
     }
 
-    pub(super) fn native_pid(&self) -> Result<u32, Error> {
+    pub(crate) fn native_pid(&self) -> Result<u32, Error> {
         self.pid.try_into().map_err(|_| Error::RuntimeChanged)
     }
 
@@ -172,7 +178,7 @@ impl CandidateRun {
     }
 }
 
-async fn inspect(api: &mut LocalApi, resource: &str) -> Result<Option<Value>, Error> {
+pub(super) async fn inspect(api: &mut LocalApi, resource: &str) -> Result<Option<Value>, Error> {
     let (status, body) = api
         .request(
             Method::GET,
@@ -374,6 +380,7 @@ async fn supervise(
     mut api: LocalApi,
     mut owner: Owner,
     launch: Launch,
+    lifetime_secs: u64,
     mut commands: mpsc::Receiver<Command>,
     ready: oneshot::Sender<Result<Running, StartFailure>>,
     cleaned: oneshot::Sender<Result<(), Error>>,
@@ -381,7 +388,7 @@ async fn supervise(
     if ready.is_closed() {
         return;
     }
-    let deadline = Instant::now() + Duration::from_secs(LIFETIME_SECS);
+    let deadline = Instant::now() + Duration::from_secs(lifetime_secs);
     // The operation keeps its ownership context even if the caller cancels
     // while Docker is creating/starting it. HTTP itself has a bounded timeout.
     let start = create_start(&mut api, &mut owner, &launch, &ready).await;
