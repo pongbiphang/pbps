@@ -187,7 +187,8 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
-                | Change::Revoke { .. } => return None,
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => return None,
             };
             let source = tables
                 .get(&column.table)

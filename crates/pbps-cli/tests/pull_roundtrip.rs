@@ -207,7 +207,12 @@ fn what_pull_writes_for_a_module_reads_back_as_the_same_module() {
     assert_eq!(pulled.schema.modules.len(), 2);
 
     for (id, module) in &pulled.schema.modules {
-        let yaml = pbps_load::render_module(id, module, &Default::default());
+        let yaml = pbps_load::render_module(
+            id,
+            module,
+            &Default::default(),
+            pulled.public_execute.contains(id),
+        );
         let loaded = pbps_load::load_module_str(Path::new("pulled.yml"), &yaml)
             .unwrap_or_else(|e| panic!("{id}: pulled YAML does not parse: {e:?}"));
         // The identity too, not only the body: a trigger's file writes

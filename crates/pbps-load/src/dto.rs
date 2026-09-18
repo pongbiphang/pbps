@@ -267,6 +267,18 @@ pub struct ModuleDto {
     #[serde(default)]
     #[schemars(with = "Vec<String>")]
     pub depends_on: Vec<Spanned<String>>,
+
+    /// Opts this routine back in to the engine's default `EXECUTE` to
+    /// `PUBLIC`, where the engine has one (ADR-0010 §5). Persistent, like
+    /// `depends_on:`, and preserved by `fmt`.
+    ///
+    /// Absent — the common case — means the plan takes that default away as
+    /// part of creating the routine. Writing `false` says the same thing out
+    /// loud and is accepted, so that a declaration can record the decision
+    /// where a reader sees it.
+    #[serde(default)]
+    #[schemars(with = "Option<bool>")]
+    pub public_execute: Option<Spanned<bool>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

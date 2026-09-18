@@ -39,12 +39,20 @@
 //! a role the declarations do not name on this target, a column-level grant
 //! (`pg_attribute.attacl`), `WITH GRANT OPTION` (the model holds no such
 //! flag), an owner a rebuild would transfer, `reloptions`, a view column
-//! default and a trigger's `tgenabled`. And the direction that is easy to
-//! miss stays a refusal *for good*, not merely until the model catches up:
-//! ADR-0010 §5 records that pbps cannot express "revoked from `PUBLIC`" — the
-//! state is the *absence* of the engine's default rather than a row, so there
-//! is no grantee named `PUBLIC` to re-emit a revoke from — and a rebuild
-//! restores the default (DECISIONS 306).
+//! default and a trigger's `tgenabled`.
+//!
+//! The direction that is easy to miss — the *absence* of an entry
+//! `acldefault` would otherwise put there — used to be a refusal for good,
+//! because there was no grantee named `PUBLIC` to re-emit a revoke from and a
+//! rebuild restores the default (DECISIONS 306). Issue #318 gave the model
+//! that grantee: `Change::PublicExecution` writes down what this plan has
+//! settled about a routine's default `EXECUTE`, and where the plan carries one
+//! for this object it is accepted here for the same reason a declared grant is
+//! — the missing default is a state somebody recorded an intent about, which
+//! the plan either restates after the `CREATE` or deliberately lets the
+//! `CREATE` give back (ADR-0010 §5 amendment, DECISIONS 517). Nothing else
+//! about that direction moved: another permission, another grantee, or no such
+//! decision in the plan, and it refuses as before.
 //!
 //! # The connected caller
 //!
@@ -195,6 +203,26 @@ pub async fn before_a_rebuild(
     let declared = grant_target(id)
         .map(|target| declared_grants(changes, &target))
         .unwrap_or_default();
+    // The other half of the same question, on the grantee the declarations
+    // cannot name. `PUBLIC` having lost the engine's default `EXECUTE` used
+    // to be a refusal for good, because nothing in the model could put the
+    // state back after the rebuild's `CREATE` restored the default
+    // (DECISIONS 306). `Change::PublicExecution` is that something.
+    //
+    // **Either decision explains it, and that is why the plan carries one
+    // whichever way it went.** `Revoked` re-issues the revoke after the
+    // `CREATE`, so the missing default is a state this plan restates, exactly
+    // as a declared grant is. `Kept` is the declaration asking for the
+    // default back on a routine somebody had closed — a valid rebuild whose
+    // whole effect is the `CREATE` restoring it, and refusing that would
+    // refuse a plan for the state it was asked to reach. What still refuses
+    // is a plan that says *nothing* about this routine, which is the only
+    // case where the missing default is nobody's recorded intent.
+    let public_execution_settled = matches!(id, ModuleId::Routine(routine)
+    if changes.changes.iter().any(|p| matches!(
+        &p.change,
+        Change::PublicExecution { routine: r, .. } if r == routine
+    )));
     // Resolved **once**, and every read below is keyed by the oid rather than
     // by the name again. Two independent name matches would be two chances to
     // disagree, and the direction they fail in is the worst one available: a
@@ -229,7 +257,7 @@ pub async fn before_a_rebuild(
             read_extension_ties(conn, oid, "pg_class", &mut carries).await?;
         }
         ModuleKind::Function | ModuleKind::Procedure => {
-            read_routine(conn, oid, &declared, &mut carries).await?;
+            read_routine(conn, oid, &declared, public_execution_settled, &mut carries).await?;
             read_arriving_grants(conn, id, "f", &mut carries).await?;
             read_attached(conn, oid, "pg_proc", &mut carries).await?;
             read_extension_ties(conn, oid, "pg_proc", &mut carries).await?;
@@ -696,7 +724,9 @@ async fn read_relation(
             owner_column: "relowner",
             objtype: "r",
         };
-        read_acl(conn, oid, source, declared, carries).await?;
+        // A view has no `EXECUTE` to lose, so there is never a revoke of one
+        // for the plan to restate.
+        read_acl(conn, oid, source, declared, false, carries).await?;
     }
     // Measured: `security_invoker`, `security_barrier` and `check_option` live
     // here and in nothing else — `pg_get_viewdef` cannot show them, and
@@ -718,6 +748,7 @@ async fn read_routine(
     conn: &mut Conn,
     oid: i64,
     declared: &BTreeMap<String, BTreeSet<Permission>>,
+    public_execution_settled: bool,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
     let rows = conn
@@ -740,7 +771,15 @@ async fn read_routine(
             owner_column: "proowner",
             objtype: "f",
         };
-        read_acl(conn, oid, source, declared, carries).await?;
+        read_acl(
+            conn,
+            oid,
+            source,
+            declared,
+            public_execution_settled,
+            carries,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1016,6 +1055,7 @@ async fn read_acl(
     oid: i64,
     source: AclSource,
     declared: &BTreeMap<String, BTreeSet<Permission>>,
+    public_execution_settled: bool,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
     let AclSource {
@@ -1081,14 +1121,24 @@ async fn read_acl(
             &grantee
         };
         if side == "missing" {
+            // One absence the plan can now put back, and only this one: the
+            // engine's default `EXECUTE` to `PUBLIC` on a routine, where the
+            // plan carries the `PublicExecution` that settles it after
+            // the `CREATE` (ADR-0010 §5). The same narrowing `declared` is
+            // for, on the grantee the declarations cannot name — and just as
+            // narrow: a different permission, or a different grantee, is
+            // still the refusal below.
+            if public_execution_settled && grantee.is_empty() && permission == "EXECUTE" {
+                continue;
+            }
             // The direction that is easy to miss (ADR-0009 §3, ADR-0010 §5):
             // not a row to compare, but the absence of one `acldefault` would
-            // otherwise put there. Always a refusal — the model has no
-            // grantee to re-emit a revoke from, `PUBLIC` least of all
-            // (DECISIONS 306) — whoever the row names.
+            // otherwise put there. Otherwise a refusal — the model has no
+            // grantee to re-emit a revoke from (DECISIONS 306) — whoever the
+            // row names.
             carries.push(Carried {
                 what: "a grant the object's own default ACL holds and this one does not, which a \
-                       rebuild restores and no declaration here can take away again",
+                       rebuild restores and nothing in this plan takes away again",
                 detail: format!(
                     "{who} no longer holds `{permission}`, which `acldefault` grants a freshly \
                      created object of this kind"
@@ -1098,8 +1148,9 @@ async fn read_acl(
         }
         if grantee.is_empty() {
             carries.push(Carried {
-                what: "a grant to PUBLIC, which is not a role the declarations can name and \
-                       ADR-0010 §5 keeps off the restorable path for good",
+                what: "a grant to PUBLIC beyond the engine's own default, which is not a role \
+                       the declarations can name — the one thing a plan may say about PUBLIC is \
+                       that a routine's default `EXECUTE` goes away (ADR-0010 §5)",
                 detail: format!("PUBLIC holds `{permission}`"),
             });
             continue;

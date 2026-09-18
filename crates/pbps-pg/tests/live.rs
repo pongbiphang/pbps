@@ -9815,12 +9815,40 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
     );
     let cs = plan(&a, &ids, &b, &ids);
     // The typed differ now includes the dialect's conservative rebind rule.
-    // Both operations are ordered and approved in the same change set.
-    assert_eq!(cs.changes.len(), 2, "{cs:#?}");
-    assert!(matches!(&cs.changes[0].change,
+    // Both operations are ordered and approved in the same change set. Each
+    // ends with a `CREATE`, so each is followed by the revoke that takes this
+    // engine's default `EXECUTE` to `PUBLIC` off the routine it made
+    // (issue #318) — those sort after every module change and are checked
+    // below rather than counted in with them.
+    let modules: Vec<&pbps_model::Change> = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .filter(|c| c.module_id().is_some())
+        .collect();
+    assert_eq!(modules.len(), 2, "{cs:#?}");
+    assert!(matches!(modules[0],
         pbps_model::Change::CreateModule { id, .. } if id == &shadow));
-    assert!(matches!(&cs.changes[1].change,
+    assert!(matches!(modules[1],
         pbps_model::Change::AlterModule { id, .. } if id == &caller));
+    let closed: std::collections::BTreeSet<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::PublicExecution { routine, .. } = &p.change {
+                Some(routine.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        closed,
+        [shadow.to_string(), caller.to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "{cs:#?}"
+    );
     let changed: std::collections::BTreeSet<pbps_model::ModuleId> =
         [shadow.clone()].into_iter().collect();
 

@@ -1439,6 +1439,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         unexpressible,
         limitations,
         unmanaged_modules,
+        // This engine grants no principal `EXECUTE` on a procedure it
+        // creates, and its `public` is an ordinary database role whose grants
+        // are compared like any other role's. There is no engine default here
+        // for a declaration to opt back in to.
+        public_execute: Default::default(),
     }
 }
 

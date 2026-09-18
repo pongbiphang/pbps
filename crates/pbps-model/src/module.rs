@@ -592,6 +592,12 @@ pub enum ModuleIdError {
     #[error("`{0}` contains an empty identifier")]
     EmptySegment(String),
 
+    #[error(
+        "`{0}` is not a routine: a routine is named with its argument types, as \
+         `schema.function(argument types)`"
+    )]
+    NotARoutine(String),
+
     #[error("`{argument}` in `{whole}` is not a type: {source}")]
     Argument {
         whole: String,
@@ -776,6 +782,38 @@ impl<'de> serde::Deserialize<'de> for ModuleId {
     }
 }
 
+impl FromStr for RoutineId {
+    type Err = ModuleIdError;
+
+    /// Through [`ModuleId`], because the shape rule that tells a routine from
+    /// a view or a trigger is written there once: parentheses mean a
+    /// signature. Parsing a bare name here as a routine with no arguments
+    /// would make `app.v` and `app.v()` one text for two different objects.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<ModuleId>()? {
+            ModuleId::Routine(r) => Ok(r),
+            ModuleId::Named(_) | ModuleId::Trigger { .. } => {
+                Err(ModuleIdError::NotARoutine(s.to_owned()))
+            }
+        }
+    }
+}
+
+// A routine names itself the same way inside a plan as it does as a map key:
+// one string, `app.f(integer,text)`, read back through the shape rule above.
+impl serde::Serialize for RoutineId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RoutineId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -853,6 +891,27 @@ pub struct Module {
 /// does, and for the same reason: it says how to get there, not where to go.
 pub type ModuleDeps = BTreeMap<ModuleId, BTreeSet<ModuleId>>;
 
+/// The routines whose declaration says `PUBLIC` may execute them.
+///
+/// # Why this is not a field of [`Module`]
+///
+/// The same reason as [`ModuleDeps`], arrived at from the other side. What
+/// `PUBLIC` holds on an object is **context, never a compared grant**
+/// (ADR-0010 §5, DECISIONS 371): a pull reports it and `status` carries it,
+/// but no comparison of two states may read it, because every routine
+/// PostgreSQL creates arrives holding it and a differ that compared it would
+/// plan the same revoke forever. A `public_execute:` inside [`Module`] would
+/// be exactly that comparison — the declared module would stop matching the
+/// identical module read back from the catalog, which is inviolable
+/// constraint 1.
+///
+/// So it travels beside the model and says what the differ should *write*,
+/// not what the two sides should agree on: absent means the plan takes the
+/// engine's default away as part of creating the routine, and present means
+/// it leaves it alone. A routine that is not here is not "unknown" — it is
+/// the safe answer, which is what makes the default the closed one.
+pub type PublicExecute = BTreeSet<ModuleId>;
+
 /// The annotations that travel beside the model.
 ///
 /// `pbps-load` returns them separately from the [`crate::Schema`], the differ
@@ -864,6 +923,9 @@ pub struct Hints {
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).
     pub module_deps: ModuleDeps,
+    /// The routines whose declaration opts back in to `PUBLIC` execution
+    /// (ADR-0010 §5).
+    pub public_execute: PublicExecute,
 }
 
 /// Whether `definition` mentions `name`, by a best-effort identifier scan.

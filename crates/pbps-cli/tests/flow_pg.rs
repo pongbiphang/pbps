@@ -897,7 +897,10 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::DropRole { .. }
             | change @ pbps_model::Change::RenameRole { .. }
             | change @ pbps_model::Change::Grant { .. }
-            | change @ pbps_model::Change::Revoke { .. } => panic!("unexpected change {change:?}"),
+            | change @ pbps_model::Change::Revoke { .. }
+            | change @ pbps_model::Change::PublicExecution { .. } => {
+                panic!("unexpected change {change:?}")
+            }
         }
     }
     assert_eq!(checked, 6);
@@ -1308,6 +1311,219 @@ fn a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it() 
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// A routine `PUBLIC` can execute, by the engine's own reckoning: the ACL
+/// expanded from `acldefault` where the catalog holds none, which is the read
+/// ADR-0010 §5 insists on — a NULL `proacl` is the default applying, not
+/// nobody being granted anything.
+const PUBLIC_EXECUTES: &str = "SELECT count(*) FROM pg_proc p, LATERAL \
+     aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a \
+     WHERE p.oid = $ROUTINE$::regprocedure AND a.grantee = 0 AND a.privilege_type = 'EXECUTE'";
+
+fn public_executes(connection: &str, routine: &str) -> bool {
+    scalar(
+        connection,
+        &PUBLIC_EXECUTES.replace("$ROUTINE$", &format!("'{routine}'")),
+    ) == 1
+}
+
+/// Issue #318. A `SECURITY DEFINER` routine runs as its owner, so this
+/// engine's default — `EXECUTE` to `PUBLIC` on every function created — means
+/// any principal that can reach the schema may act as the owner through it.
+/// The plan takes that default away as part of creating the routine, and this
+/// is the property measured from the outside: a real low-privilege login
+/// attempting the privileged action the definer routine performs.
+///
+/// Every control the fix needs is in the one fixture, because each is only
+/// meaningful beside the others: a routine that opted back in, a routine a
+/// declared role was granted, and an `ALTER DEFAULT PRIVILEGES` that hands
+/// `PUBLIC` the privilege explicitly rather than by default.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens_it() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_pe_caller_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "public-execute");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION \
+             PASSWORD 'public-execute'; CREATE SCHEMA app",
+            role.1
+        ),
+    );
+    // The custom default the issue names. Measured on 18.6: with this in
+    // place a function this account creates in `app` arrives with an
+    // *explicit* `{=X/postgres,postgres=X/postgres}` rather than a NULL
+    // `proacl` — the same access by a different route, and a fix that only
+    // looked at "is the ACL NULL" would miss it. The plan's revoke names the
+    // grantee, so it closes both.
+    on_server(
+        connection,
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC",
+    );
+    let login = format!(
+        "{} user={} password=public-execute",
+        connection
+            .split_whitespace()
+            .filter(|word| !word.starts_with("user=") && !word.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+
+    let d = Demo::new("public-execute");
+    d.table(ONE_COLUMN);
+    // The privileged marker action: the caller holds nothing on `app.t`, so
+    // the only way a row reaches it is through the definer routine's owner.
+    std::fs::write(
+        d.dir.join("schema/mark.yml"),
+        "function: app.mark()\ndefinition: |-\n  () RETURNS bigint LANGUAGE sql SECURITY DEFINER \
+         AS $$ INSERT INTO app.t (id) VALUES (1) RETURNING id $$\n",
+    )
+    .unwrap();
+    // An ordinary invoker routine. Closed too, under the policy this issue
+    // settled: which routines are definer routines is inside a body this tool
+    // never parses, so the safe answer is the default and the declaration is
+    // where a project says otherwise.
+    std::fs::write(
+        d.dir.join("schema/plain.yml"),
+        "function: app.plain()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n",
+    )
+    .unwrap();
+    // A *procedure*, and it is here for the statement rather than the policy:
+    // one word has to take a function and a procedure alike, and measured,
+    // `ON FUNCTION` on a procedure is `is not a function` (DECISIONS 372).
+    // Nothing but a live procedure proves the emitted `ON ROUTINE` is that
+    // word on a revoke as well as on a grant.
+    std::fs::write(
+        d.dir.join("schema/touch.yml"),
+        "procedure: app.touch()\ndefinition: |-\n  () LANGUAGE sql SECURITY DEFINER \
+         AS $$ INSERT INTO app.t (id) VALUES (2) $$\n",
+    )
+    .unwrap();
+    // The one line that says otherwise.
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\npublic_execute: true\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 8 $$\n",
+    )
+    .unwrap();
+    // The same line, on a signature the loader and the engine spell
+    // differently. The loader is dialect-free, so this file says `int`; the
+    // module key becomes `app.alias(integer)` before the differ runs, and an
+    // opt-in that kept the file's spelling would match nothing — which the
+    // differ reads as the closed answer, applying the declaration as its own
+    // opposite.
+    std::fs::write(
+        d.dir.join("schema/alias.yml"),
+        "function: app.alias(int)\npublic_execute: true\ndefinition: |-\n  (int) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$\n",
+    )
+    .unwrap();
+    // The positive control: access granted the ordinary way, to a role the
+    // declarations name. Closing `PUBLIC` must not close this.
+    std::fs::write(
+        d.dir.join("schema/granted.yml"),
+        "function: app.granted()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 9 $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/caller.yml"),
+        format!(
+            "role: {}\ngrants:\n  schema::app: [usage]\n  app.granted(): [execute]\n",
+            role.1
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    // No `--allow revoke`: a routine that did not exist a statement earlier
+    // takes nothing away from anybody, and demanding the flag for every plan
+    // that declares a function would be friction without safety.
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    // The exposure, attempted for real. Not "the ACL looks right" — a login
+    // holding `USAGE` on the schema and nothing else, calling the definer
+    // routine that writes as its owner.
+    let denied = try_on_server(&login, "SELECT app.mark()").expect_err("PUBLIC must not execute");
+    assert!(denied.contains("permission denied"), "{denied}");
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM app.t"),
+        0,
+        "the marker action ran"
+    );
+    let denied =
+        try_on_server(&login, "SELECT app.plain()").expect_err("an invoker routine is closed too");
+    assert!(denied.contains("permission denied"), "{denied}");
+    let denied = try_on_server(&login, "CALL app.touch()").expect_err("a procedure is closed too");
+    assert!(denied.contains("permission denied"), "{denied}");
+
+    // The three that stay open, each for its own reason.
+    on_server(&login, "SELECT app.open()");
+    on_server(&login, "SELECT app.alias(1)");
+    on_server(&login, "SELECT app.granted()");
+
+    // And the catalog agrees with the engine's own answer, `ALTER DEFAULT
+    // PRIVILEGES` included.
+    for closed in ["app.mark()", "app.plain()", "app.granted()", "app.touch()"] {
+        assert!(!public_executes(connection, closed), "{closed} is open");
+    }
+    assert!(public_executes(connection, "app.open()"));
+    assert!(public_executes(connection, "app.alias(integer)"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // A pull of this database writes the key back, or the project it hands
+    // over would close `app.open()` on its first apply. And it writes it only
+    // where the database has the routine open: the closed ones come back with
+    // no key, which is what the absent key means.
+    let puller = Demo::new("public-execute-pull");
+    succeeds(puller.run(&["pull", "--db", connection]));
+    // Found by its leading key rather than by filename: how a routine's
+    // signature is spelled on disk is `declaration_file`'s business.
+    let pulled = |routine: &str| {
+        let wanted = [
+            format!("function: {routine}"),
+            format!("procedure: {routine}"),
+        ];
+        std::fs::read_dir(puller.dir.join("schema"))
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+            .find(|text| wanted.iter().any(|w| text.starts_with(w)))
+            .unwrap_or_else(|| panic!("no pulled declaration for {routine}"))
+    };
+    for open in ["app.open()", "app.alias(integer)"] {
+        assert!(
+            pulled(open).contains("public_execute: true"),
+            "{open}: {}",
+            pulled(open)
+        );
+    }
+    for closed in ["app.mark()", "app.plain()", "app.granted()", "app.touch()"] {
+        assert!(
+            !pulled(closed).contains("public_execute"),
+            "{closed}: {}",
+            pulled(closed)
+        );
+    }
+}
+
+/// Every module edit on this engine is a drop and a create (ADR-0009 §3), and
+/// the create restores the engine's default `EXECUTE` to `PUBLIC`. Before
+/// issue #318 nothing in the model could take it away again, so a routine
+/// somebody had closed by hand made every later plan *refuse* — hardening a
+/// managed routine and managing it were mutually exclusive (ADR-0010 §5).
+///
+/// Both halves are measured here. The rebuild does not reopen the routine,
+/// which is what the test has always been for; and it no longer deadlocks,
+/// because the revoke that closes it again is a change in the approved plan.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn routine_rebuilds_do_not_restore_revoked_public_execute() {
@@ -1326,33 +1542,417 @@ fn routine_rebuilds_do_not_restore_revoked_public_execute() {
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["bootstrap", "--db", connection]));
+    // Closed from the moment it was created, without anyone typing a REVOKE.
+    assert!(!public_executes(connection, "app.secret()"));
+
     std::fs::write(&file, declaration(2)).unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     let plan = d.dir.join("plan.json");
-    let planning = ["plan", "--db", connection, "--out", plan.to_str().unwrap()];
-    succeeds(d.run(&planning));
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+
+    // A hand revoke, on a routine the plan has already closed: the state the
+    // old code refused to plan over. It is the plan's own state now, so the
+    // rebuild goes ahead.
     on_server(
         connection,
         "REVOKE EXECUTE ON FUNCTION app.secret() FROM PUBLIC",
     );
-    for o in [d.run(&planning), apply_plan(&d, connection, &plan, false)] {
-        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
-        assert!(stderr(&o).contains("PUBLIC"), "{}", stderr(&o));
-    }
-    on_server(
-        connection,
-        "DO $$ BEGIN IF app.secret() <> 1 OR EXISTS (SELECT 1 FROM pg_proc p, LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a WHERE p.oid = 'app.secret()'::regprocedure AND a.grantee = 0 AND a.privilege_type = 'EXECUTE') THEN RAISE EXCEPTION 'routine rebuild restored public access'; END IF; END $$",
+    // The rebuild's revoke *is* gated, and this is the difference from a
+    // fresh create: the object was there, so what the declarations cannot say
+    // is whether anybody was relying on the default the `CREATE` restores.
+    let unapproved = apply_plan(&d, connection, &plan, false);
+    assert_eq!(
+        code(&unapproved),
+        1,
+        "{}{}",
+        stdout(&unapproved),
+        stderr(&unapproved)
     );
-    // An explicit ACL remains carried state even if its entries resemble the
-    // default. Recreate the original default-only fixture for the safe case.
-    on_server(connection, "DROP FUNCTION app.secret()");
-    on_server(
-        connection,
-        "CREATE FUNCTION app.secret() RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$",
+    assert!(
+        stderr(&unapproved).contains("--allow revoke"),
+        "{}",
+        stderr(&unapproved)
     );
-    succeeds(apply_plan(&d, connection, &plan, false));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "revoke"],
+    ));
+
+    // The edit landed, and the routine is still closed to PUBLIC.
+    assert_eq!(scalar(connection, "SELECT app.secret()::bigint"), 2);
+    assert!(!public_executes(connection, "app.secret()"));
     succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// The other direction of the same deadlock. A routine this tool closed on
+/// creation, whose declaration later adds `public_execute: true` *and* edits
+/// the definition, asks for a rebuild whose whole effect is the `CREATE`
+/// giving the default back.
+///
+/// The plan records that decision, and the rebuild guard reads it as the
+/// recorded intent it is. A plan that instead stayed silent about the routine
+/// looked to that guard exactly like a plan with no opinion, and the missing
+/// default refused the rebuild: a valid plan refused for asking for the state
+/// it was asked to reach.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-reopen");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-reopen");
+    let file = d.dir.join("schema/reopen.yml");
+    let declaration = |value: u8, open: bool| {
+        format!(
+            "function: app.reopen()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT {value} $$\n{}",
+            if open { "public_execute: true\n" } else { "" }
+        )
+    };
+    std::fs::write(&file, declaration(1, false)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    assert!(!public_executes(connection, "app.reopen()"));
+
+    // Both edits at once, which is the only way the key can take effect: the
+    // annotation is never compared, so it is the rebuild the definition edit
+    // forces that acts on it.
+    std::fs::write(&file, declaration(2, true)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+
+    // Not gated: keeping the engine's default is a widening, and a widening
+    // is labelled rather than gated.
+    succeeds(apply_plan(&d, connection, &plan, false));
+    assert_eq!(scalar(connection, "SELECT app.reopen()::bigint"), 2);
+    assert!(public_executes(connection, "app.reopen()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // And the door closes again the same way it opened, on the next rebuild
+    // that carries the other decision.
+    std::fs::write(&file, declaration(3, false)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "revoke"],
+    ));
+    assert!(!public_executes(connection, "app.reopen()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// `--staged` applies one logical change (ADR-0003), and the decision the
+/// differ appends to a routine it creates is not a second one. Creating one
+/// routine in a staged revision was legal before issue #318, and the routine
+/// that declares `public_execute: true` is the case where it has to stay so:
+/// the other decision is refused for its own reason, by its own message.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_revision_may_still_create_one_routine() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-staged");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-staged");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    let open = d.dir.join("schema/open.yml");
+    std::fs::write(
+        &open,
+        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    succeeds(approved_apply(&d, connection, &plan, &["--staged"]));
+    assert!(public_executes(connection, "app.open()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // The closed answer is refused, and by the rule that is actually about
+    // it: the window between the `CREATE` and the revoke, not the count.
+    std::fs::write(
+        d.dir.join("schema/shut.yml"),
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", connection, "--staged"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("a staged run commits each statement on its own"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+/// The same postcondition at the read `bootstrap` records, and the shape that
+/// needs no other session at all: a `ddl_command_end` trigger already in the
+/// database reverses what the build just settled, inside the deployer'"'"'s own
+/// transaction.
+///
+/// The comment beside `refuse_unexpressible` there has said for a long time
+/// that a database-side trigger can *add* a privilege during the build and
+/// that a snapshot must never silently omit it (DECISIONS 110, 147). It can
+/// take one back too, and what `PUBLIC` holds is in neither the schema nor
+/// the unexpressible list (DECISIONS 371), so nothing else here would look.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn bootstrap_refuses_to_record_a_routine_a_trigger_reopened_to_public() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-bootstrap-snatch");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    // Already there when bootstrap starts, and it re-opens whatever the
+    // build closes. Keyed on the command tag so its own `GRANT` does not
+    // fire it again.
+    on_server(
+        connection,
+        "CREATE FUNCTION public.reopen() RETURNS event_trigger LANGUAGE plpgsql AS $$          BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE command_tag = 'REVOKE')          AND to_regprocedure('app.shut()') IS NOT NULL          THEN GRANT EXECUTE ON ROUTINE app.shut() TO PUBLIC; END IF; END $$;          CREATE EVENT TRIGGER reopen_revoke ON ddl_command_end EXECUTE FUNCTION public.reopen()",
+    );
+
+    let d = Demo::new("routine-bootstrap-snatch");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/shut.yml"),
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let refused = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("app.shut()"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("this plan closed"),
+        "{}",
+        stderr(&refused)
+    );
+    // The read-back and the ledger row are in the build'"'"'s own transaction, so
+    // the refusal leaves an empty database rather than a recorded lie.
+    on_server(
+        connection,
+        "DO $$ BEGIN IF to_regprocedure('app.shut()') IS NOT NULL THEN RAISE EXCEPTION 'the build was not rolled back'; END IF; END $$",
+    );
+
+    // With the trigger gone the same declarations bootstrap, closed.
+    on_server(connection, "DROP EVENT TRIGGER reopen_revoke");
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    assert!(!public_executes(connection, "app.shut()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// SPEC §7.6, the case it names and the read it names it at.
+///
+/// A staged run commits each statement on its own, so another session can
+/// reverse what a statement just wrote before the checkpoint reads it back.
+/// §7.6 does not promise the checkpoint catches that — the field is expected
+/// to move there, and the checkpoint cannot tell the plan'"'"'s statement from the
+/// other session'"'"'s — it promises the **closing** read does, by holding the
+/// field to the value the plan promised.
+///
+/// The other session is a DDL event trigger, which is how this suite stands
+/// one in: measured, `ddl_command_end` fires on `GRANT`, so the revoke lands
+/// after the plan'"'"'s own grant and before anything reads the catalog back.
+/// What `PUBLIC` holds is in no `Schema` (DECISIONS 371), so nothing in the
+/// movement comparison could have caught it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_routine_reopened_or_closed_behind_the_plan_refuses_to_close_the_run() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-public-snatch");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("routine-public-snatch");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+
+    // The concurrent writer: it takes back exactly what the plan'"'"'s `GRANT`
+    // just wrote, in the moment after it commits.
+    on_server(
+        connection,
+        "CREATE FUNCTION public.snatch() RETURNS event_trigger LANGUAGE plpgsql AS $$          BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE command_tag = 'GRANT')          AND to_regprocedure('app.open()') IS NOT NULL          THEN REVOKE EXECUTE ON ROUTINE app.open() FROM PUBLIC; END IF; END $$;          CREATE EVENT TRIGGER snatch_grant ON ddl_command_end EXECUTE FUNCTION public.snatch()",
+    );
+
+    let refused = approved_apply(&d, connection, &plan, &["--staged"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("app.open()"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("declared it would stay"),
+        "{}",
+        stderr(&refused)
+    );
+    // The routine is there — the statements ran and committed — and it is the
+    // *closing* that refused, which is the honest answer: the ledger keeps
+    // the last checkpoint rather than recording a success it cannot vouch for.
+    assert_eq!(scalar(connection, "SELECT app.open()::bigint"), 1);
+    assert!(!public_executes(connection, "app.open()"));
+
+    // A resume alone does not mend it, and should not pretend to: every
+    // statement has already run, so there is no `GRANT` left to re-issue and
+    // the read finds the same thing again. The refusal is not a retryable
+    // hiccup, it is a report that somebody else moved the field.
+    on_server(connection, "DROP EVENT TRIGGER snatch_grant");
+    let again = approved_apply(&d, connection, &plan, &["--staged", "--resume"]);
+    assert_eq!(code(&again), 1, "{}{}", stdout(&again), stderr(&again));
+    assert!(
+        stderr(&again).contains("declared it would stay"),
+        "{}",
+        stderr(&again)
+    );
+
+    // Settling what moved is the operator's step, and then it closes — which
+    // is what the refusal told them to do.
+    on_server(connection, "GRANT EXECUTE ON ROUTINE app.open() TO PUBLIC");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--staged", "--resume"],
+    ));
+    assert!(public_executes(connection, "app.open()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// The engine'"'"'s default is not the last word on what a new routine arrives
+/// holding. A cluster whose deployment role has run `ALTER DEFAULT PRIVILEGES
+/// REVOKE EXECUTE ON ROUTINES FROM PUBLIC` creates routines with an explicit
+/// ACL that `PUBLIC` is not in — so an opt-in that emitted nothing, trusting
+/// the `CREATE`, would apply a declaration and leave the declared state
+/// unreached, with `verify` unable to report it because what `PUBLIC` holds is
+/// never compared (DECISIONS 371).
+///
+/// Both directions are measured against that cluster: the declaration that
+/// asks for `PUBLIC` gets it, and the one that does not stays closed.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declaration_opens_a_routine_even_where_default_privileges_close_it() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-default-acl");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    // Per-database, and the deployer is the role creating the routines, so
+    // this is the state every `CREATE` below starts from.
+    on_server(
+        connection,
+        "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC",
+    );
+    let d = Demo::new("routine-default-acl");
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\npublic_execute: true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/shut.yml"),
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    // The declared state, reached against a cluster that would not have
+    // handed it over on its own.
+    assert!(public_executes(connection, "app.open()"));
+    assert!(!public_executes(connection, "app.shut()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // The *rebuild* direction on such a cluster never gets this far, and that
+    // is a different guard doing its job: `pg_default_acl` is one of the
+    // things ADR-0010 §2 refuses to plan over, because who creates an object
+    // decides what it arrives with. Asserted here so that the division of
+    // labour is on the record — the opt-in's `GRANT` is what covers the
+    // `CREATE`, and this refusal is what covers everything else the default
+    // privileges would hand the replacement.
+    std::fs::write(
+        d.dir.join("schema/open.yml"),
+        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 3 $$\npublic_execute: true\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("ALTER DEFAULT PRIVILEGES"),
+        "{}",
+        stderr(&refused)
+    );
 }
 
 #[test]
@@ -2474,7 +3074,17 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     succeeds(d.run(&planning));
     // Run the real plan before inspecting its shape: an omitted rebuild must
     // fail on the engine's observed binding, not merely a mirrored assertion.
-    succeeds(apply_plan(&d, connection, &plan, false));
+    //
+    // `--allow revoke` because the synthesized rebuild of `app.caller()` is a
+    // drop and a create on this engine, and the create restores the default
+    // `EXECUTE` to `PUBLIC` that the plan then takes away again (issue #318):
+    // the routine was there before, so the gate is asked.
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "revoke"],
+    ));
     on_server(
         connection,
         "DO $$ BEGIN IF app.caller() <> 'new' THEN RAISE EXCEPTION 'successful apply retained the old overload binding'; END IF; END $$",
@@ -2534,7 +3144,10 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
         connection,
         "COMMENT ON FUNCTION app.caller() IS 'arrived after planning'",
     );
-    let refused = apply_plan(&d, connection, &plan, false);
+    // Approved, so that the refusal under test is the comment and not the
+    // rebuild's own `revoke` risk (issue #318) — an unapproved plan stops at
+    // the gate before it ever asks the catalog.
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "revoke"]);
     assert_eq!(
         code(&refused),
         1,

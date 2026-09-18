@@ -60,6 +60,20 @@ pub struct Pulled {
     /// PostgreSQL also inventories modules it omits, including unsupported
     /// catalog kinds and definitions or identities the declaration cannot hold.
     pub unmanaged_modules: Vec<UnmanagedModule>,
+    /// The routines this database lets `PUBLIC` execute (ADR-0010 §5).
+    ///
+    /// Not part of [`Pulled::schema`], and it never can be: what `PUBLIC`
+    /// holds is context, never a compared grant (DECISIONS 371), so putting
+    /// it inside the schema would make every pulled routine differ from the
+    /// identical declared one. It rides here because a *declaration written
+    /// from this pull* has to say it — a plan now takes the engine's default
+    /// away as part of creating a routine, so a pull that omitted the key
+    /// would hand back a file whose first apply closes a routine this
+    /// database has open.
+    ///
+    /// Empty on an engine whose `CREATE` grants no such default; on those
+    /// there is nothing to write down.
+    pub public_execute: pbps_model::PublicExecute,
 }
 
 /// One permission the model cannot hold, and enough about it for the caller

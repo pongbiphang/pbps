@@ -43,8 +43,8 @@ pub mod uid;
 
 pub use change::{
     CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, Dropped, ModuleAfter, Part,
-    PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange, Presence, RiskClass,
-    RowAfter,
+    PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange, Presence, PublicAccess,
+    RiskClass, RoutineOrigin, RowAfter,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,
@@ -56,8 +56,8 @@ pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
 pub use module::{
-    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, RoutineArg,
-    RoutineArgError, RoutineId,
+    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, PublicExecute,
+    RoutineArg, RoutineArgError, RoutineId,
 };
 pub use name::{ColumnRef, NameError, TableName, check_segment};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};

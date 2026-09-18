@@ -458,10 +458,12 @@ What a connected plan has to know before it rebuilds one is read from the
 catalog and not from a list: an ACL, a revocation from `PUBLIC` that is the
 *absence* of a row, an owner a rebuild would transfer, `reloptions`, a view
 column default in `pg_attrdef`, a trigger's `tgenabled`, and the grants a *new*
-object would arrive with from `pg_default_acl`. Every one of them still refuses:
+object would arrive with from `pg_default_acl`. Almost every one of them still refuses:
 step 6 made a grant to a declared role expressible, and what re-emits it after
-the `CREATE` is #248 — and ADR-0010 §5 keeps `PUBLIC` on the refusing side for
-good whatever that lands (DECISIONS 306). The read is taken under the object's own
+the `CREATE` is #248. The one exception is a routine's missing default
+`EXECUTE` to `PUBLIC`, which issue #318 made a change a plan can carry — so it
+is accepted where the plan carries it, and refuses where it does not
+(DECISIONS 517). The read is taken under the object's own
 lock where the account can take one — a view's own, a trigger's parent table's,
 a routine's `pg_proc` row lock — and says so where nothing serialized it, which
 is the honest answer for the accounts this tool is built for. The dependency

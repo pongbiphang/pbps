@@ -815,6 +815,22 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             if matches!(g.kind, GrantedKind::Routine('f' | 'p')) && g.permission == "EXECUTE" {
                 closed_to_public.remove(&target_label(g, &signatures));
                 public_executes.push(target_label(g, &signatures));
+                // The key a declaration written from this pull has to carry.
+                // Still not a grant and still not compared — it rides beside
+                // the schema — but a plan now revokes this default as part of
+                // creating a routine, so a pull that recorded nothing would
+                // hand back a project whose first apply closes a routine this
+                // database has open (ADR-0010 §5).
+                //
+                // Only for a routine this pull actually recorded: a key on a
+                // module that has no declaration file is a line with nothing
+                // to put it in.
+                if let Ok(pbps_model::GrantTarget::Routine(r)) = target_of(g, &signatures) {
+                    let id = pbps_model::ModuleId::Routine(r);
+                    if pulled.schema.modules.contains_key(&id) {
+                        pulled.public_execute.insert(id);
+                    }
+                }
             } else {
                 pulled.warnings.push(format!(
                     "PUBLIC holds {} on {}, which is every principal in the cluster and not a \
@@ -973,7 +989,9 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         pulled.warnings.push(format!(
             "PUBLIC can execute {}: {}. That is this engine's default for a routine \
              (`acldefault('f', owner)` is `{{=X/owner,owner=X/owner}}`), not something anyone \
-             granted, so it is reported rather than compared (ADR-0010 §5)",
+             granted, so it is reported rather than compared — and written into those \
+             declarations as `public_execute: true`, without which the next plan would take it \
+             away as part of rebuilding the routine (ADR-0010 §5)",
             plural(public_executes.len(), "routine"),
             listed(&public_executes)
         ));
@@ -981,10 +999,11 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
     if !closed_to_public.is_empty() {
         let closed: Vec<String> = closed_to_public.into_iter().collect();
         pulled.warnings.push(format!(
-            "`EXECUTE` has been revoked from PUBLIC on {}: {}. The declarations cannot express \
-             that — a revocation here is the absence of the engine's default rather than a row — \
-             and a rebuild restores the default, so an ordinary edit would reopen a routine \
-             somebody deliberately closed (ADR-0009 §3, ADR-0010 §5)",
+            "`EXECUTE` has been revoked from PUBLIC on {}: {}. That is the state a plan now \
+             writes for every routine it creates, and this pull records it by leaving \
+             `public_execute:` off those declarations — it is still not a grant, because a \
+             revocation here is the absence of the engine's default rather than a row \
+             (ADR-0009 §3, ADR-0010 §5)",
             plural(closed.len(), "routine"),
             listed(&closed)
         ));

@@ -372,7 +372,8 @@ impl Unchecked {
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => change.subject(),
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. } => change.subject(),
         };
         Self::new(description, reason)
     }
@@ -1994,6 +1995,26 @@ pub trait Dialect {
     /// again or it does not come back. `diff_roles` treats an `AlterModule`
     /// exactly as it treats a `DropModule` when this answers `true`.
     fn rebuilds_modules(&self) -> bool {
+        false
+    }
+
+    /// Whether a routine this engine creates arrives executable by every
+    /// principal in it (ADR-0010 §5, DECISIONS 371).
+    ///
+    /// PostgreSQL's `acldefault` for a function includes `EXECUTE` to
+    /// `PUBLIC`, so a `SECURITY DEFINER` routine is callable — with its
+    /// owner's privileges — by anyone who can reach its schema the moment the
+    /// `CREATE` commits. SQL Server grants no principal `EXECUTE` on a
+    /// procedure it creates, and its `public` is an ordinary database role
+    /// rather than the engine's default, so it answers `false` and
+    /// [`Change::PublicExecution`] is never built for it.
+    ///
+    /// What the differ does with a `true` is take the default away as part of
+    /// creating the routine, unless the declaration opts back in
+    /// (`pbps_model::PublicExecute`). It is a property of the *engine* and not
+    /// a policy knob: a dialect answering `false` while its engine grants the
+    /// default would be the silent wrong answer this whole issue is about.
+    fn creates_public_executable_routines(&self) -> bool {
         false
     }
 

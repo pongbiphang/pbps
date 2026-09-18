@@ -81,6 +81,10 @@ struct Prepared {
     config_text: String,
     warnings: Vec<String>,
     unmanaged: Vec<pbps_db::catalog::UnmanagedModule>,
+    /// Carried out of the pull so the staged declarations say which routines
+    /// the adopted database lets `PUBLIC` execute — without it, the first
+    /// plan this project produces closes them (ADR-0010 §5).
+    public_execute: pbps_model::PublicExecute,
 }
 
 /// Creates a project at `root` without requiring one to exist already.
@@ -157,7 +161,9 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     };
     let config_text = render_config(&config);
 
-    let (schema, ids, warnings, unmanaged, onboarding_notices) = match (&args.from, &url_env) {
+    let (schema, ids, warnings, unmanaged, onboarding_notices, public_execute) = match (
+        &args.from, &url_env,
+    ) {
         (Some(_), Some(var)) => {
             let connection = std::env::var(var).with_context(|| {
                 format!(
@@ -176,6 +182,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 pulled.warnings,
                 pulled.unmanaged_modules,
                 pulled.onboarding_notices,
+                pulled.public_execute,
             )
         }
         (None, _) => (
@@ -184,6 +191,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Default::default(),
         ),
         (Some(_), None) => unreachable!("--from always resolves a url variable"),
     };
@@ -195,6 +203,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         config_text,
         warnings,
         unmanaged,
+        public_execute,
     };
     for warning in onboarding_notices.iter().chain(&prepared.warnings) {
         eprintln!("warning: {warning}");
@@ -440,7 +449,12 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
             let path = declaration_file::module_path(&schema_dir, id, module.kind)?;
             std::fs::write(
                 &path,
-                pbps_load::render_module(id, module, &Default::default()),
+                pbps_load::render_module(
+                    id,
+                    module,
+                    &Default::default(),
+                    prepared.public_execute.contains(id),
+                ),
             )
             .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }

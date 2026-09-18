@@ -92,7 +92,21 @@ use crate::schema::Schema;
 /// Bumped to 8 for `DeleteRow::dropped`, a separate reviewer-only map of
 /// baseline cells whose columns are dropped. Older readers deny unknown
 /// change fields; the version identifies that format boundary (DECISIONS 442).
-pub const CURRENT_VERSION: u32 = 8;
+///
+/// Bumped to 9 for `Change::PublicExecution`, which is a boundary in both
+/// directions (DECISIONS 517). A version 8 reader meets an unknown change
+/// variant and calls the file broken, when what it is is newer — the same
+/// shape as the field boundary above, one level up. And a version 8 plan
+/// read by *this* build is the direction that matters more: it was written
+/// before a routine's default `EXECUTE` to `PUBLIC` was anybody's decision,
+/// so it creates the routine and says nothing about the grantee, and
+/// `validate_saved_plan` finds nothing wrong with it because nothing in it
+/// is wrong — it is merely from before the policy. Applying it would leave
+/// open exactly what this build exists to close, silently. The number turns
+/// it away as a stale format, and the remedy is the one that was always
+/// right for a stale artifact: run `plan --db` again and take the new plan
+/// through the gate.
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -458,7 +472,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 8);
+        assert_eq!(CURRENT_VERSION, 9);
     }
 
     /// Sorting the keys must not sort away a difference. The same three

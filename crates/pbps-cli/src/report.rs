@@ -337,7 +337,10 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::SetDataMode { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
-        | Change::DropModule { .. } => None,
+        | Change::DropModule { .. }
+        // `PUBLIC` is not a role the summary can count: no declaration, ids
+        // file or pull ever names it (ADR-0010 §5).
+        | Change::PublicExecution { .. } => None,
     }
 }
 
@@ -383,7 +386,8 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::Grant { .. }
-            | Change::Revoke { .. } => {}
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. } => {}
         }
     }
     Renames { tables, roles }
@@ -726,6 +730,20 @@ pub fn describe(c: &Change) -> String {
             permissions,
             ..
         } => format!("- revoke {} on {target}", permissions_list(permissions)),
+        Change::PublicExecution {
+            routine,
+            access: pbps_model::PublicAccess::Revoked,
+            ..
+        } => format!("- revoke execute on {routine} from PUBLIC"),
+        // A statement of its own, because the engine's default is not
+        // something to take on trust (DECISIONS 517) — and worth a reader's
+        // eye either way: it says this routine stays runnable by every
+        // principal in the cluster.
+        Change::PublicExecution {
+            routine,
+            access: pbps_model::PublicAccess::Kept,
+            ..
+        } => format!("+ grant execute on {routine} to PUBLIC (declared)"),
     }
 }
 

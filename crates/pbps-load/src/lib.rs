@@ -233,6 +233,9 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                 if !m.depends_on.is_empty() {
                     loaded.hints.module_deps.insert(m.id.clone(), m.depends_on);
                 }
+                if m.public_execute {
+                    loaded.hints.public_execute.insert(m.id.clone());
+                }
                 loaded.schema.modules.insert(m.id, m.module);
             }
             // Merged above, in its own namespace.
@@ -657,6 +660,51 @@ indexes:
         let none = load_module("function: app.g()\ndefinition: () RETURNS int AS $$ SELECT 1 $$\n");
         assert!(matches!(none.id, pbps_model::ModuleId::Routine(_)));
         assert_eq!(none.id.to_string(), "app.g()");
+    }
+
+    /// The one line that keeps the engine's default `EXECUTE` to `PUBLIC`
+    /// (issue #318, ADR-0010 §5). Absent is the closed answer, so the common
+    /// declaration needs nothing — and `false` says the same thing out loud,
+    /// which a reader may want written down.
+    #[test]
+    fn a_routine_says_whether_public_may_execute_it_and_the_default_is_no() {
+        let open = load_module(
+            "function: app.f(int)\npublic_execute: true\ndefinition: (a integer) RETURNS int AS $$ SELECT 1 $$\n",
+        );
+        assert!(open.public_execute);
+        for text in [
+            "function: app.f(int)\ndefinition: (a integer) RETURNS int AS $$ SELECT 1 $$\n",
+            "function: app.f(int)\npublic_execute: false\ndefinition: (a integer) RETURNS int AS $$ SELECT 1 $$\n",
+        ] {
+            assert!(!load_module(text).public_execute, "{text}");
+        }
+    }
+
+    /// `public_execute:` on anything but a routine would read as a security
+    /// control and do nothing: a view is selected from and a trigger is
+    /// invoked by nobody, so neither has an `EXECUTE` privilege to leave
+    /// standing. Refused, like `on:` on a view.
+    #[test]
+    fn only_a_routine_may_say_public_execute() {
+        for text in [
+            "view: dbo.v\npublic_execute: true\ndefinition: SELECT 1\n",
+            "trigger: app.audit\non: app.orders\npublic_execute: false\ndefinition: AFTER INSERT AS SELECT 1\n",
+        ] {
+            let e = load_module_str(Path::new("m.yml"), text).expect_err(text);
+            assert!(render(&e).contains("public_execute"), "{}", render(&e));
+            assert!(
+                render(&e).contains("procedure or a function"),
+                "{}",
+                render(&e)
+            );
+        }
+        // And the two kinds that do have one are accepted.
+        assert!(
+            load_module(
+                "procedure: app.p()\npublic_execute: true\ndefinition: () LANGUAGE sql AS $$ SELECT 1 $$\n"
+            )
+            .public_execute
+        );
     }
 
     /// `on:` on anything but a trigger would read as if it did something.

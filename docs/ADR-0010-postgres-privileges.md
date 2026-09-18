@@ -325,11 +325,43 @@ it does not keep pbps from *destroying* it.
 
 So the two documents close it from both sides. ADR-0009 §3 refuses a rebuild
 whose ACL the declarations cannot reproduce **in either direction**, which is
-what stops the regression today. And this remains the largest gap in this
-document: expressing "revoked from `PUBLIC`" needs a grantee the model does not
-have, and until it has one, hardening a managed function and managing it are
-mutually exclusive. That should be closed before PostgreSQL privileges are
-called done.
+what stopped the regression while the gap stood.
+
+**Amendment (issue #318): the gap is closed, and the grantee exists.**
+Expressing "revoked from `PUBLIC`" needed a grantee the model did not have, and
+until it had one, hardening a managed function and managing it were mutually
+exclusive. `Change::PublicExecution` is that grantee, in the narrowest
+shape that expresses the act and nothing else: a `RoutineId`, which of the two
+decisions the plan reached, and which act brought the routine into being — no
+permission set and no `GrantTarget`, because `EXECUTE` is the only default
+`PUBLIC` holds on a routine and a view or a trigger cannot be one. Deliberately
+**not** a `Revoke` from a role spelled `PUBLIC` — a project may declare a role
+of that name, and a string holding the word would be a sentinel every reader
+had to know about. The opt-in decision is recorded even though the `CREATE`
+would usually have left the default standing, so that a plan with no opinion
+about a routine reads differently from one that deliberately left it open; and
+it writes a `GRANT EXECUTE … TO PUBLIC` of its own rather than trusting that
+`CREATE`, because a cluster's default privileges can revoke it (DECISIONS 517).
+
+Three consequences follow, and the third is the one that reverses a paragraph
+above.
+
+- **A plan that creates a routine closes it.** Not only a `SECURITY DEFINER`
+  one: which routines are definer routines is inside a body this tool never
+  parses, and the textual scan that would answer it is fooled by the words
+  appearing in a comment or a string. A declaration writing
+  `public_execute: true` is what leaves the default standing, and that line
+  goes through the merge request and into the plan's checksum.
+- **The opt-in is an annotation, not state**, travelling with `strategy:` and
+  `depends_on:` for the reason §5 gives above: what `PUBLIC` holds is never
+  compared, so a field inside the module would make a declared routine stop
+  matching the identical routine read back from the catalog.
+- **A rebuild no longer refuses a hand revoke.** The ADR-0009 §3 guard accepts
+  exactly one missing default — `PUBLIC`'s `EXECUTE`, on a routine whose plan
+  carries the revoke that re-issues it after the `CREATE`. A different
+  permission, or a different grantee, is still the refusal, and the `CREATE`
+  still restores the default in between; what changed is that the plan now says
+  what to do about it (DECISIONS 517).
 
 That path existing already is the reassuring part of this ADR. The mechanism for
 "the engine holds a permission this model cannot describe, and silence about it

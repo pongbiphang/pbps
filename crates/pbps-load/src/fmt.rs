@@ -212,11 +212,15 @@ fn value(v: &pbps_model::Value) -> String {
 /// anyway, and never changes what the SQL means.
 ///
 /// `depends_on` is persistent, like `strategy:`: it is an answer about this
-/// project that stays true, so rewriting the file must not lose it.
+/// project that stays true, so rewriting the file must not lose it. So is
+/// `public_execute`, and losing that one would not merely reorder a plan: the
+/// next one would take the engine's default `EXECUTE` away from a routine the
+/// declaration had asked to leave open (ADR-0010 §5).
 pub fn render_module(
     id: &ModuleId,
     module: &Module,
     depends_on: &std::collections::BTreeSet<ModuleId>,
+    public_execute: bool,
 ) -> String {
     let mut s = String::new();
     // The file keeps its two lines for a trigger — `trigger: app.audit` and
@@ -242,6 +246,12 @@ pub fn render_module(
     if !depends_on.is_empty() {
         let names: Vec<String> = depends_on.iter().map(ToString::to_string).collect();
         let _ = writeln!(s, "depends_on: {}", seq(&names));
+    }
+    // Written only when it is `true`. `false` is what the absent key means,
+    // and a formatter that spelled the default out would put the line into
+    // every view and trigger file in the project, where the loader refuses it.
+    if public_execute {
+        let _ = writeln!(s, "public_execute: true");
     }
 
     s.push_str("\ndefinition: |-\n");
@@ -368,7 +378,7 @@ mod tests {
             definition: "SELECT 'first  \nsecond' AS note".into(),
         };
         let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
-        let out = render_module(&ModuleId::Named(name), &module, &Default::default());
+        let out = render_module(&ModuleId::Named(name), &module, &Default::default(), false);
         assert!(out.contains("SELECT 'first  "), "{out}");
 
         let back = crate::load_module_str(Path::new("dbo.v.yml"), &out)
@@ -395,15 +405,16 @@ mod tests {
     fn module_round_trip(yaml: &str) -> String {
         let a = crate::load_module_str(Path::new("m.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
-        let out = render_module(&a.id, &a.module, &a.depends_on);
+        let out = render_module(&a.id, &a.module, &a.depends_on, a.public_execute);
         let b = crate::load_module_str(Path::new("m.yml"), &out).unwrap_or_else(|e| {
             panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
         assert_eq!(a.id, b.id, "output:\n{out}");
         assert_eq!(a.module, b.module, "output:\n{out}");
         assert_eq!(a.depends_on, b.depends_on, "output:\n{out}");
+        assert_eq!(a.public_execute, b.public_execute, "output:\n{out}");
         assert_eq!(
-            render_module(&b.id, &b.module, &b.depends_on),
+            render_module(&b.id, &b.module, &b.depends_on, b.public_execute),
             out,
             "fmt is not idempotent"
         );
@@ -505,6 +516,24 @@ mod tests {
             "view: dbo.top\ndepends_on: [dbo.middle, dbo.base]\ndefinition: |-\n  SELECT 1\n",
         );
         assert!(out.contains("depends_on: [dbo.base, dbo.middle]"), "{out}");
+    }
+
+    /// So is `public_execute:`, and losing it costs more than an order: the
+    /// next plan would take the engine's default `EXECUTE` away from a
+    /// routine the declaration had asked to leave open (issue #318). The
+    /// closed answer is the absent key, so `fmt` writes nothing for it —
+    /// `module_round_trip` is what holds both directions, by loading the
+    /// output back and comparing.
+    #[test]
+    fn a_routines_public_execute_survives_formatting_and_the_default_writes_nothing() {
+        let open = module_round_trip(
+            "function: app.f(int)\npublic_execute: true\ndefinition: |-\n  (a integer) RETURNS int AS $$ SELECT 1 $$\n",
+        );
+        assert!(open.contains("public_execute: true"), "{open}");
+        let closed = module_round_trip(
+            "function: app.f(int)\ndefinition: |-\n  (a integer) RETURNS int AS $$ SELECT 1 $$\n",
+        );
+        assert!(!closed.contains("public_execute"), "{closed}");
     }
 
     #[test]

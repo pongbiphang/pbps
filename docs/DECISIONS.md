@@ -13688,3 +13688,174 @@ SPEC is in sync with all of these.
      sits inside, and on 18.6 that `EXISTS` is pulled up into a join whose
      condition carries the cast — evaluated after the scan filter that carries
      the guard. Measured: the same fixture answers rather than raising.
+
+517. **A routine arrives closed to `PUBLIC`, and a declaration is what opens it
+     again (issue #318).**
+
+     On PostgreSQL every function is created with `EXECUTE` to `PUBLIC`: the
+     catalog holds no ACL at all and `acldefault('f', owner)` supplies one
+     (ADR-0010 §5). For a `SECURITY DEFINER` routine that reads "any principal
+     that can reach this schema may act as the owner", and pbps was producing
+     exactly that state with its own `CREATE`. So a plan that creates a
+     procedure or a function now also carries the change that takes the default
+     away, and a declaration saying `public_execute: true` is what leaves it
+     standing.
+
+     **Every routine, not only the definer ones**, and the reason is the one
+     that rules out the narrower fix rather than a preference for the wider
+     one: which routines are `SECURITY DEFINER` is inside a body this tool
+     never parses (SPEC §8.2), and the textual scan that would answer it is
+     fooled by the words appearing in a comment or a string. A security
+     control resting on a comparison that can be fooled is worse than one whose
+     scope is stated plainly. The cost is stated too: an ordinary invoker
+     routine that today relies on the default stops being callable by everyone
+     at its next apply, and the one line that says otherwise goes through the
+     merge request and into the plan's checksum like every other declaration.
+
+     **A change of its own, not a `Revoke` from a role called `PUBLIC`.**
+     ADR-0010 §5 named the gap as "a grantee the model does not have"; this is
+     that grantee, given the narrowest shape that expresses the act —
+     `Change::PublicExecution` carries a `RoutineId`, the decision, and which
+     of the two acts brought the routine into being, and nothing else. A
+     `String` holding the word would be a sentinel every reader had to know
+     about, and a project may declare a role named `PUBLIC`.
+
+     **Both decisions are written down, and both are written out.** The
+     opt-in — `PublicAccess::Kept` — could have emitted nothing, on the
+     reasoning that the `CREATE` has already left the default standing. That
+     reasoning is false on a cluster whose deployment role has run
+     `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC`: the
+     `CREATE` then writes an explicit `proacl` that `PUBLIC` is not in
+     (measured on 18.6), so a silent opt-in would apply a declaration and
+     leave the declared state unreached — and 371 keeps what `PUBLIC` holds
+     out of every comparison, so `verify` could not say so either. It emits
+     `GRANT EXECUTE … TO PUBLIC`, which is exactly idempotent where nobody
+     has tampered: on a routine whose `proacl` is still `NULL` the grant
+     writes precisely `acldefault('f', owner)` — measured equal — so the
+     rebuild guard, which compares against `acldefault`, sees no difference
+     either. 371 is about what is *compared*, and the annotation is still
+     never compared.
+
+     Recording it matters separately from writing it. A plan that stayed
+     silent about an opted-in routine could not be told apart from a plan that
+     had no opinion about it, and the rebuild guard below needs exactly that
+     distinction: a routine already closed by hand, whose declaration now asks
+     for the default back and whose definition also changed, would otherwise
+     have its valid rebuild refused.
+
+     **The opt-in travels beside the model**, with `strategy:` and
+     `depends_on:`, because 371 keeps what `PUBLIC` holds out of every
+     comparison: a field inside `Module` would make a declared routine stop
+     matching the identical routine read back from the catalog, which is
+     inviolable constraint 1. What it says is therefore what the plan should
+     *write*, never what the two sides should agree on — so adding or removing
+     the key is not itself a change, and takes effect the next time the plan
+     creates or rebuilds the routine.
+
+     **A fresh create carries no risk class and a rebuild carries `revoke`.**
+     Nobody held `EXECUTE` on an object that did not exist a statement earlier,
+     so demanding `--allow revoke` in front of every plan that declares a
+     function would be the friction-without-safety trade `GrantWiden` already
+     refuses. A rebuild is the other case: on this engine every module edit is
+     a drop and a create (ADR-0009 §3), the `CREATE` restores the default, and
+     whether anybody was relying on it is not something the declarations can
+     say — so the gate is asked. `RoutineOrigin` is what separates the two, an
+     enum rather than a flag because telling them apart is its whole job, and
+     `PublicAccess` is the second one for the same reason. Keeping the default
+     is `GrantWiden` on either origin — labelled in the report, never gated,
+     exactly as a widening grant is.
+
+     **It also closes the deadlock 306 left standing.** A routine somebody had
+     closed by hand used to refuse every later plan, because the rebuild would
+     restore the default and nothing in the model could take it away again —
+     hardening a managed routine and managing it were mutually exclusive. The
+     rebuild guard now accepts exactly one missing default: `PUBLIC`'s
+     `EXECUTE`, on a routine this plan has decided about — either decision,
+     since both say the plan knows what the `CREATE` will leave behind. A
+     different permission, or a different grantee, is still the refusal.
+
+     **A staged run is refused while the plan closes one.** The `CREATE` and
+     the revoke are two statements, and `--staged` commits each on its own —
+     so between them the routine is committed, visible to the whole cluster
+     and holding the default. The revoke sorts with the grants, after every
+     row the plan writes, so that window is the rest of the plan rather than
+     an instant. The same shape as the rebuild rule already in
+     `require_transactional_rebuilds`, and refused on either driver: what
+     makes it unsafe is the staging, not the engine. The opt-in's own window
+     runs the other way — between its `CREATE` and its `GRANT` the routine is
+     *less* reachable than the declaration asks for, a permission error rather
+     than somebody else's privileges — so staging it is merely slow, and it is
+     allowed.
+
+     **It is counted with the routine it belongs to.** `--staged` applies one
+     logical change (ADR-0003), and the differ appends this decision to every
+     routine a plan creates or rebuilds — so counting plan entries would make
+     a single routine two changes and refuse a staged creation that was legal
+     before the decision existed. Both guards that enforce the rule, the one
+     in the planner and the one that re-reads the saved artifact, count
+     through the same helper: a count that differed between them would refuse
+     the very file the planner had just written. A decision naming a routine
+     the plan does not build is counted on its own, having nothing to be a
+     companion of.
+
+     **The origin is checked against the plan, not believed.** Re-deriving a
+     saved plan's risks is what stops an edited `risks: []` from turning a
+     destructive change into an ungated one, and it works because the
+     derivation reads the typed change rather than the file's claim about it.
+     `RoutineOrigin` is the first field that is *both*: the derivation reads
+     it, so an artifact saying `created` over a rebuild derives no risk,
+     agrees with itself, and still emits the revoke against a routine
+     somebody was using. The plan already says which it is — an `AlterModule`
+     for that routine, or a `DropModule` before its `CreateModule`, which is
+     the shape a changed kind takes — so `validate_saved_plan` derives the
+     origin the same way and refuses a decision the rest of the plan does not
+     bear out. A decision with no companion at all is refused rather than
+     guessed at: the differ never writes one.
+
+     **And the plan is asked for a decision on every routine it builds.**
+     Deleting the entry is the cheaper edit and leaves nothing inconsistent
+     behind — the `CreateModule` derives the risks it always did — so every
+     other check passes and the routine arrives holding the default, which
+     371 keeps `verify` from reporting. An absence is not evidence of a
+     decision, and on an engine whose `CREATE` hands a routine to `PUBLIC`
+     there is no such thing as a routine the plan has no opinion about, so
+     the absence is the finding. Asked of the dialect both times: only such
+     an engine has a decision to make, and only one that rebuilds modules
+     makes an `AlterModule` another `CREATE`.
+
+     **The saved-plan version moves.** A version 8 plan is not broken, which
+     is exactly the trouble: it was written before the grantee was anybody's
+     decision, so it creates a routine and says nothing, and every check the
+     new build runs on it passes. Applying it would leave open what this
+     entry exists to close, and say nothing about that either. The version
+     turns it away as a stale format instead, and the remedy is the one a
+     stale artifact always had — plan again, and take the new plan through
+     the gate.
+
+     **The closing read holds the routine to it.** SPEC §7.6 does not promise
+     a checkpoint catches a concurrent change to the field the plan is itself
+     changing — the field is expected to move there, and the checkpoint cannot
+     tell the plan's statement from the other session's — but it does promise
+     the closing read catches it. A staged run commits the `CREATE` and the
+     decision's own statement separately, so another session can reverse what
+     the plan just wrote; and 371 keeps what `PUBLIC` holds out of every
+     `Schema`, so the movement comparison had nowhere to see it. The decision
+     is therefore checked against the read's own `public_execute` context, a
+     postcondition of its own carried beside the comparison exactly as a
+     `WITH GRANT OPTION` is (95). A resume does not mend it and does not
+     pretend to: every statement has run, so what the read reports is a fact
+     about the database and not a retryable hiccup.
+
+     The same postcondition runs at the read `bootstrap` records, where no
+     second session is needed at all: `ddl_command_end` fires on `GRANT` and
+     on `REVOKE` (measured), so a trigger already in the database reverses
+     what the build just settled inside the deployer's own transaction. The
+     comment beside that read has said since 110 and 147 that a trigger can
+     *add* a privilege there and a snapshot must never silently omit it; it
+     can take one back too.
+
+     **What a pull does with it.** The routines the database lets `PUBLIC`
+     execute ride beside the pulled schema and are written into those
+     declarations as `public_execute: true`. Still not a grant and still not
+     compared — but a pull that recorded nothing would hand back a project
+     whose first apply closes a routine the database has open.

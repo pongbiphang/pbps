@@ -407,6 +407,16 @@ fn cut(
         eprintln!("warning: {what}");
         scoped.unexpressible.push(what.to_owned());
     }
+    // Carried beside the comparison, never into it, exactly as the line above
+    // carries a `WITH GRANT OPTION` (DECISIONS 95, 371). Cut to the managed
+    // modules for the same reason every other field here is: what `PUBLIC`
+    // may run on somebody else's routine is not ours to have an opinion on.
+    scoped.public_execute = pulled
+        .public_execute
+        .iter()
+        .filter(|id| modules.contains(*id))
+        .cloned()
+        .collect();
     report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
     Ok(scoped)
 }
@@ -3131,6 +3141,12 @@ pub fn cmd_bootstrap(
         &pbps_model::Hints {
             strategies: Default::default(),
             module_deps: loaded.hints.module_deps.clone(),
+            // Carried for the same reason, and one more: it is what decides
+            // whether the routines this bootstrap creates arrive executable
+            // by every principal in the cluster (ADR-0010 §5). Dropping it
+            // here would make the first apply into an empty database the one
+            // apply that leaves the engine default standing.
+            public_execute: loaded.hints.public_execute.clone(),
         },
     )
     .map_err(|errs| {
@@ -3293,6 +3309,15 @@ pub fn cmd_bootstrap(
             // Never commit a snapshot that silently omits it (110, 147).
             refuse_unexpressible(&built, &target.label, "bootstrap again")?;
             crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
+            // And it can take one back. `ddl_command_end` fires on `GRANT`
+            // and on `REVOKE` (measured), so a trigger already in the
+            // database can reverse what this build just settled about
+            // `PUBLIC` before this read — and no other check here would see
+            // it, because what `PUBLIC` holds is in neither the schema nor
+            // the unexpressible list (DECISIONS 371, 517). The same
+            // postcondition the apply paths ask, at the read this command
+            // records.
+            refuse_unmet_public_execution(&cs, &built, &target.label)?;
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
@@ -3849,12 +3874,12 @@ pub fn cmd_plan_db(
         // back must not be able to take four unrelated changes down with it,
         // and a resume that had to reason about which of five changes were
         // half-done would be guessing.
-        if cs.changes.len() > 1 {
+        let logical = crate::logical_changes(&cs);
+        if logical > 1 {
             bail!(
-                "--staged applies one logical change, and this plan has {}.\n\
+                "--staged applies one logical change, and this plan has {logical}.\n\
                  Stage the change that needs it in a revision of its own; the rest can go \
-                 through an ordinary transactional apply.",
-                cs.changes.len()
+                 through an ordinary transactional apply."
             );
         }
         if cs.is_empty() {
@@ -4498,6 +4523,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             &target.label,
             Settled::Closing,
         )
+        .and_then(|()| refuse_unmet_public_execution(&plan.changes, &after, &target.label))
         .map_err(|e| {
             anyhow::anyhow!(
                 "{e:#}\n\n\
@@ -4965,6 +4991,18 @@ async fn apply_staged_under_lock(
         target.environment(),
         StagedRead::Closing { total },
     )?;
+    // The same read, and the half of it no `Schema` holds. Refused here for
+    // the reason the movement check above is: this is the last window, and
+    // the ordinary entry that follows is what says the deployment finished.
+    refuse_unmet_public_execution(&plan.changes, &after, &target.label).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}\n\n\
+             All {total} statement(s) completed, but the staged deployment cannot close. \
+             Nothing was rolled back; the ledger retains the last checkpoint. Settle what \
+             moved and run `pbps apply --staged --resume`, or accept the database with \
+             `pbps baseline --reason ...` and plan from there."
+        )
+    })?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,
@@ -5078,6 +5116,65 @@ fn staged_statement_changes(
         *to = statement_to.clone();
     }
     at_statement
+}
+
+/// What the plan promised about `PUBLIC`, asked of the read that closes the
+/// run.
+///
+/// # Why this is not part of the movement comparison
+///
+/// `refuse_unplanned_movement` compares two `Schema`s, and what `PUBLIC` holds
+/// is never in one: it is the engine's default rather than a grant, so putting
+/// it there would make every routine read back as drift (DECISIONS 371, 95).
+/// The decision this plan carries is therefore checked against the read's own
+/// `public_execute` context instead — which is what SPEC §7.6 requires of it.
+///
+/// # Why the closing read in particular
+///
+/// SPEC §7.6 does not promise that a checkpoint catches a concurrent change
+/// to **the field the plan is itself changing**: the field is expected to move
+/// there, and the checkpoint cannot tell the plan's statement from the other
+/// session's. It does promise the closing read catches it, by holding the
+/// field to the value the plan promised. Without this the promise was not
+/// kept: a staged run's `GRANT` and its `CREATE` commit separately, another
+/// session revoking `PUBLIC` in between would be invisible to the checkpoint
+/// by design and to the closing read because nothing looked, and the run
+/// would record a routine the declaration asked to leave open as a success.
+///
+/// A decision this engine does not make is not asked about — the check reads
+/// the plan's own decisions, and a dialect that emits none has none to fail.
+fn refuse_unmet_public_execution(
+    changes: &pbps_model::ChangeSet,
+    after: &pbps_diff::Scoped,
+    label: &str,
+) -> anyhow::Result<()> {
+    let mut unmet = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::PublicExecution {
+            routine, access, ..
+        } = &planned.change
+        else {
+            continue;
+        };
+        let id = pbps_model::ModuleId::Routine(routine.clone());
+        let open = after.public_execute.contains(&id);
+        match access {
+            pbps_model::PublicAccess::Kept if !open => unmet.push(format!(
+                "`{routine}` is not executable by PUBLIC, which this plan declared it would stay"
+            )),
+            pbps_model::PublicAccess::Revoked if open => unmet.push(format!(
+                "`{routine}` is executable by PUBLIC, which this plan closed"
+            )),
+            pbps_model::PublicAccess::Kept | pbps_model::PublicAccess::Revoked => {}
+        }
+    }
+    if !unmet.is_empty() {
+        bail!(
+            "{label} does not hold what this plan settled about PUBLIC execution:\n  {}",
+            unmet.join("\n  ")
+        );
+    }
+    Ok(())
 }
 
 fn staged_movement(
@@ -5616,6 +5713,133 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
 
+    /// SPEC §7.6 promises the closing read holds the field the plan is itself
+    /// changing to the value the plan promised. What `PUBLIC` holds is in no
+    /// `Schema` (DECISIONS 371), so the movement check cannot be the thing
+    /// that keeps that promise here, and this is.
+    ///
+    /// Both directions fail, and both hold: the routine the plan closed
+    /// found open, and the one it declared open found closed.
+    #[test]
+    fn the_closing_read_holds_a_routine_to_what_the_plan_settled_about_public() {
+        use pbps_model::{Change, ChangeSet, PlannedChange, PublicAccess, RoutineOrigin};
+        let id: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+        let decided = |access| {
+            let mut cs = ChangeSet::default();
+            cs.changes.push(PlannedChange::new(Change::PublicExecution {
+                routine: "app.f(integer)".parse().unwrap(),
+                access,
+                origin: RoutineOrigin::Created,
+            }));
+            cs
+        };
+        let read = |open: bool| {
+            let mut scoped = pbps_diff::scope(
+                &pbps_model::Schema::default(),
+                &pbps_model::IdsFile::default(),
+                &Default::default(),
+            );
+            if open {
+                scoped.public_execute.insert(id.clone());
+            }
+            scoped
+        };
+
+        // What each decision promised, found.
+        assert!(
+            refuse_unmet_public_execution(&decided(PublicAccess::Revoked), &read(false), "target")
+                .is_ok()
+        );
+        assert!(
+            refuse_unmet_public_execution(&decided(PublicAccess::Kept), &read(true), "target")
+                .is_ok()
+        );
+
+        // And each reversed by somebody else between the statement and this
+        // read, which is the case SPEC §7.6 says lands here.
+        let e = refuse_unmet_public_execution(&decided(PublicAccess::Kept), &read(false), "target")
+            .expect_err("an opened routine found closed")
+            .to_string();
+        assert!(e.contains("app.f(integer)"), "{e}");
+        assert!(e.contains("declared it would stay"), "{e}");
+        let e =
+            refuse_unmet_public_execution(&decided(PublicAccess::Revoked), &read(true), "target")
+                .expect_err("a closed routine found open")
+                .to_string();
+        assert!(e.contains("this plan closed"), "{e}");
+
+        // A plan that settles nothing about PUBLIC has nothing to fail, on
+        // either reading of the database.
+        for open in [true, false] {
+            assert!(
+                refuse_unmet_public_execution(&ChangeSet::default(), &read(open), "target").is_ok()
+            );
+        }
+    }
+
+    /// `--staged` applies one logical change (ADR-0003), and the differ's own
+    /// companion to a routine is not a second one. A routine that declares
+    /// `public_execute: true` arrives with a `PublicExecution` beside its
+    /// `CreateModule`, and counting entries would refuse a staged creation
+    /// that was legal before that decision existed.
+    ///
+    /// The negative cases are the point: two routines are two changes, and a
+    /// decision whose routine this plan does not build is counted on its own
+    /// because it has nothing to be a companion of.
+    #[test]
+    fn a_routines_public_decision_is_counted_with_the_create_it_belongs_to() {
+        use pbps_model::{
+            Change, ChangeSet, Module, ModuleKind, PlannedChange, PublicAccess, RoutineOrigin,
+        };
+        let create = |name: &str| Change::CreateModule {
+            id: name.parse().unwrap(),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+            }),
+        };
+        let decided = |name: &str, access| Change::PublicExecution {
+            routine: name.parse().unwrap(),
+            access,
+            origin: RoutineOrigin::Created,
+        };
+        let count = |changes: Vec<Change>| {
+            let mut cs = ChangeSet::default();
+            cs.changes
+                .extend(changes.into_iter().map(PlannedChange::new));
+            crate::logical_changes(&cs)
+        };
+
+        for access in [PublicAccess::Kept, PublicAccess::Revoked] {
+            assert_eq!(
+                count(vec![
+                    create("app.f(integer)"),
+                    decided("app.f(integer)", access)
+                ]),
+                1,
+                "{access:?}"
+            );
+        }
+        assert_eq!(
+            count(vec![
+                create("app.f(integer)"),
+                decided("app.f(integer)", PublicAccess::Kept),
+                create("app.g(integer)"),
+                decided("app.g(integer)", PublicAccess::Kept),
+            ]),
+            2
+        );
+        // Nothing in this plan builds `app.h`, so its decision stands alone.
+        assert_eq!(
+            count(vec![
+                create("app.f(integer)"),
+                decided("app.h(integer)", PublicAccess::Revoked),
+            ]),
+            2
+        );
+    }
+
     /// DECISIONS 415: a probe is answered under the settings the statement it
     /// clears will run under, because [`run_probes`] pins them itself.
     ///
@@ -5904,6 +6128,7 @@ mod tests {
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
+            public_execute: Default::default(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
                 entry(
@@ -9405,6 +9630,7 @@ mod tests {
                     why: "its definition cannot be read back".into(),
                 },
             ],
+            public_execute: Default::default(),
         }
     }
 

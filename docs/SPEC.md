@@ -287,6 +287,26 @@ Two more rules, both consequences of the model rather than choices:
 - **`depends_on:` is an annotation, not state.** Creation order is invisible in
   the database, so it lives beside the model exactly as `strategy:` does. It is
   needed only where the identifier scan of ADR-0002 cannot see a dependency.
+- **`public_execute:` is an annotation too, and its absence is the closed
+  answer.** On an engine whose `CREATE` hands every new routine to `PUBLIC` —
+  PostgreSQL does; SQL Server does not — a plan that creates a procedure or a
+  function also carries a change that takes that default away, and a
+  declaration writing `public_execute: true` is what leaves it standing. The
+  plan records and writes that second decision too, rather than trusting the
+  `CREATE` to have left the default standing: a cluster's own default
+  privileges can revoke it. It is an annotation and not state for the reason
+  ADR-0010 §5 gives: what `PUBLIC`
+  holds is never compared, so it says what the plan should *write* rather than
+  what the two sides should agree on. The key is refused on a view or a
+  trigger, neither of which has an `EXECUTE` privilege.
+
+  The consequence of being an annotation is worth stating: adding or removing
+  the key is not itself a change, because nothing compares it. It takes effect
+  the next time the plan creates or rebuilds the routine, which on PostgreSQL
+  is any edit to its definition. `pull` writes the key for the routines the
+  database has open, so a project adopted from a database starts out saying
+  what that database already does.
+
 - **A module name may not collide with a table or another module.** SQL Server
   keeps them in one `sys.objects` namespace per schema, so `pbps validate`
   answers this before the engine does — at apply time the answer arrives on a
