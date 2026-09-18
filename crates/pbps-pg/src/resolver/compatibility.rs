@@ -283,6 +283,16 @@ fn collations(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &m
         .map(|collation| (collation.key.as_str(), collation))
         .collect();
     for collation in &target.catalog.collations {
+        // Only the database's own default collation is required to be present:
+        // it is fixed at CREATE DATABASE and reproduced by the recipe. A
+        // user-defined collation is object DDL the compilation creates, not
+        // something a fresh scratch database must already contain, and its
+        // reproducibility follows from the resolver's build (compared through
+        // the executables), so requiring it here would refuse an otherwise
+        // compatible server (finding on #688).
+        if collation.key != "default" {
+            continue;
+        }
         let key = format!("collation:{}", collation.key);
         let Some(other) = by_key.get(collation.key.as_str()) else {
             report.facts.insert(

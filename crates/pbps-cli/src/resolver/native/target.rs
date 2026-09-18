@@ -174,6 +174,12 @@ impl NativeTarget {
     pub async fn database_recipe(&mut self) -> Result<DatabaseRecipe, EnvironmentError> {
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        // SQL Server's scratch database creation does not consume a recipe yet
+        // (reproducing its collation is #611), and its scope reader is not
+        // implemented, so it takes the neutral recipe rather than erroring.
+        if bound.connection.driver() != pbps_db::Driver::Postgres {
+            return Ok(DatabaseRecipe::neutral());
+        }
         let catalog = engine::environment(&mut bound.connection, &[], &[])
             .await
             .map_err(EnvironmentError::Catalog)?;

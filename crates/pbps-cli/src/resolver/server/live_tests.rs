@@ -195,7 +195,7 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
     let database = run.database().to_owned();
     // Reaching into the run's own state: this step exposes no SQL surface,
     // so a declaration path cannot be opened by accident from outside it.
-    run.check().await.unwrap();
+    run.check(&mut target).await.unwrap();
     let connection = &mut run
         .scratch
         .as_mut()
@@ -215,7 +215,7 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
         .execute("CREATE VIEW pbps_server_view AS SELECT id FROM pbps_server_table")
         .await
         .unwrap();
-    run.check()
+    run.check(&mut target)
         .await
         .expect("an ordinary compilation is not drift");
     run.close().await.expect("cleanup removes both objects");
@@ -339,15 +339,15 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
         .open_scratch(&scratch_recipe(&mut target).await)
         .await
         .unwrap();
-    run.check().await.unwrap();
+    run.check(&mut target).await.unwrap();
     session(&configured, maintenance()).await.close().await;
     assert!(matches!(
-        run.check().await,
+        run.check(&mut target).await,
         Err(Error::Exclusivity(super::Signal::SessionCounter))
     ));
     assert!(
         matches!(
-            run.check().await,
+            run.check(&mut target).await,
             Err(Error::Exclusivity(super::Signal::SessionCounter))
         ),
         "an invalidated run keeps answering with the same cause"
@@ -373,17 +373,17 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
         .unwrap();
     let database = run.database().to_owned();
     assert!(
-        tokio::time::timeout(std::time::Duration::from_nanos(1), run.check())
+        tokio::time::timeout(std::time::Duration::from_nanos(1), run.check(&mut target))
             .await
             .is_err(),
         "the check must still have been in flight"
     );
     assert!(
-        matches!(run.check().await, Err(Error::Cancelled)),
+        matches!(run.check(&mut target).await, Err(Error::Cancelled)),
         "a cancelled check cannot be resumed"
     );
     assert!(
-        matches!(run.check().await, Err(Error::Cancelled)),
+        matches!(run.check(&mut target).await, Err(Error::Cancelled)),
         "asking again must not be what loses the cleanup capability"
     );
     assert_eq!(run.database(), database);
@@ -742,7 +742,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     assert_ne!(target_conn, scratch_conn);
 
     // A later check requalifies the sealed scope and holds.
-    run.check().await.expect("requalification holds");
+    run.check(&mut target).await.expect("requalification holds");
 
     // Cleanup removes the scratch objects and every run-local role it created,
     // reporting nothing left over.

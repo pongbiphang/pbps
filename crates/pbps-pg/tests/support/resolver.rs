@@ -982,3 +982,90 @@ mod recon610_public {
         }
     }
 }
+
+mod recon610_super {
+    use super::*;
+    use pbps_pg::resolver::authorization::{RoleMap, read, reconstruct, verify};
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn a_superuser_deployer_on_the_default_database_reproduces_public_owner() {
+        // Mirrors the root-fixture qualify test: the deployer is a superuser
+        // reading the default database's public schema, owned by
+        // pg_database_owner.
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let pid = std::process::id();
+        let scratch_db = format!("pbps_super_s_{pid}");
+        let run_login = format!("pbps_srun_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        admin
+            .execute(&format!(
+                "CREATE DATABASE {scratch_db} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            ))
+            .await
+            .unwrap();
+        admin
+            .execute(&format!("CREATE ROLE {run_login} LOGIN PASSWORD 'r'"))
+            .await
+            .unwrap();
+
+        // Read as the superuser (the server's own admin user), against the
+        // database the connection string names.
+        let mut planning = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let target = read(&mut planning, &["public".to_owned()]).await.unwrap();
+        assert!(target.principal.superuser);
+        assert_eq!(target.schemas["public"].owner, "pg_database_owner");
+
+        let map = RoleMap::generate(&target, &run_login, &format!("s{pid}"));
+        let mut scratch_admin =
+            Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
+                .await
+                .unwrap();
+        reconstruct(&mut scratch_admin, &map, &target, &scratch_db)
+            .await
+            .unwrap();
+
+        let mut run = Conn::connect(
+            Driver::Postgres,
+            &format!(
+                "{} dbname={scratch_db} user={run_login} password=r",
+                server
+                    .split_whitespace()
+                    .filter(|p| !p.starts_with("user=") && !p.starts_with("password="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        )
+        .await
+        .unwrap();
+        let deployer = map.deployer(&target).unwrap();
+        run.execute(&format!("SET ROLE \"{deployer}\""))
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &target, &["public".to_owned()])
+            .await
+            .unwrap();
+        assert!(
+            differences.is_empty(),
+            "public owner not reproduced for a superuser deployer: {differences:?}"
+        );
+
+        drop(planning);
+        drop(run);
+        drop(scratch_admin);
+        admin
+            .execute(&format!("DROP DATABASE {scratch_db} WITH (FORCE)"))
+            .await
+            .unwrap();
+        for role in map.run_local_names() {
+            admin
+                .execute(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .await
+                .unwrap();
+        }
+        admin
+            .execute(&format!("DROP ROLE {run_login}"))
+            .await
+            .unwrap();
+    }
+}

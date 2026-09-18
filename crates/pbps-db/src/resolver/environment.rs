@@ -262,6 +262,20 @@ pub struct DatabaseRecipe {
 pub struct RecipeUnavailable(pub &'static str);
 
 impl DatabaseRecipe {
+    /// A placeholder recipe for an engine whose scratch database creation
+    /// does not consume one yet (SQL Server; reproducing its collation is
+    /// #611). It is never rendered into a PostgreSQL `CREATE DATABASE`.
+    pub fn neutral() -> Self {
+        Self {
+            encoding: "UTF8".into(),
+            provider: LocaleProvider::Libc,
+            collate: "C".into(),
+            ctype: "C".into(),
+            locale: None,
+            icu_rules: None,
+        }
+    }
+
     pub fn from_catalog(catalog: &CatalogFacts) -> Result<Self, RecipeUnavailable> {
         let observed = |key: &'static str| -> Result<String, RecipeUnavailable> {
             catalog

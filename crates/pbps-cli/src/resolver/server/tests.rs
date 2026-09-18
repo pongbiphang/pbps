@@ -199,3 +199,46 @@ fn a_forwarder_left_behind_is_named_without_replacing_the_reason() {
             .contains(&"pbps-resolver-a".to_owned())
     );
 }
+
+#[test]
+fn expected_visibility_is_pg_catalog_then_the_usable_path_schemas_in_order() {
+    use pbps_pg::resolver::authorization::{AuthorizationContext, SchemaAuthorization};
+    use std::collections::BTreeMap;
+    let schema = |usage: bool| SchemaAuthorization {
+        owner: "o".into(),
+        privileges: [("USAGE".to_owned(), usage), ("CREATE".to_owned(), false)]
+            .into_iter()
+            .collect(),
+        acl: BTreeMap::new(),
+    };
+    let context = AuthorizationContext {
+        principal: pbps_db::resolver::environment::DeploymentPrincipal {
+            login: "d".into(),
+            effective: "d".into(),
+            superuser: false,
+        },
+        schemas: [
+            ("app".to_owned(), schema(true)),
+            ("secret".to_owned(), schema(false)),
+            ("ext".to_owned(), schema(true)),
+        ]
+        .into_iter()
+        .collect(),
+        objects: BTreeMap::new(),
+        roles: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    let extras = vec!["ext".to_owned()];
+    let visibility =
+        super::expected_visibility(&context, &["app".to_owned(), "secret".to_owned()], &extras);
+    // app is usable and ext (an extra) is usable, in path order after pg_catalog.
+    assert_eq!(
+        visibility["app"],
+        pbps_db::resolver::Observation::reported(Some("{pg_catalog,app,ext}"))
+    );
+    // secret is not usable, so only pg_catalog and the usable extra remain.
+    assert_eq!(
+        visibility["secret"],
+        pbps_db::resolver::Observation::reported(Some("{pg_catalog,ext}"))
+    );
+}
