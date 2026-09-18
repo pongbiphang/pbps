@@ -43,7 +43,7 @@ const OPTIONAL_OBSERVATIONS: &[&str] = &["database_locale", "database_icu_rules"
 /// pins before every deployment statement (DECISIONS 458), read back so the
 /// pin is proven rather than assumed; the rest are ambient settings that
 /// change binding or loaded code and that no pin covers.
-const SETTINGS: &[&str] = &[
+pub(crate) const SETTINGS: &[&str] = &[
     "standard_conforming_strings",
     "check_function_bodies",
     "DateStyle",
@@ -70,7 +70,28 @@ const SETTINGS: &[&str] = &[
 
 /// A setting that exists only on some measured versions. Absent on both
 /// sides is a known absence; present on one side only is a difference.
-const OPTIONAL_SETTINGS: &[&str] = &["restrict_nonsystem_relation_kind"];
+pub(crate) const OPTIONAL_SETTINGS: &[&str] = &["restrict_nonsystem_relation_kind"];
+
+/// Settings `pg_settings` hides from a login that is neither a superuser nor
+/// a member of `pg_read_all_settings` (measured on 16 and 18: the rows are
+/// simply absent). A least-privilege deployer therefore cannot report them,
+/// and the refusal has to say what grant makes them readable rather than
+/// "not reported".
+const SUPERUSER_ONLY_SETTINGS: &[&str] = &[
+    "shared_preload_libraries",
+    "session_preload_libraries",
+    "dynamic_library_path",
+];
+
+fn missing_reason(name: &str) -> String {
+    if SUPERUSER_ONLY_SETTINGS.contains(&name) {
+        format!(
+            "{name} is not visible to this login; it is superuser-only until the login is a member of pg_read_all_settings"
+        )
+    } else {
+        "not reported".into()
+    }
+}
 
 pub fn compare(
     target: &EnvironmentFacts,
@@ -86,8 +107,8 @@ pub fn compare(
         report.facts.insert(
             (*key).into(),
             observation(
-                target.observations.get(*key),
-                resolver.observations.get(*key),
+                target.catalog.observations.get(*key),
+                resolver.catalog.observations.get(*key),
             ),
         );
     }
@@ -95,14 +116,15 @@ pub fn compare(
         report.facts.insert(
             (*key).into(),
             optional_observation(
-                target.observations.get(*key),
-                resolver.observations.get(*key),
+                target.catalog.observations.get(*key),
+                resolver.catalog.observations.get(*key),
             ),
         );
     }
     extensions(target, resolver, &mut report);
     collations(target, resolver, &mut report);
     settings(target, resolver, &mut report);
+    visibility(target, resolver, &mut report);
     executables(target, resolver, mappings, &mut report);
     report
 }
@@ -112,6 +134,7 @@ pub fn compare(
 fn version_gate(target: &EnvironmentFacts, resolver: &EnvironmentFacts) -> Option<FactStatus> {
     let major = |facts: &EnvironmentFacts| -> Option<u32> {
         facts
+            .catalog
             .observations
             .get("server_version_num")?
             .value()?
@@ -222,16 +245,17 @@ fn optional_observation(
 /// the resolver, and so must everything it requires. The resolver's scratch
 /// database is fresh, so what it has installed is not compared.
 fn extensions(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
-    for extension in &target.extensions {
+    for extension in &target.catalog.extensions {
         let key = format!("extension:{}", extension.name);
         let available = resolver
+            .catalog
             .available_extensions
             .get(&extension.name)
             .is_some_and(|versions| versions.contains(&extension.version));
         let missing_requirement = extension
             .requires
             .iter()
-            .find(|name| !resolver.available_extensions.contains_key(*name));
+            .find(|name| !resolver.catalog.available_extensions.contains_key(*name));
         let status = match (available, missing_requirement) {
             (true, None) => FactStatus::Match,
             (false, _) => FactStatus::Mismatch {
@@ -253,11 +277,12 @@ fn extensions(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &m
 /// limitation, not a resolver mismatch.
 fn collations(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
     let by_key: BTreeMap<_, _> = resolver
+        .catalog
         .collations
         .iter()
         .map(|collation| (collation.key.as_str(), collation))
         .collect();
-    for collation in &target.collations {
+    for collation in &target.catalog.collations {
         let key = format!("collation:{}", collation.key);
         let Some(other) = by_key.get(collation.key.as_str()) else {
             report.facts.insert(
@@ -305,12 +330,15 @@ fn collations(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &m
 fn settings(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
     let compare = |name: &str, optional: bool| -> Option<FactStatus> {
         let key = format!("setting:{name}");
-        let (t, r) = (target.settings.get(name), resolver.settings.get(name));
+        let (t, r) = (
+            target.catalog.settings.get(name),
+            resolver.catalog.settings.get(name),
+        );
         let status = match (t, r) {
             (None, None) if optional => return None,
             (None, None) => FactStatus::Unknown {
                 side: Side::Both,
-                reason: "not reported".into(),
+                reason: missing_reason(name),
             },
             (None, Some(_)) if optional => FactStatus::Mismatch {
                 target: "absent".into(),
@@ -322,11 +350,11 @@ fn settings(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut
             },
             (None, Some(_)) => FactStatus::Unknown {
                 side: Side::Target,
-                reason: "not reported".into(),
+                reason: missing_reason(name),
             },
             (Some(_), None) => FactStatus::Unknown {
                 side: Side::Resolver,
-                reason: "not reported".into(),
+                reason: missing_reason(name),
             },
             (Some(t), Some(_)) if t.source == "session" => FactStatus::Unknown {
                 side: Side::Target,
@@ -350,6 +378,24 @@ fn settings(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut
         if let Some(status) = compare(name, true) {
             report.facts.insert(format!("setting:{name}"), status);
         }
+    }
+}
+
+/// The engine's effective schema order for each in-scope schema must be the
+/// same on both sides as the deployer: a schema the deployer cannot see on
+/// the target but can on the resolver (or the reverse) binds a competing
+/// object differently. A schema the resolver was not asked about is a
+/// difference, not a gap.
+fn visibility(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &mut ScopeReport) {
+    for (schema, seen) in &target.catalog.visibility {
+        let status = match resolver.catalog.visibility.get(schema) {
+            None => FactStatus::Mismatch {
+                target: seen.value().unwrap_or("?").to_owned(),
+                resolver: "schema not evaluated".into(),
+            },
+            Some(other) => observation(Some(seen), Some(other)),
+        };
+        report.facts.insert(format!("visibility:{schema}"), status);
     }
 }
 
@@ -481,7 +527,7 @@ fn describe(identity: &ExecutableIdentity) -> String {
 mod tests {
     use super::*;
     use pbps_db::resolver::environment::{
-        CollationFact, ExecutableSet, ExtensionFact, SettingFact, Verdict,
+        CatalogFacts, CollationFact, ExecutableSet, ExtensionFact, SettingFact, Verdict,
     };
 
     fn observed(value: &str) -> Observation {
@@ -544,26 +590,31 @@ mod tests {
             })
             .collect();
         EnvironmentFacts {
-            observations,
-            extensions: vec![ExtensionFact {
-                name: "hstore".into(),
-                version: "1.8".into(),
-                schema: "public".into(),
-                requires: vec![],
-                libraries: vec!["$libdir/hstore".into()],
-            }],
-            available_extensions: [("hstore".to_owned(), vec!["1.8".to_owned()])]
-                .into_iter()
-                .collect(),
-            collations: vec![CollationFact {
-                key: "default".into(),
-                provider: "c".into(),
-                locale: observed("en_US.utf8"),
-                rules: Observation::NotReported,
-                recorded_version: observed("2.41"),
-                actual_version: observed("2.41"),
-            }],
-            settings,
+            catalog: CatalogFacts {
+                observations,
+                visibility: [("app".to_owned(), observed("{pg_catalog,app,pg_temp}"))]
+                    .into_iter()
+                    .collect(),
+                extensions: vec![ExtensionFact {
+                    name: "hstore".into(),
+                    version: "1.8".into(),
+                    schema: "public".into(),
+                    requires: vec![],
+                    libraries: vec!["$libdir/hstore".into()],
+                }],
+                available_extensions: [("hstore".to_owned(), vec!["1.8".to_owned()])]
+                    .into_iter()
+                    .collect(),
+                collations: vec![CollationFact {
+                    key: "default".into(),
+                    provider: "c".into(),
+                    locale: observed("en_US.utf8"),
+                    rules: Observation::NotReported,
+                    recorded_version: observed("2.41"),
+                    actual_version: observed("2.41"),
+                }],
+                settings,
+            },
             executables: ExecutableSet {
                 engine: engine(digest),
                 libraries: vec![library(
@@ -695,6 +746,7 @@ mod tests {
         }
         let mut garbage = side("180006", "e1");
         garbage
+            .catalog
             .observations
             .insert("server_version_num".into(), observed("eighteen"));
         assert!(matches!(
@@ -722,6 +774,7 @@ mod tests {
     fn an_extension_the_resolver_cannot_install_is_a_mismatch() {
         let mut resolver = side("180006", "e1");
         resolver
+            .catalog
             .available_extensions
             .insert("hstore".into(), vec!["1.7".into()]);
         assert_eq!(
@@ -729,7 +782,7 @@ mod tests {
             Verdict::Mismatch(vec!["extension:hstore".into()])
         );
         let mut target = side("180006", "e1");
-        target.extensions[0].requires.push("plperl".into());
+        target.catalog.extensions[0].requires.push("plperl".into());
         assert_eq!(
             compare(&target, &side("180006", "e1"), &[]).verdict(),
             Verdict::Mismatch(vec!["extension:hstore".into()])
@@ -739,13 +792,13 @@ mod tests {
     #[test]
     fn collation_provider_locale_and_actual_version_must_agree() {
         let mut resolver = side("180006", "e1");
-        resolver.collations[0].actual_version = observed("2.39");
+        resolver.catalog.collations[0].actual_version = observed("2.39");
         assert_eq!(
             compare(&side("180006", "e1"), &resolver, &[]).verdict(),
             Verdict::Mismatch(vec!["collation:default".into()])
         );
         let mut icu = side("180006", "e1");
-        icu.collations[0].provider = "i".into();
+        icu.catalog.collations[0].provider = "i".into();
         assert_eq!(
             compare(&side("180006", "e1"), &icu, &[]).verdict(),
             Verdict::Mismatch(vec!["collation:default".into()])
@@ -755,7 +808,7 @@ mod tests {
     #[test]
     fn a_target_whose_recorded_collation_version_drifted_is_a_limitation_not_a_mismatch() {
         let mut target = side("180006", "e1");
-        target.collations[0].recorded_version = observed("2.36");
+        target.catalog.collations[0].recorded_version = observed("2.36");
         let report = compare(&target, &side("180006", "e1"), &[]);
         assert_eq!(report.verdict(), Verdict::Verified);
         assert!(
@@ -768,7 +821,7 @@ mod tests {
     #[test]
     fn a_setting_the_planning_session_set_on_itself_is_unknown() {
         let mut target = side("180006", "e1");
-        target.settings.get_mut("DateStyle").unwrap().source = "session".into();
+        target.catalog.settings.get_mut("DateStyle").unwrap().source = "session".into();
         let report = compare(&target, &side("180006", "e1"), &[]);
         assert!(matches!(
             report.facts["setting:DateStyle"],
@@ -782,15 +835,24 @@ mod tests {
     #[test]
     fn a_differing_setting_is_a_mismatch_and_an_optional_one_may_be_absent_on_both_sides() {
         let mut resolver = side("180006", "e1");
-        resolver.settings.get_mut("lc_numeric").unwrap().value = "de_DE".into();
+        resolver
+            .catalog
+            .settings
+            .get_mut("lc_numeric")
+            .unwrap()
+            .value = "de_DE".into();
         assert_eq!(
             compare(&side("180006", "e1"), &resolver, &[]).verdict(),
             Verdict::Mismatch(vec!["setting:lc_numeric".into()])
         );
         let mut t = side("180006", "e1");
         let mut r = side("180006", "e1");
-        t.settings.remove("restrict_nonsystem_relation_kind");
-        r.settings.remove("restrict_nonsystem_relation_kind");
+        t.catalog
+            .settings
+            .remove("restrict_nonsystem_relation_kind");
+        r.catalog
+            .settings
+            .remove("restrict_nonsystem_relation_kind");
         let report = compare(&t, &r, &[]);
         assert!(
             !report
@@ -813,7 +875,8 @@ mod tests {
         assert_eq!(report.facts["collation:default"], FactStatus::Match);
         // An ICU resolver has a locale where the libc target has none.
         let mut icu = side("180006", "e1");
-        icu.observations
+        icu.catalog
+            .observations
             .insert("database_locale".into(), observed("en-US"));
         assert_eq!(
             compare(&side("180006", "e1"), &icu, &[]).facts["database_locale"],
@@ -824,7 +887,7 @@ mod tests {
         );
         // NULL is not the same as "could not read": an unread fact stays unknown.
         let mut unread = side("180006", "e1");
-        unread.observations.insert(
+        unread.catalog.observations.insert(
             "database_icu_rules".into(),
             Observation::Unknown {
                 reason: "catalog column unreadable".into(),
@@ -838,7 +901,7 @@ mod tests {
             }
         ));
         let mut unread_collation = side("180006", "e1");
-        unread_collation.collations[0].actual_version = Observation::Unknown {
+        unread_collation.catalog.collations[0].actual_version = Observation::Unknown {
             reason: "pg_collation_actual_version failed".into(),
         };
         assert!(matches!(
@@ -851,11 +914,76 @@ mod tests {
     }
 
     #[test]
+    fn the_deployers_effective_schema_order_must_agree_for_every_in_scope_schema() {
+        // The resolver's principal can see a schema the target's deployer cannot.
+        let mut resolver = side("180006", "e1");
+        resolver
+            .catalog
+            .visibility
+            .insert("app".into(), observed("{pg_catalog,shadow,app,pg_temp}"));
+        assert_eq!(
+            compare(&side("180006", "e1"), &resolver, &[]).verdict(),
+            Verdict::Mismatch(vec!["visibility:app".into()])
+        );
+        // A schema the resolver was never asked about is a difference.
+        let mut target = side("180006", "e1");
+        target
+            .catalog
+            .visibility
+            .insert("audit".into(), observed("{pg_catalog,audit,pg_temp}"));
+        assert_eq!(
+            compare(&target, &side("180006", "e1"), &[]).verdict(),
+            Verdict::Mismatch(vec!["visibility:audit".into()])
+        );
+        // Unreadable visibility is unknown, never an empty path that matches.
+        let mut unread = side("180006", "e1");
+        unread.catalog.visibility.insert(
+            "app".into(),
+            Observation::Unknown {
+                reason: "current_schemas failed".into(),
+            },
+        );
+        assert!(matches!(
+            compare(&unread, &side("180006", "e1"), &[]).facts["visibility:app"],
+            FactStatus::Unknown {
+                side: Side::Target,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_setting_hidden_from_the_deployer_names_the_grant_that_would_reveal_it() {
+        let mut target = side("180006", "e1");
+        target.catalog.settings.remove("session_preload_libraries");
+        let report = compare(&target, &side("180006", "e1"), &[]);
+        match &report.facts["setting:session_preload_libraries"] {
+            FactStatus::Unknown { side, reason } => {
+                assert_eq!(*side, Side::Target);
+                assert!(reason.contains("pg_read_all_settings"), "{reason}");
+            }
+            other @ (FactStatus::Match | FactStatus::Mismatch { .. }) => {
+                panic!("expected unknown, got {other:?}")
+            }
+        }
+        // A setting that is not superuser-only is simply unreported.
+        let mut plain = side("180006", "e1");
+        plain.catalog.settings.remove("lc_numeric");
+        assert_eq!(
+            compare(&plain, &side("180006", "e1"), &[]).facts["setting:lc_numeric"],
+            FactStatus::Unknown {
+                side: Side::Target,
+                reason: "not reported".into()
+            }
+        );
+    }
+
+    #[test]
     fn a_fact_neither_side_reports_is_unknown_never_an_empty_match() {
         let mut t = side("180006", "e1");
         let mut r = side("180006", "e1");
-        t.settings.remove("TimeZone");
-        r.settings.remove("TimeZone");
+        t.catalog.settings.remove("TimeZone");
+        r.catalog.settings.remove("TimeZone");
         assert_eq!(
             compare(&t, &r, &[]).facts["setting:TimeZone"],
             FactStatus::Unknown {
@@ -863,7 +991,8 @@ mod tests {
                 reason: "not reported".into()
             }
         );
-        t.observations
+        t.catalog
+            .observations
             .insert("database_encoding".into(), Observation::NotReported);
         assert!(matches!(
             compare(&t, &r, &[]).facts["database_encoding"],

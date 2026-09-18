@@ -199,13 +199,13 @@ pub struct ExecutableSet {
     pub libraries: Vec<ExecutableIdentity>,
 }
 
-/// Everything one side reports for an analysis scope. Serializable so the
-/// same facts can be re-read as non-snapshot inputs by later capture and
-/// apply checks, which is where a fact that changed in between is caught.
+/// What one side's catalog reports for an analysis scope: everything a
+/// connection can read with SQL. The engine crates fill this; they know
+/// nothing about processes, so the executables are not here.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
-pub struct EnvironmentFacts {
-    /// Version, encoding and locale facts, keyed as the engine's discovery
-    /// query names them.
+pub struct CatalogFacts {
+    /// Version, encoding and locale facts, keyed as the engine's query names
+    /// them.
     pub observations: BTreeMap<String, Observation>,
     pub extensions: Vec<ExtensionFact>,
     /// Extension versions this side could install, by name. The resolver's
@@ -213,6 +213,20 @@ pub struct EnvironmentFacts {
     pub available_extensions: BTreeMap<String, Vec<String>>,
     pub collations: Vec<CollationFact>,
     pub settings: BTreeMap<String, SettingFact>,
+    /// The engine's effective schema search order for each in-scope schema,
+    /// as the current principal — the visibility filter a deployer's grants
+    /// impose, computed by the engine rather than re-derived from ACLs.
+    /// Keyed by the schema the write path starts with.
+    pub visibility: BTreeMap<String, Observation>,
+}
+
+/// Everything one side reports for an analysis scope: its catalog facts and
+/// the executables its processes actually run. Serializable so the same
+/// facts can be re-read as non-snapshot inputs by later capture and apply
+/// checks, which is where a fact that changed in between is caught.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct EnvironmentFacts {
+    pub catalog: CatalogFacts,
     pub executables: ExecutableSet,
 }
 
