@@ -281,6 +281,12 @@ pub struct RawCatalog {
     pub default_acls: Vec<RawDefaultAcl>,
     pub other_grants: Vec<RawOtherGrant>,
     pub held_elsewhere: Vec<RawSharedDependency>,
+    /// The role this connection runs its statements as (`current_user`).
+    ///
+    /// Needed beside every grant's grantor because a `REVOKE` matches on the
+    /// grantor and nothing else: this connection can take back what it
+    /// granted itself, and only that.
+    pub session_role: String,
 }
 
 /// A role held by something **outside this database** (ADR-0010 §4).
@@ -399,6 +405,16 @@ pub struct RawGrant {
     /// `postgres` granting on `gr_owner`'s table records `gr_owner` as the
     /// grantor. That is why comparing against the owner does not report the
     /// grants this tool makes itself.
+    ///
+    /// A least-privilege deployer is the second grantor whose entries this
+    /// tool can remove: holding `WITH GRANT OPTION`, it grants onward and the
+    /// entry records *itself*, not the owner. Measured on 18.6:
+    /// `go_deployer` granted `go_reader` (`go_reader=r/go_deployer`) and its
+    /// own `REVOKE` took it back. So the exemption is the connection's own
+    /// role, [`RawCatalog::session_role`], and **not** the roles it is a
+    /// member of: also measured, `go_deployer` inheriting `go_mid`
+    /// (`pg_has_role` true) revoked nothing of `go_reader=r/go_mid`, and
+    /// reported success doing it.
     pub grantor: String,
 }
 
@@ -1009,22 +1025,36 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // is built, run, and refused by its own read-back — the right answer
         // at the wrong end of the apply.
         //
-        // Compared against the **owner**, which is the grantor of every entry
-        // `acldefault` supplies and of every grant this tool makes, a
-        // superuser's on somebody else's object included (both measured on
-        // 18.6). So this reports the out-of-band grant and not pbps's own.
-        if g.grantor != g.owner {
+        // Two grantors are exempt, and they are the two whose entries a
+        // statement from this connection can actually remove.
+        //
+        // The **owner**, which is the grantor of every entry `acldefault`
+        // supplies and of every grant this tool makes through a superuser, on
+        // somebody else's object included (both measured on 18.6).
+        //
+        // And **this connection's own role**: a least-privilege deployer
+        // holding `WITH GRANT OPTION` grants onward under its own name, and
+        // takes it back the same way (measured). Its own grants are ordinary
+        // managed grants, and reporting them would refuse the narrowing plan
+        // it is entitled to run.
+        //
+        // Membership is not a third case. `go_deployer`, an inheriting member
+        // of the grantor `go_mid`, revoked nothing and said it had — so the
+        // test is the session's role, not `pg_has_role` (measured).
+        if g.grantor != g.owner && g.grantor != raw.session_role {
             unexpressible(
                 pulled,
                 Some(target),
                 format!(
-                    "role {grantee}: {} on {} was granted by `{}`, not by the object's owner \
-                     `{}` — and a `REVOKE` removes only what its own grantor granted, so \
-                     nothing this tool can run takes it away (ADR-0010 §1, measured)",
+                    "role {grantee}: {} on {} was granted by `{}`, which is neither the \
+                     object's owner `{}` nor this connection's own role `{}` — and a \
+                     `REVOKE` removes only what its own grantor granted, so nothing this \
+                     tool can run takes it away (ADR-0010 §1, measured)",
                     g.permission,
                     target_label(g, &signatures),
                     g.grantor,
-                    g.owner
+                    g.owner,
+                    raw.session_role
                 ),
             );
             continue;
@@ -2650,6 +2680,9 @@ mod tests {
             ],
             module_args: signature(args),
             routine_args: signature(args),
+            // Deliberately not the owner: the two exemptions have to be
+            // distinguishable, or a fixture would pass under either rule.
+            session_role: "deployer".to_owned(),
             ..RawCatalog::default()
         }
     }
@@ -2984,6 +3017,26 @@ mod tests {
         assert!(
             !pulled_role(&pulled, "app_reader").grants.is_empty(),
             "the owner's grant belongs in the role's set"
+        );
+
+        // The second negative case, and the one the owner test alone gets
+        // wrong: a least-privilege deployer holding `WITH GRANT OPTION`
+        // grants onward under its own name, and its own `REVOKE` takes that
+        // entry back (measured on 18.6). Reported, the narrowing plan it is
+        // entitled to run would be refused instead.
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("deployer")],
+            ..declaring('f', &[])
+        });
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        assert!(
+            !pulled_role(&pulled, "app_reader").grants.is_empty(),
+            "this connection's own grant belongs in the role's set"
         );
     }
 

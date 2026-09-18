@@ -1903,6 +1903,114 @@ fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
 /// Refused at `plan --db` instead, with the line to delete. The second half is
 /// what keeps the rule scoped to the declaration: the same role owning the
 /// same table, granted nothing on it, is an ordinary project.
+/// Issue #251, the other half of the grantor rule. A `REVOKE` matches on the
+/// grantor, and a least-privilege deployer holding `WITH GRANT OPTION` is the
+/// second grantor whose entries this connection can match: it granted them
+/// under its own name, not the owner's.
+///
+/// Reported as unexpressible, those entries would refuse the narrowing plan
+/// the deployer is entitled to run — and refuse `baseline` before that, since
+/// the database would be holding a permission the declarations cannot carry.
+///
+/// Run as the deployer, not as a superuser, because a superuser's grant on
+/// somebody else's object records the **owner** as grantor (measured): the
+/// case only exists where the connection is the grantor and the owner is
+/// somebody else.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_deployers_own_onward_grant_is_one_it_can_still_narrow() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_gr_owner_{pid}");
+    let deployer = format!("pbps_gr_deploy_{pid}");
+    let reader = format!("pbps_gr_read_{pid}");
+    // Declared before the database so that it drops after it: the roles own
+    // objects inside it, and locals drop in reverse declaration order.
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "deployer-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT SELECT, INSERT ON app.t TO {deployer} WITH GRANT OPTION; \
+             GRANT USAGE ON SCHEMA app TO {reader}"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The grant this test is about: made by the deployer, under its own name.
+    on_server(
+        &deployment,
+        &format!("GRANT SELECT, INSERT ON app.t TO {reader}"),
+    );
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 1);
+
+    let d = Demo::new("deployer-grantor");
+    d.table(ONE_COLUMN);
+    // Narrower than the database: the `INSERT` is the change this plan makes.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database this deployer granted into",
+    ]));
+
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("revoke insert on app.t"),
+        "{}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    // The statement the deployer was entitled to run, and it landed.
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 0);
+    succeeds(d.run(&["verify", "--db", &deployment]));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs() {

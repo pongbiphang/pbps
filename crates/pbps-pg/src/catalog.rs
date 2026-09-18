@@ -793,6 +793,12 @@ type CatalogBatch = BTreeMap<String, Vec<serde_json::Value>>;
 /// All catalog relations are sampled by one statement, even when the caller
 /// has already written under READ COMMITTED. JSON is only the internal row
 /// transport; the checked decoder below still constructs the same RawCatalog.
+/// The role every statement of this connection runs as, and so the only
+/// grantor whose entries a `REVOKE` this tool emits can remove.
+/// `current_user` rather than `session_user`: a `SET ROLE` moves both the
+/// grantor a `GRANT` records and the one a `REVOKE` can match.
+const SESSION: &str = "SELECT current_user::text AS role";
+
 fn batch_query() -> String {
     // Aggregation must preserve semantic position order: sorting the JSON
     // itself would reorder columns and routine arguments (pinned live).
@@ -812,6 +818,7 @@ fn batch_query() -> String {
         ("held_elsewhere", HELD_ELSEWHERE.to_owned(), "role_name, in_database, deptype"),
         ("default_acls", DEFAULT_ACLS.to_owned(), "grantor, in_schema, objtype"),
         ("unheld_modules", unheld_modules_query(), "schema_name, name"),
+        ("session", SESSION.to_owned(), "role"),
     ]
     .into_iter()
     .map(|(part, query, order)| format!(
@@ -1072,6 +1079,17 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             superuser: flag(row, "superuser")?,
         });
     }
+    // Exactly one row, always: `current_user` is never null and never plural.
+    // Absent means the batch itself did not run, which is a different finding
+    // from "this connection has no role" and must not read as one.
+    raw.session_role = text(
+        batch
+            .get("session")
+            .ok_or_else(|| missing("session"))?
+            .first()
+            .ok_or_else(|| DbError::BadRow("catalog batch part session is empty".to_owned()))?,
+        "role",
+    )?;
     for row in batch.get("grants").ok_or_else(|| missing("grants"))? {
         raw.grants.push(RawGrant {
             // `None` is PUBLIC, which the query spells as a NULL rather than
@@ -2327,7 +2345,29 @@ mod tests {
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }
+        // The one part that is never empty: `current_user` always answers.
+        batch.insert(
+            "session".to_owned(),
+            vec![serde_json::json!({"role": "deploy"})],
+        );
         batch
+    }
+
+    /// Absent, empty and unreadable are three different things, and none of
+    /// them is "this connection has no role". A grant's grantor is compared
+    /// against this name to decide whether any `REVOKE` could remove it
+    /// (#251), so a silently empty one would make every entry look like the
+    /// deployer's own.
+    #[test]
+    fn the_connections_own_role_cannot_be_read_as_absent() {
+        let mut batch = empty_catalog_batch();
+        assert_eq!(decode_batch(&batch).unwrap().0.session_role, "deploy");
+        batch.insert("session".to_owned(), Vec::new());
+        assert!(decode_batch(&batch).is_err(), "an empty part");
+        batch.insert("session".to_owned(), vec![serde_json::json!({})]);
+        assert!(decode_batch(&batch).is_err(), "a row without the column");
+        batch.remove("session");
+        assert!(decode_batch(&batch).is_err(), "a missing part");
     }
 
     #[test]
