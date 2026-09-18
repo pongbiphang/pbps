@@ -917,11 +917,25 @@ mod recon610 {
         )
         .await
         .unwrap();
+        // The deployer, holding USAGE on `secret` with the option, granted it
+        // on to the reader itself: an entry whose grantor is the deployer,
+        // which only the deployer's own revoke takes back (finding on #688).
+        planning
+            .execute(&format!("GRANT USAGE ON SCHEMA secret TO {reader}"))
+            .await
+            .unwrap();
         let target = read(&mut planning, &schemas).await.unwrap();
         assert!(
             target.schemas["plain"].acl.is_empty(),
             "{:?}",
             target.schemas["plain"]
+        );
+        assert!(
+            target.schemas["secret"].acl[&reader]
+                .iter()
+                .any(|g| g.privilege == "USAGE" && g.grantor == dep),
+            "{:?}",
+            target.schemas["secret"].acl
         );
 
         // Reconstruct on scratch as the admin.
@@ -996,26 +1010,29 @@ mod recon610 {
         );
 
         // The plan's grants run as the reproduced deployer, not the
-        // administrator (finding on #688). One the deployer holds the grant
-        // option for — USAGE on `secret`, granted to it WITH GRANT OPTION —
-        // reaches `reader`, and the reproduction matches what the plan is
-        // meant to leave behind, the deployer's own starred entry included.
+        // administrator (finding on #688). A revoke of what the deployer
+        // itself granted takes on scratch only if reconstruction replayed
+        // that grant under the mapped deployer: the reader's USAGE on
+        // `secret`, granted by the deployer above, goes, the owner-granted
+        // entries stay, and the reproduction matches what the plan is meant
+        // to leave behind.
         let deployer_role = map.deployer(&target).unwrap();
         let usable = [PlannedGrant {
             role: reader.clone(),
             schema: "secret".into(),
             privilege: "USAGE".into(),
-            revoke: false,
+            revoke: true,
         }];
+        let expected = with_planned(target.clone(), &usable);
+        assert!(!expected.schemas["secret"].acl.contains_key(&reader));
+        assert!(expected.schemas["secret"].privileges["USAGE"]);
         apply_planned(&mut scratch_admin, &map, &deployer_role, &usable)
             .await
             .unwrap();
-        let expected = with_planned(target.clone(), &usable);
-        assert!(expected.schemas["secret"].privileges["USAGE"]);
         let differences = verify(&mut run, &map, &expected, &schemas).await.unwrap();
         assert!(
             differences.is_empty(),
-            "an authorized planned grant did not reproduce: {differences:?}"
+            "the deployer's own revoke did not reproduce: {differences:?}"
         );
         // One the deployer cannot make — CREATE on `app`, which it neither
         // owns nor holds the grant option for — is not an error on the
@@ -1050,6 +1067,19 @@ mod recon610 {
             refused.contains(&"schema:app:acl".to_owned()),
             "{refused:?}"
         );
+
+        // A membership revoked on the target after qualification, one that
+        // changes no schema answer (the deployer never inherited `owner`), is
+        // still an authorization the reproduction has and the target no
+        // longer does; requalification must name it (finding on #688).
+        setup
+            .execute(&format!("REVOKE {owner} FROM {dep}"))
+            .await
+            .unwrap();
+        let narrowed = read(&mut planning, &schemas).await.unwrap();
+        assert!(!narrowed.roles.contains_key(&owner));
+        let stale = verify(&mut run, &map, &narrowed, &schemas).await.unwrap();
+        assert!(stale.contains(&format!("role:{owner}:extra")), "{stale:?}");
 
         drop(planning);
         drop(setup);
