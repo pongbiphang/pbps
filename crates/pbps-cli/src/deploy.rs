@@ -3309,6 +3309,15 @@ pub fn cmd_bootstrap(
             // Never commit a snapshot that silently omits it (110, 147).
             refuse_unexpressible(&built, &target.label, "bootstrap again")?;
             crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
+            // And it can take one back. `ddl_command_end` fires on `GRANT`
+            // and on `REVOKE` (measured), so a trigger already in the
+            // database can reverse what this build just settled about
+            // `PUBLIC` before this read — and no other check here would see
+            // it, because what `PUBLIC` holds is in neither the schema nor
+            // the unexpressible list (DECISIONS 371, 517). The same
+            // postcondition the apply paths ask, at the read this command
+            // records.
+            refuse_unmet_public_execution(&cs, &built, &target.label)?;
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),

@@ -1713,6 +1713,73 @@ fn a_staged_revision_may_still_create_one_routine() {
     );
 }
 
+/// The same postcondition at the read `bootstrap` records, and the shape that
+/// needs no other session at all: a `ddl_command_end` trigger already in the
+/// database reverses what the build just settled, inside the deployer'"'"'s own
+/// transaction.
+///
+/// The comment beside `refuse_unexpressible` there has said for a long time
+/// that a database-side trigger can *add* a privilege during the build and
+/// that a snapshot must never silently omit it (DECISIONS 110, 147). It can
+/// take one back too, and what `PUBLIC` holds is in neither the schema nor
+/// the unexpressible list (DECISIONS 371), so nothing else here would look.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn bootstrap_refuses_to_record_a_routine_a_trigger_reopened_to_public() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "routine-bootstrap-snatch");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    // Already there when bootstrap starts, and it re-opens whatever the
+    // build closes. Keyed on the command tag so its own `GRANT` does not
+    // fire it again.
+    on_server(
+        connection,
+        "CREATE FUNCTION public.reopen() RETURNS event_trigger LANGUAGE plpgsql AS $$          BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE command_tag = 'REVOKE')          AND to_regprocedure('app.shut()') IS NOT NULL          THEN GRANT EXECUTE ON ROUTINE app.shut() TO PUBLIC; END IF; END $$;          CREATE EVENT TRIGGER reopen_revoke ON ddl_command_end EXECUTE FUNCTION public.reopen()",
+    );
+
+    let d = Demo::new("routine-bootstrap-snatch");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/shut.yml"),
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let refused = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("app.shut()"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("this plan closed"),
+        "{}",
+        stderr(&refused)
+    );
+    // The read-back and the ledger row are in the build'"'"'s own transaction, so
+    // the refusal leaves an empty database rather than a recorded lie.
+    on_server(
+        connection,
+        "DO $$ BEGIN IF to_regprocedure('app.shut()') IS NOT NULL THEN RAISE EXCEPTION 'the build was not rolled back'; END IF; END $$",
+    );
+
+    // With the trigger gone the same declarations bootstrap, closed.
+    on_server(connection, "DROP EVENT TRIGGER reopen_revoke");
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    assert!(!public_executes(connection, "app.shut()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// SPEC §7.6, the case it names and the read it names it at.
 ///
 /// A staged run commits each statement on its own, so another session can

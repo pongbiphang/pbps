@@ -13806,6 +13806,14 @@ SPEC is in sync with all of these.
      pretend to: every statement has run, so what the read reports is a fact
      about the database and not a retryable hiccup.
 
+     The same postcondition runs at the read `bootstrap` records, where no
+     second session is needed at all: `ddl_command_end` fires on `GRANT` and
+     on `REVOKE` (measured), so a trigger already in the database reverses
+     what the build just settled inside the deployer's own transaction. The
+     comment beside that read has said since 110 and 147 that a trigger can
+     *add* a privilege there and a snapshot must never silently omit it; it
+     can take one back too.
+
      **What a pull does with it.** The routines the database lets `PUBLIC`
      execute ride beside the pulled schema and are written into those
      declarations as `public_execute: true`. Still not a grant and still not
