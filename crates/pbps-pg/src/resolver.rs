@@ -3,6 +3,7 @@
 pub mod compatibility;
 pub mod environment;
 
+use pbps_db::resolver::environment::{DatabaseRecipe, LocaleProvider};
 use pbps_db::resolver::{
     Candidate, Discovery, Extension, Observation, OwnSession, ScratchNames, SessionCounter,
     SessionInventory,
@@ -242,6 +243,51 @@ pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Resu
     .await
 }
 
+/// The `CREATE DATABASE` that reproduces the target's encoding and locale
+/// (SPEC §9.3.3): `template0`, because a template with a different locale
+/// cannot be cloned into one; the provider's own locale clause for ICU and
+/// the builtin provider; and the libc collate/ctype in every case, which
+/// PostgreSQL requires even when another provider sorts. Rules are passed
+/// only when the target has them. Measured on 16 (ICU) and 18 (ICU, builtin).
+pub fn scratch_database_ddl(names: &ScratchNames, recipe: &DatabaseRecipe) -> String {
+    let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let mut ddl = format!(
+        "CREATE DATABASE \"{}\" OWNER \"{}\" TEMPLATE template0 ENCODING {}",
+        names.database(),
+        names.login(),
+        literal(&recipe.encoding)
+    );
+    match (recipe.provider, recipe.locale.as_deref()) {
+        (LocaleProvider::Libc, _) => ddl.push_str(" LOCALE_PROVIDER libc"),
+        (LocaleProvider::Icu, Some(locale)) => {
+            ddl.push_str(&format!(
+                " LOCALE_PROVIDER icu ICU_LOCALE {}",
+                literal(locale)
+            ));
+            if let Some(rules) = &recipe.icu_rules {
+                ddl.push_str(&format!(" ICU_RULES {}", literal(rules)));
+            }
+        }
+        (LocaleProvider::Builtin, Some(locale)) => {
+            ddl.push_str(&format!(
+                " LOCALE_PROVIDER builtin BUILTIN_LOCALE {}",
+                literal(locale)
+            ));
+        }
+        // `DatabaseRecipe::from_catalog` refuses these; rendering them would
+        // silently produce a libc database for an ICU target.
+        (LocaleProvider::Icu | LocaleProvider::Builtin, None) => {
+            unreachable!("a non-libc recipe always carries its locale")
+        }
+    }
+    ddl.push_str(&format!(
+        " LC_COLLATE {} LC_CTYPE {}",
+        literal(&recipe.collate),
+        literal(&recipe.ctype)
+    ));
+    ddl
+}
+
 /// Removes exactly the two run-owned objects. FORCE closes this run's own
 /// scratch sessions; it cannot reach anything the run did not create.
 pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
@@ -395,5 +441,50 @@ mod tests {
         ] {
             assert!(matches!(candidate(version), Candidate::Unavailable { .. }));
         }
+    }
+
+    fn names() -> ScratchNames {
+        ScratchNames::new(
+            "pbps_scratch_0123456789abcdef".into(),
+            "pbps_run_0123456789abcdef".into(),
+            "0".repeat(32),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_scratch_database_reproduces_the_targets_encoding_and_locale_provider() {
+        let libc = DatabaseRecipe {
+            encoding: "UTF8".into(),
+            provider: LocaleProvider::Libc,
+            collate: "en_US.utf8".into(),
+            ctype: "en_US.utf8".into(),
+            locale: None,
+            icu_rules: None,
+        };
+        assert_eq!(
+            scratch_database_ddl(&names(), &libc),
+            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" OWNER \"pbps_run_0123456789abcdef\" \
+             TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER libc LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
+        );
+        let icu = DatabaseRecipe {
+            provider: LocaleProvider::Icu,
+            locale: Some("en-US".into()),
+            icu_rules: Some("&a < b".into()),
+            ..libc.clone()
+        };
+        assert_eq!(
+            scratch_database_ddl(&names(), &icu),
+            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" OWNER \"pbps_run_0123456789abcdef\" \
+             TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'en-US' ICU_RULES '&a < b' \
+             LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
+        );
+        // A quote in a locale string cannot end the literal.
+        let odd = DatabaseRecipe {
+            provider: LocaleProvider::Builtin,
+            locale: Some("C.UTF-8'; DROP".into()),
+            ..libc
+        };
+        assert!(scratch_database_ddl(&names(), &odd).contains("BUILTIN_LOCALE 'C.UTF-8''; DROP'"));
     }
 }

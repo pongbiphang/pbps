@@ -124,9 +124,19 @@ impl PeerVerifiedConn {
 }
 
 impl query_sealed::Sealed for PeerVerifiedConn {}
+impl query_sealed::Sealed for Conn {}
 impl QueryConnection for PeerVerifiedConn {
     async fn query<'a>(&'a mut self, sql: &'a str) -> Result<Vec<Row>, DbError> {
         PeerVerifiedConn::query(self, sql).await
+    }
+}
+
+/// The ordinary CLI connection: the same qualification reads run on it
+/// where no peer-verified or stream connection is involved, such as the
+/// discovery-time facts a report is built from.
+impl QueryConnection for Conn {
+    async fn query<'a>(&'a mut self, sql: &'a str) -> Result<Vec<Row>, DbError> {
+        Conn::query(self, sql).await
     }
 }
 

@@ -13,9 +13,10 @@
 //! side (AGENTS.md: absent, empty and unreadable are three different things).
 
 use super::compatibility::{OPTIONAL_SETTINGS, SETTINGS};
+use pbps_db::DbError;
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{CatalogFacts, CollationFact, ExtensionFact, SettingFact};
-use pbps_db::{Conn, DbError};
+use pbps_db::transport::QueryConnection;
 use std::collections::BTreeMap;
 
 /// The schemas a plan's write path starts with, and the extras the dialect
@@ -105,7 +106,10 @@ SELECT name::text AS name, version::text AS version
 FROM pg_catalog.pg_available_extension_versions
 ORDER BY 1, 2";
 
-pub async fn read(conn: &mut Conn, scope: &Scope<'_>) -> Result<CatalogFacts, DbError> {
+pub async fn read(
+    conn: &mut impl QueryConnection,
+    scope: &Scope<'_>,
+) -> Result<CatalogFacts, DbError> {
     let rows = conn.query(DATABASE).await?;
     let [row] = rows.as_slice() else {
         return Err(DbError::BadRow(
@@ -226,7 +230,7 @@ pub async fn read(conn: &mut Conn, scope: &Scope<'_>) -> Result<CatalogFacts, Db
 /// connection's search path is not left changed for what runs next
 /// (measured on 16 and 18).
 async fn effective_schemas(
-    conn: &mut Conn,
+    conn: &mut impl QueryConnection,
     schema: &str,
     extras: &[String],
 ) -> Result<String, DbError> {

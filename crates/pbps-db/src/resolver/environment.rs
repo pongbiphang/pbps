@@ -230,6 +230,75 @@ pub struct EnvironmentFacts {
     pub executables: ExecutableSet,
 }
 
+/// The locale provider a database was created with, as the catalog spells
+/// it. Anything else is a provider this rule was not measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocaleProvider {
+    Libc,
+    Icu,
+    Builtin,
+}
+
+/// How the resolver's scratch database must be created so that it sorts,
+/// compares and encodes the way the target does. Derived from the target's
+/// facts and never defaulted: a locale the target did not report is a
+/// database the resolver cannot reproduce.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct DatabaseRecipe {
+    pub encoding: String,
+    pub provider: LocaleProvider,
+    pub collate: String,
+    pub ctype: String,
+    /// The ICU or builtin locale; absent for libc, whose locale is `collate`
+    /// and `ctype`.
+    pub locale: Option<String>,
+    pub icu_rules: Option<String>,
+}
+
+/// What kept a recipe from being derived: the fact the target did not report.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the target did not report {0}, so an equivalent scratch database cannot be created")]
+pub struct RecipeUnavailable(pub &'static str);
+
+impl DatabaseRecipe {
+    pub fn from_catalog(catalog: &CatalogFacts) -> Result<Self, RecipeUnavailable> {
+        let observed = |key: &'static str| -> Result<String, RecipeUnavailable> {
+            catalog
+                .observations
+                .get(key)
+                .and_then(Observation::value)
+                .map(str::to_owned)
+                .ok_or(RecipeUnavailable(key))
+        };
+        let optional = |key: &'static str| -> Result<Option<String>, RecipeUnavailable> {
+            match catalog.observations.get(key) {
+                Some(Observation::Observed { value }) => Ok(Some(value.clone())),
+                Some(Observation::NotReported) => Ok(None),
+                Some(Observation::Unknown { .. }) | None => Err(RecipeUnavailable(key)),
+            }
+        };
+        let provider = match observed("database_locale_provider")?.as_str() {
+            "c" => LocaleProvider::Libc,
+            "i" => LocaleProvider::Icu,
+            "b" => LocaleProvider::Builtin,
+            _ => return Err(RecipeUnavailable("a known locale provider")),
+        };
+        let locale = optional("database_locale")?;
+        if provider != LocaleProvider::Libc && locale.is_none() {
+            return Err(RecipeUnavailable("database_locale"));
+        }
+        Ok(Self {
+            encoding: observed("database_encoding")?,
+            provider,
+            collate: observed("database_collate")?,
+            ctype: observed("database_ctype")?,
+            locale,
+            icu_rules: optional("database_icu_rules")?,
+        })
+    }
+}
+
 /// A separately measured equivalence between two different builds for one
 /// scope. Data, versioned with the rule that trusts it: the mechanism ships
 /// with an empty table, and a mapping is never inferred from version strings.
@@ -364,5 +433,68 @@ mod tests {
         let json = serde_json::to_value(&identity).unwrap();
         assert!(json["digest"].is_null());
         assert_eq!(json["provenance"]["status"], "unreadable");
+    }
+
+    fn catalog_with(observations: &[(&str, Observation)]) -> CatalogFacts {
+        CatalogFacts {
+            observations: observations
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+            extensions: vec![],
+            available_extensions: BTreeMap::new(),
+            collations: vec![],
+            settings: BTreeMap::new(),
+            visibility: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_recipe_is_derived_from_reported_facts_and_never_defaulted() {
+        let observed = |v: &str| Observation::reported(Some(v));
+        let libc = catalog_with(&[
+            ("database_encoding", observed("UTF8")),
+            ("database_locale_provider", observed("c")),
+            ("database_collate", observed("en_US.utf8")),
+            ("database_ctype", observed("en_US.utf8")),
+            ("database_locale", Observation::NotReported),
+            ("database_icu_rules", Observation::NotReported),
+        ]);
+        let recipe = DatabaseRecipe::from_catalog(&libc).unwrap();
+        assert_eq!(recipe.provider, LocaleProvider::Libc);
+        assert_eq!(recipe.locale, None);
+        let mut icu = libc.clone();
+        icu.observations
+            .insert("database_locale_provider".into(), observed("i"));
+        // An ICU database without a reported ICU locale cannot be reproduced.
+        assert_eq!(
+            DatabaseRecipe::from_catalog(&icu),
+            Err(RecipeUnavailable("database_locale"))
+        );
+        icu.observations
+            .insert("database_locale".into(), observed("en-US"));
+        assert_eq!(
+            DatabaseRecipe::from_catalog(&icu)
+                .unwrap()
+                .locale
+                .as_deref(),
+            Some("en-US")
+        );
+        // An encoding that could not be read is not UTF8 by assumption.
+        let mut unread = libc.clone();
+        unread.observations.insert(
+            "database_encoding".into(),
+            Observation::Unknown {
+                reason: "hidden".into(),
+            },
+        );
+        assert_eq!(
+            DatabaseRecipe::from_catalog(&unread),
+            Err(RecipeUnavailable("database_encoding"))
+        );
+        let mut odd = libc;
+        odd.observations
+            .insert("database_locale_provider".into(), observed("x"));
+        assert!(DatabaseRecipe::from_catalog(&odd).is_err());
     }
 }

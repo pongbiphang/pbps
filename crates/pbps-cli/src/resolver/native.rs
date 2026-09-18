@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 mod daemon;
+pub(crate) mod executables;
 mod execution;
 mod private_channel;
 mod target;
@@ -185,6 +186,18 @@ impl ProcessLease {
 
     /// Reads one bounded file through the *held* proc directory, so a reused
     /// numeric PID cannot answer for the process this lease captured.
+    /// The held handle on `/proc/<pid>/exe`: the executed file object
+    /// itself, so reading it reads what runs even after the path changed.
+    pub(crate) fn executable_file(&self) -> &File {
+        &self.executable
+    }
+
+    /// Opens a file under this process's own `/proc/<pid>/` entry, such as a
+    /// `map_files/<range>` mapped file object.
+    pub(crate) fn open_proc(&self, relative: &str) -> Result<File, UnqualifiedProcess> {
+        File::open(proc_base(&self.directory).join(relative)).map_err(|_| UnqualifiedProcess)
+    }
+
     pub(crate) fn read_proc(
         &self,
         relative: &str,

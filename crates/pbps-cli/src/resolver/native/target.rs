@@ -1,7 +1,9 @@
 //! A direct native-Linux target connection, retaining its TLS and process
 //! leases together. Apply can re-establish this without invoking Docker.
 
+use super::executables;
 use super::{SocketOwnerLease, UnqualifiedProcess};
+use pbps_db::resolver::environment::EnvironmentFacts;
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::PeerVerifiedConn;
 use std::sync::{Arc, Weak};
@@ -15,6 +17,18 @@ mod tests;
 
 pub struct NativeTarget {
     current: Option<BoundTarget>,
+}
+
+/// What reading the target's analysis-scope facts refused. A catalog read
+/// and a kernel read fail differently and a caller needs to tell them apart.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvironmentError {
+    #[error("the target binding changed or became unreadable while reading its environment")]
+    Binding,
+    #[error("the target's analysis-scope catalog facts could not be read: {0}")]
+    Catalog(pbps_db::DbError),
+    #[error("the target engine's executable content could not be read")]
+    Executables,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +164,32 @@ impl NativeTarget {
             .as_ref()
             .map(|current| &current.identity)
             .ok_or(UnqualifiedProcess)
+    }
+
+    /// The analysis-scope facts of the target as its own deployer sees them:
+    /// the catalog facts read over the connection, and the content of the
+    /// engine executable and the native libraries its extensions name, read
+    /// from the running postmaster by the native observer. Bracketed by the
+    /// ordinary binding check, so a facts read is of the same qualified
+    /// backend as everything else (ADR-0016 §5, §23; SPEC §9.3.3).
+    pub async fn environment(
+        &mut self,
+        schemas: &[String],
+        write_path_extras: &[String],
+    ) -> Result<EnvironmentFacts, EnvironmentError> {
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        let catalog = engine::environment(&mut bound.connection, schemas, write_path_extras)
+            .await
+            .map_err(EnvironmentError::Catalog)?;
+        let required = executables::required_libraries(&catalog);
+        let set = executables::executables(bound.lease.service(), &required)
+            .map_err(|_| EnvironmentError::Executables)?;
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        Ok(EnvironmentFacts {
+            catalog,
+            executables: set,
+        })
     }
 
     pub async fn check(&mut self) -> Result<(), UnqualifiedProcess> {
