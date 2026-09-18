@@ -417,6 +417,11 @@ fn cut(
         .filter(|id| modules.contains(*id))
         .cloned()
         .collect();
+    // Kept whole rather than cut: a declared grant's target is the project's
+    // by construction, and the caller looks each one up by name. An owner
+    // this map lacks is an object the read did not see, which is a different
+    // finding from one whose owner is somebody else.
+    scoped.owners = pulled.owners.clone();
     report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
     Ok(scoped)
 }
@@ -3818,6 +3823,10 @@ pub fn cmd_plan_db(
 
         findings.extend(policy);
         let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
+        // Asked of the read this plan was built from, not of the connection
+        // again: the owners came out of the same statement snapshot as the
+        // schema, so the two cannot disagree (DECISIONS 174).
+        let owned_targets = crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners)?;
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
@@ -3861,7 +3870,14 @@ pub fn cmd_plan_db(
             cs,
             baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
-            vec![permission_support, drop_blockers, missing_roles, rename_evidence, rebuilds],
+            vec![
+                permission_support,
+                owned_targets,
+                drop_blockers,
+                missing_roles,
+                rename_evidence,
+                rebuilds,
+            ],
             findings,
             cost,
         ))
@@ -6129,6 +6145,7 @@ mod tests {
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
             public_execute: Default::default(),
+            owners: Default::default(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
                 entry(
@@ -9631,6 +9648,7 @@ mod tests {
                 },
             ],
             public_execute: Default::default(),
+            owners: Default::default(),
         }
     }
 

@@ -65,6 +65,12 @@ pub struct Scoped {
     /// [`Scoped::schema`] — and a postcondition that has to ask what a plan
     /// achieved about `PUBLIC` has nowhere else to read it from.
     pub public_execute: pbps_model::PublicExecute,
+
+    /// Who owns each managed securable this read saw (#261). Carried beside
+    /// the comparison for the same reason as the field above: ownership is
+    /// not a grant, and the owner's own ACL entry is the zero point every
+    /// object of that kind starts from (DECISIONS 371).
+    pub owners: BTreeMap<pbps_model::GrantTarget, String>,
 }
 
 /// Cuts a live schema down to the managed set.
@@ -168,6 +174,7 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId
         missing_roles,
         unexpressible: Vec::new(),
         public_execute: Default::default(),
+        owners: BTreeMap::new(),
     }
 }
 

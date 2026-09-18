@@ -1088,6 +1088,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             column: optional_text(row, "column_name")?,
             defaulted: flag(row, "defaulted")?,
             owner: text(row, "owner")?,
+            grantor: text(row, "grantor")?,
         });
     }
     for row in batch
@@ -1275,7 +1276,8 @@ fn grants_query() -> String {
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
                 a.privilege_type, a.is_grantable,
                 c.relacl IS NULL AS defaulted,
-                pg_catalog.pg_get_userbyid(c.relowner) AS owner
+                pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+                pg_catalog.pg_get_userbyid(a.grantor) AS grantor
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
            CROSS JOIN LATERAL pg_catalog.aclexplode(
@@ -1290,7 +1292,8 @@ fn grants_query() -> String {
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
-                false, pg_catalog.pg_get_userbyid(c.relowner)
+                false, pg_catalog.pg_get_userbyid(c.relowner),
+                pg_catalog.pg_get_userbyid(a.grantor)
            FROM pg_catalog.pg_attribute at
            JOIN pg_catalog.pg_class c ON c.oid = at.attrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1304,7 +1307,8 @@ fn grants_query() -> String {
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
-                p.proacl IS NULL, pg_catalog.pg_get_userbyid(p.proowner)
+                p.proacl IS NULL, pg_catalog.pg_get_userbyid(p.proowner),
+                pg_catalog.pg_get_userbyid(a.grantor)
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
            CROSS JOIN LATERAL pg_catalog.aclexplode(
@@ -1316,7 +1320,8 @@ fn grants_query() -> String {
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
-                n.nspacl IS NULL, pg_catalog.pg_get_userbyid(n.nspowner)
+                n.nspacl IS NULL, pg_catalog.pg_get_userbyid(n.nspowner),
+                pg_catalog.pg_get_userbyid(a.grantor)
            FROM pg_catalog.pg_namespace n
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))) AS a

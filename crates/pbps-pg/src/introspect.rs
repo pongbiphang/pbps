@@ -383,6 +383,23 @@ pub struct RawGrant {
     /// The object's owner, for the same reason: the owner's entry is the one
     /// `acldefault` puts there, not one anybody granted.
     pub owner: String,
+    /// Who granted this entry, which decides whether anything the plan runs
+    /// can take it away.
+    ///
+    /// A `REVOKE` removes only the entries the **grantor** put there.
+    /// Measured on 18.6: with `gr_mid` holding `SELECT ... WITH GRANT
+    /// OPTION` from the owner and having granted it onward, neither the
+    /// owner's `REVOKE SELECT ... FROM gr_reader` nor a *superuser's*
+    /// removes `gr_reader=r/gr_mid` — both report success, and
+    /// `has_table_privilege` stays true. So this is not a fact about who is
+    /// entitled to revoke; it is that nobody but the grantor can.
+    ///
+    /// The entries `acldefault` supplies carry the owner as grantor, and so
+    /// does a **superuser's** grant on an object it does not own — measured,
+    /// `postgres` granting on `gr_owner`'s table records `gr_owner` as the
+    /// grantor. That is why comparing against the owner does not report the
+    /// grants this tool makes itself.
+    pub grantor: String,
 }
 
 /// A routine with an explicitly empty ACL: no grant row can represent it.
@@ -845,6 +862,15 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // per object: a database has as many of these as it has objects, and a
         // report nobody can read is a report nobody reads.
         if g.defaulted || g.grantee.as_deref() == Some(g.owner.as_str()) {
+            // Not compared, and still worth carrying: a declaration that
+            // grants this object's owner something cannot converge, because
+            // the entry skipped here is the only place that grant would show
+            // (#261). Every object reaches this branch — the query coalesces
+            // a NULL ACL to `acldefault`, whose entries are all the owner's —
+            // so this is where the owner of every securable is known.
+            if let Ok(target) = target_of(g, &signatures) {
+                pulled.owners.insert(target, g.owner.clone());
+            }
             continue;
         }
         let grantee = g.grantee.as_deref().unwrap_or_default();
@@ -971,6 +997,34 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                      cannot express",
                     g.permission,
                     target_label(g, &signatures)
+                ),
+            );
+            continue;
+        }
+        // The other half of the same `WITH GRANT OPTION` story, one grant
+        // further on: an entry somebody *else* granted. A `REVOKE` removes
+        // only what the grantor put there, so a plan that narrows this role
+        // runs a statement the engine reports as succeeding and the role
+        // keeps the permission (#251). Folded in as a plain grant, that plan
+        // is built, run, and refused by its own read-back — the right answer
+        // at the wrong end of the apply.
+        //
+        // Compared against the **owner**, which is the grantor of every entry
+        // `acldefault` supplies and of every grant this tool makes, a
+        // superuser's on somebody else's object included (both measured on
+        // 18.6). So this reports the out-of-band grant and not pbps's own.
+        if g.grantor != g.owner {
+            unexpressible(
+                pulled,
+                Some(target),
+                format!(
+                    "role {grantee}: {} on {} was granted by `{}`, not by the object's owner \
+                     `{}` — and a `REVOKE` removes only what its own grantor granted, so \
+                     nothing this tool can run takes it away (ADR-0010 §1, measured)",
+                    g.permission,
+                    target_label(g, &signatures),
+                    g.grantor,
+                    g.owner
                 ),
             );
             continue;
@@ -2519,8 +2573,11 @@ mod tests {
         }
     }
 
-    /// One expanded ACL row, of the shape the query returns: an explicit grant
-    /// by somebody other than the owner.
+    /// One expanded ACL row, of the shape the query returns: an explicit
+    /// grant, made by the owner, to somebody other than the owner. The
+    /// grantor is the owner because that is what the engine records for every
+    /// grant this tool makes — including one a superuser makes on an object
+    /// it does not own (measured).
     fn grant(
         grantee: Option<&str>,
         object: Option<&str>,
@@ -2541,6 +2598,7 @@ mod tests {
             column: None,
             defaulted: false,
             owner: "deploy".to_owned(),
+            grantor: "deploy".to_owned(),
         }
     }
 
@@ -2866,6 +2924,67 @@ mod tests {
         // ADR-0010 §7: the other half of why `serial` is refused at load.
         assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
         assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+    }
+
+    /// Issue #251. A `REVOKE` removes only what its own grantor granted, so
+    /// an entry a third role put there survives every statement this tool can
+    /// write — measured on 18.6, the owner's revoke and a superuser's both
+    /// report success and leave `has_table_privilege` true.
+    ///
+    /// Folded into the role's set, such a grant is planned away, the apply
+    /// runs, and the closing read refuses it for not having achieved its own
+    /// postcondition. Reported instead, the narrowing is refused before a
+    /// statement runs, with the grantor named.
+    ///
+    /// The negative case is the one that decides the rule's shape: the owner
+    /// is the grantor of every entry `acldefault` supplies and of every grant
+    /// this tool makes, so comparing against the owner reports the out-of-band
+    /// grant and not pbps's own.
+    #[test]
+    fn a_grant_made_by_a_third_role_is_reported_rather_than_folded_into_the_set() {
+        let third = |grantor: &str| {
+            let mut g = grant(
+                Some("app_reader"),
+                Some("customer"),
+                GrantedKind::Relation('r'),
+                "SELECT",
+            );
+            g.grantor = grantor.to_owned();
+            g
+        };
+
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("app_mid")],
+            ..declaring('f', &[])
+        });
+        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
+        assert_eq!(pulled.unexpressible.len(), 1);
+        let what = &pulled.unexpressible[0].what;
+        assert!(what.contains("granted by `app_mid`"), "{what}");
+        assert!(what.contains("`deploy`"), "{what}");
+        assert!(what.contains("removes only what its own grantor"), "{what}");
+        assert!(
+            pulled.unexpressible[0].target.is_some(),
+            "the object is nameable, so the finding carries it"
+        );
+
+        // The owner's own grant — which is what a superuser's grant on
+        // somebody else's object is recorded as — is an ordinary grant.
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("deploy")],
+            ..declaring('f', &[])
+        });
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        assert!(
+            !pulled_role(&pulled, "app_reader").grants.is_empty(),
+            "the owner's grant belongs in the role's set"
+        );
     }
 
     /// Every limitation on an object carries that object as its target, and

@@ -891,6 +891,7 @@ mod tests {
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
             public_execute: Default::default(),
+            owners: Default::default(),
         };
         let scoped = pbps_diff::scope(
             &pulled.schema,

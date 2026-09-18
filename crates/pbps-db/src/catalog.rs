@@ -74,6 +74,24 @@ pub struct Pulled {
     /// Empty on an engine whose `CREATE` grants no such default; on those
     /// there is nothing to write down.
     pub public_execute: pbps_model::PublicExecute,
+    /// Who owns each securable this read saw, for the one question the
+    /// schema cannot answer: whether a declared grant's grantee already owns
+    /// its target.
+    ///
+    /// Not part of [`Pulled::schema`] for the same reason `public_execute`
+    /// is not: ownership is not a grant, and the owner's ACL entry is the
+    /// zero point every object of that kind starts from (DECISIONS 371).
+    /// Recording it as grants would make a declaration naming one permission
+    /// short of the rest, and every plan would revoke what ownership
+    /// provides.
+    ///
+    /// It is carried because a `GRANT` to the owner cannot change what the
+    /// owner holds — measured, it only forces the engine to write the whole
+    /// default set down — so a declaration asking for one plans the same
+    /// statement forever and the apply's closing read refuses it (#261).
+    ///
+    /// Empty on an engine whose reader does not carry an owner.
+    pub owners: std::collections::BTreeMap<pbps_model::GrantTarget, String>,
 }
 
 /// One permission the model cannot hold, and enough about it for the caller

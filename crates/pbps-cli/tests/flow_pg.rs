@@ -1780,6 +1780,210 @@ fn bootstrap_refuses_to_record_a_routine_a_trigger_reopened_to_public() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// Issue #308. `init --from` is the adoption workflow (SPEC §14.1), and it
+/// kept the introspector's schema, warnings and unmanaged inventory while
+/// dropping its `unexpressible` entries. A column-level grant or a
+/// `WITH GRANT OPTION` could therefore be left out of the generated
+/// declarations without being said out loud — and the command then printed a
+/// success and suggested `baseline`, which refuses that database on exactly
+/// those facts (DECISIONS 95, 97, 110).
+///
+/// The supported-grants case is the other half: a database with nothing
+/// inexpressible in it adopts with the plain suggestion, so this is a report
+/// and not a new refusal.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_init_ux_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "init-unexpressible");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} NOSUPERUSER; CREATE SCHEMA app;              CREATE TABLE app.t (id integer PRIMARY KEY, email text);              CREATE TABLE app.plain (id integer PRIMARY KEY);              GRANT USAGE ON SCHEMA app TO {};              GRANT SELECT (email) ON app.t TO {};              GRANT SELECT ON app.plain TO {} WITH GRANT OPTION",
+            role.1, role.1, role.1, role.1
+        ),
+    );
+
+    let adopt = |tag: &str, connection: &str| {
+        let dir = std::env::temp_dir().join(format!("pbps-init-ux-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let var = format!("PBPS_INIT_UX_{tag}_{}", std::process::id());
+        let o = Command::new(BIN)
+            .env(&var, connection)
+            .arg("--project")
+            .arg(&dir)
+            .args([
+                "init",
+                "--from",
+                "source",
+                "--url-env",
+                &var,
+                "--dialect",
+                "postgres",
+            ])
+            .output()
+            .unwrap();
+        (dir, o)
+    };
+
+    let (dir, o) = adopt("held", connection);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    // The role, the target and the privilege — each named, for both shapes.
+    for expected in [
+        role.1.as_str(),
+        "app.t",
+        "column `email`",
+        "app.plain",
+        "WITH GRANT OPTION",
+    ] {
+        assert!(all.contains(expected), "{expected} missing from: {all}");
+    }
+    // And the next step says so rather than sending the operator to a
+    // `baseline` that refuses on the same facts.
+    assert!(
+        stdout(&o).contains("`baseline` refuses a database holding one"),
+        "{}",
+        stdout(&o)
+    );
+    // Adoption writes declarations and no ledger entry: `init` never touches
+    // the database it read.
+    assert!(dir.join("schema.ids.json").is_file());
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE n.nspname = 'public' AND c.relname = '__pbps_state'"
+        ),
+        0,
+        "init wrote a ledger"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The control: the same adoption against a database whose grants the
+    // model can all hold.
+    let plain = OwnDatabase::new(&server, "init-expressible");
+    on_server(
+        plain.connection(),
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer PRIMARY KEY)",
+    );
+    let (dir, o) = adopt("plain", plain.connection());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("pbps baseline --env source --reason initial-adoption"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        !stdout(&o).contains("`baseline` refuses a database holding one"),
+        "{}",
+        stdout(&o)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #261. A managed role that owns a managed object already holds every
+/// privilege on it, with no ACL entry at all; the pull reads that entry — when
+/// a `GRANT` forces the engine to write one — as the zero point rather than as
+/// grants (DECISIONS 371). So a declaration granting the owner something reads
+/// back as unsatisfied, the differ emits the same `GRANT` on every plan, and
+/// the apply's closing read refuses it for not having achieved its own
+/// postcondition.
+///
+/// Refused at `plan --db` instead, with the line to delete. The second half is
+/// what keeps the rule scoped to the declaration: the same role owning the
+/// same table, granted nothing on it, is an ordinary project.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(server.clone(), format!("pbps_owner_{}", std::process::id()));
+    let own = OwnDatabase::new(&server, "owned-target");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE ROLE {} NOSUPERUSER; CREATE SCHEMA app", role.1),
+    );
+
+    let d = Demo::new("owned-target");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/owner.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    // Ownership handed over out of band, which is the only way it moves: this
+    // tool does not own `ALTER TABLE ... OWNER TO` (ADR-0010 §2).
+    on_server(
+        connection,
+        &format!("ALTER TABLE app.t OWNER TO {}", role.1),
+    );
+
+    // The declaration that cannot converge.
+    std::fs::write(
+        d.dir.join("schema/owner.yml"),
+        format!(
+            "role: {}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n",
+            role.1
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("owned_targets"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains(&role.1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("delete it from role"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
+    // The same ownership, granted nothing: an ordinary project.
+    std::fs::write(
+        d.dir.join("schema/owner.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// SPEC §7.6, the case it names and the read it names it at.
 ///
 /// A staged run commits each statement on its own, so another session can

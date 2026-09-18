@@ -740,6 +740,89 @@ fn refuse_drop_reports(
 /// its recorded snapshot. A removal must not be refused for a grant it no
 /// longer issues. The server version is checked again on apply because a
 /// saved plan can travel between environments (DECISIONS 429).
+/// A declared grant whose grantee already owns its target (#261).
+///
+/// # Why this is a refusal and not a plan
+///
+/// The `GRANT` cannot change what the role holds. Measured on 18.6: an owner
+/// already holds every privilege on its own object with a `NULL` ACL, and
+/// granting one back only forces the engine to write the *whole* default set
+/// down — `relacl` becomes exactly `acldefault(r, owner)`, and a second grant
+/// changes nothing again. The pull then skips that entry, because the owner's
+/// is the zero point rather than a grant (DECISIONS 371), so the role reads
+/// back as holding nothing there and the differ emits the same `GRANT` on
+/// every plan. The apply runs it and its closing read refuses, having not
+/// achieved what it asked for.
+///
+/// Recording the owner's entry as grants instead is the deadlock 371 exists
+/// to prevent: a declaration naming one permission would be short of the
+/// other seven, and every plan would revoke what ownership provides. So the
+/// declaration is refused, with the line to delete.
+///
+/// # Why it is scoped to the declaration
+///
+/// A managed role that owns objects and is granted nothing on them is an
+/// ordinary, plannable project. Only the grant is impossible, and only that
+/// is refused.
+pub fn owned_targets(
+    driver: Driver,
+    changes: &ChangeSet,
+    owners: &std::collections::BTreeMap<pbps_model::GrantTarget, String>,
+) -> anyhow::Result<ConnectedCheck> {
+    // The map is empty on a reader that carries no owner, so the loop would
+    // find nothing anyway — named here so that "this engine was not asked"
+    // reads differently from "this engine was asked and said no".
+    if driver != Driver::Postgres {
+        return Ok(ConnectedCheck {
+            name: "owned_targets",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server grants to an object's owner like any other principal, \
+                      and this reader carries no object owner; the PostgreSQL check for a \
+                      grant no `REVOKE` could ever undo does not apply"
+                .to_owned(),
+        });
+    }
+    let mut impossible = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::Grant {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        else {
+            continue;
+        };
+        // An owner this read did not see is an object that is not there yet —
+        // one this plan creates, whose owner will be whoever runs it. That is
+        // not this check's business.
+        if owners.get(target).is_some_and(|owner| owner == role) {
+            impossible.push(format!(
+                "role `{role}` owns `{target}`, so `{}` on it is a grant that cannot change \
+                 what the role holds: an owner already holds every privilege on its own \
+                 object, and this engine records the whole default set rather than the one \
+                 permission (ADR-0010 §1, measured). The pull reads that entry as the zero \
+                 point rather than a grant (DECISIONS 371), so nothing would ever satisfy \
+                 this line — delete it from role `{role}`",
+                permissions
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if !impossible.is_empty() {
+        anyhow::bail!("owned_targets (PostgreSQL): {}", impossible.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "owned_targets",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: "no declared grant names a target its own grantee owns".to_owned(),
+    })
+}
+
 pub async fn permission_support(
     conn: &mut Conn,
     changes: &ChangeSet,
