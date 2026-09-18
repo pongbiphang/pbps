@@ -977,9 +977,22 @@ pub(crate) fn unexpressible_permissions<'a>(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
 ) -> Vec<&'a str> {
+    permissions_the_managed_set_keeps(&pulled.unexpressible, ids, modules)
+}
+
+/// The same cut, asked of a list on its own — by `init`, which has findings
+/// and a generated identity file but no `Pulled` left to ask.
+///
+/// One function rather than two that have to agree: `init` tells the operator
+/// which of these `baseline` will refuse over, and `baseline` is this filter
+/// (#308).
+pub(crate) fn permissions_the_managed_set_keeps<'a>(
+    found: &'a [pbps_db::catalog::Unexpressible],
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+) -> Vec<&'a str> {
     let managed_tables: BTreeSet<&TableName> = ids.tables.values().collect();
-    pulled
-        .unexpressible
+    found
         .iter()
         .filter(|u| ids.roles.values().any(|managed| managed == &u.role))
         .filter(|u| match &u.target {
@@ -1097,7 +1110,7 @@ fn dependency_hints_for_schema(
 /// sound only because no recorder writes a snapshot whose managed set names a
 /// module the schema does not hold — [`managed_limitations`] turns such a
 /// module into a refusal before `record` is reached.
-fn managed_modules(
+pub(crate) fn managed_modules(
     recorded: Option<&pbps_model::StateSnapshot>,
     declared: Option<&pbps_model::Schema>,
 ) -> BTreeSet<ModuleId> {
@@ -3220,6 +3233,21 @@ pub fn cmd_bootstrap(
             crate::engine::refuse_missing_cluster_roles(
                 conn.driver(),
                 &existing.scoped.missing_roles,
+            )?;
+            // This command builds what it grants on, so the role running it
+            // owns every object the declarations name. A grant to that role
+            // is the impossible line a connected plan is refused for, and
+            // here there is nothing downstream to catch it: the engine writes
+            // only the owner's default ACL entry, the pull reads that entry
+            // as the zero point (DECISIONS 371), and this command compares no
+            // declared grant against what it built. Unrefused it reports
+            // success and records a snapshot that does not hold the grant
+            // (#261).
+            crate::engine::owned_targets(
+                conn.driver(),
+                &cs,
+                &existing.scoped.owners,
+                &existing.scoped.session_role,
             )?;
 
             // Only names the plan creates need to be free (DECISIONS 118).

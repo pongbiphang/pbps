@@ -259,14 +259,26 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 // model cannot express (DECISIONS 110), so sending the user
                 // straight to it would be sending them to the same refusal
                 // on the same facts, one command later (#308).
-                if prepared.unexpressible.is_empty() {
+                // Not the whole list: `baseline` refuses over the ones its
+                // own cut keeps — a role the identity file manages, on a
+                // securable inside the managed set (DECISIONS 176) — and the
+                // generated config leaves everything else unmanaged. Telling
+                // the operator to settle a `WITH GRANT OPTION` on somebody
+                // else's materialized view would send them to revoke a
+                // privilege that never reaches a plan.
+                let settle = crate::deploy::permissions_the_managed_set_keeps(
+                    &prepared.unexpressible,
+                    &prepared.ids,
+                    &crate::deploy::managed_modules(None, Some(&prepared.schema)),
+                );
+                if settle.is_empty() {
                     println!(
                         "Then commit the generated files and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
                     );
                 } else {
                     println!(
                         "Then settle the {} permission(s) above — `baseline` refuses a database holding one the declarations cannot express — and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`.",
-                        prepared.unexpressible.len()
+                        settle.len()
                     );
                 }
             } else {

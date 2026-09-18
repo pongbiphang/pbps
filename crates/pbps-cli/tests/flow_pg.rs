@@ -1908,6 +1908,65 @@ fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
         stdout(&o)
     );
     let _ = std::fs::remove_dir_all(&dir);
+
+    // The third case, and the one that decides which list the suggestion is
+    // counted from: a permission the model cannot express on a securable
+    // nothing manages. It is still reported — the operator asked what this
+    // read left behind — but `baseline` cuts it out (DECISIONS 176), so
+    // sending them to revoke it would be sending them to undo a privilege
+    // that never reaches a plan.
+    let outside = Role(
+        server.clone(),
+        format!("pbps_init_outside_{}", std::process::id()),
+    );
+    let aside = OwnDatabase::new(&server, "init-outside");
+    on_server(
+        aside.connection(),
+        &format!(
+            "CREATE ROLE {} NOSUPERUSER; CREATE SCHEMA app; \
+             CREATE TABLE app.t (id integer PRIMARY KEY); \
+             CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS n; \
+             GRANT USAGE ON SCHEMA app TO {}; \
+             GRANT SELECT ON app.mv TO {} WITH GRANT OPTION",
+            outside.1, outside.1, outside.1
+        ),
+    );
+    let (dir, o) = adopt("outside", aside.connection());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("`app.mv` is on a materialized view"),
+        "the finding is still reported: {}",
+        stderr(&o)
+    );
+    assert!(
+        !stdout(&o).contains("`baseline` refuses a database holding one"),
+        "{}",
+        stdout(&o)
+    );
+    // And the claim the suggestion no longer makes is the one the next
+    // command settles.
+    let var = format!("PBPS_INIT_UX_outside_{}", std::process::id());
+    let baselined = Command::new(BIN)
+        .env(&var, aside.connection())
+        .arg("--project")
+        .arg(&dir)
+        .args([
+            "baseline",
+            "--env",
+            "source",
+            "--reason",
+            "initial-adoption",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        code(&baselined),
+        0,
+        "{}{}",
+        stdout(&baselined),
+        stderr(&baselined)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Issue #261. A managed role that owns a managed object already holds every
@@ -1921,6 +1980,92 @@ fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
 /// Refused at `plan --db` instead, with the line to delete. The second half is
 /// what keeps the rule scoped to the declaration: the same role owning the
 /// same table, granted nothing on it, is an ordinary project.
+/// Issue #261, at the one command that creates the objects it grants on.
+///
+/// `bootstrap` builds the declared schema, so the role that runs it owns
+/// everything it built. A declaration granting that role a permission on what
+/// it just created is the same impossible line a connected plan is refused
+/// for — and there is nothing downstream to catch it here: the engine writes
+/// only the owner's default ACL entry, the pull reads that entry as the zero
+/// point (DECISIONS 371), and `bootstrap` has no declared-against-built
+/// comparison of grants. Unrefused, it reports success and records a snapshot
+/// that does not hold the declared grant.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn bootstrap_refuses_a_grant_to_the_role_that_will_own_what_it_builds() {
+    let server = server();
+    // The schema belongs to somebody else, so that the `usage` line the
+    // grant needs is not itself the impossible one.
+    let holder = format!("pbps_bootstrap_holder_{}", std::process::id());
+    let other = format!("pbps_bootstrap_reader_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: server.clone(),
+        names: vec![holder.clone(), other.clone()],
+    };
+    on_server(
+        &server,
+        &format!("CREATE ROLE {holder} NOSUPERUSER; CREATE ROLE {other} NOSUPERUSER"),
+    );
+    let own = OwnDatabase::new(&server, "bootstrap-owned-target");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE SCHEMA app AUTHORIZATION {holder}"),
+    );
+    let deployer = text_of(connection, "SELECT current_user");
+
+    let d = Demo::new("bootstrap-owned-target");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("owned_targets") && stderr(&refused).contains("will own"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+    // Refused before a statement runs: nothing built, nothing recorded.
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'app'"
+        ),
+        0
+    );
+
+    // The same build, granted to somebody who will not own it. The deployer's
+    // own file stays: a role file that vanishes while another appears is a
+    // rename to the resolver, and this test is not about identity.
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/other.yml"),
+        format!("role: {other}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// Issue #261. The owner a grant has to be checked against is the one the
 /// object will have when the statement runs, not the one the baseline read
 /// carries — and for an object the plan creates, the baseline has no owner
