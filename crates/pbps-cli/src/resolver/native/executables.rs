@@ -73,6 +73,7 @@ pub(crate) fn required_libraries(catalog: &CatalogFacts) -> Vec<String> {
 pub(crate) fn executables(
     lease: &ProcessLease,
     required: &[String],
+    dynamic_library_path: &str,
 ) -> Result<ExecutableSet, UnqualifiedProcess> {
     lease.check()?;
     let engine_path = lease.executable_path().to_path_buf();
@@ -100,29 +101,38 @@ pub(crate) fn executables(
 
     let libdir = library_directory(&engine_path);
     for name in required {
-        let candidate = resolve(name, &libdir);
-        if mapped.contains_key(&candidate) {
+        let candidates = resolve(name, &libdir, dynamic_library_path);
+        // A candidate already mapped is loaded content, handled above.
+        if candidates
+            .iter()
+            .any(|candidate| mapped.contains_key(candidate))
+        {
             continue;
         }
-        libraries.push(
-            match lease.open_in_root(candidate.trim_start_matches('/')) {
-                Ok(file) => match digest_of(&file) {
-                    Ok(digest) => ExecutableIdentity {
-                        role: ExecutableRole::LateLoaded,
-                        path: candidate,
-                        digest: Some(digest),
-                        provenance: Provenance::DiskCandidate,
-                        disk_differs_from_loaded: None,
-                    },
-                    Err(_) => unreadable(ExecutableRole::LateLoaded, candidate, "unreadable"),
-                },
-                Err(_) => unreadable(
-                    ExecutableRole::LateLoaded,
-                    candidate,
-                    "required library not found in the engine's library directory",
-                ),
-            },
-        );
+        // Try each candidate in the loader's search order; the first that
+        // opens is the one it would load. If none opens, the library is not
+        // where the path says it should be.
+        let found = candidates.iter().find_map(|candidate| {
+            let file = lease.open_in_root(candidate.trim_start_matches('/')).ok()?;
+            let digest = digest_of(&file).ok()?;
+            Some(ExecutableIdentity {
+                role: ExecutableRole::LateLoaded,
+                path: candidate.clone(),
+                digest: Some(digest),
+                provenance: Provenance::DiskCandidate,
+                disk_differs_from_loaded: None,
+            })
+        });
+        libraries.push(found.unwrap_or_else(|| {
+            unreadable(
+                ExecutableRole::LateLoaded,
+                candidates
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| name.clone()),
+                "required library not found on the library search path",
+            )
+        }));
     }
     lease.check()?;
     Ok(ExecutableSet { engine, libraries })
@@ -265,20 +275,41 @@ pub(crate) fn library_directory(engine: &Path) -> PathBuf {
 /// Resolves a library name the way the engine's loader does: `$libdir` is
 /// the library directory, a bare name lives there, and a name without an
 /// extension gets `.so`.
-pub(crate) fn resolve(name: &str, libdir: &Path) -> String {
-    let path = if let Some(rest) = name.strip_prefix("$libdir/") {
-        libdir.join(rest)
-    } else if name.contains('/') {
-        PathBuf::from(name)
-    } else {
-        libdir.join(name)
+pub(crate) fn resolve(name: &str, libdir: &Path, dynamic_library_path: &str) -> Vec<String> {
+    let with_suffix = |path: PathBuf| -> String {
+        let mut path = path.to_string_lossy().into_owned();
+        let file = path.rsplit('/').next().unwrap_or("").to_owned();
+        if !file.contains(".so") {
+            path.push_str(".so");
+        }
+        path
     };
-    let mut path = path.to_string_lossy().into_owned();
-    let file = path.rsplit('/').next().unwrap_or("").to_owned();
-    if !file.contains(".so") {
-        path.push_str(".so");
+    if let Some(rest) = name.strip_prefix("$libdir/") {
+        vec![with_suffix(libdir.join(rest))]
+    } else if name.contains('/') {
+        vec![with_suffix(PathBuf::from(name))]
+    } else {
+        // A bare name is searched along `dynamic_library_path`, `$libdir`
+        // expanding to the engine's library directory; the default is just
+        // `$libdir`. Each directory is a candidate, in order.
+        let dirs: Vec<String> = dynamic_library_path
+            .split(':')
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| match dir.strip_prefix("$libdir") {
+                Some(rest) => format!("{}{rest}", libdir.to_string_lossy()),
+                None => dir.to_owned(),
+            })
+            .collect();
+        let dirs = if dirs.is_empty() {
+            vec![libdir.to_string_lossy().into_owned()]
+        } else {
+            dirs
+        };
+        dirs.into_iter()
+            .map(|dir| with_suffix(PathBuf::from(dir).join(name)))
+            .collect()
     }
-    path
 }
 
 /// SHA-256 of a file's content, read positionally so a handle shared with
@@ -422,18 +453,32 @@ mod tests {
     fn library_names_resolve_like_the_engines_loader() {
         let libdir = library_directory(Path::new("/usr/lib/postgresql/18/bin/postgres"));
         assert_eq!(libdir, PathBuf::from("/usr/lib/postgresql/18/lib"));
+        // The default library path is `$libdir`; a `$libdir/` name and an
+        // absolute name resolve to one candidate each.
         assert_eq!(
-            resolve("$libdir/hstore", &libdir),
-            "/usr/lib/postgresql/18/lib/hstore.so"
+            resolve("$libdir/hstore", &libdir, "$libdir"),
+            vec!["/usr/lib/postgresql/18/lib/hstore.so".to_owned()]
         );
         assert_eq!(
-            resolve("auto_explain", &libdir),
-            "/usr/lib/postgresql/18/lib/auto_explain.so"
+            resolve("auto_explain", &libdir, "$libdir"),
+            vec!["/usr/lib/postgresql/18/lib/auto_explain.so".to_owned()]
         );
-        assert_eq!(resolve("/opt/hooks/hook.so", &libdir), "/opt/hooks/hook.so");
         assert_eq!(
-            resolve("$libdir/plugins/x.so.1", &libdir),
-            "/usr/lib/postgresql/18/lib/plugins/x.so.1"
+            resolve("/opt/hooks/hook.so", &libdir, "$libdir"),
+            vec!["/opt/hooks/hook.so".to_owned()]
+        );
+        assert_eq!(
+            resolve("$libdir/plugins/x.so.1", &libdir, "$libdir"),
+            vec!["/usr/lib/postgresql/18/lib/plugins/x.so.1".to_owned()]
+        );
+        // A bare name searches every directory of a custom path, in order,
+        // with `$libdir` expanded to the engine's library directory.
+        assert_eq!(
+            resolve("auto_explain", &libdir, "/opt/pg/lib:$libdir"),
+            vec![
+                "/opt/pg/lib/auto_explain.so".to_owned(),
+                "/usr/lib/postgresql/18/lib/auto_explain.so".to_owned(),
+            ]
         );
     }
 
@@ -449,7 +494,7 @@ mod tests {
         // Let the exec happen before the lease looks at the executable.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let lease = ProcessLease::capture(child.id()).unwrap();
-        let set = executables(&lease, &["$libdir/no_such_library".into()]).unwrap();
+        let set = executables(&lease, &["$libdir/no_such_library".into()], "$libdir").unwrap();
         let on_disk = std::fs::read(lease.executable_path()).unwrap();
         assert_eq!(
             set.engine.digest.as_deref(),

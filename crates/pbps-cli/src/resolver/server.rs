@@ -1259,11 +1259,17 @@ impl ScratchRun {
             )
             .await
             .map_err(db)?;
-            let executables =
-                crate::resolver::native::executables::executables(&scratch.backend, &required)
-                    .map_err(|_| {
-                        Error::Scope("the scratch backend's executables are unreadable".into())
-                    })?;
+            let library_path = catalog
+                .settings
+                .get("dynamic_library_path")
+                .map(|fact| fact.value.clone())
+                .unwrap_or_else(|| "$libdir".to_owned());
+            let executables = crate::resolver::native::executables::executables(
+                &scratch.backend,
+                &required,
+                &library_path,
+            )
+            .map_err(|_| Error::Scope("the scratch backend's executables are unreadable".into()))?;
             (
                 EnvironmentFacts {
                     catalog,
@@ -1377,11 +1383,17 @@ impl ScratchRun {
                 authorization::verify(&mut scratch.connection, &map, &expected_auth, &schemas)
                     .await
                     .map_err(db)?;
-            let executables =
-                crate::resolver::native::executables::executables(&scratch.backend, &required)
-                    .map_err(|_| {
-                        Error::Scope("the scratch backend's executables are unreadable".into())
-                    })?;
+            let library_path = catalog
+                .settings
+                .get("dynamic_library_path")
+                .map(|fact| fact.value.clone())
+                .unwrap_or_else(|| "$libdir".to_owned());
+            let executables = crate::resolver::native::executables::executables(
+                &scratch.backend,
+                &required,
+                &library_path,
+            )
+            .map_err(|_| Error::Scope("the scratch backend's executables are unreadable".into()))?;
             (
                 EnvironmentFacts {
                     catalog,
@@ -1646,7 +1658,10 @@ fn expected_visibility(
                     .and_then(|s| s.privileges.get("USAGE"))
                     .copied()
                     .unwrap_or(false);
-                if usable {
+                // `current_schemas` lists each namespace once, at its first
+                // occurrence, so a schema repeated on the path (or an extra
+                // equal to the start) is not duplicated here (finding on #688).
+                if usable && !visible.contains(schema) {
                     visible.push(schema.clone());
                 }
             }
