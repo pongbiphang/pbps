@@ -819,6 +819,27 @@ pub fn owned_targets(
         })
         .collect();
 
+    // A rename moves the target without changing who owns it, and the grant
+    // beside it in the same plan names the object as the plan leaves it. The
+    // owner map is keyed by what the read saw, so the question has to be
+    // asked under the earlier name.
+    //
+    // Only tables: a module is replaced rather than renamed, and a role this
+    // dialect does not manage is renamed in the cluster before the plan is
+    // built, so the read already knows it under its new name (DECISIONS 377).
+    let renamed: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::GrantTarget> =
+        changes
+            .changes
+            .iter()
+            .filter_map(|planned| match &planned.change {
+                pbps_model::Change::RenameTable { from, to, .. } => Some((
+                    pbps_model::GrantTarget::Object(to.clone()),
+                    pbps_model::GrantTarget::Object(from.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+
     let mut impossible = Vec::new();
     for planned in &changes.changes {
         let pbps_model::Change::Grant {
@@ -835,7 +856,9 @@ pub fn owned_targets(
         let owner = if created.contains(target) {
             (!session_role.is_empty()).then_some(session_role)
         } else {
-            owners.get(target).map(String::as_str)
+            owners
+                .get(renamed.get(target).unwrap_or(target))
+                .map(String::as_str)
         };
         if owner == Some(role.as_str()) {
             let when = if created.contains(target) {

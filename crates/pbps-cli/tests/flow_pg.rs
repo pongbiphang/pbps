@@ -1944,13 +1944,17 @@ fn a_grant_on_a_table_this_plan_creates_is_checked_against_its_coming_owner() {
     // that the `usage` line every grant here needs is not itself the
     // impossible one this test is about.
     let holder = format!("pbps_schema_holder_{}", std::process::id());
+    let mover = format!("pbps_table_mover_{}", std::process::id());
     let _roles = ClusterRoles {
         server: server.clone(),
-        names: vec![other.clone(), holder.clone()],
+        names: vec![other.clone(), holder.clone(), mover.clone()],
     };
     on_server(
         &server,
-        &format!("CREATE ROLE {other} NOSUPERUSER; CREATE ROLE {holder} NOSUPERUSER"),
+        &format!(
+            "CREATE ROLE {other} NOSUPERUSER; CREATE ROLE {holder} NOSUPERUSER; \
+             CREATE ROLE {mover} NOSUPERUSER"
+        ),
     );
     let own = OwnDatabase::new(&server, "owner-after-plan");
     let connection = own.connection();
@@ -2014,6 +2018,46 @@ fn a_grant_on_a_table_this_plan_creates_is_checked_against_its_coming_owner() {
     succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
     succeeds(approved_apply(&d, connection, &plan, &[]));
     succeeds(d.run(&["verify", "--db", connection]));
+
+    // And the third way a target can move under the check: a rename carries
+    // the object's owner with it, while the map is keyed by what the read
+    // saw. The grant names the table as the plan leaves it.
+    // Handed to a role with no recorded grants of its own, so that moving the
+    // owner does not itself read as drift: an owner's entry is the zero point
+    // and leaves the comparison when it arrives.
+    on_server(connection, &format!("ALTER TABLE app.n OWNER TO {mover}"));
+    std::fs::write(
+        d.dir.join("schema/n.yml"),
+        new_table.replace("table: app.n", "table: app.m\nrenamed_from: app.n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/other.yml"),
+        format!("role: {other}\ngrants:\n  schema::app: [usage]\n  app.m: [select]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/mover.yml"),
+        format!("role: {mover}\ngrants:\n  schema::app: [usage]\n  app.m: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let renamed = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&renamed),
+        1,
+        "{}{}",
+        stdout(&renamed),
+        stderr(&renamed)
+    );
+    assert!(
+        stderr(&renamed).contains("owned_targets")
+            && stderr(&renamed).contains("app.m")
+            && stderr(&renamed).contains(&mover),
+        "{}",
+        stderr(&renamed)
+    );
 }
 
 /// Issue #251, the other half of the grantor rule. A `REVOKE` matches on the
