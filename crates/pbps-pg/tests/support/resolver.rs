@@ -663,3 +663,188 @@ mod auth610 {
         admin.execute(&format!("DROP ROLE {dep}")).await.unwrap();
     }
 }
+
+mod recon610 {
+    use super::*;
+    use pbps_pg::resolver::authorization::{
+        PlannedGrant, RoleMap, apply_planned, read, reconstruct, verify,
+    };
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    async fn scratch_reproduces_the_deployers_authorization_not_the_admins() {
+        let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let pid = std::process::id();
+        let target_db = format!("pbps_recon_t_{pid}");
+        let scratch_db = format!("pbps_recon_s_{pid}");
+        let dep = format!("pbps_dep_{pid}");
+        let owner = format!("pbps_owner_{pid}");
+        let reader = format!("pbps_reader_{pid}");
+        let run_login = format!("pbps_run_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        for db in [&target_db, &scratch_db] {
+            admin
+                .execute(&format!(
+                    "CREATE DATABASE {db} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+                ))
+                .await
+                .unwrap();
+        }
+        for role in [&owner, &reader] {
+            admin
+                .execute(&format!("CREATE ROLE {role} NOLOGIN"))
+                .await
+                .unwrap();
+        }
+        admin
+            .execute(&format!(
+                "CREATE ROLE {dep} LOGIN PASSWORD 'd' IN ROLE {reader}; \
+                 GRANT {owner} TO {dep} WITH INHERIT FALSE, SET TRUE; \
+                 CREATE ROLE {run_login} LOGIN PASSWORD 'r'"
+            ))
+            .await
+            .unwrap();
+        // The target: competing schemas, the deployer usable in `app` only.
+        let mut setup = Conn::connect(Driver::Postgres, &format!("{server} dbname={target_db}"))
+            .await
+            .unwrap();
+        setup
+            .execute(&format!(
+                "GRANT CONNECT ON DATABASE {target_db} TO {dep}; \
+                 CREATE SCHEMA app AUTHORIZATION {owner}; CREATE SCHEMA secret; \
+                 GRANT USAGE ON SCHEMA app TO {reader}"
+            ))
+            .await
+            .unwrap();
+        let schemas = ["app".to_owned(), "secret".to_owned()];
+        // secret is unreadable to the deployer, so it is not an in-scope
+        // schema for it; the reproduction covers only what the deployer sees.
+        setup
+            .execute(&format!("REVOKE ALL ON SCHEMA secret FROM PUBLIC; GRANT USAGE ON SCHEMA secret TO {dep} WITH GRANT OPTION"))
+            .await
+            .unwrap();
+
+        let deployer_url = server
+            .split_whitespace()
+            .filter(|p| !p.starts_with("user=") && !p.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut planning = Conn::connect(
+            Driver::Postgres,
+            &format!("{deployer_url} dbname={target_db} user={dep} password=d"),
+        )
+        .await
+        .unwrap();
+        let target = read(&mut planning, &schemas).await.unwrap();
+
+        // Reconstruct on scratch as the admin.
+        let map = RoleMap::generate(&target, &run_login, &format!("t{pid}"));
+        // Every run-local name is a fresh pbps_role_ identifier, never a
+        // production name.
+        assert!(
+            map.run_local_names()
+                .iter()
+                .all(|n| n.starts_with("pbps_role_"))
+        );
+        assert!(
+            !map.run_local_names()
+                .iter()
+                .any(|n| [&dep, &owner, &reader].contains(&n))
+        );
+        let mut scratch_admin =
+            Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
+                .await
+                .unwrap();
+        reconstruct(&mut scratch_admin, &map, &target, &scratch_db)
+            .await
+            .unwrap();
+
+        // The run login becomes the mapped deployer and reproduces the target.
+        let mut run = Conn::connect(
+            Driver::Postgres,
+            &format!("{deployer_url} dbname={scratch_db} user={run_login} password=r"),
+        )
+        .await
+        .unwrap();
+        let mapped_deployer = {
+            // The mapped deployer is the run-local name for the logical dep.
+            let names = map.run_local_names();
+            // Find it by asking the map through a reconstruction artefact:
+            // the run login is a member of exactly the deployer, so SET ROLE
+            // to each until current_user changes to a covered role.
+            let mut found = None;
+            for candidate in &names {
+                if run.execute(&format!("SET ROLE {candidate}")).await.is_ok() {
+                    let who = run.query("SELECT current_user AS u").await.unwrap()[0]
+                        .try_get::<&str>("u")
+                        .unwrap()
+                        .unwrap()
+                        .to_owned();
+                    run.execute("RESET ROLE").await.unwrap();
+                    if who == *candidate {
+                        found = Some(candidate.clone());
+                        break;
+                    }
+                }
+            }
+            found.expect("the run login can become the mapped deployer")
+        };
+        run.execute(&format!("SET ROLE {mapped_deployer}"))
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &target, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "reproduction differed: {differences:?}"
+        );
+
+        // Case 16 negative control: reading as the setup administrator (no
+        // SET ROLE) does not reproduce the deployer — the principal differs.
+        let admin_differences = verify(&mut scratch_admin, &map, &target, &schemas)
+            .await
+            .unwrap();
+        assert!(
+            admin_differences.contains(&"principal".to_owned()),
+            "{admin_differences:?}"
+        );
+
+        // A planned CREATE grant makes the deployer able to create in `app`;
+        // the reproduced effective answer flips, and matches a target that
+        // has it.
+        assert!(!target.schemas["app"].privileges["CREATE"]);
+        apply_planned(
+            &mut scratch_admin,
+            &map,
+            &[PlannedGrant {
+                role: reader.clone(),
+                schema: "app".into(),
+                privilege: "CREATE".into(),
+                revoke: false,
+            }],
+        )
+        .await
+        .unwrap();
+        let after = read(&mut run, &schemas).await.unwrap();
+        assert!(
+            after.schemas["app"].privileges["CREATE"],
+            "planned grant did not flip CREATE"
+        );
+
+        drop(planning);
+        drop(setup);
+        drop(run);
+        drop(scratch_admin);
+        for db in [&target_db, &scratch_db] {
+            admin
+                .execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+                .await
+                .unwrap();
+        }
+        for role in map.run_local_names() {
+            admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
+        }
+        for role in [&run_login, &dep, &owner, &reader] {
+            admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
+        }
+    }
+}

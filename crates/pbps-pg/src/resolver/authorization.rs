@@ -19,7 +19,7 @@
 use pbps_db::resolver::environment::DeploymentPrincipal;
 use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Row};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The privileges the context measures for each kind of object. Enough to
 /// bind a creation against existing objects; not an audit of every grant.
@@ -47,11 +47,16 @@ const SETTINGS: &[&str] = &[
     "row_security",
 ];
 
-/// What one in-scope schema grants the deployer, as the engine answers.
+/// What one in-scope schema grants: its owner, the deployer's effective
+/// answers (for comparison), and the raw ACL (for reconstruction). The ACL
+/// is keyed by grantee role name, with `PUBLIC` for the pseudo-role, so a
+/// reconstruction can grant the same privileges to the same mapped roles and
+/// the effective answer follows from the reproduced membership.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SchemaAuthorization {
     pub owner: String,
     pub privileges: BTreeMap<String, bool>,
+    pub acl: BTreeMap<String, Vec<String>>,
 }
 
 /// What one in-scope object grants the deployer.
@@ -133,6 +138,7 @@ pub async fn read(
             SchemaAuthorization {
                 owner,
                 privileges: schema_privileges(conn, schema).await?,
+                acl: schema_acl(conn, schema).await?,
             },
         );
         objects.extend(object_privileges(conn, schema).await?);
@@ -165,6 +171,33 @@ async fn schema_owner(conn: &mut impl QueryConnection, schema: &str) -> Result<S
             "the in-scope schema {schema} is ambiguous"
         ))),
     }
+}
+
+/// The schema's grant list from `aclexplode`, keyed by grantee (the
+/// pseudo-role 0 is `PUBLIC`). A schema with the default (NULL) ACL has only
+/// the owner's implicit rights, which reconstruction gets from `AUTHORIZATION`
+/// alone, so an empty map is a real "no explicit grants", not unreadable.
+async fn schema_acl(
+    conn: &mut impl QueryConnection,
+    schema: &str,
+) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+    let rows = conn
+        .query(&format!(
+            "SELECT COALESCE(pg_catalog.pg_get_userbyid(a.grantee), 'PUBLIC') AS grantee, \
+                    a.privilege_type AS privilege \
+             FROM pg_catalog.pg_namespace n \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS a \
+             WHERE n.nspname = {} ORDER BY 1, 2",
+            literal(schema)
+        ))
+        .await?;
+    let mut acl: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        acl.entry(required(row, "grantee", "a grantee")?)
+            .or_default()
+            .push(required(row, "privilege", "a privilege type")?);
+    }
+    Ok(acl)
 }
 
 async fn schema_privileges(
@@ -333,6 +366,313 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
     Ok(settings)
 }
 
+/// A run-local role reconstruction plan: each logical role in a target
+/// context mapped to a unique role this run created and will drop, so nothing
+/// pre-existing on a shared server is touched, shadowed, or left behind. The
+/// mapping is total over the deployer, its role closure, every in-scope owner
+/// and every schema grantee.
+pub struct RoleMap {
+    to_run_local: BTreeMap<String, String>,
+    run_login: String,
+}
+
+impl RoleMap {
+    /// `token` is the run's unique suffix (the scratch names' token); run-local
+    /// roles are `pbps_role_<n>_<token>`, which the identifier rules refuse to
+    /// confuse with a production name.
+    pub fn generate(context: &AuthorizationContext, run_login: &str, token: &str) -> Self {
+        let mut logical = BTreeSet::new();
+        logical.insert(context.principal.effective.clone());
+        logical.extend(context.roles.keys().cloned());
+        for schema in context.schemas.values() {
+            logical.insert(schema.owner.clone());
+            for grantee in schema.acl.keys() {
+                if grantee != "PUBLIC" {
+                    logical.insert(grantee.clone());
+                }
+            }
+        }
+        let to_run_local = logical
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name, format!("pbps_role_{index}_{token}")))
+            .collect();
+        Self {
+            to_run_local,
+            run_login: run_login.to_owned(),
+        }
+    }
+
+    /// The run-local name for a logical role, or `PUBLIC` unchanged. `None`
+    /// for a role the map does not cover — a grant to which would silently
+    /// not be reproduced, so callers refuse rather than skip it.
+    fn run_local(&self, logical: &str) -> Option<String> {
+        if logical == "PUBLIC" {
+            return Some("PUBLIC".to_owned());
+        }
+        self.to_run_local.get(logical).cloned()
+    }
+
+    /// The logical role a run-local name stands for, for comparing a
+    /// reconstructed context back against the target.
+    fn logical_of(&self, run_local: &str) -> Option<String> {
+        if run_local == "PUBLIC" {
+            return Some("PUBLIC".to_owned());
+        }
+        self.to_run_local
+            .iter()
+            .find(|(_, run)| *run == run_local)
+            .map(|(logical, _)| logical.clone())
+    }
+
+    /// Every run-local role name, so the run records them as recovery names
+    /// before creating them and drops them on cleanup.
+    pub fn run_local_names(&self) -> Vec<String> {
+        self.to_run_local.values().cloned().collect()
+    }
+}
+
+/// A planned authorization change the plan performs before its DDL, applied
+/// to scratch so the deployer's effective privileges match what apply will
+/// see (SPEC §7.6). Only schema grants and revokes; role creation in a plan
+/// is refused by the emitter, so it cannot reach here.
+pub struct PlannedGrant {
+    pub role: String,
+    pub schema: String,
+    pub privilege: String,
+    pub revoke: bool,
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Creates the run-local roles, memberships, schemas and settings that
+/// reproduce the target deployer's authorization on the scratch database,
+/// through the admin connection. `database` is the scratch database, for the
+/// database-scoped settings. Every statement names only run-local roles and
+/// this run's own schemas; nothing pre-existing is altered.
+pub async fn reconstruct(
+    admin: &mut impl QueryConnection,
+    map: &RoleMap,
+    context: &AuthorizationContext,
+    database: &str,
+) -> Result<(), DbError> {
+    let missing = |logical: &str| {
+        DbError::BadRow(format!(
+            "the authorization reconstruction has no run-local role for {logical}"
+        ))
+    };
+    // Roles. A role in the closure carries its measured attributes; an owner
+    // that is not in the closure is created unprivileged (it only needs to
+    // own a schema).
+    for (logical, run) in &map.to_run_local {
+        let attrs = context.roles.get(logical);
+        let superuser = attrs.is_some_and(|a| a.superuser);
+        let inherit = attrs.is_none_or(|a| a.inherit);
+        let bypass = attrs.is_some_and(|a| a.bypass_rls);
+        admin
+            .query(&format!(
+                "CREATE ROLE {} NOLOGIN {} {} {}",
+                quote_ident(run),
+                if superuser {
+                    "SUPERUSER"
+                } else {
+                    "NOSUPERUSER"
+                },
+                if inherit { "INHERIT" } else { "NOINHERIT" },
+                if bypass { "BYPASSRLS" } else { "NOBYPASSRLS" },
+            ))
+            .await?;
+    }
+    // The deployer's flattened closure: a direct grant per role it inherits
+    // from or can switch to, with the measured options, reproduces the same
+    // `has_*_privilege` and `pg_has_role` answers.
+    let deployer = map
+        .run_local(&context.principal.effective)
+        .ok_or_else(|| missing(&context.principal.effective))?;
+    for (logical, attrs) in &context.roles {
+        if *logical == context.principal.effective {
+            continue;
+        }
+        let role = map.run_local(logical).ok_or_else(|| missing(logical))?;
+        admin
+            .query(&format!(
+                "GRANT {} TO {} WITH INHERIT {}, SET {}",
+                quote_ident(&role),
+                quote_ident(&deployer),
+                attrs.inherits,
+                attrs.can_set,
+            ))
+            .await?;
+    }
+    // The run login can become the deployer but never inherits it, so the
+    // compilation runs as the mapped deployer only under an explicit SET ROLE.
+    admin
+        .query(&format!(
+            "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE",
+            quote_ident(&deployer),
+            quote_ident(&map.run_login),
+        ))
+        .await?;
+    // Schemas, with the same name the emitter's write path uses, owned by the
+    // mapped owner, with the target's ACL granted to the mapped grantees.
+    for (name, schema) in &context.schemas {
+        let owner = map
+            .run_local(&schema.owner)
+            .ok_or_else(|| missing(&schema.owner))?;
+        admin
+            .query(&format!(
+                "CREATE SCHEMA {} AUTHORIZATION {}",
+                quote_ident(name),
+                quote_ident(&owner),
+            ))
+            .await?;
+        for (grantee, privileges) in &schema.acl {
+            if privileges.is_empty() {
+                continue;
+            }
+            let target = map.run_local(grantee).ok_or_else(|| missing(grantee))?;
+            let recipient = if target == "PUBLIC" {
+                "PUBLIC".to_owned()
+            } else {
+                quote_ident(&target)
+            };
+            admin
+                .query(&format!(
+                    "GRANT {} ON SCHEMA {} TO {}",
+                    privileges.join(", "),
+                    quote_ident(name),
+                    recipient,
+                ))
+                .await?;
+        }
+    }
+    // Settings: role-, database- and database-role-scoped, on the mapped
+    // deployer and this run's own database.
+    for (key, value) in &context.settings {
+        let (scope, name) = key
+            .split_once(':')
+            .ok_or_else(|| DbError::BadRow(format!("a setting key without a scope: {key}")))?;
+        let statement = match scope {
+            "role" => format!(
+                "ALTER ROLE {} SET {} = {}",
+                quote_ident(&deployer),
+                quote_ident(name),
+                literal(value)
+            ),
+            "database" => format!(
+                "ALTER DATABASE {} SET {} = {}",
+                quote_ident(database),
+                quote_ident(name),
+                literal(value)
+            ),
+            "database-role" => format!(
+                "ALTER ROLE {} IN DATABASE {} SET {} = {}",
+                quote_ident(&deployer),
+                quote_ident(database),
+                quote_ident(name),
+                literal(value)
+            ),
+            other => {
+                return Err(DbError::BadRow(format!("unknown setting scope {other}")));
+            }
+        };
+        admin.query(&statement).await?;
+    }
+    Ok(())
+}
+
+/// Applies the plan's preceding grants to scratch, mapped to run-local roles,
+/// so the deployer's effective privileges are what apply will act under.
+pub async fn apply_planned(
+    admin: &mut impl QueryConnection,
+    map: &RoleMap,
+    grants: &[PlannedGrant],
+) -> Result<(), DbError> {
+    for grant in grants {
+        let role = map.run_local(&grant.role).ok_or_else(|| {
+            DbError::BadRow(format!(
+                "a planned grant to {} has no run-local role",
+                grant.role
+            ))
+        })?;
+        let recipient = if role == "PUBLIC" {
+            "PUBLIC".to_owned()
+        } else {
+            quote_ident(&role)
+        };
+        let statement = if grant.revoke {
+            format!(
+                "REVOKE {} ON SCHEMA {} FROM {}",
+                grant.privilege,
+                quote_ident(&grant.schema),
+                recipient
+            )
+        } else {
+            format!(
+                "GRANT {} ON SCHEMA {} TO {}",
+                grant.privilege,
+                quote_ident(&grant.schema),
+                recipient
+            )
+        };
+        admin.query(&statement).await?;
+    }
+    Ok(())
+}
+
+/// Reads the reconstructed context as the mapped deployer and names every
+/// key that does not reproduce the target — owner, effective privilege, ACL
+/// grantee or setting — after mapping run-local role names back to logical
+/// ones. An empty result is a faithful reproduction; the run compiles only
+/// when it is empty (ADR-0016 case 16).
+pub async fn verify(
+    deployer: &mut impl QueryConnection,
+    map: &RoleMap,
+    target: &AuthorizationContext,
+    schemas: &[String],
+) -> Result<Vec<String>, DbError> {
+    let reproduced = read(deployer, schemas).await?;
+    let mut differences = Vec::new();
+    // The compilation must run as the mapped deployer, and its superuser
+    // standing must match the target's.
+    if map.logical_of(&reproduced.principal.effective).as_deref()
+        != Some(target.principal.effective.as_str())
+    {
+        differences.push("principal".into());
+    }
+    if reproduced.principal.superuser != target.principal.superuser {
+        differences.push("principal:superuser".into());
+    }
+    for (name, want) in &target.schemas {
+        let Some(got) = reproduced.schemas.get(name) else {
+            differences.push(format!("schema:{name}:absent"));
+            continue;
+        };
+        if map.logical_of(&got.owner).as_deref() != Some(want.owner.as_str()) {
+            differences.push(format!("schema:{name}:owner"));
+        }
+        if got.privileges != want.privileges {
+            differences.push(format!("schema:{name}:privileges"));
+        }
+        let got_acl: BTreeMap<String, Vec<String>> = got
+            .acl
+            .iter()
+            .map(|(grantee, privs)| {
+                (
+                    map.logical_of(grantee).unwrap_or_else(|| grantee.clone()),
+                    privs.clone(),
+                )
+            })
+            .collect();
+        if got_acl != want.acl {
+            differences.push(format!("schema:{name}:acl"));
+        }
+    }
+    Ok(differences)
+}
+
 /// A SQL string literal with single quotes doubled: the schema, object and
 /// privilege names reach `has_*_privilege` as text arguments, and the scratch
 /// stream has no parameter binding, so quoting is what keeps a name from
@@ -393,6 +733,9 @@ mod tests {
                 SchemaAuthorization {
                     owner: "app_owner".into(),
                     privileges: [("USAGE".to_owned(), true), ("CREATE".to_owned(), false)]
+                        .into_iter()
+                        .collect(),
+                    acl: [("app_reader".to_owned(), vec!["USAGE".to_owned()])]
                         .into_iter()
                         .collect(),
                 },
