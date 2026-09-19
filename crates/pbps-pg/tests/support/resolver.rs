@@ -220,7 +220,7 @@ mod scope610 {
         ))
         .await;
         planning
-            .execute("SET DateStyle = 'German, DMY'")
+            .execute("SET default_text_search_config = 'pg_catalog.simple'")
             .await
             .unwrap();
         let before = planning
@@ -283,13 +283,21 @@ mod scope610 {
         assert_eq!(hstore.libraries, vec!["$libdir/hstore".to_owned()]);
         assert!(hstore.requires.is_empty());
         assert!(seen_by_deployer.available_extensions.contains_key("hstore"));
-        // Where a setting came from is read with it.
-        assert_eq!(seen_by_deployer.settings["DateStyle"].source, "session");
-        assert_ne!(seen_by_deployer.settings["TimeZone"].source, "session");
+        // Where a setting came from is read with it; a setting the dialect
+        // pins before every deployment statement is not read at all, since
+        // no deployment runs under the server's default for it (finding on
+        // #688).
+        assert_eq!(
+            seen_by_deployer.settings["default_text_search_config"].source,
+            "session"
+        );
+        assert!(!seen_by_deployer.settings.contains_key("TimeZone"));
+        assert!(!seen_by_deployer.settings.contains_key("DateStyle"));
 
         // The setup administrator sees `a`; a resolver compiled as that role
         // would bind `t` differently, and the rule says so. The session-set
-        // DateStyle is unknown on the deployer's side, never a match.
+        // search configuration is unknown on the deployer's side, never a
+        // match.
         let seen_by_admin = read(&mut setup, &scope).await.unwrap();
         let report = compare(
             &with_executables(seen_by_deployer.clone()),
@@ -305,7 +313,7 @@ mod scope610 {
         );
         assert_eq!(report.facts["visibility:b"], FactStatus::Match);
         assert!(matches!(
-            report.facts["setting:DateStyle"],
+            report.facts["setting:default_text_search_config"],
             FactStatus::Unknown {
                 side: Side::Target,
                 ..
@@ -325,7 +333,7 @@ mod scope610 {
         assert_eq!(
             same.verdict(),
             Verdict::Unknown(vec![
-                "setting:DateStyle".into(),
+                "setting:default_text_search_config".into(),
                 "setting:dynamic_library_path".into(),
                 "setting:session_preload_libraries".into(),
                 "setting:shared_preload_libraries".into(),
@@ -338,8 +346,8 @@ mod scope610 {
             FactStatus::Match | FactStatus::Mismatch { .. } => panic!("{same:?}"),
         }
         // The remedy is a read-only role, not superuser: granted, the settings
-        // are reported, and only the session-set DateStyle keeps the scope
-        // from verifying; reset, it verifies.
+        // are reported, and only the session-set search configuration keeps
+        // the scope from verifying; reset, it verifies.
         admin
             .execute(&format!("GRANT pg_read_all_settings TO {deployer}"))
             .await
@@ -350,7 +358,7 @@ mod scope610 {
         ))
         .await;
         planning
-            .execute("SET DateStyle = 'German, DMY'")
+            .execute("SET default_text_search_config = 'pg_catalog.simple'")
             .await
             .unwrap();
         let granted = read(&mut planning, &scope).await.unwrap();
@@ -365,9 +373,12 @@ mod scope610 {
         );
         assert_eq!(
             same.verdict(),
-            Verdict::Unknown(vec!["setting:DateStyle".into()])
+            Verdict::Unknown(vec!["setting:default_text_search_config".into()])
         );
-        planning.execute("RESET DateStyle").await.unwrap();
+        planning
+            .execute("RESET default_text_search_config")
+            .await
+            .unwrap();
         let reset = read(&mut planning, &scope).await.unwrap();
         let same = compare(
             &with_executables(reset.clone()),

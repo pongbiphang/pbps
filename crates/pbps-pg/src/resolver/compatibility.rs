@@ -39,20 +39,15 @@ const OBSERVATIONS: &[&str] = &[
 /// a difference. Only an unreadable fact is unknown.
 const OPTIONAL_OBSERVATIONS: &[&str] = &["database_locale", "database_icu_rules"];
 
-/// Effective settings the rule compares. The first nine are what the dialect
-/// pins before every deployment statement (DECISIONS 458), read back so the
-/// pin is proven rather than assumed; the rest are ambient settings that
-/// change binding or loaded code and that no pin covers.
+/// Effective settings the rule compares: the ambient settings that change
+/// binding or loaded code and that no pin covers. The nine the dialect pins
+/// before every deployment statement (`session_pins!`, DECISIONS 458) are
+/// not among them: a deployment statement never runs under a server's own
+/// default for `TimeZone` or `DateStyle`, so two servers whose defaults
+/// differ deploy identically, and comparing those defaults refused scopes
+/// whose deployments were the same (finding on #688; DECISIONS 520 compares
+/// what the dialect does not pin).
 pub(crate) const SETTINGS: &[&str] = &[
-    "standard_conforming_strings",
-    "check_function_bodies",
-    "DateStyle",
-    "TimeZone",
-    "IntervalStyle",
-    "timezone_abbreviations",
-    "transform_null_equals",
-    "bytea_output",
-    "extra_float_digits",
     "server_encoding",
     "client_encoding",
     "lc_numeric",
@@ -831,10 +826,15 @@ mod tests {
     #[test]
     fn a_setting_the_planning_session_set_on_itself_is_unknown() {
         let mut target = side("180006", "e1");
-        target.catalog.settings.get_mut("DateStyle").unwrap().source = "session".into();
+        target
+            .catalog
+            .settings
+            .get_mut("default_text_search_config")
+            .unwrap()
+            .source = "session".into();
         let report = compare(&target, &side("180006", "e1"), &[]);
         assert!(matches!(
-            report.facts["setting:DateStyle"],
+            report.facts["setting:default_text_search_config"],
             FactStatus::Unknown {
                 side: Side::Target,
                 ..
@@ -992,10 +992,10 @@ mod tests {
     fn a_fact_neither_side_reports_is_unknown_never_an_empty_match() {
         let mut t = side("180006", "e1");
         let mut r = side("180006", "e1");
-        t.catalog.settings.remove("TimeZone");
-        r.catalog.settings.remove("TimeZone");
+        t.catalog.settings.remove("row_security");
+        r.catalog.settings.remove("row_security");
         assert_eq!(
-            compare(&t, &r, &[]).facts["setting:TimeZone"],
+            compare(&t, &r, &[]).facts["setting:row_security"],
             FactStatus::Unknown {
                 side: Side::Both,
                 reason: "not reported".into()
