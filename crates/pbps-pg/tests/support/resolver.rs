@@ -598,25 +598,28 @@ mod scope610 {
             .await
             .expect("the connection reads again after a refusal");
         // A transaction left open on the connection — what a read cancelled
-        // between its BEGIN and its COMMIT leaves behind — is refused, not
-        // joined: a BEGIN inside it is only a warning and would hand back
-        // that transaction's old snapshot (finding on #688).
-        conn.execute(
+        // between its BEGIN and its COMMIT leaves behind, or a caller's own
+        // — is refused, not joined: a BEGIN inside it is only a warning, the
+        // read would run under its isolation and its snapshot, and the
+        // COMMIT would commit it (DECISIONS 253; finding on #688). Whether
+        // it has read anything yet or not.
+        for opened in [
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT count(*) FROM pg_catalog.pg_namespace",
-        )
-        .await
-        .unwrap();
-        let refused = scope_facts(&mut conn, &scope, &schemas)
-            .await
-            .expect_err("an open transaction refuses the read");
-        assert!(
-            refused.to_string().contains("transaction open"),
-            "{refused}"
-        );
-        conn.execute("ROLLBACK").await.unwrap();
-        scope_facts(&mut conn, &scope, &schemas)
-            .await
-            .expect("the connection reads again once the transaction ended");
+            "BEGIN",
+        ] {
+            conn.execute(opened).await.unwrap();
+            let refused = scope_facts(&mut conn, &scope, &schemas)
+                .await
+                .expect_err("an open transaction refuses the read");
+            assert!(
+                refused.to_string().contains("transaction open"),
+                "{opened}: {refused}"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+            scope_facts(&mut conn, &scope, &schemas)
+                .await
+                .expect("the connection reads again once the transaction ended");
+        }
     }
 }
 
