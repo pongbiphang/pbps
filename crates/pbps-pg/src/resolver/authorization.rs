@@ -511,14 +511,21 @@ pub async fn reconstruct(
         // which the target does not have, so the commonest schema of all
         // would never reproduce (finding on #688). It runs only where the
         // target has entries to reproduce, an ACL the engine materialized the
-        // same way when the first of them was granted.
+        // same way when the first of them was granted. That materialized
+        // entry is the owner's full default, `UC`, but the target's owner
+        // may have revoked part of its own — an ACL of `{owner=U/owner}` —
+        // and a replay only adds, so the owner's entry is cleared to an
+        // empty ACL first and comes back from the replay exactly as the
+        // target has it (measured on 18; finding on #688).
         if !schema.acl.is_empty() {
-            admin
-                .query(&format!(
-                    "REVOKE ALL ON SCHEMA {} FROM PUBLIC",
-                    quote_ident(name)
-                ))
-                .await?;
+            for holder in ["PUBLIC".to_owned(), quote_ident(&owner)] {
+                admin
+                    .query(&format!(
+                        "REVOKE ALL ON SCHEMA {} FROM {holder}",
+                        quote_ident(name)
+                    ))
+                    .await?;
+            }
         }
         // Every entry is replayed under its own grantor, because a revoke is
         // grantor-specific: the deployer's planned revoke of a privilege it

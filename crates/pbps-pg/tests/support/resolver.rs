@@ -891,14 +891,25 @@ mod recon610 {
                 "GRANT CONNECT ON DATABASE {target_db} TO {dep}; \
                  CREATE SCHEMA app AUTHORIZATION {owner}; CREATE SCHEMA secret; \
                  CREATE SCHEMA plain AUTHORIZATION {owner}; \
+                 CREATE SCHEMA trimmed AUTHORIZATION {owner}; \
+                 REVOKE CREATE ON SCHEMA trimmed FROM {owner}; \
                  GRANT USAGE ON SCHEMA app TO {reader}"
             ))
             .await
             .unwrap();
         // `plain` has no grants at all: a NULL ACL, the commonest schema on
         // a real target, which reconstruction must not turn into one with
-        // the owner's entry materialized (finding on #688).
-        let schemas = ["app".to_owned(), "secret".to_owned(), "plain".to_owned()];
+        // the owner's entry materialized (finding on #688). `trimmed` is the
+        // other edge: the owner gave up part of its own default, so its ACL
+        // holds less than the entry the engine materializes, and a replay
+        // that only adds would leave the scratch owner able to CREATE
+        // (finding on #688).
+        let schemas = [
+            "app".to_owned(),
+            "secret".to_owned(),
+            "plain".to_owned(),
+            "trimmed".to_owned(),
+        ];
         // secret is unreadable to the deployer, so it is not an in-scope
         // schema for it; the reproduction covers only what the deployer sees.
         setup
@@ -929,6 +940,18 @@ mod recon610 {
             target.schemas["plain"].acl.is_empty(),
             "{:?}",
             target.schemas["plain"]
+        );
+        assert_eq!(
+            target.schemas["trimmed"]
+                .acl
+                .get(&owner)
+                .map(|grants| grants
+                    .iter()
+                    .map(|g| g.privilege.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec!["USAGE"]),
+            "{:?}",
+            target.schemas["trimmed"].acl
         );
         assert!(
             target.schemas["secret"].acl[&reader]
