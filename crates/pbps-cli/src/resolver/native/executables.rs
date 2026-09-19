@@ -27,7 +27,7 @@
 
 use super::{ProcessLease, UnqualifiedProcess};
 use pbps_db::resolver::environment::{
-    CatalogFacts, ExecutableIdentity, ExecutableRole, ExecutableSet, Provenance,
+    CatalogFacts, ExecutableIdentity, ExecutableRole, ExecutableSet, Provenance, guc_list,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -74,60 +74,15 @@ pub(crate) fn required_libraries(catalog: &CatalogFacts) -> Vec<String> {
 }
 
 /// The names in a preload setting, split as the engine's loader splits them
-/// (`SplitDirectoriesString`, measured on 18): elements are separated by
-/// commas and trimmed, a double-quoted element keeps its commas and spaces,
-/// and `""` inside one is a quote. The engine itself renders the list that
-/// way — `SET session_preload_libraries = 'foo,bar', baz` reads back as
-/// `"foo,bar", baz` and loads `foo,bar` — so a plain split on commas turned
-/// one library into two names nothing resolves, and a compatible scope was
-/// refused as unknown (finding on #688). A list the engine would reject —
-/// an unclosed quote, an empty unquoted element, text after a closing quote
-/// — is kept whole as one name: the engine logs the syntax error and loads
-/// nothing, but that log is not readable from here, and a value that could
-/// not be read must stay a candidate that fails to resolve, not read as
-/// "no libraries".
+/// (`SplitDirectoriesString`): `"foo,bar", baz` is the two libraries
+/// `foo,bar` and `baz`, where a plain split on commas made two names nothing
+/// resolves and refused a compatible scope as unknown (finding on #688). A
+/// list the engine would reject is kept whole as one name: the engine logs
+/// the syntax error and loads nothing, but that log is not readable from
+/// here, and a value that could not be read must stay a candidate that
+/// fails to resolve, not read as "no libraries".
 pub(crate) fn library_list(value: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = value.trim_start();
-    if rest.is_empty() {
-        return names;
-    }
-    loop {
-        let name;
-        if let Some(quoted) = rest.strip_prefix('"') {
-            let mut text = String::new();
-            let mut after = quoted;
-            loop {
-                let Some(end) = after.find('"') else {
-                    return vec![value.to_owned()];
-                };
-                text.push_str(&after[..end]);
-                after = &after[end + 1..];
-                if let Some(more) = after.strip_prefix('"') {
-                    text.push('"');
-                    after = more;
-                } else {
-                    break;
-                }
-            }
-            name = text;
-            rest = after;
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            name = rest[..end].trim_end().to_owned();
-            if name.is_empty() {
-                return vec![value.to_owned()];
-            }
-            rest = &rest[end..];
-        }
-        names.push(name);
-        rest = rest.trim_start();
-        match rest.strip_prefix(',') {
-            Some(more) => rest = more.trim_start(),
-            None if rest.is_empty() => return names,
-            None => return vec![value.to_owned()],
-        }
-    }
+    guc_list(value).unwrap_or_else(|| vec![value.to_owned()])
 }
 
 /// The executable set of one process: its engine image, every file-backed

@@ -360,9 +360,89 @@ pub fn render_visibility(elements: &[String]) -> String {
     serde_json::to_string(elements).expect("a list of strings serializes")
 }
 
+/// The elements of a list-valued GUC as PostgreSQL's own splitter reads them
+/// (`SplitIdentifierString` / `SplitDirectoriesString`, measured on 18):
+/// separated by commas and trimmed, a double-quoted element keeping its
+/// commas and spaces with `""` standing for one quote. This is the form the
+/// engine itself renders — `SET search_path = '$user', public` reads back as
+/// `"$user", public` — so a plain split on commas, or a whole value replayed
+/// as one string literal, turns one list into another (findings on #688).
+/// `None` is the syntax the engine rejects: an unclosed quote, an empty
+/// unquoted element, text after a closing quote.
+pub fn guc_list(value: &str) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut rest = value.trim_start();
+    if rest.is_empty() {
+        return Some(names);
+    }
+    loop {
+        let name;
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut text = String::new();
+            let mut after = quoted;
+            loop {
+                let end = after.find('"')?;
+                text.push_str(&after[..end]);
+                after = &after[end + 1..];
+                if let Some(more) = after.strip_prefix('"') {
+                    text.push('"');
+                    after = more;
+                } else {
+                    break;
+                }
+            }
+            name = text;
+            rest = after;
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            name = rest[..end].trim_end().to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            rest = &rest[end..];
+        }
+        names.push(name);
+        rest = rest.trim_start();
+        match rest.strip_prefix(',') {
+            Some(more) => rest = more.trim_start(),
+            None if rest.is_empty() => return Some(names),
+            None => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guc_list_is_split_as_the_engine_splits_it() {
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        // Measured on 18: how the engine renders
+        // `SET session_preload_libraries = 'foo,bar', baz, 'q"x', ' sp ace '`
+        // and the names it then loads, in order.
+        assert_eq!(
+            guc_list(r#""foo,bar", baz, "q""x", " sp ace ""#),
+            Some(names(&["foo,bar", "baz", "q\"x", " sp ace "]))
+        );
+        assert_eq!(
+            guc_list(r#""$user", public, "odd name""#),
+            Some(names(&["$user", "public", "odd name"]))
+        );
+        // Unquoted elements lose their surrounding whitespace; an empty
+        // value is an empty list, and a quoted empty element is one name.
+        assert_eq!(
+            guc_list("  auto_explain ,$libdir/hstore  "),
+            Some(names(&["auto_explain", "$libdir/hstore"]))
+        );
+        assert_eq!(guc_list(""), Some(Vec::new()));
+        assert_eq!(guc_list("   "), Some(Vec::new()));
+        assert_eq!(guc_list(r#""""#), Some(names(&[""])));
+        // What the engine rejects as list syntax is not a shorter list.
+        for broken in [r#""foo"#, "a,,b", "a,", r#""a"b"#] {
+            assert_eq!(guc_list(broken), None, "{broken:?}");
+        }
+    }
 
     fn report(facts: &[(&str, FactStatus)]) -> ScopeReport {
         let mut report = ScopeReport::new(RuleVersion::new("test-v1"));

@@ -790,6 +790,7 @@ mod auth688 {
                 "CREATE ROLE {login} LOGIN PASSWORD 'pbps-login'; \
                  CREATE ROLE {effective} NOLOGIN; GRANT {effective} TO {login}; \
                  ALTER ROLE {login} SET search_path = 'login_path'; \
+                 ALTER ROLE {login} SET default_text_search_config = 'pg_catalog.simple'; \
                  ALTER ROLE {effective} SET search_path = 'effective_path'; \
                  GRANT CONNECT ON DATABASE {database} TO {login}"
             ))
@@ -825,6 +826,17 @@ mod auth688 {
         assert_eq!(
             context.settings.get("role:search_path").map(String::as_str),
             Some("login_path"),
+            "{:?}",
+            context.settings
+        );
+        // Every setting the compatibility rule compares is captured, not
+        // only the loading-related few (finding on #688).
+        assert_eq!(
+            context
+                .settings
+                .get("role:default_text_search_config")
+                .map(String::as_str),
+            Some("pg_catalog.simple"),
             "{:?}",
             context.settings
         );
@@ -878,6 +890,8 @@ mod recon610 {
             .execute(&format!(
                 "CREATE ROLE {dep} LOGIN PASSWORD 'd' IN ROLE {reader}; \
                  GRANT {owner} TO {dep} WITH INHERIT FALSE, SET TRUE; \
+                 ALTER ROLE {dep} SET search_path = \"$user\", public, \"odd name\"; \
+                 ALTER ROLE {dep} SET default_text_search_config = 'pg_catalog.simple'; \
                  CREATE ROLE {run_login} LOGIN PASSWORD 'r'"
             ))
             .await
@@ -936,6 +950,25 @@ mod recon610 {
             .await
             .unwrap();
         let target = read(&mut planning, &schemas).await.unwrap();
+        // The deployer's login defaults: a quoted list, which must come back
+        // from the reproduction as the same list and not as one element
+        // spelled like it, and a compared setting outside the old shorter
+        // whitelist (findings on #688).
+        assert_eq!(
+            target.settings.get("role:search_path").map(String::as_str),
+            Some(r#""$user", public, "odd name""#),
+            "{:?}",
+            target.settings
+        );
+        assert_eq!(
+            target
+                .settings
+                .get("role:default_text_search_config")
+                .map(String::as_str),
+            Some("pg_catalog.simple"),
+            "{:?}",
+            target.settings
+        );
         assert!(
             target.schemas["plain"].acl.is_empty(),
             "{:?}",

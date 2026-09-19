@@ -27,18 +27,51 @@ pub const RULE: &str = "pg-auth-v1";
 /// The privileges the context measures for each kind of object. Enough to
 /// bind a creation against existing objects; not an audit of every grant.
 const SCHEMA_PRIVILEGES: &[&str] = &["USAGE", "CREATE"];
-/// The GUCs a role- or database-level setting may pin that change binding or
-/// loaded code; the same list the compatibility rule compares, so a
-/// role-scoped `session_preload_libraries` is part of the context.
-const SETTINGS: &[&str] = &[
+/// Whether a role- or database-level default is part of the context: the
+/// write path's `search_path`, and every setting the compatibility rule
+/// compares. The rule reads the target's effective values as the deployer,
+/// which its login defaults shape, so a compared setting the context did not
+/// carry — a role default for `default_text_search_config`, say — kept the
+/// image's value on scratch and refused a reproducible scope; the list is
+/// the compatibility module's own, not a shorter copy (finding on #688).
+fn is_context_setting(name: &str) -> bool {
+    name == "search_path"
+        || super::compatibility::SETTINGS.contains(&name)
+        || super::compatibility::OPTIONAL_SETTINGS.contains(&name)
+}
+
+/// The settings the engine stores and parses as a quoted identifier list
+/// (`GUC_LIST_QUOTE`; the set pg_dump's `variable_is_guc_list_quote` names).
+/// Their stored text is a rendered list — `"$user", public` — and replayed
+/// as one string literal it becomes one element spelled like the list, so
+/// the commonest role default of all did not reproduce and every such
+/// deployer was refused (measured on 18; finding on #688). Each element goes
+/// back as its own literal, which the engine renders to the same text.
+const LIST_QUOTE_SETTINGS: &[&str] = &[
     "search_path",
     "session_preload_libraries",
     "shared_preload_libraries",
     "local_preload_libraries",
-    "dynamic_library_path",
-    "check_function_bodies",
-    "row_security",
+    "temp_tablespaces",
 ];
+
+/// The right-hand side of `ALTER ROLE ... SET name = ...` that stores the
+/// target's text for `name` again.
+fn setting_value(name: &str, value: &str) -> Result<String, DbError> {
+    if !LIST_QUOTE_SETTINGS.contains(&name) {
+        return Ok(literal(value));
+    }
+    let elements = pbps_db::resolver::environment::guc_list(value).ok_or_else(|| {
+        DbError::BadRow(format!(
+            "the default for {name} is not a list the engine can read: {value}"
+        ))
+    })?;
+    Ok(elements
+        .iter()
+        .map(|element| literal(element))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
 
 /// What one in-scope schema grants: its owner, the deployer's effective
 /// answers (for comparison), and the raw ACL (for reconstruction). The ACL
@@ -297,7 +330,7 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
         let Some((name, value)) = entry.split_once('=') else {
             continue;
         };
-        if SETTINGS.contains(&name) {
+        if is_context_setting(name) {
             settings.insert(format!("{scope}:{name}"), value.to_owned());
         }
     }
@@ -607,26 +640,24 @@ pub async fn reconstruct(
         // the reproduction back finds them under `session_user`. On the
         // mapped deployer they would apply nowhere, since it never logs in
         // (finding on #688).
+        let rendered = setting_value(name, value)?;
         let mut statements = Vec::new();
         match scope {
             "role" => statements.push(format!(
-                "ALTER ROLE {} SET {} = {}",
+                "ALTER ROLE {} SET {} = {rendered}",
                 quote_ident(&map.run_login),
                 quote_ident(name),
-                literal(value)
             )),
             "database" => statements.push(format!(
-                "ALTER DATABASE {} SET {} = {}",
+                "ALTER DATABASE {} SET {} = {rendered}",
                 quote_ident(database),
                 quote_ident(name),
-                literal(value)
             )),
             "database-role" => statements.push(format!(
-                "ALTER ROLE {} IN DATABASE {} SET {} = {}",
+                "ALTER ROLE {} IN DATABASE {} SET {} = {rendered}",
                 quote_ident(&map.run_login),
                 quote_ident(database),
                 quote_ident(name),
-                literal(value)
             )),
             other => {
                 return Err(DbError::BadRow(format!("unknown setting scope {other}")));
@@ -949,6 +980,49 @@ fn required(row: &Row, field: &str, what: &str) -> Result<String, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_compared_setting_is_part_of_the_context() {
+        for name in super::super::compatibility::SETTINGS
+            .iter()
+            .chain(super::super::compatibility::OPTIONAL_SETTINGS)
+            .chain(&["search_path"])
+        {
+            assert!(is_context_setting(name), "{name}");
+        }
+        assert!(!is_context_setting("work_mem"));
+        assert!(
+            !is_context_setting("datestyle"),
+            "the stored spelling is the canonical one"
+        );
+    }
+
+    #[test]
+    fn a_list_setting_is_replayed_element_by_element() {
+        // Measured on 18: the stored text of
+        // `ALTER ROLE r SET search_path = "$user", public, "odd name"`,
+        // and the literal-per-element form that stores the same text again.
+        assert_eq!(
+            setting_value("search_path", r#""$user", public, "odd name""#).unwrap(),
+            "'$user', 'public', 'odd name'"
+        );
+        assert_eq!(
+            setting_value("session_preload_libraries", r#""foo,bar", auto_explain"#).unwrap(),
+            "'foo,bar', 'auto_explain'"
+        );
+        // A scalar, and a list the engine does not quote, keep the whole
+        // text as one literal; a quote in it cannot end the literal.
+        assert_eq!(
+            setting_value("DateStyle", "ISO, MDY").unwrap(),
+            "'ISO, MDY'"
+        );
+        assert_eq!(
+            setting_value("default_text_search_config", "it's").unwrap(),
+            "'it''s'"
+        );
+        // A stored list the engine could not read is refused, not replayed.
+        assert!(setting_value("search_path", r#""open"#).is_err());
+    }
 
     fn grant(privilege: &str, grantable: bool, grantor: &str) -> Grant {
         Grant {
