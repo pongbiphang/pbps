@@ -141,6 +141,15 @@ impl ProcessLease {
         Ok(text)
     }
 
+    /// The process's working directory, as a path inside its own mount
+    /// namespace, through the held proc directory. For a backend that is the
+    /// data directory, which is where the engine's loader resolves a library
+    /// named by a relative path.
+    pub(crate) fn working_directory(&self) -> Result<PathBuf, UnqualifiedProcess> {
+        self.check()?;
+        std::fs::read_link(proc_base(&self.directory).join("cwd")).map_err(|_| UnqualifiedProcess)
+    }
+
     /// The process's root directory, through the held proc directory.
     fn root(&self) -> Result<File, UnqualifiedProcess> {
         File::open(proc_base(&self.directory).join("root")).map_err(|_| UnqualifiedProcess)

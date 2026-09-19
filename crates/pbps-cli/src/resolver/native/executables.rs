@@ -113,6 +113,7 @@ pub(crate) fn executables(
 
     let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?);
     let libdir = library_directory(&engine_path);
+    let cwd = lease.working_directory()?;
     // The required libraries first, so that each can claim the mapping it is
     // loaded through. A mapping is named by the file's resolved path, while
     // the candidates are spelled the way the engine names the library, and
@@ -130,7 +131,7 @@ pub(crate) fn executables(
     let mut claimed: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut late = Vec::new();
     for name in required {
-        let candidates = resolve(name, &libdir, dynamic_library_path);
+        let candidates = resolve(name, &libdir, dynamic_library_path, &cwd);
         // A candidate already mapped under its own spelling is loaded
         // content, reported with the mappings below — and recorded as one
         // of that mapping's spellings, so that an alias of the same file in
@@ -344,7 +345,12 @@ pub(crate) fn library_directory(engine: &Path) -> PathBuf {
 /// Resolves a library name the way the engine's loader does: `$libdir` is
 /// the library directory, a bare name lives there, and a name without an
 /// extension gets `.so`.
-pub(crate) fn resolve(name: &str, libdir: &Path, dynamic_library_path: &str) -> Vec<String> {
+pub(crate) fn resolve(
+    name: &str,
+    libdir: &Path,
+    dynamic_library_path: &str,
+    cwd: &Path,
+) -> Vec<String> {
     // The loader tries the name exactly as given before appending the
     // platform suffix (`expand_dynamic_library_name`): a bare name is looked
     // for in every directory of the path as is, then in every directory with
@@ -354,7 +360,13 @@ pub(crate) fn resolve(name: &str, libdir: &Path, dynamic_library_path: &str) -> 
     let bases: Vec<PathBuf> = if let Some(rest) = name.strip_prefix("$libdir/") {
         vec![libdir.join(rest)]
     } else if name.contains('/') {
-        vec![PathBuf::from(name)]
+        // A name with a directory is used as given; a relative one is
+        // relative to the backend's working directory, the data directory
+        // (measured on 18: `CREATE FUNCTION ... AS 'plugins/relhstore'`
+        // loads `$PGDATA/plugins/relhstore.so` and stores the name as
+        // written). Anchored at the root instead, `plugins/foo` read
+        // `/plugins/foo`, absent or another file (finding on #688).
+        vec![cwd.join(name)]
     } else {
         // A bare name is searched along `dynamic_library_path`, `$libdir`
         // expanding to the engine's library directory; the default is just
@@ -570,19 +582,20 @@ mod tests {
     fn library_names_resolve_like_the_engines_loader() {
         let libdir = library_directory(Path::new("/usr/lib/postgresql/18/bin/postgres"));
         assert_eq!(libdir, PathBuf::from("/usr/lib/postgresql/18/lib"));
+        let cwd = Path::new("/var/lib/postgresql/18/main");
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
         // The default library path is `$libdir`; a `$libdir/` name and an
         // absolute name are each tried as given and then with the platform
         // suffix, in that order, as the loader tries them (finding on #688).
         assert_eq!(
-            resolve("$libdir/hstore", &libdir, "$libdir"),
+            resolve("$libdir/hstore", &libdir, "$libdir", cwd),
             names(&[
                 "/usr/lib/postgresql/18/lib/hstore",
                 "/usr/lib/postgresql/18/lib/hstore.so"
             ])
         );
         assert_eq!(
-            resolve("auto_explain", &libdir, "$libdir"),
+            resolve("auto_explain", &libdir, "$libdir", cwd),
             names(&[
                 "/usr/lib/postgresql/18/lib/auto_explain",
                 "/usr/lib/postgresql/18/lib/auto_explain.so"
@@ -591,21 +604,30 @@ mod tests {
         // A name that already carries a suffix is still tried suffixed again
         // second, exactly as the loader does; the exact file comes first.
         assert_eq!(
-            resolve("/opt/hooks/hook.so", &libdir, "$libdir"),
+            resolve("/opt/hooks/hook.so", &libdir, "$libdir", cwd),
             names(&["/opt/hooks/hook.so", "/opt/hooks/hook.so.so"])
         );
         assert_eq!(
-            resolve("$libdir/plugins/x.so.1", &libdir, "$libdir"),
+            resolve("$libdir/plugins/x.so.1", &libdir, "$libdir", cwd),
             names(&[
                 "/usr/lib/postgresql/18/lib/plugins/x.so.1",
                 "/usr/lib/postgresql/18/lib/plugins/x.so.1.so"
+            ])
+        );
+        // A relative name with a directory is the backend's working
+        // directory's, the data directory, not the root's (finding on #688).
+        assert_eq!(
+            resolve("plugins/foo", &libdir, "$libdir", cwd),
+            names(&[
+                "/var/lib/postgresql/18/main/plugins/foo",
+                "/var/lib/postgresql/18/main/plugins/foo.so"
             ])
         );
         // A bare name searches every directory of a custom path for the exact
         // name, then every directory for the suffixed one, with `$libdir`
         // expanded to the engine's library directory.
         assert_eq!(
-            resolve("auto_explain", &libdir, "/opt/pg/lib:$libdir"),
+            resolve("auto_explain", &libdir, "/opt/pg/lib:$libdir", cwd),
             names(&[
                 "/opt/pg/lib/auto_explain",
                 "/usr/lib/postgresql/18/lib/auto_explain",
@@ -694,6 +716,18 @@ mod tests {
             "the mapping is reported under the aliases alone: {:?}",
             set.libraries
         );
+        // A relative name with a directory resolves against the process's
+        // working directory — the test's own, which `sleep` inherited — and
+        // is reported at that absolute path (finding on #688).
+        let relative = executables(&lease, &["src/lib.rs".into()], "$libdir").unwrap();
+        let expected = std::env::current_dir().unwrap().join("src/lib.rs");
+        let found = relative
+            .libraries
+            .iter()
+            .find(|l| l.path == expected.to_string_lossy())
+            .expect("the relative name is anchored at the working directory");
+        assert_eq!(found.role, ExecutableRole::LateLoaded);
+        assert!(found.digest.is_some(), "{found:?}");
         // Required under its own path *and* an alias: both spellings, once
         // each, the mapping's own name not displaced by the alias (finding
         // on #688).
