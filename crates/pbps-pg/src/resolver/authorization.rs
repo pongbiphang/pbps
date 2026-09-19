@@ -824,6 +824,67 @@ fn grantor_for(context: &AuthorizationContext, schema: &str, privilege: &str) ->
     inherited.into_iter().find(|role| holds(role)).cloned()
 }
 
+/// The planned grants whose grantor the engine would choose among several
+/// inherited option holders. `grantor_for` names one of them, but the
+/// engine's `select_best_grantor` walks the deployer's memberships in
+/// catalog order — measured on 18: of two inherited roles both holding
+/// `USAGE` with the option, the one created first is recorded, not the
+/// first by name — and the reproduction's roles are new catalog identities,
+/// so which one the target would record cannot be predicted from here. Such
+/// a context is refused before anything is built rather than guessed at: a
+/// wrong guess reads as an unexpected grantor on scratch and refuses the
+/// plan anyway, or fingerprints it under a grantor the target would not
+/// record (finding on #688). Each entry names the grant and the holders.
+pub fn ambiguous_grantors(context: &AuthorizationContext, grants: &[PlannedGrant]) -> Vec<String> {
+    let deployer = &context.principal.effective;
+    let inherited: BTreeSet<&String> = context
+        .roles
+        .iter()
+        .filter(|(_, attrs)| attrs.inherits)
+        .map(|(role, _)| role)
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut ambiguous = Vec::new();
+    for grant in grants {
+        if !seen.insert((grant.schema.clone(), grant.privilege.clone())) {
+            continue;
+        }
+        let Some(schema) = context.schemas.get(&grant.schema) else {
+            continue;
+        };
+        if context.principal.superuser
+            || &schema.owner == deployer
+            || inherited.contains(&schema.owner)
+        {
+            continue;
+        }
+        let holds = |role: &String| {
+            schema.acl.get(role).is_some_and(|grants| {
+                grants
+                    .iter()
+                    .any(|g| g.privilege == grant.privilege && g.grantable)
+            })
+        };
+        if holds(deployer) {
+            continue;
+        }
+        let holders: Vec<&str> = inherited
+            .iter()
+            .filter(|role| holds(role))
+            .map(|role| role.as_str())
+            .collect();
+        if holders.len() > 1 {
+            ambiguous.push(format!(
+                "{} on schema {} is held with the grant option through {}",
+                grant.privilege,
+                grant.schema,
+                holders.join(" and ")
+            ));
+        }
+    }
+    ambiguous
+}
+
 /// Recomputes the deployer's effective USAGE/CREATE for each schema from the
 /// ACL, ownership and the deployer's role closure, the way the engine answers
 /// `has_schema_privilege`: a superuser has everything; on a NULL ACL (read
@@ -1082,6 +1143,68 @@ mod tests {
             .into_iter()
             .collect(),
         }
+    }
+
+    /// Measured on 18: with two inherited roles both holding the option, the
+    /// engine records the one created first (`zz_first`, the lower oid), not
+    /// the first by name (`aa_second`); the reproduction cannot know which,
+    /// so the context is refused, while one holder or the owner is not.
+    #[test]
+    fn a_grant_with_several_inherited_option_holders_is_refused_not_guessed() {
+        let mut two = context();
+        for role in ["aa_second", "zz_first"] {
+            two.roles.insert(
+                role.to_owned(),
+                RoleAttributes {
+                    superuser: false,
+                    inherit: true,
+                    bypass_rls: false,
+                    can_set: true,
+                    inherits: true,
+                },
+            );
+            two.schemas
+                .get_mut("app")
+                .unwrap()
+                .acl
+                .insert(role.to_owned(), vec![grant("USAGE", true, "app_owner")]);
+        }
+        let planned = [PlannedGrant {
+            role: "app_reader".into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke: false,
+        }];
+        let refused = ambiguous_grantors(&two, &planned);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("aa_second and zz_first"), "{refused:?}");
+        // One holder is not ambiguous; nor is a deployer that holds the
+        // option itself, owns the schema, or is a superuser; and a revoke of
+        // a privilege nobody holds the option for is not a grantor question.
+        let mut one = two.clone();
+        one.schemas.get_mut("app").unwrap().acl.remove("aa_second");
+        assert!(ambiguous_grantors(&one, &planned).is_empty());
+        let mut direct = two.clone();
+        direct
+            .schemas
+            .get_mut("app")
+            .unwrap()
+            .acl
+            .insert("dep".into(), vec![grant("USAGE", true, "app_owner")]);
+        assert!(ambiguous_grantors(&direct, &planned).is_empty());
+        let mut owns = two.clone();
+        owns.schemas.get_mut("app").unwrap().owner = "dep".into();
+        assert!(ambiguous_grantors(&owns, &planned).is_empty());
+        let mut superuser = two.clone();
+        superuser.principal.superuser = true;
+        assert!(ambiguous_grantors(&superuser, &planned).is_empty());
+        let create = [PlannedGrant {
+            role: "app_reader".into(),
+            schema: "app".into(),
+            privilege: "CREATE".into(),
+            revoke: true,
+        }];
+        assert!(ambiguous_grantors(&two, &create).is_empty());
     }
 
     /// The engine's owner rule, as `has_schema_privilege` answers it

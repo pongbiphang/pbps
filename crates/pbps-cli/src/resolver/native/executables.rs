@@ -294,18 +294,16 @@ pub(crate) fn library_directory(engine: &Path) -> PathBuf {
 /// the library directory, a bare name lives there, and a name without an
 /// extension gets `.so`.
 pub(crate) fn resolve(name: &str, libdir: &Path, dynamic_library_path: &str) -> Vec<String> {
-    let with_suffix = |path: PathBuf| -> String {
-        let mut path = path.to_string_lossy().into_owned();
-        let file = path.rsplit('/').next().unwrap_or("").to_owned();
-        if !file.contains(".so") {
-            path.push_str(".so");
-        }
-        path
-    };
-    if let Some(rest) = name.strip_prefix("$libdir/") {
-        vec![with_suffix(libdir.join(rest))]
+    // The loader tries the name exactly as given before appending the
+    // platform suffix (`expand_dynamic_library_name`): a bare name is looked
+    // for in every directory of the path as is, then in every directory with
+    // `.so`; a name with a directory is tried as is, then suffixed. Emitting
+    // the suffixed form alone read a valid `/opt/plugin` as unreadable and
+    // could hash an unrelated `/opt/plugin.so` beside it (finding on #688).
+    let bases: Vec<PathBuf> = if let Some(rest) = name.strip_prefix("$libdir/") {
+        vec![libdir.join(rest)]
     } else if name.contains('/') {
-        vec![with_suffix(PathBuf::from(name))]
+        vec![PathBuf::from(name)]
     } else {
         // A bare name is searched along `dynamic_library_path`, `$libdir`
         // expanding to the engine's library directory; the default is just
@@ -325,9 +323,15 @@ pub(crate) fn resolve(name: &str, libdir: &Path, dynamic_library_path: &str) -> 
             dirs
         };
         dirs.into_iter()
-            .map(|dir| with_suffix(PathBuf::from(dir).join(name)))
+            .map(|dir| PathBuf::from(dir).join(name))
             .collect()
-    }
+    };
+    let exact: Vec<String> = bases
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let suffixed: Vec<String> = exact.iter().map(|path| format!("{path}.so")).collect();
+    exact.into_iter().chain(suffixed).collect()
 }
 
 /// SHA-256 of a file's content, read positionally so a handle shared with
@@ -515,32 +519,48 @@ mod tests {
     fn library_names_resolve_like_the_engines_loader() {
         let libdir = library_directory(Path::new("/usr/lib/postgresql/18/bin/postgres"));
         assert_eq!(libdir, PathBuf::from("/usr/lib/postgresql/18/lib"));
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
         // The default library path is `$libdir`; a `$libdir/` name and an
-        // absolute name resolve to one candidate each.
+        // absolute name are each tried as given and then with the platform
+        // suffix, in that order, as the loader tries them (finding on #688).
         assert_eq!(
             resolve("$libdir/hstore", &libdir, "$libdir"),
-            vec!["/usr/lib/postgresql/18/lib/hstore.so".to_owned()]
+            names(&[
+                "/usr/lib/postgresql/18/lib/hstore",
+                "/usr/lib/postgresql/18/lib/hstore.so"
+            ])
         );
         assert_eq!(
             resolve("auto_explain", &libdir, "$libdir"),
-            vec!["/usr/lib/postgresql/18/lib/auto_explain.so".to_owned()]
+            names(&[
+                "/usr/lib/postgresql/18/lib/auto_explain",
+                "/usr/lib/postgresql/18/lib/auto_explain.so"
+            ])
         );
+        // A name that already carries a suffix is still tried suffixed again
+        // second, exactly as the loader does; the exact file comes first.
         assert_eq!(
             resolve("/opt/hooks/hook.so", &libdir, "$libdir"),
-            vec!["/opt/hooks/hook.so".to_owned()]
+            names(&["/opt/hooks/hook.so", "/opt/hooks/hook.so.so"])
         );
         assert_eq!(
             resolve("$libdir/plugins/x.so.1", &libdir, "$libdir"),
-            vec!["/usr/lib/postgresql/18/lib/plugins/x.so.1".to_owned()]
+            names(&[
+                "/usr/lib/postgresql/18/lib/plugins/x.so.1",
+                "/usr/lib/postgresql/18/lib/plugins/x.so.1.so"
+            ])
         );
-        // A bare name searches every directory of a custom path, in order,
-        // with `$libdir` expanded to the engine's library directory.
+        // A bare name searches every directory of a custom path for the exact
+        // name, then every directory for the suffixed one, with `$libdir`
+        // expanded to the engine's library directory.
         assert_eq!(
             resolve("auto_explain", &libdir, "/opt/pg/lib:$libdir"),
-            vec![
-                "/opt/pg/lib/auto_explain.so".to_owned(),
-                "/usr/lib/postgresql/18/lib/auto_explain.so".to_owned(),
-            ]
+            names(&[
+                "/opt/pg/lib/auto_explain",
+                "/usr/lib/postgresql/18/lib/auto_explain",
+                "/opt/pg/lib/auto_explain.so",
+                "/usr/lib/postgresql/18/lib/auto_explain.so",
+            ])
         );
     }
 
@@ -578,7 +598,10 @@ mod tests {
         let missing = set
             .libraries
             .iter()
-            .find(|l| l.path.ends_with("no_such_library.so"))
+            // Reported at the first candidate the loader would try, the
+            // exact name, which is also the name the engine's own error
+            // names (finding on #688).
+            .find(|l| l.path.ends_with("/no_such_library"))
             .expect("the required library is reported");
         assert_eq!(missing.role, ExecutableRole::LateLoaded);
         assert!(matches!(missing.provenance, Provenance::Unreadable { .. }));

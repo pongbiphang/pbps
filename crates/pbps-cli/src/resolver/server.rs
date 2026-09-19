@@ -1122,6 +1122,18 @@ impl ScratchRun {
             .scope_facts(&request.schemas, &request.write_path_extras, &scope_schemas)
             .await
             .map_err(read)?;
+        // A planned grant whose grantor the engine would pick among several
+        // inherited option holders cannot be predicted here (the pick follows
+        // catalog order, which the reproduction's fresh roles do not share),
+        // so the scope is refused before anything is built rather than
+        // guessed at (finding on #688).
+        let ambiguous = authorization::ambiguous_grantors(&target_auth, &request.planned);
+        if !ambiguous.is_empty() {
+            return Err(Error::Scope(format!(
+                "the grantor of a planned grant cannot be predicted on the target: {}",
+                ambiguous.join("; ")
+            )));
+        }
         let target_connection = target
             .connection_id()
             .map_err(|_| Error::Scope("the target binding is unreadable".into()))?;
