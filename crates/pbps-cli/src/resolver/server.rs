@@ -1391,7 +1391,7 @@ impl ScratchRun {
         // still compatible with — an extension installed after `qualify` is
         // "available on the resolver" and reads as a match — while the run
         // keeps a report and binding work made over a scope that no longer
-        // exists (finding on #688; DECISIONS 519).
+        // exists (finding on #688; DECISIONS 520).
         let changed = changed_sections(&sealed_facts, &target_facts);
         let authorization_digest = format!("{:x}", Sha256::digest(expected_auth.canonical()));
         if !changed.is_empty() || authorization_digest != sealed_authorization {

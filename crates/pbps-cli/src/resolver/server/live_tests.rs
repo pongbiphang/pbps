@@ -758,7 +758,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     // A change on the target after `qualify` — an extension installed by
     // another session — is a scope that no longer exists, even though the
     // scratch side is still compatible with it; the next check refuses and
-    // says what moved (finding on #688; DECISIONS 519).
+    // says what moved (finding on #688; DECISIONS 520).
     setup
         .query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         .await
