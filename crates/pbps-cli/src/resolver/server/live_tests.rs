@@ -784,11 +784,13 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     // very grant on the target after `qualify` leaves the projected
     // authorization unchanged — the projection is idempotent — but the
     // target is not what was sealed, and the next check must say so
-    // (finding on #688).
+    // (finding on #688). An admission opens one run, so the server is
+    // admitted again for it, once the first run's resources are gone.
+    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     let mut run = server
         .open_scratch(&scratch_recipe(&mut target).await)
         .await
-        .expect("scratch resources");
+        .expect("scratch resources for the second run");
     let request = crate::resolver::server::ScopeRequest {
         schemas: vec!["public".to_owned()],
         write_path_extras: vec!["pbps_extra_688".to_owned()],
