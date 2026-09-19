@@ -937,6 +937,11 @@ mod recon610 {
             "trimmed".to_owned(),
             "mine".to_owned(),
             "public".to_owned(),
+            // A write-path extra the engine provides: not droppable, owned
+            // by the bootstrap superuser, so the reproduction leaves it
+            // alone and compares the deployer's privileges on it alone
+            // (finding on #688).
+            "information_schema".to_owned(),
         ];
         // secret is unreadable to the deployer, so it is not an in-scope
         // schema for it; the reproduction covers only what the deployer sees.
@@ -1006,6 +1011,8 @@ mod recon610 {
             target.schemas["public"]
         );
         assert_eq!(target.schemas["public"].owner, owner);
+        assert!(target.schemas["information_schema"].privileges["USAGE"]);
+        assert!(!target.schemas["information_schema"].privileges["CREATE"]);
         assert_eq!(target.schemas["mine"].owner, dep);
         assert!(target.schemas["mine"].privileges["USAGE"]);
         assert!(!target.schemas["mine"].privileges["CREATE"]);

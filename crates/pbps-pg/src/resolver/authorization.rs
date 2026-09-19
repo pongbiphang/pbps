@@ -348,6 +348,20 @@ pub struct RoleMap {
     run_login: String,
 }
 
+/// Whether a schema is one the engine itself provides: `information_schema`
+/// and the `pg_` namespaces, created by initdb in every database, owned by
+/// the bootstrap superuser (whose name varies by installation) with the
+/// default ACL, and not droppable — `DROP SCHEMA information_schema` fails
+/// on the objects that depend on it (measured on 18). Such a schema reaches
+/// the scope as a write-path extra. It is neither recreated nor reconciled
+/// by ACL on scratch, since scratch already has the engine's own; what is
+/// compared is the deployer's effective privileges on it, which is what
+/// binding depends on (finding on #688). The pull never manages objects in
+/// these schemas (DECISIONS 276), so none is ever an in-scope schema.
+pub fn is_system_schema(name: &str) -> bool {
+    name == "information_schema" || name.starts_with("pg_")
+}
+
 /// Whether a role is one of the engine's predefined roles, which a
 /// reproduction grants membership in rather than clones. Their capabilities
 /// live in the role identity — `pg_read_all_settings` is what makes the
@@ -375,7 +389,12 @@ impl RoleMap {
         let mut logical = BTreeSet::new();
         logical.insert(context.principal.effective.clone());
         logical.extend(context.roles.keys().cloned());
-        for schema in context.schemas.values() {
+        for (name, schema) in &context.schemas {
+            // A system schema's owner and grantees are the engine's own and
+            // nothing is replayed on it, so they need no run-local role.
+            if is_system_schema(name) {
+                continue;
+            }
             logical.insert(schema.owner.clone());
             for (grantee, grants) in &schema.acl {
                 if grantee != "PUBLIC" {
@@ -544,6 +563,9 @@ pub async fn reconstruct(
     // Schemas, with the same name the emitter's write path uses, owned by the
     // mapped owner, with the target's ACL replayed under the mapped grantors.
     for (name, schema) in &context.schemas {
+        if is_system_schema(name) {
+            continue;
+        }
         let owner = map
             .run_local(&schema.owner)
             .ok_or_else(|| missing(&schema.owner))?;
@@ -997,11 +1019,18 @@ pub async fn verify(
             differences.push(format!("schema:{name}:absent"));
             continue;
         };
-        if map.logical_of(&got.owner).as_deref() != Some(want.owner.as_str()) {
-            differences.push(format!("schema:{name}:owner"));
-        }
         if got.privileges != want.privileges {
             differences.push(format!("schema:{name}:privileges"));
+        }
+        // A system schema is the engine's own on both sides: its owner is
+        // each installation's bootstrap superuser and its ACL is not
+        // replayed, so only the deployer's effective privileges above are
+        // the reproduction's to match.
+        if is_system_schema(name) {
+            continue;
+        }
+        if map.logical_of(&got.owner).as_deref() != Some(want.owner.as_str()) {
+            differences.push(format!("schema:{name}:owner"));
         }
         let got_acl: BTreeMap<String, Vec<Grant>> = got
             .acl

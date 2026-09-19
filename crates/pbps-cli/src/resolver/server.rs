@@ -1709,9 +1709,6 @@ fn changed_sections(sealed: &EnvironmentFacts, fresh: &EnvironmentFacts) -> Vec<
     }
     changed
 }
-/// Why the run ended and whether its resources went away are two different
-/// facts. Reporting "could not create scratch resources" for a channel that
-/// failed qualification would hide which of them happened.
 /// The effective schema order the deployer would see on each in-scope path,
 /// derived from the (post-plan) authorization: `pg_catalog` first, then each
 /// of the path's schemas the deployer has USAGE on, in order. This is what
@@ -1750,6 +1747,9 @@ fn expected_visibility(
         .collect()
 }
 
+/// Why the run ended and whether its resources went away are two different
+/// facts. Reporting "could not create scratch resources" for a channel that
+/// failed qualification would hide which of them happened.
 /// Adds the forwarder names run-owned state still holds to what one exit
 /// found. The reason the run ended is kept: `Cleanup` is the cause only when
 /// the scratch database and login themselves could not be removed
