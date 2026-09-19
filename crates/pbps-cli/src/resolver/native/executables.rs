@@ -123,8 +123,11 @@ pub(crate) fn executables(
     // identical builds were refused on the name (finding on #688). So the
     // candidate the loader would open is correlated with the mappings by
     // inode as well, and a mapping it claims is reported under the
-    // candidate's spelling, which both sides share.
-    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    // candidate's spelling, which both sides share — once per spelling, since
+    // two required names can be two links to one loaded file, and a side
+    // that has it loaded must still name both, as the side that has not
+    // does (finding on #688).
+    let mut claimed: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut late = Vec::new();
     for name in required {
         let candidates = resolve(name, &libdir, dynamic_library_path);
@@ -160,7 +163,7 @@ pub(crate) fn executables(
                 .find(|(_, mapping)| mapping.inode == inode)
                 .map(|(path, _)| path.clone())
         }) {
-            claimed.insert(path, candidate);
+            claimed.entry(path).or_default().push(candidate);
             continue;
         }
         late.push(match digest_of(&file) {
@@ -182,11 +185,15 @@ pub(crate) fn executables(
     }
     let mut libraries = Vec::new();
     for (path, mapping) in &mapped {
-        let mut identity = mapped_library(lease, path, mapping);
-        if let Some(spelling) = claimed.get(path) {
-            identity.path = spelling.clone();
+        let identity = mapped_library(lease, path, mapping);
+        match claimed.get(path) {
+            Some(spellings) => libraries.extend(spellings.iter().map(|spelling| {
+                let mut aliased = identity.clone();
+                aliased.path = spelling.clone();
+                aliased
+            })),
+            None => libraries.push(identity),
         }
-        libraries.push(identity);
     }
     libraries.extend(late);
     lease.check()?;
@@ -651,23 +658,33 @@ mod tests {
         let libc_path = libc.path.clone();
         let dir = std::env::temp_dir().join(format!("pbps-exec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let alias = dir.join("libc_alias.so");
-        let _ = std::fs::remove_file(&alias);
-        std::os::unix::fs::symlink(&libc_path, &alias).unwrap();
-        let alias_name = alias.to_string_lossy().into_owned();
-        let set = executables(&lease, std::slice::from_ref(&alias_name), "$libdir").unwrap();
-        let through_alias: Vec<_> = set
-            .libraries
+        // Two required names that are two links to the one loaded file are
+        // two identities, one per spelling, and none under the resolved
+        // path (finding on #688).
+        let aliases: Vec<String> = ["libc_alias.so", "libc_other.so"]
             .iter()
-            .filter(|l| l.path == alias_name)
+            .map(|name| {
+                let alias = dir.join(name);
+                let _ = std::fs::remove_file(&alias);
+                std::os::unix::fs::symlink(&libc_path, &alias).unwrap();
+                alias.to_string_lossy().into_owned()
+            })
             .collect();
-        assert_eq!(through_alias.len(), 1, "{:?}", set.libraries);
-        assert_eq!(through_alias[0].role, ExecutableRole::Preloaded);
-        assert!(through_alias[0].digest.is_some());
-        assert_eq!(through_alias[0].disk_differs_from_loaded, Some(false));
+        let set = executables(&lease, &aliases, "$libdir").unwrap();
+        for alias_name in &aliases {
+            let through_alias: Vec<_> = set
+                .libraries
+                .iter()
+                .filter(|l| l.path == *alias_name)
+                .collect();
+            assert_eq!(through_alias.len(), 1, "{alias_name}: {:?}", set.libraries);
+            assert_eq!(through_alias[0].role, ExecutableRole::Preloaded);
+            assert!(through_alias[0].digest.is_some());
+            assert_eq!(through_alias[0].disk_differs_from_loaded, Some(false));
+        }
         assert!(
             !set.libraries.iter().any(|l| l.path == libc_path),
-            "the mapping is reported under the alias alone: {:?}",
+            "the mapping is reported under the aliases alone: {:?}",
             set.libraries
         );
         std::fs::remove_dir_all(&dir).unwrap();
