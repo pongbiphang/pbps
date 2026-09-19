@@ -112,46 +112,83 @@ pub(crate) fn executables(
     };
 
     let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?);
-    let mut libraries = Vec::new();
-    for (path, mapping) in &mapped {
-        libraries.push(mapped_library(lease, path, mapping));
-    }
-
     let libdir = library_directory(&engine_path);
+    // The required libraries first, so that each can claim the mapping it is
+    // loaded through. A mapping is named by the file's resolved path, while
+    // the candidates are spelled the way the engine names the library, and
+    // the two differ when the library is installed through a symlink
+    // (`$libdir/foo.so -> foo.so.1`): matched by path alone, the target
+    // reported the mapped file under one name and the candidate under the
+    // other, a fresh scratch backend reported the candidate only, and
+    // identical builds were refused on the name (finding on #688). So the
+    // candidate the loader would open is correlated with the mappings by
+    // inode as well, and a mapping it claims is reported under the
+    // candidate's spelling, which both sides share.
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    let mut late = Vec::new();
     for name in required {
         let candidates = resolve(name, &libdir, dynamic_library_path);
-        // A candidate already mapped is loaded content, handled above.
+        // A candidate already mapped under its own spelling is loaded
+        // content, reported with the mappings below.
         if candidates
             .iter()
             .any(|candidate| mapped.contains_key(candidate))
         {
             continue;
         }
-        // Try each candidate in the loader's search order; the first that
-        // opens is the one it would load. If none opens, the library is not
-        // where the path says it should be.
-        let found = candidates.iter().find_map(|candidate| {
+        // The first candidate that opens is the one the loader would load;
+        // a later one is never what runs. None opening means the library is
+        // not where the path says it should be.
+        let Some((candidate, file)) = candidates.iter().find_map(|candidate| {
             let file = lease.open_in_root(candidate.trim_start_matches('/')).ok()?;
-            let digest = digest_of(&file).ok()?;
-            Some(ExecutableIdentity {
-                role: ExecutableRole::LateLoaded,
-                path: candidate.clone(),
-                digest: Some(digest),
-                provenance: Provenance::DiskCandidate,
-                disk_differs_from_loaded: None,
-            })
-        });
-        libraries.push(found.unwrap_or_else(|| {
-            unreadable(
+            Some((candidate.clone(), file))
+        }) else {
+            late.push(unreadable(
                 ExecutableRole::LateLoaded,
                 candidates
                     .into_iter()
                     .next()
                     .unwrap_or_else(|| name.clone()),
                 "required library not found on the library search path",
-            )
-        }));
+            ));
+            continue;
+        };
+        let inode = file.metadata().map(|metadata| metadata.ino()).ok();
+        if let Some(path) = inode.and_then(|inode| {
+            mapped
+                .iter()
+                .find(|(_, mapping)| mapping.inode == inode)
+                .map(|(path, _)| path.clone())
+        }) {
+            claimed.insert(path, candidate);
+            continue;
+        }
+        late.push(match digest_of(&file) {
+            Ok(digest) => ExecutableIdentity {
+                role: ExecutableRole::LateLoaded,
+                path: candidate,
+                digest: Some(digest),
+                provenance: Provenance::DiskCandidate,
+                disk_differs_from_loaded: None,
+            },
+            // Opened but not hashable is not "absent": the loader would load
+            // this file, so nothing else stands in for it.
+            Err(_) => unreadable(
+                ExecutableRole::LateLoaded,
+                candidate,
+                "the required library could not be read",
+            ),
+        });
     }
+    let mut libraries = Vec::new();
+    for (path, mapping) in &mapped {
+        let mut identity = mapped_library(lease, path, mapping);
+        if let Some(spelling) = claimed.get(path) {
+            identity.path = spelling.clone();
+        }
+        libraries.push(identity);
+    }
+    libraries.extend(late);
     lease.check()?;
     Ok(ExecutableSet { engine, libraries })
 }
@@ -606,6 +643,34 @@ mod tests {
         assert_eq!(missing.role, ExecutableRole::LateLoaded);
         assert!(matches!(missing.provenance, Provenance::Unreadable { .. }));
         assert!(missing.digest.is_none());
+
+        // A required library installed through a symlink to a file the
+        // process has mapped is that mapping, reported once and under the
+        // spelling the engine names it by, not a second, late-loaded copy
+        // beside the mapping's own path (finding on #688).
+        let libc_path = libc.path.clone();
+        let dir = std::env::temp_dir().join(format!("pbps-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alias = dir.join("libc_alias.so");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&libc_path, &alias).unwrap();
+        let alias_name = alias.to_string_lossy().into_owned();
+        let set = executables(&lease, std::slice::from_ref(&alias_name), "$libdir").unwrap();
+        let through_alias: Vec<_> = set
+            .libraries
+            .iter()
+            .filter(|l| l.path == alias_name)
+            .collect();
+        assert_eq!(through_alias.len(), 1, "{:?}", set.libraries);
+        assert_eq!(through_alias[0].role, ExecutableRole::Preloaded);
+        assert!(through_alias[0].digest.is_some());
+        assert_eq!(through_alias[0].disk_differs_from_loaded, Some(false));
+        assert!(
+            !set.libraries.iter().any(|l| l.path == libc_path),
+            "the mapping is reported under the alias alone: {:?}",
+            set.libraries
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
     }
