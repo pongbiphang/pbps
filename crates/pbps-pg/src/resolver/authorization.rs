@@ -672,21 +672,36 @@ pub async fn reconstruct(
         // the reproduction back finds them under `session_user`. On the
         // mapped deployer they would apply nowhere, since it never logs in
         // (finding on #688).
-        let rendered = setting_value(name, value)?;
+        // An empty stored text — `ALTER ROLE ... SET session_preload_libraries
+        // FROM CURRENT` while the list was empty stores `name=` — has no
+        // spelling on the right of `=`: no arguments is a syntax error, and
+        // `''` stores `""`, one library with an empty name that fails to load
+        // at login (measured on 18). `FROM CURRENT` copies the session's
+        // value text verbatim, so the admin session is given the empty text
+        // first and the default is copied from it (finding on #688).
         let mut statements = Vec::new();
+        let assignment = if value.is_empty() {
+            statements.push(format!(
+                "SELECT pg_catalog.set_config({}, '', false)",
+                literal(name)
+            ));
+            "FROM CURRENT".to_owned()
+        } else {
+            format!("= {}", setting_value(name, value)?)
+        };
         match scope {
             "role" => statements.push(format!(
-                "ALTER ROLE {} SET {} = {rendered}",
+                "ALTER ROLE {} SET {} {assignment}",
                 quote_ident(&map.run_login),
                 quote_ident(name),
             )),
             "database" => statements.push(format!(
-                "ALTER DATABASE {} SET {} = {rendered}",
+                "ALTER DATABASE {} SET {} {assignment}",
                 quote_ident(database),
                 quote_ident(name),
             )),
             "database-role" => statements.push(format!(
-                "ALTER ROLE {} IN DATABASE {} SET {} = {rendered}",
+                "ALTER ROLE {} IN DATABASE {} SET {} {assignment}",
                 quote_ident(&map.run_login),
                 quote_ident(database),
                 quote_ident(name),

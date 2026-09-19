@@ -893,6 +893,7 @@ mod recon610 {
                  GRANT pg_read_all_settings TO {dep}; \
                  ALTER ROLE {dep} SET search_path = \"$user\", public, \"odd name\"; \
                  ALTER ROLE {dep} SET default_text_search_config = 'pg_catalog.simple'; \
+                 ALTER ROLE {dep} SET session_preload_libraries FROM CURRENT; \
                  CREATE ROLE {run_login} LOGIN PASSWORD 'r'"
             ))
             .await
@@ -979,6 +980,18 @@ mod recon610 {
                 .get("role:default_text_search_config")
                 .map(String::as_str),
             Some("pg_catalog.simple"),
+            "{:?}",
+            target.settings
+        );
+        // An empty list default is stored as empty text, which has no
+        // spelling as an assignment; the reproduction must store the same
+        // empty text, not `""` (finding on #688).
+        assert_eq!(
+            target
+                .settings
+                .get("role:session_preload_libraries")
+                .map(String::as_str),
+            Some(""),
             "{:?}",
             target.settings
         );
