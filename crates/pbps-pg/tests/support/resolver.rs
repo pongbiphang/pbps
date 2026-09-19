@@ -906,6 +906,7 @@ mod recon610 {
             .execute(&format!(
                 "GRANT CONNECT ON DATABASE {target_db} TO {dep}; \
                  CREATE SCHEMA app AUTHORIZATION {owner}; CREATE SCHEMA secret; \
+                 REVOKE USAGE ON SCHEMA information_schema FROM PUBLIC; \
                  CREATE SCHEMA plain AUTHORIZATION {owner}; \
                  CREATE SCHEMA trimmed AUTHORIZATION {owner}; \
                  REVOKE CREATE ON SCHEMA trimmed FROM {owner}; \
@@ -938,9 +939,10 @@ mod recon610 {
             "mine".to_owned(),
             "public".to_owned(),
             // A write-path extra the engine provides: not droppable, owned
-            // by the bootstrap superuser, so the reproduction leaves it
-            // alone and compares the deployer's privileges on it alone
-            // (finding on #688).
+            // by the bootstrap superuser, so the reproduction keeps the
+            // engine's own and compares the deployer's privileges on it
+            // alone — here taken away from PUBLIC on the target, which the
+            // scratch default would otherwise still grant (finding on #688).
             "information_schema".to_owned(),
         ];
         // secret is unreadable to the deployer, so it is not an in-scope
@@ -1011,7 +1013,7 @@ mod recon610 {
             target.schemas["public"]
         );
         assert_eq!(target.schemas["public"].owner, owner);
-        assert!(target.schemas["information_schema"].privileges["USAGE"]);
+        assert!(!target.schemas["information_schema"].privileges["USAGE"]);
         assert!(!target.schemas["information_schema"].privileges["CREATE"]);
         assert_eq!(target.schemas["mine"].owner, dep);
         assert!(target.schemas["mine"].privileges["USAGE"]);

@@ -564,6 +564,35 @@ pub async fn reconstruct(
     // mapped owner, with the target's ACL replayed under the mapped grantors.
     for (name, schema) in &context.schemas {
         if is_system_schema(name) {
+            // The engine's own schema is neither recreated nor given the
+            // target's ACL (its owner is each installation's bootstrap
+            // superuser); what is reproduced is the deployer's effective
+            // answer on it, which `verify` compares. Scratch starts from the
+            // engine's default — USAGE for PUBLIC, CREATE for the owner alone
+            // — so a target that took USAGE away (a `REVOKE ... FROM PUBLIC`
+            // on `information_schema`, measured to read false) has it taken
+            // away here too, and one that granted CREATE has it granted to
+            // the mapped deployer (finding on #688). A superuser deployer
+            // reads true on both sides whatever the ACL says.
+            if !context.principal.superuser {
+                if !schema.privileges.get("USAGE").copied().unwrap_or(true) {
+                    admin
+                        .query(&format!(
+                            "REVOKE USAGE ON SCHEMA {} FROM PUBLIC",
+                            quote_ident(name)
+                        ))
+                        .await?;
+                }
+                if schema.privileges.get("CREATE").copied().unwrap_or(false) {
+                    admin
+                        .query(&format!(
+                            "GRANT CREATE ON SCHEMA {} TO {}",
+                            quote_ident(name),
+                            quote_ident(&deployer)
+                        ))
+                        .await?;
+                }
+            }
             continue;
         }
         let owner = map
