@@ -2416,6 +2416,286 @@ fn a_deployers_own_onward_grant_is_one_it_can_still_narrow() {
     succeeds(d.run(&["verify", "--db", &deployment]));
 }
 
+/// Issue #251, the grain of the grantor rule. A `REVOKE` removes only the
+/// entries the one grantor it selects put there, so two grantors on **one**
+/// privilege of one grantee defeat it. Two grantors on two *different*
+/// privileges do not: measured on 18.6, `REVOKE SELECT` run by the deployer
+/// over `reader=a/owner,reader=r/deployer` took the `SELECT` away and left
+/// the owner's `INSERT` standing.
+///
+/// Reading that rule per target rather than per privilege refuses a narrowing
+/// the deployer is entitled to run, and refuses `baseline` before it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_the_deployer_made_is_narrowable_beside_one_the_owner_made() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_mix_owner_{pid}");
+    let deployer = format!("pbps_mix_deploy_{pid}");
+    let reader = format!("pbps_mix_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "mixed-grantors");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT SELECT ON app.t TO {deployer} WITH GRANT OPTION; \
+             GRANT INSERT ON app.t TO {reader}; \
+             GRANT USAGE ON SCHEMA app TO {reader}"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The second grantor on the same target, and the whole point of the case:
+    // the owner granted the `INSERT`, this connection granted the `SELECT`.
+    on_server(&deployment, &format!("GRANT SELECT ON app.t TO {reader}"));
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(DISTINCT grantor)::bigint \
+                   FROM pg_class c, aclexplode(c.relacl) a \
+                  WHERE c.oid = 'app.t'::regclass \
+                    AND a.grantee = '{reader}'::regrole::oid"
+            ),
+        ),
+        2,
+        "the grantee has to hold entries from two grantors for this case to exist"
+    );
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+
+    let d = Demo::new("mixed-grantors");
+    d.table(ONE_COLUMN);
+    // The owner's `INSERT` is kept; the deployer's own `SELECT` is the one
+    // this plan takes away.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [insert]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database two roles granted into",
+    ]));
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("revoke select on app.t"),
+        "{}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    assert_eq!(granted("SELECT"), 0);
+    assert_eq!(
+        granted("INSERT"),
+        1,
+        "the owner's grant was not this plan's"
+    );
+    succeeds(d.run(&["verify", "--db", &deployment]));
+
+    // The negative the rule is for: two grantors on **one** privilege. The
+    // deployer's `REVOKE INSERT` would leave the owner's entry behind, so the
+    // permission is unexpressible and the declaration that drops it is
+    // refused before a statement runs.
+    on_server(
+        connection,
+        &format!("GRANT INSERT ON app.t TO {deployer} WITH GRANT OPTION"),
+    );
+    on_server(&deployment, &format!("GRANT INSERT ON app.t TO {reader}"));
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("INSERT") && stderr(&refused).contains(&reader),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(granted("INSERT"), 1, "nothing ran");
+}
+
+/// Issue #251, why one `REVOKE` carries one privilege. PostgreSQL selects the
+/// grantor once for the whole statement, so a combined `REVOKE SELECT, INSERT`
+/// over entries from two grantors takes only one of them and warns `not all
+/// privileges could be revoked` — measured on 18.6, where the same two
+/// privileges revoked one statement each took both.
+///
+/// Both grantors are roles this deployer inherits, so each privilege is
+/// revocable on its own; only the width of the statement could lose one.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn two_grantors_on_two_privileges_are_revoked_one_statement_each() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_two_owner_{pid}");
+    let deployer = format!("pbps_two_deploy_{pid}");
+    let first = format!("pbps_two_first_{pid}");
+    let second = format!("pbps_two_second_{pid}");
+    let reader = format!("pbps_two_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![
+            owner.clone(),
+            deployer.clone(),
+            first.clone(),
+            second.clone(),
+            reader.clone(),
+        ],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {first} NOSUPERUSER; \
+             CREATE ROLE {second} NOSUPERUSER; \
+             CREATE ROLE {reader} NOSUPERUSER; \
+             GRANT {first} TO {deployer}; \
+             GRANT {second} TO {deployer}"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "two-grantors");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {first}, {second}, {reader}; \
+             GRANT SELECT ON app.t TO {first} WITH GRANT OPTION; \
+             GRANT INSERT ON app.t TO {second} WITH GRANT OPTION"
+        ),
+    );
+    // One privilege from each intermediate role, which is what makes a single
+    // statement unable to carry both. `SET ROLE` rather than a connection of
+    // their own: the grantor a `GRANT` records is the current role, and these
+    // two need no login for that.
+    on_server(
+        connection,
+        &format!(
+            "SET ROLE {first}; GRANT SELECT ON app.t TO {reader}; RESET ROLE; \
+             SET ROLE {second}; GRANT INSERT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(DISTINCT grantor)::bigint \
+                   FROM pg_class c, aclexplode(c.relacl) a \
+                  WHERE c.oid = 'app.t'::regclass \
+                    AND a.grantee = '{reader}'::regrole::oid"
+            ),
+        ),
+        2,
+        "the two privileges have to come from two grantors for this case to exist"
+    );
+    let deployment = as_role(connection, &deployer);
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 1);
+
+    let d = Demo::new("two-grantors");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select, insert]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database two intermediate roles granted into",
+    ]));
+    // Both permissions go, in one plan.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    // One combined statement would have left one of these standing.
+    assert_eq!(granted("SELECT"), 0);
+    assert_eq!(granted("INSERT"), 0);
+    succeeds(d.run(&["verify", "--db", &deployment]));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs() {

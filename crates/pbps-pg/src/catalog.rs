@@ -1460,9 +1460,16 @@ fn owners_query() -> String {
 /// Competing inherited paths need explicit role selection, because PostgreSQL
 /// does not promise which one wins (DECISIONS 483).
 ///
-/// One original grantor per grantee and target as well: a single emitted
-/// `REVOKE` cannot combine two grantors' authority, so a grantee holding
-/// entries from two of them is not narrowable by one statement.
+/// One original grantor per grantee, target **and privilege** as well: a
+/// `REVOKE` removes only the entries its selected grantor put there, so
+/// measured on 18.6 `r1=ar/own1` beside `r1=r/dep1` keeps its `SELECT` when
+/// `dep1` revokes. The test is per privilege and not per target, because two
+/// *different* privileges of one grantee may come from two grantors and each
+/// still be revocable alone — `REVOKE SELECT` by `dep1` took `r1=r/dep1` away
+/// and left `r1=a/own1` standing (measured). What one statement cannot do is
+/// combine two grantors' authority, and [`crate::emit`] keeps that
+/// unrepresentable by revoking one privilege per statement (DECISIONS 518,
+/// #251).
 ///
 /// `owner` and `acl` are the catalog columns of the securable in the caller's
 /// query; the caller supplies `me` as a `pg_roles` row for `current_user`.
@@ -1482,7 +1489,8 @@ pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
                     AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
              ) candidate HAVING count(*) = 1)
          END, false) AND (SELECT count(DISTINCT grantor)
-             FROM pg_catalog.aclexplode({acl}) WHERE grantee = a.grantee) = 1"
+             FROM pg_catalog.aclexplode({acl})
+            WHERE grantee = a.grantee AND privilege_type = a.privilege_type) = 1"
     )
 }
 
