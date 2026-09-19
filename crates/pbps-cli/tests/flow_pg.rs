@@ -2831,6 +2831,110 @@ fn a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused() {
     );
 }
 
+/// Issue #251, the rename the check has to see through. A plan that renames a
+/// table and narrows a role in the same step spells the `Revoke` with the name
+/// the plan leaves behind, while the read that found the grant knows the
+/// object under the name it had. Keyed by the planned name alone, the check
+/// finds nothing and lets through a `REVOKE` that removes no ACL entry — and
+/// nothing downstream catches that (#700).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_no_revoke_could_remove_is_found_under_the_name_the_read_saw() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_rn_owner_{pid}");
+    let deployer = format!("pbps_rn_deploy_{pid}");
+    let third = format!("pbps_rn_third_{pid}");
+    let reader = format!("pbps_rn_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![
+            owner.clone(),
+            deployer.clone(),
+            third.clone(),
+            reader.clone(),
+        ],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {third} NOSUPERUSER; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "renamed-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {third}, {reader}; \
+             GRANT SELECT ON app.t TO {third} WITH GRANT OPTION; \
+             SET ROLE {third}; GRANT SELECT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+
+    let d = Demo::new("renamed-grantor");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database a third role granted into",
+    ]));
+
+    // The rename and the narrowing in one plan: the `Revoke` names `app.moved`
+    // and the read knows the grant on `app.t`.
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: app.moved\nrenamed_from: app.t"));
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("unrevocable_grants") && stderr(&refused).contains(&third),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', 'SELECT') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        ),
+        1,
+        "nothing ran"
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs() {

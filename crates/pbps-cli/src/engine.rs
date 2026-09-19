@@ -909,6 +909,7 @@ pub fn owned_targets(
 /// standing, and the apply's read-back does not notice: measured, it exited 0
 /// and recorded the narrowing as converged (#700). So this is the only place
 /// that answer can be given, and it is given before a statement runs.
+#[allow(clippy::wildcard_enum_match_arm)]
 pub fn unrevocable_grants(
     driver: Driver,
     changes: &ChangeSet,
@@ -925,6 +926,28 @@ pub fn unrevocable_grants(
                 .to_owned(),
         });
     }
+    // A rename moves the target without changing who granted what on it, and
+    // the `Revoke` beside it in the same plan names the object as the plan
+    // leaves it — while this list is keyed by what the read saw. The same
+    // translation `owned_targets` makes, for the same reason: without it a
+    // plan that renames and narrows in one step passes a check that would
+    // refuse either step alone.
+    //
+    // Only tables, again: a module is replaced rather than renamed, and a
+    // schema this dialect does not rename cannot move under a grant.
+    let renamed: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::GrantTarget> =
+        changes
+            .changes
+            .iter()
+            .filter_map(|planned| match &planned.change {
+                pbps_model::Change::RenameTable { from, to, .. } => Some((
+                    pbps_model::GrantTarget::Object(to.clone()),
+                    pbps_model::GrantTarget::Object(from.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+
     let mut impossible = Vec::new();
     for planned in &changes.changes {
         let pbps_model::Change::Revoke {
@@ -935,9 +958,10 @@ pub fn unrevocable_grants(
         else {
             continue;
         };
+        let read_as = renamed.get(target).unwrap_or(target);
         for found in unrevocable {
             if &found.role == role
-                && &found.target == target
+                && &found.target == read_as
                 && permissions.contains(&found.permission)
             {
                 impossible.push(format!("role {role}: {}", found.why));
