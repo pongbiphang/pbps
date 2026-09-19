@@ -597,6 +597,26 @@ mod scope610 {
         scope_facts(&mut conn, &scope, &schemas)
             .await
             .expect("the connection reads again after a refusal");
+        // A transaction left open on the connection — what a read cancelled
+        // between its BEGIN and its COMMIT leaves behind — is refused, not
+        // joined: a BEGIN inside it is only a warning and would hand back
+        // that transaction's old snapshot (finding on #688).
+        conn.execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT count(*) FROM pg_catalog.pg_namespace",
+        )
+        .await
+        .unwrap();
+        let refused = scope_facts(&mut conn, &scope, &schemas)
+            .await
+            .expect_err("an open transaction refuses the read");
+        assert!(
+            refused.to_string().contains("transaction open"),
+            "{refused}"
+        );
+        conn.execute("ROLLBACK").await.unwrap();
+        scope_facts(&mut conn, &scope, &schemas)
+            .await
+            .expect("the connection reads again once the transaction ended");
     }
 }
 

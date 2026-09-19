@@ -235,6 +235,34 @@ pub async fn scope_facts(
     scope: &environment::Scope<'_>,
     authorization_schemas: &[String],
 ) -> Result<(CatalogFacts, authorization::AuthorizationContext), DbError> {
+    // A transaction already open on this connection would swallow the
+    // `BEGIN` below (a warning, not an error, measured on 18) and hand the
+    // read that transaction's snapshot — stale by however long it has been
+    // open — so a check cancelled between an earlier read's `BEGIN` and its
+    // `COMMIT` could pass on facts the target no longer has (finding on
+    // #688). Such a transaction is visible by what it holds: a repeatable
+    // read that has read the catalog keeps its `AccessShareLock` on
+    // `pg_namespace` until it ends (measured: 0 outside a transaction and
+    // in one that has read nothing yet, 1 after the first catalog read, 0
+    // after COMMIT), and one that has read nothing has no snapshot yet, so
+    // joining it is harmless. Not `now() = statement_timestamp()`: under
+    // the extended protocol those differ even outside a transaction.
+    let held = conn
+        .query(
+            "SELECT count(*)::text AS held FROM pg_catalog.pg_locks \
+             WHERE pid = pg_catalog.pg_backend_pid() AND locktype = 'relation' \
+               AND relation = 'pg_catalog.pg_namespace'::pg_catalog.regclass",
+        )
+        .await?;
+    match held.as_slice() {
+        [row] if row.try_get::<&str>("held")? == Some("0") => {}
+        _ => {
+            return Err(DbError::BadRow(
+                "the planning connection has a transaction open; the scope cannot be read in a snapshot of its own"
+                    .into(),
+            ));
+        }
+    }
     conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await?;
     let outcome = async {

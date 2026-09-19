@@ -1488,8 +1488,8 @@ impl ScratchRun {
             let scratch = self.scratch.as_ref().expect("scratch is present");
             self.inner.check(Some(scratch)).await
         };
-        self.in_flight = false;
         if let Err(cause) = outcome {
+            self.in_flight = false;
             if let Some(scratch) = self.scratch.take() {
                 self.inner.control.retire(scratch);
             }
@@ -1497,14 +1497,20 @@ impl ScratchRun {
         }
         // The runtime, channel, exclusivity and target-binding held; the
         // qualified scope must still hold too, against a *freshly re-read*
-        // target, or a change on either side has invalidated it.
+        // target, or a change on either side has invalidated it. Still in
+        // flight: a check dropped between the target read's `BEGIN` and its
+        // `COMMIT` leaves that transaction open on the planning connection,
+        // and the next check must find the flag and end the run rather than
+        // read inside the stale snapshot (finding on #688).
         if let Err(cause) = self.requalify(target).await {
+            self.in_flight = false;
             self.inner.refuse(cause.clone());
             if let Some(scratch) = self.scratch.take() {
                 self.inner.control.retire(scratch);
             }
             return Err(cause);
         }
+        self.in_flight = false;
         Ok(())
     }
 
