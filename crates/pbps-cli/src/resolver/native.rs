@@ -441,14 +441,38 @@ pub(crate) fn open_within(
     relative: &str,
     flags: rustix::fs::OFlags,
 ) -> std::io::Result<File> {
-    let fd = rustix::fs::openat2(
-        root,
-        relative,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | flags,
-        rustix::fs::Mode::empty(),
-        rustix::fs::ResolveFlags::IN_ROOT,
-    )?;
-    Ok(File::from(fd))
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | flags;
+    match rustix::fs::openat2(root, relative, flags, Mode::empty(), ResolveFlags::IN_ROOT) {
+        Ok(fd) => Ok(File::from(fd)),
+        // `RESOLVE_IN_ROOT` also refuses magic links (documented, as
+        // `RESOLVE_NO_MAGICLINKS` does; measured as `EXDEV`, the escape
+        // error, on 6.6), and a namespace handle such as `proc/1/ns/pid` is
+        // one: in CI the containment check read "the container's /proc is
+        // not its own instance" through it. A magic link names a kernel
+        // object, not a path — its target reads `pid:[4026531836]` — so
+        // following it cannot leave the root. The parent is resolved inside
+        // the root, the last component is checked to be such a link and not
+        // a path-shaped one, and it is opened through the parent's handle.
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
+            let (parent, name) = relative.rsplit_once('/').unwrap_or((".", relative));
+            let dir = rustix::fs::openat2(
+                root,
+                parent,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::IN_ROOT,
+            )?;
+            let target = rustix::fs::readlinkat(&dir, name, Vec::new())?;
+            let target = target.to_bytes();
+            if target.contains(&b'/') || !target.contains(&b':') {
+                return Err(rustix::io::Errno::LOOP.into());
+            }
+            let fd = rustix::fs::openat(&dir, name, flags, Mode::empty())?;
+            Ok(File::from(fd))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +516,32 @@ mod confined_open_tests {
         let listed = open_within(&dir, "etc", rustix::fs::OFlags::DIRECTORY).unwrap();
         assert!(listed.metadata().unwrap().is_dir());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A namespace handle is a magic link, which `RESOLVE_IN_ROOT` refuses;
+    /// it is still opened, and is the same object a plain open reaches,
+    /// while a path-shaped link in the last component stays confined.
+    #[test]
+    fn a_magic_link_under_the_root_opens_and_a_path_link_stays_confined() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::fs::File::open("/").unwrap();
+        let relative = format!("proc/{}/ns/pid", std::process::id());
+        let through_root = open_within(&root, &relative, rustix::fs::OFlags::empty()).unwrap();
+        let plain = std::fs::File::open(format!("/{relative}")).unwrap();
+        assert_eq!(
+            through_root.metadata().unwrap().ino(),
+            plain.metadata().unwrap().ino()
+        );
+        // The confinement test above covers a path link that escapes; here
+        // the same shape sits in the last component of a deeper path.
+        let dir = std::env::temp_dir().join(format!("pbps-magic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("a/out")).unwrap();
+        let confined = std::fs::File::open(&dir).unwrap();
+        let error = open_within(&confined, "a/out", rustix::fs::OFlags::empty()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
