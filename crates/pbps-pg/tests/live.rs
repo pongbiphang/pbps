@@ -22156,6 +22156,59 @@ async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing(
         .expect("drop");
 }
 
+/// The same for a **table** target, which used to reach the queries without its
+/// name ever being resolved.
+///
+/// Every query here hands the name to `to_regclass`, so an absent one made each
+/// of them join to nothing and the report came back empty — the operator was
+/// told a rename affects nothing about a rename that could not be evaluated at
+/// all (#269). A `RenameTable`'s `from` is by construction a name the catalog
+/// had when the plan was made, so its absence means something happened.
+///
+/// The second half is what stops the refusal being read as "an empty report is
+/// now an error": a table the catalog *does* have, with nothing depending on
+/// it, still reports an empty list.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_table_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing() {
+    use pbps_pg::impact::{ImpactError, RenameTarget, rename_impact};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("absent_table");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TABLE {s}.t (id integer)"))
+        .await
+        .expect("the fixture");
+
+    let missing = RenameTarget::Table(TableName::new(&s, "no_such_table"));
+    let e = rename_impact(&mut conn, &missing)
+        .await
+        .expect_err("a table that is not there cannot be reported on");
+    assert!(matches!(e, ImpactError::Name(_)), "{e:?}");
+
+    // A schema the catalog does not have either: `to_regclass` answers NULL
+    // for that too, so it is the same refusal and not a query error.
+    let nowhere = RenameTarget::Table(TableName::new(format!("{s}_gone"), "t"));
+    let e = rename_impact(&mut conn, &nowhere)
+        .await
+        .expect_err("a schema that is not there cannot be reported on");
+    assert!(matches!(e, ImpactError::Name(_)), "{e:?}");
+
+    // The negative case: present, and genuinely without dependants.
+    let present = RenameTarget::Table(TableName::new(&s, "t"));
+    let report = rename_impact(&mut conn, &present)
+        .await
+        .expect("a table the catalog has can be reported on");
+    assert!(
+        report.is_empty(),
+        "nothing depends on this table, and that is an empty report rather than a          refusal: {report:#?}"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// ADR-0012 §3's dataset, re-measured in full: for every ordered pair of the
 /// catalogue's spellings, does `ALTER COLUMN … TYPE` rebuild the table, and does
 /// the dialect say the same?

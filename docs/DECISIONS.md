@@ -13889,3 +13889,39 @@ SPEC is in sync with all of these.
      statement would therefore have the pull promise per privilege what the
      emitted statement settles per grantor, so the width is what goes rather
      than the promise (#251).
+
+519. **A rename impact report resolves its relation once, and an absent one is
+     a refusal rather than an empty report.** `rename_impact` held two
+     positions on the same question. A **column** target resolved its `attnum`
+     first and refused outright when the catalog did not have it — "a question
+     that could not be asked, and the caller has to hear it as one". A
+     **table** target skipped that step: `attnum` was 0, every query's
+     `to_regclass` answered NULL, all of them joined to nothing, and the
+     operator was told a rename affects nothing about a rename that could not
+     be evaluated at all. The comment beside them argued the opposite of the
+     column path, that "a raise in the middle of an impact report is an error
+     where the honest answer is an empty list".
+
+     The column path is the one kept. Absent, empty and unreadable are three
+     different things, and a `RenameTable`'s `from` is by construction a name
+     the catalog held when the plan was made — so its absence is not "nothing
+     depends on this", it is evidence that something happened to the object
+     between the plan and the connection.
+
+     `to_regclass` is still the right function, for a reason the module did not
+     give before: a `::regclass` cast *raises*, and a raise arrives at a caller
+     as `ImpactError::Query`, which says a query could not be run. That is a
+     third answer again, and it is not the true one. The NULL is read in Rust
+     and turned into `ImpactError::Name` in this module's own words.
+
+     Resolved **once**, and the oid — not the name — is what the other three
+     queries take. That is what makes the failure unrepresentable rather than
+     merely checked: no later query can be handed a name that resolves to
+     nothing, and a relation dropped and recreated between two of them cannot
+     make half a report about one object and half about another. The oid
+     travels as `int8`, because an oid is unsigned 32-bit and measured on 18.6
+     `4000000000::oid::int4` is `-294967296` while `::int8` is exact; the
+     comparisons spell `($1::int8)::oid` so the engine infers the parameter as
+     `int8`, and measured, they keep their index scans. `ATTNUM` loses its own
+     existence question with this: an empty result there now means the column
+     is absent and nothing else (#269).

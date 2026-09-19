@@ -228,7 +228,7 @@ const CARRIED: &str = "\
 SELECT DISTINCT pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) AS described
   FROM pg_catalog.pg_depend d
  WHERE d.refclassid = 'pg_catalog.pg_class'::regclass
-   AND d.refobjid = pg_catalog.to_regclass($1)
+   AND d.refobjid = ($1::int8)::oid
    AND d.deptype <> 'i'
    AND ($2 = 0 OR d.refobjsubid IN (0, $2))
  ORDER BY 1";
@@ -241,20 +241,47 @@ const NAMED_OBJECTS: &str = "\
 SELECT 'index' AS kind, ic.relname AS name
   FROM pg_catalog.pg_index i
   JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
- WHERE i.indrelid = pg_catalog.to_regclass($1)
+ WHERE i.indrelid = ($1::int8)::oid
 UNION ALL
 SELECT 'constraint', con.conname
   FROM pg_catalog.pg_constraint con
- WHERE con.conrelid = pg_catalog.to_regclass($1)
+ WHERE con.conrelid = ($1::int8)::oid
  ORDER BY 1, 2";
+
+/// The relation the report is about, resolved **once**, before any of it is
+/// built.
+///
+/// `to_regclass` rather than a `::regclass` cast, and the reason is not the one
+/// this module used to give. The cast raises, and its raise would reach a
+/// caller as `ImpactError::Query` — "a query could not be run" — for a name
+/// that was simply not there, which is a different answer from the one that is
+/// true. The function answers NULL, and the NULL is read here and turned into
+/// the refusal below, in this module's own words.
+///
+/// The oid travels on as `int8` and not `int4`: an oid is unsigned 32-bit, and
+/// measured on 18.6 `4000000000::oid::int4` is `-294967296` while
+/// `::int8` is `4000000000`. Every query after this one takes that oid, so an
+/// absent name cannot reach them at all — a relation dropped and recreated
+/// between two of them cannot make half the report about one object and half
+/// about another either (DECISIONS 519, #269).
+///
+/// The queries that take it spell the cast `($1::int8)::oid` rather than
+/// comparing an oid column to a bare `$1`: a bare one makes the engine infer
+/// the parameter as `oid`, which the driver cannot serialize an `i64` into.
+/// Measured, the cast keeps their index scans.
+const RELATION: &str = "SELECT pg_catalog.to_regclass($1)::oid::int8 AS oid";
 
 /// The column's `attnum`, which is what `pg_depend` records — **not** its
 /// position: a dropped column keeps its slot, so the two part company the first
 /// time anybody drops one (ADR-0012 §6).
+///
+/// No existence question of its own: [`RELATION`] has already established that
+/// the relation is there, so an empty result here means the column is not, and
+/// nothing else.
 const ATTNUM: &str = "\
 SELECT a.attnum::int4 AS attnum
   FROM pg_catalog.pg_attribute a
- WHERE a.attrelid = pg_catalog.to_regclass($1)
+ WHERE a.attrelid = ($1::int8)::oid
    AND a.attname = $2 AND NOT a.attisdropped";
 
 /// Queries every impact of one rename.
@@ -262,12 +289,6 @@ pub async fn rename_impact(
     conn: &mut Conn,
     target: &RenameTarget,
 ) -> Result<ImpactReport, ImpactError> {
-    // The quoted, qualified spelling, because every query here hands the name
-    // to `to_regclass`, which *parses* its argument. `to_regclass` and not a
-    // `::regclass` cast: the cast raises for a name that is not there and the
-    // function answers NULL, and a raise in the middle of an impact report is
-    // an error where the honest answer is an empty list (DECISIONS 336's
-    // shape).
     // Never built by `rename_targets`, and refused rather than answered if
     // handed in from elsewhere: a module has no `attnum`, so the queries
     // below would ask about "every column" of a relation `to_regclass` does
@@ -282,7 +303,35 @@ pub async fn rename_impact(
             ),
         }));
     }
-    let relation = qualified(target.table())?;
+    // The quoted, qualified spelling, because `RELATION` hands the name to
+    // `to_regclass`, which *parses* its argument.
+    let name = qualified(target.table())?;
+    // Resolved before anything is built, and for a table target as much as for
+    // a column one. A table target used to skip this: `to_regclass` answered
+    // NULL inside every query, all of them joined to nothing, and the operator
+    // was told a rename affects nothing about a rename that could not be
+    // evaluated at all. A `RenameTable`'s `from` is by construction a name the
+    // catalog had when the plan was made, so its absence means something
+    // happened, and absent is not empty (DECISIONS 519, #269).
+    let relation: i64 = match conn
+        .query_with(RELATION, &[name.as_str().into()])
+        .await?
+        .first()
+        .and_then(|row| row.try_get::<i64>("oid").transpose())
+        .transpose()?
+    {
+        Some(oid) => oid,
+        None => {
+            return Err(ImpactError::Name(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "{} is not a table this database has, so what a rename of {target} \
+                     would affect cannot be read",
+                    target.table()
+                ),
+            }));
+        }
+    };
     let mut report = ImpactReport {
         target: target.to_string(),
         ..Default::default()
@@ -294,13 +343,13 @@ pub async fn rename_impact(
         None => 0,
         Some(name) => {
             let rows = conn
-                .query_with(ATTNUM, &[relation.as_str().into(), name.into()])
+                .query_with(ATTNUM, &[relation.into(), name.into()])
                 .await?;
             match rows.first() {
                 Some(row) => row.try_get::<i32>("attnum")?.unwrap_or(0),
-                // The column is not in the catalog. That is not "nothing
-                // depends on it": it is a question that could not be asked, and
-                // the caller has to hear it as one.
+                // The table is there and the column is not. That is not
+                // "nothing depends on it": it is a question that could not be
+                // asked, and the caller has to hear it as one.
                 None => {
                     return Err(ImpactError::Name(DialectError::Invalid {
                         dialect: crate::types::DIALECT,
@@ -340,10 +389,7 @@ pub async fn rename_impact(
 
     // What goes stale in name only.
     if let Some(column) = target.column() {
-        for row in conn
-            .query_with(NAMED_OBJECTS, &[relation.as_str().into()])
-            .await?
-        {
+        for row in conn.query_with(NAMED_OBJECTS, &[relation.into()]).await? {
             let name = text(&row, "name")?;
             if !name.contains(column) {
                 continue;
@@ -358,7 +404,7 @@ pub async fn rename_impact(
 
     // And what the rename is carried into.
     for row in conn
-        .query_with(CARRIED, &[relation.as_str().into(), attnum.into()])
+        .query_with(CARRIED, &[relation.into(), attnum.into()])
         .await?
     {
         report.carried.push(Referrer {
@@ -717,13 +763,19 @@ mod tests {
             ATTNUM.contains("NOT a.attisdropped"),
             "a dropped column keeps its slot (ADR-0012 §6)"
         );
-        // The *bound* name goes through `to_regclass` and never through a
-        // cast: the cast raises for a name that is not there, and a raise is
-        // not an empty report. A constant class name beside it is a different
-        // thing and is left alone.
+        // Exactly one query resolves the bound name, and through
+        // `to_regclass` rather than a cast: the cast raises for a name that is
+        // not there, and a raise reaches a caller as `ImpactError::Query` —
+        // "a query could not be run" — where the true answer is that the name
+        // is absent. A constant class name beside it is a different thing and
+        // is left alone.
+        assert!(RELATION.contains("to_regclass($1)"), "{RELATION}");
+        assert!(!RELATION.contains("$1::regclass"), "{RELATION}");
+        // And every other query takes the oid that one produced, so no name a
+        // report is built from can resolve to nothing halfway through (#269).
         for sql in [CARRIED, NAMED_OBJECTS, ATTNUM] {
-            assert!(sql.contains("to_regclass($1)"), "{sql}");
-            assert!(!sql.contains("$1::regclass"), "{sql}");
+            assert!(!sql.contains("to_regclass"), "{sql}");
+            assert!(sql.contains("($1::int8)::oid"), "{sql}");
         }
     }
 
