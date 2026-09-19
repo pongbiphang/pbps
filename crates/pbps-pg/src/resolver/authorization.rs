@@ -825,13 +825,19 @@ fn grantor_for(context: &AuthorizationContext, schema: &str, privilege: &str) ->
 }
 
 /// Recomputes the deployer's effective USAGE/CREATE for each schema from the
-/// ACL, ownership and the deployer's role closure: a schema is usable if the
-/// deployer owns it, inherits its owner, or holds the privilege through
-/// PUBLIC, itself, or a role it inherits. This mirrors what the engine answers
-/// for schema privileges, so an expected context stays comparable to one read
-/// back from a real server.
+/// ACL, ownership and the deployer's role closure, the way the engine answers
+/// `has_schema_privilege`: a superuser has everything; on a NULL ACL (read
+/// as no entries) the owner, or a deployer inheriting the owner, has
+/// everything implicitly; once the ACL has entries the owner's own ordinary
+/// privileges are the entries recorded for it and nothing more — measured on
+/// 18, `{owner=U/owner}` answers CREATE false for the owner itself. An
+/// ownership shortcut that granted both regardless expected CREATE where the
+/// owner had revoked it from itself, and a reproduction that faithfully kept
+/// the revoke was refused (finding on #688). Otherwise a privilege is held
+/// through PUBLIC, the deployer itself, or a role it inherits.
 fn recompute_schema_effective(context: &mut AuthorizationContext) {
     let deployer = context.principal.effective.clone();
+    let superuser = context.principal.superuser;
     let inherited: BTreeSet<String> = context
         .roles
         .iter()
@@ -842,14 +848,15 @@ fn recompute_schema_effective(context: &mut AuthorizationContext) {
         grantee == "PUBLIC" || grantee == deployer || inherited.contains(grantee)
     };
     for schema in context.schemas.values_mut() {
-        let owns = schema.owner == deployer || inherited.contains(&schema.owner);
+        let owns_default = schema.acl.is_empty()
+            && (schema.owner == deployer || inherited.contains(&schema.owner));
         for privilege in ["USAGE", "CREATE"] {
             let granted = schema.acl.iter().any(|(grantee, grants)| {
                 holders(grantee) && grants.iter().any(|g| g.privilege == privilege)
             });
             schema
                 .privileges
-                .insert(privilege.to_owned(), owns || granted);
+                .insert(privilege.to_owned(), superuser || owns_default || granted);
         }
     }
 }
@@ -1075,6 +1082,50 @@ mod tests {
             .into_iter()
             .collect(),
         }
+    }
+
+    /// The engine's owner rule, as `has_schema_privilege` answers it
+    /// (measured on 18): everything on a NULL ACL, only the recorded entries
+    /// once the ACL has any, and everything for a superuser regardless.
+    #[test]
+    fn an_owner_keeps_only_what_its_acl_records_once_the_acl_has_entries() {
+        let mut owned = context();
+        let schema = owned.schemas.get_mut("app").unwrap();
+        schema.owner = "dep".into();
+        // `REVOKE CREATE ON SCHEMA app FROM dep` by the owner itself leaves
+        // `{dep=U/dep}`, and the engine reads CREATE false for the owner.
+        schema.acl = [("dep".to_owned(), vec![grant("USAGE", false, "dep")])]
+            .into_iter()
+            .collect();
+        schema.privileges = [("USAGE".to_owned(), true), ("CREATE".to_owned(), false)]
+            .into_iter()
+            .collect();
+        // No planned grants, and a planned grant to somebody else: neither
+        // restores what the owner revoked from itself.
+        let unchanged = with_planned(owned.clone(), &[]);
+        assert!(unchanged.schemas["app"].privileges["USAGE"]);
+        assert!(!unchanged.schemas["app"].privileges["CREATE"]);
+        let granted = with_planned(
+            owned.clone(),
+            &[PlannedGrant {
+                role: "app_reader".into(),
+                schema: "app".into(),
+                privilege: "USAGE".into(),
+                revoke: false,
+            }],
+        );
+        assert!(!granted.schemas["app"].privileges["CREATE"]);
+        assert_eq!(
+            granted.schemas["app"].acl["app_reader"],
+            vec![grant("USAGE", false, "dep")]
+        );
+        // A NULL ACL is the owner's implicit everything, and a superuser has
+        // it whatever the ACL says.
+        let mut fresh = owned.clone();
+        fresh.schemas.get_mut("app").unwrap().acl.clear();
+        assert!(with_planned(fresh, &[]).schemas["app"].privileges["CREATE"]);
+        owned.principal.superuser = true;
+        assert!(with_planned(owned, &[]).schemas["app"].privileges["CREATE"]);
     }
 
     /// Planned grants and revokes are recorded under the grantor the engine

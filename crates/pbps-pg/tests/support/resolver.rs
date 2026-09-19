@@ -907,6 +907,8 @@ mod recon610 {
                  CREATE SCHEMA plain AUTHORIZATION {owner}; \
                  CREATE SCHEMA trimmed AUTHORIZATION {owner}; \
                  REVOKE CREATE ON SCHEMA trimmed FROM {owner}; \
+                 CREATE SCHEMA mine AUTHORIZATION {dep}; \
+                 REVOKE CREATE ON SCHEMA mine FROM {dep}; \
                  GRANT USAGE ON SCHEMA app TO {reader}"
             ))
             .await
@@ -917,12 +919,16 @@ mod recon610 {
         // other edge: the owner gave up part of its own default, so its ACL
         // holds less than the entry the engine materializes, and a replay
         // that only adds would leave the scratch owner able to CREATE
-        // (finding on #688).
+        // (finding on #688). `mine` is the deployer's own schema with CREATE
+        // revoked from itself: the engine answers CREATE false for an owner
+        // under such an ACL, and the expected context after the plan's grants
+        // must say the same, not "owner, so everything" (finding on #688).
         let schemas = [
             "app".to_owned(),
             "secret".to_owned(),
             "plain".to_owned(),
             "trimmed".to_owned(),
+            "mine".to_owned(),
         ];
         // secret is unreadable to the deployer, so it is not an in-scope
         // schema for it; the reproduction covers only what the deployer sees.
@@ -974,6 +980,9 @@ mod recon610 {
             "{:?}",
             target.schemas["plain"]
         );
+        assert_eq!(target.schemas["mine"].owner, dep);
+        assert!(target.schemas["mine"].privileges["USAGE"]);
+        assert!(!target.schemas["mine"].privileges["CREATE"]);
         assert_eq!(
             target.schemas["trimmed"]
                 .acl
