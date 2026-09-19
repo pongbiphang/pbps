@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Twenty-three instances so far. **Absent, empty and unreadable are three different
+Twenty-four instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -63,6 +63,14 @@ things, and only one of them is good news.**
   then refuses. `SELECT 'abcde'::varchar(4)` is `'abcd'`, so nothing is
   rejected and nothing is counted — the emptiness is the good news, and the
   statement it cleared fails (DECISIONS 387). See below.
+- A rename impact report for a **table** the catalog does not have coming back
+  empty, where the same report refused outright for an absent **column**. The
+  module argued both sides in adjacent comments, and the table path never
+  resolved its name at all: `to_regclass` answered NULL inside each query, they
+  all joined to nothing, and the operator read "this rename affects nothing"
+  about a rename that could not be evaluated. Resolved once now, and the oid
+  rather than the name is what the rest of the report is built from
+  (DECISIONS 519).
 
 ### 2. Failures escaping the one-envelope contract
 
