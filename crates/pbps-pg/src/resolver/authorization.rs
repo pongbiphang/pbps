@@ -519,19 +519,23 @@ pub async fn reconstruct(
         let owner = map
             .run_local(&schema.owner)
             .ok_or_else(|| missing(&schema.owner))?;
-        // A fresh database from template0 already has `public`; recreating it
-        // fails. Create the schema only if absent, then set its owner and
-        // clear the default PUBLIC grants, so the ACL reproduced below is the
-        // target's exactly and not the template's defaults (finding on #610).
+        // A fresh database from template0 already has `public`, with the
+        // template's explicit ACL (`{pg_database_owner=UC/...,=U/...}`,
+        // measured on 18). A target whose `public` was dropped and recreated
+        // has a NULL ACL instead, and keeping the template's schema would
+        // leave those entries in place for a target with none to replay, so
+        // the reproduction was refused (finding on #688). Every schema is
+        // therefore dropped if present and created afresh under its mapped
+        // owner: a new schema has a NULL ACL, which is the target's commonest
+        // state exactly, and the one the replay below builds on. The scratch
+        // database is this run's own, fresh from template0, so `public` holds
+        // nothing to lose (findings on #610 and #688).
         admin
-            .query(&format!(
-                "CREATE SCHEMA IF NOT EXISTS {}",
-                quote_ident(name)
-            ))
+            .query(&format!("DROP SCHEMA IF EXISTS {}", quote_ident(name)))
             .await?;
         admin
             .query(&format!(
-                "ALTER SCHEMA {} OWNER TO {}",
+                "CREATE SCHEMA {} AUTHORIZATION {}",
                 quote_ident(name),
                 quote_ident(&owner),
             ))

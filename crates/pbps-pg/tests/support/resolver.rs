@@ -909,6 +909,7 @@ mod recon610 {
                  REVOKE CREATE ON SCHEMA trimmed FROM {owner}; \
                  CREATE SCHEMA mine AUTHORIZATION {dep}; \
                  REVOKE CREATE ON SCHEMA mine FROM {dep}; \
+                 DROP SCHEMA public; CREATE SCHEMA public AUTHORIZATION {owner}; \
                  GRANT USAGE ON SCHEMA app TO {reader}"
             ))
             .await
@@ -923,12 +924,17 @@ mod recon610 {
         // revoked from itself: the engine answers CREATE false for an owner
         // under such an ACL, and the expected context after the plan's grants
         // must say the same, not "owner, so everything" (finding on #688).
+        // `public` was dropped and recreated on the target, so it has a NULL
+        // ACL where the scratch database's template `public` has explicit
+        // entries; the reproduction must not keep the template's (finding on
+        // #688).
         let schemas = [
             "app".to_owned(),
             "secret".to_owned(),
             "plain".to_owned(),
             "trimmed".to_owned(),
             "mine".to_owned(),
+            "public".to_owned(),
         ];
         // secret is unreadable to the deployer, so it is not an in-scope
         // schema for it; the reproduction covers only what the deployer sees.
@@ -980,6 +986,12 @@ mod recon610 {
             "{:?}",
             target.schemas["plain"]
         );
+        assert!(
+            target.schemas["public"].acl.is_empty(),
+            "{:?}",
+            target.schemas["public"]
+        );
+        assert_eq!(target.schemas["public"].owner, owner);
         assert_eq!(target.schemas["mine"].owner, dep);
         assert!(target.schemas["mine"].privileges["USAGE"]);
         assert!(!target.schemas["mine"].privileges["CREATE"]);
@@ -1173,7 +1185,7 @@ mod recon610_public {
 
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-    async fn scratch_reuses_public_and_refuses_a_planned_grant_the_deployer_cannot_make() {
+    async fn scratch_reproduces_the_template_public_and_refuses_an_impossible_grant() {
         let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
         let pid = std::process::id();
         let target_db = format!("pbps_pub_t_{pid}");
