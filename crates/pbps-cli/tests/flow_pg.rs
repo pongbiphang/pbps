@@ -2696,6 +2696,141 @@ fn two_grantors_on_two_privileges_are_revoked_one_statement_each() {
     succeeds(d.run(&["verify", "--db", &deployment]));
 }
 
+/// Issue #251, the direction the limitation is *not* in. An entry a third
+/// role granted is an ordinary grant: a declaration that keeps it is
+/// satisfied by the database exactly as it stands, and no statement is
+/// needed. Left out of the pull instead, it made every connected command over
+/// that database fail — `refuse_unexpressible` runs before the changes are
+/// looked at — so a no-op plan and the `baseline` before it were both refused.
+///
+/// Only the removal is impossible, and that is what is refused, before a
+/// statement runs and with the grantor named.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_thd_owner_{pid}");
+    let deployer = format!("pbps_thd_deploy_{pid}");
+    let third = format!("pbps_thd_third_{pid}");
+    let reader = format!("pbps_thd_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![
+            owner.clone(),
+            deployer.clone(),
+            third.clone(),
+            reader.clone(),
+        ],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {third} NOSUPERUSER; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "third-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {third}, {reader}; \
+             GRANT SELECT ON app.t TO {third} WITH GRANT OPTION; \
+             SET ROLE {third}; GRANT SELECT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The deployer is not the owner, is no member of the grantor, and holds no
+    // option of its own on this privilege: nothing it runs takes this away.
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*)::bigint FROM pg_class c, aclexplode(c.relacl) a \
+                  WHERE c.oid = 'app.t'::regclass \
+                    AND a.grantee = '{reader}'::regrole::oid \
+                    AND a.grantor = '{third}'::regrole::oid"
+            ),
+        ),
+        1,
+        "the entry has to carry the third role's grantor for this case to exist"
+    );
+
+    let d = Demo::new("third-grantor");
+    d.table(ONE_COLUMN);
+    // The declaration that keeps it. Nothing has to run for this to be true.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database a third role granted into",
+    ]));
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("No changes."),
+        "the declaration matches the database: {}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&["verify", "--db", &deployment]));
+
+    // The one direction that is impossible, refused before a statement runs.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let _ = std::fs::remove_file(&plan);
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("unrevocable_grants"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains(&third), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("nothing this tool can run takes it away"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', 'SELECT') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        ),
+        1,
+        "nothing ran"
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs() {

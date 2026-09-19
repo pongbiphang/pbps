@@ -893,6 +893,7 @@ mod tests {
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new(),
+            unrevocable: Vec::new(),
         };
         let scoped = pbps_diff::scope(
             &pulled.schema,

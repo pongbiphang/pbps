@@ -44,6 +44,17 @@ pub struct Managed {
     /// never ignorable warnings, and no recorder accepts a schema that has any
     /// (see [`managed_limitations`]).
     pub limitations: Vec<String>,
+    /// The grants this read could see and this connection could not take
+    /// away (#251): an entry a third role granted, where no `REVOKE` this
+    /// connection runs would carry that grantor.
+    ///
+    /// Here rather than in [`pbps_diff::Scoped`] for the reason above — whose
+    /// grantor a statement carries is a dialect fact, and the differ knows no
+    /// dialect. They are **not** removed from the scoped schema: each is an
+    /// ordinary grant, and a declaration that keeps one is satisfied by the
+    /// database as it stands. Only a plan that revokes one is impossible, and
+    /// that is what [`crate::engine::unrevocable_grants`] refuses.
+    pub unrevocable: Vec<pbps_db::catalog::Unrevocable>,
     /// Every module in the database that introspection cannot express, by identity,
     /// with the reason already rendered.
     ///
@@ -364,6 +375,7 @@ async fn managed_state_full(
     Ok(Managed {
         scoped,
         limitations,
+        unrevocable: pulled.unrevocable.clone(),
         unreadable,
         rows,
         unmanaged_relations,
@@ -3857,6 +3869,11 @@ pub fn cmd_plan_db(
         // schema, so the two cannot disagree (DECISIONS 174).
         let owned_targets =
         crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners, &scoped.session_role)?;
+        // The other half of the same read, and the other direction: a grant
+        // this connection could see and could not take away is refused only
+        // when the plan actually revokes it (#251).
+        let unrevocable_grants =
+            crate::engine::unrevocable_grants(conn.driver(), &cs, &managed.unrevocable)?;
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
@@ -3903,6 +3920,7 @@ pub fn cmd_plan_db(
             vec![
                 permission_support,
                 owned_targets,
+                unrevocable_grants,
                 drop_blockers,
                 missing_roles,
                 rename_evidence,
@@ -6177,6 +6195,7 @@ mod tests {
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new(),
+            unrevocable: Vec::new(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
                 entry(
@@ -9681,6 +9700,7 @@ mod tests {
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new(),
+            unrevocable: Vec::new(),
         }
     }
 

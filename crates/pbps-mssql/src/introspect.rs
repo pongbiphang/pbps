@@ -1452,6 +1452,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // This reader carries no object owner and no session role; both
         // belong to the PostgreSQL grantor rules (ADR-0010 §1).
         session_role: String::new(),
+        // The same rules: this engine's `REVOKE` takes an `AS` clause and its
+        // catalog records the grantor, so "no statement from this connection
+        // could remove it" is a question with a different shape here, and no
+        // caller asks it yet (#251).
+        unrevocable: Vec::new(),
     }
 }
 

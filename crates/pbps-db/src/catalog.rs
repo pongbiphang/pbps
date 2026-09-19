@@ -100,6 +100,34 @@ pub struct Pulled {
     ///
     /// Empty on an engine whose reader does not carry one.
     pub session_role: String,
+    /// Grants this connection can read and could not take away: an entry a
+    /// third role granted, where no `REVOKE` this connection runs would
+    /// carry that grantor (PostgreSQL; DECISIONS 483, 518).
+    ///
+    /// They are ordinary grants and stay in [`Pulled::schema`], because a
+    /// declaration that *keeps* one is satisfied by the database exactly as
+    /// it stands. Leaving them out refused that declaration — and refused
+    /// `baseline` before it — for a plan that emits no statement at all.
+    ///
+    /// The limitation is on one direction only, so it rides here and is
+    /// spent where that direction is: a plan whose `Revoke` names one of
+    /// these is refused before a statement runs (#251).
+    ///
+    /// Empty on an engine whose reader does not answer the question.
+    pub unrevocable: Vec<Unrevocable>,
+}
+
+/// One grant a read could see and this connection could not remove.
+///
+/// The `why` is rendered by the reader that found it, because only the
+/// engine's own vocabulary can say whose grantor it carries and what would
+/// have to happen instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrevocable {
+    pub role: String,
+    pub target: pbps_model::GrantTarget,
+    pub permission: pbps_model::Permission,
+    pub why: String,
 }
 
 /// One permission the model cannot hold, and enough about it for the caller

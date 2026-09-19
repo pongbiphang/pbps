@@ -13778,6 +13778,7 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
     );
     for name in [
         "owned_targets",
+        "unrevocable_grants",
         "missing_roles",
         "rename_evidence",
         "before_a_rebuild",

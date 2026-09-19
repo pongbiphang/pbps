@@ -1082,20 +1082,30 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // this tool is built to deploy into. That narrowing is #696's, with
         // the deployment-privilege question it needs answering first.
         //
-        // Folded in regardless, a grant this connection cannot revoke
-        // produces a plan that narrows the role, an apply that runs, and a
-        // closing read that refuses it for not having achieved its own
-        // postcondition — the right answer at the wrong end of the apply
-        // (#251).
+        // The limitation is on one direction, and it is recorded as one.
+        // Dropping the grant here instead refused every connected command
+        // over this database — `refuse_unexpressible` runs before the
+        // changes are looked at — including a declaration that *keeps* the
+        // permission and therefore emits no statement at all. So the grant
+        // stays in the schema, where a declaration that matches the database
+        // is satisfied by it, and the plan that would have to run the
+        // impossible `REVOKE` is the one refused (`engine::unrevocable_grants`).
+        //
+        // Folding it in with nothing recorded is the other wrong answer: the
+        // narrowing plan would be built and run, and the `REVOKE` would
+        // report success with the entry still standing. The apply's
+        // read-back does not catch that — measured, it exited 0 and recorded
+        // the narrowing as converged (#700).
         if g.grantor != g.owner && !g.revocable {
-            unexpressible(
-                pulled,
-                Some(target),
-                format!(
-                    "role {grantee}: {} on {} was granted by `{}`, and a `REVOKE` from \
-                     `{}` would not carry that grantor — so nothing this tool can run \
-                     takes it away. Select `{}` explicitly, or have its owner `{}` revoke \
-                     it (ADR-0010 §1, DECISIONS 483, measured)",
+            pulled.unrevocable.push(pbps_db::catalog::Unrevocable {
+                role: grantee.to_owned(),
+                target: target.clone(),
+                permission,
+                why: format!(
+                    "{} on {} was granted by `{}`, and a `REVOKE` from `{}` would not \
+                     carry that grantor — so nothing this tool can run takes it away. \
+                     Select `{}` explicitly, or have its owner `{}` revoke it \
+                     (ADR-0010 §1, DECISIONS 483, measured)",
                     g.permission,
                     target_label(g, &signatures),
                     g.grantor,
@@ -1103,8 +1113,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     g.grantor,
                     g.owner
                 ),
-            );
-            continue;
+            });
         }
         if let Some(role) = pulled.schema.roles.get_mut(grantee) {
             role.grants.entry(target).or_default().insert(permission);
@@ -3115,10 +3124,12 @@ mod tests {
     /// write — measured on 18.6, the owner's revoke and a superuser's both
     /// report success and leave `has_table_privilege` true.
     ///
-    /// Folded into the role's set, such a grant is planned away, the apply
-    /// runs, and the closing read refuses it for not having achieved its own
-    /// postcondition. Reported instead, the narrowing is refused before a
-    /// statement runs, with the grantor named.
+    /// The grant itself is ordinary and stays in the role's set: a
+    /// declaration that *keeps* it is satisfied by the database exactly as it
+    /// stands, and leaving it out refused that declaration — and `baseline`
+    /// before it — for a plan that emits no statement at all. What is
+    /// recorded is the one direction that is impossible, which
+    /// `engine::unrevocable_grants` spends on a plan that revokes it.
     ///
     /// The negative case is the one that decides the rule's shape: the owner
     /// is the grantor of every entry `acldefault` supplies and of every grant
@@ -3143,18 +3154,32 @@ mod tests {
             grants: vec![third("app_mid", false)],
             ..declaring('f', &[])
         });
-        assert!(pulled_role(&pulled, "app_reader").grants.is_empty());
-        assert_eq!(pulled.unexpressible.len(), 1);
-        let what = &pulled.unexpressible[0].what;
-        assert!(what.contains("granted by `app_mid`"), "{what}");
-        assert!(what.contains("`deployer`"), "{what}");
         assert!(
-            what.contains("nothing this tool can run takes it away"),
-            "{what}"
+            !pulled_role(&pulled, "app_reader").grants.is_empty(),
+            "the grant is ordinary; only removing it is impossible"
         );
         assert!(
-            pulled.unexpressible[0].target.is_some(),
-            "the object is nameable, so the finding carries it"
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        assert_eq!(pulled.unrevocable.len(), 1);
+        let found = &pulled.unrevocable[0];
+        assert_eq!(found.role, "app_reader");
+        assert_eq!(found.permission, pbps_model::Permission::Select);
+        assert!(
+            matches!(&found.target, pbps_model::GrantTarget::Object(o) if o.to_string() == "app.customer"),
+            "{:?}",
+            found.target
+        );
+        assert!(found.why.contains("granted by `app_mid`"), "{}", found.why);
+        assert!(found.why.contains("`deployer`"), "{}", found.why);
+        assert!(
+            found
+                .why
+                .contains("nothing this tool can run takes it away"),
+            "{}",
+            found.why
         );
 
         // The owner's own grant — which is what a superuser's grant on
@@ -3169,6 +3194,7 @@ mod tests {
             "{:?}",
             pulled.unexpressible
         );
+        assert!(pulled.unrevocable.is_empty(), "{:?}", pulled.unrevocable);
         assert!(
             !pulled_role(&pulled, "app_reader").grants.is_empty(),
             "the owner's grant belongs in the role's set"
@@ -3189,6 +3215,7 @@ mod tests {
             "{:?}",
             pulled.unexpressible
         );
+        assert!(pulled.unrevocable.is_empty(), "{:?}", pulled.unrevocable);
         assert!(
             !pulled_role(&pulled, "app_reader").grants.is_empty(),
             "this connection's own grant belongs in the role's set"

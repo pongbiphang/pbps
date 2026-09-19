@@ -895,6 +895,68 @@ pub fn owned_targets(
     })
 }
 
+/// Refuse a plan that revokes a grant no `REVOKE` from this connection could
+/// take away (#251).
+///
+/// Asked of the plan rather than of the read, and that is the whole point.
+/// The grants are ordinary ones: a declaration that *keeps* one is satisfied
+/// by the database exactly as it stands, and dropping them from the pull
+/// instead refused every connected command over the database — `baseline`
+/// included — for a plan that emits no statement at all.
+///
+/// The other direction has nothing downstream to catch it. A `REVOKE` whose
+/// grantor the engine does not select reports success with the entry still
+/// standing, and the apply's read-back does not notice: measured, it exited 0
+/// and recorded the narrowing as converged (#700). So this is the only place
+/// that answer can be given, and it is given before a statement runs.
+pub fn unrevocable_grants(
+    driver: Driver,
+    changes: &ChangeSet,
+    unrevocable: &[pbps_db::catalog::Unrevocable],
+) -> anyhow::Result<ConnectedCheck> {
+    if driver != Driver::Postgres {
+        return Ok(ConnectedCheck {
+            name: "unrevocable_grants",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server's `REVOKE` names its grantor with `AS`, and this reader \
+                      carries no unrevocable grant; the PostgreSQL check for a grant this \
+                      connection could not take away does not apply"
+                .to_owned(),
+        });
+    }
+    let mut impossible = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::Revoke {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        else {
+            continue;
+        };
+        for found in unrevocable {
+            if &found.role == role
+                && &found.target == target
+                && permissions.contains(&found.permission)
+            {
+                impossible.push(format!("role {role}: {}", found.why));
+            }
+        }
+    }
+    if !impossible.is_empty() {
+        anyhow::bail!("unrevocable_grants (PostgreSQL): {}", impossible.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "unrevocable_grants",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: "every permission this plan revokes is one a `REVOKE` from this connection \
+                  would carry the grantor of"
+            .to_owned(),
+    })
+}
+
 pub async fn permission_support(
     conn: &mut Conn,
     changes: &ChangeSet,
