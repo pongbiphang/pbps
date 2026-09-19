@@ -755,6 +755,24 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
 
     // A later check requalifies the sealed scope and holds.
     run.check(&mut target).await.expect("requalification holds");
+    // A change on the target after `qualify` — an extension installed by
+    // another session — is a scope that no longer exists, even though the
+    // scratch side is still compatible with it; the next check refuses and
+    // says what moved (finding on #688; DECISIONS 518).
+    setup
+        .query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        .await
+        .unwrap();
+    let refused = run
+        .check(&mut target)
+        .await
+        .expect_err("a target that moved since qualify is refused");
+    assert!(
+        refused.to_string().contains("changed under the run")
+            && refused.to_string().contains("extensions"),
+        "{refused}"
+    );
+    setup.query("DROP EXTENSION pgcrypto").await.unwrap();
 
     // Cleanup removes the scratch objects and every run-local role it created,
     // reporting nothing left over.

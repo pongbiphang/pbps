@@ -348,6 +348,20 @@ pub struct RoleMap {
     run_login: String,
 }
 
+/// Whether a role is one of the engine's predefined roles, which a
+/// reproduction grants membership in rather than clones. Their capabilities
+/// live in the role identity — `pg_read_all_settings` is what makes the
+/// superuser-only settings visible in `pg_settings`, measured on 18: a clone
+/// carrying the same attributes sees none of them, membership in the real
+/// role sees all three — and the `pg_` prefix is reserved, so no target role
+/// of its own can be mistaken for one (finding on #688). `pg_database_owner`
+/// is the exception: it cannot have explicit members (measured: "role
+/// pg_database_owner cannot have explicit members"), and what it carries is
+/// ownership of `public`, which a clone reproduces by owning the schema.
+fn is_predefined(role: &str) -> bool {
+    role.starts_with("pg_") && role != "pg_database_owner"
+}
+
 impl RoleMap {
     /// `token` is the run's unique suffix (the scratch names' token); run-local
     /// roles are `pbps_role_<n>_<token>`, which the identifier rules refuse to
@@ -386,7 +400,14 @@ impl RoleMap {
         let to_run_local = logical
             .into_iter()
             .enumerate()
-            .map(|(index, name)| (name, format!("pbps_role_{index}_{token}")))
+            .map(|(index, name)| {
+                let run_local = if is_predefined(&name) {
+                    name.clone()
+                } else {
+                    format!("pbps_role_{index}_{token}")
+                };
+                (name, run_local)
+            })
             .collect();
         Self {
             to_run_local,
@@ -419,7 +440,11 @@ impl RoleMap {
     /// Every run-local role name, so the run records them as recovery names
     /// before creating them and drops them on cleanup.
     pub fn run_local_names(&self) -> Vec<String> {
-        self.to_run_local.values().cloned().collect()
+        self.to_run_local
+            .values()
+            .filter(|name| !is_predefined(name))
+            .cloned()
+            .collect()
     }
 
     /// The run-local role the compilation session must `SET ROLE` to: the
@@ -465,6 +490,9 @@ pub async fn reconstruct(
     // that is not in the closure is created unprivileged (it only needs to
     // own a schema).
     for (logical, run) in &map.to_run_local {
+        if is_predefined(logical) {
+            continue;
+        }
         let attrs = context.roles.get(logical);
         let superuser = attrs.is_some_and(|a| a.superuser);
         let inherit = attrs.is_none_or(|a| a.inherit);
@@ -1147,6 +1175,50 @@ mod tests {
             .into_iter()
             .collect(),
         }
+    }
+
+    #[test]
+    fn a_predefined_role_is_granted_not_cloned() {
+        let mut ctx = context();
+        for role in ["pg_read_all_settings", "pg_database_owner"] {
+            ctx.roles.insert(
+                role.to_owned(),
+                RoleAttributes {
+                    superuser: false,
+                    inherit: true,
+                    bypass_rls: false,
+                    can_set: true,
+                    inherits: true,
+                },
+            );
+        }
+        let map = RoleMap::generate(&ctx, &[], "pbps_run_x", "tok");
+        // The capability role keeps its identity both ways; the database
+        // owner pseudo-role, which cannot have members, is cloned like any
+        // other; and cleanup never names a predefined role.
+        assert_eq!(
+            map.run_local("pg_read_all_settings").as_deref(),
+            Some("pg_read_all_settings")
+        );
+        assert_eq!(
+            map.logical_of("pg_read_all_settings").as_deref(),
+            Some("pg_read_all_settings")
+        );
+        assert!(
+            map.run_local("pg_database_owner")
+                .is_some_and(|run| run.starts_with("pbps_role_"))
+        );
+        assert!(
+            map.run_local("dep")
+                .is_some_and(|run| run.starts_with("pbps_role_"))
+        );
+        assert!(
+            map.run_local_names()
+                .iter()
+                .all(|name| name.starts_with("pbps_role_")),
+            "{:?}",
+            map.run_local_names()
+        );
     }
 
     /// Measured on 18: with two inherited roles both holding the option, the

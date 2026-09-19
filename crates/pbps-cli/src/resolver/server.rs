@@ -1042,6 +1042,9 @@ pub struct ScopeRequest {
 struct QualifiedScope {
     report: ScopeReport,
     authorization: AuthorizationFingerprint,
+    /// The target's facts as sealed at `qualify`, visibility expected after
+    /// the plan's grants: what every later check re-reads the target against.
+    target: EnvironmentFacts,
     map: RoleMap,
     schemas: Vec<String>,
     write_path_extras: Vec<String>,
@@ -1322,6 +1325,7 @@ impl ScratchRun {
         self.scope = Some(QualifiedScope {
             report,
             authorization,
+            target: target_facts,
             map,
             schemas: request.schemas.clone(),
             write_path_extras: request.write_path_extras.clone(),
@@ -1355,6 +1359,8 @@ impl ScratchRun {
         let extras = scope.write_path_extras.clone();
         let sealed_connection = scope.scratch_connection;
         let sealed_target = scope.target_connection;
+        let sealed_facts = scope.target.clone();
+        let sealed_authorization = scope.authorization.digest.clone();
         // Re-read the target: a second target session may have changed an
         // in-scope grant, extension, collation or setting since `qualify`, and
         // comparing scratch against the sealed evidence would miss it (finding
@@ -1380,6 +1386,24 @@ impl ScratchRun {
             .map_err(read)?;
         let expected_auth = authorization::with_planned(target_auth, &planned);
         target_facts.catalog.visibility = expected_visibility(&expected_auth, &schemas, &extras);
+        // The fresh read must be the sealed one. Comparing it against scratch
+        // alone would pass a target that changed into something scratch is
+        // still compatible with — an extension installed after `qualify` is
+        // "available on the resolver" and reads as a match — while the run
+        // keeps a report and binding work made over a scope that no longer
+        // exists (finding on #688; DECISIONS 518).
+        let changed = changed_sections(&sealed_facts, &target_facts);
+        let authorization_digest = format!("{:x}", Sha256::digest(expected_auth.canonical()));
+        if !changed.is_empty() || authorization_digest != sealed_authorization {
+            let mut what = changed;
+            if authorization_digest != sealed_authorization {
+                what.push("authorization");
+            }
+            return Err(Error::Scope(format!(
+                "the target scope changed under the run since it was qualified: {}",
+                what.join(", ")
+            )));
+        }
         let deployer = map
             .deployer(&expected_auth)
             .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
@@ -1662,6 +1686,29 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
     outcome
 }
 
+/// The sections of the target's facts that differ between the sealed read
+/// and a fresh one, by name, for the refusal that says what moved.
+fn changed_sections(sealed: &EnvironmentFacts, fresh: &EnvironmentFacts) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    let (s, f) = (&sealed.catalog, &fresh.catalog);
+    for (name, differs) in [
+        ("observations", s.observations != f.observations),
+        ("extensions", s.extensions != f.extensions),
+        (
+            "available extensions",
+            s.available_extensions != f.available_extensions,
+        ),
+        ("collations", s.collations != f.collations),
+        ("settings", s.settings != f.settings),
+        ("visibility", s.visibility != f.visibility),
+        ("executables", sealed.executables != fresh.executables),
+    ] {
+        if differs {
+            changed.push(name);
+        }
+    }
+    changed
+}
 /// Why the run ended and whether its resources went away are two different
 /// facts. Reporting "could not create scratch resources" for a channel that
 /// failed qualification would hide which of them happened.

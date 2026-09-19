@@ -890,6 +890,7 @@ mod recon610 {
             .execute(&format!(
                 "CREATE ROLE {dep} LOGIN PASSWORD 'd' IN ROLE {reader}; \
                  GRANT {owner} TO {dep} WITH INHERIT FALSE, SET TRUE; \
+                 GRANT pg_read_all_settings TO {dep}; \
                  ALTER ROLE {dep} SET search_path = \"$user\", public, \"odd name\"; \
                  ALTER ROLE {dep} SET default_text_search_config = 'pg_catalog.simple'; \
                  CREATE ROLE {run_login} LOGIN PASSWORD 'r'"
@@ -1074,6 +1075,26 @@ mod recon610 {
         assert!(
             differences.is_empty(),
             "reproduction differed: {differences:?}"
+        );
+        // The deployer's membership in `pg_read_all_settings` is reproduced as
+        // membership in the real predefined role, not a clone of it, so the
+        // mapped deployer sees the superuser-only settings the way the target
+        // deployer does (finding on #688).
+        assert!(target.roles.contains_key("pg_read_all_settings"));
+        let visible = run
+            .query(
+                "SELECT count(*)::text AS n FROM pg_catalog.pg_settings \
+                 WHERE name IN ('shared_preload_libraries', 'session_preload_libraries', 'dynamic_library_path')",
+            )
+            .await
+            .unwrap()[0]
+            .try_get::<&str>("n")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            visible, "3",
+            "the superuser-only settings are visible to the mapped deployer"
         );
 
         // Case 16 negative control: reading as the setup administrator (no
