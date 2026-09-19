@@ -199,3 +199,94 @@ fn a_forwarder_left_behind_is_named_without_replacing_the_reason() {
             .contains(&"pbps-resolver-a".to_owned())
     );
 }
+
+#[test]
+fn a_target_that_moved_since_qualify_is_named_section_by_section() {
+    use pbps_db::resolver::environment::{
+        CatalogFacts, ExecutableIdentity, ExecutableRole, ExecutableSet, ExtensionFact, Provenance,
+    };
+    use std::collections::BTreeMap;
+    let engine = |digest: &str| ExecutableIdentity {
+        role: ExecutableRole::Engine,
+        path: "/usr/lib/postgresql/18/bin/postgres".into(),
+        digest: Some(digest.into()),
+        provenance: Provenance::LoadedContent,
+        disk_differs_from_loaded: Some(false),
+    };
+    let facts = |digest: &str, extensions: Vec<ExtensionFact>| EnvironmentFacts {
+        catalog: CatalogFacts {
+            observations: BTreeMap::new(),
+            extensions,
+            available_extensions: BTreeMap::new(),
+            collations: Vec::new(),
+            settings: BTreeMap::new(),
+            visibility: BTreeMap::new(),
+        },
+        executables: ExecutableSet {
+            engine: engine(digest),
+            libraries: Vec::new(),
+        },
+    };
+    let sealed = facts("aa", Vec::new());
+    // The same read again is not a change; an extension installed after
+    // qualify, or an engine binary replaced under the run, is — and each is
+    // named, so the refusal says what moved.
+    assert!(changed_sections(&sealed, &sealed.clone()).is_empty());
+    let pgcrypto = ExtensionFact {
+        name: "pgcrypto".into(),
+        version: "1.3".into(),
+        schema: "public".into(),
+        requires: Vec::new(),
+        libraries: vec!["$libdir/pgcrypto".into()],
+    };
+    assert_eq!(
+        changed_sections(&sealed, &facts("aa", vec![pgcrypto.clone()])),
+        vec!["extensions"]
+    );
+    assert_eq!(
+        changed_sections(&sealed, &facts("bb", vec![pgcrypto])),
+        vec!["extensions", "executables"]
+    );
+}
+
+#[test]
+fn expected_visibility_is_pg_catalog_then_the_usable_path_schemas_in_order() {
+    use pbps_pg::resolver::authorization::{AuthorizationContext, SchemaAuthorization};
+    use std::collections::BTreeMap;
+    let schema = |usage: bool| SchemaAuthorization {
+        owner: "o".into(),
+        privileges: [("USAGE".to_owned(), usage), ("CREATE".to_owned(), false)]
+            .into_iter()
+            .collect(),
+        acl: BTreeMap::new(),
+    };
+    let context = AuthorizationContext {
+        principal: pbps_db::resolver::environment::DeploymentPrincipal {
+            login: "d".into(),
+            effective: "d".into(),
+            superuser: false,
+        },
+        schemas: [
+            ("app".to_owned(), schema(true)),
+            ("secret".to_owned(), schema(false)),
+            ("ext".to_owned(), schema(true)),
+        ]
+        .into_iter()
+        .collect(),
+        roles: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    let extras = vec!["ext".to_owned()];
+    let visibility =
+        super::expected_visibility(&context, &["app".to_owned(), "secret".to_owned()], &extras);
+    // app is usable and ext (an extra) is usable, in path order after pg_catalog.
+    assert_eq!(
+        visibility["app"],
+        pbps_db::resolver::Observation::reported(Some(r#"["pg_catalog","app","ext"]"#))
+    );
+    // secret is not usable, so only pg_catalog and the usable extra remain.
+    assert_eq!(
+        visibility["secret"],
+        pbps_db::resolver::Observation::reported(Some(r#"["pg_catalog","ext"]"#))
+    );
+}

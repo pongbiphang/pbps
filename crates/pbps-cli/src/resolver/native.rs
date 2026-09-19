@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 mod daemon;
+pub(crate) mod executables;
 mod execution;
 mod private_channel;
 mod target;
@@ -26,7 +27,7 @@ pub(crate) use private_channel::{
     PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guard, private_network, security,
 };
 pub(crate) use target::TargetWitness;
-pub use target::{NativeTarget, NativeTargetError};
+pub use target::{EnvironmentError, NativeTarget, NativeTargetError};
 
 #[derive(Debug, thiserror::Error)]
 #[error("the actual Linux peer process or its protected executable cannot be established")]
@@ -115,10 +116,12 @@ impl ProcessLease {
     }
 
     /// Opens a path inside this process's own mount namespace, through the
-    /// held proc directory, so a reused numeric PID cannot answer for it.
+    /// held proc directory, so a reused numeric PID cannot answer for it,
+    /// and resolved the way the process itself would resolve it (see
+    /// [`open_within`]).
     pub(crate) fn open_in_root(&self, relative: &str) -> Result<File, UnqualifiedProcess> {
         self.check()?;
-        let file = File::open(proc_base(&self.directory).join("root").join(relative))
+        let file = open_within(&self.root()?, relative, rustix::fs::OFlags::empty())
             .map_err(|_| UnqualifiedProcess)?;
         self.check()?;
         Ok(file)
@@ -131,12 +134,25 @@ impl ProcessLease {
         limit: usize,
     ) -> Result<String, UnqualifiedProcess> {
         self.check()?;
-        let text = read_bounded(
-            &proc_base(&self.directory).join("root").join(relative),
-            limit,
-        )?;
+        let file = open_within(&self.root()?, relative, rustix::fs::OFlags::empty())
+            .map_err(|_| UnqualifiedProcess)?;
+        let text = read_bounded_from(file, limit)?;
         self.check()?;
         Ok(text)
+    }
+
+    /// The process's working directory, as a path inside its own mount
+    /// namespace, through the held proc directory. For a backend that is the
+    /// data directory, which is where the engine's loader resolves a library
+    /// named by a relative path.
+    pub(crate) fn working_directory(&self) -> Result<PathBuf, UnqualifiedProcess> {
+        self.check()?;
+        std::fs::read_link(proc_base(&self.directory).join("cwd")).map_err(|_| UnqualifiedProcess)
+    }
+
+    /// The process's root directory, through the held proc directory.
+    fn root(&self) -> Result<File, UnqualifiedProcess> {
+        File::open(proc_base(&self.directory).join("root")).map_err(|_| UnqualifiedProcess)
     }
 
     /// The entries of a directory inside this process's mount namespace.
@@ -146,7 +162,9 @@ impl ProcessLease {
     ) -> Result<BTreeSet<String>, UnqualifiedProcess> {
         self.check()?;
         let mut names = BTreeSet::new();
-        for entry in std::fs::read_dir(proc_base(&self.directory).join("root").join(relative))
+        let dir = open_within(&self.root()?, relative, rustix::fs::OFlags::DIRECTORY)
+            .map_err(|_| UnqualifiedProcess)?;
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))
             .map_err(|_| UnqualifiedProcess)?
         {
             let entry = entry.map_err(|_| UnqualifiedProcess)?;
@@ -185,6 +203,18 @@ impl ProcessLease {
 
     /// Reads one bounded file through the *held* proc directory, so a reused
     /// numeric PID cannot answer for the process this lease captured.
+    /// The held handle on `/proc/<pid>/exe`: the executed file object
+    /// itself, so reading it reads what runs even after the path changed.
+    pub(crate) fn executable_file(&self) -> &File {
+        &self.executable
+    }
+
+    /// Opens a file under this process's own `/proc/<pid>/` entry, such as a
+    /// `map_files/<range>` mapped file object.
+    pub(crate) fn open_proc(&self, relative: &str) -> Result<File, UnqualifiedProcess> {
+        File::open(proc_base(&self.directory).join(relative)).map_err(|_| UnqualifiedProcess)
+    }
+
     pub(crate) fn read_proc(
         &self,
         relative: &str,
@@ -393,16 +423,135 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
+    read_bounded_from(File::open(path).map_err(|_| UnqualifiedProcess)?, limit)
+}
+
+fn read_bounded_from(file: File, limit: usize) -> Result<String, UnqualifiedProcess> {
     let mut text = String::new();
-    File::open(path)
-        .map_err(|_| UnqualifiedProcess)?
-        .take(limit as u64 + 1)
+    file.take(limit as u64 + 1)
         .read_to_string(&mut text)
         .map_err(|_| UnqualifiedProcess)?;
     if text.len() > limit {
         return Err(UnqualifiedProcess);
     }
     Ok(text)
+}
+
+/// Opens `relative` beneath `root` as a process whose root directory is
+/// `root` would: `openat2` with `RESOLVE_IN_ROOT`, so an absolute symbolic
+/// link inside it and a `..` at its top resolve inside it. A plain open of
+/// `/proc/<pid>/root/<relative>` follows an absolute link from the
+/// inspector's own root instead — a container's `/lib/foo.so -> /opt/foo.so`
+/// read the host's `/opt/foo.so`, absent or another file, so a library the
+/// engine loads fine was unreadable or the wrong content was hashed for
+/// both sides (finding on #688).
+pub(crate) fn open_within(
+    root: &File,
+    relative: &str,
+    flags: rustix::fs::OFlags,
+) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | flags;
+    match rustix::fs::openat2(root, relative, flags, Mode::empty(), ResolveFlags::IN_ROOT) {
+        Ok(fd) => Ok(File::from(fd)),
+        // `RESOLVE_IN_ROOT` also refuses magic links (documented, as
+        // `RESOLVE_NO_MAGICLINKS` does; measured as `EXDEV`, the escape
+        // error, on 6.6), and a namespace handle such as `proc/1/ns/pid` is
+        // one: in CI the containment check read "the container's /proc is
+        // not its own instance" through it. A magic link names a kernel
+        // object, not a path — its target reads `pid:[4026531836]` — so
+        // following it cannot leave the root. The parent is resolved inside
+        // the root, the last component is checked to be such a link and not
+        // a path-shaped one, and it is opened through the parent's handle.
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
+            let (parent, name) = relative.rsplit_once('/').unwrap_or((".", relative));
+            let dir = rustix::fs::openat2(
+                root,
+                parent,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::IN_ROOT,
+            )?;
+            let target = rustix::fs::readlinkat(&dir, name, Vec::new())?;
+            let target = target.to_bytes();
+            if target.contains(&b'/') || !target.contains(&b':') {
+                return Err(rustix::io::Errno::LOOP.into());
+            }
+            let fd = rustix::fs::openat(&dir, name, flags, Mode::empty())?;
+            Ok(File::from(fd))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod confined_open_tests {
+    use super::open_within;
+    use std::io::Read as _;
+
+    /// A root of its own, with an absolute link pointing at a path that
+    /// exists both inside it and on the host, and one that exists on the
+    /// host alone: the first reads the inside file, the second is absent.
+    #[test]
+    fn an_absolute_link_inside_a_root_resolves_inside_that_root() {
+        let root = std::env::temp_dir().join(format!("pbps-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/hostname"), "inside\n").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", root.join("host_link")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("host_only")).unwrap();
+        std::os::unix::fs::symlink("../../etc/hostname", root.join("etc/up_and_over")).unwrap();
+        assert!(
+            std::path::Path::new("/etc/passwd").exists(),
+            "the host has the file"
+        );
+        let dir = std::fs::File::open(&root).unwrap();
+        let mut text = String::new();
+        open_within(&dir, "host_link", rustix::fs::OFlags::empty())
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "inside\n");
+        // `..` above the root stays at the root, as it would for the process.
+        text.clear();
+        open_within(&dir, "etc/up_and_over", rustix::fs::OFlags::empty())
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "inside\n");
+        let error = open_within(&dir, "host_only", rustix::fs::OFlags::empty()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        // A directory is listed through its confined handle.
+        let listed = open_within(&dir, "etc", rustix::fs::OFlags::DIRECTORY).unwrap();
+        assert!(listed.metadata().unwrap().is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A namespace handle is a magic link, which `RESOLVE_IN_ROOT` refuses;
+    /// it is still opened, and is the same object a plain open reaches,
+    /// while a path-shaped link in the last component stays confined.
+    #[test]
+    fn a_magic_link_under_the_root_opens_and_a_path_link_stays_confined() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::fs::File::open("/").unwrap();
+        let relative = format!("proc/{}/ns/pid", std::process::id());
+        let through_root = open_within(&root, &relative, rustix::fs::OFlags::empty()).unwrap();
+        let plain = std::fs::File::open(format!("/{relative}")).unwrap();
+        assert_eq!(
+            through_root.metadata().unwrap().ino(),
+            plain.metadata().unwrap().ino()
+        );
+        // The confinement test above covers a path link that escapes; here
+        // the same shape sits in the last component of a deeper path.
+        let dir = std::env::temp_dir().join(format!("pbps-magic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("a/out")).unwrap();
+        let confined = std::fs::File::open(&dir).unwrap();
+        let error = open_within(&confined, "a/out", rustix::fs::OFlags::empty()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 // A held proc inode can outlive its task. Linux reports ESRCH as well as

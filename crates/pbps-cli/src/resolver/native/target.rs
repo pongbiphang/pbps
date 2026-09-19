@@ -1,9 +1,12 @@
 //! A direct native-Linux target connection, retaining its TLS and process
 //! leases together. Apply can re-establish this without invoking Docker.
 
+use super::executables;
 use super::{SocketOwnerLease, UnqualifiedProcess};
+use pbps_db::resolver::environment::{DatabaseRecipe, EnvironmentFacts};
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::PeerVerifiedConn;
+use pbps_pg::resolver::authorization::AuthorizationContext;
 use std::sync::{Arc, Weak};
 
 #[path = "target_engine.rs"]
@@ -15,6 +18,18 @@ mod tests;
 
 pub struct NativeTarget {
     current: Option<BoundTarget>,
+}
+
+/// What reading the target's analysis-scope facts refused. A catalog read
+/// and a kernel read fail differently and a caller needs to tell them apart.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvironmentError {
+    #[error("the target binding changed or became unreadable while reading its environment")]
+    Binding,
+    #[error("the target's analysis-scope catalog facts could not be read: {0}")]
+    Catalog(pbps_db::DbError),
+    #[error("the target engine's executable content could not be read")]
+    Executables,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +165,73 @@ impl NativeTarget {
             .as_ref()
             .map(|current| &current.identity)
             .ok_or(UnqualifiedProcess)
+    }
+
+    /// The `CREATE DATABASE` recipe that reproduces the target's encoding and
+    /// locale on the scratch server, read before any scratch database exists.
+    /// Catalog-only: no executables and no visibility, because a recipe needs
+    /// neither.
+    pub async fn database_recipe(&mut self) -> Result<DatabaseRecipe, EnvironmentError> {
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        // SQL Server's scratch database creation does not consume a recipe yet
+        // (reproducing its collation is #611), and its scope reader is not
+        // implemented, so it takes the neutral recipe rather than erroring.
+        if bound.connection.driver() != pbps_db::Driver::Postgres {
+            return Ok(DatabaseRecipe::neutral());
+        }
+        let catalog = engine::environment(&mut bound.connection, &[], &[])
+            .await
+            .map_err(EnvironmentError::Catalog)?;
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        DatabaseRecipe::from_catalog(&catalog)
+            .map_err(|error| EnvironmentError::Catalog(pbps_db::DbError::BadRow(error.to_string())))
+    }
+
+    /// The analysis-scope facts of the target as its own deployer sees them,
+    /// and that deployer's authorization context over `authorization_schemas`:
+    /// both read over the connection in one catalog snapshot, so the sealed
+    /// scope never holds half of a change committed between them (finding on
+    /// #688). The content of the engine executable and the native libraries
+    /// its extensions name is read from the connected backend by the native
+    /// observer — kernel state, outside any snapshot. Bracketed by the
+    /// ordinary binding check, so a facts read is of the same qualified
+    /// backend as everything else (ADR-0016 §5, §23; SPEC §9.3.3).
+    pub async fn scope_facts(
+        &mut self,
+        schemas: &[String],
+        write_path_extras: &[String],
+        authorization_schemas: &[String],
+    ) -> Result<(EnvironmentFacts, AuthorizationContext), EnvironmentError> {
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        let (catalog, authorization) = engine::scope_facts(
+            &mut bound.connection,
+            schemas,
+            write_path_extras,
+            authorization_schemas,
+        )
+        .await
+        .map_err(EnvironmentError::Catalog)?;
+        let required = executables::required_libraries(&catalog);
+        let library_path = catalog
+            .settings
+            .get("dynamic_library_path")
+            .map(|fact| fact.value.clone())
+            .unwrap_or_else(|| "$libdir".to_owned());
+        // The backend, not the postmaster: `session_preload_libraries` and
+        // `local_preload_libraries` are loaded into the connected backend, so
+        // hashing the service process would miss them (finding on #610).
+        let set = executables::executables(bound.lease.owner(), &required, &library_path)
+            .map_err(|_| EnvironmentError::Executables)?;
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        Ok((
+            EnvironmentFacts {
+                catalog,
+                executables: set,
+            },
+            authorization,
+        ))
     }
 
     pub async fn check(&mut self) -> Result<(), UnqualifiedProcess> {

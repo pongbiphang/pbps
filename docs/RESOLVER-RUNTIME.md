@@ -80,6 +80,29 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
 | Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
 
+## Analysis scope qualification (#610, PostgreSQL)
+
+Once a run holds a scratch database, `ScratchRun::qualify` establishes that it
+is a place the target's declarations can be compiled as the target's own
+deployer would (ADR-0016 cases 5, 14, 16, 21, 23). It refuses by name on SQL
+Server, which is #611.
+
+| Premise | What is measured |
+| --- | --- |
+| Compatibility | Under `pg-analysis-scope-v1`: equal patch-level version; encoding and locale, including the provider's *actual* collation version; every target extension installable on the resolver, with the native libraries its C functions name; the effective settings the dialect does not pin; and the deployer's effective schema visibility. Each fact is match, mismatch or unknown, and an unknown fact refuses like a provisioning failure rather than reading as a match |
+| Executables | The engine image and each loaded or required native library by content, not version: the running image through `/proc/<pid>/exe`, a loaded library through `/proc/<pid>/map_files`, an unloaded required library as a disk candidate; a library replaced under the running process is caught by inode identity, so a same-version build with different content or a parser-hook library is a mismatch |
+| Deployer | The planning connection's `current_user`, reproduced on scratch with run-local `pbps_role_<n>_<token>` roles created NOLOGIN with the measured attributes and memberships, reachable only under `SET ROLE`; the reproduction is verified by re-reading it as the mapped deployer, and compiling as the setup administrator instead is refused |
+| Stability | The target's facts and its deployer's authorization are read in one catalog snapshot, so the sealed scope never holds half of a change committed between them. The scope is sealed to the target and scratch connections, so a reopened session cannot inherit it, and requalified on every check, so an extension, setting, collation or authorization change between checks invalidates the run |
+
+The scope carries a deployment-authorization fingerprint later steps seal
+(#614) and apply rechecks against its own session (#616). What it does not
+prove is named: a target that is not on this kernel is unqualifiable
+(executable content is unreadable); code loaded dynamically inside a routine
+body, or by an operator's `LD_PRELOAD`, is outside this proof domain; and a
+target whose recorded collation version has drifted from its provider's is
+recorded as a limitation, not a resolver mismatch. Reproducing a target's
+collation and deployer on SQL Server is #611.
+
 The engine is reached the way the Docker profile reaches its own: a
 run-owned **forwarder**, launched from the supplied container's image into
 its network namespace with its own PID and mount namespaces, piping exactly

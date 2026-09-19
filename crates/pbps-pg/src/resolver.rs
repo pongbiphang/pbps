@@ -1,10 +1,15 @@
 //! Advisory environment observations, never resolver qualification (ADR-0016).
 
+pub mod authorization;
+pub mod compatibility;
+pub mod environment;
+
+use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, LocaleProvider};
 use pbps_db::resolver::{
     Candidate, Discovery, Extension, Observation, OwnSession, ScratchNames, SessionCounter,
     SessionInventory,
 };
-use pbps_db::transport::StreamConn;
+use pbps_db::transport::{QueryConnection, StreamConn};
 use pbps_db::{Conn, DbError};
 
 /// The cluster identifier is observed alongside, never instead of, qualified
@@ -214,18 +219,86 @@ FROM pg_catalog.pg_stat_activity a",
     })
 }
 
+/// Both target-side reads of an analysis scope in one `REPEATABLE READ READ
+/// ONLY` snapshot: the catalog facts and the deployer's authorization are
+/// sealed and compared together, so they must describe one catalog state. As
+/// two autocommit sequences, an extension or a grant committed between them
+/// would seal half of a change as the whole target (finding on #688).
+///
+/// Authorization is read first: the visibility read sets a transaction-local
+/// `search_path` per write path, and inside one transaction that setting now
+/// outlives its statement. The transaction ends either way, so a failed read
+/// cannot leave the planning connection inside a block that the next check
+/// would trip over.
+pub async fn scope_facts(
+    conn: &mut impl QueryConnection,
+    scope: &environment::Scope<'_>,
+    authorization_schemas: &[String],
+) -> Result<(CatalogFacts, authorization::AuthorizationContext), DbError> {
+    // A transaction already open on this connection would swallow the
+    // `BEGIN` below (a warning, not an error, measured on 18): the read would
+    // run inside it — under its isolation, on its snapshot if it has one,
+    // seeing different commits per statement if it is read committed — and
+    // the `COMMIT` that ends the read would commit whatever the caller had
+    // begun (DECISIONS 253). So the read refuses instead, asked the one way
+    // that reads differently in the two states through this driver: a
+    // `set_config(…, is_local)` in one statement, read back in the next,
+    // survives inside a transaction and not outside one — the probe the
+    // catalog reader uses (finding on #688; an earlier lock-based probe saw
+    // only a transaction that had already read the catalog).
+    let token = crate::catalog::probe_token();
+    conn.query(&crate::catalog::probe_set(&token)).await?;
+    let probed = conn.query(crate::catalog::PROBE_READ).await?;
+    match probed.as_slice() {
+        [row] if row.try_get::<&str>("probe")? != Some(token.as_str()) => {}
+        _ => {
+            return Err(DbError::BadRow(
+                "the planning connection has a transaction open; the scope cannot be read in a snapshot of its own"
+                    .into(),
+            ));
+        }
+    }
+    conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
+    let outcome = async {
+        let authorization = authorization::read(conn, authorization_schemas).await?;
+        let catalog = environment::read(conn, scope).await?;
+        Ok::<_, DbError>((catalog, authorization))
+    }
+    .await;
+    let ended = conn
+        .query(if outcome.is_ok() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        })
+        .await;
+    let facts = outcome?;
+    ended?;
+    Ok(facts)
+}
+
 /// Creates only this run's own resources. `CREATE DATABASE` cannot run inside
 /// a transaction block, so each statement is separate and the caller removes
 /// whatever was created when a later one fails.
-pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
+pub async fn create_scratch(
+    conn: &mut StreamConn,
+    names: &ScratchNames,
+    recipe: &DatabaseRecipe,
+) -> Result<(), DbError> {
     conn.execute(&format!(
         "CREATE ROLE \"{}\" LOGIN PASSWORD '{}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
         names.login(),
         names.password()
     ))
     .await?;
+    // The scratch database reproduces the target's encoding and locale so it
+    // sorts, compares and encodes the same way (SPEC §9.3.3); an owner is set
+    // after creation because the locale clauses and OWNER cannot both follow
+    // TEMPLATE cleanly on every version.
+    conn.execute(&scratch_database_ddl(names, recipe)).await?;
     conn.execute(&format!(
-        "CREATE DATABASE \"{}\" OWNER \"{}\"",
+        "ALTER DATABASE \"{}\" OWNER TO \"{}\"",
         names.database(),
         names.login()
     ))
@@ -239,8 +312,67 @@ pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Resu
     .await
 }
 
+/// The `CREATE DATABASE` that reproduces the target's encoding and locale
+/// (SPEC §9.3.3): `template0`, because a template with a different locale
+/// cannot be cloned into one; the provider's own locale clause for ICU and
+/// the builtin provider; and the libc collate/ctype in every case, which
+/// PostgreSQL requires even when another provider sorts. Rules are passed
+/// only when the target has them. Measured on 16 (ICU) and 18 (ICU, builtin).
+pub fn scratch_database_ddl(names: &ScratchNames, recipe: &DatabaseRecipe) -> String {
+    let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let mut ddl = format!(
+        "CREATE DATABASE \"{}\" TEMPLATE template0 ENCODING {}",
+        names.database(),
+        literal(&recipe.encoding)
+    );
+    match (recipe.provider, recipe.locale.as_deref()) {
+        (LocaleProvider::Libc, _) => ddl.push_str(" LOCALE_PROVIDER libc"),
+        (LocaleProvider::Icu, Some(locale)) => {
+            ddl.push_str(&format!(
+                " LOCALE_PROVIDER icu ICU_LOCALE {}",
+                literal(locale)
+            ));
+            if let Some(rules) = &recipe.icu_rules {
+                ddl.push_str(&format!(" ICU_RULES {}", literal(rules)));
+            }
+        }
+        (LocaleProvider::Builtin, Some(locale)) => {
+            ddl.push_str(&format!(
+                " LOCALE_PROVIDER builtin BUILTIN_LOCALE {}",
+                literal(locale)
+            ));
+        }
+        // `DatabaseRecipe::from_catalog` refuses these; rendering them would
+        // silently produce a libc database for an ICU target.
+        (LocaleProvider::Icu | LocaleProvider::Builtin, None) => {
+            unreachable!("a non-libc recipe always carries its locale")
+        }
+    }
+    ddl.push_str(&format!(
+        " LC_COLLATE {} LC_CTYPE {}",
+        literal(&recipe.collate),
+        literal(&recipe.ctype)
+    ));
+    ddl
+}
+
 /// Removes exactly the two run-owned objects. FORCE closes this run's own
 /// scratch sessions; it cannot reach anything the run did not create.
+/// Drops the run-local authorization roles, after the scratch database they
+/// owned is gone. Each drop is independent: a role that cannot be dropped is
+/// returned so the caller can report it, and does not stop the others. Uses
+/// `IF EXISTS` so a role a retry already removed is not an error.
+pub async fn drop_roles(conn: &mut StreamConn, roles: &[String]) -> Vec<String> {
+    let mut failed = Vec::new();
+    for role in roles {
+        let statement = format!("DROP ROLE IF EXISTS \"{}\"", role.replace('"', "\"\""));
+        if conn.execute(&statement).await.is_err() {
+            failed.push(role.clone());
+        }
+    }
+    failed
+}
+
 pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
     let database = conn
         .execute(&format!(
@@ -392,5 +524,50 @@ mod tests {
         ] {
             assert!(matches!(candidate(version), Candidate::Unavailable { .. }));
         }
+    }
+
+    fn names() -> ScratchNames {
+        ScratchNames::new(
+            "pbps_scratch_0123456789abcdef".into(),
+            "pbps_run_0123456789abcdef".into(),
+            "0".repeat(32),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_scratch_database_reproduces_the_targets_encoding_and_locale_provider() {
+        let libc = DatabaseRecipe {
+            encoding: "UTF8".into(),
+            provider: LocaleProvider::Libc,
+            collate: "en_US.utf8".into(),
+            ctype: "en_US.utf8".into(),
+            locale: None,
+            icu_rules: None,
+        };
+        assert_eq!(
+            scratch_database_ddl(&names(), &libc),
+            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" \
+             TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER libc LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
+        );
+        let icu = DatabaseRecipe {
+            provider: LocaleProvider::Icu,
+            locale: Some("en-US".into()),
+            icu_rules: Some("&a < b".into()),
+            ..libc.clone()
+        };
+        assert_eq!(
+            scratch_database_ddl(&names(), &icu),
+            "CREATE DATABASE \"pbps_scratch_0123456789abcdef\" \
+             TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'en-US' ICU_RULES '&a < b' \
+             LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
+        );
+        // A quote in a locale string cannot end the literal.
+        let odd = DatabaseRecipe {
+            provider: LocaleProvider::Builtin,
+            locale: Some("C.UTF-8'; DROP".into()),
+            ..libc
+        };
+        assert!(scratch_database_ddl(&names(), &odd).contains("BUILTIN_LOCALE 'C.UTF-8''; DROP'"));
     }
 }
