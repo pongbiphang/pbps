@@ -779,5 +779,51 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     run.close()
         .await
         .expect("cleanup confirms the run-local roles gone");
+
+    // A second run, with a planned grant. Another session performing that
+    // very grant on the target after `qualify` leaves the projected
+    // authorization unchanged — the projection is idempotent — but the
+    // target is not what was sealed, and the next check must say so
+    // (finding on #688).
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .expect("scratch resources");
+    let request = crate::resolver::server::ScopeRequest {
+        schemas: vec!["public".to_owned()],
+        write_path_extras: vec!["pbps_extra_688".to_owned()],
+        planned: vec![PlannedGrant {
+            role: "PUBLIC".into(),
+            schema: "pbps_extra_688".into(),
+            privilege: "USAGE".into(),
+            revoke: false,
+        }],
+    };
+    let verdict = run
+        .qualify(&mut target, &request)
+        .await
+        .expect("qualify runs with a planned grant");
+    assert_eq!(
+        verdict,
+        pbps_db::resolver::environment::Verdict::Verified,
+        "{verdict:?}"
+    );
+    run.check(&mut target).await.expect("requalification holds");
+    setup
+        .query("GRANT USAGE ON SCHEMA pbps_extra_688 TO PUBLIC")
+        .await
+        .unwrap();
+    let refused = run
+        .check(&mut target)
+        .await
+        .expect_err("a target that performed the planned grant itself is refused");
+    assert!(
+        refused.to_string().contains("changed under the run")
+            && refused.to_string().contains("authorization"),
+        "{refused}"
+    );
+    run.close()
+        .await
+        .expect("cleanup confirms the run-local roles gone");
     setup.query("DROP SCHEMA pbps_extra_688").await.unwrap();
 }

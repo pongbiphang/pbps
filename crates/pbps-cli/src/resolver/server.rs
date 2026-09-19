@@ -1045,6 +1045,12 @@ struct QualifiedScope {
     /// The target's facts as sealed at `qualify`, visibility expected after
     /// the plan's grants: what every later check re-reads the target against.
     target: EnvironmentFacts,
+    /// The digest of the target's authorization as read, before the plan's
+    /// grants are projected onto it. The projected digest above cannot see a
+    /// target that performed one of those very grants in the meantime — the
+    /// projection is idempotent — so the raw read is sealed and compared too
+    /// (finding on #688).
+    target_authorization: String,
     map: RoleMap,
     schemas: Vec<String>,
     write_path_extras: Vec<String>,
@@ -1240,6 +1246,7 @@ impl ScratchRun {
             }
             self.scratch = Some(reopened);
         }
+        let target_authorization = format!("{:x}", Sha256::digest(target_auth.canonical()));
         // The authorization the reproduction is meant to have *after* the
         // plan's preceding grants, which scratch has already run; verification
         // and the fingerprint compare against this, not the pre-plan state.
@@ -1326,6 +1333,7 @@ impl ScratchRun {
             report,
             authorization,
             target: target_facts,
+            target_authorization,
             map,
             schemas: request.schemas.clone(),
             write_path_extras: request.write_path_extras.clone(),
@@ -1361,6 +1369,7 @@ impl ScratchRun {
         let sealed_target = scope.target_connection;
         let sealed_facts = scope.target.clone();
         let sealed_authorization = scope.authorization.digest.clone();
+        let sealed_target_authorization = scope.target_authorization.clone();
         // Re-read the target: a second target session may have changed an
         // in-scope grant, extension, collation or setting since `qualify`, and
         // comparing scratch against the sealed evidence would miss it (finding
@@ -1384,6 +1393,7 @@ impl ScratchRun {
             .scope_facts(&schemas, &extras, &scope_schemas)
             .await
             .map_err(read)?;
+        let target_authorization = format!("{:x}", Sha256::digest(target_auth.canonical()));
         let expected_auth = authorization::with_planned(target_auth, &planned);
         target_facts.catalog.visibility = expected_visibility(&expected_auth, &schemas, &extras);
         // The fresh read must be the sealed one. Comparing it against scratch
@@ -1394,9 +1404,14 @@ impl ScratchRun {
         // exists (finding on #688; DECISIONS 520).
         let changed = changed_sections(&sealed_facts, &target_facts);
         let authorization_digest = format!("{:x}", Sha256::digest(expected_auth.canonical()));
-        if !changed.is_empty() || authorization_digest != sealed_authorization {
+        // Both digests: the projected one, which a change outside the plan
+        // moves, and the raw one, which a target that ran one of the plan's
+        // own grants moves while the projection stays put (finding on #688).
+        let authorization_moved = authorization_digest != sealed_authorization
+            || target_authorization != sealed_target_authorization;
+        if !changed.is_empty() || authorization_moved {
             let mut what = changed;
-            if authorization_digest != sealed_authorization {
+            if authorization_moved {
                 what.push("authorization");
             }
             return Err(Error::Scope(format!(
