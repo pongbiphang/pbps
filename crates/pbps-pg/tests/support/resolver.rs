@@ -199,7 +199,8 @@ mod scope610 {
             .execute(&format!(
                 "CREATE SCHEMA a; CREATE SCHEMA b; CREATE TABLE a.t (x int); CREATE TABLE b.t (y int); \
                  REVOKE ALL ON SCHEMA a FROM PUBLIC; GRANT USAGE ON SCHEMA b TO {deployer}; \
-                 GRANT CONNECT ON DATABASE {database} TO {deployer}; CREATE EXTENSION hstore"
+                 GRANT CONNECT ON DATABASE {database} TO {deployer}; CREATE EXTENSION hstore; \
+                 CREATE EXTENSION cube; CREATE EXTENSION earthdistance"
             ))
             .await
             .unwrap();
@@ -282,6 +283,15 @@ mod scope610 {
             .expect("hstore is installed");
         assert_eq!(hstore.libraries, vec!["$libdir/hstore".to_owned()]);
         assert!(hstore.requires.is_empty());
+        // What an installed extension requires is read from `pg_depend`, so
+        // it is known whether or not the control file is still there
+        // (finding on #688).
+        let earthdistance = seen_by_deployer
+            .extensions
+            .iter()
+            .find(|e| e.name == "earthdistance")
+            .expect("earthdistance is installed");
+        assert_eq!(earthdistance.requires, vec!["cube".to_owned()]);
         assert!(seen_by_deployer.available_extensions.contains_key("hstore"));
         // Where a setting came from is read with it; a setting the dialect
         // pins before every deployment statement is not read at all, since

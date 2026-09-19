@@ -80,15 +80,26 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
 WHERE n.nspname NOT IN ('pg_catalog', 'pg_toast')
 ORDER BY 1";
 
-// LEFT JOINs keep an extension whose namespace or version row could not be
-// read; an inner join would certify an incomplete inventory. The native
-// libraries are the `probin` of the extension's C-language functions — what
-// a resolver has to load, not what the extension is called.
+// A LEFT JOIN keeps an extension whose namespace row could not be read; an
+// inner join would certify an incomplete inventory. `requires` is what the
+// installed extension depends on in `pg_depend`, not the control file's
+// list through `pg_available_extension_versions`: that row is absent when
+// the control file is gone from the target, and absent read as an empty
+// list would certify an extension whose dependencies a resolver lacks
+// (finding on #688; measured: earthdistance depends on cube either way).
+// The native libraries are the `probin` of the extension's C-language
+// functions — what a resolver has to load, not what the extension is called.
 const EXTENSIONS: &str = "\
 SELECT e.extname::text AS name,
        e.extversion AS version,
        n.nspname::text AS schema,
-       (SELECT pg_catalog.json_agg(r ORDER BY r)::text FROM pg_catalog.unnest(v.requires) AS r) AS requires,
+       (SELECT pg_catalog.json_agg(r.extname::text ORDER BY r.extname)::text
+        FROM pg_catalog.pg_depend d
+        JOIN pg_catalog.pg_extension r ON r.oid = d.refobjid
+        WHERE d.classid = 'pg_catalog.pg_extension'::regclass
+          AND d.objid = e.oid
+          AND d.refclassid = 'pg_catalog.pg_extension'::regclass
+          AND d.deptype = 'n') AS requires,
        (SELECT pg_catalog.json_agg(DISTINCT p.probin ORDER BY p.probin)::text
         FROM pg_catalog.pg_depend d
         JOIN pg_catalog.pg_proc p ON p.oid = d.objid
@@ -100,8 +111,6 @@ SELECT e.extname::text AS name,
           AND p.probin IS NOT NULL) AS libraries
 FROM pg_catalog.pg_extension e
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
-LEFT JOIN pg_catalog.pg_available_extension_versions v
-       ON v.name = e.extname AND v.version = e.extversion
 ORDER BY 1";
 
 const AVAILABLE: &str = "\
