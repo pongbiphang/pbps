@@ -2349,20 +2349,43 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 quote(role)?
             ),
         )?]),
+        // One privilege per statement, unlike `GRANT` above. A `REVOKE`
+        // removes only what the one grantor PostgreSQL selects for it put
+        // there, and that selection is made once for the whole statement:
+        // measured on 18.6, a deployer inheriting both `ga` and `gb` ran
+        // `REVOKE SELECT, INSERT` over `r1=r/ga,r1=a/gb` and took only the
+        // `SELECT`, warning `not all privileges could be revoked`; the same
+        // two privileges revoked one statement each took both. The pull
+        // decides revocability per privilege for exactly this reason
+        // (`catalog::revocable_by_current_role`), so keeping the emitted
+        // statement that wide would promise something it cannot do
+        // (DECISIONS 518, #251).
         Change::Revoke {
             role,
             target,
             permissions,
-        } => Ok(vec![scoped(
-            pg,
-            target.schema(),
-            &format!(
-                "REVOKE {} ON {} FROM {};",
-                permission_list(permissions, target)?,
-                securable(target, permissions)?,
-                quote(role)?
-            ),
-        )?]),
+        } => {
+            // `permission_list` still guards the empty set: `REVOKE ON t`
+            // with nothing to revoke is a syntax error, and an empty loop
+            // would emit no statement rather than say so.
+            permission_list(permissions, target)?;
+            permissions
+                .iter()
+                .map(|permission| {
+                    let one = core::iter::once(*permission).collect();
+                    scoped(
+                        pg,
+                        target.schema(),
+                        &format!(
+                            "REVOKE {} ON {} FROM {};",
+                            permission_list(&one, target)?,
+                            securable(target, &one)?,
+                            quote(role)?
+                        ),
+                    )
+                })
+                .collect()
+        }
 
         // `PUBLIC` is written bare, and that is the whole point of the
         // variant: it is SQL's keyword for every principal at once, and
@@ -3321,6 +3344,52 @@ mod tests {
             sql[0].contains("REVOKE SELECT ON TABLE \"app\".\"recent\" FROM \"app_reader\";"),
             "{}",
             sql[0]
+        );
+    }
+
+    /// One privilege per `REVOKE`, unlike the `GRANT` beside it. PostgreSQL
+    /// picks the grantor once for the whole statement and removes only that
+    /// grantor's entries, so a combined revoke over two grantors' entries
+    /// takes one of them and warns about the rest (measured on 18.6, #251).
+    /// The pull answers revocability per privilege for the same reason.
+    #[test]
+    fn a_revoke_carries_one_privilege_per_statement() {
+        let pg = Postgres::new();
+        let sql = sql_of(
+            &pg,
+            &Change::Revoke {
+                role: "app_reader".to_owned(),
+                target: target("app.recent"),
+                permissions: permissions(&[Permission::Select, Permission::Insert]),
+            },
+        );
+        let revokes: Vec<&String> = sql.iter().filter(|s| s.contains("REVOKE")).collect();
+        assert_eq!(revokes.len(), 2, "{sql:?}");
+        for statement in &revokes {
+            // The `REVOKE` line alone: the `SET search_path` this one is
+            // scoped by carries a comma of its own.
+            let line = statement
+                .lines()
+                .find(|l| l.starts_with("REVOKE"))
+                .unwrap_or_else(|| panic!("no REVOKE line in {statement}"));
+            assert!(
+                !line.contains(", "),
+                "one privilege per statement: {statement}"
+            );
+        }
+        assert!(
+            revokes
+                .iter()
+                .any(|s| s
+                    .contains("REVOKE SELECT ON TABLE \"app\".\"recent\" FROM \"app_reader\";")),
+            "{sql:?}"
+        );
+        assert!(
+            revokes
+                .iter()
+                .any(|s| s
+                    .contains("REVOKE INSERT ON TABLE \"app\".\"recent\" FROM \"app_reader\";")),
+            "{sql:?}"
         );
     }
 

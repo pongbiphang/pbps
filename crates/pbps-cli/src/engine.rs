@@ -740,6 +740,247 @@ fn refuse_drop_reports(
 /// its recorded snapshot. A removal must not be refused for a grant it no
 /// longer issues. The server version is checked again on apply because a
 /// saved plan can travel between environments (DECISIONS 429).
+/// A declared grant whose grantee already owns its target (#261).
+///
+/// # Why this is a refusal and not a plan
+///
+/// The `GRANT` cannot change what the role holds. Measured on 18.6: an owner
+/// already holds every privilege on its own object with a `NULL` ACL, and
+/// granting one back only forces the engine to write the *whole* default set
+/// down — `relacl` becomes exactly `acldefault(r, owner)`, and a second grant
+/// changes nothing again. The pull then skips that entry, because the owner's
+/// is the zero point rather than a grant (DECISIONS 371), so the role reads
+/// back as holding nothing there and the differ emits the same `GRANT` on
+/// every plan. The apply runs it and its closing read refuses, having not
+/// achieved what it asked for.
+///
+/// Recording the owner's entry as grants instead is the deadlock 371 exists
+/// to prevent: a declaration naming one permission would be short of the
+/// other seven, and every plan would revoke what ownership provides. So the
+/// declaration is refused, with the line to delete.
+///
+/// # Why it is scoped to the declaration
+///
+/// A managed role that owns objects and is granted nothing on them is an
+/// ordinary, plannable project. Only the grant is impossible, and only that
+/// is refused.
+// The complement is intentionally every change that does not create a
+// securable a grant can name.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn owned_targets(
+    driver: Driver,
+    changes: &ChangeSet,
+    owners: &std::collections::BTreeMap<pbps_model::GrantTarget, String>,
+    session_role: &str,
+) -> anyhow::Result<ConnectedCheck> {
+    // The map is empty on a reader that carries no owner, so the loop would
+    // find nothing anyway — named here so that "this engine was not asked"
+    // reads differently from "this engine was asked and said no".
+    if driver != Driver::Postgres {
+        return Ok(ConnectedCheck {
+            name: "owned_targets",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server grants to an object's owner like any other principal, \
+                      and this reader carries no object owner; the PostgreSQL check for a \
+                      grant no `REVOKE` could ever undo does not apply"
+                .to_owned(),
+        });
+    }
+    // Who will own each target when the `GRANT` runs, which is not always who
+    // owns it now. A plan that creates a target — or replaces one, which this
+    // model spells as a drop and a create — leaves it owned by the role that
+    // ran the statements, **measured** on 18.6: a table created in somebody
+    // else's schema is owned by its creator, not by the schema's owner.
+    //
+    // Both directions matter. Asking the baseline about a replaced object
+    // refuses a valid plan, because the old object's owner is gone with it;
+    // asking it about a created one finds nothing and lets through the grant
+    // whose closing read then refuses the apply.
+    let created: std::collections::BTreeSet<pbps_model::GrantTarget> = changes
+        .changes
+        .iter()
+        .filter_map(|planned| match &planned.change {
+            pbps_model::Change::CreateTable { name, .. } => {
+                Some(pbps_model::GrantTarget::Object(name.clone()))
+            }
+            pbps_model::Change::CreateModule { id, .. } => match id {
+                pbps_model::ModuleId::Routine(r) => {
+                    Some(pbps_model::GrantTarget::Routine(r.clone()))
+                }
+                pbps_model::ModuleId::Named(n) => Some(pbps_model::GrantTarget::Object(n.clone())),
+                // A trigger is not a securable a grant can name.
+                pbps_model::ModuleId::Trigger { .. } => None,
+            },
+            // Every other change either leaves the target where it was or
+            // takes it away, and a grant on something this plan drops is a
+            // different finding.
+            _ => None,
+        })
+        .collect();
+
+    // A rename moves the target without changing who owns it, and the grant
+    // beside it in the same plan names the object as the plan leaves it. The
+    // owner map is keyed by what the read saw, so the question has to be
+    // asked under the earlier name.
+    //
+    // Only tables: a module is replaced rather than renamed, and a role this
+    // dialect does not manage is renamed in the cluster before the plan is
+    // built, so the read already knows it under its new name (DECISIONS 377).
+    let renamed: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::GrantTarget> =
+        changes
+            .changes
+            .iter()
+            .filter_map(|planned| match &planned.change {
+                pbps_model::Change::RenameTable { from, to, .. } => Some((
+                    pbps_model::GrantTarget::Object(to.clone()),
+                    pbps_model::GrantTarget::Object(from.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+
+    let mut impossible = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::Grant {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        else {
+            continue;
+        };
+        // An owner neither the plan nor the read supplies is an object this
+        // read did not cover. Absent, not empty — and not something this
+        // check can refuse on.
+        let owner = if created.contains(target) {
+            (!session_role.is_empty()).then_some(session_role)
+        } else {
+            owners
+                .get(renamed.get(target).unwrap_or(target))
+                .map(String::as_str)
+        };
+        if owner == Some(role.as_str()) {
+            let when = if created.contains(target) {
+                format!(
+                    "role `{role}` will own `{target}`, because this plan creates it and \
+                         the role that runs the statements owns what they create (measured)"
+                )
+            } else {
+                format!("role `{role}` owns `{target}`")
+            };
+            impossible.push(format!(
+                "{when}, so `{}` on it is a grant that cannot change what the role holds: an \
+                 owner already holds every privilege on its own object, and this engine \
+                 records the whole default set rather than the one permission (ADR-0010 §1, \
+                 measured). The pull reads that entry as the zero point rather than a grant \
+                 (DECISIONS 371), so nothing would ever satisfy this line — delete it from \
+                 role `{role}`",
+                permissions
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if !impossible.is_empty() {
+        anyhow::bail!("owned_targets (PostgreSQL): {}", impossible.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "owned_targets",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: "no declared grant names a target its own grantee owns".to_owned(),
+    })
+}
+
+/// Refuse a plan that revokes a grant no `REVOKE` from this connection could
+/// take away (#251).
+///
+/// Asked of the plan rather than of the read, and that is the whole point.
+/// The grants are ordinary ones: a declaration that *keeps* one is satisfied
+/// by the database exactly as it stands, and dropping them from the pull
+/// instead refused every connected command over the database — `baseline`
+/// included — for a plan that emits no statement at all.
+///
+/// The other direction has nothing downstream to catch it. A `REVOKE` whose
+/// grantor the engine does not select reports success with the entry still
+/// standing, and the apply's read-back does not notice: measured, it exited 0
+/// and recorded the narrowing as converged (#700). So this is the only place
+/// that answer can be given, and it is given before a statement runs.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn unrevocable_grants(
+    driver: Driver,
+    changes: &ChangeSet,
+    unrevocable: &[pbps_db::catalog::Unrevocable],
+) -> anyhow::Result<ConnectedCheck> {
+    if driver != Driver::Postgres {
+        return Ok(ConnectedCheck {
+            name: "unrevocable_grants",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server's `REVOKE` names its grantor with `AS`, and this reader \
+                      carries no unrevocable grant; the PostgreSQL check for a grant this \
+                      connection could not take away does not apply"
+                .to_owned(),
+        });
+    }
+    // A rename moves the target without changing who granted what on it, and
+    // the `Revoke` beside it in the same plan names the object as the plan
+    // leaves it — while this list is keyed by what the read saw. The same
+    // translation `owned_targets` makes, for the same reason: without it a
+    // plan that renames and narrows in one step passes a check that would
+    // refuse either step alone.
+    //
+    // Only tables, again: a module is replaced rather than renamed, and a
+    // schema this dialect does not rename cannot move under a grant.
+    let renamed: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::GrantTarget> =
+        changes
+            .changes
+            .iter()
+            .filter_map(|planned| match &planned.change {
+                pbps_model::Change::RenameTable { from, to, .. } => Some((
+                    pbps_model::GrantTarget::Object(to.clone()),
+                    pbps_model::GrantTarget::Object(from.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+
+    let mut impossible = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::Revoke {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        else {
+            continue;
+        };
+        let read_as = renamed.get(target).unwrap_or(target);
+        for found in unrevocable {
+            if &found.role == role
+                && &found.target == read_as
+                && permissions.contains(&found.permission)
+            {
+                impossible.push(format!("role {role}: {}", found.why));
+            }
+        }
+    }
+    if !impossible.is_empty() {
+        anyhow::bail!("unrevocable_grants (PostgreSQL): {}", impossible.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "unrevocable_grants",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: "every permission this plan revokes is one a `REVOKE` from this connection \
+                  would carry the grantor of"
+            .to_owned(),
+    })
+}
+
 pub async fn permission_support(
     conn: &mut Conn,
     changes: &ChangeSet,

@@ -13760,8 +13760,14 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
     assert_eq!(check["engine"], "SQL Server");
     assert_eq!(check["status"], "not_applicable");
     assert!(check["message"].as_str().unwrap().contains("PostgreSQL"));
-    let drop_check = &report["data"]["connected_checks"][1];
-    assert_eq!(drop_check["name"], "drop_blockers");
+    // By name, not by position: the list grows as checks are added, and a
+    // positional read turns any addition into this test's failure.
+    let drop_check = report["data"]["connected_checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "drop_blockers")
+        .unwrap_or_else(|| panic!("missing drop_blockers: {report}"));
     assert_eq!(drop_check["engine"], "SQL Server");
     assert_eq!(drop_check["status"], "unavailable");
     assert!(
@@ -13770,7 +13776,13 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
             .unwrap()
             .contains("not implemented")
     );
-    for name in ["missing_roles", "rename_evidence", "before_a_rebuild"] {
+    for name in [
+        "owned_targets",
+        "unrevocable_grants",
+        "missing_roles",
+        "rename_evidence",
+        "before_a_rebuild",
+    ] {
         let check = report["data"]["connected_checks"]
             .as_array()
             .unwrap()

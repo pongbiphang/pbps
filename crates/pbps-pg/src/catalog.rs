@@ -36,7 +36,7 @@ pub use pbps_db::catalog::Spellings;
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
     RawDefaultAcl, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg,
-    RawOtherGrant, RawRole, RawSharedDependency, RawTable, assemble,
+    RawOtherGrant, RawOwner, RawRole, RawSharedDependency, RawTable, assemble,
 };
 
 /// The emitter quotes both parts of every table name. PostgreSQL compares
@@ -793,6 +793,12 @@ type CatalogBatch = BTreeMap<String, Vec<serde_json::Value>>;
 /// All catalog relations are sampled by one statement, even when the caller
 /// has already written under READ COMMITTED. JSON is only the internal row
 /// transport; the checked decoder below still constructs the same RawCatalog.
+/// The role every statement of this connection runs as, and so the only
+/// grantor whose entries a `REVOKE` this tool emits can remove.
+/// `current_user` rather than `session_user`: a `SET ROLE` moves both the
+/// grantor a `GRANT` records and the one a `REVOKE` can match.
+const SESSION: &str = "SELECT current_user::text AS role";
+
 fn batch_query() -> String {
     // Aggregation must preserve semantic position order: sorting the JSON
     // itself would reorder columns and routine arguments (pinned live).
@@ -812,6 +818,8 @@ fn batch_query() -> String {
         ("held_elsewhere", HELD_ELSEWHERE.to_owned(), "role_name, in_database, deptype"),
         ("default_acls", DEFAULT_ACLS.to_owned(), "grantor, in_schema, objtype"),
         ("unheld_modules", unheld_modules_query(), "schema_name, name"),
+        ("session", SESSION.to_owned(), "role"),
+        ("owners", owners_query(), "schema_name, object_name, routine_oid, kind"),
     ]
     .into_iter()
     .map(|(part, query, order)| format!(
@@ -1072,6 +1080,26 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             superuser: flag(row, "superuser")?,
         });
     }
+    // Exactly one row, always: `current_user` is never null and never plural.
+    // Absent means the batch itself did not run, which is a different finding
+    // from "this connection has no role" and must not read as one.
+    raw.session_role = text(
+        batch
+            .get("session")
+            .ok_or_else(|| missing("session"))?
+            .first()
+            .ok_or_else(|| DbError::BadRow("catalog batch part session is empty".to_owned()))?,
+        "role",
+    )?;
+    for row in batch.get("owners").ok_or_else(|| missing("owners"))? {
+        raw.owners.push(RawOwner {
+            schema: text(row, "schema_name")?,
+            object: optional_text(row, "object_name")?,
+            kind: granted_kind(&text(row, "source")?, &text(row, "kind")?),
+            routine_oid: row.integer("routine_oid")?,
+            owner: text(row, "owner")?,
+        });
+    }
     for row in batch.get("grants").ok_or_else(|| missing("grants"))? {
         raw.grants.push(RawGrant {
             // `None` is PUBLIC, which the query spells as a NULL rather than
@@ -1088,6 +1116,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             column: optional_text(row, "column_name")?,
             defaulted: flag(row, "defaulted")?,
             owner: text(row, "owner")?,
+            grantor: text(row, "grantor")?,
+            revocable: flag(row, "revocable")?,
         });
     }
     for row in batch
@@ -1267,6 +1297,19 @@ SELECT r.rolname AS name, r.rolsuper AS superuser
 /// role as holding nothing on a table it can read a column of.
 fn grants_query() -> String {
     let not_one_of_our_tables = not_one_of_our_tables();
+    let relation_revocable = revocable_by_current_role(
+        "c.relowner",
+        "COALESCE(c.relacl, pg_catalog.acldefault(\
+         (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))",
+    );
+    let routine_revocable = revocable_by_current_role(
+        "p.proowner",
+        "COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))",
+    );
+    let schema_revocable = revocable_by_current_role(
+        "n.nspowner",
+        "COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))",
+    );
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS object_name,
                 'rel' AS source, c.relkind::text AS kind,
@@ -1275,13 +1318,17 @@ fn grants_query() -> String {
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee,
                 a.privilege_type, a.is_grantable,
                 c.relacl IS NULL AS defaulted,
-                pg_catalog.pg_get_userbyid(c.relowner) AS owner
+                pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+                pg_catalog.pg_get_userbyid(a.grantor) AS grantor,
+                {relation_revocable} AS revocable
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(c.relacl, pg_catalog.acldefault(
                     (CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::\"char\", c.relowner))) AS a
-          WHERE {NOT_AN_INDEX_OR_TOAST}
+           CROSS JOIN pg_catalog.pg_roles me
+          WHERE me.rolname = current_user
+            AND {NOT_AN_INDEX_OR_TOAST}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {not_one_of_our_tables}
          UNION ALL
@@ -1290,7 +1337,11 @@ fn grants_query() -> String {
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
-                false, pg_catalog.pg_get_userbyid(c.relowner)
+                false, pg_catalog.pg_get_userbyid(c.relowner),
+                pg_catalog.pg_get_userbyid(a.grantor),
+                -- A column-level grant is outside the model whatever its
+                -- grantor, and is reported before this is read (DECISIONS 97).
+                false
            FROM pg_catalog.pg_attribute at
            JOIN pg_catalog.pg_class c ON c.oid = at.attrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1304,23 +1355,29 @@ fn grants_query() -> String {
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
-                p.proacl IS NULL, pg_catalog.pg_get_userbyid(p.proowner)
+                p.proacl IS NULL, pg_catalog.pg_get_userbyid(p.proowner),
+                pg_catalog.pg_get_userbyid(a.grantor),
+                {routine_revocable}
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))) AS a
-          WHERE {NOT_A_PROJECTS_SCHEMA}
+           CROSS JOIN pg_catalog.pg_roles me
+          WHERE me.rolname = current_user AND {NOT_A_PROJECTS_SCHEMA}
          UNION ALL
          SELECT n.nspname, NULL::text, 'nsp', '',
                 NULL::int8, NULL::text,
                 CASE WHEN a.grantee = 0 THEN NULL
                      ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
                 a.privilege_type, a.is_grantable,
-                n.nspacl IS NULL, pg_catalog.pg_get_userbyid(n.nspowner)
+                n.nspacl IS NULL, pg_catalog.pg_get_userbyid(n.nspowner),
+                pg_catalog.pg_get_userbyid(a.grantor),
+                {schema_revocable}
            FROM pg_catalog.pg_namespace n
            CROSS JOIN LATERAL pg_catalog.aclexplode(
                 COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))) AS a
-          WHERE {NOT_A_PROJECTS_SCHEMA}
+           CROSS JOIN pg_catalog.pg_roles me
+          WHERE me.rolname = current_user AND {NOT_A_PROJECTS_SCHEMA}
          ORDER BY 1, 2, 6, 7, 8"
     )
 }
@@ -1351,6 +1408,92 @@ fn empty_routine_acls_query() -> String {
 /// `GRANT SELECT ON mk.parent` (a partitioned table) both land in `relacl`. A
 /// filter that named only the declarable kinds reported the role as holding
 /// nothing there, which is *absent* reading as *empty*.
+/// Who owns each securable a grant can name — read from the object catalogs,
+/// not from the ACLs.
+///
+/// An ACL row is the wrong source for this. `aclexplode` returns nothing for
+/// an ACL that is explicitly empty, and an ACL that holds only other
+/// principals' entries has no owner row in it either. **Measured** on 18.6:
+/// `REVOKE ALL ON s.t FROM a2_owner` leaves `relacl = '{}'`, and the same
+/// revoke beside one grant leaves `{a2_reader=r/a2_owner}`. Either way the
+/// object is owned, and a reader that learned owners from ACL rows alone
+/// would report those two as owned by nobody — absent reading as empty, and
+/// `owned_targets` accepting a declaration that cannot converge (#261).
+///
+/// Three arms rather than four: a column-level grant is on its table, and
+/// takes that table's owner.
+fn owners_query() -> String {
+    let not_one_of_our_tables = not_one_of_our_tables();
+    format!(
+        "SELECT n.nspname AS schema_name, c.relname AS object_name,
+                'rel' AS source, c.relkind::text AS kind, NULL::int8 AS routine_oid,
+                pg_catalog.pg_get_userbyid(c.relowner) AS owner
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE {NOT_AN_INDEX_OR_TOAST}
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {not_one_of_our_tables}
+         UNION ALL
+         SELECT n.nspname, p.proname, 'pro', p.prokind::text, p.oid::int8,
+                pg_catalog.pg_get_userbyid(p.proowner)
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+         UNION ALL
+         SELECT n.nspname, NULL::text, 'nsp', '', NULL::int8,
+                pg_catalog.pg_get_userbyid(n.nspowner)
+           FROM pg_catalog.pg_namespace n
+          WHERE {NOT_A_PROJECTS_SCHEMA}
+         ORDER BY 1, 2, 5"
+    )
+}
+
+/// Whether a `REVOKE` from this connection would remove an ACL entry.
+///
+/// An effective grant option answers `GRANT`, not `REVOKE`: PostgreSQL only
+/// changes the entries attributed to the grantor it selects. Owner and
+/// superuser act as the owner; otherwise the current role wins when it holds a
+/// **direct** option, and a **unique inherited** option is sufficient too —
+/// measured on 18.6, `ih_deploy` inheriting `ih_mid` and holding no direct
+/// option of its own revoked `ih_reader=r/ih_mid`, while the same revoke with
+/// a competing direct option in place removed nothing and reported success.
+/// Competing inherited paths need explicit role selection, because PostgreSQL
+/// does not promise which one wins (DECISIONS 483).
+///
+/// One original grantor per grantee, target **and privilege** as well: a
+/// `REVOKE` removes only the entries its selected grantor put there, so
+/// measured on 18.6 `r1=ar/own1` beside `r1=r/dep1` keeps its `SELECT` when
+/// `dep1` revokes. The test is per privilege and not per target, because two
+/// *different* privileges of one grantee may come from two grantors and each
+/// still be revocable alone — `REVOKE SELECT` by `dep1` took `r1=r/dep1` away
+/// and left `r1=a/own1` standing (measured). What one statement cannot do is
+/// combine two grantors' authority, and [`crate::emit`] keeps that
+/// unrepresentable by revoking one privilege per statement (DECISIONS 518,
+/// #251).
+///
+/// `owner` and `acl` are the catalog columns of the securable in the caller's
+/// query; the caller supplies `me` as a `pg_roles` row for `current_user`.
+pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
+    format!(
+        "COALESCE(a.grantor = CASE
+             WHEN me.rolsuper OR me.oid = {owner} THEN {owner}
+             WHEN EXISTS (SELECT FROM pg_catalog.aclexplode({acl}) own
+                 WHERE own.grantee = me.oid AND own.is_grantable
+                   AND own.privilege_type = a.privilege_type) THEN me.oid
+             ELSE (SELECT min(candidate.oid::bigint)::oid FROM (
+                 SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
+                 UNION
+                 SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
+                  WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
+                    AND opt.grantee <> 0
+                    AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
+             ) candidate HAVING count(*) = 1)
+         END, false) AND (SELECT count(DISTINCT grantor)
+             FROM pg_catalog.aclexplode({acl})
+            WHERE grantee = a.grantee AND privilege_type = a.privilege_type) = 1"
+    )
+}
+
 const NOT_AN_INDEX_OR_TOAST: &str = "c.relkind NOT IN ('i', 'I', 't')";
 
 /// The argument types of every routine a grant can name, one row per
@@ -2319,10 +2462,33 @@ mod tests {
             "held_elsewhere",
             "default_acls",
             "unheld_modules",
+            "owners",
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }
+        // The one part that is never empty: `current_user` always answers.
+        batch.insert(
+            "session".to_owned(),
+            vec![serde_json::json!({"role": "deploy"})],
+        );
         batch
+    }
+
+    /// Absent, empty and unreadable are three different things, and none of
+    /// them is "this connection has no role". A grant's grantor is compared
+    /// against this name to decide whether any `REVOKE` could remove it
+    /// (#251), so a silently empty one would make every entry look like the
+    /// deployer's own.
+    #[test]
+    fn the_connections_own_role_cannot_be_read_as_absent() {
+        let mut batch = empty_catalog_batch();
+        assert_eq!(decode_batch(&batch).unwrap().0.session_role, "deploy");
+        batch.insert("session".to_owned(), Vec::new());
+        assert!(decode_batch(&batch).is_err(), "an empty part");
+        batch.insert("session".to_owned(), vec![serde_json::json!({})]);
+        assert!(decode_batch(&batch).is_err(), "a row without the column");
+        batch.remove("session");
+        assert!(decode_batch(&batch).is_err(), "a missing part");
     }
 
     #[test]

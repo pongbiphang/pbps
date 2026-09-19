@@ -44,6 +44,17 @@ pub struct Managed {
     /// never ignorable warnings, and no recorder accepts a schema that has any
     /// (see [`managed_limitations`]).
     pub limitations: Vec<String>,
+    /// The grants this read could see and this connection could not take
+    /// away (#251): an entry a third role granted, where no `REVOKE` this
+    /// connection runs would carry that grantor.
+    ///
+    /// Here rather than in [`pbps_diff::Scoped`] for the reason above — whose
+    /// grantor a statement carries is a dialect fact, and the differ knows no
+    /// dialect. They are **not** removed from the scoped schema: each is an
+    /// ordinary grant, and a declaration that keeps one is satisfied by the
+    /// database as it stands. Only a plan that revokes one is impossible, and
+    /// that is what [`crate::engine::unrevocable_grants`] refuses.
+    pub unrevocable: Vec<pbps_db::catalog::Unrevocable>,
     /// Every module in the database that introspection cannot express, by identity,
     /// with the reason already rendered.
     ///
@@ -364,6 +375,7 @@ async fn managed_state_full(
     Ok(Managed {
         scoped,
         limitations,
+        unrevocable: pulled.unrevocable.clone(),
         unreadable,
         rows,
         unmanaged_relations,
@@ -417,6 +429,12 @@ fn cut(
         .filter(|id| modules.contains(*id))
         .cloned()
         .collect();
+    // Kept whole rather than cut: a declared grant's target is the project's
+    // by construction, and the caller looks each one up by name. An owner
+    // this map lacks is an object the read did not see, which is a different
+    // finding from one whose owner is somebody else.
+    scoped.owners = pulled.owners.clone();
+    scoped.session_role = pulled.session_role.clone();
     report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
     Ok(scoped)
 }
@@ -971,9 +989,22 @@ pub(crate) fn unexpressible_permissions<'a>(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
 ) -> Vec<&'a str> {
+    permissions_the_managed_set_keeps(&pulled.unexpressible, ids, modules)
+}
+
+/// The same cut, asked of a list on its own — by `init`, which has findings
+/// and a generated identity file but no `Pulled` left to ask.
+///
+/// One function rather than two that have to agree: `init` tells the operator
+/// which of these `baseline` will refuse over, and `baseline` is this filter
+/// (#308).
+pub(crate) fn permissions_the_managed_set_keeps<'a>(
+    found: &'a [pbps_db::catalog::Unexpressible],
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+) -> Vec<&'a str> {
     let managed_tables: BTreeSet<&TableName> = ids.tables.values().collect();
-    pulled
-        .unexpressible
+    found
         .iter()
         .filter(|u| ids.roles.values().any(|managed| managed == &u.role))
         .filter(|u| match &u.target {
@@ -1091,7 +1122,7 @@ fn dependency_hints_for_schema(
 /// sound only because no recorder writes a snapshot whose managed set names a
 /// module the schema does not hold — [`managed_limitations`] turns such a
 /// module into a refusal before `record` is reached.
-fn managed_modules(
+pub(crate) fn managed_modules(
     recorded: Option<&pbps_model::StateSnapshot>,
     declared: Option<&pbps_model::Schema>,
 ) -> BTreeSet<ModuleId> {
@@ -3215,6 +3246,21 @@ pub fn cmd_bootstrap(
                 conn.driver(),
                 &existing.scoped.missing_roles,
             )?;
+            // This command builds what it grants on, so the role running it
+            // owns every object the declarations name. A grant to that role
+            // is the impossible line a connected plan is refused for, and
+            // here there is nothing downstream to catch it: the engine writes
+            // only the owner's default ACL entry, the pull reads that entry
+            // as the zero point (DECISIONS 371), and this command compares no
+            // declared grant against what it built. Unrefused it reports
+            // success and records a snapshot that does not hold the grant
+            // (#261).
+            crate::engine::owned_targets(
+                conn.driver(),
+                &cs,
+                &existing.scoped.owners,
+                &existing.scoped.session_role,
+            )?;
 
             // Only names the plan creates need to be free (DECISIONS 118).
             // PostgreSQL grants use existing cluster roles; their existence
@@ -3818,6 +3864,16 @@ pub fn cmd_plan_db(
 
         findings.extend(policy);
         let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
+        // Asked of the read this plan was built from, not of the connection
+        // again: the owners came out of the same statement snapshot as the
+        // schema, so the two cannot disagree (DECISIONS 174).
+        let owned_targets =
+        crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners, &scoped.session_role)?;
+        // The other half of the same read, and the other direction: a grant
+        // this connection could see and could not take away is refused only
+        // when the plan actually revokes it (#251).
+        let unrevocable_grants =
+            crate::engine::unrevocable_grants(conn.driver(), &cs, &managed.unrevocable)?;
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
@@ -3861,7 +3917,15 @@ pub fn cmd_plan_db(
             cs,
             baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
-            vec![permission_support, drop_blockers, missing_roles, rename_evidence, rebuilds],
+            vec![
+                permission_support,
+                owned_targets,
+                unrevocable_grants,
+                drop_blockers,
+                missing_roles,
+                rename_evidence,
+                rebuilds,
+            ],
             findings,
             cost,
         ))
@@ -6129,6 +6193,9 @@ mod tests {
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
             public_execute: Default::default(),
+            owners: Default::default(),
+            session_role: String::new(),
+            unrevocable: Vec::new(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
                 entry(
@@ -9631,6 +9698,9 @@ mod tests {
                 },
             ],
             public_execute: Default::default(),
+            owners: Default::default(),
+            session_role: String::new(),
+            unrevocable: Vec::new(),
         }
     }
 

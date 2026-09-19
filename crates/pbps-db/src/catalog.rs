@@ -74,6 +74,60 @@ pub struct Pulled {
     /// Empty on an engine whose `CREATE` grants no such default; on those
     /// there is nothing to write down.
     pub public_execute: pbps_model::PublicExecute,
+    /// Who owns each securable this read saw, for the one question the
+    /// schema cannot answer: whether a declared grant's grantee already owns
+    /// its target.
+    ///
+    /// Not part of [`Pulled::schema`] for the same reason `public_execute`
+    /// is not: ownership is not a grant, and the owner's ACL entry is the
+    /// zero point every object of that kind starts from (DECISIONS 371).
+    /// Recording it as grants would make a declaration naming one permission
+    /// short of the rest, and every plan would revoke what ownership
+    /// provides.
+    ///
+    /// It is carried because a `GRANT` to the owner cannot change what the
+    /// owner holds — measured, it only forces the engine to write the whole
+    /// default set down — so a declaration asking for one plans the same
+    /// statement forever and the apply's closing read refuses it (#261).
+    ///
+    /// Empty on an engine whose reader does not carry an owner.
+    pub owners: std::collections::BTreeMap<pbps_model::GrantTarget, String>,
+    /// The role this connection runs its statements as, and therefore the
+    /// role that will own whatever the plan creates — measured on 18.6, a
+    /// table created in somebody else's schema is owned by its creator, not
+    /// by the schema's owner. The owner of a target a plan replaces is
+    /// tomorrow's owner, not the one in [`Pulled::owners`] (#261).
+    ///
+    /// Empty on an engine whose reader does not carry one.
+    pub session_role: String,
+    /// Grants this connection can read and could not take away: an entry a
+    /// third role granted, where no `REVOKE` this connection runs would
+    /// carry that grantor (PostgreSQL; DECISIONS 483, 518).
+    ///
+    /// They are ordinary grants and stay in [`Pulled::schema`], because a
+    /// declaration that *keeps* one is satisfied by the database exactly as
+    /// it stands. Leaving them out refused that declaration — and refused
+    /// `baseline` before it — for a plan that emits no statement at all.
+    ///
+    /// The limitation is on one direction only, so it rides here and is
+    /// spent where that direction is: a plan whose `Revoke` names one of
+    /// these is refused before a statement runs (#251).
+    ///
+    /// Empty on an engine whose reader does not answer the question.
+    pub unrevocable: Vec<Unrevocable>,
+}
+
+/// One grant a read could see and this connection could not remove.
+///
+/// The `why` is rendered by the reader that found it, because only the
+/// engine's own vocabulary can say whose grantor it carries and what would
+/// have to happen instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrevocable {
+    pub role: String,
+    pub target: pbps_model::GrantTarget,
+    pub permission: pbps_model::Permission,
+    pub why: String,
 }
 
 /// One permission the model cannot hold, and enough about it for the caller

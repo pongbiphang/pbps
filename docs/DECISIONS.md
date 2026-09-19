@@ -13859,3 +13859,33 @@ SPEC is in sync with all of these.
      declarations as `public_execute: true`. Still not a grant and still not
      compared — but a pull that recorded nothing would hand back a project
      whose first apply closes a routine the database has open.
+
+518. **A `REVOKE` carries one privilege, and revocability is decided per
+     privilege.** 483 read "multiple original grantors on one grantee and
+     target" as a single gap. Measured on PostgreSQL 18.6, it is two cases and
+     only one of them is a gap. Two grantors on **one** privilege defeat any
+     single statement: with `reader=ar/owner,reader=r/deploy`, the deployer's
+     `REVOKE SELECT` removed its own entry and left the owner's, so the reader
+     still held `SELECT`. Two grantors on **two** privileges do not: over
+     `reader=a/owner,reader=r/deploy`, the same `REVOKE SELECT` took the
+     deployer's `SELECT` away and left the owner's `INSERT` standing, which is
+     exactly the narrowing a declaration that keeps `INSERT` asks for. Reading
+     the rule per target refused that plan and refused `baseline` before it.
+
+     So the catalog's revocability question is asked per grantee, target **and
+     privilege** (`catalog::revocable_by_current_role`, shared with the doctor
+     so the diagnosis and the read that refuses a plan cannot disagree).
+
+     What makes that answer true of the statements this tool runs is the
+     second half: the PostgreSQL emitter revokes **one privilege per
+     statement**, where `GRANT` beside it still names the whole set. The
+     engine selects the grantor once for the whole `REVOKE`, so a deployer
+     inheriting both `ga` and `gb` running `REVOKE SELECT, INSERT` over
+     `reader=r/ga,reader=a/gb` removed only the `SELECT` and warned `not all
+     privileges could be revoked`; the same two privileges revoked one
+     statement each removed both (measured). Worse than the warning, the
+     apply's read-back did not refuse that half-done run — it recorded the
+     narrowing as converged while the `INSERT` was still standing. A wider
+     statement would therefore have the pull promise per privilege what the
+     emitted statement settles per grantor, so the width is what goes rather
+     than the promise (#251).

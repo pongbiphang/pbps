@@ -1444,6 +1444,19 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // are compared like any other role's. There is no engine default here
         // for a declaration to opt back in to.
         public_execute: Default::default(),
+        // This reader carries no owner. On this engine a schema has one and a
+        // table inherits it, and `sys.database_permissions` records the
+        // grantor rather than the owner — so the question #261 asks of
+        // PostgreSQL has a different answer here and no caller asks it yet.
+        owners: Default::default(),
+        // This reader carries no object owner and no session role; both
+        // belong to the PostgreSQL grantor rules (ADR-0010 §1).
+        session_role: String::new(),
+        // The same rules: this engine's `REVOKE` takes an `AS` clause and its
+        // catalog records the grantor, so "no statement from this connection
+        // could remove it" is a question with a different shape here, and no
+        // caller asks it yet (#251).
+        unrevocable: Vec::new(),
     }
 }
 

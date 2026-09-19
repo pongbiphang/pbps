@@ -235,6 +235,24 @@ fn scalar(connection: &str, sql: &str) -> i64 {
         })
 }
 
+/// One text cell, for the catalog questions a test asks in passing.
+fn text_of(connection: &str, sql: &str) -> String {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            c.query(sql).await.unwrap()[0]
+                .try_get_at::<&str>(0)
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        })
+}
+
 fn latest_snapshot(connection: &str) -> pbps_model::StateSnapshot {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1777,6 +1795,1249 @@ fn bootstrap_refuses_to_record_a_routine_a_trigger_reopened_to_public() {
     on_server(connection, "DROP EVENT TRIGGER reopen_revoke");
     succeeds(d.run(&["bootstrap", "--db", connection]));
     assert!(!public_executes(connection, "app.shut()"));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// Issue #308. `init --from` is the adoption workflow (SPEC §14.1), and it
+/// kept the introspector's schema, warnings and unmanaged inventory while
+/// dropping its `unexpressible` entries. A column-level grant or a
+/// `WITH GRANT OPTION` could therefore be left out of the generated
+/// declarations without being said out loud — and the command then printed a
+/// success and suggested `baseline`, which refuses that database on exactly
+/// those facts (DECISIONS 95, 97, 110).
+///
+/// The supported-grants case is the other half: a database with nothing
+/// inexpressible in it adopts with the plain suggestion, so this is a report
+/// and not a new refusal.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_init_ux_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "init-unexpressible");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} NOSUPERUSER; CREATE SCHEMA app;              CREATE TABLE app.t (id integer PRIMARY KEY, email text);              CREATE TABLE app.plain (id integer PRIMARY KEY);              GRANT USAGE ON SCHEMA app TO {};              GRANT SELECT (email) ON app.t TO {};              GRANT SELECT ON app.plain TO {} WITH GRANT OPTION",
+            role.1, role.1, role.1, role.1
+        ),
+    );
+
+    let adopt = |tag: &str, connection: &str| {
+        let dir = std::env::temp_dir().join(format!("pbps-init-ux-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let var = format!("PBPS_INIT_UX_{tag}_{}", std::process::id());
+        let o = Command::new(BIN)
+            .env(&var, connection)
+            .arg("--project")
+            .arg(&dir)
+            .args([
+                "init",
+                "--from",
+                "source",
+                "--url-env",
+                &var,
+                "--dialect",
+                "postgres",
+            ])
+            .output()
+            .unwrap();
+        (dir, o)
+    };
+
+    let (dir, o) = adopt("held", connection);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    // The role, the target and the privilege — each named, for both shapes.
+    for expected in [
+        role.1.as_str(),
+        "app.t",
+        "column `email`",
+        "app.plain",
+        "WITH GRANT OPTION",
+    ] {
+        assert!(all.contains(expected), "{expected} missing from: {all}");
+    }
+    // And the next step says so rather than sending the operator to a
+    // `baseline` that refuses on the same facts.
+    assert!(
+        stdout(&o).contains("`baseline` refuses a database holding one"),
+        "{}",
+        stdout(&o)
+    );
+    // Adoption writes declarations and no ledger entry: `init` never touches
+    // the database it read.
+    assert!(dir.join("schema.ids.json").is_file());
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE n.nspname = 'public' AND c.relname = '__pbps_state'"
+        ),
+        0,
+        "init wrote a ledger"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The control: the same adoption against a database whose grants the
+    // model can all hold.
+    let plain = OwnDatabase::new(&server, "init-expressible");
+    on_server(
+        plain.connection(),
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer PRIMARY KEY)",
+    );
+    let (dir, o) = adopt("plain", plain.connection());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("pbps baseline --env source --reason initial-adoption"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        !stdout(&o).contains("`baseline` refuses a database holding one"),
+        "{}",
+        stdout(&o)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The third case, and the one that decides which list the suggestion is
+    // counted from: a permission the model cannot express on a securable
+    // nothing manages. It is still reported — the operator asked what this
+    // read left behind — but `baseline` cuts it out (DECISIONS 176), so
+    // sending them to revoke it would be sending them to undo a privilege
+    // that never reaches a plan.
+    let outside = Role(
+        server.clone(),
+        format!("pbps_init_outside_{}", std::process::id()),
+    );
+    let aside = OwnDatabase::new(&server, "init-outside");
+    on_server(
+        aside.connection(),
+        &format!(
+            "CREATE ROLE {} NOSUPERUSER; CREATE SCHEMA app; \
+             CREATE TABLE app.t (id integer PRIMARY KEY); \
+             CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS n; \
+             GRANT USAGE ON SCHEMA app TO {}; \
+             GRANT SELECT ON app.mv TO {} WITH GRANT OPTION",
+            outside.1, outside.1, outside.1
+        ),
+    );
+    let (dir, o) = adopt("outside", aside.connection());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("`app.mv` is on a materialized view"),
+        "the finding is still reported: {}",
+        stderr(&o)
+    );
+    assert!(
+        !stdout(&o).contains("`baseline` refuses a database holding one"),
+        "{}",
+        stdout(&o)
+    );
+    // And the claim the suggestion no longer makes is the one the next
+    // command settles.
+    let var = format!("PBPS_INIT_UX_outside_{}", std::process::id());
+    let baselined = Command::new(BIN)
+        .env(&var, aside.connection())
+        .arg("--project")
+        .arg(&dir)
+        .args([
+            "baseline",
+            "--env",
+            "source",
+            "--reason",
+            "initial-adoption",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        code(&baselined),
+        0,
+        "{}{}",
+        stdout(&baselined),
+        stderr(&baselined)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #261. A managed role that owns a managed object already holds every
+/// privilege on it, with no ACL entry at all; the pull reads that entry — when
+/// a `GRANT` forces the engine to write one — as the zero point rather than as
+/// grants (DECISIONS 371). So a declaration granting the owner something reads
+/// back as unsatisfied, the differ emits the same `GRANT` on every plan, and
+/// the apply's closing read refuses it for not having achieved its own
+/// postcondition.
+///
+/// Refused at `plan --db` instead, with the line to delete. The second half is
+/// what keeps the rule scoped to the declaration: the same role owning the
+/// same table, granted nothing on it, is an ordinary project.
+/// Issue #261, at the one command that creates the objects it grants on.
+///
+/// `bootstrap` builds the declared schema, so the role that runs it owns
+/// everything it built. A declaration granting that role a permission on what
+/// it just created is the same impossible line a connected plan is refused
+/// for — and there is nothing downstream to catch it here: the engine writes
+/// only the owner's default ACL entry, the pull reads that entry as the zero
+/// point (DECISIONS 371), and `bootstrap` has no declared-against-built
+/// comparison of grants. Unrefused, it reports success and records a snapshot
+/// that does not hold the declared grant.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn bootstrap_refuses_a_grant_to_the_role_that_will_own_what_it_builds() {
+    let server = server();
+    // The schema belongs to somebody else, so that the `usage` line the
+    // grant needs is not itself the impossible one.
+    let holder = format!("pbps_bootstrap_holder_{}", std::process::id());
+    let other = format!("pbps_bootstrap_reader_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: server.clone(),
+        names: vec![holder.clone(), other.clone()],
+    };
+    on_server(
+        &server,
+        &format!("CREATE ROLE {holder} NOSUPERUSER; CREATE ROLE {other} NOSUPERUSER"),
+    );
+    let own = OwnDatabase::new(&server, "bootstrap-owned-target");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE SCHEMA app AUTHORIZATION {holder}"),
+    );
+    let deployer = text_of(connection, "SELECT current_user");
+
+    let d = Demo::new("bootstrap-owned-target");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("owned_targets") && stderr(&refused).contains("will own"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+    // Refused before a statement runs: nothing built, nothing recorded.
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'app'"
+        ),
+        0
+    );
+
+    // The same build, granted to somebody who will not own it. The deployer's
+    // own file stays: a role file that vanishes while another appears is a
+    // rename to the resolver, and this test is not about identity.
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/other.yml"),
+        format!("role: {other}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// Issue #261. The owner a grant has to be checked against is the one the
+/// object will have when the statement runs, not the one the baseline read
+/// carries — and for an object the plan creates, the baseline has no owner
+/// for it at all.
+///
+/// **Measured** on 18.6: a table created in somebody else's schema is owned
+/// by its creator, not by the schema's owner. So the role that runs the plan
+/// owns what the plan creates, and a declaration granting that role something
+/// on it is the same impossible line as on a table that already stands.
+///
+/// The other half of this — a target the plan *replaces* — cannot reach this
+/// check: `before_a_rebuild` refuses a rebuild whose object somebody else
+/// owns, precisely because the rebuild would hand it to the deploying
+/// account. The created case is the one that gets here.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_on_a_table_this_plan_creates_is_checked_against_its_coming_owner() {
+    let server = server();
+    let other = format!("pbps_other_reader_{}", std::process::id());
+    // The schema belongs to neither the deployment role nor the grantee, so
+    // that the `usage` line every grant here needs is not itself the
+    // impossible one this test is about.
+    let holder = format!("pbps_schema_holder_{}", std::process::id());
+    let mover = format!("pbps_table_mover_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: server.clone(),
+        names: vec![other.clone(), holder.clone(), mover.clone()],
+    };
+    on_server(
+        &server,
+        &format!(
+            "CREATE ROLE {other} NOSUPERUSER; CREATE ROLE {holder} NOSUPERUSER; \
+             CREATE ROLE {mover} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&server, "owner-after-plan");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE SCHEMA app AUTHORIZATION {holder}"),
+    );
+
+    let d = Demo::new("owner-after-plan");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    // A table that does not exist yet, granted to the role that will own it
+    // the moment the plan creates it.
+    let deployer = text_of(connection, "SELECT current_user");
+    let new_table = "table: app.n\ncolumns:\n  id: {type: bigint, nullable: false}\n\
+                     primary_key: {name: pk_n, columns: [id]}\n";
+    std::fs::write(d.dir.join("schema/n.yml"), new_table).unwrap();
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n  app.n: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("owned_targets") && stderr(&refused).contains("will own"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.n"), "{}", stderr(&refused));
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
+    // The negative case: the same new table, granted to somebody who will not
+    // own it. A plan that creates a table and grants on it is ordinary work.
+    // Kept, not deleted: a role file that vanishes while another appears is
+    // a rename to the resolver, and this test is not about identity.
+    std::fs::write(
+        d.dir.join("schema/deployer.yml"),
+        format!("role: {deployer}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/other.yml"),
+        format!("role: {other}\ngrants:\n  schema::app: [usage]\n  app.n: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // And the third way a target can move under the check: a rename carries
+    // the object's owner with it, while the map is keyed by what the read
+    // saw. The grant names the table as the plan leaves it.
+    // Handed to a role with no recorded grants of its own, so that moving the
+    // owner does not itself read as drift: an owner's entry is the zero point
+    // and leaves the comparison when it arrives.
+    on_server(connection, &format!("ALTER TABLE app.n OWNER TO {mover}"));
+    std::fs::write(
+        d.dir.join("schema/n.yml"),
+        new_table.replace("table: app.n", "table: app.m\nrenamed_from: app.n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/other.yml"),
+        format!("role: {other}\ngrants:\n  schema::app: [usage]\n  app.m: [select]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/mover.yml"),
+        format!("role: {mover}\ngrants:\n  schema::app: [usage]\n  app.m: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let renamed = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&renamed),
+        1,
+        "{}{}",
+        stdout(&renamed),
+        stderr(&renamed)
+    );
+    assert!(
+        stderr(&renamed).contains("owned_targets")
+            && stderr(&renamed).contains("app.m")
+            && stderr(&renamed).contains(&mover),
+        "{}",
+        stderr(&renamed)
+    );
+}
+
+/// Issue #251, and the reason the grantor rule asks the engine rather than
+/// comparing names.
+///
+/// A `REVOKE` carries the grantor PostgreSQL selects for it, and an inherited
+/// one counts when nothing competes with it (DECISIONS 483). **Measured** on
+/// 18.6: `ih_deploy`, an inheriting member of `ih_mid` and holding no direct
+/// option of its own, removed `ih_reader=r/ih_mid`; with a competing direct
+/// option in place the same statement removed nothing and reported success.
+///
+/// So the deployer here can narrow a role whose grants a role it inherits
+/// made, and a name comparison would refuse that valid plan.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_from_a_role_the_deployer_inherits_is_one_it_can_still_narrow() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_ih_owner_{pid}");
+    let mid = format!("pbps_ih_mid_{pid}");
+    let deployer = format!("pbps_ih_deploy_{pid}");
+    let reader = format!("pbps_ih_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), mid.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; CREATE ROLE {mid} LOGIN NOSUPERUSER \
+             PASSWORD 'trigger-test'; CREATE ROLE {deployer} LOGIN NOSUPERUSER INHERIT \
+             PASSWORD 'trigger-test'; CREATE ROLE {reader} NOSUPERUSER; \
+             GRANT {mid} TO {deployer}"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "inherited-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT SELECT, INSERT ON app.t TO {mid} WITH GRANT OPTION; \
+             GRANT USAGE ON SCHEMA app TO {reader}, {mid}"
+        ),
+    );
+    // The entry this test is about: made by `mid`, which the deployer
+    // inherits and holds no competing direct option against.
+    on_server(
+        &as_role(connection, &mid),
+        &format!("GRANT SELECT, INSERT ON app.t TO {reader}"),
+    );
+    let deployment = as_role(connection, &deployer);
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+    assert_eq!(granted("INSERT"), 1);
+
+    let d = Demo::new("inherited-grantor");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database a role this deployer inherits granted into",
+    ]));
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("revoke insert on app.t"),
+        "{}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 0);
+    succeeds(d.run(&["verify", "--db", &deployment]));
+}
+
+/// Issue #251, the other half of the grantor rule. A `REVOKE` matches on the
+/// grantor, and a least-privilege deployer holding `WITH GRANT OPTION` is the
+/// second grantor whose entries this connection can match: it granted them
+/// under its own name, not the owner's.
+///
+/// Reported as unexpressible, those entries would refuse the narrowing plan
+/// the deployer is entitled to run — and refuse `baseline` before that, since
+/// the database would be holding a permission the declarations cannot carry.
+///
+/// Run as the deployer, not as a superuser, because a superuser's grant on
+/// somebody else's object records the **owner** as grantor (measured): the
+/// case only exists where the connection is the grantor and the owner is
+/// somebody else.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_deployers_own_onward_grant_is_one_it_can_still_narrow() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_gr_owner_{pid}");
+    let deployer = format!("pbps_gr_deploy_{pid}");
+    let reader = format!("pbps_gr_read_{pid}");
+    // Declared before the database so that it drops after it: the roles own
+    // objects inside it, and locals drop in reverse declaration order.
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "deployer-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT SELECT, INSERT ON app.t TO {deployer} WITH GRANT OPTION; \
+             GRANT USAGE ON SCHEMA app TO {reader}"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The grant this test is about: made by the deployer, under its own name.
+    on_server(
+        &deployment,
+        &format!("GRANT SELECT, INSERT ON app.t TO {reader}"),
+    );
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 1);
+
+    let d = Demo::new("deployer-grantor");
+    d.table(ONE_COLUMN);
+    // Narrower than the database: the `INSERT` is the change this plan makes.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database this deployer granted into",
+    ]));
+
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("revoke insert on app.t"),
+        "{}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    // The statement the deployer was entitled to run, and it landed.
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 0);
+    succeeds(d.run(&["verify", "--db", &deployment]));
+}
+
+/// Issue #251, the grain of the grantor rule. A `REVOKE` removes only the
+/// entries the one grantor it selects put there, so two grantors on **one**
+/// privilege of one grantee defeat it. Two grantors on two *different*
+/// privileges do not: measured on 18.6, `REVOKE SELECT` run by the deployer
+/// over `reader=a/owner,reader=r/deployer` took the `SELECT` away and left
+/// the owner's `INSERT` standing.
+///
+/// Reading that rule per target rather than per privilege refuses a narrowing
+/// the deployer is entitled to run, and refuses `baseline` before it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_the_deployer_made_is_narrowable_beside_one_the_owner_made() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_mix_owner_{pid}");
+    let deployer = format!("pbps_mix_deploy_{pid}");
+    let reader = format!("pbps_mix_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "mixed-grantors");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT SELECT ON app.t TO {deployer} WITH GRANT OPTION; \
+             GRANT INSERT ON app.t TO {reader}; \
+             GRANT USAGE ON SCHEMA app TO {reader}"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The second grantor on the same target, and the whole point of the case:
+    // the owner granted the `INSERT`, this connection granted the `SELECT`.
+    on_server(&deployment, &format!("GRANT SELECT ON app.t TO {reader}"));
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(DISTINCT grantor)::bigint \
+                   FROM pg_class c, aclexplode(c.relacl) a \
+                  WHERE c.oid = 'app.t'::regclass \
+                    AND a.grantee = '{reader}'::regrole::oid"
+            ),
+        ),
+        2,
+        "the grantee has to hold entries from two grantors for this case to exist"
+    );
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+
+    let d = Demo::new("mixed-grantors");
+    d.table(ONE_COLUMN);
+    // The owner's `INSERT` is kept; the deployer's own `SELECT` is the one
+    // this plan takes away.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [insert]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database two roles granted into",
+    ]));
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("revoke select on app.t"),
+        "{}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    assert_eq!(granted("SELECT"), 0);
+    assert_eq!(
+        granted("INSERT"),
+        1,
+        "the owner's grant was not this plan's"
+    );
+    succeeds(d.run(&["verify", "--db", &deployment]));
+
+    // The negative the rule is for: two grantors on **one** privilege. The
+    // deployer's `REVOKE INSERT` would leave the owner's entry behind, so the
+    // permission is unexpressible and the declaration that drops it is
+    // refused before a statement runs.
+    on_server(
+        connection,
+        &format!("GRANT INSERT ON app.t TO {deployer} WITH GRANT OPTION"),
+    );
+    on_server(&deployment, &format!("GRANT INSERT ON app.t TO {reader}"));
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("INSERT") && stderr(&refused).contains(&reader),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(granted("INSERT"), 1, "nothing ran");
+}
+
+/// Issue #251, why one `REVOKE` carries one privilege. PostgreSQL selects the
+/// grantor once for the whole statement, so a combined `REVOKE SELECT, INSERT`
+/// over entries from two grantors takes only one of them and warns `not all
+/// privileges could be revoked` — measured on 18.6, where the same two
+/// privileges revoked one statement each took both.
+///
+/// Both grantors are roles this deployer inherits, so each privilege is
+/// revocable on its own; only the width of the statement could lose one.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn two_grantors_on_two_privileges_are_revoked_one_statement_each() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_two_owner_{pid}");
+    let deployer = format!("pbps_two_deploy_{pid}");
+    let first = format!("pbps_two_first_{pid}");
+    let second = format!("pbps_two_second_{pid}");
+    let reader = format!("pbps_two_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![
+            owner.clone(),
+            deployer.clone(),
+            first.clone(),
+            second.clone(),
+            reader.clone(),
+        ],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {first} NOSUPERUSER; \
+             CREATE ROLE {second} NOSUPERUSER; \
+             CREATE ROLE {reader} NOSUPERUSER; \
+             GRANT {first} TO {deployer}; \
+             GRANT {second} TO {deployer}"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "two-grantors");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {first}, {second}, {reader}; \
+             GRANT SELECT ON app.t TO {first} WITH GRANT OPTION; \
+             GRANT INSERT ON app.t TO {second} WITH GRANT OPTION"
+        ),
+    );
+    // One privilege from each intermediate role, which is what makes a single
+    // statement unable to carry both. `SET ROLE` rather than a connection of
+    // their own: the grantor a `GRANT` records is the current role, and these
+    // two need no login for that.
+    on_server(
+        connection,
+        &format!(
+            "SET ROLE {first}; GRANT SELECT ON app.t TO {reader}; RESET ROLE; \
+             SET ROLE {second}; GRANT INSERT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(DISTINCT grantor)::bigint \
+                   FROM pg_class c, aclexplode(c.relacl) a \
+                  WHERE c.oid = 'app.t'::regclass \
+                    AND a.grantee = '{reader}'::regrole::oid"
+            ),
+        ),
+        2,
+        "the two privileges have to come from two grantors for this case to exist"
+    );
+    let deployment = as_role(connection, &deployer);
+    let granted = |permission: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', '{permission}') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        )
+    };
+    assert_eq!(granted("SELECT"), 1);
+    assert_eq!(granted("INSERT"), 1);
+
+    let d = Demo::new("two-grantors");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select, insert]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database two intermediate roles granted into",
+    ]));
+    // Both permissions go, in one plan.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        &deployment,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]));
+    // One combined statement would have left one of these standing.
+    assert_eq!(granted("SELECT"), 0);
+    assert_eq!(granted("INSERT"), 0);
+    succeeds(d.run(&["verify", "--db", &deployment]));
+}
+
+/// Issue #251, the direction the limitation is *not* in. An entry a third
+/// role granted is an ordinary grant: a declaration that keeps it is
+/// satisfied by the database exactly as it stands, and no statement is
+/// needed. Left out of the pull instead, it made every connected command over
+/// that database fail — `refuse_unexpressible` runs before the changes are
+/// looked at — so a no-op plan and the `baseline` before it were both refused.
+///
+/// Only the removal is impossible, and that is what is refused, before a
+/// statement runs and with the grantor named.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_thd_owner_{pid}");
+    let deployer = format!("pbps_thd_deploy_{pid}");
+    let third = format!("pbps_thd_third_{pid}");
+    let reader = format!("pbps_thd_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![
+            owner.clone(),
+            deployer.clone(),
+            third.clone(),
+            reader.clone(),
+        ],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {third} NOSUPERUSER; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "third-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {third}, {reader}; \
+             GRANT SELECT ON app.t TO {third} WITH GRANT OPTION; \
+             SET ROLE {third}; GRANT SELECT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The deployer is not the owner, is no member of the grantor, and holds no
+    // option of its own on this privilege: nothing it runs takes this away.
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*)::bigint FROM pg_class c, aclexplode(c.relacl) a \
+                  WHERE c.oid = 'app.t'::regclass \
+                    AND a.grantee = '{reader}'::regrole::oid \
+                    AND a.grantor = '{third}'::regrole::oid"
+            ),
+        ),
+        1,
+        "the entry has to carry the third role's grantor for this case to exist"
+    );
+
+    let d = Demo::new("third-grantor");
+    d.table(ONE_COLUMN);
+    // The declaration that keeps it. Nothing has to run for this to be true.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database a third role granted into",
+    ]));
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("No changes."),
+        "the declaration matches the database: {}",
+        stdout(&planned)
+    );
+    succeeds(d.run(&["verify", "--db", &deployment]));
+
+    // The one direction that is impossible, refused before a statement runs.
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let _ = std::fs::remove_file(&plan);
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("unrevocable_grants"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains(&third), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("nothing this tool can run takes it away"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', 'SELECT') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        ),
+        1,
+        "nothing ran"
+    );
+}
+
+/// Issue #251, the rename the check has to see through. A plan that renames a
+/// table and narrows a role in the same step spells the `Revoke` with the name
+/// the plan leaves behind, while the read that found the grant knows the
+/// object under the name it had. Keyed by the planned name alone, the check
+/// finds nothing and lets through a `REVOKE` that removes no ACL entry — and
+/// nothing downstream catches that (#700).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_grant_no_revoke_could_remove_is_found_under_the_name_the_read_saw() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_rn_owner_{pid}");
+    let deployer = format!("pbps_rn_deploy_{pid}");
+    let third = format!("pbps_rn_third_{pid}");
+    let reader = format!("pbps_rn_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![
+            owner.clone(),
+            deployer.clone(),
+            third.clone(),
+            reader.clone(),
+        ],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {third} NOSUPERUSER; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "renamed-grantor");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {third}, {reader}; \
+             GRANT SELECT ON app.t TO {third} WITH GRANT OPTION; \
+             SET ROLE {third}; GRANT SELECT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+
+    let d = Demo::new("renamed-grantor");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database a third role granted into",
+    ]));
+
+    // The rename and the narrowing in one plan: the `Revoke` names `app.moved`
+    // and the read knows the grant on `app.t`.
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: app.moved\nrenamed_from: app.t"));
+    std::fs::write(
+        d.dir.join("schema/reader.yml"),
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("unrevocable_grants") && stderr(&refused).contains(&third),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', 'SELECT') \
+                 THEN 1 ELSE 0 END::bigint"
+            ),
+        ),
+        1,
+        "nothing ran"
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(server.clone(), format!("pbps_owner_{}", std::process::id()));
+    let own = OwnDatabase::new(&server, "owned-target");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE ROLE {} NOSUPERUSER; CREATE SCHEMA app", role.1),
+    );
+
+    let d = Demo::new("owned-target");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/owner.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    // Ownership handed over out of band, which is the only way it moves: this
+    // tool does not own `ALTER TABLE ... OWNER TO` (ADR-0010 §2).
+    on_server(
+        connection,
+        &format!("ALTER TABLE app.t OWNER TO {}", role.1),
+    );
+
+    // The declaration that cannot converge.
+    std::fs::write(
+        d.dir.join("schema/owner.yml"),
+        format!(
+            "role: {}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n",
+            role.1
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("owned_targets"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("app.t"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains(&role.1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("delete it from role"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
+    // The same declaration against an object whose ACL holds nothing at all.
+    // `aclexplode` returns no rows for `{}`, so a reader that learned owners
+    // from ACL rows would have this object owned by nobody and would accept
+    // the very declaration refused above.
+    on_server(connection, &format!("REVOKE ALL ON app.t FROM {}", role.1));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT CASE WHEN relacl IS NOT NULL AND cardinality(relacl) = 0 \
+             THEN 1 ELSE 0 END::bigint FROM pg_class WHERE relname = 't'"
+        ),
+        1,
+        "the ACL has to be explicitly empty for this case to exist"
+    );
+    // The declaration is the one already committed above; only the database
+    // has moved.
+    let still = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&still), 1, "{}{}", stdout(&still), stderr(&still));
+    assert!(
+        stderr(&still).contains("owned_targets") && stderr(&still).contains("app.t"),
+        "{}",
+        stderr(&still)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
+    // The same ownership, granted nothing: an ordinary project.
+    std::fs::write(
+        d.dir.join("schema/owner.yml"),
+        format!("role: {}\n", role.1),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
     succeeds(d.run(&["verify", "--db", connection]));
 }
 

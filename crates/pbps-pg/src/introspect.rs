@@ -281,6 +281,16 @@ pub struct RawCatalog {
     pub default_acls: Vec<RawDefaultAcl>,
     pub other_grants: Vec<RawOtherGrant>,
     pub held_elsewhere: Vec<RawSharedDependency>,
+    /// Who owns each securable a grant can name, read from the object
+    /// catalogs. An ACL is the wrong place to learn this — see
+    /// `catalog::owners_query`.
+    pub owners: Vec<RawOwner>,
+    /// The role this connection runs its statements as (`current_user`).
+    ///
+    /// Needed beside every grant's grantor because a `REVOKE` matches on the
+    /// grantor and nothing else: this connection can take back what it
+    /// granted itself, and only that.
+    pub session_role: String,
 }
 
 /// A role held by something **outside this database** (ADR-0010 §4).
@@ -330,6 +340,24 @@ pub struct RawRole {
 /// `aclitem` text form is the engine's and parsing it here would be a second,
 /// worse copy of `aclexplode` — the letters are positional, `m` arrived in
 /// PostgreSQL 17, and a letter this code did not know would read as no
+/// One securable and the role that owns it, straight from the object
+/// catalogs.
+///
+/// Separate from [`RawGrant`] because ownership is a fact about the object and
+/// a grant is a fact about a principal: an object with no ACL rows at all is
+/// still owned, and reading ownership out of the ACL made that object look
+/// like one nobody owns (#261, measured — see `catalog::owners_query`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawOwner {
+    pub schema: String,
+    /// `None` is the schema itself.
+    pub object: Option<String>,
+    pub kind: GrantedKind,
+    /// The routine's oid, for the signature its identity needs.
+    pub routine_oid: Option<i64>,
+    pub owner: String,
+}
+
 /// permission at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawGrant {
@@ -383,6 +411,43 @@ pub struct RawGrant {
     /// The object's owner, for the same reason: the owner's entry is the one
     /// `acldefault` puts there, not one anybody granted.
     pub owner: String,
+    /// Who granted this entry, which decides whether anything the plan runs
+    /// can take it away.
+    ///
+    /// A `REVOKE` removes only the entries the **grantor** put there.
+    /// Measured on 18.6: with `gr_mid` holding `SELECT ... WITH GRANT
+    /// OPTION` from the owner and having granted it onward, neither the
+    /// owner's `REVOKE SELECT ... FROM gr_reader` nor a *superuser's*
+    /// removes `gr_reader=r/gr_mid` — both report success, and
+    /// `has_table_privilege` stays true. So this is not a fact about who is
+    /// entitled to revoke; it is that nobody but the grantor can.
+    ///
+    /// The entries `acldefault` supplies carry the owner as grantor, and so
+    /// does a **superuser's** grant on an object it does not own — measured,
+    /// `postgres` granting on `gr_owner`'s table records `gr_owner` as the
+    /// grantor. That is why comparing against the owner does not report the
+    /// grants this tool makes itself.
+    ///
+    /// A least-privilege deployer is the second grantor whose entries this
+    /// tool can remove: holding `WITH GRANT OPTION`, it grants onward and the
+    /// entry records *itself*, not the owner. Measured on 18.6:
+    /// `go_deployer` granted `go_reader` (`go_reader=r/go_deployer`) and its
+    /// own `REVOKE` took it back.
+    ///
+    /// The name alone does not decide it, which is why
+    /// [`RawGrant::revocable`] exists beside it. An inherited grantor counts
+    /// too when nothing competes with it — measured, `ih_deploy` inheriting
+    /// `ih_mid` and holding no direct option removed `ih_reader=r/ih_mid`,
+    /// while the same revoke with a competing direct option in place removed
+    /// nothing and reported success (DECISIONS 483). This field is what the
+    /// report names; the decision is the engine's.
+    pub grantor: String,
+    /// Whether a `REVOKE` from this connection would remove this entry — the
+    /// question [`crate::catalog::revocable_by_current_role`] puts to the
+    /// engine, because only the engine knows which grantor it would select.
+    ///
+    /// The grantor's *name* is beside it for the report; this is the answer.
+    pub revocable: bool,
 }
 
 /// A routine with an explicitly empty ACL: no grant row can represent it.
@@ -565,7 +630,10 @@ impl Parts<'_> {
 /// Pure: every decision here is a function of `raw`, and every one of them is
 /// reachable from a unit test.
 pub fn assemble(raw: &RawCatalog) -> Pulled {
-    let mut pulled = Pulled::default();
+    let mut pulled = Pulled {
+        session_role: raw.session_role.clone(),
+        ..Pulled::default()
+    };
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
 
@@ -807,6 +875,19 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         )
         .collect();
 
+    // Every securable the read saw, owned by somebody — before a single ACL
+    // row is looked at, because an object with no ACL rows is still owned.
+    for o in &raw.owners {
+        if let Ok(target) = target_named(
+            &o.schema,
+            o.object.as_deref(),
+            o.kind,
+            args_of(o.routine_oid, &signatures),
+            "",
+        ) {
+            pulled.owners.insert(target, o.owner.clone());
+        }
+    }
     for g in &raw.grants {
         if g.grantee.is_none() {
             // PUBLIC. Context, never drift (ADR-0010 §5): it is not a role,
@@ -974,6 +1055,65 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                 ),
             );
             continue;
+        }
+        // The other half of the same `WITH GRANT OPTION` story, one grant
+        // further on: an entry somebody *else* granted. A `REVOKE` removes
+        // only what the grantor put there, so a plan that narrows this role
+        // runs a statement the engine reports as succeeding and the role
+        // keeps the permission (#251). Folded in as a plain grant, that plan
+        // is built, run, and refused by its own read-back — the right answer
+        // at the wrong end of the apply.
+        //
+        // A `REVOKE` removes only the entries its own grantor put there, and
+        // which grantor a statement from this connection carries is the
+        // engine's decision rather than a name comparison: a direct grant
+        // option selects this role, and a *unique* inherited option selects
+        // the role it came through — measured, and recorded as DECISIONS 483.
+        // So the question goes to the engine beside the read
+        // (`revocable_by_current_role`), the same expression `doctor` asks it
+        // with.
+        //
+        // The **owner**'s own entries are exempt ahead of that answer, and
+        // deliberately: they are what `acldefault` supplies and what a
+        // superuser's grant on somebody else's object is recorded as (both
+        // measured on 18.6). A least-privilege deployer cannot revoke them
+        // either — the pull is *run* as that account, by design (DECISIONS
+        // 375) — and reporting them here would refuse to read the databases
+        // this tool is built to deploy into. That narrowing is #696's, with
+        // the deployment-privilege question it needs answering first.
+        //
+        // The limitation is on one direction, and it is recorded as one.
+        // Dropping the grant here instead refused every connected command
+        // over this database — `refuse_unexpressible` runs before the
+        // changes are looked at — including a declaration that *keeps* the
+        // permission and therefore emits no statement at all. So the grant
+        // stays in the schema, where a declaration that matches the database
+        // is satisfied by it, and the plan that would have to run the
+        // impossible `REVOKE` is the one refused (`engine::unrevocable_grants`).
+        //
+        // Folding it in with nothing recorded is the other wrong answer: the
+        // narrowing plan would be built and run, and the `REVOKE` would
+        // report success with the entry still standing. The apply's
+        // read-back does not catch that — measured, it exited 0 and recorded
+        // the narrowing as converged (#700).
+        if g.grantor != g.owner && !g.revocable {
+            pulled.unrevocable.push(pbps_db::catalog::Unrevocable {
+                role: grantee.to_owned(),
+                target: target.clone(),
+                permission,
+                why: format!(
+                    "{} on {} was granted by `{}`, and a `REVOKE` from `{}` would not \
+                     carry that grantor — so nothing this tool can run takes it away. \
+                     Select `{}` explicitly, or have its owner `{}` revoke it \
+                     (ADR-0010 §1, DECISIONS 483, measured)",
+                    g.permission,
+                    target_label(g, &signatures),
+                    g.grantor,
+                    raw.session_role,
+                    g.grantor,
+                    g.owner
+                ),
+            });
         }
         if let Some(role) = pulled.schema.roles.get_mut(grantee) {
             role.grants.entry(target).or_default().insert(permission);
@@ -1222,11 +1362,32 @@ fn target_of(
     g: &RawGrant,
     signatures: &BTreeMap<i64, Vec<&str>>,
 ) -> Result<pbps_model::GrantTarget, Unsupported> {
-    let Some(object) = g.object.as_deref() else {
-        return Ok(pbps_model::GrantTarget::Schema(g.schema.clone()));
+    target_named(
+        &g.schema,
+        g.object.as_deref(),
+        g.kind,
+        routine_args(g, signatures),
+        &g.permission,
+    )
+}
+
+/// The same question asked of a securable rather than of a grant, so that an
+/// object with no ACL row at all can still be named (see [`RawOwner`]).
+///
+/// `permission` reaches the failure messages only; a caller that wants the
+/// target alone passes an empty one and keeps the `Ok`.
+fn target_named(
+    schema: &str,
+    object: Option<&str>,
+    kind: GrantedKind,
+    spelled_args: Vec<&str>,
+    permission: &str,
+) -> Result<pbps_model::GrantTarget, Unsupported> {
+    let Some(object) = object else {
+        return Ok(pbps_model::GrantTarget::Schema(schema.to_owned()));
     };
-    let name = pbps_model::ObjectName::new(g.schema.clone(), object.to_owned());
-    match g.kind {
+    let name = pbps_model::ObjectName::new(schema.to_owned(), object.to_owned());
+    match kind {
         // A table or a view: the two the model declares, and the two that
         // share `GRANT ... ON TABLE`.
         GrantedKind::Relation('r' | 'v') => Ok(pbps_model::GrantTarget::Object(name)),
@@ -1243,7 +1404,7 @@ fn target_of(
                 "{} on sequence `{name}` is a grant on a sequence, which this model does not \
                  declare — an identity column needs no such grant and a `serial` column does, \
                  which is why `serial` is refused at load (ADR-0010 §7)",
-                g.permission
+                permission
             ),
         )),
         // A relation this model does not hold. **Measured**, a `GRANT SELECT`
@@ -1254,7 +1415,7 @@ fn target_of(
             pbps_model::GrantTarget::Object(name.clone()),
             format!(
                 "{} on `{name}` is on {}, which this model does not declare",
-                g.permission,
+                permission,
                 relation_kind(other)
             ),
         )),
@@ -1262,7 +1423,7 @@ fn target_of(
         // where the kind overloads (ADR-0009 §1).
         GrantedKind::Routine('f' | 'p') => {
             let mut args = Vec::new();
-            for spelled in routine_args(g, signatures) {
+            for spelled in spelled_args.iter() {
                 match spelled.parse::<RoutineArg>() {
                     Ok(arg) => args.push(arg),
                     // The characters a declaration's argument admits are a
@@ -1277,7 +1438,7 @@ fn target_of(
                         return Err(Unsupported::nameless(format!(
                             "{} on `{name}` is on a routine whose argument `{spelled}` a \
                              declaration cannot spell",
-                            g.permission
+                            permission
                         )));
                     }
                 }
@@ -1292,11 +1453,11 @@ fn target_of(
         GrantedKind::Routine(other) => {
             let what = format!(
                 "{} on `{name}` is on {}, which this model does not declare",
-                g.permission,
+                permission,
                 routine_kind(other)
             );
             let mut args = Vec::new();
-            for spelled in routine_args(g, signatures) {
+            for spelled in spelled_args.iter() {
                 let Ok(arg) = spelled.parse::<RoutineArg>() else {
                     return Err(Unsupported::nameless(what));
                 };
@@ -1312,7 +1473,7 @@ fn target_of(
         // apart, and it says so rather than picking one.
         GrantedKind::Schema => Err(Unsupported::nameless(format!(
             "{} on `{name}` came back as a grant on a schema that also names an object",
-            g.permission
+            permission
         ))),
     }
 }
@@ -1364,7 +1525,12 @@ fn routine_label(
 /// Empty for a routine that takes none — which is a routine all the same, and
 /// is why `RoutineId` keeps the parentheses.
 fn routine_args<'a>(g: &RawGrant, signatures: &BTreeMap<i64, Vec<&'a str>>) -> Vec<&'a str> {
-    g.routine_oid
+    args_of(g.routine_oid, signatures)
+}
+
+/// The same lookup for a securable read from the object catalogs.
+fn args_of<'a>(routine_oid: Option<i64>, signatures: &BTreeMap<i64, Vec<&'a str>>) -> Vec<&'a str> {
+    routine_oid
         .and_then(|oid| signatures.get(&oid))
         .cloned()
         .unwrap_or_default()
@@ -2519,8 +2685,11 @@ mod tests {
         }
     }
 
-    /// One expanded ACL row, of the shape the query returns: an explicit grant
-    /// by somebody other than the owner.
+    /// One expanded ACL row, of the shape the query returns: an explicit
+    /// grant, made by the owner, to somebody other than the owner. The
+    /// grantor is the owner because that is what the engine records for every
+    /// grant this tool makes — including one a superuser makes on an object
+    /// it does not own (measured).
     fn grant(
         grantee: Option<&str>,
         object: Option<&str>,
@@ -2541,6 +2710,12 @@ mod tests {
             column: None,
             defaulted: false,
             owner: "deploy".to_owned(),
+            grantor: "deploy".to_owned(),
+            // The engine's answer, which the fixtures set directly: what
+            // `add_roles` does with an entry it cannot revoke is this file's
+            // business, and which entries those are is
+            // `catalog::revocable_by_current_role`'s.
+            revocable: true,
         }
     }
 
@@ -2592,6 +2767,35 @@ mod tests {
             ],
             module_args: signature(args),
             routine_args: signature(args),
+            // Ownership comes from the object catalogs, so the fixture states
+            // it the same way: an object here has an owner whether or not a
+            // grant row ever mentions it.
+            owners: vec![
+                RawOwner {
+                    schema: "app".to_owned(),
+                    object: Some("customer".to_owned()),
+                    kind: GrantedKind::Relation('r'),
+                    routine_oid: None,
+                    owner: "deploy".to_owned(),
+                },
+                RawOwner {
+                    schema: "app".to_owned(),
+                    object: Some("f".to_owned()),
+                    kind: GrantedKind::Routine(kind),
+                    routine_oid: Some(1),
+                    owner: "deploy".to_owned(),
+                },
+                RawOwner {
+                    schema: "app".to_owned(),
+                    object: None,
+                    kind: GrantedKind::Schema,
+                    routine_oid: None,
+                    owner: "deploy".to_owned(),
+                },
+            ],
+            // Deliberately not the owner: the two exemptions have to be
+            // distinguishable, or a fixture would pass under either rule.
+            session_role: "deployer".to_owned(),
             ..RawCatalog::default()
         }
     }
@@ -2866,6 +3070,156 @@ mod tests {
         // ADR-0010 §7: the other half of why `serial` is refused at load.
         assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
         assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+    }
+
+    /// Issue #261. An object with no ACL row at all is still owned, so
+    /// ownership is read from the object catalogs and not from the ACL.
+    ///
+    /// Measured on 18.6: `REVOKE ALL ON s.t FROM a2_owner` leaves
+    /// `relacl = '{}'`, which `aclexplode` returns nothing for, and the same
+    /// revoke beside one grant leaves `{a2_reader=r/a2_owner}`, which has no
+    /// owner row in it either. Learned from the ACL, both objects would read
+    /// as owned by nobody — and `owned_targets` would accept a declaration
+    /// granting their owner a privilege it can never observe.
+    #[test]
+    fn an_object_with_no_acl_row_of_its_own_still_has_an_owner() {
+        let none = RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: Vec::new(),
+            ..declaring('f', &[])
+        };
+        let pulled = assemble(&none);
+        assert_eq!(
+            pulled
+                .owners
+                .get(&pbps_model::GrantTarget::Object(
+                    pbps_model::ObjectName::new("app", "customer")
+                ))
+                .map(String::as_str),
+            Some("deploy"),
+            "{:?}",
+            pulled.owners
+        );
+        assert_eq!(
+            pulled
+                .owners
+                .get(&pbps_model::GrantTarget::Schema("app".to_owned()))
+                .map(String::as_str),
+            Some("deploy")
+        );
+
+        // And the negative case: an owner the read never saw is absent, not
+        // invented. `owned_targets` asks by name, and a name it cannot find
+        // is an object this read did not cover — a different finding from one
+        // whose owner is somebody else.
+        assert!(
+            !pulled.owners.contains_key(&pbps_model::GrantTarget::Object(
+                pbps_model::ObjectName::new("app", "elsewhere")
+            ))
+        );
+    }
+
+    /// Issue #251. A `REVOKE` removes only what its own grantor granted, so
+    /// an entry a third role put there survives every statement this tool can
+    /// write — measured on 18.6, the owner's revoke and a superuser's both
+    /// report success and leave `has_table_privilege` true.
+    ///
+    /// The grant itself is ordinary and stays in the role's set: a
+    /// declaration that *keeps* it is satisfied by the database exactly as it
+    /// stands, and leaving it out refused that declaration — and `baseline`
+    /// before it — for a plan that emits no statement at all. What is
+    /// recorded is the one direction that is impossible, which
+    /// `engine::unrevocable_grants` spends on a plan that revokes it.
+    ///
+    /// The negative case is the one that decides the rule's shape: the owner
+    /// is the grantor of every entry `acldefault` supplies and of every grant
+    /// this tool makes, so comparing against the owner reports the out-of-band
+    /// grant and not pbps's own.
+    #[test]
+    fn a_grant_made_by_a_third_role_is_reported_rather_than_folded_into_the_set() {
+        let third = |grantor: &str, revocable: bool| {
+            let mut g = grant(
+                Some("app_reader"),
+                Some("customer"),
+                GrantedKind::Relation('r'),
+                "SELECT",
+            );
+            g.grantor = grantor.to_owned();
+            g.revocable = revocable;
+            g
+        };
+
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("app_mid", false)],
+            ..declaring('f', &[])
+        });
+        assert!(
+            !pulled_role(&pulled, "app_reader").grants.is_empty(),
+            "the grant is ordinary; only removing it is impossible"
+        );
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        assert_eq!(pulled.unrevocable.len(), 1);
+        let found = &pulled.unrevocable[0];
+        assert_eq!(found.role, "app_reader");
+        assert_eq!(found.permission, pbps_model::Permission::Select);
+        assert!(
+            matches!(&found.target, pbps_model::GrantTarget::Object(o) if o.to_string() == "app.customer"),
+            "{:?}",
+            found.target
+        );
+        assert!(found.why.contains("granted by `app_mid`"), "{}", found.why);
+        assert!(found.why.contains("`deployer`"), "{}", found.why);
+        assert!(
+            found
+                .why
+                .contains("nothing this tool can run takes it away"),
+            "{}",
+            found.why
+        );
+
+        // The owner's own grant — which is what a superuser's grant on
+        // somebody else's object is recorded as — is an ordinary grant.
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("deploy", true)],
+            ..declaring('f', &[])
+        });
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        assert!(pulled.unrevocable.is_empty(), "{:?}", pulled.unrevocable);
+        assert!(
+            !pulled_role(&pulled, "app_reader").grants.is_empty(),
+            "the owner's grant belongs in the role's set"
+        );
+
+        // The second negative case, and the one the owner test alone gets
+        // wrong: a least-privilege deployer holding `WITH GRANT OPTION`
+        // grants onward under its own name, and its own `REVOKE` takes that
+        // entry back (measured on 18.6). Reported, the narrowing plan it is
+        // entitled to run would be refused instead.
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("deployer", true)],
+            ..declaring('f', &[])
+        });
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        assert!(pulled.unrevocable.is_empty(), "{:?}", pulled.unrevocable);
+        assert!(
+            !pulled_role(&pulled, "app_reader").grants.is_empty(),
+            "this connection's own grant belongs in the role's set"
+        );
     }
 
     /// Every limitation on an object carries that object as its target, and

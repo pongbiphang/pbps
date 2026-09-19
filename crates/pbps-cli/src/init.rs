@@ -85,6 +85,15 @@ struct Prepared {
     /// the adopted database lets `PUBLIC` execute — without it, the first
     /// plan this project produces closes them (ADR-0010 §5).
     public_execute: pbps_model::PublicExecute,
+    /// The permissions the model cannot hold, carried for the same reason
+    /// `cmd_pull` reports them (#308).
+    ///
+    /// Without them `init --from` writes declarations that silently omit a
+    /// column-level grant or a `WITH GRANT OPTION`, prints a successful setup
+    /// and suggests `baseline` — which then refuses the same database on the
+    /// same facts (DECISIONS 95, 97, 110). Reported here, the adoption says
+    /// what it could not take with it while the user is still looking at it.
+    unexpressible: Vec<pbps_db::catalog::Unexpressible>,
 }
 
 /// Creates a project at `root` without requiring one to exist already.
@@ -161,40 +170,41 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     };
     let config_text = render_config(&config);
 
-    let (schema, ids, warnings, unmanaged, onboarding_notices, public_execute) = match (
-        &args.from, &url_env,
-    ) {
-        (Some(_), Some(var)) => {
-            let connection = std::env::var(var).with_context(|| {
+    let (schema, ids, warnings, unmanaged, onboarding_notices, public_execute, unexpressible) =
+        match (&args.from, &url_env) {
+            (Some(_), Some(var)) => {
+                let connection = std::env::var(var).with_context(|| {
                 format!(
                     "cannot adopt the database because ${var} is not set.\nExport it, then run the same `pbps init --from ...` command again."
                 )
             })?;
-            let pulled = db::runtime()?.block_on(async {
-                let mut conn =
-                    pbps_db::Conn::connect(db::driver_for(config.dialect), &connection).await?;
-                crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await
-            })?;
-            let ids = mint_ids(&pulled.schema, &root)?;
-            (
-                pulled.schema,
-                ids,
-                pulled.warnings,
-                pulled.unmanaged_modules,
-                pulled.onboarding_notices,
-                pulled.public_execute,
-            )
-        }
-        (None, _) => (
-            Schema::default(),
-            IdsFile::default(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Default::default(),
-        ),
-        (Some(_), None) => unreachable!("--from always resolves a url variable"),
-    };
+                let pulled = db::runtime()?.block_on(async {
+                    let mut conn =
+                        pbps_db::Conn::connect(db::driver_for(config.dialect), &connection).await?;
+                    crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await
+                })?;
+                let ids = mint_ids(&pulled.schema, &root)?;
+                (
+                    pulled.schema,
+                    ids,
+                    pulled.warnings,
+                    pulled.unmanaged_modules,
+                    pulled.onboarding_notices,
+                    pulled.public_execute,
+                    pulled.unexpressible,
+                )
+            }
+            (None, _) => (
+                Schema::default(),
+                IdsFile::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Default::default(),
+                Vec::new(),
+            ),
+            (Some(_), None) => unreachable!("--from always resolves a url variable"),
+        };
 
     let prepared = Prepared {
         schema,
@@ -204,9 +214,16 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         warnings,
         unmanaged,
         public_execute,
+        unexpressible,
     };
     for warning in onboarding_notices.iter().chain(&prepared.warnings) {
         eprintln!("warning: {warning}");
+    }
+    // Every one of them, unfiltered, as `cmd_pull` reports them: this command
+    // is writing the declarations rather than comparing them, so there is no
+    // managed set yet for one to be somebody else's business (DECISIONS 176).
+    for u in &prepared.unexpressible {
+        eprintln!("warning: {}", u.what);
     }
     if !prepared.unmanaged.is_empty() {
         eprintln!(
@@ -223,11 +240,9 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     commit(&root, stage.path())?;
 
     println!("Initialized pbps project at `{}`.", root.display());
-    if !prepared.warnings.is_empty() {
-        println!(
-            "{} catalog item(s) could not be expressed; see the warnings above.",
-            prepared.warnings.len()
-        );
+    let left_out = prepared.warnings.len() + prepared.unexpressible.len();
+    if left_out > 0 {
+        println!("{left_out} catalog item(s) could not be expressed; see the warnings above.");
     }
     if !prepared.unmanaged.is_empty() {
         println!(
@@ -239,9 +254,33 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         Some(name) => {
             println!("Next: `pbps validate`");
             if args.from.is_some() {
-                println!(
-                    "Then commit the generated files and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
+                // The suggestion has to account for what was just reported:
+                // `baseline` refuses a database holding a permission the
+                // model cannot express (DECISIONS 110), so sending the user
+                // straight to it would be sending them to the same refusal
+                // on the same facts, one command later (#308).
+                // Not the whole list: `baseline` refuses over the ones its
+                // own cut keeps — a role the identity file manages, on a
+                // securable inside the managed set (DECISIONS 176) — and the
+                // generated config leaves everything else unmanaged. Telling
+                // the operator to settle a `WITH GRANT OPTION` on somebody
+                // else's materialized view would send them to revoke a
+                // privilege that never reaches a plan.
+                let settle = crate::deploy::permissions_the_managed_set_keeps(
+                    &prepared.unexpressible,
+                    &prepared.ids,
+                    &crate::deploy::managed_modules(None, Some(&prepared.schema)),
                 );
+                if settle.is_empty() {
+                    println!(
+                        "Then commit the generated files and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
+                    );
+                } else {
+                    println!(
+                        "Then settle the {} permission(s) above — `baseline` refuses a database holding one the declarations cannot express — and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`.",
+                        settle.len()
+                    );
+                }
             } else {
                 println!(
                     "To adopt the existing database first, run `pbps pull --env {name}`; otherwise add declarations under `schema/`."

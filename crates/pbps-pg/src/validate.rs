@@ -452,6 +452,24 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
         // it would propose the same `GRANT` again. Refused here, where the
         // remedy is a line in a file.
         let schema_of = target.schema();
+        // The name that fails somewhere else entirely, and the reason a grant
+        // needs the check a table already has: `$user` is what this engine
+        // substitutes for the current role's own schema wherever a
+        // `search_path` names it, quoted or not
+        // (`emit::NOT_A_SCHEMA_A_PATH_CAN_NAME`). Every `Grant` and `Revoke`
+        // is emitted through `scoped`, whose `write_path` refuses that name —
+        // so the declaration passes this command and stops `plan` instead,
+        // one command later than the remedy is (#272).
+        if schema_of == crate::emit::NOT_A_SCHEMA_A_PATH_CAN_NAME {
+            errs.push(invalid(format!(
+                "role `{name}`: `{target}` is in a schema named `{schema_of}`, which this \
+                 engine reads as the current role's own schema wherever a `search_path` names \
+                 it — quoting does not make it literal. Every grant this dialect emits sets \
+                 the path first, so no plan can carry this one. Grant in a schema the path \
+                 can name"
+            )));
+            continue;
+        }
         if !crate::catalog::a_projects_schema(schema_of) {
             errs.push(invalid(format!(
                 "role `{name}`: `{target}` is in schema `{schema_of}`, which is the engine's \
@@ -768,6 +786,55 @@ mod tests {
             "{}",
             problems[0]
         );
+    }
+
+    /// Issue #272. `$user` is not a schema name here: this engine substitutes
+    /// the current role's own schema for it wherever a `search_path` names
+    /// it, and every grant this dialect emits sets the path first. The
+    /// offline command took the declaration and `plan` stopped on it — the
+    /// right answer, one command later than the remedy is.
+    ///
+    /// # Which spellings are the hazard, measured
+    ///
+    /// A grant target keeps the quoting it was written with: `$user.t` and
+    /// `schema::$user` name the schema `$user`, while `"$user".t` names a
+    /// schema whose name *contains* the quote characters. Only the first two
+    /// reach the substitution — `quote` renders `$user` as `"$user"`, which
+    /// is the token a `search_path` replaces, and renders the quoted name as
+    /// `"""$user"""`, which is not. So the bare spellings are refused and the
+    /// odd-but-distinct name is left alone, along with every schema that
+    /// merely has the word in it.
+    #[test]
+    fn a_grant_target_in_a_schema_a_path_cannot_name_is_refused() {
+        for target in ["schema::$user", "$user.t", "$user.f(integer)"] {
+            let role = granting(&[(target, &[Permission::Usage, Permission::Select])]);
+            let problems = messages("app_reader", &role);
+            assert_eq!(problems.len(), 1, "{target}: {problems:?}");
+            assert!(problems[0].contains("$user"), "{target}: {}", problems[0]);
+            assert!(
+                problems[0].contains("the current role's own schema"),
+                "{target}: {}",
+                problems[0]
+            );
+            // One message, not that one plus the kind and permission checks
+            // below it: the target is unusable, so there is nothing further
+            // to say about it.
+            assert!(
+                !problems[0].contains("DECISIONS 385"),
+                "{target}: {}",
+                problems[0]
+            );
+        }
+        // Neither a schema that merely has the word in its name, nor the one
+        // whose name holds the quote characters, is the engine's token.
+        for target in ["schema::user", "schema::\"$user\""] {
+            let role = granting(&[(target, &[Permission::Usage])]);
+            let problems = messages("app_reader", &role);
+            assert!(
+                !problems.iter().any(|m| m.contains("a `search_path` names")),
+                "{target}: {problems:?}"
+            );
+        }
     }
 
     /// One mistake, one message: a grant with three permissions on a schema

@@ -305,13 +305,10 @@ fn routine_question() -> String {
 }
 
 fn catalog_question(values: &str) -> String {
-    // An effective grant option answers GRANT, not REVOKE. PostgreSQL only
-    // changes ACLs attributed to its selected grantor. Owner/superuser act as
-    // owner; otherwise the current role wins when it has a direct option.
-    // A unique inherited option is also sufficient. Competing inherited paths
-    // need explicit role selection. Require one original grantor per grantee
-    // and target too: separate grantors cannot jointly revoke a privilege list
-    // (DECISIONS 483). Checking each privilege preserves partial-removal demands.
+    // The question itself is `crate::catalog::revocable_by_current_role`,
+    // shared with the pull so that the diagnosis and the read that refuses a
+    // plan cannot answer it differently (#251).
+    let held = crate::catalog::revocable_by_current_role("t.owner", "t.acl");
     format!(
         "WITH managed AS (
             SELECT r.oid FROM pg_catalog.pg_roles r
@@ -337,21 +334,7 @@ fn catalog_question(values: &str) -> String {
         )
         SELECT t.schema_name, t.object_name, t.kind, t.signature,
                a.privilege_type AS privilege, pg_catalog.pg_get_userbyid(a.grantor) AS grantor,
-               COALESCE(a.grantor = CASE
-                   WHEN me.rolsuper OR me.oid = t.owner THEN t.owner
-                   WHEN EXISTS (SELECT FROM pg_catalog.aclexplode(t.acl) own
-                       WHERE own.grantee = me.oid AND own.is_grantable
-                         AND own.privilege_type = a.privilege_type) THEN me.oid
-                   ELSE (SELECT min(candidate.oid::bigint)::oid FROM (
-                       SELECT t.owner AS oid WHERE pg_catalog.pg_has_role(me.oid, t.owner, 'USAGE')
-                       UNION
-                       SELECT opt.grantee FROM pg_catalog.aclexplode(t.acl) opt
-                        WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
-                          AND opt.grantee <> 0
-                          AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
-                   ) candidate HAVING count(*) = 1)
-               END, false) AND (SELECT count(DISTINCT grantor)
-                   FROM pg_catalog.aclexplode(t.acl) WHERE grantee = a.grantee) = 1 AS held,
+               {held} AS held,
                t.usage_ok
           FROM targets t
           CROSS JOIN LATERAL pg_catalog.aclexplode(t.acl) a

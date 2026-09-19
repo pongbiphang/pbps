@@ -25829,20 +25829,31 @@ async fn doctor_adopted_revoke_requires_the_original_grantor() {
         ..grants
     };
     let batched = doctor::missing(&grant_diagnosis(&mut theirs, &batched_grants).await);
+    let batched_acl = format!(
+        "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
+         WHERE c.oid = 'public.batched'::regclass AND a.grantee = '{recipient}'::regrole)"
+    );
+    // One statement over two grantors' entries, which is what the emitter no
+    // longer writes: the engine selects the grantor once for the whole
+    // `REVOKE`, so this takes one privilege and warns about the other.
     theirs
         .execute(&format!(
             "REVOKE SELECT, UPDATE ON public.batched FROM {recipient}"
         ))
         .await
         .unwrap();
-    let batched_left_acl = truth(
-        &mut db.conn,
-        &format!(
-            "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
-         WHERE c.oid = 'public.batched'::regclass AND a.grantee = '{recipient}'::regrole)"
-        ),
-    )
-    .await;
+    let batched_left_acl = truth(&mut db.conn, &batched_acl).await;
+    // The same two privileges, one statement each: both entries go, which is
+    // why the diagnosis above reports no gap (DECISIONS 518).
+    for permission in ["SELECT", "UPDATE"] {
+        theirs
+            .execute(&format!(
+                "REVOKE {permission} ON public.batched FROM {recipient}"
+            ))
+            .await
+            .unwrap();
+    }
+    let batched_cleared_acl = !truth(&mut db.conn, &batched_acl).await;
     for role in [&recipient, &deployer, &first, &second] {
         cleanup_role(&mut db, role).await;
     }
@@ -25858,11 +25869,19 @@ async fn doctor_adopted_revoke_requires_the_original_grantor() {
     assert!(inherited.is_empty(), "{inherited:?}");
     assert!(inherited_removed_acl);
     assert!(owner_issued.is_empty(), "{owner_issued:?}");
+    // Two grantors on two *different* privileges are not a gap: each one is
+    // revocable on its own, and the emitter revokes one privilege per
+    // statement so that the authority never has to be combined (DECISIONS
+    // 518, measured below in both directions).
+    assert!(batched.is_empty(), "{batched:?}");
     assert!(
-        !batched.is_empty(),
-        "separate grantors cannot jointly authorize one REVOKE"
+        batched_left_acl,
+        "one statement cannot carry two grantors' authority"
     );
-    assert!(batched_left_acl);
+    assert!(
+        batched_cleared_acl,
+        "one statement per privilege carries each grantor's own"
+    );
 }
 
 #[tokio::test]
