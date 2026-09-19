@@ -55,28 +55,79 @@ pub(crate) fn required_libraries(catalog: &CatalogFacts) -> Vec<String> {
         "local_preload_libraries",
     ] {
         if let Some(fact) = catalog.settings.get(setting) {
-            names.extend(
-                fact.value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(|entry| {
-                        // `local_preload_libraries` is the one preload setting
-                        // that does not search `dynamic_library_path`: the
-                        // engine loads its names from `$libdir/plugins` alone
-                        // and refuses a directory component, so a bare `foo`
-                        // there is `$libdir/plugins/foo`, not `$libdir/foo`
-                        // (finding on #688).
-                        if setting == "local_preload_libraries" && !entry.contains('/') {
-                            format!("$libdir/plugins/{entry}")
-                        } else {
-                            entry.to_owned()
-                        }
-                    }),
-            );
+            names.extend(library_list(&fact.value).into_iter().map(|entry| {
+                // `local_preload_libraries` is the one preload setting
+                // that does not search `dynamic_library_path`: the
+                // engine loads its names from `$libdir/plugins` alone
+                // and refuses a directory component, so a bare `foo`
+                // there is `$libdir/plugins/foo`, not `$libdir/foo`
+                // (finding on #688).
+                if setting == "local_preload_libraries" && !entry.contains('/') {
+                    format!("$libdir/plugins/{entry}")
+                } else {
+                    entry
+                }
+            }));
         }
     }
     names.into_iter().collect()
+}
+
+/// The names in a preload setting, split as the engine's loader splits them
+/// (`SplitDirectoriesString`, measured on 18): elements are separated by
+/// commas and trimmed, a double-quoted element keeps its commas and spaces,
+/// and `""` inside one is a quote. The engine itself renders the list that
+/// way — `SET session_preload_libraries = 'foo,bar', baz` reads back as
+/// `"foo,bar", baz` and loads `foo,bar` — so a plain split on commas turned
+/// one library into two names nothing resolves, and a compatible scope was
+/// refused as unknown (finding on #688). A list the engine would reject —
+/// an unclosed quote, an empty unquoted element, text after a closing quote
+/// — is kept whole as one name: the engine logs the syntax error and loads
+/// nothing, but that log is not readable from here, and a value that could
+/// not be read must stay a candidate that fails to resolve, not read as
+/// "no libraries".
+pub(crate) fn library_list(value: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = value.trim_start();
+    if rest.is_empty() {
+        return names;
+    }
+    loop {
+        let name;
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut text = String::new();
+            let mut after = quoted;
+            loop {
+                let Some(end) = after.find('"') else {
+                    return vec![value.to_owned()];
+                };
+                text.push_str(&after[..end]);
+                after = &after[end + 1..];
+                if let Some(more) = after.strip_prefix('"') {
+                    text.push('"');
+                    after = more;
+                } else {
+                    break;
+                }
+            }
+            name = text;
+            rest = after;
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            name = rest[..end].trim_end().to_owned();
+            if name.is_empty() {
+                return vec![value.to_owned()];
+            }
+            rest = &rest[end..];
+        }
+        names.push(name);
+        rest = rest.trim_start();
+        match rest.strip_prefix(',') {
+            Some(more) => rest = more.trim_start(),
+            None if rest.is_empty() => return names,
+            None => return vec![value.to_owned()],
+        }
+    }
 }
 
 /// The executable set of one process: its engine image, every file-backed
@@ -413,6 +464,32 @@ mod tests {
     }
 
     #[test]
+    fn a_preload_list_is_split_as_the_engine_splits_it() {
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        // Measured on 18: this is how the engine renders
+        // `SET session_preload_libraries = 'foo,bar', baz, 'q"x', ' sp ace '`
+        // and the names it then tries to load, in order.
+        assert_eq!(
+            library_list(r#""foo,bar", baz, "q""x", " sp ace ""#),
+            names(&["foo,bar", "baz", "q\"x", " sp ace "])
+        );
+        // Unquoted elements lose their surrounding whitespace; a bare list
+        // and an empty one stay what they were.
+        assert_eq!(
+            library_list("  auto_explain ,$libdir/hstore  "),
+            names(&["auto_explain", "$libdir/hstore"])
+        );
+        assert_eq!(library_list(""), Vec::<String>::new());
+        assert_eq!(library_list("   "), Vec::<String>::new());
+        // What the engine rejects as list syntax is one unreadable name, not
+        // a shorter list: an unclosed quote, an empty element, text after a
+        // closing quote.
+        for broken in [r#""foo"#, "a,,b", "a,", r#""a"b"#] {
+            assert_eq!(library_list(broken), names(&[broken]), "{broken:?}");
+        }
+    }
+
+    #[test]
     fn required_libraries_gathers_extension_and_preload_names_deduplicated() {
         use pbps_db::resolver::Observation;
         use pbps_db::resolver::environment::{CatalogFacts, ExtensionFact, SettingFact};
@@ -448,13 +525,18 @@ mod tests {
                     "shared_preload_libraries".to_owned(),
                     setting("auto_explain, $libdir/hstore"),
                 ),
-                ("session_preload_libraries".to_owned(), setting("")),
                 // A local preload is loaded from `$libdir/plugins`, so the
                 // same bare name as the shared one is a different library
                 // (finding on #688).
                 (
                     "local_preload_libraries".to_owned(),
                     setting("auto_explain, plugin_hook"),
+                ),
+                // A quoted element is one library whatever it contains, as
+                // the engine renders and loads it (finding on #688).
+                (
+                    "session_preload_libraries".to_owned(),
+                    setting(r#""foo,bar", auto_explain"#),
                 ),
             ]
             .into_iter()
@@ -468,7 +550,8 @@ mod tests {
                 "$libdir/hstore".to_owned(),
                 "$libdir/plugins/auto_explain".to_owned(),
                 "$libdir/plugins/plugin_hook".to_owned(),
-                "auto_explain".to_owned()
+                "auto_explain".to_owned(),
+                "foo,bar".to_owned()
             ]
         );
     }

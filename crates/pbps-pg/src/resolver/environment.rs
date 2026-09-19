@@ -88,15 +88,16 @@ const EXTENSIONS: &str = "\
 SELECT e.extname::text AS name,
        e.extversion AS version,
        n.nspname::text AS schema,
-       (SELECT pg_catalog.string_agg(r, ',' ORDER BY r) FROM pg_catalog.unnest(v.requires) AS r) AS requires,
-       (SELECT pg_catalog.string_agg(DISTINCT p.probin, ',')
+       (SELECT pg_catalog.json_agg(r ORDER BY r)::text FROM pg_catalog.unnest(v.requires) AS r) AS requires,
+       (SELECT pg_catalog.json_agg(DISTINCT p.probin ORDER BY p.probin)::text
         FROM pg_catalog.pg_depend d
         JOIN pg_catalog.pg_proc p ON p.oid = d.objid
         JOIN pg_catalog.pg_language l ON l.oid = p.prolang
         WHERE d.refclassid = 'pg_catalog.pg_extension'::regclass
           AND d.refobjid = e.oid
           AND d.classid = 'pg_catalog.pg_proc'::regclass
-          AND l.lanname = 'c') AS libraries
+          AND l.lanname = 'c'
+          AND p.probin IS NOT NULL) AS libraries
 FROM pg_catalog.pg_extension e
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
 LEFT JOIN pg_catalog.pg_available_extension_versions v
@@ -150,21 +151,14 @@ pub async fn read(
 
     let mut extensions = Vec::new();
     for row in conn.query(EXTENSIONS).await? {
-        // An aggregate over no rows is NULL, and for `requires` and
-        // `libraries` that is a measured "none" (hstore has neither); the
-        // name, version and namespace are never optional.
-        let list = |field: &str| -> Result<Vec<String>, DbError> {
-            Ok(row
-                .try_get::<&str>(field)?
-                .map(|joined| joined.split(',').map(str::to_owned).collect())
-                .unwrap_or_default())
-        };
+        let name = required(&row, "name", "an extension's name")?;
+        let list = |field: &str| json_list(row.try_get::<&str>(field)?, &name, field);
         extensions.push(ExtensionFact {
-            name: required(&row, "name", "an extension's name")?,
             version: required(&row, "version", "an extension's version")?,
             schema: required(&row, "schema", "an extension's namespace")?,
             requires: list("requires")?,
             libraries: list("libraries")?,
+            name,
         });
     }
 
@@ -293,6 +287,24 @@ fn render_path(schema: &str, extras: &[String]) -> String {
         .join(", ")
 }
 
+/// A name list the catalog query aggregated as a JSON array, so that a
+/// library path or extension name containing a comma stays one element: a
+/// comma-joined `string_agg` had no way to tell `$libdir/foo,bar` from two
+/// libraries, and the two names it produced resolved to nothing, so a scope
+/// whose extension the scratch engine had just as well was refused as
+/// unknown (finding on #688). An aggregate over no rows is NULL, and for
+/// `requires` and `libraries` that is a measured "none" (hstore has
+/// neither).
+fn json_list(text: Option<&str>, extension: &str, field: &str) -> Result<Vec<String>, DbError> {
+    text.map_or(Ok(Vec::new()), |text| {
+        serde_json::from_str(text).map_err(|error| {
+            DbError::BadRow(format!(
+                "extension {extension}'s {field} is not a JSON array of names: {error}"
+            ))
+        })
+    })
+}
+
 fn required(row: &pbps_db::Row, field: &str, what: &str) -> Result<String, DbError> {
     row.try_get::<&str>(field)?
         .map(str::to_owned)
@@ -301,7 +313,7 @@ fn required(row: &pbps_db::Row, field: &str, what: &str) -> Result<String, DbErr
 
 #[cfg(test)]
 mod tests {
-    use super::{render_path, without_temp_schemas};
+    use super::{json_list, render_path, without_temp_schemas};
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| (*name).to_owned()).collect()
@@ -330,6 +342,34 @@ mod tests {
             names(&["pg_temp_archive", "b", "a", "x,pg_temp_3,y"])
         );
         assert_eq!(without_temp_schemas(Vec::new()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_library_name_is_one_element_whatever_it_contains() {
+        assert_eq!(
+            json_list(
+                Some(r#"["$libdir/foo,bar","$libdir/hstore"]"#),
+                "x",
+                "libraries"
+            )
+            .unwrap(),
+            names(&["$libdir/foo,bar", "$libdir/hstore"])
+        );
+        // No rows aggregated is the measured "none", not an error; text
+        // that is not a JSON array of names is an error, not an empty list.
+        assert_eq!(
+            json_list(None, "x", "requires").unwrap(),
+            Vec::<String>::new()
+        );
+        for broken in ["$libdir/hstore", "[1]", "[null]", ""] {
+            let error = json_list(Some(broken), "x", "libraries")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("extension x's libraries"),
+                "{broken:?}: {error}"
+            );
+        }
     }
 
     #[test]
