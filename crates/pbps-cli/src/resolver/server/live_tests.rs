@@ -25,6 +25,15 @@ fn endpoint(variable: &str) -> ScratchEndpoint {
     ScratchEndpoint::parse(&std::env::var(variable).unwrap()).unwrap()
 }
 
+async fn scratch_recipe(
+    target: &mut NativeTarget,
+) -> pbps_db::resolver::environment::DatabaseRecipe {
+    target
+        .database_recipe()
+        .await
+        .expect("the target reports a database recipe")
+}
+
 async fn native_target() -> NativeTarget {
     let peer =
         PeerVerifiedConn::connect(driver(), &std::env::var("PBPS_NATIVE_CONNECTION").unwrap())
@@ -179,11 +188,14 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
     // No inspection session is open here on purpose: one would be a session
     // this run did not open, and admission is required to refuse it.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server.open_scratch().await.expect("scratch resources");
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .expect("scratch resources");
     let database = run.database().to_owned();
     // Reaching into the run's own state: this step exposes no SQL surface,
     // so a declaration path cannot be opened by accident from outside it.
-    run.check().await.unwrap();
+    run.check(&mut target).await.unwrap();
     let connection = &mut run
         .scratch
         .as_mut()
@@ -203,7 +215,7 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
         .execute("CREATE VIEW pbps_server_view AS SELECT id FROM pbps_server_table")
         .await
         .unwrap();
-    run.check()
+    run.check(&mut target)
         .await
         .expect("an ordinary compilation is not drift");
     run.close().await.expect("cleanup removes both objects");
@@ -323,16 +335,19 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // resources are still removed.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     server.check().await.unwrap();
-    let mut run = server.open_scratch().await.unwrap();
-    run.check().await.unwrap();
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .unwrap();
+    run.check(&mut target).await.unwrap();
     session(&configured, maintenance()).await.close().await;
     assert!(matches!(
-        run.check().await,
+        run.check(&mut target).await,
         Err(Error::Exclusivity(super::Signal::SessionCounter))
     ));
     assert!(
         matches!(
-            run.check().await,
+            run.check(&mut target).await,
             Err(Error::Exclusivity(super::Signal::SessionCounter))
         ),
         "an invalidated run keeps answering with the same cause"
@@ -352,20 +367,23 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // and the login on someone else's server.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     server.check().await.unwrap();
-    let mut run = server.open_scratch().await.unwrap();
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .unwrap();
     let database = run.database().to_owned();
     assert!(
-        tokio::time::timeout(std::time::Duration::from_nanos(1), run.check())
+        tokio::time::timeout(std::time::Duration::from_nanos(1), run.check(&mut target))
             .await
             .is_err(),
         "the check must still have been in flight"
     );
     assert!(
-        matches!(run.check().await, Err(Error::Cancelled)),
+        matches!(run.check(&mut target).await, Err(Error::Cancelled)),
         "a cancelled check cannot be resumed"
     );
     assert!(
-        matches!(run.check().await, Err(Error::Cancelled)),
+        matches!(run.check(&mut target).await, Err(Error::Cancelled)),
         "asking again must not be what loses the cleanup capability"
     );
     assert_eq!(run.database(), database);
@@ -380,9 +398,12 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // holding something that can still remove the run-owned objects.
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1), server.open_scratch())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            server.open_scratch(&scratch_recipe(&mut target).await)
+        )
+        .await
+        .is_err(),
         "creation must still have been in flight"
     );
     // The cancelled creation is terminal for the server, and everything but
@@ -391,7 +412,9 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     assert!(matches!(server.check().await, Err(Error::Cancelled)));
     assert!(matches!(server.identity(), Err(Error::Cancelled)));
     assert!(matches!(
-        server.open_scratch().await,
+        server
+            .open_scratch(&scratch_recipe(&mut target).await)
+            .await,
         Err(ServerFailure {
             cause: Error::Cancelled,
             ..
@@ -638,7 +661,10 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
     let configured = endpoint("PBPS_SERVER_ENDPOINT");
     let mut target = native_target().await;
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server.open_scratch().await.unwrap();
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .unwrap();
     let database = run.database().to_owned();
     let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
     api.stop_container(&configured.container).await.unwrap();
@@ -673,4 +699,85 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
         "a credential is never a recovery name"
     );
     target.check().await.unwrap();
+}
+
+/// #610: a run reads the target's environment and deployer authorization,
+/// reproduces them on its scratch database, and compares the two through the
+/// lifecycle. Both the target and the supplied server are the same pinned
+/// image, so a fresh scratch reproduces the target and the scope verifies;
+/// the scope is bound to distinct connections, requalifies on a later check,
+/// and cleanup drops the run-local roles it created with nothing left over.
+#[tokio::test]
+#[ignore = "needs the dedicated-server fixture; run scripts/live-resolver-server.py"]
+async fn a_run_qualifies_its_analysis_scope_against_the_target() {
+    fixture();
+    if driver() != Driver::Postgres {
+        return; // SQL Server scope qualification is #611.
+    }
+    // A write-path extra outside `schemas`: its authorization is part of the
+    // scope (SPEC §7.3), so verification must cover it too, or a faithful
+    // reproduction is refused as missing the schema (finding on #688).
+    let mut setup =
+        PeerVerifiedConn::connect(driver(), &std::env::var("PBPS_NATIVE_CONNECTION").unwrap())
+            .await
+            .unwrap();
+    setup
+        .query("DROP SCHEMA IF EXISTS pbps_extra_688")
+        .await
+        .unwrap();
+    setup.query("CREATE SCHEMA pbps_extra_688").await.unwrap();
+    let mut target = native_target().await;
+    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
+    let mut run = server
+        .open_scratch(&scratch_recipe(&mut target).await)
+        .await
+        .expect("scratch resources");
+
+    let request = crate::resolver::server::ScopeRequest {
+        schemas: vec!["public".to_owned()],
+        write_path_extras: vec!["pbps_extra_688".to_owned()],
+        planned: Vec::new(),
+    };
+    let verdict = run
+        .qualify(&mut target, &request)
+        .await
+        .expect("qualify runs");
+    assert_eq!(
+        verdict,
+        pbps_db::resolver::environment::Verdict::Verified,
+        "the scratch reproduces the target: {verdict:?}"
+    );
+    // The scope is sealed with a fingerprint and bound to two distinct
+    // connections, so a reopened session cannot present it as its own.
+    assert!(run.authorization_fingerprint().is_some());
+    let (target_conn, scratch_conn) = run.scope_connections().expect("bound connections");
+    assert_ne!(target_conn, scratch_conn);
+
+    // A later check requalifies the sealed scope and holds.
+    run.check(&mut target).await.expect("requalification holds");
+    // A change on the target after `qualify` — an extension installed by
+    // another session — is a scope that no longer exists, even though the
+    // scratch side is still compatible with it; the next check refuses and
+    // says what moved (finding on #688; DECISIONS 520).
+    setup
+        .query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        .await
+        .unwrap();
+    let refused = run
+        .check(&mut target)
+        .await
+        .expect_err("a target that moved since qualify is refused");
+    assert!(
+        refused.to_string().contains("changed under the run")
+            && refused.to_string().contains("extensions"),
+        "{refused}"
+    );
+    setup.query("DROP EXTENSION pgcrypto").await.unwrap();
+
+    // Cleanup removes the scratch objects and every run-local role it created,
+    // reporting nothing left over.
+    run.close()
+        .await
+        .expect("cleanup confirms the run-local roles gone");
+    setup.query("DROP SCHEMA pbps_extra_688").await.unwrap();
 }

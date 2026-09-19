@@ -33,6 +33,8 @@ EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+    # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
+    "a_run_qualifies_its_analysis_scope_against_the_target",
     "a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
     # Runs with the exposed control started; see below.
     "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",

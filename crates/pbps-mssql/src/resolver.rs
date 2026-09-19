@@ -1,5 +1,6 @@
 //! Advisory environment observations, never resolver qualification (ADR-0016).
 
+use pbps_db::resolver::environment::DatabaseRecipe;
 use pbps_db::resolver::{
     Candidate, Discovery, Observation, OwnSession, ScratchNames, SessionCounter, SessionInventory,
 };
@@ -197,7 +198,11 @@ FROM sys.dm_exec_sessions s;",
 
 /// Creates only this run's own login and database. Ownership is transferred
 /// rather than granting the login rights on anything that already existed.
-pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
+pub async fn create_scratch(
+    conn: &mut StreamConn,
+    names: &ScratchNames,
+    _recipe: &DatabaseRecipe,
+) -> Result<(), DbError> {
     conn.execute(&format!(
         "CREATE LOGIN [{}] WITH PASSWORD = '{}', CHECK_POLICY = OFF;",
         names.login(),
@@ -216,6 +221,13 @@ pub async fn create_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Resu
 
 /// Removes exactly the two run-owned objects. SINGLE_USER only rolls back
 /// sessions inside this run's own scratch database.
+/// SQL Server reconstruction creates no run-local roles yet (#611), so there
+/// is nothing to drop; the signature matches PostgreSQL's so the router does
+/// not branch on more than the engine.
+pub async fn drop_roles(_conn: &mut StreamConn, _roles: &[String]) -> Vec<String> {
+    Vec::new()
+}
+
 pub async fn drop_scratch(conn: &mut StreamConn, names: &ScratchNames) -> Result<(), DbError> {
     let database = conn
         .execute(&format!(

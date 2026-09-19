@@ -4,6 +4,8 @@
 //! the queries and candidate rules. Discovery cannot construct a qualified
 //! resolver or authorize compilation, publication or apply.
 
+pub mod environment;
+
 use std::collections::BTreeMap;
 
 /// Read-only engine observations for a native runtime admission check. They
