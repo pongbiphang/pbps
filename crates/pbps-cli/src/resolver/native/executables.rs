@@ -132,11 +132,18 @@ pub(crate) fn executables(
     for name in required {
         let candidates = resolve(name, &libdir, dynamic_library_path);
         // A candidate already mapped under its own spelling is loaded
-        // content, reported with the mappings below.
-        if candidates
+        // content, reported with the mappings below — and recorded as one
+        // of that mapping's spellings, so that an alias of the same file in
+        // the required set does not take the mapping's name for itself
+        // alone (finding on #688).
+        if let Some(candidate) = candidates
             .iter()
-            .any(|candidate| mapped.contains_key(candidate))
+            .find(|candidate| mapped.contains_key(*candidate))
         {
+            claimed
+                .entry(candidate.clone())
+                .or_default()
+                .push(candidate.clone());
             continue;
         }
         // The first candidate that opens is the one the loader would load;
@@ -687,6 +694,19 @@ mod tests {
             "the mapping is reported under the aliases alone: {:?}",
             set.libraries
         );
+        // Required under its own path *and* an alias: both spellings, once
+        // each, the mapping's own name not displaced by the alias (finding
+        // on #688).
+        let both = [libc_path.clone(), aliases[0].clone()];
+        let set = executables(&lease, &both, "$libdir").unwrap();
+        for spelling in &both {
+            assert_eq!(
+                set.libraries.iter().filter(|l| l.path == *spelling).count(),
+                1,
+                "{spelling}: {:?}",
+                set.libraries
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
