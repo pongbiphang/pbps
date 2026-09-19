@@ -72,7 +72,7 @@ http-body-util = "0.1"
 bytes = "1"
 # Safe Linux socket diagnostics authenticate the accepted Docker Unix peer,
 # including a listener passed to dockerd by systemd socket activation.
-rustix = { version = "1", features = ["net"] }
+rustix = { version = "1", features = ["net", "fs"] }
 
 # PostgreSQL (ADR-0007 decision 5 / ADR-0014). Pure Rust like the SQL
 # Server driver, so §11.3's single static binary still needs nothing installed

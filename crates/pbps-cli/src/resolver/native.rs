@@ -116,10 +116,12 @@ impl ProcessLease {
     }
 
     /// Opens a path inside this process's own mount namespace, through the
-    /// held proc directory, so a reused numeric PID cannot answer for it.
+    /// held proc directory, so a reused numeric PID cannot answer for it,
+    /// and resolved the way the process itself would resolve it (see
+    /// [`open_within`]).
     pub(crate) fn open_in_root(&self, relative: &str) -> Result<File, UnqualifiedProcess> {
         self.check()?;
-        let file = File::open(proc_base(&self.directory).join("root").join(relative))
+        let file = open_within(&self.root()?, relative, rustix::fs::OFlags::empty())
             .map_err(|_| UnqualifiedProcess)?;
         self.check()?;
         Ok(file)
@@ -132,12 +134,16 @@ impl ProcessLease {
         limit: usize,
     ) -> Result<String, UnqualifiedProcess> {
         self.check()?;
-        let text = read_bounded(
-            &proc_base(&self.directory).join("root").join(relative),
-            limit,
-        )?;
+        let file = open_within(&self.root()?, relative, rustix::fs::OFlags::empty())
+            .map_err(|_| UnqualifiedProcess)?;
+        let text = read_bounded_from(file, limit)?;
         self.check()?;
         Ok(text)
+    }
+
+    /// The process's root directory, through the held proc directory.
+    fn root(&self) -> Result<File, UnqualifiedProcess> {
+        File::open(proc_base(&self.directory).join("root")).map_err(|_| UnqualifiedProcess)
     }
 
     /// The entries of a directory inside this process's mount namespace.
@@ -147,7 +153,9 @@ impl ProcessLease {
     ) -> Result<BTreeSet<String>, UnqualifiedProcess> {
         self.check()?;
         let mut names = BTreeSet::new();
-        for entry in std::fs::read_dir(proc_base(&self.directory).join("root").join(relative))
+        let dir = open_within(&self.root()?, relative, rustix::fs::OFlags::DIRECTORY)
+            .map_err(|_| UnqualifiedProcess)?;
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))
             .map_err(|_| UnqualifiedProcess)?
         {
             let entry = entry.map_err(|_| UnqualifiedProcess)?;
@@ -406,16 +414,85 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
+    read_bounded_from(File::open(path).map_err(|_| UnqualifiedProcess)?, limit)
+}
+
+fn read_bounded_from(file: File, limit: usize) -> Result<String, UnqualifiedProcess> {
     let mut text = String::new();
-    File::open(path)
-        .map_err(|_| UnqualifiedProcess)?
-        .take(limit as u64 + 1)
+    file.take(limit as u64 + 1)
         .read_to_string(&mut text)
         .map_err(|_| UnqualifiedProcess)?;
     if text.len() > limit {
         return Err(UnqualifiedProcess);
     }
     Ok(text)
+}
+
+/// Opens `relative` beneath `root` as a process whose root directory is
+/// `root` would: `openat2` with `RESOLVE_IN_ROOT`, so an absolute symbolic
+/// link inside it and a `..` at its top resolve inside it. A plain open of
+/// `/proc/<pid>/root/<relative>` follows an absolute link from the
+/// inspector's own root instead — a container's `/lib/foo.so -> /opt/foo.so`
+/// read the host's `/opt/foo.so`, absent or another file, so a library the
+/// engine loads fine was unreadable or the wrong content was hashed for
+/// both sides (finding on #688).
+pub(crate) fn open_within(
+    root: &File,
+    relative: &str,
+    flags: rustix::fs::OFlags,
+) -> std::io::Result<File> {
+    let fd = rustix::fs::openat2(
+        root,
+        relative,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | flags,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::IN_ROOT,
+    )?;
+    Ok(File::from(fd))
+}
+
+#[cfg(test)]
+mod confined_open_tests {
+    use super::open_within;
+    use std::io::Read as _;
+
+    /// A root of its own, with an absolute link pointing at a path that
+    /// exists both inside it and on the host, and one that exists on the
+    /// host alone: the first reads the inside file, the second is absent.
+    #[test]
+    fn an_absolute_link_inside_a_root_resolves_inside_that_root() {
+        let root = std::env::temp_dir().join(format!("pbps-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/hostname"), "inside\n").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", root.join("host_link")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("host_only")).unwrap();
+        std::os::unix::fs::symlink("../../etc/hostname", root.join("etc/up_and_over")).unwrap();
+        assert!(
+            std::path::Path::new("/etc/passwd").exists(),
+            "the host has the file"
+        );
+        let dir = std::fs::File::open(&root).unwrap();
+        let mut text = String::new();
+        open_within(&dir, "host_link", rustix::fs::OFlags::empty())
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "inside\n");
+        // `..` above the root stays at the root, as it would for the process.
+        text.clear();
+        open_within(&dir, "etc/up_and_over", rustix::fs::OFlags::empty())
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "inside\n");
+        let error = open_within(&dir, "host_only", rustix::fs::OFlags::empty()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        // A directory is listed through its confined handle.
+        let listed = open_within(&dir, "etc", rustix::fs::OFlags::DIRECTORY).unwrap();
+        assert!(listed.metadata().unwrap().is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 // A held proc inode can outlive its task. Linux reports ESRCH as well as
