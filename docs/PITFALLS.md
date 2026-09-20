@@ -306,6 +306,20 @@ columns the plan does not carry, and its expression is deliberately never
 rewritten, so it can only subtract the rows the plan deletes and give no
 answer at all where the plan inserts or updates.
 
+**A third state the catalog does not hold: a parent this plan creates.** A
+foreign key into a table that arrives empty makes every non-NULL reference in
+the child an orphan, and `rows_after` ends with a `WHERE false` branch written
+for exactly that. It was **unreachable** for a day. `AsStored::of` recorded a
+`CreateTable` as a name only, so `final_type` had no answer for a column of a
+created table, the branch returned `None`, and the plan produced no probe at
+all. What revived it was an unrelated commit — `5a3fb43c`, which gave a created
+table's declared types to `column_types` so that a key between two created
+tables would not be compared as `text`. Nothing connected the two, and no test
+named the case, so between the branch being written and that commit landing the
+comment said what the code did not do — which reads as covered, and is worse
+than an absence that is named. Both are pinned now, and each comment points at
+the other (#273).
+
 ## The engine fills in a type's defaulted arguments
 
 `decimal` is stored as `decimal(18,0)`, `char` as `char(1)`, `float` as

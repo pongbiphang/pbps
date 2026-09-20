@@ -21285,6 +21285,131 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
         .expect("drop");
 }
 
+/// A foreign key into a table this plan **creates** with no rows, against a
+/// child that is already populated.
+///
+/// The parent will hold nothing, and nothing is an answer: every non-NULL
+/// reference in the child is an orphan, and the probe has to say so *before*
+/// the statement runs. Built from the catalog alone there is no parent to read
+/// and the answer would be no probe at all — which is what the plan produced
+/// until a created table's declared types reached `column_types` (#273).
+///
+/// Both halves, like every other probe in this suite: the count is asserted
+/// against a real table **and** against the engine's own verdict on the very
+/// statement it is about, then the rows the probe named are repaired and the
+/// same statement runs.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_holds() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("created_parent");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.child (id integer PRIMARY KEY, status text);
+         INSERT INTO {s}.child VALUES (1, 'open'), (2, 'closed'), (3, NULL);"
+    ))
+    .await
+    .expect("the fixture");
+
+    let parent = TableName::new(&s, "status");
+    let mut declared = pbps_model::Table::default();
+    declared.columns.insert(
+        "code".to_owned(),
+        pbps_model::Column::new(ty("text")).not_null(),
+    );
+    // The key needs something unique to point at, or the engine refuses it
+    // with `42830` before it ever looks at a row — a different refusal from
+    // the one this test is about.
+    declared.primary_key = Some(PrimaryKey {
+        name: Some("pk_status".into()),
+        columns: vec!["code".into()],
+    });
+    let changes = [
+        Change::CreateTable {
+            uid: "t_aaaaaa".parse().expect("a uid"),
+            name: parent.clone(),
+            table: Box::new(declared),
+        },
+        Change::AddForeignKey {
+            table: TableName::new(&s, "child"),
+            name: "fk_child_status".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec!["status".into()],
+                references_table: parent.clone(),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        },
+    ];
+    let cs = ChangeSet {
+        changes: changes.iter().cloned().map(PlannedChange::new).collect(),
+    };
+
+    // Asked of the report first, and by name: `counts` fails on the first
+    // probe the engine will not answer, and without the parent's declared type
+    // the *collation* probe is that — so a reader of a future regression would
+    // be shown an unreadable count where the fact is that the orphan probe was
+    // never built at all.
+    let report = Postgres::new().preflight(&cs);
+    assert!(
+        report
+            .probes
+            .iter()
+            .any(|p| p.description.contains("no matching parent")),
+        "a key into a parent that will hold nothing still gets a probe: {report:#?}"
+    );
+    assert!(report.unchecked.is_empty(), "{report:#?}");
+
+    let measured = counts(&mut conn, &cs).await;
+    assert_eq!(
+        one(&measured, "no matching parent"),
+        2,
+        "two rows reference a parent that will hold nothing; the third is NULL \
+         and references nothing at all: {measured:#?}"
+    );
+
+    // The engine's own verdict on the same statements.
+    let pg = Postgres::new();
+    for stmt in pg.emit(&changes[0], Strategy::default()).expect("emit") {
+        conn.execute(&stmt.sql).await.expect("create the parent");
+    }
+    let statements = pg.emit(&changes[1], Strategy::default()).expect("emit");
+    let mut refused = None;
+    for stmt in &statements {
+        if let Err(e) = conn.execute(&stmt.sql).await {
+            refused = Some(e);
+            break;
+        }
+    }
+    let e = refused.expect("the engine accepted a key into an empty parent");
+    assert_eq!(sqlstate(&e), "23503", "{e:?}");
+
+    // Repair exactly the rows the probe named. The plan declares no parent
+    // rows, so the references themselves are what has to go — and the NULL
+    // stays, because it was never counted.
+    conn.execute(&format!(
+        "UPDATE {s}.child SET status = NULL WHERE status IS NOT NULL"
+    ))
+    .await
+    .expect("repair");
+    let measured = counts(&mut conn, &cs).await;
+    for (description, n) in &measured {
+        assert_eq!(*n, 0, "{description} still counts {n}: {measured:#?}");
+    }
+    for stmt in &statements {
+        conn.execute(&stmt.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+    }
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// This engine's `UNIQUE` holds NULLs apart, and `GROUP BY` puts them
 /// together — so the duplicate count has to take them out by hand.
 ///
