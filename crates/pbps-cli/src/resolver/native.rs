@@ -1260,11 +1260,20 @@ mod tests {
     /// that moved, and it is the answer #650 is looking for.
     #[test]
     fn establishing_a_process_is_named_apart_from_re_reading_one() {
-        // An executable that is readable and is not root-owned: the test
-        // binary's own process, which `capture` refuses by that rule alone.
+        // An executable a lease may not be built on. World-writable rather
+        // than non-root-owned, because the uid half of that rule is the build
+        // user's and a suite built as root would find its own binary
+        // acceptable — the mode half refuses for either of them.
+        let (mut writable, path) = spawned_writable_executable();
         LAST_READING.with(|cell| cell.set(None));
-        assert!(ProcessLease::capture(std::process::id()).is_err());
-        assert_eq!(last_reading(), Some(Reading::CaptureUnprotected));
+        let refused = ProcessLease::capture(writable.id());
+        let reading = last_reading();
+        let cleanup = writable.kill();
+        writable.wait().unwrap();
+        std::fs::remove_file(path).unwrap();
+        cleanup.unwrap();
+        assert!(refused.is_err());
+        assert_eq!(reading, Some(Reading::CaptureUnprotected));
 
         // And no process at all to open.
         LAST_READING.with(|cell| cell.set(None));
@@ -1426,6 +1435,25 @@ mod tests {
 
     #[test]
     fn writable_executable_content_cannot_identify_a_trusted_peer() {
+        let (mut child, path) = spawned_writable_executable();
+        let lease = ProcessLease::capture(child.id());
+        let cleanup = child.kill();
+        child.wait().unwrap();
+        std::fs::remove_file(path).unwrap();
+        cleanup.unwrap();
+        assert!(lease.is_err());
+    }
+
+    /// A running process whose executable is world-writable, and therefore one
+    /// no lease may be built on whoever owns it.
+    ///
+    /// The **mode** is what makes this fixture portable, and the uid is not: a
+    /// suite built and run as root has a root-owned test binary that
+    /// `capture` accepts, so a test that reached for the test binary's own pid
+    /// to provoke this refusal would pass for the build user and fail for a
+    /// root builder (found in review of #674). `0o777` is refused by
+    /// `mode & 0o022` for either of them.
+    fn spawned_writable_executable() -> (std::process::Child, PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "pbps-untrusted-executable-{:032x}",
             rand::random::<u128>()
@@ -1436,7 +1464,7 @@ mod tests {
         // descriptor. CLOEXEC closes that inherited descriptor at exec, not
         // at fork; retry only this transient fixture error, with a deadline.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut child = loop {
+        let child = loop {
             match Command::new(&path).arg("30").spawn() {
                 Ok(child) => break child,
                 Err(error)
@@ -1450,17 +1478,12 @@ mod tests {
                 }
             }
         };
-        // The same exec window as everywhere else, and here it would let the
-        // test pass for the wrong reason: a pre-exec capture is refused
-        // because this test binary is not root-installed, which is not the
-        // refusal this test is about.
+        // The same exec window as everywhere else, and here it would let a
+        // caller pass for the wrong reason: a pre-exec capture is refused
+        // because the test binary is not root-installed, which is a different
+        // refusal — and on a root builder it would not be refused at all.
         wait_for_exec(child.id(), path.file_name().unwrap().to_str().unwrap());
-        let lease = ProcessLease::capture(child.id());
-        let cleanup = child.kill();
-        child.wait().unwrap();
-        std::fs::remove_file(path).unwrap();
-        cleanup.unwrap();
-        assert!(lease.is_err());
+        (child, path)
     }
 
     #[test]
