@@ -64,6 +64,19 @@ RECIPE = [
     "--security-opt", "no-new-privileges",
     "--memory", "3g", "--memory-swap", "3g", "--cpus", "2", "--pids-limit", "512",
 ]
+# SQL Server's own telemetry client (`SQLServerCEIP`) logs in over loopback a
+# few minutes after the engine starts — measured on 17.0: five and a half
+# minutes, as `NT AUTHORITY\SYSTEM` from 127.0.0.1 — and to a census of the
+# engine's namespace that is a session this run did not open. A run that was
+# still open at that moment was refused as not exclusive, which no test here
+# lived long enough to meet until one hashed the engine's packages (#611). The
+# operator of a dedicated scratch server turns customer feedback off, as this
+# does; with it off no such session appears (measured, Developer edition).
+# The file has to be written at start: its directory is the tmpfs below.
+MSSQL_BOOT = """
+printf '[telemetry]\\ncustomerfeedback = false\\n' > /var/opt/mssql/mssql.conf
+exec /opt/mssql/bin/launch_sqlservr.sh /opt/mssql/bin/sqlservr
+"""
 STORAGE = {
     "pg": "/var/lib/postgresql:rw,nosuid,nodev,noexec,size=268435456,uid=999,gid=999,mode=700",
     "mssql": "/var/opt/mssql:rw,nosuid,nodev,noexec,size=1073741824,uid=10001,gid=0,mode=700",
@@ -160,7 +173,8 @@ def start_dedicated(engine, name, owned, network=None):
         run("docker", "create", *common, "--user", str(ENGINE_UID[engine]),
             "--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE",
             "-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
-            "-e", "MSSQL_MEMORY_LIMIT_MB=1024", IMAGES[engine], **QUIET)
+            "-e", "MSSQL_MEMORY_LIMIT_MB=1024",
+            "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", MSSQL_BOOT, **QUIET)
     run("docker", "start", name, **QUIET)
 
 

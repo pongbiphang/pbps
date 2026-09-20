@@ -98,7 +98,7 @@ declaration is transferred and no SQL surface is exposed. See
 
 Each issue describes its scope, ADR acceptance cases, positive/negative tests
 and dependencies. The issue loop is sequential: the current PR must merge
-before the next issue is claimed. #597 is complete; #606 through #609 are delivered.
+before the next issue is claimed. #597 is complete; #606 through #611 are delivered.
 
 | Step | Issue | Required outcome |
 |---|---|---|

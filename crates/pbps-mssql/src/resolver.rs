@@ -1,4 +1,12 @@
-//! Advisory environment observations, never resolver qualification (ADR-0016).
+//! Resolver support for SQL Server (ADR-0016): advisory discovery, the
+//! dedicated-server instance and session reads, and the analysis-scope
+//! qualification — environment facts, the versioned compatibility rule and
+//! the deployment authorization context (#611). Qualification is not a
+//! binding adapter; SQL Server binding stays unimplemented (#619, #620).
+
+pub mod authorization;
+pub mod compatibility;
+pub mod environment;
 
 use pbps_db::resolver::environment::DatabaseRecipe;
 use pbps_db::resolver::{
@@ -6,6 +14,46 @@ use pbps_db::resolver::{
 };
 use pbps_db::transport::StreamConn;
 use pbps_db::{Conn, DbError};
+
+/// Reads the analysis-scope catalog facts and the deployment authorization
+/// context together, as the connection's own principal, and refuses a read
+/// the target moved under.
+///
+/// SQL Server's catalog views and dynamic management views are not a
+/// snapshot, and no isolation level makes them one — a `SNAPSHOT` transaction
+/// needs a database option this tool must not turn on, and metadata reads
+/// ignore it anyway. So the read is bracketed instead: everything is read
+/// twice, and a difference between the two is a scope that was changing
+/// while it was read, which would otherwise seal half of one state and half
+/// of another. A change made and undone between the two reads is outside
+/// what a bracket can see; the requalification on every check re-reads the
+/// target against what was sealed, which is where a lasting change shows.
+pub async fn scope_facts(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+    scope: &environment::Scope<'_>,
+    authorization_schemas: &[String],
+) -> Result<
+    (
+        pbps_db::resolver::environment::CatalogFacts,
+        authorization::AuthorizationContext,
+    ),
+    DbError,
+> {
+    let mut reads = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let authorization = authorization::read(conn, authorization_schemas).await?;
+        let catalog = environment::read(conn, scope).await?;
+        reads.push((catalog, authorization));
+    }
+    let second = reads.pop().expect("two reads");
+    let first = reads.pop().expect("two reads");
+    if first != second {
+        return Err(DbError::Refused(
+            "the analysis scope changed while it was read; it cannot be sealed as one state".into(),
+        ));
+    }
+    Ok(first)
+}
 
 /// A master database GUID may be copied with an installation. Separation is
 /// decided using the qualified native runtime as well, never GUID inequality
@@ -197,20 +245,25 @@ FROM sys.dm_exec_sessions s;",
 }
 
 /// Creates only this run's own login and database. Ownership is transferred
-/// rather than granting the login rights on anything that already existed.
+/// rather than granting the login rights on anything that already existed,
+/// which also makes the run login `dbo` of its scratch database: the context
+/// a `dbo` deployer is reproduced by, and the one that may impersonate the
+/// run-local users every other deployer is reproduced by.
 pub async fn create_scratch(
     conn: &mut StreamConn,
     names: &ScratchNames,
-    _recipe: &DatabaseRecipe,
+    recipe: &DatabaseRecipe,
 ) -> Result<(), DbError> {
+    contained_databases_are_allowed(conn, recipe).await?;
     conn.execute(&format!(
         "CREATE LOGIN [{}] WITH PASSWORD = '{}', CHECK_POLICY = OFF;",
         names.login(),
         names.password()
     ))
     .await?;
-    conn.execute(&format!("CREATE DATABASE [{}];", names.database()))
-        .await?;
+    for statement in scratch_database_ddl(names, recipe)? {
+        conn.execute(&statement).await?;
+    }
     conn.execute(&format!(
         "ALTER AUTHORIZATION ON DATABASE::[{}] TO [{}];",
         names.database(),
@@ -219,11 +272,117 @@ pub async fn create_scratch(
     .await
 }
 
+/// A partially contained target needs a scratch server that allows contained
+/// databases, and a fresh SQL Server does not: measured on 17.0, `CREATE
+/// DATABASE ... CONTAINMENT = PARTIAL` is error 12824 until the server-level
+/// `contained database authentication` option is 1. Every such target was
+/// refused by that error halfway through creation, after the run's login
+/// existed (finding on #611).
+///
+/// The option is the operator's to set, not this run's: it is server
+/// configuration on a server pbps did not provision, it outlives the run, and
+/// nothing a run creates there is allowed to. So it is a premise, asked
+/// before anything is created and refused in words that name the option. Any
+/// login may read it (measured), so the question never fails for privilege.
+pub async fn contained_databases_are_allowed(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+    recipe: &DatabaseRecipe,
+) -> Result<(), DbError> {
+    if !recipe
+        .sql_server
+        .as_ref()
+        .is_some_and(|settings| settings.containment == "PARTIAL")
+    {
+        return Ok(());
+    }
+    let rows = conn
+        .query(
+            "SELECT CONVERT(nvarchar(12), value_in_use) AS in_use FROM sys.configurations \
+             WHERE name = N'contained database authentication';",
+        )
+        .await?;
+    // Absent is not "off": a server that does not report the option is one
+    // this rule was not measured on.
+    let [row] = rows.as_slice() else {
+        return Err(DbError::BadRow(
+            "the scratch server did not report its contained database authentication option".into(),
+        ));
+    };
+    match row.try_get::<&str>("in_use")? {
+        Some("1") => Ok(()),
+        _ => Err(DbError::Refused(
+            "the target database is partially contained, and the scratch server does not allow \
+             contained databases; set its 'contained database authentication' option to 1 \
+             (sp_configure, then RECONFIGURE)"
+                .into(),
+        )),
+    }
+}
+
+/// The statements that create the scratch database the way the target's is:
+/// its collation and containment at creation, then its compatibility level
+/// and the database-level ANSI options. Every value is checked against the
+/// shape the engine reports it in before it reaches a statement, because a
+/// collation or a level is spliced, not quoted. A recipe without SQL Server
+/// settings creates the server's default database, which the compatibility
+/// rule then compares like any other.
+pub fn scratch_database_ddl(
+    names: &ScratchNames,
+    recipe: &DatabaseRecipe,
+) -> Result<Vec<String>, DbError> {
+    let database = names.database();
+    let Some(settings) = &recipe.sql_server else {
+        return Ok(vec![format!("CREATE DATABASE [{database}];")]);
+    };
+    let refuse = |what: &str, value: &str| {
+        DbError::BadRow(format!(
+            "the target reported a {what} this tool will not splice into a statement: {value}"
+        ))
+    };
+    let collation = &settings.collation;
+    if collation.is_empty()
+        || !collation
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(refuse("collation", collation));
+    }
+    let level = &settings.compatibility_level;
+    if level.is_empty() || level.len() > 3 || !level.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse("compatibility level", level));
+    }
+    if !matches!(settings.containment.as_str(), "NONE" | "PARTIAL") {
+        return Err(refuse("containment", &settings.containment));
+    }
+    let mut statements = vec![
+        format!(
+            "CREATE DATABASE [{database}] CONTAINMENT = {} COLLATE {collation};",
+            settings.containment
+        ),
+        format!("ALTER DATABASE [{database}] SET COMPATIBILITY_LEVEL = {level};"),
+    ];
+    for (option, on) in &settings.options {
+        if !pbps_db::resolver::environment::SQL_SERVER_DATABASE_OPTIONS
+            .iter()
+            .any(|(_, known)| known == option)
+        {
+            return Err(refuse("database option", option));
+        }
+        statements.push(format!(
+            "ALTER DATABASE [{database}] SET {option} {};",
+            if *on { "ON" } else { "OFF" }
+        ));
+    }
+    Ok(statements)
+}
+
 /// Removes exactly the two run-owned objects. SINGLE_USER only rolls back
 /// sessions inside this run's own scratch database.
-/// SQL Server reconstruction creates no run-local roles yet (#611), so there
-/// is nothing to drop; the signature matches PostgreSQL's so the router does
-/// not branch on more than the engine.
+/// SQL Server's run-local principals are users without a login and roles,
+/// both database-scoped: they go with the scratch database, so nothing
+/// outlives it for this to drop. The signature matches PostgreSQL's, whose
+/// roles are cluster-wide, so the router does not branch on more than the
+/// engine.
 pub async fn drop_roles(_conn: &mut StreamConn, _roles: &[String]) -> Vec<String> {
     Vec::new()
 }
@@ -332,6 +491,67 @@ fn candidate(engine_edition: Option<&str>, major: Option<&str>) -> Candidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scratch_database_is_created_the_way_the_targets_is() {
+        use pbps_db::resolver::environment::SqlServerDatabase;
+        let names = ScratchNames::new(
+            "pbps_scratch_0123456789abcdef".into(),
+            "pbps_login_0123456789abcdef".into(),
+            "0123456789abcdef0123456789abcdef".into(),
+        )
+        .unwrap();
+        let recipe = |collation: &str, level: &str, containment: &str| DatabaseRecipe {
+            sql_server: Some(SqlServerDatabase {
+                collation: collation.into(),
+                compatibility_level: level.into(),
+                containment: containment.into(),
+                options: [
+                    ("ANSI_PADDING".to_owned(), true),
+                    ("ARITHABORT".to_owned(), false),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            ..DatabaseRecipe::neutral()
+        };
+        assert_eq!(
+            scratch_database_ddl(&names, &recipe("Latin1_General_100_CS_AS", "160", "NONE"))
+                .unwrap(),
+            [
+                "CREATE DATABASE [pbps_scratch_0123456789abcdef] CONTAINMENT = NONE COLLATE Latin1_General_100_CS_AS;",
+                "ALTER DATABASE [pbps_scratch_0123456789abcdef] SET COMPATIBILITY_LEVEL = 160;",
+                "ALTER DATABASE [pbps_scratch_0123456789abcdef] SET ANSI_PADDING ON;",
+                "ALTER DATABASE [pbps_scratch_0123456789abcdef] SET ARITHABORT OFF;",
+            ]
+        );
+        // The values are spliced, so anything but the shape the engine
+        // reports them in is refused, never quoted around.
+        for (collation, level, containment) in [
+            ("Latin1_General_CI_AS; DROP DATABASE x", "160", "NONE"),
+            ("", "160", "NONE"),
+            ("Latin1_General_CI_AS", "160; SHUTDOWN", "NONE"),
+            ("Latin1_General_CI_AS", "", "NONE"),
+            ("Latin1_General_CI_AS", "160", "FULL"),
+        ] {
+            assert!(
+                scratch_database_ddl(&names, &recipe(collation, level, containment)).is_err(),
+                "{collation} {level} {containment}"
+            );
+        }
+        let mut odd = recipe("Latin1_General_CI_AS", "160", "NONE");
+        odd.sql_server
+            .as_mut()
+            .unwrap()
+            .options
+            .insert("TRUSTWORTHY".into(), true);
+        assert!(scratch_database_ddl(&names, &odd).is_err());
+        // No SQL Server settings is the server's own default database.
+        assert_eq!(
+            scratch_database_ddl(&names, &DatabaseRecipe::neutral()).unwrap(),
+            ["CREATE DATABASE [pbps_scratch_0123456789abcdef];"]
+        );
+    }
 
     #[test]
     fn hosted_or_unknown_products_never_borrow_boxed_sql_server_versions() {

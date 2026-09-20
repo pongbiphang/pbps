@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs the live SQL Server tests (SPEC §11.5) against a throwaway container.
 #
-# The container is left running afterwards so re-runs are instant; remove it
-# with: docker rm -f pbps-test-mssql
+# The containers are left running afterwards so re-runs are instant; remove
+# them with: docker rm -f pbps-test-mssql pbps-test-mssql-express
 set -euo pipefail
 
 NAME=pbps-test-mssql
@@ -37,6 +37,28 @@ for _ in $(seq 1 60); do
 done
 
 export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
+
+# A second instance of the same build, as another edition and under another
+# server collation: what the resolver's analysis-scope rule is measured
+# against for the two facts no database on the first server can vary (#611).
+# Express, so it stays small beside the first one.
+EXPRESS_NAME=pbps-test-mssql-express
+EXPRESS_PORT=${PBPS_TEST_EXPRESS_PORT:-14331}
+if ! docker ps --format '{{.Names}}' | grep -qx "$EXPRESS_NAME"; then
+    docker rm -f "$EXPRESS_NAME" >/dev/null 2>&1 || true
+    docker run -d --name "$EXPRESS_NAME" -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
+        -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
+        -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$EXPRESS_PORT:1433" "$IMAGE" >/dev/null
+fi
+echo "waiting for the Express SQL Server..."
+for _ in $(seq 1 60); do
+    if docker exec "$EXPRESS_NAME" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
+        -U sa -P "$PASSWORD" -Q "SELECT 1" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
+export PBPS_TEST_EXPRESS_DB="Server=localhost,$EXPRESS_PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
 
 # The `--dev docker://` path starts a *second*, throwaway server of its own, so
 # it stays opt-in: naming an image here is what enables it. CI covers it in a

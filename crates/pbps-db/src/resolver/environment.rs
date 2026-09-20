@@ -254,7 +254,40 @@ pub struct DatabaseRecipe {
     /// and `ctype`.
     pub locale: Option<String>,
     pub icu_rules: Option<String>,
+    /// What a SQL Server scratch database is created with. The fields above
+    /// are PostgreSQL's and unused for it; this is absent for PostgreSQL.
+    pub sql_server: Option<SqlServerDatabase>,
 }
+
+/// How a SQL Server scratch database must be created so that it compares,
+/// parses and defaults the way the target's does: its collation, its
+/// compatibility level, its containment, and the database-level ANSI options
+/// that are a session's fallback and are persisted into what it creates.
+/// Derived from the target's facts and never defaulted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct SqlServerDatabase {
+    pub collation: String,
+    pub compatibility_level: String,
+    pub containment: String,
+    /// `ALTER DATABASE ... SET <option> ON|OFF`, by option name, `true` for on.
+    pub options: BTreeMap<String, bool>,
+}
+
+/// The `sys.databases` options a SQL Server recipe carries, as the fact key
+/// the engine crate reads them under and the `ALTER DATABASE SET` name.
+pub const SQL_SERVER_DATABASE_OPTIONS: &[(&str, &str)] = &[
+    ("database_ansi_null_default", "ANSI_NULL_DEFAULT"),
+    ("database_ansi_nulls", "ANSI_NULLS"),
+    ("database_ansi_padding", "ANSI_PADDING"),
+    ("database_ansi_warnings", "ANSI_WARNINGS"),
+    ("database_arithabort", "ARITHABORT"),
+    (
+        "database_concat_null_yields_null",
+        "CONCAT_NULL_YIELDS_NULL",
+    ),
+    ("database_numeric_roundabort", "NUMERIC_ROUNDABORT"),
+    ("database_quoted_identifier", "QUOTED_IDENTIFIER"),
+];
 
 /// What kept a recipe from being derived: the fact the target did not report.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -262,9 +295,10 @@ pub struct DatabaseRecipe {
 pub struct RecipeUnavailable(pub &'static str);
 
 impl DatabaseRecipe {
-    /// A placeholder recipe for an engine whose scratch database creation
-    /// does not consume one yet (SQL Server; reproducing its collation is
-    /// #611). It is never rendered into a PostgreSQL `CREATE DATABASE`.
+    /// A recipe that asks for nothing: the PostgreSQL fields a SQL Server
+    /// recipe leaves unused, and the database a SQL Server scratch gets when
+    /// no target has been read for one. It is never rendered into a
+    /// PostgreSQL `CREATE DATABASE`.
     pub fn neutral() -> Self {
         Self {
             encoding: "UTF8".into(),
@@ -273,7 +307,40 @@ impl DatabaseRecipe {
             ctype: "C".into(),
             locale: None,
             icu_rules: None,
+            sql_server: None,
         }
+    }
+
+    /// The recipe for a SQL Server scratch database, from the target's
+    /// catalog facts. A fact the target did not report is a database the
+    /// resolver cannot reproduce.
+    pub fn from_sql_server_catalog(catalog: &CatalogFacts) -> Result<Self, RecipeUnavailable> {
+        let observed = |key: &'static str| -> Result<String, RecipeUnavailable> {
+            catalog
+                .observations
+                .get(key)
+                .and_then(Observation::value)
+                .map(str::to_owned)
+                .ok_or(RecipeUnavailable(key))
+        };
+        let mut options = BTreeMap::new();
+        for (key, option) in SQL_SERVER_DATABASE_OPTIONS {
+            let on = match observed(key)?.as_str() {
+                "1" => true,
+                "0" => false,
+                _ => return Err(RecipeUnavailable(key)),
+            };
+            options.insert((*option).to_owned(), on);
+        }
+        Ok(Self {
+            sql_server: Some(SqlServerDatabase {
+                collation: observed("database_collation")?,
+                compatibility_level: observed("database_compatibility_level")?,
+                containment: observed("database_containment")?,
+                options,
+            }),
+            ..Self::neutral()
+        })
     }
 
     pub fn from_catalog(catalog: &CatalogFacts) -> Result<Self, RecipeUnavailable> {
@@ -309,6 +376,7 @@ impl DatabaseRecipe {
             ctype: observed("database_ctype")?,
             locale,
             icu_rules: optional("database_icu_rules")?,
+            sql_server: None,
         })
     }
 }
@@ -327,6 +395,138 @@ pub struct BuildMapping {
     pub scope: String,
     /// Where and how the equivalence was measured.
     pub measured: String,
+}
+
+/// The executable half of an analysis-scope rule, shared by every engine: the
+/// process facts are the same shape whichever engine runs, and only the rule
+/// name a build mapping must carry differs.
+///
+/// Content identity, not version. Equal digests match; different digests
+/// match only through a mapping measured for exactly this pair and scope;
+/// anything unreadable is unknown. A library present on one side only is a
+/// difference in both directions — a resolver-only preload changes binding
+/// as surely as a missing one.
+pub fn compare_executables(
+    rule: &str,
+    target: &EnvironmentFacts,
+    resolver: &EnvironmentFacts,
+    mappings: &[BuildMapping],
+    report: &mut ScopeReport,
+) {
+    let engine = identity(
+        rule,
+        "engine",
+        Some(&target.executables.engine),
+        Some(&resolver.executables.engine),
+        mappings,
+        report,
+    );
+    report.facts.insert("executable:engine".into(), engine);
+    let (t, r) = (
+        by_path(&target.executables.libraries),
+        by_path(&resolver.executables.libraries),
+    );
+    let paths: std::collections::BTreeSet<&str> = t.keys().chain(r.keys()).copied().collect();
+    for path in paths {
+        let status = identity(
+            rule,
+            path,
+            t.get(path).copied(),
+            r.get(path).copied(),
+            mappings,
+            report,
+        );
+        report.facts.insert(format!("library:{path}"), status);
+    }
+}
+
+fn by_path(set: &[ExecutableIdentity]) -> BTreeMap<&str, &ExecutableIdentity> {
+    set.iter()
+        .map(|library| (library.path.as_str(), library))
+        .collect()
+}
+
+fn identity(
+    rule: &str,
+    scope: &str,
+    target: Option<&ExecutableIdentity>,
+    resolver: Option<&ExecutableIdentity>,
+    mappings: &[BuildMapping],
+    report: &mut ScopeReport,
+) -> FactStatus {
+    let (Some(t), Some(r)) = (target, resolver) else {
+        let (side, present) = match (target, resolver) {
+            (None, Some(r)) => (Side::Target, r),
+            (Some(t), None) => (Side::Resolver, t),
+            _ => unreachable!("at least one side names every compared path"),
+        };
+        let role = format!("{:?}", present.role).to_lowercase();
+        return match side {
+            Side::Target => FactStatus::Mismatch {
+                target: "absent".into(),
+                resolver: format!("{role} library present"),
+            },
+            Side::Resolver | Side::Both => FactStatus::Mismatch {
+                target: format!("{role} library present"),
+                resolver: "absent".into(),
+            },
+        };
+    };
+    for (side, identity) in [(Side::Target, t), (Side::Resolver, r)] {
+        if let Provenance::Unreadable { reason } = &identity.provenance {
+            return FactStatus::Unknown {
+                side,
+                reason: reason.clone(),
+            };
+        }
+        if identity.disk_differs_from_loaded == Some(true) {
+            return FactStatus::Mismatch {
+                target: describe(t),
+                resolver: describe(r),
+            };
+        }
+    }
+    let (Some(td), Some(rd)) = (&t.digest, &r.digest) else {
+        return FactStatus::Unknown {
+            side: Side::Both,
+            reason: "no digest for readable content".into(),
+        };
+    };
+    if td == rd {
+        return FactStatus::Match;
+    }
+    if let Some(mapping) = mappings.iter().find(|m| {
+        m.rule.as_str() == rule && m.scope == scope && m.target == *td && m.resolver == *rd
+    }) {
+        report.limitations.insert(
+            format!("mapping:{scope}"),
+            format!(
+                "different builds accepted through a measured mapping: {}",
+                mapping.measured
+            ),
+        );
+        return FactStatus::Match;
+    }
+    FactStatus::Mismatch {
+        target: describe(t),
+        resolver: describe(r),
+    }
+}
+
+fn describe(identity: &ExecutableIdentity) -> String {
+    let digest = identity.digest.as_deref().unwrap_or("-");
+    let short = &digest[..digest.len().min(12)];
+    match identity.disk_differs_from_loaded {
+        Some(true) => format!("{short} (loaded content differs from the file on disk)"),
+        _ => match identity.role {
+            ExecutableRole::LateLoaded if identity.provenance == Provenance::DiskCandidate => {
+                format!("{short} (disk candidate)")
+            }
+            ExecutableRole::Engine | ExecutableRole::Preloaded | ExecutableRole::LateLoaded => {
+                short.to_owned()
+            }
+        },
+    }
 }
 
 /// The principal a deployment runs as, read from the planning connection,

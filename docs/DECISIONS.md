@@ -13962,4 +13962,71 @@ SPEC is in sync with all of these.
      snapshot, so the sealed scope never holds half of a change committed
      between them. The scope is sealed to the target and scratch connections,
      so a reopened session cannot inherit it, and requalified on every check so
-     an in-place change invalidates the run. SQL Server is the twin step #611.
+     an in-place change invalidates the run. SQL Server is the twin step, 521.
+
+521. **SQL Server's analysis scope is qualified by the engine's own answers:
+     a family gate, an edition limitation, mapped packages as the engine, and
+     grants run only after the reproduction is verified (issue #611, ADR-0016
+     cases 5, 14, 16, 21, 23).**
+
+     The twin of 520, under its own versioned rules `mssql-analysis-scope-v1`
+     and `mssql-auth-v1`, measured on SQL Server 2025 (17.0) for Linux. Four
+     things are not PostgreSQL's and are decided here.
+
+     *The product family is a premise, the edition a limitation.* Azure SQL
+     Database, Managed Instance, Synapse and Edge report version numbers of
+     their own that name no boxed build, so an `EngineEdition` outside 2–4 is
+     unknown on either side and the comparison stops there; nothing maps a
+     hosted version to an image by guess. Inside the boxed family an edition
+     difference is not a binding difference — a Developer scratch resolves
+     names exactly as an Express target does, measured on two real instances of
+     one build — but it is a capability difference. It verifies with a named
+     limitation: the target's own edition and capability checks stay the
+     authority, and a statement the scratch accepts proves nothing about them.
+
+     *The engine is its mapped packages.* SQL Server for Linux runs its Windows
+     binaries out of `.sfp` packages the platform layer maps into the process
+     (measured: `sqlservr.sfp`, `system.common.sfp` and others, thousands of
+     ranges), so `/proc/<pid>/exe` is only the loader. The engine router names
+     `.sfp` as engine code and the packages are hashed like any loaded library;
+     without that, two builds with one loader would be the same engine.
+
+     *Effective answers are the engine's.* The context is read as the deployer:
+     `fn_my_permissions` for the database and each in-scope schema,
+     `IS_ROLEMEMBER` for its roles. DENY, role nesting, ownership and the fixed
+     roles are the engine's to combine; a second implementation would be a
+     second thing to keep right. The grant rows it can see are what the
+     reproduction replays, under their own grantors (`AS`). What it cannot see
+     is why a grantor could grant: a session is shown only the rows that
+     concern it. It need not be shown. Measured, a grant made through
+     `CONTROL`, `db_owner` or `db_securityadmin` records the securable's owner,
+     a database-level grant option cannot grant on a schema, and taking a
+     grant option back cascades; so a row naming any other grantor proves that
+     grantor holds that permission with the grant option on that securable,
+     and the replay gives the mapped grantor exactly that when no visible row
+     does. `verify` still reads the result as the deployer. The engine's
+     built-in principals — `dbo`, `public`, the fixed `db_` roles — keep their
+     identity, as predefined roles do in 520: a clone of `db_ddladmin` would
+     carry none of what membership grants. The session's language is the
+     login's default, which decides the date format and the first day of the
+     week a literal is read under, so the run login is given the deployer's.
+
+     *The plan's grants run after verification, not before.* PostgreSQL records
+     a grant under a grantor the engine chooses, so 520 projects the grants
+     onto the context and verifies against the projection — and the projection
+     was where most of #688's findings lived. SQL Server refuses a grant the
+     deployer cannot make outright (error 15151, measured), so the reproduction
+     is verified against the target as read and only then does the engine run
+     the grants as the reproduced deployer. Nothing predicts a grantor. The
+     sealed fingerprint is the context as read together with the grants, and a
+     later check compares the scratch side with what was sealed once the scope
+     settled, since a scratch that ran the grants no longer equals the target.
+
+     The lifecycle is shared. Every engine-specific step routes through
+     `pbps-cli`'s `resolver::scope`, so the run lifecycle and the target
+     binding name no engine and a third engine is a compile error in each
+     function there rather than a branch someone forgot (#714). SQL Server's
+     catalog views are not a snapshot under any isolation level, so its target
+     read is bracketed — read twice, and the two must agree — where 520 uses one
+     transaction. Qualification is not a binding adapter; SQL Server's stays
+     unimplemented (#619, #620).

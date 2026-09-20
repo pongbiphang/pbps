@@ -2394,3 +2394,35 @@ took 82,028 spawns and an instrumented `capture` — one that says which of its
 six refusal legs fired — to see 2 refusals and read the cause off them. When a
 rate is unknown, a probe that finds nothing has measured the probe, not the
 question; size it against the rate you would need to detect.
+
+## A gigabyte hashed on the only thread there is
+
+Every resolver run lives on a current-thread runtime, beside the watcher tasks
+that keep its containers: each ticks once a second and gives Docker fifteen
+seconds to answer. The executable census hashed each mapped file inline. For
+PostgreSQL that is a few megabytes and nobody noticed. SQL Server for Linux maps
+its engine out of `.sfp` packages — over a gigabyte — so one census held the
+thread for longer than the watchers' budget; their request in flight read as
+timed out, they took the control connection for lost, removed the run's
+forwarders, and the next check failed with "control connection was lost" about a
+daemon that had never stopped answering (#611, the `resolver (mssql)` job).
+
+The symptom pointed at Docker and at the second check; the cause was in the
+first census. It passed locally only because the fixture that hashes a real
+engine needs root and runs in CI alone. The hashing now runs on the blocking
+pool, and a unit test hashes a large sparse file beside a ticker and requires
+the ticker to have run.
+
+The fix uncovered the next one. The same test now lived past five minutes, and
+SQL Server's telemetry client (`SQLServerCEIP`) logs in over loopback about that
+long after the engine starts: a session the run did not open, in a namespace it
+must be alone in, so the following check refused the run as not exclusive. Every
+earlier dedicated-server test had finished before the engine said hello to
+itself. The fixture now starts the server with customer feedback off, which
+docs/RESOLVER-RUNTIME.md records as the operator's premise. A suite's longest
+test is the only one that measures what happens later.
+
+A `tokio::time::timeout` measures the wall clock, not the work: anything that
+stops the runtime's thread spends every other task's budget for it. On a
+current-thread runtime, a synchronous loop over input whose size the engine
+decides is that.

@@ -16,16 +16,14 @@ use crate::resolver::docker::{CandidateImage, LocalApi, forwarder::Forwarder};
 use crate::resolver::native::{
     NativeTarget, ProcessLease, TargetWitness, guard, observe_incidental, process_scope, security,
 };
+use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
 use pbps_db::resolver::environment::{
     AuthorizationFingerprint, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Verdict,
 };
 use pbps_db::resolver::{InstanceObservation, ScratchNames};
 use pbps_db::transport::{StreamConn, StreamLogin};
-use pbps_pg::resolver::authorization::{self, AuthorizationContext, PlannedGrant, RoleMap};
-use pbps_pg::resolver::{compatibility, environment as pg_environment};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -1051,7 +1049,12 @@ struct QualifiedScope {
     /// projection is idempotent — so the raw read is sealed and compared too
     /// (finding on #688).
     target_authorization: String,
-    map: RoleMap,
+    /// The digest of the scratch side's own context as the reproduced
+    /// deployer read it once the scope settled: what a later check compares
+    /// the scratch side with on an engine whose scratch, having run the
+    /// plan's grants, no longer equals the target as read.
+    scratch_authorization: String,
+    map: scope::Principals,
     schemas: Vec<String>,
     write_path_extras: Vec<String>,
     planned: Vec<PlannedGrant>,
@@ -1097,18 +1100,15 @@ impl ScratchRun {
     /// SPEC §9.3.3). The result is sealed and bound to both connections. No
     /// declaration is transferred and no SQL surface is exposed here.
     ///
-    /// PostgreSQL only; a SQL Server dedicated server refuses by name (#611).
+    /// Every engine-specific step routes through `resolver::scope`; this is
+    /// the lifecycle, which is the same for both engines. Qualification is
+    /// not a binding adapter: SQL Server's stays unimplemented (#619, #620).
     pub async fn qualify(
         &mut self,
         target: &mut NativeTarget,
         request: &ScopeRequest,
     ) -> Result<Verdict, Error> {
-        if self.inner.control.driver != Driver::Postgres {
-            return Err(Error::Scope(
-                "dedicated-server scope qualification is not implemented for this engine (#611)"
-                    .into(),
-            ));
-        }
+        let driver = self.inner.control.driver;
         let read =
             |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
         let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
@@ -1116,17 +1116,10 @@ impl ScratchRun {
         // reconstructed for the write-path extras too, not only the in-scope
         // schemas, or a schema on the path but outside `schemas` would be
         // missing from scratch and drop out of its visibility (finding on
-        // #688).
-        let mut scope_schemas = request.schemas.clone();
-        for extra in &request.write_path_extras {
-            // `pg_temp` is a path alias for the session's temporary namespace,
-            // not a persistent schema to read or reconstruct authorization for
-            // (finding on #688); it is normalized out of the scope, though it
-            // stays on the write path the visibility read evaluates.
-            if extra != "pg_temp" && !scope_schemas.contains(extra) {
-                scope_schemas.push(extra.clone());
-            }
-        }
+        // #688); which schemas that is, is the engine's to say.
+        let scope_schemas =
+            scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
+                .map_err(Error::Scope)?;
         let (mut target_facts, target_auth) = target
             .scope_facts(&request.schemas, &request.write_path_extras, &scope_schemas)
             .await
@@ -1136,7 +1129,7 @@ impl ScratchRun {
         // catalog order, which the reproduction's fresh roles do not share),
         // so the scope is refused before anything is built rather than
         // guessed at (finding on #688).
-        let ambiguous = authorization::ambiguous_grantors(&target_auth, &request.planned);
+        let ambiguous = target_auth.unpredictable(&request.planned);
         if !ambiguous.is_empty() {
             return Err(Error::Scope(format!(
                 "the grantor of a planned grant cannot be predicted on the target: {}",
@@ -1151,14 +1144,15 @@ impl ScratchRun {
         // cleanup drops them even if reconstruction fails part-way.
         let login = self.names.login().to_owned();
         let token = login[login.len().saturating_sub(16)..].to_owned();
-        let map = RoleMap::generate(&target_auth, &request.planned, &login, &token);
-        self.inner.control.roles = map.run_local_names();
+        let map = scope::Principals::generate(&target_auth, &request.planned, &login, &token);
+        self.inner.control.roles = map.server_wide_names();
         // The mapped deployer runs the plan's grants on scratch and is the
-        // role every scratch read below runs as; its name follows from the
-        // principal alone, which the planned grants do not change.
+        // principal every scratch read below runs as; its name follows from
+        // the principal alone, which the planned grants do not change. `None`
+        // is a deployer the scratch session already is.
         let deployer = map
             .deployer(&target_auth)
-            .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
+            .map_err(|reason| Error::Scope(reason.into()))?;
         // Reconstruction's schema and grant DDL is database-local, so it must
         // run *in* the scratch database — the control session is on the
         // maintenance database and its `CREATE SCHEMA`/`GRANT ON SCHEMA` would
@@ -1189,34 +1183,27 @@ impl ScratchRun {
             analysis.opened += 1;
         }
         let mut reconstruction = reconstruction;
-        let outcome = async {
-            authorization::reconstruct(
-                &mut reconstruction.connection,
-                &map,
-                &target_auth,
-                self.names.database(),
-            )
-            .await
-            .map_err(db)?;
-            authorization::apply_planned(
-                &mut reconstruction.connection,
-                &map,
-                &deployer,
-                &request.planned,
-            )
-            .await
-            .map_err(db)
-        }
-        .await;
+        let outcome = scope::prepare(
+            &mut reconstruction.connection,
+            &map,
+            &target_auth,
+            &request.planned,
+            self.names.database(),
+            self.names.login(),
+        )
+        .await
+        .map_err(db);
         // The admin session is done either way; retire it so cleanup closes
         // its forwarder and reports it if that cannot be confirmed.
         self.inner.control.retire(reconstruction);
         outcome?;
         // The scratch session opened before reconstruction, so it did not load
-        // the role and database defaults reconstruction set — an `ALTER ROLE
-        // ... SET`, and `session_preload_libraries`, which a live session
-        // cannot load at all. Reopen it so the environment read observes the
-        // reproduced settings and any preloaded code (finding on #688).
+        // the login defaults reconstruction set — PostgreSQL's `ALTER ROLE ...
+        // SET` and `session_preload_libraries`, which a live session cannot
+        // load at all; SQL Server's default language, which decides the date
+        // format a statement reads a literal under. Reopen it so the
+        // environment read observes the reproduced settings and any preloaded
+        // code (finding on #688).
         {
             let stale = self.scratch.take().ok_or(Error::Cancelled)?;
             self.inner.control.retire(stale);
@@ -1246,62 +1233,60 @@ impl ScratchRun {
             }
             self.scratch = Some(reopened);
         }
-        let target_authorization = format!("{:x}", Sha256::digest(target_auth.canonical()));
-        // The authorization the reproduction is meant to have *after* the
-        // plan's preceding grants, which scratch has already run; verification
-        // and the fingerprint compare against this, not the pre-plan state.
-        let expected_auth = authorization::with_planned(target_auth, &request.planned);
+        let target_authorization = target_auth.digest();
         // The expected visibility is what the deployer would see on each path
-        // *after* those grants — derived from the post-plan authorization, so
-        // a planned USAGE grant that intentionally reveals or hides a schema
-        // is compared against its intended effect, not the pre-plan reading
-        // (finding on #688).
-        target_facts.catalog.visibility =
-            expected_visibility(&expected_auth, &request.schemas, &request.write_path_extras);
+        // *after* the plan's preceding grants — so a planned USAGE grant that
+        // intentionally reveals or hides a schema is compared against its
+        // intended effect, not the pre-plan reading (finding on #688).
+        target_auth.project_visibility(
+            &request.planned,
+            &request.schemas,
+            &request.write_path_extras,
+            &mut target_facts.catalog,
+        );
         // The libraries to look for on scratch are the target's, not the fresh
         // scratch catalog's, which has no extensions installed yet.
-        let required =
-            crate::resolver::native::executables::required_libraries(&target_facts.catalog);
-        // Read the scratch side as the reproduced deployer: catalog and the
-        // reproduced authorization over the connection, then the backend's
-        // executables, which include any session-preloaded code.
-        let (scratch_facts, auth_differences, scratch_connection) = {
+        let required = scope::required_libraries(driver, &target_facts.catalog);
+        // Read the scratch side as the reproduced deployer: the reproduced
+        // authorization and the catalog over the connection, then the
+        // backend's executables, which include any session-preloaded code.
+        let (scratch_facts, auth_differences, scratch_connection, scratch_authorization) = {
             let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
             let connection = scratch.connection.id();
-            scratch
-                .connection
-                .execute(&format!("SET ROLE \"{}\"", deployer.replace('"', "\"\"")))
-                .await
-                .map_err(db)?;
-            let scope = pg_environment::Scope {
-                schemas: &request.schemas,
-                write_path_extras: &request.write_path_extras,
-            };
-            let catalog = pg_environment::read(&mut scratch.connection, &scope)
+            scope::enter(&mut scratch.connection, driver, deployer.as_deref())
                 .await
                 .map_err(db)?;
             // Over the full scope, extras included: the expected context
             // covers every schema reconstruction created, and a read of the
             // in-scope schemas alone would report the extras absent and
             // refuse a faithful reproduction (finding on #688).
-            let differences = authorization::verify(
+            let differences = scope::settle(
                 &mut scratch.connection,
                 &map,
-                &expected_auth,
+                &target_auth,
+                &request.planned,
                 &scope_schemas,
             )
             .await
             .map_err(db)?;
-            let library_path = catalog
-                .settings
-                .get("dynamic_library_path")
-                .map(|fact| fact.value.clone())
-                .unwrap_or_else(|| "$libdir".to_owned());
+            let sealed = scope::seal_scratch(&mut scratch.connection, driver, &scope_schemas)
+                .await
+                .map_err(db)?;
+            let catalog = scope::read_catalog(
+                &mut scratch.connection,
+                driver,
+                &request.schemas,
+                &request.write_path_extras,
+            )
+            .await
+            .map_err(db)?;
             let executables = crate::resolver::native::executables::executables(
                 &scratch.backend,
                 &required,
-                &library_path,
+                &scope::library_path(driver, &catalog),
+                scope::engine_packages(driver),
             )
+            .await
             .map_err(|_| Error::Scope("the scratch backend's executables are unreadable".into()))?;
             (
                 EnvironmentFacts {
@@ -1310,11 +1295,12 @@ impl ScratchRun {
                 },
                 differences,
                 connection,
+                sealed,
             )
         };
         // Compare, folding the authorization reproduction into the report so a
         // deployer the scratch could not reproduce is a mismatch, not a pass.
-        let mut report = compatibility::compare(&target_facts, &scratch_facts, &[]);
+        let mut report = scope::compare(driver, &target_facts, &scratch_facts);
         for key in &auth_differences {
             report.facts.insert(
                 format!("authorization:{key}"),
@@ -1326,14 +1312,15 @@ impl ScratchRun {
         }
         let verdict = report.verdict();
         let authorization = AuthorizationFingerprint {
-            rule: RuleVersion::new(authorization::RULE),
-            digest: format!("{:x}", Sha256::digest(expected_auth.canonical())),
+            rule: RuleVersion::new(target_auth.rule()),
+            digest: target_auth.sealed_digest(&request.planned),
         };
         self.scope = Some(QualifiedScope {
             report,
             authorization,
             target: target_facts,
             target_authorization,
+            scratch_authorization,
             map,
             schemas: request.schemas.clone(),
             write_path_extras: request.write_path_extras.clone(),
@@ -1352,24 +1339,26 @@ impl ScratchRun {
     /// refused. The sealed scratch connection must still be the one in hand, so
     /// a reopened session cannot present the old scope as its own (case 14).
     async fn requalify(&mut self, target: &mut NativeTarget) -> Result<(), Error> {
-        let Some(scope) = self.scope.as_ref() else {
+        let Some(sealed) = self.scope.as_ref() else {
             return Ok(());
         };
-        if scope.report.verdict() != Verdict::Verified {
+        if sealed.report.verdict() != Verdict::Verified {
             return Ok(());
         }
+        let driver = self.inner.control.driver;
         let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
         let read =
             |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
-        let map = scope.map.clone();
-        let planned = scope.planned.clone();
-        let schemas = scope.schemas.clone();
-        let extras = scope.write_path_extras.clone();
-        let sealed_connection = scope.scratch_connection;
-        let sealed_target = scope.target_connection;
-        let sealed_facts = scope.target.clone();
-        let sealed_authorization = scope.authorization.digest.clone();
-        let sealed_target_authorization = scope.target_authorization.clone();
+        let map = sealed.map.clone();
+        let planned = sealed.planned.clone();
+        let schemas = sealed.schemas.clone();
+        let extras = sealed.write_path_extras.clone();
+        let sealed_connection = sealed.scratch_connection;
+        let sealed_target = sealed.target_connection;
+        let sealed_facts = sealed.target.clone();
+        let sealed_authorization = sealed.authorization.digest.clone();
+        let sealed_target_authorization = sealed.target_authorization.clone();
+        let sealed_scratch_authorization = sealed.scratch_authorization.clone();
         // Re-read the target: a second target session may have changed an
         // in-scope grant, extension, collation or setting since `qualify`, and
         // comparing scratch against the sealed evidence would miss it (finding
@@ -1383,19 +1372,14 @@ impl ScratchRun {
                 "the target connection was replaced; the qualified scope cannot be reused".into(),
             ));
         }
-        let mut scope_schemas = schemas.clone();
-        for extra in &extras {
-            if extra != "pg_temp" && !scope_schemas.contains(extra) {
-                scope_schemas.push(extra.clone());
-            }
-        }
+        let scope_schemas =
+            scope::scope_schemas(driver, &schemas, &extras).map_err(Error::Scope)?;
         let (mut target_facts, target_auth) = target
             .scope_facts(&schemas, &extras, &scope_schemas)
             .await
             .map_err(read)?;
-        let target_authorization = format!("{:x}", Sha256::digest(target_auth.canonical()));
-        let expected_auth = authorization::with_planned(target_auth, &planned);
-        target_facts.catalog.visibility = expected_visibility(&expected_auth, &schemas, &extras);
+        let target_authorization = target_auth.digest();
+        target_auth.project_visibility(&planned, &schemas, &extras, &mut target_facts.catalog);
         // The fresh read must be the sealed one. Comparing it against scratch
         // alone would pass a target that changed into something scratch is
         // still compatible with — an extension installed after `qualify` is
@@ -1403,7 +1387,7 @@ impl ScratchRun {
         // keeps a report and binding work made over a scope that no longer
         // exists (finding on #688; DECISIONS 520).
         let changed = changed_sections(&sealed_facts, &target_facts);
-        let authorization_digest = format!("{:x}", Sha256::digest(expected_auth.canonical()));
+        let authorization_digest = target_auth.sealed_digest(&planned);
         // Both digests: the projected one, which a change outside the plan
         // moves, and the raw one, which a target that ran one of the plan's
         // own grants moves while the projection stays put (finding on #688).
@@ -1420,10 +1404,9 @@ impl ScratchRun {
             )));
         }
         let deployer = map
-            .deployer(&expected_auth)
-            .ok_or_else(|| Error::Scope("no run-local deployer role was mapped".into()))?;
-        let required =
-            crate::resolver::native::executables::required_libraries(&target_facts.catalog);
+            .deployer(&target_auth)
+            .map_err(|reason| Error::Scope(reason.into()))?;
+        let required = scope::required_libraries(driver, &target_facts.catalog);
         let (scratch_facts, auth_differences) = {
             let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
             if scratch.connection.id() != sealed_connection {
@@ -1431,36 +1414,29 @@ impl ScratchRun {
                     "the scratch session was replaced; the qualified scope cannot be reused".into(),
                 ));
             }
-            scratch
-                .connection
-                .execute(&format!("SET ROLE \"{}\"", deployer.replace('"', "\"\"")))
+            scope::enter(&mut scratch.connection, driver, deployer.as_deref())
                 .await
                 .map_err(db)?;
-            let scope = pg_environment::Scope {
-                schemas: &schemas,
-                write_path_extras: &extras,
-            };
-            let catalog = pg_environment::read(&mut scratch.connection, &scope)
-                .await
-                .map_err(db)?;
-            let differences = authorization::verify(
+            let differences = scope::recheck(
                 &mut scratch.connection,
                 &map,
-                &expected_auth,
+                &target_auth,
+                &planned,
                 &scope_schemas,
+                &sealed_scratch_authorization,
             )
             .await
             .map_err(db)?;
-            let library_path = catalog
-                .settings
-                .get("dynamic_library_path")
-                .map(|fact| fact.value.clone())
-                .unwrap_or_else(|| "$libdir".to_owned());
+            let catalog = scope::read_catalog(&mut scratch.connection, driver, &schemas, &extras)
+                .await
+                .map_err(db)?;
             let executables = crate::resolver::native::executables::executables(
                 &scratch.backend,
                 &required,
-                &library_path,
+                &scope::library_path(driver, &catalog),
+                scope::engine_packages(driver),
             )
+            .await
             .map_err(|_| Error::Scope("the scratch backend's executables are unreadable".into()))?;
             (
                 EnvironmentFacts {
@@ -1470,7 +1446,7 @@ impl ScratchRun {
                 differences,
             )
         };
-        let report = compatibility::compare(&target_facts, &scratch_facts, &[]);
+        let report = scope::compare(driver, &target_facts, &scratch_facts);
         if report.verdict() != Verdict::Verified || !auth_differences.is_empty() {
             return Err(Error::Scope(
                 "the analysis scope changed under the run and no longer qualifies".into(),
@@ -1730,44 +1706,6 @@ fn changed_sections(sealed: &EnvironmentFacts, fresh: &EnvironmentFacts) -> Vec<
     }
     changed
 }
-/// The effective schema order the deployer would see on each in-scope path,
-/// derived from the (post-plan) authorization: `pg_catalog` first, then each
-/// of the path's schemas the deployer has USAGE on, in order. This is what
-/// PostgreSQL's `current_schemas(true)` returns once the temporary namespaces
-/// are stripped, so a reproduction that grants the same USAGE matches it, and
-/// a planned USAGE change is compared against its intended effect.
-fn expected_visibility(
-    auth: &AuthorizationContext,
-    paths: &[String],
-    extras: &[String],
-) -> std::collections::BTreeMap<String, pbps_db::resolver::Observation> {
-    paths
-        .iter()
-        .map(|start| {
-            let mut visible = vec!["pg_catalog".to_owned()];
-            for schema in std::iter::once(start).chain(extras.iter()) {
-                let usable = auth
-                    .schemas
-                    .get(schema)
-                    .and_then(|s| s.privileges.get("USAGE"))
-                    .copied()
-                    .unwrap_or(false);
-                // `current_schemas` lists each namespace once, at its first
-                // occurrence, so a schema repeated on the path (or an extra
-                // equal to the start) is not duplicated here (finding on #688).
-                if usable && !visible.contains(schema) {
-                    visible.push(schema.clone());
-                }
-            }
-            let rendered = pbps_db::resolver::environment::render_visibility(&visible);
-            (
-                start.clone(),
-                pbps_db::resolver::Observation::reported(Some(&rendered)),
-            )
-        })
-        .collect()
-}
-
 /// Why the run ended and whether its resources went away are two different
 /// facts. Reporting "could not create scratch resources" for a channel that
 /// failed qualification would hide which of them happened.

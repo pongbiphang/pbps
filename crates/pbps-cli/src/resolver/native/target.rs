@@ -3,10 +3,10 @@
 
 use super::executables;
 use super::{SocketOwnerLease, UnqualifiedProcess};
+use crate::resolver::scope;
 use pbps_db::resolver::environment::{DatabaseRecipe, EnvironmentFacts};
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::PeerVerifiedConn;
-use pbps_pg::resolver::authorization::AuthorizationContext;
 use std::sync::{Arc, Weak};
 
 #[path = "target_engine.rs"]
@@ -167,31 +167,28 @@ impl NativeTarget {
             .ok_or(UnqualifiedProcess)
     }
 
-    /// The `CREATE DATABASE` recipe that reproduces the target's encoding and
-    /// locale on the scratch server, read before any scratch database exists.
-    /// Catalog-only: no executables and no visibility, because a recipe needs
-    /// neither.
+    /// The `CREATE DATABASE` recipe that reproduces the target's database on
+    /// the scratch server — PostgreSQL's encoding and locale, SQL Server's
+    /// collation, compatibility level, containment and ANSI options — read
+    /// before any scratch database exists. Catalog-only: no executables and
+    /// no visibility, because a recipe needs neither.
     pub async fn database_recipe(&mut self) -> Result<DatabaseRecipe, EnvironmentError> {
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
-        // SQL Server's scratch database creation does not consume a recipe yet
-        // (reproducing its collation is #611), and its scope reader is not
-        // implemented, so it takes the neutral recipe rather than erroring.
-        if bound.connection.driver() != pbps_db::Driver::Postgres {
-            return Ok(DatabaseRecipe::neutral());
-        }
-        let catalog = engine::environment(&mut bound.connection, &[], &[])
+        let driver = bound.connection.driver();
+        let catalog = scope::read_catalog(&mut bound.connection, driver, &[], &[])
             .await
             .map_err(EnvironmentError::Catalog)?;
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
-        DatabaseRecipe::from_catalog(&catalog)
+        scope::recipe(driver, &catalog)
             .map_err(|error| EnvironmentError::Catalog(pbps_db::DbError::BadRow(error.to_string())))
     }
 
     /// The analysis-scope facts of the target as its own deployer sees them,
     /// and that deployer's authorization context over `authorization_schemas`:
-    /// both read over the connection in one catalog snapshot, so the sealed
-    /// scope never holds half of a change committed between them (finding on
+    /// both read over the connection together — one catalog snapshot on
+    /// PostgreSQL, a bracketed double read on SQL Server — so the sealed scope
+    /// never holds half of a change committed between them (finding on
     /// #688). The content of the engine executable and the native libraries
     /// its extensions name is read from the connected backend by the native
     /// observer — kernel state, outside any snapshot. Bracketed by the
@@ -202,28 +199,32 @@ impl NativeTarget {
         schemas: &[String],
         write_path_extras: &[String],
         authorization_schemas: &[String],
-    ) -> Result<(EnvironmentFacts, AuthorizationContext), EnvironmentError> {
+    ) -> Result<(EnvironmentFacts, scope::Authorization), EnvironmentError> {
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
-        let (catalog, authorization) = engine::scope_facts(
+        let driver = bound.connection.driver();
+        let (catalog, authorization) = scope::read_target(
             &mut bound.connection,
+            driver,
             schemas,
             write_path_extras,
             authorization_schemas,
         )
         .await
         .map_err(EnvironmentError::Catalog)?;
-        let required = executables::required_libraries(&catalog);
-        let library_path = catalog
-            .settings
-            .get("dynamic_library_path")
-            .map(|fact| fact.value.clone())
-            .unwrap_or_else(|| "$libdir".to_owned());
+        let required = scope::required_libraries(driver, &catalog);
+        let library_path = scope::library_path(driver, &catalog);
         // The backend, not the postmaster: `session_preload_libraries` and
         // `local_preload_libraries` are loaded into the connected backend, so
         // hashing the service process would miss them (finding on #610).
-        let set = executables::executables(bound.lease.owner(), &required, &library_path)
-            .map_err(|_| EnvironmentError::Executables)?;
+        let set = executables::executables(
+            bound.lease.owner(),
+            &required,
+            &library_path,
+            scope::engine_packages(driver),
+        )
+        .await
+        .map_err(|_| EnvironmentError::Executables)?;
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         Ok((
             EnvironmentFacts {

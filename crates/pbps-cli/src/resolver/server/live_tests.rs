@@ -711,21 +711,75 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
 #[ignore = "needs the dedicated-server fixture; run scripts/live-resolver-server.py"]
 async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     fixture();
-    if driver() != Driver::Postgres {
-        return; // SQL Server scope qualification is #611.
+    // What differs by engine is the scope and the statements another session
+    // changes the target with; the lifecycle under test is the same.
+    struct Case {
+        schemas: Vec<String>,
+        extras: Vec<String>,
+        setup: &'static [&'static str],
+        /// A change outside the plan, and the section the refusal names.
+        drift: (&'static str, &'static str, &'static str),
+        planned: PlannedGrant,
+        /// The same grant, as another session runs it on the target.
+        performed: &'static str,
+        cleanup: &'static [&'static str],
     }
-    // A write-path extra outside `schemas`: its authorization is part of the
-    // scope (SPEC §7.3), so verification must cover it too, or a faithful
-    // reproduction is refused as missing the schema (finding on #688).
+    let case = match driver() {
+        // A write-path extra outside `schemas`: its authorization is part of
+        // the scope (SPEC §7.3), so verification must cover it too, or a
+        // faithful reproduction is refused as missing the schema (finding on
+        // #688). The drift is an extension installed after `qualify`.
+        Driver::Postgres => Case {
+            schemas: vec!["public".to_owned()],
+            extras: vec!["pbps_extra_688".to_owned()],
+            setup: &[
+                "DROP SCHEMA IF EXISTS pbps_extra_688",
+                "CREATE SCHEMA pbps_extra_688",
+            ],
+            drift: (
+                "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+                "extensions",
+                "DROP EXTENSION pgcrypto",
+            ),
+            planned: PlannedGrant {
+                principal: "PUBLIC".into(),
+                schema: "pbps_extra_688".into(),
+                privilege: "USAGE".into(),
+                revoke: false,
+            },
+            performed: "GRANT USAGE ON SCHEMA pbps_extra_688 TO PUBLIC",
+            cleanup: &["DROP SCHEMA pbps_extra_688"],
+        },
+        // SQL Server has no write path. The deployer is `sa`, which is `dbo`
+        // in every database, reproduced by the run login that owns its
+        // scratch database; the drift is a grant another session makes on
+        // the in-scope schema (#611).
+        Driver::Mssql => Case {
+            schemas: vec!["dbo".to_owned()],
+            extras: Vec::new(),
+            setup: &[],
+            drift: (
+                "GRANT EXECUTE ON SCHEMA::dbo TO public",
+                "authorization",
+                "REVOKE EXECUTE ON SCHEMA::dbo FROM public",
+            ),
+            planned: PlannedGrant {
+                principal: "public".into(),
+                schema: "dbo".into(),
+                privilege: "SELECT".into(),
+                revoke: false,
+            },
+            performed: "GRANT SELECT ON SCHEMA::dbo TO public",
+            cleanup: &["REVOKE SELECT ON SCHEMA::dbo FROM public"],
+        },
+    };
     let mut setup =
         PeerVerifiedConn::connect(driver(), &std::env::var("PBPS_NATIVE_CONNECTION").unwrap())
             .await
             .unwrap();
-    setup
-        .query("DROP SCHEMA IF EXISTS pbps_extra_688")
-        .await
-        .unwrap();
-    setup.query("CREATE SCHEMA pbps_extra_688").await.unwrap();
+    for statement in case.setup {
+        setup.query(statement).await.unwrap();
+    }
     let mut target = native_target().await;
     let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
     let mut run = server
@@ -734,8 +788,8 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
         .expect("scratch resources");
 
     let request = crate::resolver::server::ScopeRequest {
-        schemas: vec!["public".to_owned()],
-        write_path_extras: vec!["pbps_extra_688".to_owned()],
+        schemas: case.schemas.clone(),
+        write_path_extras: case.extras.clone(),
         planned: Vec::new(),
     };
     let verdict = run
@@ -755,24 +809,22 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
 
     // A later check requalifies the sealed scope and holds.
     run.check(&mut target).await.expect("requalification holds");
-    // A change on the target after `qualify` — an extension installed by
-    // another session — is a scope that no longer exists, even though the
-    // scratch side is still compatible with it; the next check refuses and
-    // says what moved (finding on #688; DECISIONS 520).
-    setup
-        .query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
-        .await
-        .unwrap();
+    // A change on the target after `qualify` by another session is a scope
+    // that no longer exists, even though the scratch side is still
+    // compatible with it; the next check refuses and says what moved
+    // (finding on #688; DECISIONS 520).
+    let (change, section, undo) = case.drift;
+    setup.query(change).await.unwrap();
     let refused = run
         .check(&mut target)
         .await
         .expect_err("a target that moved since qualify is refused");
     assert!(
         refused.to_string().contains("changed under the run")
-            && refused.to_string().contains("extensions"),
+            && refused.to_string().contains(section),
         "{refused}"
     );
-    setup.query("DROP EXTENSION pgcrypto").await.unwrap();
+    setup.query(undo).await.unwrap();
 
     // Cleanup removes the scratch objects and every run-local role it created,
     // reporting nothing left over.
@@ -792,14 +844,9 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
         .await
         .expect("scratch resources for the second run");
     let request = crate::resolver::server::ScopeRequest {
-        schemas: vec!["public".to_owned()],
-        write_path_extras: vec!["pbps_extra_688".to_owned()],
-        planned: vec![PlannedGrant {
-            role: "PUBLIC".into(),
-            schema: "pbps_extra_688".into(),
-            privilege: "USAGE".into(),
-            revoke: false,
-        }],
+        schemas: case.schemas.clone(),
+        write_path_extras: case.extras.clone(),
+        planned: vec![case.planned.clone()],
     };
     let verdict = run
         .qualify(&mut target, &request)
@@ -811,10 +858,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
         "{verdict:?}"
     );
     run.check(&mut target).await.expect("requalification holds");
-    setup
-        .query("GRANT USAGE ON SCHEMA pbps_extra_688 TO PUBLIC")
-        .await
-        .unwrap();
+    setup.query(case.performed).await.unwrap();
     let refused = run
         .check(&mut target)
         .await
@@ -827,5 +871,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     run.close()
         .await
         .expect("cleanup confirms the run-local roles gone");
-    setup.query("DROP SCHEMA pbps_extra_688").await.unwrap();
+    for statement in case.cleanup {
+        setup.query(statement).await.unwrap();
+    }
 }
