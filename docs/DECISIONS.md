@@ -14123,3 +14123,40 @@ SPEC is in sync with all of these.
      `06` mean the engine closed first. The first draft of this said the opposite, and a
      refusal that names the wrong end sends the next investigation to the
      wrong process — worse than naming none.
+
+523. **A process walk says whether it could account for everything, and the
+     caller says which it needs.** `process_scope` answered
+     `Result<Vec<(u32, File)>, _>`. That can mean "here are the processes" and
+     "I could not walk at all", and not "here are the processes I was able to
+     see" — which is what every branch that passes a node over produces. Three
+     of its four callers inspect **every** occupant, and the `Vec` let them
+     read a partial walk as a whole one: `private_channel`'s occupant check,
+     which also asserts the tree is exactly a root and one shell, `server`'s
+     forwarder check, and `runtime`'s container walk. 522 fixed the branches
+     one at a time and kept meeting the same wall, because the branches were
+     never the defect — the answer they had to squeeze into was (#730).
+
+     So the processes cannot be had without choosing. `Scope::complete`
+     refuses a walk that could not account for everything; `Scope::seen`
+     hands over what was seen, and its one caller today is `socket_owners`,
+     where an omission takes the count of holders to zero and zero refuses.
+     A caller added later has to choose too, at the call site, where the
+     reason is visible.
+
+     **A node that orphans nothing does not make a walk partial**, and that is
+     asked before the reads that may find it gone, because afterwards it
+     cannot be asked at all. Measured over 1,304,698 walks of a tree two deep:
+     of 1,356 nodes passed over, 705 demonstrably had no children, 4 had some,
+     and 647 had vanished before the question could be put. Cannot-be-asked
+     counts with "had some": the two have the same consequence.
+
+     **And walking again settles it**, because incompleteness is a state of
+     the moment rather than of the tree. Measured over single walks: 2.88% of
+     a tree spawning forty thousand processes a second could not account for
+     everything, 0.21% of a tree two deep at a hundred a second, and **none of
+     312,300** of a tree with one sleeping child — the cost tracks how often
+     processes come and go, and a quiet tree pays nothing. Four attempts takes
+     the first two to 1 call in 322,865 and 1 in 237,582. The bound stays and
+     a refusal sits behind it: "ask again until it looks right" is the shape
+     that hides a fault which is not going away, and every caller of this
+     needs every occupant.

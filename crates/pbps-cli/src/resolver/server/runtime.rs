@@ -8,8 +8,9 @@
 use super::profile::{self, ServerProfile};
 use super::{Error, Premise};
 use crate::resolver::native::{
-    BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative, for_each_occupant,
-    foreign_network_tasks, groups, mount_rows, private_network, process_scope, security,
+    BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative,
+    complete_process_scope, for_each_occupant, foreign_network_tasks, groups, mount_rows,
+    private_network, security,
 };
 
 /// The processes the daemon's record names, before anything is measured of
@@ -39,7 +40,10 @@ impl ServerProcesses {
             ));
         }
         let mut engines = Vec::new();
-        for (pid, _) in process_scope(&init)
+        // Every process in the container, so a walk that could not account
+        // for one refuses rather than reporting the engines it did see
+        // (#730).
+        for (pid, _) in complete_process_scope(&init)
             .map_err(|_| Error::Unqualified("the supplied container's processes are unreadable"))?
         {
             let Ok(process) = ProcessLease::capture(pid) else {

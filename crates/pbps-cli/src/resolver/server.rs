@@ -14,7 +14,8 @@
 
 use crate::resolver::docker::{CandidateImage, LocalApi, forwarder::Forwarder};
 use crate::resolver::native::{
-    NativeTarget, ProcessLease, TargetWitness, guard, observe_incidental, process_scope, security,
+    NativeTarget, ProcessLease, TargetWitness, complete_process_scope, guard, observe_incidental,
+    security,
 };
 use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
@@ -557,7 +558,9 @@ fn check_kernel_parts(
 ) -> Result<(), Error> {
     let channel = |reason: &str| Error::Channel(reason.to_owned());
     guard(forwarder_guard).map_err(|_| channel("the forwarder's init is not the fixed guard"))?;
-    for (pid, directory) in process_scope(forwarder_guard)
+    // Every occupant of the forwarder, so a walk that could not account for
+    // one refuses rather than checking the rest (#730).
+    for (pid, directory) in complete_process_scope(forwarder_guard)
         .map_err(|_| channel("the forwarder's processes are unreadable"))?
     {
         if pid == forwarder_guard.pid() {

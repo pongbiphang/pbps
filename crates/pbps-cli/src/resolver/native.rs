@@ -113,6 +113,9 @@ pub(crate) enum Reading {
     ScopeParent,
     /// The descriptor table of a process in the scope.
     ScopeDescriptors,
+    /// The walk passed over a node it could not rule out had descendants, and
+    /// the caller needs every occupant rather than as many as could be seen.
+    ScopeIncomplete,
     /// A process the walk has just seen has no `/proc` entry to open.
     CaptureOpen,
     /// Its `stat` start time, when establishing it rather than re-reading it.
@@ -188,6 +191,7 @@ impl std::fmt::Display for Reading {
             Self::Scope => f.write_str("scope"),
             Self::ScopeParent => f.write_str("scope-parent"),
             Self::ScopeDescriptors => f.write_str("scope-descriptors"),
+            Self::ScopeIncomplete => f.write_str("scope-incomplete"),
             Self::CaptureOpen => f.write_str("capture-open"),
             Self::CaptureStartTicks => f.write_str("capture-start-ticks"),
             Self::CaptureStatus => f.write_str("capture-status"),
@@ -888,9 +892,106 @@ pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
     File::open(format!("/proc/{pid}"))
 }
 
-pub(crate) fn process_scope(
+/// Whether `pid` demonstrably has no children of its own.
+///
+/// `false` for "it has some" **and** for "it could not be asked", because the
+/// two have the same consequence here: a node passed over may have left live
+/// descendants the walk will not reach. Only a definite empty answer lets the
+/// walk still call itself complete.
+///
+/// Measured over 1,304,698 walks of a tree two deep, of the 1,356 nodes
+/// passed over: 705 answered definitely empty, 4 definitely not, and 647 had
+/// already vanished (#730).
+fn has_no_children(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    let mut answered = false;
+    for task in tasks {
+        let Ok(task) = task else { return false };
+        let Ok(text) = std::fs::read_to_string(task.path().join("children")) else {
+            return false;
+        };
+        if !text.trim().is_empty() {
+            return false;
+        }
+        answered = true;
+    }
+    answered
+}
+
+/// The processes of a service's tree, and whether the walk can account for
+/// all of them.
+///
+/// **The list alone could not say.** `process_scope` answered a bare `Vec`,
+/// which can mean "here are the processes" and "I could not walk at all" but
+/// not "here are the processes I was able to see" — and the third is what
+/// every branch that passes a node over produces. Three of this walk's four
+/// callers inspect **every** occupant, and a `Vec` let them read a partial
+/// walk as a whole one; `socket_owners` asks which single process holds a
+/// socket, and an omission only takes its count to zero, which refuses.
+///
+/// So the question is asked at the call site rather than assumed: the
+/// processes cannot be had without choosing [`Self::complete`] or
+/// [`Self::seen`], and a caller added later has to choose too (#730,
+/// DECISIONS 523).
+pub(crate) struct Scope {
+    processes: Vec<(u32, File)>,
+    /// A node was passed over without being able to rule out that it had
+    /// descendants this walk therefore never enumerated.
+    may_have_orphans: bool,
+}
+
+impl Scope {
+    /// Every process in the tree, where the walk could account for all of
+    /// them — and a refusal where it could not.
+    pub(crate) fn complete(self) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
+        if self.may_have_orphans {
+            return Err(Reading::ScopeIncomplete.refuse());
+        }
+        Ok(self.processes)
+    }
+
+    /// Every process the walk **saw**, which may be missing one.
+    ///
+    /// Only for a caller whose answer an omission cannot make wrong. The one
+    /// today is the socket owner: a missing process takes the count of
+    /// holders to zero, and zero refuses.
+    pub(crate) fn seen(self) -> Vec<(u32, File)> {
+        self.processes
+    }
+}
+
+/// [`process_scope`], walked again while it cannot account for everything.
+///
+/// A walk is incomplete because a node went away while it was being read, and
+/// that is a state of the moment rather than of the tree: the next walk is an
+/// independent attempt at a tree that has stopped moving in that particular
+/// place. Measured over a tree spawning forty thousand processes a second,
+/// one walk in 34 could not account for everything; over a tree two deep at a
+/// hundred a second, one in 477; over a tree with one sleeping child, none of
+/// 312,300.
+///
+/// **Bounded, with a refusal behind it**, because "ask again until it looks
+/// right" is the shape that hides a fault that is not going away. Four
+/// attempts, and a tree that cannot be walked completely in four is refused —
+/// which is what the callers of this want, since every one of them needs
+/// every occupant.
+pub(crate) fn complete_process_scope(
     service: &ProcessLease,
 ) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
+    let mut last = None;
+    for _ in 0..4 {
+        match process_scope(service)?.complete() {
+            Ok(processes) => return Ok(processes),
+            Err(refusal) => last = Some(refusal),
+        }
+    }
+    Err(last.unwrap_or(UnqualifiedProcess))
+}
+
+pub(crate) fn process_scope(service: &ProcessLease) -> Result<Scope, UnqualifiedProcess> {
+    let mut may_have_orphans = false;
     let mut scope = vec![(
         service.pid,
         service
@@ -911,6 +1012,11 @@ pub(crate) fn process_scope(
             // their own live leases; a vanished unrelated child is not an
             // unreadable live process or a reason to invalidate that socket.
             Err(error) if process_gone(&error) => {
+                // Gone before its own children could be read, so whether it
+                // had any is unanswerable: anything it held was reparented,
+                // and if the reaper is a node this walk has already passed
+                // the descendants are never reached (#730).
+                may_have_orphans = true;
                 cursor += 1;
                 continue;
             }
@@ -940,14 +1046,26 @@ pub(crate) fn process_scope(
             if scope.len() >= 4096 {
                 return Err(Reading::Scope.refuse());
             }
+            // Asked before the reads that may find it gone, because after
+            // that it cannot be asked at all. Measured over 1,304,698 walks
+            // of a tree two deep: of 1,356 nodes passed over, 705 demonstrably
+            // had no children and orphaned nothing, 4 had some, and 647 had
+            // vanished before the question could be put (#730).
+            let childless = has_no_children(pid);
             let directory = match open_process(pid) {
                 Ok(file) => file,
-                Err(error) if process_gone(&error) => continue,
+                Err(error) if process_gone(&error) => {
+                    may_have_orphans |= !childless;
+                    continue;
+                }
                 Err(_) => return Err(Reading::Scope.refuse()),
             };
             let stat = match std::fs::read_to_string(proc_base(&directory).join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if process_gone(&error) => continue,
+                Err(error) if process_gone(&error) => {
+                    may_have_orphans |= !childless;
+                    continue;
+                }
                 Err(_) => return Err(Reading::Scope.refuse()),
             };
             let ppid = stat
@@ -988,6 +1106,10 @@ pub(crate) fn process_scope(
             // incomplete scan that reads as a complete one.
             if ppid != parent_pid {
                 if exited_stat(&stat).map_err(Reading::Scope.named())? {
+                    // Over, so it holds nothing itself — but a process that
+                    // is over can still have had live children, and those are
+                    // reparented rather than ended (#730).
+                    may_have_orphans |= !childless;
                     continue;
                 }
                 return Err(Reading::ScopeParent.refuse());
@@ -996,7 +1118,10 @@ pub(crate) fn process_scope(
         }
         cursor += 1;
     }
-    Ok(scope)
+    Ok(Scope {
+        processes: scope,
+        may_have_orphans,
+    })
 }
 
 /// The tasks sharing one of a lease's namespaces, by kernel id.
@@ -1198,7 +1323,10 @@ pub(crate) fn socket_owners(
 ) -> Result<Vec<ProcessLease>, UnqualifiedProcess> {
     let expected = PathBuf::from(format!("socket:[{inode}]"));
     let mut owners = Vec::new();
-    for (pid, directory) in process_scope(service)? {
+    // `seen` and not `complete`: this asks which single process holds the
+    // socket, and a process the walk missed takes the count of holders to
+    // zero, which refuses. An omission cannot make this answer wrong (#730).
+    for (pid, directory) in process_scope(service)?.seen() {
         let entries = match std::fs::read_dir(proc_base(&directory).join("fd")) {
             Ok(entries) => entries,
             Err(error) if process_gone(&error) => continue,
@@ -1728,6 +1856,151 @@ mod tests {
             ours_first, theirs_first,
             "the two directions must not render the same, or the state says \
              nothing about who closed"
+        );
+    }
+
+    /// A walk that could not account for everything cannot be read as one
+    /// that did.
+    ///
+    /// This is the whole point of the type: three of the four callers need
+    /// every occupant, and a bare `Vec` let them take a partial walk for a
+    /// whole one. The processes cannot be had without saying which question
+    /// was asked (#730).
+    #[test]
+    fn an_incomplete_scope_cannot_be_read_as_a_whole_one() {
+        let partial = || Scope {
+            processes: Vec::new(),
+            may_have_orphans: true,
+        };
+        let whole = || Scope {
+            processes: Vec::new(),
+            may_have_orphans: false,
+        };
+        assert!(whole().complete().is_ok());
+        assert!(
+            partial().complete().is_err(),
+            "a partial walk is not a whole one"
+        );
+        // `seen` answers either way, which is what makes it the deliberate
+        // choice rather than the convenient one.
+        assert!(partial().seen().is_empty());
+        assert!(whole().seen().is_empty());
+
+        LAST_READING.with(|cell| cell.set(None));
+        assert!(partial().complete().is_err());
+        assert_eq!(last_reading(), Some(Reading::ScopeIncomplete));
+    }
+
+    /// Whether a node could have orphaned anything has three answers, and
+    /// only one of them lets the walk still call itself whole.
+    #[test]
+    fn a_node_that_cannot_be_asked_is_not_a_node_without_children() {
+        // This process has one: a child it spawned and has not reaped.
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
+        assert!(
+            !has_no_children(std::process::id()),
+            "a process holding an unreaped child has children"
+        );
+        // That child has none of its own.
+        assert!(has_no_children(child.id()), "`sleep` spawns nothing");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // And a pid nothing answers for cannot say either way, which counts
+        // as "may have had some" rather than as "had none".
+        assert!(
+            !has_no_children(u32::MAX),
+            "a node that cannot be asked is not a node without children"
+        );
+    }
+
+    /// A tree that is not moving is walked whole, every time.
+    ///
+    /// The three callers that need every occupant pay for completeness only
+    /// where processes are coming and going. Measured: 312,300 walks of a
+    /// tree with one sleeping child, none incomplete (#730).
+    #[test]
+    fn a_quiet_tree_is_walked_completely() {
+        let mut tree = spawned_and_execed(
+            Command::new("/bin/bash")
+                .args(["-c", "exec /bin/bash -c '/usr/bin/sleep 60 & wait'"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            "bash",
+        );
+        let lease = ProcessLease::capture(tree.id()).expect("a root-installed shell");
+        let mut walks = 0usize;
+        let mut incomplete = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            walks += 1;
+            if process_scope(&lease)
+                .expect("the walk itself does not refuse")
+                .complete()
+                .is_err()
+            {
+                incomplete += 1;
+            }
+        }
+        tree.kill().unwrap();
+        tree.wait().unwrap();
+        assert!(walks > 10_000, "too few walks to say anything: {walks}");
+        assert_eq!(
+            incomplete, 0,
+            "a tree that is not moving has nothing to miss: {incomplete} of {walks}"
+        );
+    }
+
+    /// Walking again settles a tree that moved under the first walk.
+    ///
+    /// Incompleteness is a state of the moment, not of the tree, so a second
+    /// walk is an independent attempt. Measured on the churning fixture:
+    /// **2.88%** of single walks could not account for everything, and
+    /// **1 call in 322,865** still could not after four — the bound stays,
+    /// and with it the refusal (#730).
+    #[test]
+    fn walking_again_settles_a_tree_that_moved() {
+        let mut tree = spawned_and_execed(
+            Command::new("/bin/bash")
+                .args([
+                    "-c",
+                    "exec /bin/bash -c 'while :; do /usr/bin/true & /usr/bin/true & wait; done'",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            "bash",
+        );
+        let lease = ProcessLease::capture(tree.id()).expect("a root-installed shell");
+        let mut calls = 0usize;
+        let mut single = 0usize;
+        let mut bounded = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            calls += 1;
+            if process_scope(&lease)
+                .expect("the walk itself does not refuse")
+                .complete()
+                .is_err()
+            {
+                single += 1;
+            }
+            if complete_process_scope(&lease).is_err() {
+                bounded += 1;
+            }
+        }
+        tree.kill().unwrap();
+        tree.wait().unwrap();
+        assert!(calls > 10_000, "too few calls to say anything: {calls}");
+        assert!(
+            single > 0,
+            "this fixture must move enough for a single walk to miss something, \
+             or it measures nothing: {single} of {calls}"
+        );
+        assert!(
+            bounded * 1_000 < single,
+            "walking again must settle all but a thousandth of what one walk missed: \
+             {bounded} after four against {single} after one, over {calls} calls"
         );
     }
 

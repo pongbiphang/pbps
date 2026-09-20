@@ -3,7 +3,7 @@
 //! containment, target separation and the relevant engine compatibility.
 
 use super::{
-    File, ProcessLease, UnqualifiedProcess, observe_incidental, proc_base, process_scope,
+    File, ProcessLease, UnqualifiedProcess, complete_process_scope, observe_incidental, proc_base,
     socket_owners,
 };
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
@@ -132,7 +132,9 @@ impl PrivateChannelLease {
         if shells != 1 || readers_writers != 2 {
             return Err(UnqualifiedProcess);
         }
-        for (pid, directory) in process_scope(&self.workload)? {
+        // Every occupant, so a walk that could not account for one refuses
+        // rather than passing the rest (#730).
+        for (pid, directory) in complete_process_scope(&self.workload)? {
             if pid == self.workload.pid() {
                 continue;
             }
@@ -166,7 +168,10 @@ pub(crate) fn awaiting_engine(
     let root = ProcessLease::capture(pid)?;
     guard(&root)?;
     private_network(&root)?;
-    let scope = process_scope(&root)?;
+    // `complete` and not `seen`: this asserts the tree is exactly the root
+    // and one shell, and a walk missing a process makes a larger tree look
+    // like the expected one (#730).
+    let scope = complete_process_scope(&root)?;
     if scope.len() != 2 {
         return Err(UnqualifiedProcess);
     }

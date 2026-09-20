@@ -366,6 +366,15 @@ as a complete one. Review caught it before it shipped. Its own second defect
 was shape 1 again, inside the fix for shape 1: it read an unreadable `task`
 directory or `children` file as "not a child".
 
+**The fourth was the return type, and it was the defect the other three kept
+bouncing off.** `process_scope` answered a bare `Vec`, which cannot say "here
+are the processes I was able to see" — so three callers that need every
+occupant read a partial walk as a whole one, and each branch fixed in
+isolation just moved where the partial list came from. Carrying completeness
+in the value, and making the caller choose `complete` or `seen`, is what
+finally made the wrong reading unrepresentable rather than merely unlikely
+(#730, DECISIONS 523).
+
 **The third shape was a second answer to a question this file had already
 answered.** The replacement tested the `stat` state alone, and a dead leader
 can retain live threads — `exited_stat` was right there, requiring the count
