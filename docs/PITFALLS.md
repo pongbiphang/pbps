@@ -371,9 +371,12 @@ bouncing off.** `process_scope` answered a bare `Vec`, which cannot say "here
 are the processes I was able to see" — so three callers that need every
 occupant read a partial walk as a whole one, and each branch fixed in
 isolation just moved where the partial list came from. Carrying completeness
-in the value, and making the caller choose `complete` or `seen`, is what
-finally made the wrong reading unrepresentable rather than merely unlikely
-(#730, DECISIONS 523).
+in the value is what finally made the wrong reading unrepresentable rather
+than merely unlikely — and **not** by letting the caller choose, which was the
+first shape and was wrong too: the one caller that looked able to take a
+partial list could not either, because an omission there takes two socket
+holders to one and one is the count that is *accepted*. An incomplete list is
+never handed out (#730, DECISIONS 523).
 
 **The third shape was a second answer to a question this file had already
 answered.** The replacement tested the `stat` state alone, and a dead leader

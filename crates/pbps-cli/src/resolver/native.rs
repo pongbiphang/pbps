@@ -116,6 +116,9 @@ pub(crate) enum Reading {
     /// The walk passed over a node it could not rule out had descendants, and
     /// the caller needs every occupant rather than as many as could be seen.
     ScopeIncomplete,
+    /// This kernel has no `/proc/<pid>/task/<tid>/children` at all, so a
+    /// process tree cannot be walked on it.
+    ScopeUnsupported,
     /// A process the walk has just seen has no `/proc` entry to open.
     CaptureOpen,
     /// Its `stat` start time, when establishing it rather than re-reading it.
@@ -141,6 +144,14 @@ thread_local! {
     /// assert *which* read answered rather than only that one did.
     static LAST_READING: std::cell::Cell<Option<Reading>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Answers [`proc_children_supported`] `false` on this thread, so the
+    /// refusal a kernel without `CONFIG_CHECKPOINT_RESTORE` earns can be
+    /// exercised on one that has it.
+    static NO_PROC_CHILDREN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -192,6 +203,7 @@ impl std::fmt::Display for Reading {
             Self::ScopeParent => f.write_str("scope-parent"),
             Self::ScopeDescriptors => f.write_str("scope-descriptors"),
             Self::ScopeIncomplete => f.write_str("scope-incomplete"),
+            Self::ScopeUnsupported => f.write_str("scope-unsupported"),
             Self::CaptureOpen => f.write_str("capture-open"),
             Self::CaptureStartTicks => f.write_str("capture-start-ticks"),
             Self::CaptureStatus => f.write_str("capture-status"),
@@ -933,6 +945,29 @@ impl Scope {
     }
 }
 
+/// Whether this kernel exposes `/proc/<pid>/task/<tid>/children`.
+///
+/// Asked of **this** process, which is certainly alive, so an absent file is
+/// the kernel's answer and not a race: it is `CONFIG_CHECKPOINT_RESTORE`, and
+/// a build without it has no such file anywhere. Every other read of one is
+/// ambiguous — a task that has just gone answers the same `ENOENT` — which is
+/// exactly why this is asked separately rather than inferred (#730).
+fn proc_children_supported() -> bool {
+    // A thread-local and not an environment variable: tests run in parallel
+    // and a process-wide switch would answer for threads that never set it.
+    // `open_process` takes a variable because its fixture is a separate
+    // process; this one is only ever flipped by the test beside it.
+    #[cfg(test)]
+    if NO_PROC_CHILDREN.with(std::cell::Cell::get) {
+        return false;
+    }
+    std::fs::read_dir("/proc/self/task")
+        .ok()
+        .and_then(|mut tasks| tasks.next())
+        .and_then(Result::ok)
+        .is_some_and(|task| task.path().join("children").exists())
+}
+
 /// [`process_scope`], walked again while it cannot account for everything.
 ///
 /// A walk is incomplete because a node went away while it was being read, and
@@ -952,6 +987,21 @@ impl Scope {
 pub(crate) fn complete_process_scope(
     service: &ProcessLease,
 ) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
+    // Asked once, before spending four walks discovering it. A Linux built
+    // without `CONFIG_CHECKPOINT_RESTORE` has no `children` file for any
+    // task, so every read of one answers `ENOENT` — which is indistinguishable
+    // from a task that has just gone, and would mark every walk incomplete
+    // for ever. Four attempts would then refuse every native run on such a
+    // kernel, saying only that the walk could not account for everything
+    // (found in review, #730).
+    //
+    // Refusing is still the answer: without that file the tree below the
+    // service cannot be enumerated at all, and the occupant checks this
+    // feeds would inspect nothing and pass. What changes is that the refusal
+    // names the kernel rather than the moment.
+    if !proc_children_supported() {
+        return Err(Reading::ScopeUnsupported.refuse());
+    }
     let mut last = None;
     for _ in 0..4 {
         match process_scope(service)?.complete() {
@@ -1571,7 +1621,7 @@ mod tests {
     /// not what made CI intermittent. Closing it is #729.
     #[test]
     fn a_child_leaving_the_tree_does_not_refuse_the_walk() {
-        if !proc_children_readable() {
+        if !proc_children_supported() {
             eprintln!(
                 "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
                  enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
@@ -1595,8 +1645,8 @@ mod tests {
 
         let mut walks = 0usize;
         let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
+        let started = std::time::Instant::now();
+        while sampling(walks, started) {
             walks += 1;
             LAST_READING.with(|cell| cell.set(None));
             if process_scope(&lease).is_err() {
@@ -1610,8 +1660,9 @@ mod tests {
         tree.wait().unwrap();
 
         assert!(
-            walks > 10_000,
-            "too few walks to say anything: {walks} in five seconds"
+            walks >= 20_000,
+            "the sampling stopped on time rather than on samples, so this machine \
+             was too busy to measure on: {walks}"
         );
         let refusals: usize = refused.values().sum();
         assert!(
@@ -1851,19 +1902,51 @@ mod tests {
         );
     }
 
-    /// Whether this kernel exposes `/proc/<pid>/task/<tid>/children` at all.
+    /// Whether to keep sampling: enough samples, or out of time.
     ///
-    /// It is `CONFIG_CHECKPOINT_RESTORE`, and a Linux built without it has no
-    /// such file — so `process_scope` enumerates nothing below the root, and
-    /// the tests that measure what the walk does with a moving tree would
-    /// measure nothing while still passing. Passing vacuously is worse than
-    /// not running, so they say which it was.
-    fn proc_children_readable() -> bool {
-        std::fs::read_dir("/proc/self/task")
-            .ok()
-            .and_then(|mut tasks| tasks.next())
-            .and_then(Result::ok)
-            .is_some_and(|task| task.path().join("children").exists())
+    /// **Samples rather than seconds.** A fixed window takes what the machine
+    /// gives it, and a machine that is compiling gives very little — one run
+    /// of `walking_again_settles_a_tree_that_moved` here failed its
+    /// sample-count assertion for exactly that reason while the crate was
+    /// still building. A test whose evidence depends on the load beside it is
+    /// a test that fails for a reason it does not name.
+    fn sampling(taken: usize, since: std::time::Instant) -> bool {
+        taken < 20_000 && since.elapsed() < std::time::Duration::from_secs(30)
+    }
+
+    /// A kernel with no `children` file is refused by name, not by four
+    /// walks that cannot succeed.
+    ///
+    /// Every read of that file on such a build answers the same `ENOENT` a
+    /// task that has just gone does, so taken as the transient it usually is
+    /// it marks every walk incomplete for ever — and the caller is told only
+    /// that the walk could not account for everything, about a kernel that
+    /// can never account for anything. Found in review after the tests alone
+    /// had been gated on the capability and the production path had not
+    /// (#730).
+    #[test]
+    fn a_kernel_without_proc_children_is_refused_by_name() {
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
+        let lease = ProcessLease::capture(child.id()).expect("a root-installed child");
+
+        NO_PROC_CHILDREN.with(|flag| flag.set(true));
+        LAST_READING.with(|cell| cell.set(None));
+        let refused = complete_process_scope(&lease);
+        let named = last_reading();
+        NO_PROC_CHILDREN.with(|flag| flag.set(false));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            refused.is_err(),
+            "a tree that cannot be walked is not a whole one"
+        );
+        assert_eq!(
+            named,
+            Some(Reading::ScopeUnsupported),
+            "the refusal names the kernel rather than the moment"
+        );
+        assert_eq!(Reading::ScopeUnsupported.to_string(), "scope-unsupported");
     }
 
     /// A walk that could not account for everything cannot be read as one
@@ -1901,7 +1984,7 @@ mod tests {
     /// tree with one sleeping child, none incomplete (#730).
     #[test]
     fn a_quiet_tree_is_walked_completely() {
-        if !proc_children_readable() {
+        if !proc_children_supported() {
             eprintln!(
                 "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
                  enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
@@ -1919,8 +2002,8 @@ mod tests {
         let lease = ProcessLease::capture(tree.id()).expect("a root-installed shell");
         let mut walks = 0usize;
         let mut incomplete = 0usize;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
+        let started = std::time::Instant::now();
+        while sampling(walks, started) {
             walks += 1;
             if process_scope(&lease)
                 .expect("the walk itself does not refuse")
@@ -1932,7 +2015,11 @@ mod tests {
         }
         tree.kill().unwrap();
         tree.wait().unwrap();
-        assert!(walks > 10_000, "too few walks to say anything: {walks}");
+        assert!(
+            walks >= 20_000,
+            "the sampling stopped on time rather than on samples, so this machine \
+             was too busy to measure on: {walks}"
+        );
         assert_eq!(
             incomplete, 0,
             "a tree that is not moving has nothing to miss: {incomplete} of {walks}"
@@ -1949,7 +2036,7 @@ mod tests {
     /// not one this should keep asking about (#730).
     #[test]
     fn walking_again_settles_a_tree_that_moved() {
-        if !proc_children_readable() {
+        if !proc_children_supported() {
             eprintln!(
                 "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
                  enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
@@ -1971,8 +2058,8 @@ mod tests {
         let mut calls = 0usize;
         let mut single = 0usize;
         let mut bounded = 0usize;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
+        let started = std::time::Instant::now();
+        while sampling(calls, started) {
             calls += 1;
             if process_scope(&lease)
                 .expect("the walk itself does not refuse")
@@ -1987,7 +2074,11 @@ mod tests {
         }
         tree.kill().unwrap();
         tree.wait().unwrap();
-        assert!(calls > 10_000, "too few calls to say anything: {calls}");
+        assert!(
+            calls >= 20_000,
+            "the sampling stopped on time rather than on samples, so this machine \
+             was too busy to measure on: {calls}"
+        );
         assert!(
             single > 0,
             "this fixture must move enough for a single walk to miss something, \
@@ -2243,5 +2334,173 @@ mod tests {
             invalidated,
             "a stable numeric PID cannot preserve an exec-replaced peer's lease"
         );
+    }
+}
+
+/// TEMPORARY MEASUREMENT (#730, not for commit).
+#[cfg(test)]
+mod scope_shape_measurement {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn task_facts(id: u32) -> Option<(u32, u64, String)> {
+        let status = std::fs::read_to_string(format!("/proc/{id}/status")).ok()?;
+        let tgid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Tgid:"))?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        let stat = std::fs::read_to_string(format!("/proc/{id}/stat")).ok()?;
+        let (head, rest) = stat.rsplit_once(')')?;
+        let comm = head.split_once('(')?.1.to_owned();
+        let starttime = rest.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+        Some((tgid, starttime, comm))
+    }
+
+    /// Thread-group leaders keyed by `(pid, starttime)`, so a reused numeric
+    /// PID cannot answer for the process that held it.
+    fn leaders(anchor: &ProcessLease, observer: u32) -> Option<BTreeMap<(u32, u64), String>> {
+        let mut found = BTreeMap::new();
+        for id in namespace_task_ids(anchor, "pid").ok()? {
+            if id == observer {
+                continue;
+            }
+            if let Some((tgid, starttime, comm)) = task_facts(id)
+                && tgid == id
+            {
+                found.insert((id, starttime), comm);
+            }
+        }
+        Some(found)
+    }
+
+    #[test]
+    #[ignore]
+    fn flat_namespace_scan_against_the_children_walk() {
+        let observer = std::process::id();
+        let one = task_facts(1).expect("no /proc/1: run under unshare --pid --mount-proc");
+        assert_ne!(observer, 1, "the observer must not be the anchor");
+        assert!(proc_children_supported(), "no /proc/<pid>/task/<tid>/children");
+        let anchor = ProcessLease::capture(1).expect("PID 1 of this namespace");
+        let label = std::env::var("PBPS_FIXTURE").unwrap_or_else(|_| "unnamed".into());
+
+        let mut calls = 0usize;
+        let (mut ids_refused, mut occ_refused, mut walk_refused) = (0usize, 0usize, 0usize);
+        let mut walk_single_incomplete = 0usize;
+        let mut walk_census_refused = 0usize;
+        let mut complete_but_missing = (0usize, 0usize);
+        let mut scan_short_of_walk = 0usize;
+        let mut witnesses: BTreeMap<String, usize> = BTreeMap::new();
+        let (mut t_ids, mut t_occ, mut t_walk, mut t_census) = (0u128, 0u128, 0u128, 0u128);
+        let (mut n_ids, mut n_scope) = (0usize, 0usize);
+
+        let started = std::time::Instant::now();
+        while calls < 20_000 && started.elapsed() < std::time::Duration::from_secs(60) {
+            calls += 1;
+            let before = leaders(&anchor, observer);
+
+            let at = std::time::Instant::now();
+            let ids = namespace_task_ids(&anchor, "pid");
+            t_ids += at.elapsed().as_nanos();
+
+            let at = std::time::Instant::now();
+            let occupants = for_each_occupant(&anchor, "pid", |_| Ok(()));
+            t_occ += at.elapsed().as_nanos();
+
+            if process_scope(&anchor)
+                .map(|scope| scope.complete().is_err())
+                .unwrap_or(true)
+            {
+                walk_single_incomplete += 1;
+            }
+
+            let at = std::time::Instant::now();
+            let walk = complete_process_scope(&anchor);
+            t_walk += at.elapsed().as_nanos();
+
+            match &ids {
+                Ok(ids) => n_ids += ids.len(),
+                Err(_) => ids_refused += 1,
+            }
+            if occupants.is_err() {
+                occ_refused += 1;
+            }
+
+            let after = leaders(&anchor, observer);
+            let Ok(scope) = walk else {
+                walk_refused += 1;
+                continue;
+            };
+            n_scope += scope.len();
+
+            // What the three census callers actually do with the walk.
+            let at = std::time::Instant::now();
+            let census = scope.iter().try_for_each(|(pid, directory)| {
+                if *pid == anchor.pid() {
+                    return Ok(());
+                }
+                observe_incidental(*pid, directory, |_| Ok(())).map(|_| ())
+            });
+            t_census += at.elapsed().as_nanos();
+            if census.is_err() {
+                walk_census_refused += 1;
+            }
+
+            let walked: BTreeSet<u32> = scope.iter().map(|(pid, _)| *pid).collect();
+            let (Some(before), Some(after)) = (before, after) else {
+                continue;
+            };
+            let mut missing = 0usize;
+            for (key, comm) in &before {
+                // Alive across the whole walk: same (pid, starttime) in both
+                // scans, so neither an arrival during the walk nor a reused
+                // numeric PID can be mistaken for one it should have found.
+                if after.contains_key(key) && !walked.contains(&key.0) {
+                    missing += 1;
+                    *witnesses.entry(comm.clone()).or_default() += 1;
+                }
+            }
+            if missing > 0 {
+                complete_but_missing.0 += 1;
+                complete_but_missing.1 += missing;
+            }
+            // Only a process neither scan ever saw is one the scan missed:
+            // one that arrived during the walk is in the walk and in no
+            // earlier snapshot, which is an ordering artefact and not a hole.
+            let seen: BTreeSet<u32> = before
+                .keys()
+                .chain(after.keys())
+                .map(|(pid, _)| *pid)
+                .collect();
+            if walked
+                .iter()
+                .any(|pid| *pid != anchor.pid() && !seen.contains(pid))
+            {
+                scan_short_of_walk += 1;
+            }
+        }
+
+        let us = |total: u128| total / calls.max(1) as u128 / 1_000;
+        println!(
+            "\nFIXTURE {label}  pid1={}  calls={calls}\n\
+             walk   complete_process_scope: refused={walk_refused} \
+             single_walk_incomplete={walk_single_incomplete} mean_scope={} mean={}us\n\
+             walk   + per-occupant census:  refused={walk_census_refused} mean={}us\n\
+             scan   namespace_task_ids:     refused={ids_refused} mean_tasks={} mean={}us\n\
+             scan   for_each_occupant:      refused={occ_refused} mean={}us\n\
+             walk complete-but-missing: walks={} processes={} witnesses={witnesses:?}\n\
+             scan short of walk: {scan_short_of_walk}",
+            one.2,
+            n_scope / calls.max(1).max(1),
+            us(t_walk),
+            us(t_census),
+            n_ids / calls.max(1),
+            us(t_ids),
+            us(t_occ),
+            complete_but_missing.0,
+            complete_but_missing.1,
+        );
+        assert!(calls >= 2_000, "too busy to measure on: {calls} calls");
     }
 }

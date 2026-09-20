@@ -14152,12 +14152,29 @@ SPEC is in sync with all of these.
      than offering a choice. Offering one would have meant offering the wrong
      one.
 
-     **A node that orphans nothing does not make a walk partial**, and that is
-     asked before the reads that may find it gone, because afterwards it
-     cannot be asked at all. Measured over 1,304,698 walks of a tree two deep:
-     of 1,356 nodes passed over, 705 demonstrably had no children, 4 had some,
-     and 647 had vanished before the question could be put. Cannot-be-asked
-     counts with "had some": the two have the same consequence.
+     **Every node passed over makes the walk partial**, and a probe that
+     tried to narrow that is recorded here because it looked right and
+     measured well. Asking whether a node had children, before the reads that
+     may find it gone, answers about the moment it was asked: a process
+     childless then can fork and exit before the read that finds it gone, and
+     the child is reparented, possibly to a node the walk has already passed.
+     It accounted for 705 of 1,356 passed-over nodes on a tree two deep, with
+     4 having children and 647 already gone — and it bought that with a claim
+     the reading cannot support. Removing it moved single-walk incompleteness
+     from 2.88% to 2.78% on the churning fixture and not at all on the other
+     two, because the vanished nodes were always the larger half and the probe
+     could never answer for them.
+
+     **A kernel without `CONFIG_CHECKPOINT_RESTORE` has no `children` file for
+     any task**, and every read of one there answers the same `ENOENT` a task
+     that has just gone does. Taken as the transient it usually is, that marks
+     every walk on such a kernel incomplete for ever and refuses every native
+     run after four attempts, saying only that the walk could not account for
+     everything. The capability is asked once, of this process, which is
+     certainly alive — so an absent file is the kernel's answer rather than a
+     race — and the refusal names the kernel. Refusing is still right: without
+     that file nothing below the service can be enumerated, and the occupant
+     checks would inspect nothing and pass.
 
      **And walking again settles it**, because incompleteness is a state of
      the moment rather than of the tree. Measured over single walks: 2.78% of
