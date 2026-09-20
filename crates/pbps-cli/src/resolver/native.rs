@@ -83,8 +83,13 @@ pub(crate) enum Reading {
     PeerTable,
     /// This verifier's own end of the connection is not in that table.
     PeerClientAbsent,
-    /// The engine's end is not in that table at all.
+    /// The engine's end is not in that table at all, in any state.
     PeerServerAbsent,
+    /// The engine's end is in that table, but not established — so the socket
+    /// this run was bound to is not the one that is there. The code is
+    /// `/proc/net/tcp`'s own `st` column: `06` is `TIME_WAIT`, `08` is
+    /// `CLOSE_WAIT`, and each says something different about who closed.
+    PeerServerState(u8),
     /// The engine's end is in that table more than once, which one
     /// established pair cannot be.
     PeerServerDuplicated,
@@ -168,6 +173,7 @@ impl std::fmt::Display for Reading {
             Self::PeerTable => f.write_str("peer-table"),
             Self::PeerClientAbsent => f.write_str("peer-client-absent"),
             Self::PeerServerAbsent => f.write_str("peer-server-absent"),
+            Self::PeerServerState(state) => write!(f, "peer-server-state({state:02x})"),
             Self::PeerServerDuplicated => f.write_str("peer-server-duplicated"),
             Self::OwnerCount(found) => write!(f, "owner-count({found})"),
             Self::Scope => f.write_str("scope"),
@@ -578,26 +584,44 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
 /// therefore refusing a read of the table rather than a change to the socket,
 /// and it was 14% of reads under that load (#674, DECISIONS 522).
 ///
-/// The same walk can drop a row as well as repeat one, which is
-/// `PeerServerAbsent` and is how CI named this read. That direction is not
-/// reproduced here and is not treated differently yet.
+/// **It does not drop one, which was worth finding out.** `peer-server-absent`
+/// is how CI named this read, and a walk that skips rows was the obvious
+/// explanation. Measured, it is not: a pool of 3,000 connections filled and
+/// emptied repeatedly with `RST` closes, so that a close is an immediate
+/// removal, produced no missed row in 2,451 reads; and 200 established pairs
+/// held open while four threads churned 8,664,700 connections produced no
+/// missed row in **2,202,800 row observations**, while a third of those reads
+/// carried a duplicate. The walk re-emits on insertion and does not skip on
+/// removal.
+///
+/// So an absent row means the engine's end was not established, and that is
+/// the check being right rather than a read to be hardened. What it could not
+/// say was *which*: no row at all, or a row in another state. Those are
+/// different facts about who closed the socket, and they are told apart now
+/// (#674).
 fn server_inode(text: &str, local: &str, peer: &str) -> Result<u64, Reading> {
     let mut lines = text.lines();
     lines.next().ok_or(Reading::PeerTable)?;
     let mut found: Option<u64> = None;
     let mut client_present = false;
+    let mut server_state = None;
     for line in lines {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() < 10 {
             return Err(Reading::PeerTable);
         }
-        if fields[3] != "01" {
-            continue;
-        }
-        if fields[1] == local && fields[2] == peer && fields[9] != "0" {
+        let established = fields[3] == "01";
+        if established && fields[1] == local && fields[2] == peer && fields[9] != "0" {
             client_present = true;
         }
         if fields[1] == peer && fields[2] == local {
+            // Kept even though only an established pair is this connection:
+            // it is the difference between the engine's socket being gone and
+            // the engine having closed it, and one bare name said neither.
+            if !established {
+                server_state = u8::from_str_radix(fields[3], 16).ok().or(server_state);
+                continue;
+            }
             let inode = fields[9].parse::<u64>().map_err(|_| Reading::PeerTable)?;
             if inode == 0 {
                 return Err(Reading::PeerServerAbsent);
@@ -615,7 +639,7 @@ fn server_inode(text: &str, local: &str, peer: &str) -> Result<u64, Reading> {
     if !client_present {
         return Err(Reading::PeerClientAbsent);
     }
-    found.ok_or(Reading::PeerServerAbsent)
+    found.ok_or(server_state.map_or(Reading::PeerServerAbsent, Reading::PeerServerState))
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
@@ -1539,7 +1563,10 @@ mod tests {
             ),
             Err(Reading::PeerClientAbsent)
         );
-        // A pair that is there but not established is not this connection.
+        // A pair that is there but not established is not this connection,
+        // and it says so with the state rather than reading as no row at all:
+        // `08` is `CLOSE_WAIT`, the engine having closed its end, which is a
+        // different fact from the socket being gone (#674).
         let closing = row("0100007F:81E4", "0100007F:1538", "08", "9001");
         assert_eq!(
             server_inode(
@@ -1547,7 +1574,20 @@ mod tests {
                 "0100007F:1538",
                 "0100007F:81E4"
             ),
-            Err(Reading::PeerServerAbsent)
+            Err(Reading::PeerServerState(8))
+        );
+        let waiting = row("0100007F:81E4", "0100007F:1538", "06", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), waiting]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerServerState(6))
+        );
+        assert_eq!(
+            Reading::PeerServerState(6).to_string(),
+            "peer-server-state(06)"
         );
         // An inode of zero is no socket at all, never a silent skip.
         let zero = row("0100007F:81E4", "0100007F:1538", "01", "0");
@@ -1599,6 +1639,7 @@ mod tests {
             Reading::PeerClientAbsent,
             Reading::PeerServerAbsent,
             Reading::PeerServerDuplicated,
+            Reading::PeerServerState(6),
         ]
         .map(|reading| reading.to_string());
         let distinct: BTreeSet<&String> = names.iter().collect();

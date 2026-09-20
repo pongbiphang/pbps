@@ -14098,6 +14098,20 @@ SPEC is in sync with all of these.
      being one socket requires. Refusing the repetition was refusing a read of
      the table rather than a change to the socket, at 14% of reads under that
      load, so a repeated row is now one socket seen twice and only a differing
-     inode is the table contradicting itself. The dropped-row direction is not
-     reproduced here and is not treated differently yet; #674 stays open for
-     it.
+     inode is the table contradicting itself.
+
+     **The walk does not drop a row, which is the other half of that and was
+     worth finding out.** A skipped row was the obvious reading of the
+     `peer-server-absent` CI named, and it is wrong: a pool of 3,000
+     connections filled and emptied repeatedly with `RST` closes, so that a
+     close is an immediate removal, missed nothing in 2,451 reads, and 200
+     established pairs held open while four threads churned 8,664,700
+     connections missed nothing in **2,202,800 row observations** — while a
+     third of those reads carried a duplicate. It re-emits on insertion and
+     does not skip on removal. So an absent row is the engine's end not being
+     established, which is the check being right rather than a read to be
+     hardened, and the refusal stays. What it could not say is *which* absence:
+     no row at all, or a row in another state. `PeerServerState` carries
+     `/proc/net/tcp`'s own `st` column for the second, because `06`
+     (`TIME_WAIT`) and `08` (`CLOSE_WAIT`) say different things about who
+     closed the socket.
