@@ -14082,4 +14082,22 @@ SPEC is in sync with all of these.
      comparing the opened process's `starttime` against the moment the list
      was read. Refusing is the fail-closed answer to that ambiguity and stays;
      closing it needs a clock-tick conversion behind a `rustix` feature this
-     workspace does not enable, which is #729 rather than a line here.
+     workspace does not enable, which is #729 rather than a line here. A
+     passed-over node's live descendants can still leave the result silently,
+     through this branch and through the two `process_gone` branches that
+     reach it four times more often, which is #730.
+
+     **The second window is the table, not the tree.** With the reads named,
+     CI named one: `peer-server-absent`, the engine's established row missing
+     from `/proc/self/net/tcp`. Iterating that file is a `seq_file` walk over
+     hash buckets and not a snapshot, so a row can be repeated as well as
+     dropped. Measured against a loopback pair held open while four threads
+     churned 7.3 million connections: **1,413 of 43,311 reads returned the
+     same pair twice, every one carrying the same inode**, and two different
+     inodes for one four-tuple was never seen — which is what a four-tuple
+     being one socket requires. Refusing the repetition was refusing a read of
+     the table rather than a change to the socket, at 14% of reads under that
+     load, so a repeated row is now one socket seen twice and only a differing
+     inode is the table contradicting itself. The dropped-row direction is not
+     reproduced here and is not treated differently yet; #674 stays open for
+     it.

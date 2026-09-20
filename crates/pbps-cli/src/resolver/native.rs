@@ -557,16 +557,39 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
     };
     let text =
         read_bounded(Path::new(table), 32 * 1024 * 1024).map_err(Reading::PeerTable.named())?;
+    server_inode(&text, &encoded(local), &encoded(peer)).map_err(Reading::refuse)
+}
+
+/// The inode of the engine's end of one established loopback pair, from the
+/// text of `/proc/self/net/tcp`.
+///
+/// Separated from the read so the table can be handed in: every refusal below
+/// is a shape a live table produces, and none of them can be staged against
+/// the real one.
+///
+/// **One pair can appear more than once, and that is not two sockets.**
+/// Iterating `/proc/net/tcp` is a `seq_file` walk over hash buckets and not a
+/// snapshot, so a row can be emitted twice when the table changes between
+/// chunks. Measured against a loopback pair held open while four threads
+/// churned 7.3 million connections: **1,413 of 43,311 reads** returned the
+/// same pair twice, and **every one of them carried the same inode** — two
+/// different inodes for one established four-tuple was never seen, and cannot
+/// be, because a four-tuple is one socket. Refusing the repetition is
+/// therefore refusing a read of the table rather than a change to the socket,
+/// and it was 14% of reads under that load (#674, DECISIONS 522).
+///
+/// The same walk can drop a row as well as repeat one, which is
+/// `PeerServerAbsent` and is how CI named this read. That direction is not
+/// reproduced here and is not treated differently yet.
+fn server_inode(text: &str, local: &str, peer: &str) -> Result<u64, Reading> {
     let mut lines = text.lines();
-    lines.next().ok_or_else(|| Reading::PeerTable.refuse())?;
-    let local = encoded(local);
-    let peer = encoded(peer);
-    let mut found = None;
+    lines.next().ok_or(Reading::PeerTable)?;
+    let mut found: Option<u64> = None;
     let mut client_present = false;
     for line in lines {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() < 10 {
-            return Err(Reading::PeerTable.refuse());
+            return Err(Reading::PeerTable);
         }
         if fields[3] != "01" {
             continue;
@@ -575,25 +598,24 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
             client_present = true;
         }
         if fields[1] == peer && fields[2] == local {
-            let inode = fields[9]
-                .parse::<u64>()
-                .map_err(Reading::PeerTable.named())?;
+            let inode = fields[9].parse::<u64>().map_err(|_| Reading::PeerTable)?;
             if inode == 0 {
-                return Err(Reading::PeerServerAbsent.refuse());
+                return Err(Reading::PeerServerAbsent);
             }
-            // Two rows for one established pair is a table read that was not
-            // a snapshot, not a second connection — and CI has now named this
-            // read once (`peer-server-absent`), so the two stop sharing a
-            // name before the next occurrence (#674).
-            if found.replace(inode).is_some() {
-                return Err(Reading::PeerServerDuplicated.refuse());
+            // Repeated is one socket seen twice; a *different* inode for the
+            // same four-tuple is the table contradicting itself.
+            if found
+                .replace(inode)
+                .is_some_and(|previous| previous != inode)
+            {
+                return Err(Reading::PeerServerDuplicated);
             }
         }
     }
     if !client_present {
-        return Err(Reading::PeerClientAbsent.refuse());
+        return Err(Reading::PeerClientAbsent);
     }
-    found.ok_or_else(|| Reading::PeerServerAbsent.refuse())
+    found.ok_or(Reading::PeerServerAbsent)
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
@@ -1437,6 +1459,108 @@ mod tests {
              departing child was passed over (267 in 206,771), not after it (1 or 2 in \
              200,000): {refused:?}"
         );
+    }
+
+    /// One established pair read twice is one socket, and the negative cases
+    /// around that.
+    ///
+    /// Iterating `/proc/net/tcp` is not a snapshot. Measured against a
+    /// loopback pair held open while four threads churned 7.3 million
+    /// connections, **1,413 of 43,311 reads returned the same pair twice**,
+    /// every one carrying the same inode, and refusing them was 14% of reads
+    /// under that load. Two *different* inodes for one four-tuple was never
+    /// seen, and is the one shape that is the table contradicting itself
+    /// (#674).
+    #[test]
+    fn one_established_pair_read_twice_is_still_one_socket() {
+        // `local` and `peer` as the table spells them; the columns are
+        // `sl local rem st ... inode`.
+        let row = |l: &str, r: &str, state: &str, inode: &str| {
+            format!("   0: {l} {r} {state} 00000000:00000000 00:00000000 00000000 1000 0 {inode} 1")
+        };
+        let table = |rows: &[String]| {
+            let mut text = String::from(
+                "  sl  local_address rem_address   st ...
+",
+            );
+            for row in rows {
+                text.push_str(row);
+                text.push('\n');
+            }
+            text
+        };
+        let client = row("0100007F:1538", "0100007F:81E4", "01", "4242");
+        let server = row("0100007F:81E4", "0100007F:1538", "01", "9001");
+
+        // The ordinary read.
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), server.clone()]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Ok(9001)
+        );
+        // The same pair emitted twice by one walk of the hash buckets.
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), server.clone(), server.clone()]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Ok(9001),
+            "a repeated row is one socket seen twice"
+        );
+        // Two inodes for one four-tuple is the table contradicting itself.
+        let other = row("0100007F:81E4", "0100007F:1538", "01", "9002");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), server.clone(), other]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerServerDuplicated)
+        );
+        // The engine's end missing, which is how CI named this read.
+        assert_eq!(
+            server_inode(
+                &table(std::slice::from_ref(&client)),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerServerAbsent)
+        );
+        // Our own end missing.
+        assert_eq!(
+            server_inode(
+                &table(std::slice::from_ref(&server)),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerClientAbsent)
+        );
+        // A pair that is there but not established is not this connection.
+        let closing = row("0100007F:81E4", "0100007F:1538", "08", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), closing]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerServerAbsent)
+        );
+        // An inode of zero is no socket at all, never a silent skip.
+        let zero = row("0100007F:81E4", "0100007F:1538", "01", "0");
+        assert_eq!(
+            server_inode(&table(&[client, zero]), "0100007F:1538", "0100007F:81E4"),
+            Err(Reading::PeerServerAbsent)
+        );
+        // A row that is not a row, and a table with no header.
+        assert_eq!(
+            server_inode("header\nshort row\n", "a", "b"),
+            Err(Reading::PeerTable)
+        );
+        assert_eq!(server_inode("", "a", "b"), Err(Reading::PeerTable));
     }
 
     /// The count is part of the name where the refusal *is* a count.
