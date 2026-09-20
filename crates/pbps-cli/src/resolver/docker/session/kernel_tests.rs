@@ -393,13 +393,16 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
     let control = match control {
         Ok(control) => control,
         Err(error) => {
-            workload.close().await.unwrap();
-            // `{error:?}` and not `{error}`: `StartFailure`'s `Display` is its
-            // cause alone, and the fixture reads `recovery_names` out of this
-            // panic to report and remove a container whose cleanup could not
-            // be confirmed. Printed by name, that container is neither
-            // reported nor removed (#724).
-            panic!("{error:?}");
+            // Both failures, and neither through `unwrap`. `{error:?}` and not
+            // `{error}` because `StartFailure`'s `Display` is its cause alone,
+            // and the fixture reads `recovery_names` out of this panic to
+            // report and remove a container whose cleanup could not be
+            // confirmed. And the close is *not* unwrapped: when the daemon is
+            // unavailable for both removals, unwrapping it panics first, with
+            // only the workload's names, and the control's container is
+            // neither reported nor removed while the workload's is (#724).
+            let closed = workload.close().await;
+            panic!("control: {error:?}; closing the workload after it: {closed:?}");
         }
     };
     let result = inspect_pair(
