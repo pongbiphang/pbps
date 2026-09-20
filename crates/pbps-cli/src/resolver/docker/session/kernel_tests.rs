@@ -408,9 +408,19 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
             // fixture, which removes what it reports.
             let workload_name = workload.resource_name().to_owned();
             let closed = workload.close().await;
+            // Named as recoverable **only** when its removal failed. The
+            // fixture removes what this list names and reports what it
+            // cannot read, so naming a container that was removed cleanly
+            // makes it report one as left behind that never was — removed
+            // and left behind are not the same answer.
+            let unremoved = if closed.is_err() {
+                format!("; recovery_names: [\"{workload_name}\"]")
+            } else {
+                String::new()
+            };
             panic!(
                 "control: {error:?}; closing the workload {workload_name} after it: \
-                 {closed:?}; recovery_names: [\"{workload_name}\"]"
+                 {closed:?}{unremoved}"
             );
         }
     };
