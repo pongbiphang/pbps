@@ -36,9 +36,10 @@ use std::io::Read;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-/// Larger than any engine binary or extension library; a mapping past this
-/// is not something this profile would run.
-const CONTENT_LIMIT: u64 = 512 * 1024 * 1024;
+/// Larger than any engine binary, extension library or engine package; a
+/// mapping past this is not something this profile would run. SQL Server's
+/// own package is the measure: `sqlservr.sfp` is 637 MB on 17.0.
+const CONTENT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The native libraries a scope requires the engine to have loaded or be
 /// able to load: those an installed extension's C functions name, and those
@@ -92,6 +93,7 @@ pub(crate) fn executables(
     lease: &ProcessLease,
     required: &[String],
     dynamic_library_path: &str,
+    packages: &[&str],
 ) -> Result<ExecutableSet, UnqualifiedProcess> {
     lease.check()?;
     let engine_path = lease.executable_path().to_path_buf();
@@ -111,7 +113,7 @@ pub(crate) fn executables(
         )),
     };
 
-    let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?);
+    let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?, packages);
     let libdir = library_directory(&engine_path);
     let cwd = lease.working_directory()?;
     // The required libraries first, so that each can claim the mapping it is
@@ -221,7 +223,7 @@ pub(crate) struct Mapping {
 /// the first (lowest) range of each. Anonymous, device and non-library
 /// mappings are skipped; a path is taken verbatim after the inode column, so
 /// one containing spaces survives.
-pub(crate) fn mappings(maps: &str) -> BTreeMap<String, Mapping> {
+pub(crate) fn mappings(maps: &str, packages: &[&str]) -> BTreeMap<String, Mapping> {
     let mut found = BTreeMap::new();
     for line in maps.lines() {
         let mut fields = line.splitn(6, ' ');
@@ -240,7 +242,7 @@ pub(crate) fn mappings(maps: &str) -> BTreeMap<String, Mapping> {
             Some(path) => (path, true),
             None => (path, false),
         };
-        if !path.starts_with('/') || !is_shared_object(path) || inode == "0" {
+        if !path.starts_with('/') || !is_engine_code(path, packages) || inode == "0" {
             continue;
         }
         let Some((start, end)) = range.split_once('-') else {
@@ -263,9 +265,16 @@ pub(crate) fn mappings(maps: &str) -> BTreeMap<String, Mapping> {
     found
 }
 
-fn is_shared_object(path: &str) -> bool {
+/// A mapped file that is code the engine runs: a shared object, or a file
+/// with one of the suffixes the engine's router names as its own packages.
+/// SQL Server for Linux maps its Windows binaries out of `.sfp` packages, so
+/// for it the ELF is only the loader and these are the engine (#611;
+/// DECISIONS 521).
+fn is_engine_code(path: &str, packages: &[&str]) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    name.ends_with(".so") || name.contains(".so.")
+    name.ends_with(".so")
+        || name.contains(".so.")
+        || packages.iter().any(|suffix| name.ends_with(suffix))
 }
 
 fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> ExecutableIdentity {
@@ -454,7 +463,7 @@ mod tests {
 
     #[test]
     fn only_file_backed_shared_objects_are_mapped_and_the_first_range_is_kept() {
-        let found = mappings(MAPS);
+        let found = mappings(MAPS, &[]);
         assert_eq!(
             found.keys().cloned().collect::<Vec<_>>(),
             vec![
@@ -475,9 +484,42 @@ mod tests {
         assert!(!found.contains_key("/usr/share/odd name/data.bin"));
     }
 
+    /// An engine's own packages are code when the router names their suffix,
+    /// and only then: the same row is a data file to an engine that does not.
+    #[test]
+    fn a_mapped_engine_package_is_code_only_for_the_engine_that_names_it() {
+        const SQL_SERVER: &str = "\
+7f0000000000-7f0000100000 r--p 00000000 08:30 700001                     /opt/mssql/lib/sqlservr.sfp
+7f0000100000-7f0000200000 r--p 00100000 08:30 700001                     /opt/mssql/lib/sqlservr.sfp
+7f0000300000-7f0000400000 r--p 00000000 08:30 700002                     /opt/mssql/lib/system.common.sfp
+7f0000500000-7f0000600000 r-xp 00000000 08:30 700003                     /opt/mssql/lib/libsqlvdi.so
+7f0000700000-7f0000800000 r--s 00000000 08:30 700004                     /var/opt/mssql/data/master.mdf
+";
+        assert_eq!(
+            mappings(SQL_SERVER, &[".sfp"])
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "/opt/mssql/lib/libsqlvdi.so",
+                "/opt/mssql/lib/sqlservr.sfp",
+                "/opt/mssql/lib/system.common.sfp",
+            ]
+        );
+        let package = &mappings(SQL_SERVER, &[".sfp"])["/opt/mssql/lib/sqlservr.sfp"];
+        assert_eq!((package.start, package.inode), (0x7f00_0000_0000, 700_001));
+        assert_eq!(
+            mappings(SQL_SERVER, &[])
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["/opt/mssql/lib/libsqlvdi.so"]
+        );
+    }
+
     #[test]
     fn a_library_unlinked_under_the_process_is_marked_deleted() {
-        let found = mappings(MAPS);
+        let found = mappings(MAPS, &[]);
         assert!(found["/usr/lib/x86_64-linux-gnu/libz.so.1.3.1"].deleted);
         assert_eq!(
             found["/usr/lib/x86_64-linux-gnu/libz.so.1.3.1"].inode,
@@ -649,7 +691,7 @@ mod tests {
         // Let the exec happen before the lease looks at the executable.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let lease = ProcessLease::capture(child.id()).unwrap();
-        let set = executables(&lease, &["$libdir/no_such_library".into()], "$libdir").unwrap();
+        let set = executables(&lease, &["$libdir/no_such_library".into()], "$libdir", &[]).unwrap();
         let on_disk = std::fs::read(lease.executable_path()).unwrap();
         assert_eq!(
             set.engine.digest.as_deref(),
@@ -699,7 +741,7 @@ mod tests {
                 alias.to_string_lossy().into_owned()
             })
             .collect();
-        let set = executables(&lease, &aliases, "$libdir").unwrap();
+        let set = executables(&lease, &aliases, "$libdir", &[]).unwrap();
         for alias_name in &aliases {
             let through_alias: Vec<_> = set
                 .libraries
@@ -719,7 +761,7 @@ mod tests {
         // A relative name with a directory resolves against the process's
         // working directory — the test's own, which `sleep` inherited — and
         // is reported at that absolute path (finding on #688).
-        let relative = executables(&lease, &["src/lib.rs".into()], "$libdir").unwrap();
+        let relative = executables(&lease, &["src/lib.rs".into()], "$libdir", &[]).unwrap();
         let expected = std::env::current_dir().unwrap().join("src/lib.rs");
         let found = relative
             .libraries
@@ -732,7 +774,7 @@ mod tests {
         // each, the mapping's own name not displaced by the alias (finding
         // on #688).
         let both = [libc_path.clone(), aliases[0].clone()];
-        let set = executables(&lease, &both, "$libdir").unwrap();
+        let set = executables(&lease, &both, "$libdir", &[]).unwrap();
         for spelling in &both {
             assert_eq!(
                 set.libraries.iter().filter(|l| l.path == *spelling).count(),
@@ -775,7 +817,7 @@ mod tests {
         ));
 
         let maps = lease.read_proc("maps", 8 * 1024 * 1024).unwrap();
-        let (libc_path, libc) = mappings(&maps)
+        let (libc_path, libc) = mappings(&maps, &[])
             .into_iter()
             .find(|(path, _)| path.contains("libc.so"))
             .expect("libc is mapped");

@@ -126,12 +126,13 @@ or local private channels; those require the runtime profiles in #608/#609.
 The internal Docker runtime (#608) now acquires explicit trusted images and
 qualifies native Linux target separation, effective kernel containment and a
 run-private database channel before exposing a source-free session. It owns
-bounded startup, continuity and cleanup for both engines. PostgreSQL
-analysis-scope compatibility and deployment-context qualification is wired into
-the run (#610): a run reproduces the target's locale, executable content and
-deployer authorization on scratch and compares them before it can be used. SQL
-Server's is #611, and the subsequent source-handling and binding steps remain
-required. See [the runtime boundary and fixtures](RESOLVER-RUNTIME.md).
+bounded startup, continuity and cleanup for both engines. Analysis-scope
+compatibility and deployment-context qualification is wired into the run for
+PostgreSQL (#610) and SQL Server (#611): a run reproduces the target's database
+settings, executable content and deployer authorization on scratch and compares
+them under the engine's versioned rule before it can be used. It is not a
+binding adapter — SQL Server's is unimplemented (#619, #620) — and the
+subsequent source-handling and binding steps remain required. See [the runtime boundary and fixtures](RESOLVER-RUNTIME.md).
 
 A supplied **dedicated scratch server** (#609) is an operator-started container
 of a known layout: pbps reads the runtime's record of it, measures the kernel

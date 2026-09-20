@@ -544,6 +544,7 @@ mod tests {
             ctype: "en_US.utf8".into(),
             locale: None,
             icu_rules: None,
+            sql_server: None,
         };
         assert_eq!(
             scratch_database_ddl(&names(), &libc),

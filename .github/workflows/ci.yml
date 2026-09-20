@@ -107,8 +107,21 @@ jobs:
           MSSQL_SA_PASSWORD: "Pbps!Ci12345"
         ports:
           - 14330:1433
+      # The same build as another edition under another server collation: the
+      # two facts of the resolver's analysis-scope rule that no database on
+      # the first server can vary (#611). Express, so it stays small.
+      mssql-express:
+        image: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: "Express"
+          MSSQL_COLLATION: "Latin1_General_100_CS_AS"
+          MSSQL_SA_PASSWORD: "Pbps!Ci12345"
+        ports:
+          - 14331:1433
     env:
       PBPS_TEST_DB: "Server=localhost,14330;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
+      PBPS_TEST_EXPRESS_DB: "Server=localhost,14331;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -121,19 +134,25 @@ jobs:
       # that no longer matches.
       - name: wait for SQL Server
         run: |
-          id=$(docker ps -q --filter publish=14330)
-          if [ -z "$id" ]; then
-            echo "no service container publishing 14330" >&2
-            docker ps -a >&2
-            exit 1
-          fi
-          for _ in $(seq 1 60); do
-            if docker exec "$id" /opt/mssql-tools18/bin/sqlcmd \
-                 -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
-              exit 0
+          for port in 14330 14331; do
+            id=$(docker ps -q --filter publish=$port)
+            if [ -z "$id" ]; then
+              echo "no service container publishing $port" >&2
+              docker ps -a >&2
+              exit 1
             fi
-            sleep 2
+            ready=
+            for _ in $(seq 1 60); do
+              if docker exec "$id" /opt/mssql-tools18/bin/sqlcmd \
+                   -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              sleep 2
+            done
+            [ -n "$ready" ] || break
           done
+          [ -n "$ready" ] && exit 0
           # The container has crashed at startup twice on this job, and both
           # times the reason was only visible in its own log — which the raw
           # job output buries under teardown noise. Print it where the failure

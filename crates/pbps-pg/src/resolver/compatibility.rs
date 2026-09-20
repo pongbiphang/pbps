@@ -9,8 +9,7 @@
 
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{
-    BuildMapping, EnvironmentFacts, ExecutableIdentity, ExecutableRole, FactStatus, Provenance,
-    RuleVersion, ScopeReport, Side,
+    BuildMapping, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Side,
 };
 use std::collections::BTreeMap;
 
@@ -120,7 +119,13 @@ pub fn compare(
     collations(target, resolver, &mut report);
     settings(target, resolver, &mut report);
     visibility(target, resolver, &mut report);
-    executables(target, resolver, mappings, &mut report);
+    pbps_db::resolver::environment::compare_executables(
+        RULE,
+        target,
+        resolver,
+        mappings,
+        &mut report,
+    );
     report
 }
 
@@ -404,135 +409,12 @@ fn visibility(target: &EnvironmentFacts, resolver: &EnvironmentFacts, report: &m
     }
 }
 
-/// Content identity, not version. Equal digests match; different digests
-/// match only through a mapping measured for exactly this pair and scope;
-/// anything unreadable is unknown. A library present on one side only is a
-/// difference in both directions — a resolver-only preload changes binding
-/// as surely as a missing one.
-fn executables(
-    target: &EnvironmentFacts,
-    resolver: &EnvironmentFacts,
-    mappings: &[BuildMapping],
-    report: &mut ScopeReport,
-) {
-    let engine = identity(
-        "engine",
-        Some(&target.executables.engine),
-        Some(&resolver.executables.engine),
-        mappings,
-        report,
-    );
-    report.facts.insert("executable:engine".into(), engine);
-    let (t, r) = (
-        by_path(&target.executables.libraries),
-        by_path(&resolver.executables.libraries),
-    );
-    let paths: std::collections::BTreeSet<&str> = t.keys().chain(r.keys()).copied().collect();
-    for path in paths {
-        let status = identity(
-            path,
-            t.get(path).copied(),
-            r.get(path).copied(),
-            mappings,
-            report,
-        );
-        report.facts.insert(format!("library:{path}"), status);
-    }
-}
-
-fn by_path(set: &[ExecutableIdentity]) -> BTreeMap<&str, &ExecutableIdentity> {
-    set.iter()
-        .map(|library| (library.path.as_str(), library))
-        .collect()
-}
-
-fn identity(
-    scope: &str,
-    target: Option<&ExecutableIdentity>,
-    resolver: Option<&ExecutableIdentity>,
-    mappings: &[BuildMapping],
-    report: &mut ScopeReport,
-) -> FactStatus {
-    let (Some(t), Some(r)) = (target, resolver) else {
-        let (side, present) = match (target, resolver) {
-            (None, Some(r)) => (Side::Target, r),
-            (Some(t), None) => (Side::Resolver, t),
-            _ => unreachable!("at least one side names every compared path"),
-        };
-        let role = format!("{:?}", present.role).to_lowercase();
-        return match side {
-            Side::Target => FactStatus::Mismatch {
-                target: "absent".into(),
-                resolver: format!("{role} library present"),
-            },
-            Side::Resolver | Side::Both => FactStatus::Mismatch {
-                target: format!("{role} library present"),
-                resolver: "absent".into(),
-            },
-        };
-    };
-    for (side, identity) in [(Side::Target, t), (Side::Resolver, r)] {
-        if let Provenance::Unreadable { reason } = &identity.provenance {
-            return FactStatus::Unknown {
-                side,
-                reason: reason.clone(),
-            };
-        }
-        if identity.disk_differs_from_loaded == Some(true) {
-            return FactStatus::Mismatch {
-                target: describe(t),
-                resolver: describe(r),
-            };
-        }
-    }
-    let (Some(td), Some(rd)) = (&t.digest, &r.digest) else {
-        return FactStatus::Unknown {
-            side: Side::Both,
-            reason: "no digest for readable content".into(),
-        };
-    };
-    if td == rd {
-        return FactStatus::Match;
-    }
-    if let Some(mapping) = mappings.iter().find(|m| {
-        m.rule.as_str() == RULE && m.scope == scope && m.target == *td && m.resolver == *rd
-    }) {
-        report.limitations.insert(
-            format!("mapping:{scope}"),
-            format!(
-                "different builds accepted through a measured mapping: {}",
-                mapping.measured
-            ),
-        );
-        return FactStatus::Match;
-    }
-    FactStatus::Mismatch {
-        target: describe(t),
-        resolver: describe(r),
-    }
-}
-
-fn describe(identity: &ExecutableIdentity) -> String {
-    let digest = identity.digest.as_deref().unwrap_or("-");
-    let short = &digest[..digest.len().min(12)];
-    match identity.disk_differs_from_loaded {
-        Some(true) => format!("{short} (loaded content differs from the file on disk)"),
-        _ => match identity.role {
-            ExecutableRole::LateLoaded if identity.provenance == Provenance::DiskCandidate => {
-                format!("{short} (disk candidate)")
-            }
-            ExecutableRole::Engine | ExecutableRole::Preloaded | ExecutableRole::LateLoaded => {
-                short.to_owned()
-            }
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pbps_db::resolver::environment::{
-        CatalogFacts, CollationFact, ExecutableSet, ExtensionFact, SettingFact, Verdict,
+        CatalogFacts, CollationFact, ExecutableIdentity, ExecutableRole, ExecutableSet,
+        ExtensionFact, Provenance, SettingFact, Verdict,
     };
 
     fn observed(value: &str) -> Observation {

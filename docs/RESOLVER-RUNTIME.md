@@ -80,12 +80,12 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
 | Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
 
-## Analysis scope qualification (#610, PostgreSQL)
+## Analysis scope qualification (#610 PostgreSQL, #611 SQL Server)
 
 Once a run holds a scratch database, `ScratchRun::qualify` establishes that it
 is a place the target's declarations can be compiled as the target's own
-deployer would (ADR-0016 cases 5, 14, 16, 21, 23). It refuses by name on SQL
-Server, which is #611.
+deployer would (ADR-0016 cases 5, 14, 16, 21, 23). The lifecycle is one; what a
+scope is belongs to each engine, behind `resolver::scope`. PostgreSQL first:
 
 | Premise | What is measured |
 | --- | --- |
@@ -100,8 +100,24 @@ prove is named: a target that is not on this kernel is unqualifiable
 (executable content is unreadable); code loaded dynamically inside a routine
 body, or by an operator's `LD_PRELOAD`, is outside this proof domain; and a
 target whose recorded collation version has drifted from its provider's is
-recorded as a limitation, not a resolver mismatch. Reproducing a target's
-collation and deployer on SQL Server is #611.
+recorded as a limitation, not a resolver mismatch.
+
+SQL Server is qualified under its own rules, measured on 2025 (17.0) for Linux.
+Qualification is not a binding adapter: SQL Server binding stays unimplemented
+(#619, #620).
+
+| Premise | What is measured |
+| --- | --- |
+| Compatibility | Under `mssql-analysis-scope-v1`: equal product version, level and update; the same operating system; server and database collation, compatibility level, containment and the database-level ANSI options, which the scratch database is created to match; the session's effective statement settings — language, date format, first day of the week and the SET options a statement persists or an indexed expression requires — which are the login's and the driver's, not the server's defaults; `QUOTED_IDENTIFIER` and `ANSI_NULLS` on, the only module settings this tool manages; user CLR assemblies by content, in both directions. A hosted or unknown product family (`EngineEdition` outside 2–4) is refused by name and never mapped to a boxed build; an edition difference inside the boxed family verifies with a named limitation, because binding is the same and capability stays the target's to check |
+| Executables | As for PostgreSQL, plus the engine's own packages: SQL Server for Linux maps its binaries out of `.sfp` files, so the ELF at `/proc/<pid>/exe` is only the loader and the mapped packages are the engine, hashed like any loaded library |
+| Deployer | The planning connection's database user, read as itself: `fn_my_permissions` on the database and each in-scope schema, `IS_ROLEMEMBER`, its default schema and language, the users it may impersonate, and the grant rows it can see. Reproduced with run-local users `WITHOUT LOGIN` and roles named `pbps_principal_<n>_<token>`, database-scoped, reachable only under `EXECUTE AS USER`; `dbo`, `public` and the fixed `db_` roles keep their identity; grants and DENYs are replayed under their own grantors. A `dbo` deployer — which a member of `sysadmin` is everywhere — is the run login itself, which owns its scratch database. The reproduction is verified against the target as read, and only then are the plan's grants run, as the reproduced deployer, so one it could not make is the engine's refusal |
+| Stability | Catalog views are not a snapshot under any isolation level, so the target's facts and authorization are read twice and must agree. The rest is PostgreSQL's: sealed to both connections, requalified on every check against what was sealed |
+
+What it does not prove is named here too: server-level permissions of the
+deployment login beyond `dbo` are outside a database scope; a change made and
+undone between the two bracketing reads is not seen by them, only a lasting one
+by the next check; and an assembly the target has is a mismatch rather than
+something the resolver reproduces.
 
 The engine is reached the way the Docker profile reaches its own: a
 run-owned **forwarder**, launched from the supplied container's image into
