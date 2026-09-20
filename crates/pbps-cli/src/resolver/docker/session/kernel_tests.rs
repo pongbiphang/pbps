@@ -394,7 +394,12 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
         Ok(control) => control,
         Err(error) => {
             workload.close().await.unwrap();
-            panic!("{error}");
+            // `{error:?}` and not `{error}`: `StartFailure`'s `Display` is its
+            // cause alone, and the fixture reads `recovery_names` out of this
+            // panic to report and remove a container whose cleanup could not
+            // be confirmed. Printed by name, that container is neither
+            // reported nor removed (#724).
+            panic!("{error:?}");
         }
     };
     let result = inspect_pair(
