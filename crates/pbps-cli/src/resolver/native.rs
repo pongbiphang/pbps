@@ -83,8 +83,22 @@ pub(crate) enum Reading {
     PeerTable,
     /// This verifier's own end of the connection is not in that table.
     PeerClientAbsent,
-    /// The engine's end is not in that table at all.
+    /// The engine's end is not in that table at all, in any state.
     PeerServerAbsent,
+    /// The engine's end is in that table, but not established — so the socket
+    /// this run was bound to is not the one that is there.
+    ///
+    /// The code is `/proc/net/tcp`'s own `st` column, and it is read **of the
+    /// engine's row**, which is where the direction lives. **Measured** on a
+    /// loopback pair: when this verifier closed first the engine's row read
+    /// `08`, and when the engine closed first it read `04` or `05` depending
+    /// on whether the read caught it before our ACK. So on the engine's row
+    /// `08` (`CLOSE_WAIT`) means it is holding *our* FIN and has not closed
+    /// yet, while `04`/`05` (`FIN_WAIT1`, `FIN_WAIT2`) and `06` (`TIME_WAIT`)
+    /// mean the engine closed first. A
+    /// refusal that named the wrong end would send the next investigation to
+    /// the wrong process, which is worse than not naming one.
+    PeerServerState(u8),
     /// The engine's end is in that table more than once, which one
     /// established pair cannot be.
     PeerServerDuplicated,
@@ -168,6 +182,7 @@ impl std::fmt::Display for Reading {
             Self::PeerTable => f.write_str("peer-table"),
             Self::PeerClientAbsent => f.write_str("peer-client-absent"),
             Self::PeerServerAbsent => f.write_str("peer-server-absent"),
+            Self::PeerServerState(state) => write!(f, "peer-server-state({state:02x})"),
             Self::PeerServerDuplicated => f.write_str("peer-server-duplicated"),
             Self::OwnerCount(found) => write!(f, "owner-count({found})"),
             Self::Scope => f.write_str("scope"),
@@ -578,26 +593,52 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
 /// therefore refusing a read of the table rather than a change to the socket,
 /// and it was 14% of reads under that load (#674, DECISIONS 522).
 ///
-/// The same walk can drop a row as well as repeat one, which is
-/// `PeerServerAbsent` and is how CI named this read. That direction is not
-/// reproduced here and is not treated differently yet.
+/// **It does not drop one, which was worth finding out.** `peer-server-absent`
+/// is how CI named this read, and a walk that skips rows was the obvious
+/// explanation. Measured, it is not: a pool of 3,000 connections filled and
+/// emptied repeatedly with `RST` closes, so that a close is an immediate
+/// removal, produced no missed row in 2,451 reads; and 200 established pairs
+/// held open while four threads churned 8,664,700 connections produced no
+/// missed row in **2,202,800 row observations**, while a third of those reads
+/// carried a duplicate. The walk re-emits on insertion and does not skip on
+/// removal.
+///
+/// So an absent row means the engine's end was not established, and that is
+/// the check being right rather than a read to be hardened. What it could not
+/// say was *which*: no row at all, or a row in another state. Those are
+/// different facts about who closed the socket, and they are told apart now
+/// (#674).
 fn server_inode(text: &str, local: &str, peer: &str) -> Result<u64, Reading> {
     let mut lines = text.lines();
     lines.next().ok_or(Reading::PeerTable)?;
     let mut found: Option<u64> = None;
     let mut client_present = false;
+    let mut server_state = None;
     for line in lines {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() < 10 {
             return Err(Reading::PeerTable);
         }
-        if fields[3] != "01" {
-            continue;
-        }
-        if fields[1] == local && fields[2] == peer && fields[9] != "0" {
+        let established = fields[3] == "01";
+        if established && fields[1] == local && fields[2] == peer && fields[9] != "0" {
             client_present = true;
         }
         if fields[1] == peer && fields[2] == local {
+            // Kept even though only an established pair is this connection:
+            // it is the difference between no row for the pair at all and a
+            // row that says how the connection ended and which end began it,
+            // and one bare name said neither.
+            if !established {
+                // Parsed, never `.ok()`: a state this cannot read is the
+                // table being unreadable, and dropping the failure would let
+                // it arrive as `PeerServerAbsent` — a fact about the
+                // connection — or leave an earlier row's state standing in
+                // for it. Absent, unreadable and "in another state" are three
+                // things and this function answers all three.
+                server_state =
+                    Some(u8::from_str_radix(fields[3], 16).map_err(|_| Reading::PeerTable)?);
+                continue;
+            }
             let inode = fields[9].parse::<u64>().map_err(|_| Reading::PeerTable)?;
             if inode == 0 {
                 return Err(Reading::PeerServerAbsent);
@@ -615,7 +656,7 @@ fn server_inode(text: &str, local: &str, peer: &str) -> Result<u64, Reading> {
     if !client_present {
         return Err(Reading::PeerClientAbsent);
     }
-    found.ok_or(Reading::PeerServerAbsent)
+    found.ok_or(server_state.map_or(Reading::PeerServerAbsent, Reading::PeerServerState))
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
@@ -1539,7 +1580,14 @@ mod tests {
             ),
             Err(Reading::PeerClientAbsent)
         );
-        // A pair that is there but not established is not this connection.
+        // A pair that is there but not established is not this connection,
+        // and it says so with the state rather than reading as no row at all.
+        // The state is the **engine's**, so `08` (`CLOSE_WAIT`) is the engine
+        // holding our FIN — this end closed first — and `06` (`TIME_WAIT`) is
+        // the engine having closed. Measured: closing this end put `05` on it
+        // and `08` on the engine's, and closing the engine's swapped them, so
+        // the two are not interchangeable and naming the wrong end would send
+        // the next investigation to the wrong process (issue 674).
         let closing = row("0100007F:81E4", "0100007F:1538", "08", "9001");
         assert_eq!(
             server_inode(
@@ -1547,13 +1595,52 @@ mod tests {
                 "0100007F:1538",
                 "0100007F:81E4"
             ),
-            Err(Reading::PeerServerAbsent)
+            Err(Reading::PeerServerState(8))
+        );
+        let waiting = row("0100007F:81E4", "0100007F:1538", "06", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), waiting]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerServerState(6))
+        );
+        assert_eq!(
+            Reading::PeerServerState(6).to_string(),
+            "peer-server-state(06)"
         );
         // An inode of zero is no socket at all, never a silent skip.
         let zero = row("0100007F:81E4", "0100007F:1538", "01", "0");
         assert_eq!(
-            server_inode(&table(&[client, zero]), "0100007F:1538", "0100007F:81E4"),
+            server_inode(
+                &table(&[client.clone(), zero]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
             Err(Reading::PeerServerAbsent)
+        );
+        // A state nobody could read is the table, not the connection: it
+        // must not arrive as "no row for the pair", and it must not leave an
+        // earlier row's state standing in for it.
+        let unreadable = row("0100007F:81E4", "0100007F:1538", "zz", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), unreadable.clone()]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerTable)
+        );
+        let waiting_then_unreadable = row("0100007F:81E4", "0100007F:1538", "06", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), waiting_then_unreadable, unreadable]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerTable),
+            "an earlier row's state does not answer for one that cannot be read"
         );
         // A row that is not a row, and a table with no header.
         assert_eq!(
@@ -1561,6 +1648,87 @@ mod tests {
             Err(Reading::PeerTable)
         );
         assert_eq!(server_inode("", "a", "b"), Err(Reading::PeerTable));
+    }
+
+    /// Which end closed first, as the **engine's** row spells it.
+    ///
+    /// `PeerServerState` carries that row's `st` column so a refusal can say
+    /// more than "not established", and the whole value of it is the
+    /// direction — which is the easy thing to get backwards. The first draft
+    /// of this change did, calling `08` on the engine's row "the engine
+    /// having closed its end", which would send the next investigation to the
+    /// wrong process.
+    ///
+    /// So it is measured here rather than recited: a loopback pair, closed
+    /// from one end and then from the other, read out of the same table the
+    /// resolver reads. No root, no container — this is `127.0.0.1` and
+    /// `/proc/self/net/tcp`.
+    #[test]
+    fn the_engines_row_says_which_end_closed_first() {
+        use std::net::{TcpListener, TcpStream};
+
+        // The engine's row is the one whose local address is our peer.
+        let engine_row = |local: &str, peer: &str| -> Option<String> {
+            let text = read_bounded(Path::new("/proc/self/net/tcp"), 32 * 1024 * 1024).ok()?;
+            text.lines().skip(1).find_map(|line| {
+                let f: Vec<_> = line.split_whitespace().collect();
+                (f.len() >= 10 && f[1] == peer && f[2] == local).then(|| f[3].to_owned())
+            })
+        };
+        // A close is not instant on the wire, so wait for the row to leave
+        // `01` rather than sleeping a guessed interval.
+        let settled = |local: &str, peer: &str| -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match engine_row(local, peer) {
+                    Some(state) if state != "01" => return state,
+                    _ if std::time::Instant::now() >= deadline => {
+                        return engine_row(local, peer).unwrap_or_else(|| "absent".to_owned());
+                    }
+                    _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // This verifier is the client. Close its end first.
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let local = encoded(client.local_addr().unwrap());
+        let peer = encoded(client.peer_addr().unwrap());
+        drop(client);
+        let ours_first = settled(&local, &peer);
+        drop(server);
+
+        // And the other way round: the engine's end closes first.
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let local = encoded(client.local_addr().unwrap());
+        let peer = encoded(client.peer_addr().unwrap());
+        drop(server);
+        let theirs_first = settled(&local, &peer);
+        drop(client);
+
+        assert_eq!(
+            ours_first, "08",
+            "this end closing first leaves the engine's row holding our FIN, \
+             in CLOSE_WAIT"
+        );
+        // `04` or `05`: the engine has sent its FIN, and whether this read
+        // catches it before or after our ACK is a race no assertion should
+        // pin. Both say the same thing — that end closed first.
+        assert!(
+            theirs_first == "04" || theirs_first == "05",
+            "the engine closing first leaves its own row in FIN_WAIT1 or \
+             FIN_WAIT2, not `{theirs_first}`"
+        );
+        assert_ne!(
+            ours_first, theirs_first,
+            "the two directions must not render the same, or the state says \
+             nothing about who closed"
+        );
     }
 
     /// The count is part of the name where the refusal *is* a count.
@@ -1599,6 +1767,7 @@ mod tests {
             Reading::PeerClientAbsent,
             Reading::PeerServerAbsent,
             Reading::PeerServerDuplicated,
+            Reading::PeerServerState(6),
         ]
         .map(|reading| reading.to_string());
         let distinct: BTreeSet<&String> = names.iter().collect();
