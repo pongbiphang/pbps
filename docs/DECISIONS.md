@@ -14160,12 +14160,12 @@ SPEC is in sync with all of these.
      counts with "had some": the two have the same consequence.
 
      **And walking again settles it**, because incompleteness is a state of
-     the moment rather than of the tree. Measured over single walks: 2.88% of
+     the moment rather than of the tree. Measured over single walks: 2.78% of
      a tree spawning forty thousand processes a second could not account for
-     everything, 0.21% of a tree two deep at a hundred a second, and **none of
-     312,300** of a tree with one sleeping child — the cost tracks how often
-     processes come and go, and a quiet tree pays nothing. Four attempts takes
-     the first two to 1 call in 322,865 and 1 in 237,582. The bound stays and
+     everything, 0.21% of a tree two deep at a hundred a second, and **none**
+     of a tree with one sleeping child — the cost tracks how often processes
+     come and go, and a quiet tree pays nothing. Four attempts takes the first
+     two to **none at all**, 0 of 152,541 and 0 of 124,521. The bound stays and
      a refusal sits behind it: "ask again until it looks right" is the shape
      that hides a fault which is not going away, and every caller of this
      needs every occupant.

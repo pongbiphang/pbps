@@ -892,34 +892,6 @@ pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
     File::open(format!("/proc/{pid}"))
 }
 
-/// Whether `pid` demonstrably has no children of its own.
-///
-/// `false` for "it has some" **and** for "it could not be asked", because the
-/// two have the same consequence here: a node passed over may have left live
-/// descendants the walk will not reach. Only a definite empty answer lets the
-/// walk still call itself complete.
-///
-/// Measured over 1,304,698 walks of a tree two deep, of the 1,356 nodes
-/// passed over: 705 answered definitely empty, 4 definitely not, and 647 had
-/// already vanished (#730).
-fn has_no_children(pid: u32) -> bool {
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return false;
-    };
-    let mut answered = false;
-    for task in tasks {
-        let Ok(task) = task else { return false };
-        let Ok(text) = std::fs::read_to_string(task.path().join("children")) else {
-            return false;
-        };
-        if !text.trim().is_empty() {
-            return false;
-        }
-        answered = true;
-    }
-    answered
-}
-
 /// The processes of a service's tree, and whether the walk can account for
 /// all of them.
 ///
@@ -967,9 +939,10 @@ impl Scope {
 /// that is a state of the moment rather than of the tree: the next walk is an
 /// independent attempt at a tree that has stopped moving in that particular
 /// place. Measured over a tree spawning forty thousand processes a second,
-/// one walk in 34 could not account for everything; over a tree two deep at a
-/// hundred a second, one in 477; over a tree with one sleeping child, none of
-/// 312,300.
+/// one walk in 36 could not account for everything; over a tree two deep at a
+/// hundred a second, one in 472; over a tree with one sleeping child, none at
+/// all. Four attempts took the first two to none of 152,541 and none of
+/// 124,521.
 ///
 /// **Bounded, with a refusal behind it**, because "ask again until it looks
 /// right" is the shape that hides a fault that is not going away. Four
@@ -1025,7 +998,13 @@ pub(crate) fn process_scope(service: &ProcessLease) -> Result<Scope, Unqualified
             let task = task.map_err(Reading::Scope.named())?;
             let text = match std::fs::read_to_string(task.path().join("children")) {
                 Ok(text) if text.len() <= 65536 => text,
-                Err(error) if process_gone(&error) => continue,
+                // The task went away between being listed and being read. Its
+                // list is not an empty one: a child it had made is reparented,
+                // possibly to a task this walk has already read (#730).
+                Err(error) if process_gone(&error) => {
+                    may_have_orphans = true;
+                    continue;
+                }
                 Ok(_) | Err(_) => return Err(Reading::Scope.refuse()),
             };
             for pid in text.split_whitespace() {
@@ -1045,16 +1024,22 @@ pub(crate) fn process_scope(service: &ProcessLease) -> Result<Scope, Unqualified
             if scope.len() >= 4096 {
                 return Err(Reading::Scope.refuse());
             }
-            // Asked before the reads that may find it gone, because after
-            // that it cannot be asked at all. Measured over 1,304,698 walks
-            // of a tree two deep: of 1,356 nodes passed over, 705 demonstrably
-            // had no children and orphaned nothing, 4 had some, and 647 had
-            // vanished before the question could be put (#730).
-            let childless = has_no_children(pid);
+            // A node passed over takes its descendants out of this walk with
+            // it, so the walk stops claiming to have accounted for them.
+            //
+            // **A childlessness probe was tried here and is not sound.**
+            // Asking before these reads answers about the moment it was
+            // asked: a process childless then can fork and exit before the
+            // read that finds it gone, and the child is reparented to a node
+            // this walk may already have passed. It bought 705 of 1,356
+            // passed-over nodes on a measured fixture, and bought them with a
+            // claim the probe cannot support. The bounded re-walk gets the
+            // same rate back without asserting anything about a moment that
+            // has gone (#730).
             let directory = match open_process(pid) {
                 Ok(file) => file,
                 Err(error) if process_gone(&error) => {
-                    may_have_orphans |= !childless;
+                    may_have_orphans = true;
                     continue;
                 }
                 Err(_) => return Err(Reading::Scope.refuse()),
@@ -1062,7 +1047,7 @@ pub(crate) fn process_scope(service: &ProcessLease) -> Result<Scope, Unqualified
             let stat = match std::fs::read_to_string(proc_base(&directory).join("stat")) {
                 Ok(stat) => stat,
                 Err(error) if process_gone(&error) => {
-                    may_have_orphans |= !childless;
+                    may_have_orphans = true;
                     continue;
                 }
                 Err(_) => return Err(Reading::Scope.refuse()),
@@ -1108,7 +1093,7 @@ pub(crate) fn process_scope(service: &ProcessLease) -> Result<Scope, Unqualified
                     // Over, so it holds nothing itself — but a process that
                     // is over can still have had live children, and those are
                     // reparented rather than ended (#730).
-                    may_have_orphans |= !childless;
+                    may_have_orphans = true;
                     continue;
                 }
                 return Err(Reading::ScopeParent.refuse());
@@ -1909,39 +1894,10 @@ mod tests {
         assert_eq!(last_reading(), Some(Reading::ScopeIncomplete));
     }
 
-    /// Whether a node could have orphaned anything has three answers, and
-    /// only one of them lets the walk still call itself whole.
-    #[test]
-    fn a_node_that_cannot_be_asked_is_not_a_node_without_children() {
-        if !proc_children_readable() {
-            eprintln!(
-                "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
-                 enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
-            );
-            return;
-        }
-        // This process has one: a child it spawned and has not reaped.
-        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
-        assert!(
-            !has_no_children(std::process::id()),
-            "a process holding an unreaped child has children"
-        );
-        // That child has none of its own.
-        assert!(has_no_children(child.id()), "`sleep` spawns nothing");
-        child.kill().unwrap();
-        child.wait().unwrap();
-        // And a pid nothing answers for cannot say either way, which counts
-        // as "may have had some" rather than as "had none".
-        assert!(
-            !has_no_children(u32::MAX),
-            "a node that cannot be asked is not a node without children"
-        );
-    }
-
     /// A tree that is not moving is walked whole, every time.
     ///
     /// The three callers that need every occupant pay for completeness only
-    /// where processes are coming and going. Measured: 312,300 walks of a
+    /// where processes are coming and going. Measured: 188,823 walks of a
     /// tree with one sleeping child, none incomplete (#730).
     #[test]
     fn a_quiet_tree_is_walked_completely() {
@@ -1987,9 +1943,10 @@ mod tests {
     ///
     /// Incompleteness is a state of the moment, not of the tree, so a second
     /// walk is an independent attempt. Measured on the churning fixture:
-    /// **2.88%** of single walks could not account for everything, and
-    /// **1 call in 322,865** still could not after four — the bound stays,
-    /// and with it the refusal (#730).
+    /// **2.78%** of single walks could not account for everything, and
+    /// **none of 152,541** after four. The bound and the refusal behind it
+    /// stay anyway: a tree that cannot be walked whole in four attempts is
+    /// not one this should keep asking about (#730).
     #[test]
     fn walking_again_settles_a_tree_that_moved() {
         if !proc_children_readable() {
