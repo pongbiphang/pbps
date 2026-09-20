@@ -14030,3 +14030,74 @@ SPEC is in sync with all of these.
      read is bracketed — read twice, and the two must agree — where 520 uses one
      transaction. Qualification is not a binding adapter; SQL Server's stays
      unimplemented (#619, #620).
+
+522. **A process walk passes over a child that is *over*, and refuses
+     anything still alive.** `process_scope` reads a node's `children`, opens
+     each pid and reads its `stat`, and refused the whole walk when that
+     `stat` named a different parent. Two very different things look like
+     that, and refusing both made a valid deployment intermittently refused:
+     `socket_owners` walks this for every `SocketOwnerLease::check`, so the
+     operator was told "the target this run was aimed at changed" about a
+     target that had not moved (#674, three occurrences, both engines).
+
+     **Measured**, walking a shell that spawns and reaps two children in a
+     loop: 785,426 walks produced 1,055 refusals, every one at this branch.
+     Classified over 1,155,160 walks, 2,769 of 2,771 occurrences were a
+     process in state `X` or `Z` — the child caught mid-exit, its `stat`
+     already reparented to the reaper while `/proc/<pid>` still answers.
+
+     A process that is over is the one case that can be passed over without
+     asking anything else: it holds no descriptor, runs no code and owns no
+     socket, so no caller of this walk has a question it could answer. What
+     decides that is `exited_stat`, which this file already had, and not a
+     state test written at the branch — the count matters as much as the
+     state, because a dead leader can retain live threads and a surviving
+     thread can hold the socket or have descendants of its own. A second,
+     weaker answer to one question was the first shape of this and review
+     caught it.
+
+     **`exited_stat` accepts a thread count of none, which it used to refuse.**
+     `aa7315d2` wrote it to admit "a dead leader with no surviving threads"
+     and then refused `num_threads` 0, and its test pinned the refusal.
+     Measured here, that is precisely what a child caught mid-exit reports: a
+     complete fifty-field `stat`, state `X` or `Z`, `num_threads` **0**, 1,409
+     times. The guard was refusing the case the function set out to admit, one
+     value further on, and with it in place this walk still refused every
+     dying child — 234 refusals per 197,000 walks with the branch otherwise
+     correct. A count that cannot be read is still an error, because that is a
+     reading nobody made; a count of none is a reading.
+
+     **Anything still alive refuses, as it did before.** The first shape of
+     this fix skipped a pid the parent no longer listed, which is not proof of
+     exit: a live descendant reparented to a subreaper leaves its old parent's
+     list while remaining in the scope, and passing it over would hand
+     `PrivateChannelLease::check` and `check_kernel_parts` an incomplete scan
+     that reads as a complete one. Review caught that, and the answer is that
+     absence from a list is not an exit — the same distinction 519 is about,
+     one question further on.
+
+     Measured after the fix: 1 or 2 refusals per 200,000 walks against 267
+     before it. The residual is a pid **reused** between the two reads by a
+     process outside the tree, which cannot be told from a reparent without
+     comparing the opened process's `starttime` against the moment the list
+     was read. Refusing is the fail-closed answer to that ambiguity and stays;
+     closing it needs a clock-tick conversion behind a `rustix` feature this
+     workspace does not enable, which is #729 rather than a line here. A
+     passed-over node's live descendants can still leave the result silently,
+     through this branch and through the two `process_gone` branches that
+     reach it four times more often, which is #730.
+
+     **The second window is the table, not the tree.** With the reads named,
+     CI named one: `peer-server-absent`, the engine's established row missing
+     from `/proc/self/net/tcp`. Iterating that file is a `seq_file` walk over
+     hash buckets and not a snapshot, so a row can be repeated as well as
+     dropped. Measured against a loopback pair held open while four threads
+     churned 7.3 million connections: **1,413 of 43,311 reads returned the
+     same pair twice, every one carrying the same inode**, and two different
+     inodes for one four-tuple was never seen — which is what a four-tuple
+     being one socket requires. Refusing the repetition was refusing a read of
+     the table rather than a change to the socket, at 14% of reads under that
+     load, so a repeated row is now one socket seen twice and only a differing
+     inode is the table contradicting itself. The dropped-row direction is not
+     reproduced here and is not treated differently yet; #674 stays open for
+     it.

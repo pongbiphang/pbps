@@ -344,6 +344,39 @@ pointing at the parent — probed zero. Under `ON DELETE CASCADE` the engine
 then deleted it without a word (decision 73). Shape 4: a fix right about the
 case in front of it, one step too wide.
 
+**The mirror image: a refusal wider than its reason.** `process_scope` refused
+a whole walk when a pid listed in a node's `children` had a `stat` naming a
+different parent. The reason is an inconsistency in the tree; the refusal also
+covered a child that simply exited while the walk ran, whose `stat` the kernel
+had already reparented. Measured, that is 2,769 of 2,771 occurrences over
+1,155,160 walks. The walk is on the path of every socket-owner check, so a
+valid deployment was intermittently refused with "the target this run was
+aimed at changed" (#674, DECISIONS 522). The two branches either side of it
+already treated a disappearing child as ordinary; this one asked the same
+question and read the answer as a fault.
+
+**And the first fix for it was one step too wide in the other direction** —
+shape 4, inside the change that fixed shape 1. It passed over any pid the
+parent no longer listed, on the strength of a measurement saying every
+observed case was a dying child. Absence from a list is not an exit: a live
+descendant reparented to a subreaper leaves its old parent's list while
+remaining in the scope, and `PrivateChannelLease::check` and
+`check_kernel_parts` would then have been handed an incomplete scan that reads
+as a complete one. Review caught it before it shipped. Its own second defect
+was shape 1 again, inside the fix for shape 1: it read an unreadable `task`
+directory or `children` file as "not a child".
+
+**The third shape was a second answer to a question this file had already
+answered.** The replacement tested the `stat` state alone, and a dead leader
+can retain live threads — `exited_stat` was right there, requiring the count
+as well, with `a_zombie_leader_does_not_prove_that_its_other_threads_exited`
+pinning the counterexample. What passes over a process now is that shared
+proof. **And the proof itself had the same shape one value further on**: it
+refused `num_threads` 0, which is exactly what a child caught mid-exit
+reports (measured 1,409 times), while its own commit message said it meant to
+admit "a dead leader with no surviving threads". A count nobody could read is
+an error; a count of none is a reading.
+
 The apply guard had two more. The columns and constraints a plan moves are
 excluded from the shape comparison and held to a *presence* check instead —
 but the exclusion is of a definition, so a definition somebody else put behind
