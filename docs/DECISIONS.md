@@ -14136,12 +14136,21 @@ SPEC is in sync with all of these.
      one at a time and kept meeting the same wall, because the branches were
      never the defect — the answer they had to squeeze into was (#730).
 
-     So the processes cannot be had without choosing. `Scope::complete`
-     refuses a walk that could not account for everything; `Scope::seen`
-     hands over what was seen, and its one caller today is `socket_owners`,
-     where an omission takes the count of holders to zero and zero refuses.
-     A caller added later has to choose too, at the call site, where the
-     reason is visible.
+     **No caller can use an incomplete one**, which is where this ended up
+     and not where it started. `socket_owners` looked like the exception: it
+     asks which single process holds a socket, and a missing process takes
+     the count of holders to zero, which refuses. An omission does not only
+     reach zero. Where two processes hold the socket — which a fork
+     produces, and which the count of one exists to refuse — dropping one
+     takes the count to **one**, and one is the count that is *accepted*.
+     There the omission turns a refusal into an acceptance, and review caught
+     it after the first shape of this had already written the opposite into
+     a type's documentation and into this entry.
+
+     So the processes are not handed out at all except through
+     `complete_process_scope`, and `Scope` carries the answer to it rather
+     than offering a choice. Offering one would have meant offering the wrong
+     one.
 
      **A node that orphans nothing does not make a walk partial**, and that is
      asked before the reads that may find it gone, because afterwards it

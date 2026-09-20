@@ -931,10 +931,18 @@ fn has_no_children(pid: u32) -> bool {
 /// walk as a whole one; `socket_owners` asks which single process holds a
 /// socket, and an omission only takes its count to zero, which refuses.
 ///
-/// So the question is asked at the call site rather than assumed: the
-/// processes cannot be had without choosing [`Self::complete`] or
-/// [`Self::seen`], and a caller added later has to choose too (#730,
-/// DECISIONS 523).
+/// **No caller can use an incomplete one**, which is the answer review
+/// arrived at and not the one this started with. It looked as though
+/// `socket_owners` could, since a missing process takes the count of holders
+/// to zero and zero refuses — but an omission does not only reach zero. Where
+/// two processes hold the socket, which a fork produces, dropping one takes
+/// the count from two to **one**, and one is the count that is *accepted*. An
+/// omission there turns a refusal into an acceptance.
+///
+/// So the processes are not handed out at all except through
+/// [`complete_process_scope`], and this type exists to carry the answer to
+/// it rather than to offer a choice. Offering one would have meant offering
+/// the wrong one (#730, DECISIONS 523).
 pub(crate) struct Scope {
     processes: Vec<(u32, File)>,
     /// A node was passed over without being able to rule out that it had
@@ -945,20 +953,11 @@ pub(crate) struct Scope {
 impl Scope {
     /// Every process in the tree, where the walk could account for all of
     /// them — and a refusal where it could not.
-    pub(crate) fn complete(self) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
+    fn complete(self) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
         if self.may_have_orphans {
             return Err(Reading::ScopeIncomplete.refuse());
         }
         Ok(self.processes)
-    }
-
-    /// Every process the walk **saw**, which may be missing one.
-    ///
-    /// Only for a caller whose answer an omission cannot make wrong. The one
-    /// today is the socket owner: a missing process takes the count of
-    /// holders to zero, and zero refuses.
-    pub(crate) fn seen(self) -> Vec<(u32, File)> {
-        self.processes
     }
 }
 
@@ -1323,10 +1322,11 @@ pub(crate) fn socket_owners(
 ) -> Result<Vec<ProcessLease>, UnqualifiedProcess> {
     let expected = PathBuf::from(format!("socket:[{inode}]"));
     let mut owners = Vec::new();
-    // `seen` and not `complete`: this asks which single process holds the
-    // socket, and a process the walk missed takes the count of holders to
-    // zero, which refuses. An omission cannot make this answer wrong (#730).
-    for (pid, directory) in process_scope(service)?.seen() {
+    // Complete, like every other caller. This counts the processes holding
+    // one socket and accepts exactly one of them, so an omission does not
+    // only reach zero: where a fork leaves two holders, dropping one takes
+    // the count to the value that is *accepted* (#730).
+    for (pid, directory) in complete_process_scope(service)? {
         let entries = match std::fs::read_dir(proc_base(&directory).join("fd")) {
             Ok(entries) => entries,
             Err(error) if process_gone(&error) => continue,
@@ -1586,6 +1586,13 @@ mod tests {
     /// not what made CI intermittent. Closing it is #729.
     #[test]
     fn a_child_leaving_the_tree_does_not_refuse_the_walk() {
+        if !proc_children_readable() {
+            eprintln!(
+                "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
+                 enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
+            );
+            return;
+        }
         let mut tree = spawned_and_execed(
             Command::new("/bin/bash")
                 .args([
@@ -1859,13 +1866,29 @@ mod tests {
         );
     }
 
+    /// Whether this kernel exposes `/proc/<pid>/task/<tid>/children` at all.
+    ///
+    /// It is `CONFIG_CHECKPOINT_RESTORE`, and a Linux built without it has no
+    /// such file — so `process_scope` enumerates nothing below the root, and
+    /// the tests that measure what the walk does with a moving tree would
+    /// measure nothing while still passing. Passing vacuously is worse than
+    /// not running, so they say which it was.
+    fn proc_children_readable() -> bool {
+        std::fs::read_dir("/proc/self/task")
+            .ok()
+            .and_then(|mut tasks| tasks.next())
+            .and_then(Result::ok)
+            .is_some_and(|task| task.path().join("children").exists())
+    }
+
     /// A walk that could not account for everything cannot be read as one
     /// that did.
     ///
-    /// This is the whole point of the type: three of the four callers need
-    /// every occupant, and a bare `Vec` let them take a partial walk for a
-    /// whole one. The processes cannot be had without saying which question
-    /// was asked (#730).
+    /// This is the whole point of the type. Every caller needs every
+    /// occupant — including `socket_owners`, which looked as though it did
+    /// not until review: it accepts exactly one holder of a socket, so an
+    /// omission that takes two holders to one turns a refusal into an
+    /// acceptance rather than into another refusal (#730).
     #[test]
     fn an_incomplete_scope_cannot_be_read_as_a_whole_one() {
         let partial = || Scope {
@@ -1881,11 +1904,6 @@ mod tests {
             partial().complete().is_err(),
             "a partial walk is not a whole one"
         );
-        // `seen` answers either way, which is what makes it the deliberate
-        // choice rather than the convenient one.
-        assert!(partial().seen().is_empty());
-        assert!(whole().seen().is_empty());
-
         LAST_READING.with(|cell| cell.set(None));
         assert!(partial().complete().is_err());
         assert_eq!(last_reading(), Some(Reading::ScopeIncomplete));
@@ -1895,6 +1913,13 @@ mod tests {
     /// only one of them lets the walk still call itself whole.
     #[test]
     fn a_node_that_cannot_be_asked_is_not_a_node_without_children() {
+        if !proc_children_readable() {
+            eprintln!(
+                "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
+                 enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
+            );
+            return;
+        }
         // This process has one: a child it spawned and has not reaped.
         let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
         assert!(
@@ -1920,6 +1945,13 @@ mod tests {
     /// tree with one sleeping child, none incomplete (#730).
     #[test]
     fn a_quiet_tree_is_walked_completely() {
+        if !proc_children_readable() {
+            eprintln!(
+                "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
+                 enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
+            );
+            return;
+        }
         let mut tree = spawned_and_execed(
             Command::new("/bin/bash")
                 .args(["-c", "exec /bin/bash -c '/usr/bin/sleep 60 & wait'"])
@@ -1960,6 +1992,13 @@ mod tests {
     /// and with it the refusal (#730).
     #[test]
     fn walking_again_settles_a_tree_that_moved() {
+        if !proc_children_readable() {
+            eprintln!(
+                "skipped: this kernel has no /proc/<pid>/task/<tid>/children, so the walk \
+                 enumerates nothing below the root (CONFIG_CHECKPOINT_RESTORE)"
+            );
+            return;
+        }
         let mut tree = spawned_and_execed(
             Command::new("/bin/bash")
                 .args([
