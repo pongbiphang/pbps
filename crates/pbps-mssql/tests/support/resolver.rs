@@ -466,6 +466,102 @@ mod recon611 {
         PlannedGrant, PrincipalMap, apply_planned, enter, read, reconstruct, verify,
     };
 
+    /// On a case-insensitive database `DBO` and `App` are valid spellings of
+    /// `dbo` and `app`, and a request may use them. The context is keyed by
+    /// the catalog's own names, so the schema every database already has is
+    /// still recognised as that — not created a second time on scratch, which
+    /// ended the request on the engine's error 2760 (finding on #611) — and a
+    /// user schema is reproduced under the target's spelling.
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn a_schema_requested_in_another_casing_is_the_catalogs_schema() {
+        let mut target = TestDb::create("recon611c_t").await;
+        let mut scratch = TestDb::create("recon611c_s").await;
+        // The premise: this database compares names case-insensitively.
+        let folded = target
+            .conn
+            .query("SELECT CONVERT(nvarchar(8), SCHEMA_ID(N'DBO')) AS id;")
+            .await
+            .unwrap();
+        assert_eq!(
+            folded[0].try_get::<&str>("id").unwrap(),
+            Some("1"),
+            "the live server's default collation is expected to be case-insensitive"
+        );
+        let pid = std::process::id();
+        let dep = format!("pbps_cdep611_{pid}");
+        let run_login = format!("pbps_crun611_{pid}");
+        for statement in [
+            format!(
+                "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon611', CHECK_POLICY = OFF; \
+                 CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER app_owner WITHOUT LOGIN;"
+            ),
+            "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
+            format!(
+                "GRANT SELECT ON SCHEMA::app TO [{dep}]; GRANT ALTER ON SCHEMA::dbo TO [{dep}];"
+            ),
+        ] {
+            target.conn.execute(&statement).await.unwrap();
+        }
+        let schemas = ["DBO".to_owned(), "App".to_owned(), "Sys".to_owned()];
+        let mut planning = connect_live(&login_url(&dep, "Pbps!Recon611", &target.name))
+            .await
+            .unwrap();
+        let context = read(&mut planning, &schemas).await.unwrap();
+        assert_eq!(
+            context
+                .schemas
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["app", "dbo", "sys"]
+        );
+
+        scratch
+            .conn
+            .execute(&format!(
+                "CREATE LOGIN [{run_login}] WITH PASSWORD = 'Pbps!Run611', CHECK_POLICY = OFF; \
+                 ALTER AUTHORIZATION ON DATABASE::[{}] TO [{run_login}];",
+                scratch.name
+            ))
+            .await
+            .unwrap();
+        let map = PrincipalMap::generate(&context, &[], &format!("c{pid}"));
+        reconstruct(&mut scratch.conn, &map, &context, &run_login)
+            .await
+            .unwrap();
+        let mut run = connect_live(&login_url(&run_login, "Pbps!Run611", &scratch.name))
+            .await
+            .unwrap();
+        enter(&mut run, map.deployer(&context).as_deref())
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "reproduction differed: {differences:?}"
+        );
+        // A spelling that names no schema is still an absent schema, not a
+        // quiet nothing.
+        let absent = read(&mut planning, &["no_such_schema_611".to_owned()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(absent.contains("does not exist"), "{absent}");
+
+        drop(run);
+        drop(planning);
+        let mut master = connect_live(&conn_str()).await.unwrap();
+        target.drop().await;
+        scratch.drop().await;
+        for login in [&dep, &run_login] {
+            master
+                .execute(&format!("DROP LOGIN [{login}];"))
+                .await
+                .unwrap();
+        }
+    }
+
     /// What the deployer holds through `public` is part of its authorization:
     /// every user is in `public` without being a member of it, so a
     /// database permission or an impersonation right granted there is in the

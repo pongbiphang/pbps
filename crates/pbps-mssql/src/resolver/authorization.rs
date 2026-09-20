@@ -241,12 +241,25 @@ pub async fn read(
     for schema in schemas {
         let rows = conn
             .query(&format!(
-                "SELECT USER_NAME(s.principal_id) AS owner FROM sys.schemas s WHERE s.name = {};",
+                "SELECT s.name AS name, USER_NAME(s.principal_id) AS owner FROM sys.schemas s \
+                 WHERE s.name = {};",
                 literal(schema)
             ))
             .await?;
-        let owner = match rows.as_slice() {
-            [row] => required(row, "owner", "a schema's owner")?,
+        // The schema is keyed by the name the catalog holds, not by the
+        // spelling it was asked for. The lookup above compares under the
+        // database's collation, so on a case-insensitive database `DBO`
+        // finds `dbo` — and keyed as `DBO` it was no longer recognised as
+        // the schema every database already has, the reconstruction ran
+        // `CREATE SCHEMA [DBO]` into a scratch database of the same
+        // collation, and a valid request ended on the engine's error 2760
+        // (measured; finding on #611). Which names are one schema is the engine's
+        // answer, read here once, rather than a comparison repeated in Rust.
+        let (name, owner) = match rows.as_slice() {
+            [row] => (
+                required(row, "name", "a schema's name")?,
+                required(row, "owner", "a schema's owner")?,
+            ),
             // Every login sees every schema's row, so none is absence — and
             // an absent in-scope schema is a scope that cannot be established.
             [] => {
@@ -273,7 +286,7 @@ pub async fn read(
         )
         .await?;
         context.schemas.insert(
-            schema.clone(),
+            name,
             SchemaAuthorization {
                 owner,
                 permissions,
