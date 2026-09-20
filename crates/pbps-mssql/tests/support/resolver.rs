@@ -368,6 +368,97 @@ mod recon611 {
         PlannedGrant, PrincipalMap, apply_planned, enter, read, reconstruct, verify,
     };
 
+    /// What the deployer holds through `public` is part of its authorization:
+    /// every user is in `public` without being a member of it, so a
+    /// database permission or an impersonation right granted there is in the
+    /// engine's effective answer. Both are read, reproduced and verified —
+    /// not left out of the rows replayed, which refused the target (finding
+    /// on #611).
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn what_the_deployer_holds_through_public_is_reproduced() {
+        let mut target = TestDb::create("recon611p_t").await;
+        let mut scratch = TestDb::create("recon611p_s").await;
+        let pid = std::process::id();
+        let dep = format!("pbps_pdep611_{pid}");
+        let run_login = format!("pbps_prun611_{pid}");
+        target
+            .conn
+            .execute(&format!(
+                "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon611', CHECK_POLICY = OFF; \
+                 CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER other WITHOUT LOGIN; \
+                 GRANT CREATE VIEW TO public; GRANT IMPERSONATE ON USER::other TO public;"
+            ))
+            .await
+            .unwrap();
+        let schemas = ["dbo".to_owned()];
+        let mut planning = connect_live(&login_url(&dep, "Pbps!Recon611", &target.name))
+            .await
+            .unwrap();
+        let context = read(&mut planning, &schemas).await.unwrap();
+        assert!(context.database_permissions.contains("CREATE VIEW"));
+        assert!(
+            context
+                .database_grants
+                .iter()
+                .any(|g| g.grantee == "public" && g.permission == "CREATE VIEW"),
+            "{:?}",
+            context.database_grants
+        );
+        assert!(context.impersonation.contains("other"));
+        // `public` is a holder, not a membership to reproduce.
+        assert!(!context.roles.contains_key("public"));
+
+        scratch
+            .conn
+            .execute(&format!(
+                "CREATE LOGIN [{run_login}] WITH PASSWORD = 'Pbps!Run611', CHECK_POLICY = OFF; \
+                 ALTER AUTHORIZATION ON DATABASE::[{}] TO [{run_login}];",
+                scratch.name
+            ))
+            .await
+            .unwrap();
+        let map = PrincipalMap::generate(&context, &[], &format!("p{pid}"));
+        reconstruct(&mut scratch.conn, &map, &context, &run_login)
+            .await
+            .unwrap();
+        let mut run = connect_live(&login_url(&run_login, "Pbps!Run611", &scratch.name))
+            .await
+            .unwrap();
+        enter(&mut run, map.deployer(&context).as_deref())
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "reproduction differed: {differences:?}"
+        );
+        // And a scratch side that loses it is named.
+        scratch
+            .conn
+            .execute("REVOKE CREATE VIEW FROM public;")
+            .await
+            .unwrap();
+        let drifted = verify(&mut run, &map, &context, &schemas).await.unwrap();
+        assert!(
+            drifted.contains(&"database:permissions".to_owned())
+                && drifted.contains(&"database:grants".to_owned()),
+            "{drifted:?}"
+        );
+
+        drop(run);
+        drop(planning);
+        let mut master = connect_live(&conn_str()).await.unwrap();
+        target.drop().await;
+        scratch.drop().await;
+        for login in [&dep, &run_login] {
+            master
+                .execute(&format!("DROP LOGIN [{login}];"))
+                .await
+                .unwrap();
+        }
+    }
+
     /// A deployer granted a permission by a grant-option holder sees its own
     /// row and not the holder's: the session that reads the context cannot
     /// see why the grantor could grant. That is an ordinary target, and it is

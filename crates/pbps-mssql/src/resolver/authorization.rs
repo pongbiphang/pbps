@@ -187,8 +187,18 @@ pub async fn read(
         }
     }
 
+    // Everything the deployer holds a permission *through*: itself, its
+    // roles, and `public`, which every user is in without being a member of
+    // it — `IS_ROLEMEMBER` is not asked about it and the role list leaves it
+    // out, since there is no membership to reproduce. Its grants still reach
+    // the deployer (measured: a permission granted to `public` is in
+    // `fn_my_permissions`), so left out of this list they were in the
+    // effective answer and not in the rows replayed, and a scratch side
+    // without them failed verification for an ordinary target (finding on
+    // #611).
     let mut holders: BTreeSet<String> = roles.keys().cloned().collect();
     holders.insert(principal.effective.clone());
+    holders.insert("public".to_owned());
     let holder_list = holders
         .iter()
         .map(|name| literal(name))

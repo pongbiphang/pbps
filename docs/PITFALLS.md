@@ -2399,6 +2399,15 @@ engine needs root and runs in CI alone. The hashing now runs on the blocking
 pool, and a unit test hashes a large sparse file beside a ticker and requires
 the ticker to have run.
 
+The fix uncovered the next one. The same test now lived past five minutes, and
+SQL Server's telemetry client (`SQLServerCEIP`) logs in over loopback about that
+long after the engine starts: a session the run did not open, in a namespace it
+must be alone in, so the following check refused the run as not exclusive. Every
+earlier dedicated-server test had finished before the engine said hello to
+itself. The fixture now starts the server with customer feedback off, which
+docs/RESOLVER-RUNTIME.md records as the operator's premise. A suite's longest
+test is the only one that measures what happens later.
+
 A `tokio::time::timeout` measures the wall clock, not the work: anything that
 stops the runtime's thread spends every other task's budget for it. On a
 current-thread runtime, a synchronous loop over input whose size the engine

@@ -107,21 +107,8 @@ jobs:
           MSSQL_SA_PASSWORD: "Pbps!Ci12345"
         ports:
           - 14330:1433
-      # The same build as another edition under another server collation: the
-      # two facts of the resolver's analysis-scope rule that no database on
-      # the first server can vary (#611). Express, so it stays small.
-      mssql-express:
-        image: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
-        env:
-          ACCEPT_EULA: "Y"
-          MSSQL_PID: "Express"
-          MSSQL_COLLATION: "Latin1_General_100_CS_AS"
-          MSSQL_SA_PASSWORD: "Pbps!Ci12345"
-        ports:
-          - 14331:1433
     env:
       PBPS_TEST_DB: "Server=localhost,14330;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
-      PBPS_TEST_EXPRESS_DB: "Server=localhost,14331;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -134,25 +121,19 @@ jobs:
       # that no longer matches.
       - name: wait for SQL Server
         run: |
-          for port in 14330 14331; do
-            id=$(docker ps -q --filter publish=$port)
-            if [ -z "$id" ]; then
-              echo "no service container publishing $port" >&2
-              docker ps -a >&2
-              exit 1
+          id=$(docker ps -q --filter publish=14330)
+          if [ -z "$id" ]; then
+            echo "no service container publishing 14330" >&2
+            docker ps -a >&2
+            exit 1
+          fi
+          for _ in $(seq 1 60); do
+            if docker exec "$id" /opt/mssql-tools18/bin/sqlcmd \
+                 -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
+              exit 0
             fi
-            ready=
-            for _ in $(seq 1 60); do
-              if docker exec "$id" /opt/mssql-tools18/bin/sqlcmd \
-                   -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
-                ready=1
-                break
-              fi
-              sleep 2
-            done
-            [ -n "$ready" ] || break
+            sleep 2
           done
-          [ -n "$ready" ] && exit 0
           # The container has crashed at startup twice on this job, and both
           # times the reason was only visible in its own log — which the raw
           # job output buries under teardown noise. Print it where the failure
@@ -161,7 +142,12 @@ jobs:
           echo "----- service container log -----" >&2
           docker logs "$id" >&2 2>&1 || true
           exit 1
-      - run: cargo test -p pbps-mssql --test live -- --ignored
+      # One test compares this server with a second, Express one, and that pair
+      # lives in `live-editions`: a second SQL Server starting beside this one
+      # is the pressure the startup crashes in docs/PITFALLS.md warn about, and
+      # it crashed this job the first time it was tried (#611). Skipped by
+      # name here; unset, its variable makes the test fail rather than pass.
+      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation
       - run: python3 scripts/live-transport.py mssql
       # Phase 3.1's onboarding path and the optional dev rehearsal both cross
       # the CLI/database boundary, so the dialect-only suite cannot exercise
@@ -172,6 +158,59 @@ jobs:
       # fail, and the failure looks like a bug in the lock rather than in the
       # test schedule.
       - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1
+
+  # Two real instances of one build, as two editions under two server
+  # collations: the two facts of the resolver's analysis-scope rule that no
+  # database on one server can vary (#611).
+  #
+  # Its own job, and the engines are started by a step rather than as
+  # services: services start together, and two SQL Servers starting at once on
+  # one runner is the pressure the startup crashes in docs/PITFALLS.md warn
+  # about — as service containers in `live` they crashed it on the second run.
+  # Here the second starts only once the first answers, and a crash costs this
+  # job alone rather than every SQL Server suite.
+  live-editions:
+    needs: quick
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
+      PBPS_TEST_DB: "Server=localhost,14330;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
+      PBPS_TEST_EXPRESS_DB: "Server=localhost,14331;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: start the two SQL Servers, one after the other
+        run: |
+          await() {
+            for _ in $(seq 1 60); do
+              if docker exec "$1" /opt/mssql-tools18/bin/sqlcmd \
+                   -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$1 never became ready" >&2
+            echo "----- container log -----" >&2
+            docker logs "$1" >&2 2>&1 || true
+            return 1
+          }
+          docker run -d --name pbps-ci-mssql -e ACCEPT_EULA=Y \
+            -e "MSSQL_SA_PASSWORD=Pbps!Ci12345" -p 14330:1433 "$IMAGE" >/dev/null
+          await pbps-ci-mssql
+          docker run -d --name pbps-ci-mssql-express -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
+            -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
+            -e "MSSQL_SA_PASSWORD=Pbps!Ci12345" -p 14331:1433 "$IMAGE" >/dev/null
+          await pbps-ci-mssql-express
+      # A name filter that matches nothing passes with zero tests, so the run
+      # is required to have run the one test this job exists for.
+      - name: the edition test
+        run: |
+          set -o pipefail
+          cargo test -p pbps-mssql --test live -- --ignored \
+            a_real_express_target_is_an_edition_limitation | tee edition.log
+          grep -q "test result: ok. 1 passed" edition.log
+
 
   # The PostgreSQL half of SPEC 11.5, and at this phase a small one: the crate
   # holds a connected boundary and two lexical rules, so those are what it
@@ -371,7 +410,7 @@ jobs:
   # quietly qualify a pull request that nothing ran on.
   gate:
     name: ci-gate
-    needs: [quick, windows, live, live-pg, dev-rehearsal, resolver, msrv]
+    needs: [quick, windows, live, live-editions, live-pg, dev-rehearsal, resolver, msrv]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

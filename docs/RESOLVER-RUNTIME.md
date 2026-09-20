@@ -159,6 +159,17 @@ moved it:
   cumulative despite its name, with `sqlserver_start_time` as its origin.
   `@@CONNECTIONS` is unusable here: it also counts the engine's internal
   connections, and rose by eighteen during one `CREATE DATABASE`.
+- A dedicated SQL Server runs with **customer feedback off**
+  (`[telemetry] customerfeedback = false` in `mssql.conf`). With it on, the
+  engine's own telemetry client logs in over loopback a few minutes after
+  startup — measured on 17.0: `SQLServerCEIP`, as `NT AUTHORITY\SYSTEM` from
+  `127.0.0.1`, five and a half minutes in — and that is a socket in the
+  engine's namespace, a session in its list and a login on its counter that
+  this run did not open. All three signals refuse it, correctly by their own
+  terms, and a run that straddles the moment ends as not exclusive (#611).
+  With the setting off no such session appears (measured on Developer
+  edition). This is the operator's premise, like the container's layout; the
+  profile does not try to tell the engine's own client from somebody else's.
 
 Neither counter is readable without the privilege to see other sessions, and
 an unreadable counter refuses rather than reporting an idle server; so does a
