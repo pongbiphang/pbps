@@ -1665,8 +1665,17 @@ mod tests {
              was too busy to measure on: {walks}"
         );
         let refusals: usize = refused.values().sum();
+        // **The bar is the rate, and it has to admit the residual this
+        // test's own rustdoc documents.** `* 20_000` read as "a rate below
+        // one in twenty thousand", but the sampling stops at twenty
+        // thousand walks, so it demanded *zero* — of a fixture measured at
+        // 1 or 2 refusals per 200,000, which is a one-in-seven chance of
+        // failing the required suite for the behaviour the paragraph above
+        // calls correct. `* 2_000` passes the documented residual with room
+        // and still fails the pre-fix rate, which would put about 26
+        // refusals in this many walks (review on #735).
         assert!(
-            refusals * 20_000 < walks,
+            refusals * 2_000 < walks,
             "{refusals} refusals in {walks} walks is the rate this fixture had before the \
              departing child was passed over (267 in 206,771), not after it (1 or 2 in \
              200,000): {refused:?}"
@@ -2002,23 +2011,37 @@ mod tests {
         let lease = ProcessLease::capture(tree.id()).expect("a root-installed shell");
         let mut walks = 0usize;
         let mut incomplete = 0usize;
+        let mut refused = 0usize;
         let started = std::time::Instant::now();
         while sampling(walks, started) {
             walks += 1;
-            if process_scope(&lease)
-                .expect("the walk itself does not refuse")
-                .complete()
-                .is_err()
-            {
-                incomplete += 1;
+            match process_scope(&lease) {
+                Ok(scope) => {
+                    if scope.complete().is_err() {
+                        incomplete += 1;
+                    }
+                }
+                // Zero is the property here — this fixture forks once and
+                // then sleeps, so there is no reparenting for the walk to
+                // refuse over — but it is asserted after the fixture is
+                // killed rather than raised as a panic inside the loop
+                // (review on #735).
+                Err(_) => refused += 1,
             }
         }
-        tree.kill().unwrap();
-        tree.wait().unwrap();
+        let cleanup = tree.kill();
+        let reaped = tree.wait();
+        cleanup.expect("the fixture is killable");
+        reaped.expect("the fixture is reapable");
         assert!(
             walks >= 20_000,
             "the sampling stopped on time rather than on samples, so this machine \
              was too busy to measure on: {walks}"
+        );
+        assert_eq!(
+            refused, 0,
+            "a tree with one sleeping child gives the walk nothing to refuse over: \
+             {refused} of {walks}"
         );
         assert_eq!(
             incomplete, 0,
@@ -2058,22 +2081,50 @@ mod tests {
         let mut calls = 0usize;
         let mut single = 0usize;
         let mut bounded = 0usize;
+        let mut refused = 0usize;
         let started = std::time::Instant::now();
         while sampling(calls, started) {
             calls += 1;
-            if process_scope(&lease)
-                .expect("the walk itself does not refuse")
-                .complete()
-                .is_err()
-            {
-                single += 1;
+            match process_scope(&lease) {
+                Ok(scope) => {
+                    if scope.complete().is_err() {
+                        single += 1;
+                    }
+                }
+                // **Counted, not required to be absent.** This is the race
+                // the walk still refuses on purpose — a pid whose parent
+                // changed between the two reads and which `exited_stat`
+                // could not prove over — and it is rare, not impossible:
+                // two of 1,155,160 walks of this same fixture. Demanding
+                // none of them over twenty thousand samples would fail the
+                // required suite a few runs in a hundred with production
+                // behaving exactly as DECISIONS 522 documents, which is a
+                // test failing for a reason it does not name (review on
+                // #735).
+                Err(_) => refused += 1,
             }
+            LAST_READING.with(|cell| cell.set(None));
             if complete_process_scope(&lease).is_err() {
-                bounded += 1;
+                // The same refusal reaches here through `?`, so the two are
+                // told apart by name. Counting it as a failure to settle
+                // would hand the settling assertion the flake this branch
+                // was just freed from — and that assertion is the tighter
+                // of the two, since it requires a thousandth of `single`.
+                match last_reading() {
+                    Some(Reading::ScopeIncomplete) => bounded += 1,
+                    _ => refused += 1,
+                }
             }
         }
-        tree.kill().unwrap();
-        tree.wait().unwrap();
+        // Killed before anything is asserted. A `Child` does not kill on
+        // drop, so a panic between the loop and here leaves this fixture —
+        // two forks and a `wait` around an unbounded loop — spinning for the
+        // rest of the run, slowing every test beside it and outliving the
+        // binary that started it (review on #735).
+        let cleanup = tree.kill();
+        let reaped = tree.wait();
+        cleanup.expect("the fixture is killable");
+        reaped.expect("the fixture is reapable");
         assert!(
             calls >= 20_000,
             "the sampling stopped on time rather than on samples, so this machine \
@@ -2088,6 +2139,11 @@ mod tests {
             bounded * 1_000 < single,
             "walking again must settle all but a thousandth of what one walk missed: \
              {bounded} after four against {single} after one, over {calls} calls"
+        );
+        assert!(
+            refused * 2_000 < calls,
+            "the parent-changed refusal is a documented rarity, not a routine \
+             answer: {refused} hard refusals over {calls} calls"
         );
     }
 
