@@ -87,6 +87,23 @@ pub(crate) enum Reading {
     ScopeParent,
     /// The descriptor table of a process in the scope.
     ScopeDescriptors,
+    /// A process the walk has just seen has no `/proc` entry to open.
+    CaptureOpen,
+    /// Its `stat` start time, when establishing it rather than re-reading it.
+    CaptureStartTicks,
+    /// Its `status`, or the `NSpid` line inside it.
+    CaptureStatus,
+    /// Its `exe` link, the file behind it, or that file's metadata.
+    CaptureExecutable,
+    /// Its executable is readable and is not a root-owned, group- and
+    /// other-unwritable file — the rule a lease is built on rather than a
+    /// read that moved. #650's shape lands here.
+    CaptureUnprotected,
+    /// One of its namespaces, when establishing it.
+    CaptureNamespace,
+    /// The recaptured process is not the one the walk held a directory for:
+    /// its numeric PID now answers for something else.
+    CaptureReplaced,
 }
 
 #[cfg(test)]
@@ -139,6 +156,13 @@ impl std::fmt::Display for Reading {
             Self::Scope => f.write_str("scope"),
             Self::ScopeParent => f.write_str("scope-parent"),
             Self::ScopeDescriptors => f.write_str("scope-descriptors"),
+            Self::CaptureOpen => f.write_str("capture-open"),
+            Self::CaptureStartTicks => f.write_str("capture-start-ticks"),
+            Self::CaptureStatus => f.write_str("capture-status"),
+            Self::CaptureExecutable => f.write_str("capture-executable"),
+            Self::CaptureUnprotected => f.write_str("capture-unprotected"),
+            Self::CaptureNamespace => f.write_str("capture-namespace"),
+            Self::CaptureReplaced => f.write_str("capture-replaced"),
         }
     }
 }
@@ -176,26 +200,29 @@ impl ProcessLease {
     /// remains a proxy: the caller must separately match a supported runtime.
     pub fn capture(pid: u32) -> Result<Self, UnqualifiedProcess> {
         if pid == 0 {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::CaptureOpen.refuse());
         }
-        let directory = open_process(pid).map_err(|_| UnqualifiedProcess)?;
+        let directory = open_process(pid).map_err(Reading::CaptureOpen.named())?;
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        let start_ticks = start_ticks(&base)?;
+        let start_ticks = start_ticks(&base).map_err(Reading::CaptureStartTicks.named())?;
         let status =
-            std::fs::read_to_string(base.join("status")).map_err(|_| UnqualifiedProcess)?;
+            std::fs::read_to_string(base.join("status")).map_err(Reading::CaptureStatus.named())?;
         let namespace_pid = status
             .lines()
             .find_map(|line| line.strip_prefix("NSpid:"))
             .and_then(|pids| pids.split_whitespace().last())
             .and_then(|pid| pid.parse::<u32>().ok())
             .filter(|pid| *pid > 0)
-            .ok_or(UnqualifiedProcess)?;
+            .ok_or_else(|| Reading::CaptureStatus.refuse())?;
         let executable_path =
-            std::fs::read_link(base.join("exe")).map_err(|_| UnqualifiedProcess)?;
-        let executable = File::open(base.join("exe")).map_err(|_| UnqualifiedProcess)?;
-        let metadata = executable.metadata().map_err(|_| UnqualifiedProcess)?;
+            std::fs::read_link(base.join("exe")).map_err(Reading::CaptureExecutable.named())?;
+        let executable =
+            File::open(base.join("exe")).map_err(Reading::CaptureExecutable.named())?;
+        let metadata = executable
+            .metadata()
+            .map_err(Reading::CaptureExecutable.named())?;
         if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::CaptureUnprotected.refuse());
         }
         let mut namespaces = Vec::new();
         // `ipc` is here for the dedicated-server profile's occupant accounting:
@@ -204,8 +231,9 @@ impl ProcessLease {
         // this is additive — `same_process` and `check` iterate whatever was
         // captured, and no caller assumes the set's size.
         for name in ["pid", "mnt", "net", "user", "ipc"] {
-            let file = File::open(base.join("ns").join(name)).map_err(|_| UnqualifiedProcess)?;
-            let identity = FileIdentity::of(&file)?;
+            let file = File::open(base.join("ns").join(name))
+                .map_err(Reading::CaptureNamespace.named())?;
+            let identity = FileIdentity::of(&file).map_err(Reading::CaptureNamespace.named())?;
             namespaces.push((name, file, identity));
         }
         let lease = Self {
@@ -716,8 +744,10 @@ pub(crate) fn observe_incidental<T>(
 ) -> Result<Option<T>, UnqualifiedProcess> {
     let result = (|| {
         let process = ProcessLease::capture(pid)?;
-        if FileIdentity::of(directory)? != FileIdentity::of(&process.directory)? {
-            return Err(UnqualifiedProcess);
+        if FileIdentity::of(directory).map_err(Reading::CaptureReplaced.named())?
+            != FileIdentity::of(&process.directory).map_err(Reading::CaptureReplaced.named())?
+        {
+            return Err(Reading::CaptureReplaced.refuse());
         }
         inspect(process)
     })();
@@ -1216,6 +1246,44 @@ mod tests {
         assert_eq!(last_reading(), Some(Reading::StartTicks));
     }
 
+    /// Establishing a process is named apart from re-reading one.
+    ///
+    /// `socket_owners` recaptures every holder it finds through
+    /// `observe_incidental`, so a `capture` that refuses on a **live** process
+    /// propagates straight out of the socket-owner walk. Left unnamed, that is
+    /// the one way a refusal on the path #674 lives on could still reach a CI
+    /// log carrying nothing but the outer step — found in review of this
+    /// change, which had named only the re-reads.
+    ///
+    /// `CaptureUnprotected` earns its own name rather than sharing
+    /// `CaptureExecutable`: it is the rule a lease is built on and not a read
+    /// that moved, and it is the answer #650 is looking for.
+    #[test]
+    fn establishing_a_process_is_named_apart_from_re_reading_one() {
+        // An executable that is readable and is not root-owned: the test
+        // binary's own process, which `capture` refuses by that rule alone.
+        LAST_READING.with(|cell| cell.set(None));
+        assert!(ProcessLease::capture(std::process::id()).is_err());
+        assert_eq!(last_reading(), Some(Reading::CaptureUnprotected));
+
+        // And no process at all to open.
+        LAST_READING.with(|cell| cell.set(None));
+        assert!(ProcessLease::capture(0).is_err());
+        assert_eq!(last_reading(), Some(Reading::CaptureOpen));
+
+        // The recapture inside the walk carries the name out rather than
+        // flattening it: a live process whose capture refuses is an error
+        // `observe_incidental` propagates, not an absence it reports.
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
+        let directory = open_process(child.id()).unwrap();
+        LAST_READING.with(|cell| cell.set(None));
+        let walked = observe_incidental(child.id(), &directory, Ok);
+        assert!(walked.is_ok(), "a live, root-installed child is capturable");
+        assert_eq!(last_reading(), None, "nothing refused");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     /// The count is part of the name where the refusal *is* a count.
     ///
     /// `owner-count(0)` and `owner-count(2)` are different accidents — a walk
@@ -1240,6 +1308,13 @@ mod tests {
             Reading::Scope,
             Reading::ScopeParent,
             Reading::ScopeDescriptors,
+            Reading::CaptureOpen,
+            Reading::CaptureStartTicks,
+            Reading::CaptureStatus,
+            Reading::CaptureExecutable,
+            Reading::CaptureUnprotected,
+            Reading::CaptureNamespace,
+            Reading::CaptureReplaced,
         ]
         .map(|reading| reading.to_string());
         let distinct: BTreeSet<&String> = names.iter().collect();
