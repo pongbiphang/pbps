@@ -888,6 +888,56 @@ pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
     File::open(format!("/proc/{pid}"))
 }
 
+/// Boot-relative "now", in the units `/proc/<pid>/stat`'s field 22 uses.
+///
+/// `starttime` is in clock ticks since boot and nothing else in `/proc`
+/// reports the current time that way, so this is `/proc/uptime`'s seconds
+/// times the tick rate. Both have the same granularity — a tick is 10ms on
+/// every Linux this runs on and `/proc/uptime` carries two decimals — so a
+/// process started within the same tick as the reading compares equal and is
+/// **not** treated as newer, which is the fail-closed side.
+fn ticks_since_boot() -> Result<u64, Reading> {
+    let uptime = read_bounded(Path::new("/proc/uptime"), 4096).map_err(|_| Reading::Scope)?;
+    let seconds: f64 = uptime
+        .split_whitespace()
+        .next()
+        .ok_or(Reading::Scope)?
+        .parse()
+        .map_err(|_| Reading::Scope)?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(Reading::Scope);
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "uptime in ticks is far inside f64's exact integer range, and \
+                  the guards above exclude the values a cast could mangle"
+    )]
+    Ok((seconds * rustix::param::clock_ticks_per_second() as f64) as u64)
+}
+
+/// Whether the process this `stat` describes began **after** `reference`.
+///
+/// A pid read from a `children` list names a process that existed when the
+/// list was read. If the process now answering for that number began after
+/// that moment, it is not that process: the listed child exited and its
+/// number was reused. Field 22 of `proc_pid_stat(5)` is that beginning, in
+/// the same ticks [`ticks_since_boot`] returns.
+///
+/// Unreadable is neither yes nor no: a `stat` this cannot parse is the walk
+/// being unable to read, and it refuses rather than guessing either way.
+fn started_after(stat: &str, reference: u64) -> Result<bool, Reading> {
+    let (_, fields) = stat.rsplit_once(')').ok_or(Reading::Scope)?;
+    let started: u64 = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or(Reading::Scope)?
+        .parse()
+        .map_err(|_| Reading::Scope)?;
+    Ok(started > reference)
+}
+
 pub(crate) fn process_scope(
     service: &ProcessLease,
 ) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
@@ -904,6 +954,9 @@ pub(crate) fn process_scope(
         let (parent_pid, directory) = &scope[cursor];
         let parent_pid = *parent_pid;
         let mut children = Vec::new();
+        // Taken before the list is read, so that a process which began after
+        // this moment cannot be one the list named (#729).
+        let listed_at = ticks_since_boot().map_err(Reading::refuse)?;
         let tasks = match std::fs::read_dir(proc_base(directory).join("task")) {
             Ok(tasks) => tasks,
             // Another session may exit while its already-observed proc
@@ -988,6 +1041,16 @@ pub(crate) fn process_scope(
             // incomplete scan that reads as a complete one.
             if ppid != parent_pid {
                 if exited_stat(&stat).map_err(Reading::Scope.named())? {
+                    continue;
+                }
+                // Alive, and claiming a parent that did not list it. Either
+                // it is a descendant that reparented — still in the scope,
+                // and passing it over would hand the occupant checks an
+                // incomplete scan — or the listed child exited and its number
+                // now answers for somebody else. The two are told apart by
+                // when this process began: after the list was read, and it
+                // cannot be the one the list named (#729).
+                if started_after(&stat, listed_at).map_err(Reading::refuse)? {
                     continue;
                 }
                 return Err(Reading::ScopeParent.refuse());
@@ -1446,16 +1509,20 @@ mod tests {
     /// this machine walks it tens of thousands of times a second.
     ///
     /// **Zero is deliberately not the bar, and the residual is not a bug.**
-    /// Measured across five runs after the fix: 1 or 2 refusals per ~200,000
-    /// walks, against 267 before it. Those are a pid **reused** between the
-    /// `children` read and the `stat` read by a process outside the tree —
-    /// indistinguishable from a live descendant that reparented, without
-    /// comparing the opened process's `starttime` against the moment the list
-    /// was read, which needs a clock-tick conversion this crate's `rustix`
-    /// features do not carry. Refusing is the fail-closed answer to that
-    /// ambiguity, and at one walk in a hundred thousand — on a fixture that
-    /// spawns forty thousand processes a second, which no engine does — it is
-    /// not what made CI intermittent. Closing it is #729.
+    /// Measured across five runs when the departing child was first passed
+    /// over: 1 or 2 refusals per ~200,000 walks, against 267 before it. Those
+    /// are a pid **reused** between the `children` read and the `stat` read by
+    /// a process outside the tree, which #729 then told from a reparented
+    /// descendant by `starttime` — four of five runs at none, one at 1 per
+    /// 134,990.
+    ///
+    /// It does not reach zero and cannot: `starttime` counts in ticks and
+    /// this fixture spawns some four hundred processes inside each one, so a
+    /// reuse within the same tick is indistinguishable from a start before the
+    /// list was read. Refusing that is the fail-closed side of an ambiguity
+    /// the kernel does not resolve at this resolution, and at one walk in
+    /// something over half a million — on a fixture no engine resembles — it
+    /// is not what made CI intermittent.
     #[test]
     fn a_child_leaving_the_tree_does_not_refuse_the_walk() {
         let mut tree = spawned_and_execed(
@@ -1729,6 +1796,52 @@ mod tests {
             "the two directions must not render the same, or the state says \
              nothing about who closed"
         );
+    }
+
+    /// A pid whose process began after the list named it is not that process.
+    ///
+    /// This is the half of the walk that tells a **reused** number from a
+    /// **reparented** descendant, and only one of those may be passed over.
+    /// Same tick is deliberately *not* "after": `starttime` counts in ticks
+    /// and `/proc/uptime` carries two decimals, so two readings inside one
+    /// 10ms tick are indistinguishable, and the fail-closed side of that is
+    /// to refuse (#729).
+    #[test]
+    fn a_process_that_began_after_the_list_is_not_the_one_the_list_named() {
+        // `comm` is parenthesized and may itself contain ')', so the fields
+        // are taken after the last one — and field 22 is the twentieth after
+        // it. This shape matches `start_ticks`'s own reading.
+        let stat =
+            |started: &str| format!("7 (a ) name) S 1 {} {started} rest", ["0"; 17].join(" "));
+        assert_eq!(started_after(&stat("500"), 499), Ok(true));
+        assert_eq!(
+            started_after(&stat("500"), 500),
+            Ok(false),
+            "the same tick is not proof of a later start"
+        );
+        assert_eq!(started_after(&stat("500"), 501), Ok(false));
+        // Unreadable is neither: it refuses rather than guessing a direction.
+        assert_eq!(started_after(&stat("later"), 0), Err(Reading::Scope));
+        assert_eq!(started_after("no parenthesis", 0), Err(Reading::Scope));
+        assert_eq!(started_after("(short)", 0), Err(Reading::Scope));
+    }
+
+    /// The reference the comparison above is made against is real, and in the
+    /// units `starttime` uses.
+    #[test]
+    fn boot_relative_now_is_read_in_the_units_starttime_counts_in() {
+        let first = ticks_since_boot().expect("/proc/uptime is readable here");
+        assert!(first > 0, "this machine has been up for some ticks");
+        // This process started before now, in the same units — which is the
+        // whole assumption the comparison rests on.
+        let own = std::fs::read_to_string("/proc/self/stat").unwrap();
+        assert_eq!(
+            started_after(&own, first),
+            Ok(false),
+            "a process already running did not begin after this reading"
+        );
+        let second = ticks_since_boot().expect("readable twice");
+        assert!(second >= first, "{first} then {second}");
     }
 
     /// The count is part of the name where the refusal *is* a count.

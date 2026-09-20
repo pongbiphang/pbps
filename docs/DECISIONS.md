@@ -14080,9 +14080,21 @@ SPEC is in sync with all of these.
      before it. The residual is a pid **reused** between the two reads by a
      process outside the tree, which cannot be told from a reparent without
      comparing the opened process's `starttime` against the moment the list
-     was read. Refusing is the fail-closed answer to that ambiguity and stays;
-     closing it needs a clock-tick conversion behind a `rustix` feature this
-     workspace does not enable, which is #729 rather than a line here. A
+     was read. **#729 told those two apart by when the process began.** A pid
+     from a `children` list named a process that existed when the list was
+     read, so one whose `starttime` is later cannot be it: the listed child
+     exited and the number was reused, and passing it over is proved. One that
+     began earlier may be the reparented descendant, and still refuses. The
+     reference is `/proc/uptime` in `starttime`'s own ticks, which is what
+     `rustix`'s `param` feature is enabled for.
+
+     It does not reach zero and cannot. `starttime` counts in ticks, and the
+     fixture that measures this spawns some four hundred processes inside each
+     one, so a reuse within the same tick is indistinguishable from a start
+     before the list was read; same tick is deliberately not "after", which is
+     the fail-closed side. Measured: four runs of five at no refusals and one
+     at 1 per 134,990 walks, against 1 or 2 per 200,000 before it and 267
+     before that. The remainder is the kernel's resolution, not a rule. A
      passed-over node's live descendants can still leave the result silently,
      through this branch and through the two `process_gone` branches that
      reach it four times more often, which is #730.
