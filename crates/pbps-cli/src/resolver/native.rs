@@ -73,9 +73,21 @@ pub(crate) enum Reading {
     SocketOwner,
     /// This verifier's own network namespace, or the service's record of it.
     NetNamespace,
-    /// `/proc/self/net/tcp`: unreadable, malformed, or no longer carrying the
-    /// established pair this lease was captured over.
+    /// `/proc/self/net/tcp`'s established pair no longer carries the inode
+    /// this lease was captured over — read twice, and it moved between them.
     PeerInode,
+    /// A pair this cannot answer for at all: not both loopback, or one of
+    /// each address family.
+    PeerEndpoints,
+    /// `/proc/self/net/tcp` itself: unreadable, or a row that will not parse.
+    PeerTable,
+    /// This verifier's own end of the connection is not in that table.
+    PeerClientAbsent,
+    /// The engine's end is not in that table at all.
+    PeerServerAbsent,
+    /// The engine's end is in that table more than once, which one
+    /// established pair cannot be.
+    PeerServerDuplicated,
     /// The number of processes in the service's scope holding the socket,
     /// where exactly one is the only answer a lease can be built on.
     OwnerCount(usize),
@@ -152,6 +164,11 @@ impl std::fmt::Display for Reading {
             Self::SocketOwner => f.write_str("socket-owner"),
             Self::NetNamespace => f.write_str("net-namespace"),
             Self::PeerInode => f.write_str("peer-inode"),
+            Self::PeerEndpoints => f.write_str("peer-endpoints"),
+            Self::PeerTable => f.write_str("peer-table"),
+            Self::PeerClientAbsent => f.write_str("peer-client-absent"),
+            Self::PeerServerAbsent => f.write_str("peer-server-absent"),
+            Self::PeerServerDuplicated => f.write_str("peer-server-duplicated"),
             Self::OwnerCount(found) => write!(f, "owner-count({found})"),
             Self::Scope => f.write_str("scope"),
             Self::ScopeParent => f.write_str("scope-parent"),
@@ -376,7 +393,8 @@ impl ProcessLease {
         self.check()?;
         other.check()?;
         Ok(self.start_ticks == other.start_ticks
-            && FileIdentity::of(&self.directory)? == FileIdentity::of(&other.directory)?
+            && FileIdentity::of(&self.directory).map_err(Reading::SocketOwner.named())?
+                == FileIdentity::of(&other.directory).map_err(Reading::SocketOwner.named())?
             && self
                 .namespaces
                 .iter()
@@ -530,7 +548,7 @@ fn encoded(address: SocketAddr) -> String {
 
 fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedProcess> {
     if !local.ip().is_loopback() || !peer.ip().is_loopback() || local.is_ipv4() != peer.is_ipv4() {
-        return Err(Reading::PeerInode.refuse());
+        return Err(Reading::PeerEndpoints.refuse());
     }
     let table = if local.is_ipv4() {
         "/proc/self/net/tcp"
@@ -538,9 +556,9 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
         "/proc/self/net/tcp6"
     };
     let text =
-        read_bounded(Path::new(table), 32 * 1024 * 1024).map_err(Reading::PeerInode.named())?;
+        read_bounded(Path::new(table), 32 * 1024 * 1024).map_err(Reading::PeerTable.named())?;
     let mut lines = text.lines();
-    lines.next().ok_or_else(|| Reading::PeerInode.refuse())?;
+    lines.next().ok_or_else(|| Reading::PeerTable.refuse())?;
     let local = encoded(local);
     let peer = encoded(peer);
     let mut found = None;
@@ -548,7 +566,7 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
     for line in lines {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() < 10 {
-            return Err(Reading::PeerInode.refuse());
+            return Err(Reading::PeerTable.refuse());
         }
         if fields[3] != "01" {
             continue;
@@ -559,16 +577,23 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
         if fields[1] == peer && fields[2] == local {
             let inode = fields[9]
                 .parse::<u64>()
-                .map_err(Reading::PeerInode.named())?;
-            if inode == 0 || found.replace(inode).is_some() {
-                return Err(Reading::PeerInode.refuse());
+                .map_err(Reading::PeerTable.named())?;
+            if inode == 0 {
+                return Err(Reading::PeerServerAbsent.refuse());
+            }
+            // Two rows for one established pair is a table read that was not
+            // a snapshot, not a second connection — and CI has now named this
+            // read once (`peer-server-absent`), so the two stop sharing a
+            // name before the next occurrence (#674).
+            if found.replace(inode).is_some() {
+                return Err(Reading::PeerServerDuplicated.refuse());
             }
         }
     }
     if !client_present {
-        return Err(Reading::PeerInode.refuse());
+        return Err(Reading::PeerClientAbsent.refuse());
     }
-    found.ok_or_else(|| Reading::PeerInode.refuse())
+    found.ok_or_else(|| Reading::PeerServerAbsent.refuse())
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
@@ -727,14 +752,22 @@ fn exited_stat(stat: &str) -> Result<bool, UnqualifiedProcess> {
         .ok_or(UnqualifiedProcess)?
         .parse()
         .map_err(|_| UnqualifiedProcess)?;
-    if threads == 0 {
-        return Err(UnqualifiedProcess);
-    }
     // A dead leader can retain live threads, and /proc/PID/task can become
     // unavailable after pthread_exit. The same kernel stat record must show
-    // that only the dead leader remains; absence of its task directory is not
-    // proof of group exit (proc_pid_task(5), proc_pid_stat(5) field 20).
-    Ok(matches!(*state, "Z" | "X") && threads == 1)
+    // that no thread of the group remains; absence of its task directory is
+    // not proof of group exit (proc_pid_task(5), proc_pid_stat(5) field 20).
+    //
+    // **Zero is such a record, not a malformed one.** `aa7315d2` refused it,
+    // and its own message says what it meant to admit — "a dead leader with
+    // no surviving threads". Measured while fixing #674, walking a shell that
+    // spawns and reaps children: a child caught mid-exit reports a complete
+    // fifty-field `stat` with `state` `X` or `Z` and `num_threads` **0**,
+    // 1,409 times. Refusing that is refusing the very case this admits, one
+    // value further on, and it is what made `process_scope` refuse a whole
+    // walk for a child that was simply finishing (DECISIONS 522). An
+    // unreadable or unparseable count is still an error, because that is a
+    // reading nobody made.
+    Ok(matches!(*state, "Z" | "X") && threads <= 1)
 }
 
 pub(crate) fn observe_incidental<T>(
@@ -754,16 +787,19 @@ pub(crate) fn observe_incidental<T>(
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
-            if !process_exited(directory)? {
+            if !process_exited(directory).map_err(Reading::CaptureReplaced.named())? {
                 return Err(error);
             }
             // Prove exit through the held proc inode, then exclude replacement
             // of its numeric PID. Never turn a live permission failure into
             // absence. Essential service/backend leases still must stay live.
             match open_process(pid) {
-                Ok(current) if FileIdentity::of(&current)? == FileIdentity::of(directory)? => (),
+                Ok(current)
+                    if FileIdentity::of(&current).map_err(Reading::CaptureReplaced.named())?
+                        == FileIdentity::of(directory)
+                            .map_err(Reading::CaptureReplaced.named())? => {}
                 Err(error) if process_gone(&error) => (),
-                Ok(_) | Err(_) => return Err(UnqualifiedProcess),
+                Ok(_) | Err(_) => return Err(Reading::CaptureReplaced.refuse()),
             }
             Ok(None)
         }
@@ -797,7 +833,7 @@ pub(crate) fn process_scope(
         service
             .directory
             .try_clone()
-            .map_err(|_| UnqualifiedProcess)?,
+            .map_err(Reading::Scope.named())?,
     )];
     let mut seen = BTreeSet::from([service.pid]);
     let mut cursor = 0;
@@ -854,14 +890,43 @@ pub(crate) fn process_scope(
             let ppid = stat
                 .rsplit_once(')')
                 .and_then(|(_, fields)| fields.split_whitespace().nth(1))
-                .and_then(|s| s.parse::<u32>().ok())
+                .and_then(|value| value.parse::<u32>().ok())
                 .ok_or_else(|| Reading::Scope.refuse())?;
-            // Named apart from the reads around it: this is the one refusal
-            // in the walk that a process merely coming and going can produce
-            // without any read failing — the pid was in a `children` list a
-            // moment ago and its own `stat` now names a different parent, by
-            // reparenting or by numeric reuse (#674).
+            // A pid was in a `children` list a moment ago and its own `stat`
+            // now names a different parent. Two very different things look
+            // like this, and refusing both is what made a valid deployment
+            // intermittently refused (#674, DECISIONS 522).
+            //
+            // **Measured on this machine**, walking a shell that spawns and
+            // reaps two children in a loop: 1,155,160 walks produced 2,771 of
+            // these, and 2,769 of them were a process in state `X` or `Z` —
+            // the child caught mid-exit, its `stat` already reparented to the
+            // reaper while `/proc/<pid>` still answers.
+            //
+            // A process that is over is the one case that can be passed over
+            // without asking anything else: it holds no descriptor, runs no
+            // code and owns no socket, so no caller of this walk has a
+            // question it could answer.
+            //
+            // **`exited_stat` and not a state test written here.** This file
+            // already answers "is this process over", and it requires the
+            // thread count as well as the state, because a dead leader can
+            // retain live threads and a surviving thread can hold the socket
+            // or have descendants of its own —
+            // `a_zombie_leader_does_not_prove_that_its_other_threads_exited`
+            // pins exactly that. A second, weaker answer to one question was
+            // the first shape of this branch, and review caught it.
+            //
+            // **Anything not proved over refuses**, as it did before. Absence
+            // from a parent's list is not proof either: a live descendant
+            // reparented to a subreaper leaves the list while remaining in
+            // the scope, and passing it over would hand
+            // `PrivateChannelLease::check` and `check_kernel_parts` an
+            // incomplete scan that reads as a complete one.
             if ppid != parent_pid {
+                if exited_stat(&stat).map_err(Reading::Scope.named())? {
+                    continue;
+                }
                 return Err(Reading::ScopeParent.refuse());
             }
             scope.push((pid, directory));
@@ -1231,7 +1296,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(last_reading(), Some(Reading::PeerInode));
+        assert_eq!(last_reading(), Some(Reading::PeerEndpoints));
 
         // And a lease whose process is gone: the held proc directory outlives
         // the process, so the read that refuses is the one that asks what it
@@ -1293,6 +1358,87 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// A child leaving the tree while the tree is being walked is not a
+    /// reason to refuse the walk.
+    ///
+    /// This is #674's liveness window, and it is the one the walk meets in
+    /// production: PostgreSQL forks a backend per connection and SQL Server's
+    /// engine runs 116 tasks, so the service's own process tree churns
+    /// exactly like this fixture. `socket_owners` walks that tree for every
+    /// `SocketOwnerLease::check`, so a refusal here reached the operator as
+    /// "the target this run was aimed at changed" — a valid deployment
+    /// intermittently refused.
+    ///
+    /// **Measured before the fix**: 785,426 walks of this fixture produced
+    /// 1,055 refusals, every one of them `scope-parent`. Classified over
+    /// 1,155,160 walks, all 2,771 occurrences had the pid **no longer listed**
+    /// as a child by the time it was asked again, and 2,761 of those were in
+    /// state `X`, the child caught mid-exit with its `stat` already
+    /// reparented. None was still listed and claiming another parent, which
+    /// is the inconsistency the check exists for and the one that still
+    /// refuses.
+    ///
+    /// The budget is time rather than iterations because the rate is what
+    /// matters: unfixed, this window opened roughly once per 750 walks, and
+    /// this machine walks it tens of thousands of times a second.
+    ///
+    /// **Zero is deliberately not the bar, and the residual is not a bug.**
+    /// Measured across five runs after the fix: 1 or 2 refusals per ~200,000
+    /// walks, against 267 before it. Those are a pid **reused** between the
+    /// `children` read and the `stat` read by a process outside the tree —
+    /// indistinguishable from a live descendant that reparented, without
+    /// comparing the opened process's `starttime` against the moment the list
+    /// was read, which needs a clock-tick conversion this crate's `rustix`
+    /// features do not carry. Refusing is the fail-closed answer to that
+    /// ambiguity, and at one walk in a hundred thousand — on a fixture that
+    /// spawns forty thousand processes a second, which no engine does — it is
+    /// not what made CI intermittent. Closing it is #729.
+    #[test]
+    fn a_child_leaving_the_tree_does_not_refuse_the_walk() {
+        let mut tree = spawned_and_execed(
+            Command::new("/bin/bash")
+                .args([
+                    "-c",
+                    "exec /bin/bash -c 'while :; do /usr/bin/true & /usr/bin/true & wait; done'",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            "bash",
+        );
+        // `/bin/bash` is root-installed, so a lease can be built on it without
+        // the root fixture the resolver matrix needs.
+        let lease = ProcessLease::capture(tree.id()).expect("a root-installed shell");
+
+        let mut walks = 0usize;
+        let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            walks += 1;
+            LAST_READING.with(|cell| cell.set(None));
+            if process_scope(&lease).is_err() {
+                let name = last_reading()
+                    .map(|reading| reading.to_string())
+                    .unwrap_or_else(|| "unnamed".to_owned());
+                *refused.entry(name).or_default() += 1;
+            }
+        }
+        tree.kill().unwrap();
+        tree.wait().unwrap();
+
+        assert!(
+            walks > 10_000,
+            "too few walks to say anything: {walks} in five seconds"
+        );
+        let refusals: usize = refused.values().sum();
+        assert!(
+            refusals * 20_000 < walks,
+            "{refusals} refusals in {walks} walks is the rate this fixture had before the \
+             departing child was passed over (267 in 206,771), not after it (1 or 2 in \
+             200,000): {refused:?}"
+        );
+    }
+
     /// The count is part of the name where the refusal *is* a count.
     ///
     /// `owner-count(0)` and `owner-count(2)` are different accidents — a walk
@@ -1324,6 +1470,11 @@ mod tests {
             Reading::CaptureUnprotected,
             Reading::CaptureNamespace,
             Reading::CaptureReplaced,
+            Reading::PeerEndpoints,
+            Reading::PeerTable,
+            Reading::PeerClientAbsent,
+            Reading::PeerServerAbsent,
+            Reading::PeerServerDuplicated,
         ]
         .map(|reading| reading.to_string());
         let distinct: BTreeSet<&String> = names.iter().collect();
@@ -1398,8 +1549,18 @@ mod tests {
         assert!(!exited_stat(&stat("S", "1")).unwrap());
         assert!(exited_stat(&stat("Z", "1")).unwrap());
         assert!(exited_stat(&stat("X", "1")).unwrap());
+        // And none at all, which is what a child caught mid-exit actually
+        // reports — measured 1,409 times while fixing #674. This assertion
+        // read `is_err()` until then, which refused the very case this
+        // function's own commit message set out to admit, "a dead leader with
+        // no surviving threads".
+        assert!(exited_stat(&stat("Z", "0")).unwrap());
+        assert!(exited_stat(&stat("X", "0")).unwrap());
+        // A live state is still live at any count.
+        assert!(!exited_stat(&stat("S", "0")).unwrap());
+        // A count nobody could read stays an error, which is a different
+        // thing from a count of none.
         assert!(exited_stat(&stat("Z", "unknown")).is_err());
-        assert!(exited_stat(&stat("Z", "0")).is_err());
         assert!(exited_stat("unreadable").is_err());
     }
 
