@@ -254,6 +254,7 @@ pub async fn create_scratch(
     names: &ScratchNames,
     recipe: &DatabaseRecipe,
 ) -> Result<(), DbError> {
+    contained_databases_are_allowed(conn, recipe).await?;
     conn.execute(&format!(
         "CREATE LOGIN [{}] WITH PASSWORD = '{}', CHECK_POLICY = OFF;",
         names.login(),
@@ -269,6 +270,53 @@ pub async fn create_scratch(
         names.login()
     ))
     .await
+}
+
+/// A partially contained target needs a scratch server that allows contained
+/// databases, and a fresh SQL Server does not: measured on 17.0, `CREATE
+/// DATABASE ... CONTAINMENT = PARTIAL` is error 12824 until the server-level
+/// `contained database authentication` option is 1. Every such target was
+/// refused by that error halfway through creation, after the run's login
+/// existed (finding on #611).
+///
+/// The option is the operator's to set, not this run's: it is server
+/// configuration on a server pbps did not provision, it outlives the run, and
+/// nothing a run creates there is allowed to. So it is a premise, asked
+/// before anything is created and refused in words that name the option. Any
+/// login may read it (measured), so the question never fails for privilege.
+pub async fn contained_databases_are_allowed(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+    recipe: &DatabaseRecipe,
+) -> Result<(), DbError> {
+    if !recipe
+        .sql_server
+        .as_ref()
+        .is_some_and(|settings| settings.containment == "PARTIAL")
+    {
+        return Ok(());
+    }
+    let rows = conn
+        .query(
+            "SELECT CONVERT(nvarchar(12), value_in_use) AS in_use FROM sys.configurations \
+             WHERE name = N'contained database authentication';",
+        )
+        .await?;
+    // Absent is not "off": a server that does not report the option is one
+    // this rule was not measured on.
+    let [row] = rows.as_slice() else {
+        return Err(DbError::BadRow(
+            "the scratch server did not report its contained database authentication option".into(),
+        ));
+    };
+    match row.try_get::<&str>("in_use")? {
+        Some("1") => Ok(()),
+        _ => Err(DbError::Refused(
+            "the target database is partially contained, and the scratch server does not allow \
+             contained databases; set its 'contained database authentication' option to 1 \
+             (sp_configure, then RECONFIGURE)"
+                .into(),
+        )),
+    }
 }
 
 /// The statements that create the scratch database the way the target's is:

@@ -113,6 +113,15 @@ Qualification is not a binding adapter: SQL Server binding stays unimplemented
 | Deployer | The planning connection's database user, read as itself: `fn_my_permissions` on the database and each in-scope schema, `IS_ROLEMEMBER`, its default schema and language, the users it may impersonate, and the grant rows it can see. Reproduced with run-local users `WITHOUT LOGIN` and roles named `pbps_principal_<n>_<token>`, database-scoped, reachable only under `EXECUTE AS USER`; `dbo`, `public` and the fixed `db_` roles keep their identity; grants and DENYs are replayed under their own grantors. A `dbo` deployer — which a member of `sysadmin` is everywhere — is the run login itself, which owns its scratch database. The reproduction is verified against the target as read, and only then are the plan's grants run, as the reproduced deployer, so one it could not make is the engine's refusal |
 | Stability | Catalog views are not a snapshot under any isolation level, so the target's facts and authorization are read twice and must agree. The rest is PostgreSQL's: sealed to both connections, requalified on every check against what was sealed |
 
+The scratch database is created the way the target's is: collation, containment,
+compatibility level and the database-level ANSI options. A **partially
+contained** target therefore needs a scratch server whose
+`contained database authentication` option is 1; a fresh server has it at 0 and
+refuses the `CREATE DATABASE` (error 12824, measured). The run asks before it
+creates anything and refuses by the option's name. It does not set the option:
+that is configuration of a server pbps did not provision, and it would outlive
+the run.
+
 What it does not prove is named here too: server-level permissions of the
 deployment login beyond `dbo` are outside a database scope; a change made and
 undone between the two bracketing reads is not seen by them, only a lasting one

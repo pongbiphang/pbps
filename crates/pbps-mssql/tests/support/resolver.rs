@@ -93,6 +93,104 @@ fn login_url(user: &str, password: &str, database: &str) -> String {
     )
 }
 
+mod contained611 {
+    use super::*;
+    use pbps_db::resolver::ScratchNames;
+    use pbps_db::resolver::environment::DatabaseRecipe;
+    use pbps_mssql::resolver::environment::{Scope, read};
+    use pbps_mssql::resolver::{contained_databases_are_allowed, scratch_database_ddl};
+
+    /// A partially contained target needs a scratch server that allows
+    /// contained databases, which a fresh one does not. The premise is asked
+    /// before anything is created and refused by the option's name; with the
+    /// option on, the recipe read from the real target creates a database
+    /// contained the way the target's is (finding on #611).
+    ///
+    /// The option is server-wide, so this test is the only one that may touch
+    /// it, and it puts it back.
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn a_partially_contained_target_needs_a_server_that_allows_contained_databases() {
+        let mut admin = connect_live(&conn_str()).await.unwrap();
+        let option = |value: u8| {
+            format!("EXEC sp_configure 'contained database authentication', {value}; RECONFIGURE;")
+        };
+        admin.execute(&option(1)).await.unwrap();
+        let pid = std::process::id();
+        let target = format!("pbps_contained611_t_{pid}");
+        let scratch = format!("pbps_contained611_s_{pid}");
+        admin
+            .execute(&format!(
+                "CREATE DATABASE [{target}] CONTAINMENT = PARTIAL;"
+            ))
+            .await
+            .unwrap();
+        let mut planning = connect_live(&format!("{};Database={target}", conn_str()))
+            .await
+            .unwrap();
+        let schemas = ["dbo".to_owned()];
+        let catalog = read(&mut planning, &Scope { schemas: &schemas })
+            .await
+            .unwrap();
+        let recipe = DatabaseRecipe::from_sql_server_catalog(&catalog).unwrap();
+        assert_eq!(recipe.sql_server.as_ref().unwrap().containment, "PARTIAL");
+
+        // Off: refused by name, before any statement could fail halfway. The
+        // engine will not turn the option off while a contained database
+        // exists (12818), so the target goes first; its recipe is what is kept.
+        drop(planning);
+        let drop_database = |database: &str| {
+            format!(
+                "ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{database}];"
+            )
+        };
+        admin.execute(&drop_database(&target)).await.unwrap();
+        admin.execute(&option(0)).await.unwrap();
+        let refused = contained_databases_are_allowed(&mut admin, &recipe)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("contained database authentication"),
+            "{refused}"
+        );
+        // A target that is not contained asks nothing of the server.
+        contained_databases_are_allowed(&mut admin, &DatabaseRecipe::neutral())
+            .await
+            .unwrap();
+
+        // On: allowed, and the recipe's own statements create it contained.
+        admin.execute(&option(1)).await.unwrap();
+        contained_databases_are_allowed(&mut admin, &recipe)
+            .await
+            .unwrap();
+        let names = ScratchNames::new(
+            scratch.clone(),
+            format!("pbps_contained611_l_{pid}"),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )
+        .unwrap();
+        for statement in scratch_database_ddl(&names, &recipe).unwrap() {
+            admin.execute(&statement).await.unwrap();
+        }
+        let rows = admin
+            .query(&format!(
+                "SELECT CONVERT(nvarchar(16), containment_desc) AS containment FROM sys.databases \
+                 WHERE name = N'{scratch}';"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].try_get::<&str>("containment").unwrap(),
+            Some("PARTIAL")
+        );
+
+        admin.execute(&drop_database(&scratch)).await.unwrap();
+        admin.execute(&option(0)).await.unwrap();
+    }
+}
+
 mod scope611 {
     use super::*;
     use pbps_db::resolver::environment::{
