@@ -401,8 +401,17 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
             // unavailable for both removals, unwrapping it panics first, with
             // only the workload's names, and the control's container is
             // neither reported nor removed while the workload's is (#724).
+            // The workload's own name, taken before `close` consumes it:
+            // `close` answers `Result<(), Error>` and `Error` carries no
+            // `recovery_names`, so a close that fails leaves nothing naming
+            // the container it could not remove. Read out of the panic by the
+            // fixture, which removes what it reports.
+            let workload_name = workload.resource_name().to_owned();
             let closed = workload.close().await;
-            panic!("control: {error:?}; closing the workload after it: {closed:?}");
+            panic!(
+                "control: {error:?}; closing the workload {workload_name} after it: \
+                 {closed:?}; recovery_names: [\"{workload_name}\"]"
+            );
         }
     };
     let result = inspect_pair(

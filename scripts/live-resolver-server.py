@@ -176,7 +176,19 @@ def start_dedicated(engine, name, owned, network=None):
             "-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
             "-e", "MSSQL_MEMORY_LIMIT_MB=1024",
             "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", MSSQL_BOOT, **QUIET)
-    run("docker", "start", name, **QUIET)
+    started(name)
+
+
+def started(name):
+    """Start a fixture container, and report it if it will not start.
+
+    `run`'s default would raise straight past the caller's cleanup, which
+    removes the container, so an engine that refused to start at all printed
+    neither state nor log — the case this whole reporter exists for (#724).
+    """
+    if run("docker", "start", name, check=False, **QUIET).returncode:
+        report(run, name)
+        raise RuntimeError(f"owned fixture {name} did not start")
 
 
 def start_target(engine, name, root, owned):
@@ -202,7 +214,7 @@ def start_target(engine, name, root, owned):
     if engine == "mssql":
         run("docker", "cp", str(root / "mssql.conf"),
             name + ":/var/opt/mssql/mssql.conf", **QUIET)
-    run("docker", "start", name, **QUIET)
+    started(name)
 
 
 def describe(container):

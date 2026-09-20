@@ -96,7 +96,12 @@ def fixture(args, binary, root, owned):
         run("docker", "cp", str(root / leaf), target + ":/tmp/" + leaf, **QUIET)
     if engine == "mssql":
         run("docker", "cp", str(root / "mssql.conf"), target + ":/var/opt/mssql/mssql.conf", **QUIET)
-    run("docker", "start", target, **QUIET)
+    # `check=False` and reported: the wrapper's default would raise straight
+    # past `main`'s cleanup, which removes the container, so an engine that
+    # refused to start at all printed neither state nor log (#724).
+    if run("docker", "start", target, check=False, **QUIET).returncode:
+        report(run, target)
+        raise RuntimeError("owned native TLS fixture did not start")
     for _ in range(60):
         if run("docker", "exec", target, *probe, check=False, **QUIET).returncode == 0:
             break
