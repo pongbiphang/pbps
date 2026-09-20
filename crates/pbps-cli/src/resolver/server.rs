@@ -1286,6 +1286,7 @@ impl ScratchRun {
                 &scope::library_path(driver, &catalog),
                 scope::engine_packages(driver),
             )
+            .await
             .map_err(|_| Error::Scope("the scratch backend's executables are unreadable".into()))?;
             (
                 EnvironmentFacts {
@@ -1435,6 +1436,7 @@ impl ScratchRun {
                 &scope::library_path(driver, &catalog),
                 scope::engine_packages(driver),
             )
+            .await
             .map_err(|_| Error::Scope("the scratch backend's executables are unreadable".into()))?;
             (
                 EnvironmentFacts {

@@ -89,7 +89,15 @@ pub(crate) fn library_list(value: &str) -> Vec<String> {
 /// The executable set of one process: its engine image, every file-backed
 /// shared object it has mapped, and the `required` libraries (as an engine
 /// names them, e.g. `$libdir/hstore`) it has not.
-pub(crate) fn executables(
+///
+/// The census itself stays on the caller's task, because it borrows the
+/// lease; the hashing does not. An engine's code can be more than a gigabyte
+/// — SQL Server maps its own from packages — and the runs that call this live
+/// on a current-thread runtime beside the watchers that keep their containers:
+/// hashed inline, one census stalled them past their request budget and they
+/// removed the run's channel as lost (measured in CI on #611). So each file is
+/// hashed on the blocking pool while the runtime keeps turning.
+pub(crate) async fn executables(
     lease: &ProcessLease,
     required: &[String],
     dynamic_library_path: &str,
@@ -100,7 +108,7 @@ pub(crate) fn executables(
     let engine = ExecutableIdentity {
         role: ExecutableRole::Engine,
         path: engine_path.to_string_lossy().into_owned(),
-        digest: Some(digest_of(lease.executable_file())?),
+        digest: Some(digest_of(lease.executable_file()).await?),
         provenance: Provenance::LoadedContent,
         disk_differs_from_loaded: Some(disk_differs(
             lease,
@@ -176,7 +184,7 @@ pub(crate) fn executables(
             claimed.entry(path).or_default().push(candidate);
             continue;
         }
-        late.push(match digest_of(&file) {
+        late.push(match digest_of(&file).await {
             Ok(digest) => ExecutableIdentity {
                 role: ExecutableRole::LateLoaded,
                 path: candidate,
@@ -195,7 +203,7 @@ pub(crate) fn executables(
     }
     let mut libraries = Vec::new();
     for (path, mapping) in &mapped {
-        let identity = mapped_library(lease, path, mapping);
+        let identity = mapped_library(lease, path, mapping).await;
         match claimed.get(path) {
             Some(spellings) => libraries.extend(spellings.iter().map(|spelling| {
                 let mut aliased = identity.clone();
@@ -277,11 +285,11 @@ fn is_engine_code(path: &str, packages: &[&str]) -> bool {
         || packages.iter().any(|suffix| name.ends_with(suffix))
 }
 
-fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> ExecutableIdentity {
+async fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> ExecutableIdentity {
     let differs = mapping.deleted || disk_differs(lease, Path::new(path), mapping.inode);
     // The mapped file object itself, when the inspector may open it.
     if let Ok(file) = lease.open_proc(&format!("map_files/{:x}-{:x}", mapping.start, mapping.end))
-        && let Ok(digest) = digest_of(&file)
+        && let Ok(digest) = digest_of(&file).await
     {
         return ExecutableIdentity {
             role: ExecutableRole::Preloaded,
@@ -300,10 +308,11 @@ fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> Execut
             "the mapped library was replaced or removed on disk and its loaded content cannot be read",
         );
     }
-    match lease
-        .open_in_root(path.trim_start_matches('/'))
-        .and_then(|file| digest_of(&file))
-    {
+    let on_disk = match lease.open_in_root(path.trim_start_matches('/')) {
+        Ok(file) => digest_of(&file).await,
+        Err(error) => Err(error),
+    };
+    match on_disk {
         Ok(digest) => ExecutableIdentity {
             role: ExecutableRole::Preloaded,
             path: path.to_owned(),
@@ -406,9 +415,19 @@ pub(crate) fn resolve(
     exact.into_iter().chain(suffixed).collect()
 }
 
+/// SHA-256 of a file's content, computed off the runtime's thread. The
+/// handle is duplicated rather than moved because the lease keeps its own;
+/// a duplicate shares the cursor, which the positional read never touches.
+async fn digest_of(file: &File) -> Result<String, UnqualifiedProcess> {
+    let file = file.try_clone().map_err(|_| UnqualifiedProcess)?;
+    tokio::task::spawn_blocking(move || digest_blocking(&file))
+        .await
+        .map_err(|_| UnqualifiedProcess)?
+}
+
 /// SHA-256 of a file's content, read positionally so a handle shared with
 /// the lease keeps its own cursor untouched.
-fn digest_of(file: &File) -> Result<String, UnqualifiedProcess> {
+fn digest_blocking(file: &File) -> Result<String, UnqualifiedProcess> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut offset = 0u64;
@@ -682,8 +701,8 @@ mod tests {
     /// A live process this test owns: what runs is what is hashed, the
     /// libraries it mapped are reported with content, and a required library
     /// that does not exist is unreadable rather than absent-and-fine.
-    #[test]
-    fn a_running_process_reports_its_executed_content_and_mapped_libraries() {
+    #[tokio::test]
+    async fn a_running_process_reports_its_executed_content_and_mapped_libraries() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -691,7 +710,9 @@ mod tests {
         // Let the exec happen before the lease looks at the executable.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let lease = ProcessLease::capture(child.id()).unwrap();
-        let set = executables(&lease, &["$libdir/no_such_library".into()], "$libdir", &[]).unwrap();
+        let set = executables(&lease, &["$libdir/no_such_library".into()], "$libdir", &[])
+            .await
+            .unwrap();
         let on_disk = std::fs::read(lease.executable_path()).unwrap();
         assert_eq!(
             set.engine.digest.as_deref(),
@@ -741,7 +762,7 @@ mod tests {
                 alias.to_string_lossy().into_owned()
             })
             .collect();
-        let set = executables(&lease, &aliases, "$libdir", &[]).unwrap();
+        let set = executables(&lease, &aliases, "$libdir", &[]).await.unwrap();
         for alias_name in &aliases {
             let through_alias: Vec<_> = set
                 .libraries
@@ -761,7 +782,9 @@ mod tests {
         // A relative name with a directory resolves against the process's
         // working directory — the test's own, which `sleep` inherited — and
         // is reported at that absolute path (finding on #688).
-        let relative = executables(&lease, &["src/lib.rs".into()], "$libdir", &[]).unwrap();
+        let relative = executables(&lease, &["src/lib.rs".into()], "$libdir", &[])
+            .await
+            .unwrap();
         let expected = std::env::current_dir().unwrap().join("src/lib.rs");
         let found = relative
             .libraries
@@ -774,7 +797,7 @@ mod tests {
         // each, the mapping's own name not displaced by the alias (finding
         // on #688).
         let both = [libc_path.clone(), aliases[0].clone()];
-        let set = executables(&lease, &both, "$libdir", &[]).unwrap();
+        let set = executables(&lease, &both, "$libdir", &[]).await.unwrap();
         for spelling in &both {
             assert_eq!(
                 set.libraries.iter().filter(|l| l.path == *spelling).count(),
@@ -794,8 +817,8 @@ mod tests {
     /// mapped, and a mapped library whose inode moved is reported as
     /// replaced rather than hashed from disk. Replacing a binary under a
     /// running engine end to end is the root fixture's case.
-    #[test]
-    fn a_path_that_no_longer_names_the_mapped_inode_is_reported_as_differing() {
+    #[tokio::test]
+    async fn a_path_that_no_longer_names_the_mapped_inode_is_reported_as_differing() {
         let mut child = std::process::Command::new(which_sleep())
             .arg("30")
             .spawn()
@@ -821,7 +844,7 @@ mod tests {
             .into_iter()
             .find(|(path, _)| path.contains("libc.so"))
             .expect("libc is mapped");
-        let intact = mapped_library(&lease, &libc_path, &libc);
+        let intact = mapped_library(&lease, &libc_path, &libc).await;
         assert_eq!(intact.disk_differs_from_loaded, Some(false));
         assert!(intact.digest.is_some());
         // The same library with the inode the mapping would carry after a
@@ -830,7 +853,7 @@ mod tests {
             inode: libc.inode + 1,
             ..libc
         };
-        let replaced = mapped_library(&lease, &libc_path, &moved);
+        let replaced = mapped_library(&lease, &libc_path, &moved).await;
         match replaced.provenance {
             Provenance::LoadedContent => {
                 // A root inspector read the mapped object itself and still
@@ -856,8 +879,8 @@ mod tests {
         panic!("no sleep binary");
     }
 
-    #[test]
-    fn a_digest_is_of_the_content_and_independent_of_the_handles_cursor() {
+    #[tokio::test]
+    async fn a_digest_is_of_the_content_and_independent_of_the_handles_cursor() {
         let dir = std::env::temp_dir().join(format!("pbps-exe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lib.so");
@@ -865,10 +888,49 @@ mod tests {
         let mut file = File::open(&path).unwrap();
         let mut skip = [0u8; 5];
         file.read_exact(&mut skip).unwrap();
-        let digest = digest_of(&file).unwrap();
+        let digest = digest_of(&file).await.unwrap();
         assert_eq!(digest, format!("{:x}", Sha256::digest(b"hello, loader")));
         std::fs::write(&path, b"hello, loader!").unwrap();
-        assert_ne!(digest_of(&File::open(&path).unwrap()).unwrap(), digest);
+        assert_ne!(
+            digest_of(&File::open(&path).unwrap()).await.unwrap(),
+            digest
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The runs that call the census live on a current-thread runtime beside
+    /// the watchers that keep their containers alive, and an engine's code
+    /// can be over a gigabyte. Hashed on the runtime's own thread, one file
+    /// stops every other task for as long as it takes — long enough, measured
+    /// in CI on #611, for a watcher to miss its request budget and remove the
+    /// run's channel. A sparse file costs no disk and still has to be read
+    /// and hashed in full.
+    #[tokio::test]
+    async fn hashing_a_large_file_does_not_stop_the_runtimes_other_tasks() {
+        let dir = std::env::temp_dir().join(format!("pbps-exe-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.sfp");
+        let file = File::create(&path).unwrap();
+        file.set_len(192 * 1024 * 1024).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let digest = digest_of(&file).await.unwrap();
+        let turned = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        ticker.abort();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(digest.len(), 64);
+        assert!(
+            turned >= 5,
+            "the ticker ran {turned} times while 192 MiB were hashed"
+        );
     }
 }

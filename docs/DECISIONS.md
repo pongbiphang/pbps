@@ -13996,7 +13996,15 @@ SPEC is in sync with all of these.
      `IS_ROLEMEMBER` for its roles. DENY, role nesting, ownership and the fixed
      roles are the engine's to combine; a second implementation would be a
      second thing to keep right. The grant rows it can see are what the
-     reproduction replays, under their own grantors (`AS`), and the engine's
+     reproduction replays, under their own grantors (`AS`). What it cannot see
+     is why a grantor could grant: a session is shown only the rows that
+     concern it. It need not be shown. Measured, a grant made through
+     `CONTROL`, `db_owner` or `db_securityadmin` records the securable's owner,
+     a database-level grant option cannot grant on a schema, and taking a
+     grant option back cascades; so a row naming any other grantor proves that
+     grantor holds that permission with the grant option on that securable,
+     and the replay gives the mapped grantor exactly that when no visible row
+     does. `verify` still reads the result as the deployer. The engine's
      built-in principals — `dbo`, `public`, the fixed `db_` roles — keep their
      identity, as predefined roles do in 520: a clone of `db_ddladmin` would
      carry none of what membership grants. The session's language is the

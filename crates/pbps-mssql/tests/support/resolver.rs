@@ -368,6 +368,131 @@ mod recon611 {
         PlannedGrant, PrincipalMap, apply_planned, enter, read, reconstruct, verify,
     };
 
+    /// A deployer granted a permission by a grant-option holder sees its own
+    /// row and not the holder's: the session that reads the context cannot
+    /// see why the grantor could grant. That is an ordinary target, and it is
+    /// reconstructed — the grantor recorded on scratch is the mapped holder,
+    /// at the schema level and at the database level — rather than refused
+    /// for a row nobody could have shown it (finding on #611).
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn a_grant_from_a_holder_whose_own_grant_the_deployer_cannot_see_is_reproduced() {
+        let mut target = TestDb::create("recon611w_t").await;
+        let mut scratch = TestDb::create("recon611w_s").await;
+        let pid = std::process::id();
+        let dep = format!("pbps_wdep611_{pid}");
+        let run_login = format!("pbps_wrun611_{pid}");
+        for statement in [
+            format!(
+                "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon611', CHECK_POLICY = OFF; \
+                 CREATE USER [{dep}] FOR LOGIN [{dep}]; \
+                 CREATE USER app_owner WITHOUT LOGIN; CREATE USER wgo WITHOUT LOGIN; \
+                 CREATE USER dbg WITHOUT LOGIN;"
+            ),
+            "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
+            "GRANT EXECUTE ON SCHEMA::app TO wgo WITH GRANT OPTION; \
+             GRANT CREATE TABLE TO dbg WITH GRANT OPTION;"
+                .to_owned(),
+            format!(
+                "EXECUTE AS USER = 'wgo'; GRANT EXECUTE ON SCHEMA::app TO [{dep}]; REVERT; \
+                 EXECUTE AS USER = 'dbg'; GRANT CREATE TABLE TO [{dep}]; REVERT;"
+            ),
+        ] {
+            target.conn.execute(&statement).await.unwrap();
+        }
+        let schemas = ["app".to_owned()];
+        let mut planning = connect_live(&login_url(&dep, "Pbps!Recon611", &target.name))
+            .await
+            .unwrap();
+        let context = read(&mut planning, &schemas).await.unwrap();
+        // The premise, on this engine: the deployer's rows name the holders,
+        // and the holders' own rows are not among them.
+        let seen = |grants: &[pbps_mssql::resolver::authorization::Grant]| {
+            grants
+                .iter()
+                .map(|g| format!("{} {} by {}", g.grantee, g.permission, g.grantor))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seen(&context.schemas["app"].grants),
+            [format!("{dep} EXECUTE by wgo")]
+        );
+        assert!(
+            seen(&context.database_grants).contains(&format!("{dep} CREATE TABLE by dbg")),
+            "{:?}",
+            context.database_grants
+        );
+        assert!(
+            context
+                .database_grants
+                .iter()
+                .all(|g| g.grantee != "dbg" && g.grantee != "wgo")
+        );
+
+        scratch
+            .conn
+            .execute(&format!(
+                "CREATE LOGIN [{run_login}] WITH PASSWORD = 'Pbps!Run611', CHECK_POLICY = OFF; \
+                 ALTER AUTHORIZATION ON DATABASE::[{}] TO [{run_login}];",
+                scratch.name
+            ))
+            .await
+            .unwrap();
+        let map = PrincipalMap::generate(&context, &[], &format!("w{pid}"));
+        reconstruct(&mut scratch.conn, &map, &context, &run_login)
+            .await
+            .unwrap();
+        let mut run = connect_live(&login_url(&run_login, "Pbps!Run611", &scratch.name))
+            .await
+            .unwrap();
+        enter(&mut run, map.deployer(&context).as_deref())
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "reproduction differed: {differences:?}"
+        );
+        // Recorded under the mapped holder, not under the owner that enabled it.
+        let grantors = scratch
+            .conn
+            .query(
+                "SELECT USER_NAME(grantor_principal_id) AS grantor FROM sys.database_permissions \
+                 WHERE state = 'G' AND permission_name IN (N'EXECUTE', N'CREATE TABLE') \
+                   AND USER_NAME(grantee_principal_id) LIKE N'pbps[_]principal[_]%';",
+            )
+            .await
+            .unwrap();
+        let grantors: Vec<String> = grantors
+            .iter()
+            .map(|row| {
+                row.try_get::<&str>("grantor")
+                    .unwrap()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(grantors.len(), 2, "{grantors:?}");
+        assert!(
+            grantors
+                .iter()
+                .all(|name| name.starts_with("pbps_principal_")),
+            "{grantors:?}"
+        );
+
+        drop(run);
+        drop(planning);
+        let mut master = connect_live(&conn_str()).await.unwrap();
+        target.drop().await;
+        scratch.drop().await;
+        for login in [&dep, &run_login] {
+            master
+                .execute(&format!("DROP LOGIN [{login}];"))
+                .await
+                .unwrap();
+        }
+    }
+
     /// The deployer's authorization — default schema, roles, a DENY, an
     /// impersonation right, the grant option it holds — is reproduced in a
     /// scratch database with run-local principals and verified by reading it

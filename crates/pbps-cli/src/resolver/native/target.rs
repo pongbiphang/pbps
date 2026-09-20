@@ -223,6 +223,7 @@ impl NativeTarget {
             &library_path,
             scope::engine_packages(driver),
         )
+        .await
         .map_err(|_| EnvironmentError::Executables)?;
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         Ok((

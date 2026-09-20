@@ -529,11 +529,94 @@ pub async fn reconstruct(
     Ok(())
 }
 
-/// Replays grant rows under their own grantors. A grantor other than the
-/// securable's owner must itself hold the permission with the grant option
-/// first, so rows run in rounds until none is left; a row whose grantor never
-/// becomes able to grant is a context this reconstruction cannot reproduce,
-/// and is refused rather than granted as somebody else.
+/// One statement of a replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step<'a> {
+    /// The row itself, under its own grantor.
+    Row(&'a Grant),
+    /// The grant option a grantor must hold before its rows can be replayed,
+    /// which the deployment session could not see on the target.
+    Enable {
+        grantor: &'a str,
+        permission: &'a str,
+    },
+}
+
+/// The order grant rows can be replayed in under their own grantors.
+///
+/// A grantor other than the securable's owner must hold the permission with
+/// the grant option first, so rows run in rounds. Whether it does is usually
+/// **not visible**: a session sees only the permission rows that concern it,
+/// so a deployer granted `EXECUTE` by `wgo` sees that row and not the one
+/// that let `wgo` grant it — and a replay that waited for the invisible row
+/// refused an ordinary target (finding on #611). It need not be seen to be
+/// known. Measured on 17.0: a grant made through `CONTROL`, `db_owner` or
+/// `db_securityadmin` records the securable's *owner* as grantor, a
+/// database-level grant option cannot grant on a schema at all (15151), and
+/// taking a grant option back cascades to what was granted through it. So a
+/// row naming any other grantor proves that grantor holds exactly this
+/// permission with the grant option on exactly this securable, and the
+/// replay gives it that — only once no visible row can, so a chain the
+/// deployer can see is replayed as it is. The added row is as invisible to
+/// the scratch deployer as the target's is to the real one, and `verify`
+/// refuses the reconstruction if it ever is not.
+fn replay_order<'a>(owner: &str, grants: &'a [Grant]) -> Result<Vec<Step<'a>>, DbError> {
+    let mut steps = Vec::new();
+    let mut pending: Vec<&Grant> = grants.iter().collect();
+    let mut able: BTreeSet<(&str, &str)> = BTreeSet::new();
+    while !pending.is_empty() {
+        let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|grant| {
+            grant.grantor == owner
+                || grant.grantor == "dbo"
+                || able.contains(&(grant.grantor.as_str(), grant.permission.as_str()))
+        });
+        if ready.is_empty() {
+            // The grantors nothing still pending could enable. A set with
+            // none is a cycle of grant options, which no engine state is.
+            let roots: BTreeSet<(&str, &str)> = waiting
+                .iter()
+                .filter(|grant| {
+                    !waiting.iter().any(|other| {
+                        other.grantee == grant.grantor
+                            && other.permission == grant.permission
+                            && other.state == "GRANT_WITH_GRANT_OPTION"
+                    })
+                })
+                .map(|grant| (grant.grantor.as_str(), grant.permission.as_str()))
+                .collect();
+            if roots.is_empty() {
+                let stuck: Vec<String> = waiting
+                    .iter()
+                    .map(|g| format!("{} to {} by {}", g.permission, g.grantee, g.grantor))
+                    .collect();
+                return Err(DbError::BadRow(format!(
+                    "grant rows name each other as the source of their grant option: {}",
+                    stuck.join(", ")
+                )));
+            }
+            for (grantor, permission) in roots {
+                steps.push(Step::Enable {
+                    grantor,
+                    permission,
+                });
+                able.insert((grantor, permission));
+            }
+            pending = waiting;
+            continue;
+        }
+        for grant in ready {
+            steps.push(Step::Row(grant));
+            if grant.state == "GRANT_WITH_GRANT_OPTION" {
+                able.insert((grant.grantee.as_str(), grant.permission.as_str()));
+            }
+        }
+        pending = waiting;
+    }
+    Ok(steps)
+}
+
+/// Replays grant rows in [`replay_order`], each under its own grantor, so
+/// the scratch side records who granted what as the target does.
 async fn replay(
     admin: &mut impl QueryConnection,
     map: &PrincipalMap,
@@ -541,62 +624,51 @@ async fn replay(
     grants: &[Grant],
     schema: Option<&str>,
 ) -> Result<(), DbError> {
-    let missing = |logical: &str| {
-        DbError::BadRow(format!(
-            "the authorization reconstruction has no run-local principal for {logical}"
-        ))
+    // `dbo` owns the database-level securable and is named by no row of a
+    // context that grants nothing through it, so it may be absent from the map.
+    let local = |logical: &str| {
+        if logical == "dbo" {
+            return Ok("dbo".to_owned());
+        }
+        map.run_local(logical).ok_or_else(|| {
+            DbError::BadRow(format!(
+                "the authorization reconstruction has no run-local principal for {logical}"
+            ))
+        })
     };
     let on = schema.map_or(String::new(), |name| {
         format!(" ON SCHEMA::{}", bracket(name))
     });
-    let mut pending: Vec<&Grant> = grants.iter().collect();
-    let mut able: BTreeSet<(String, String)> = BTreeSet::new();
-    while !pending.is_empty() {
-        let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|grant| {
-            grant.grantor == owner
-                || grant.grantor == "dbo"
-                || able.contains(&(grant.grantor.clone(), grant.permission.clone()))
-        });
-        if ready.is_empty() {
-            let stuck: Vec<String> = waiting
-                .iter()
-                .map(|g| format!("{} to {} by {}", g.permission, g.grantee, g.grantor))
-                .collect();
-            return Err(DbError::BadRow(format!(
-                "a grant names a grantor that never holds the grant option: {}",
-                stuck.join(", ")
-            )));
-        }
-        for grant in ready {
-            let grantee = map
-                .run_local(&grant.grantee)
-                .ok_or_else(|| missing(&grant.grantee))?;
-            let grantor = map
-                .run_local(&grant.grantor)
-                .ok_or_else(|| missing(&grant.grantor))?;
-            let (verb, option) = match grant.state.as_str() {
-                "GRANT" => ("GRANT", ""),
-                "GRANT_WITH_GRANT_OPTION" => ("GRANT", " WITH GRANT OPTION"),
-                "DENY" => ("DENY", ""),
-                other => {
-                    return Err(DbError::BadRow(format!(
-                        "a permission row has the unknown state {other}"
-                    )));
-                }
-            };
-            admin
-                .query(&format!(
+    for step in replay_order(owner, grants)? {
+        let statement = match step {
+            Step::Enable {
+                grantor,
+                permission,
+            } => format!(
+                "GRANT {permission}{on} TO {} WITH GRANT OPTION AS {};",
+                bracket(&local(grantor)?),
+                bracket(&local(owner)?)
+            ),
+            Step::Row(grant) => {
+                let (verb, option) = match grant.state.as_str() {
+                    "GRANT" => ("GRANT", ""),
+                    "GRANT_WITH_GRANT_OPTION" => ("GRANT", " WITH GRANT OPTION"),
+                    "DENY" => ("DENY", ""),
+                    other => {
+                        return Err(DbError::BadRow(format!(
+                            "a permission row has the unknown state {other}"
+                        )));
+                    }
+                };
+                format!(
                     "{verb} {}{on} TO {}{option} AS {};",
                     grant.permission,
-                    bracket(&grantee),
-                    bracket(&grantor)
-                ))
-                .await?;
-            if grant.state == "GRANT_WITH_GRANT_OPTION" {
-                able.insert((grant.grantee.clone(), grant.permission.clone()));
+                    bracket(&local(&grant.grantee)?),
+                    bracket(&local(&grant.grantor)?)
+                )
             }
-        }
-        pending = waiting;
+        };
+        admin.query(&statement).await?;
     }
     Ok(())
 }
@@ -765,6 +837,92 @@ mod tests {
             permission: permission.into(),
             state: state.into(),
         }
+    }
+
+    fn rows(steps: &[Step<'_>]) -> Vec<String> {
+        steps
+            .iter()
+            .map(|step| match step {
+                Step::Row(g) => format!(
+                    "{} {} to {} by {}",
+                    g.state, g.permission, g.grantee, g.grantor
+                ),
+                Step::Enable {
+                    grantor,
+                    permission,
+                } => format!("enable {permission} for {grantor}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_grantor_whose_grant_option_is_invisible_is_given_it_and_a_visible_chain_is_not() {
+        // What a deployer sees when `wgo` granted it EXECUTE: its own row
+        // only. The engine records a grantor other than the owner for a
+        // grant-option holder and nobody else (measured), so the row is
+        // replayable once `wgo` holds exactly that.
+        let invisible = [grant("dep", "wgo", "EXECUTE", "GRANT")];
+        assert_eq!(
+            rows(&replay_order("app_owner", &invisible).unwrap()),
+            ["enable EXECUTE for wgo", "GRANT EXECUTE to dep by wgo"]
+        );
+
+        // A chain the deployer can see is replayed as it is, in dependency
+        // order whatever order the rows were read in, with nothing added.
+        let visible = [
+            grant("dep", "wgo", "EXECUTE", "GRANT"),
+            grant("wgo", "app_owner", "EXECUTE", "GRANT_WITH_GRANT_OPTION"),
+            grant("dep", "app_owner", "SELECT", "DENY"),
+        ];
+        assert_eq!(
+            rows(&replay_order("app_owner", &visible).unwrap()),
+            [
+                "GRANT_WITH_GRANT_OPTION EXECUTE to wgo by app_owner",
+                "DENY SELECT to dep by app_owner",
+                "GRANT EXECUTE to dep by wgo",
+            ]
+        );
+
+        // Only the root of a half-visible chain is enabled: `mid` gets its
+        // grant option from the row that names `root`, never a second one
+        // from the owner, which the deployer would see and the target lacks.
+        let half = [
+            grant("dep", "mid", "EXECUTE", "GRANT"),
+            grant("mid", "root", "EXECUTE", "GRANT_WITH_GRANT_OPTION"),
+        ];
+        assert_eq!(
+            rows(&replay_order("app_owner", &half).unwrap()),
+            [
+                "enable EXECUTE for root",
+                "GRANT_WITH_GRANT_OPTION EXECUTE to mid by root",
+                "GRANT EXECUTE to dep by mid",
+            ]
+        );
+
+        // The grant option is per permission: holding it for one does not
+        // make the grantor able for another.
+        let other = [
+            grant("wgo", "app_owner", "SELECT", "GRANT_WITH_GRANT_OPTION"),
+            grant("dep", "wgo", "EXECUTE", "GRANT"),
+        ];
+        assert_eq!(
+            rows(&replay_order("app_owner", &other).unwrap()),
+            [
+                "GRANT_WITH_GRANT_OPTION SELECT to wgo by app_owner",
+                "enable EXECUTE for wgo",
+                "GRANT EXECUTE to dep by wgo",
+            ]
+        );
+    }
+
+    #[test]
+    fn grant_options_that_only_name_each_other_are_refused() {
+        let cycle = [
+            grant("a", "b", "SELECT", "GRANT_WITH_GRANT_OPTION"),
+            grant("b", "a", "SELECT", "GRANT_WITH_GRANT_OPTION"),
+        ];
+        let refused = replay_order("app_owner", &cycle).unwrap_err().to_string();
+        assert!(refused.contains("name each other"), "{refused}");
     }
 
     fn context() -> AuthorizationContext {
