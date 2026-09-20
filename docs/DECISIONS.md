@@ -14112,6 +14112,14 @@ SPEC is in sync with all of these.
      established, which is the check being right rather than a read to be
      hardened, and the refusal stays. What it could not say is *which* absence:
      no row at all, or a row in another state. `PeerServerState` carries
-     `/proc/net/tcp`'s own `st` column for the second, because `06`
-     (`TIME_WAIT`) and `08` (`CLOSE_WAIT`) say different things about who
-     closed the socket.
+     `/proc/net/tcp`'s own `st` column for the second, read **of the engine's
+     row**, which is where the direction lives and is easy to invert.
+     **Measured** on a loopback pair, and pinned by
+     `the_engines_row_says_which_end_closed_first` rather than left in a
+     comment: closing this verifier's end left the engine's row at `08`, and
+     closing the engine's end left it at `04` or `05` depending on whether the
+     read caught it before our ACK. So on the engine's row `08` (`CLOSE_WAIT`)
+     means it is holding *our* FIN and has not closed, while `04`/`05` and
+     `06` mean the engine closed first. The first draft of this said the opposite, and a
+     refusal that names the wrong end sends the next investigation to the
+     wrong process — worse than naming none.
