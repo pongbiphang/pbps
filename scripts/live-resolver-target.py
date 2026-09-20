@@ -7,6 +7,7 @@ native Linux runner; it requires root and a direct native Docker daemon.
 """
 
 import argparse
+from fixture_diagnostics import report
 import json
 import os
 from pathlib import Path
@@ -95,12 +96,21 @@ def fixture(args, binary, root, owned):
         run("docker", "cp", str(root / leaf), target + ":/tmp/" + leaf, **QUIET)
     if engine == "mssql":
         run("docker", "cp", str(root / "mssql.conf"), target + ":/var/opt/mssql/mssql.conf", **QUIET)
-    run("docker", "start", target, **QUIET)
+    # `check=False` and reported: the wrapper's default would raise straight
+    # past `main`'s cleanup, which removes the container, so an engine that
+    # refused to start at all printed neither state nor log (#724).
+    if run("docker", "start", target, check=False, **QUIET).returncode:
+        report(run, target)
+        raise RuntimeError("owned native TLS fixture did not start")
     for _ in range(60):
         if run("docker", "exec", target, *probe, check=False, **QUIET).returncode == 0:
             break
         time.sleep(1)
     else:
+        # This said only that it failed, and the cleanup then removed the
+        # container: an engine that crashed while starting and a fault in the
+        # fixture read identically (#724).
+        report(run, target)
         raise RuntimeError("owned native TLS fixture failed to start")
     trust = str(root / "ca.pem") if args.native_host else "/tmp/ca.pem"
     if engine == "pg":

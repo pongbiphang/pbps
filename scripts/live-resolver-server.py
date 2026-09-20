@@ -14,6 +14,7 @@ host path, volume or runtime socket is mounted into any of them.
 """
 
 import argparse
+from fixture_diagnostics import report
 import json
 import os
 from pathlib import Path
@@ -145,14 +146,14 @@ def await_engine(container, engine):
         if run("docker", "exec", container, *probe, check=False, **QUIET).returncode == 0:
             return
         time.sleep(2)
-    # Say why. The cleanup below removes the container, so a bare "did not
-    # become ready" is the last thing anyone reading CI ever sees of it.
-    state = run("docker", "inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}}",
-                container, stdout=subprocess.PIPE, check=False).stdout.strip()
-    logs = run("docker", "logs", "--tail", "40", container, stdout=subprocess.PIPE,
-               stderr=subprocess.STDOUT, check=False).stdout
-    raise RuntimeError(
-        f"owned fixture {container} did not become ready ({state})\n{logs}")
+    # Say why. The cleanup below removes the container, so whatever is not
+    # printed here is the last anyone reading CI ever sees of it. Through the
+    # shared reporter rather than inline: this used to interpolate the log into
+    # the message, and on the occurrence that filed #724 that log was empty —
+    # which printed as nothing at all, indistinguishable from a fixture that
+    # does not print logs.
+    report(run, container)
+    raise RuntimeError(f"owned fixture {container} did not become ready")
 
 
 def start_dedicated(engine, name, owned, network=None):
@@ -175,7 +176,19 @@ def start_dedicated(engine, name, owned, network=None):
             "-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
             "-e", "MSSQL_MEMORY_LIMIT_MB=1024",
             "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", MSSQL_BOOT, **QUIET)
-    run("docker", "start", name, **QUIET)
+    started(name)
+
+
+def started(name):
+    """Start a fixture container, and report it if it will not start.
+
+    `run`'s default would raise straight past the caller's cleanup, which
+    removes the container, so an engine that refused to start at all printed
+    neither state nor log — the case this whole reporter exists for (#724).
+    """
+    if run("docker", "start", name, check=False, **QUIET).returncode:
+        report(run, name)
+        raise RuntimeError(f"owned fixture {name} did not start")
 
 
 def start_target(engine, name, root, owned):
@@ -201,7 +214,7 @@ def start_target(engine, name, root, owned):
     if engine == "mssql":
         run("docker", "cp", str(root / "mssql.conf"),
             name + ":/var/opt/mssql/mssql.conf", **QUIET)
-    run("docker", "start", name, **QUIET)
+    started(name)
 
 
 def describe(container):

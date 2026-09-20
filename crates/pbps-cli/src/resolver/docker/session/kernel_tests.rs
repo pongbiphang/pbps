@@ -393,8 +393,35 @@ async fn private_channel_kernel_pairing_uses_only_owned_process_mounts() {
     let control = match control {
         Ok(control) => control,
         Err(error) => {
-            workload.close().await.unwrap();
-            panic!("{error}");
+            // Both failures, and neither through `unwrap`. `{error:?}` and not
+            // `{error}` because `StartFailure`'s `Display` is its cause alone,
+            // and the fixture reads `recovery_names` out of this panic to
+            // report and remove a container whose cleanup could not be
+            // confirmed. And the close is *not* unwrapped: when the daemon is
+            // unavailable for both removals, unwrapping it panics first, with
+            // only the workload's names, and the control's container is
+            // neither reported nor removed while the workload's is (#724).
+            // The workload's own name, taken before `close` consumes it:
+            // `close` answers `Result<(), Error>` and `Error` carries no
+            // `recovery_names`, so a close that fails leaves nothing naming
+            // the container it could not remove. Read out of the panic by the
+            // fixture, which removes what it reports.
+            let workload_name = workload.resource_name().to_owned();
+            let closed = workload.close().await;
+            // Named as recoverable **only** when its removal failed. The
+            // fixture removes what this list names and reports what it
+            // cannot read, so naming a container that was removed cleanly
+            // makes it report one as left behind that never was — removed
+            // and left behind are not the same answer.
+            let unremoved = if closed.is_err() {
+                format!("; recovery_names: [\"{workload_name}\"]")
+            } else {
+                String::new()
+            };
+            panic!(
+                "control: {error:?}; closing the workload {workload_name} after it: \
+                 {closed:?}{unremoved}"
+            );
         }
     };
     let result = inspect_pair(
