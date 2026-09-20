@@ -574,6 +574,14 @@ impl AsStored {
                     // the engine took the plan. The same reasoning as
                     // DECISIONS 339 and 341, arriving at the column the row
                     // changes cannot describe.
+                    //
+                    // It is also what makes [`rows_after`]'s empty-relation
+                    // branch reachable at all: that branch asks `final_type`
+                    // for a column of a table nothing has created yet, and
+                    // without this it has no answer, so a key into a created
+                    // parent gets no probe. Remove this and read that branch
+                    // before believing only the key comparison is at stake
+                    // (#273).
                     for (column, declared) in &table.columns {
                         this.column_types
                             .insert(name.column(column), declared.ty.clone());
@@ -2834,6 +2842,12 @@ fn rows_after(
     // non-NULL reference on the child side of a foreign key into it is an
     // orphan. `WHERE false` is what makes it the empty relation, and each
     // column still states its type so the outer query can compare against it.
+    //
+    // The type comes from `column_types`, which `AsStored::of` fills from the
+    // `CreateTable` itself — the catalog has nothing to answer with. This
+    // branch was unreachable until it did, which is why the case is pinned
+    // twice: a unit test on the SQL, and a live one on the count and the
+    // engine's own verdict (#273).
     let mut empty = Vec::new();
     for (i, column) in columns.iter().enumerate() {
         let Some(ty) = names.final_type(&table.column(column)) else {
@@ -3873,6 +3887,94 @@ mod tests {
 
     /// A key this plan adds is asked about from the plan alone — and the
     /// hidden-children refusal names the child outright (DECISIONS 336, 345).
+    /// A foreign key into a table this plan **creates** with no rows: the
+    /// parent side is the empty relation, and every non-NULL reference on the
+    /// child side is an orphan.
+    ///
+    /// The branch [`rows_after`] ends with is built for exactly this case and
+    /// nothing exercised it, which is how it stayed unreachable through the
+    /// revision this issue was filed against: `AsStored::of` recorded a
+    /// `CreateTable` as a name only, so `final_type` had no answer for a
+    /// column of a created table, the branch returned `None` and the plan
+    /// produced **no probe at all**. `5a3fb43c` gave the created table's
+    /// declared types to `column_types` for a different reason — a key between
+    /// two created tables being compared as `text` — and made this reachable
+    /// with it. Unpinned, one is an edit away from the other (#273).
+    #[test]
+    fn a_key_into_a_table_this_plan_creates_empty_makes_every_reference_an_orphan() {
+        let child: TableName = "app.child".parse().expect("a table name");
+        let parent: TableName = "app.status".parse().expect("a table name");
+        let key = pbps_model::ForeignKey {
+            columns: vec!["status".to_owned()],
+            references_table: parent.clone(),
+            references_columns: vec!["code".to_owned()],
+            on_delete: pbps_model::ReferentialAction::NoAction,
+            on_update: pbps_model::ReferentialAction::NoAction,
+        };
+        let created = |ty: &str| {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "code".to_owned(),
+                pbps_model::Column::new(ty.parse().expect("a type")),
+            );
+            set(vec![
+                Change::CreateTable {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                    name: parent.clone(),
+                    table: Box::new(table),
+                },
+                Change::AddForeignKey {
+                    table: child.clone(),
+                    name: "child_status_fkey".to_owned(),
+                    constraint: Box::new(key.clone()),
+                },
+            ])
+        };
+
+        let report = super::probes(&created("text"));
+        assert!(report.unchecked.is_empty(), "{report:#?}");
+        let orphan = report
+            .probes
+            .iter()
+            .find(|p| p.description.contains("no matching parent"))
+            .unwrap_or_else(|| panic!("no orphan probe at all: {report:#?}"));
+        assert!(
+            orphan.sql.contains("WHERE false"),
+            "the parent side is the empty relation: {}",
+            orphan.sql
+        );
+        // Each column still states its type, so the outer comparison is
+        // between two typed values rather than two unknown literals.
+        assert!(
+            orphan.sql.contains("CAST(NULL AS text) AS k0"),
+            "the empty relation carries the declared type: {}",
+            orphan.sql
+        );
+        // And the child side is the stored table, with the NULLs left out:
+        // a row referencing nothing is not an orphan (DECISIONS 337).
+        assert!(
+            orphan.sql.contains("r.k0 IS NOT NULL"),
+            "a NULL reference is not an orphan: {}",
+            orphan.sql
+        );
+
+        // The type is the parent's own, not a guess: a `numeric(5,1)` parent
+        // says so here, which is what keeps the comparison out of `text`. In
+        // the dialect's normalized spelling, which is the one emitted SQL
+        // carries.
+        let report = super::probes(&created("numeric(5,1)"));
+        let orphan = report
+            .probes
+            .iter()
+            .find(|p| p.description.contains("no matching parent"))
+            .unwrap_or_else(|| panic!("no orphan probe at all: {report:#?}"));
+        assert!(
+            orphan.sql.contains("CAST(NULL AS numeric(5, 1)) AS k0"),
+            "{}",
+            orphan.sql
+        );
+    }
+
     #[test]
     fn a_key_this_plan_adds_on_a_column_it_adds_gets_its_own_probes() {
         let child: TableName = "app.child".parse().expect("a table name");
