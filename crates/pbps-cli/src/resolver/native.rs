@@ -33,6 +33,140 @@ pub use target::{EnvironmentError, NativeTarget, NativeTargetError};
 #[error("the actual Linux peer process or its protected executable cannot be established")]
 pub struct UnqualifiedProcess;
 
+/// Which reading of a native binding refused.
+///
+/// [`UnqualifiedProcess`] is one value for every read below. That is the right
+/// answer for a *caller* — nothing it could do differs between them — and no
+/// answer at all for anyone holding a CI log from a fixture whose host is
+/// already gone. Three occurrences of #674 arrived as one sentence each, on
+/// both engines and at three different call sites, and deciding whether the
+/// unstable read is a liveness window or a wrong rule needs to know which read
+/// moved.
+///
+/// The same shape as [`crate::resolver::server::Premise`], one layer down.
+/// The name is recorded where the refusal is *made* and the caller's type does
+/// not change: widening `UnqualifiedProcess` itself is #646, and it would
+/// reach every caller in the crate. Propagated errors are never renamed — a
+/// refusal is named exactly once, by the read that made it, so a log line
+/// names a read and not a call stack.
+///
+/// [`target`]'s own `stage` names the *step* of `NativeTarget::check` one
+/// layer up, and the two compose rather than compete: a failing round now
+/// prints the read that refused and then the step it refused in
+/// (`reading=owner-count(2)`, `stage=lease-after`). They become one under
+/// #646; they are apart today because `target.rs` is being rewritten by
+/// another change and a merge conflict there would cost more than a duplicate
+/// debug print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// `/proc/<pid>/stat`'s start time: unreadable, or a different process.
+    StartTicks,
+    /// The held `exe`: unreadable, a different file object, or a moved path.
+    Executable,
+    /// A held namespace: unreadable, or no longer the one captured.
+    Namespace,
+    /// The TLS connection this lease was bound to is not the one presented.
+    Connection,
+    /// The socket behind the connection is no longer the inode captured.
+    SocketInode,
+    /// The process holding that socket is no longer the one captured.
+    SocketOwner,
+    /// This verifier's own network namespace, or the service's record of it.
+    NetNamespace,
+    /// `/proc/self/net/tcp`: unreadable, malformed, or no longer carrying the
+    /// established pair this lease was captured over.
+    PeerInode,
+    /// The number of processes in the service's scope holding the socket,
+    /// where exactly one is the only answer a lease can be built on.
+    OwnerCount(usize),
+    /// Walking the service's descendants: a `task`, `children` or `stat` read
+    /// that did not merely say the process is gone.
+    Scope,
+    /// A process named by `children` whose own `stat` no longer names the
+    /// parent that named it — a reparent, or a reused numeric PID.
+    ScopeParent,
+    /// The descriptor table of a process in the scope.
+    ScopeDescriptors,
+    /// A process the walk has just seen has no `/proc` entry to open.
+    CaptureOpen,
+    /// Its `stat` start time, when establishing it rather than re-reading it.
+    CaptureStartTicks,
+    /// Its `status`, or the `NSpid` line inside it.
+    CaptureStatus,
+    /// Its `exe` link, the file behind it, or that file's metadata.
+    CaptureExecutable,
+    /// Its executable is readable and is not a root-owned, group- and
+    /// other-unwritable file — the rule a lease is built on rather than a
+    /// read that moved. #650's shape lands here.
+    CaptureUnprotected,
+    /// One of its namespaces, when establishing it.
+    CaptureNamespace,
+    /// The recaptured process is not the one the walk held a directory for:
+    /// its numeric PID now answers for something else.
+    CaptureReplaced,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The last reading to refuse on this thread, for tests that need to
+    /// assert *which* read answered rather than only that one did.
+    static LAST_READING: std::cell::Cell<Option<Reading>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn last_reading() -> Option<Reading> {
+    LAST_READING.with(std::cell::Cell::get)
+}
+
+impl Reading {
+    /// The caller's answer, with the name recorded first.
+    ///
+    /// Under `cfg(test)` — which is every context that runs the resolver
+    /// fixtures, since they are `cargo test` binaries — the name goes to
+    /// stderr the way `docker/session.rs` reports its startup stages, and to
+    /// a thread-local a unit test can read back.
+    fn refuse(self) -> UnqualifiedProcess {
+        #[cfg(test)]
+        {
+            LAST_READING.with(|cell| cell.set(Some(self)));
+            eprintln!("native binding reading={self}");
+        }
+        UnqualifiedProcess
+    }
+
+    /// For `map_err`, where the read's own error carries nothing this names.
+    fn named<E>(self) -> impl FnOnce(E) -> UnqualifiedProcess {
+        move |_| self.refuse()
+    }
+}
+
+impl std::fmt::Display for Reading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartTicks => f.write_str("start-ticks"),
+            Self::Executable => f.write_str("executable"),
+            Self::Namespace => f.write_str("namespace"),
+            Self::Connection => f.write_str("connection"),
+            Self::SocketInode => f.write_str("socket-inode"),
+            Self::SocketOwner => f.write_str("socket-owner"),
+            Self::NetNamespace => f.write_str("net-namespace"),
+            Self::PeerInode => f.write_str("peer-inode"),
+            Self::OwnerCount(found) => write!(f, "owner-count({found})"),
+            Self::Scope => f.write_str("scope"),
+            Self::ScopeParent => f.write_str("scope-parent"),
+            Self::ScopeDescriptors => f.write_str("scope-descriptors"),
+            Self::CaptureOpen => f.write_str("capture-open"),
+            Self::CaptureStartTicks => f.write_str("capture-start-ticks"),
+            Self::CaptureStatus => f.write_str("capture-status"),
+            Self::CaptureExecutable => f.write_str("capture-executable"),
+            Self::CaptureUnprotected => f.write_str("capture-unprotected"),
+            Self::CaptureNamespace => f.write_str("capture-namespace"),
+            Self::CaptureReplaced => f.write_str("capture-replaced"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileIdentity {
     device: u64,
@@ -66,26 +200,29 @@ impl ProcessLease {
     /// remains a proxy: the caller must separately match a supported runtime.
     pub fn capture(pid: u32) -> Result<Self, UnqualifiedProcess> {
         if pid == 0 {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::CaptureOpen.refuse());
         }
-        let directory = open_process(pid).map_err(|_| UnqualifiedProcess)?;
+        let directory = open_process(pid).map_err(Reading::CaptureOpen.named())?;
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        let start_ticks = start_ticks(&base)?;
+        let start_ticks = start_ticks(&base).map_err(Reading::CaptureStartTicks.named())?;
         let status =
-            std::fs::read_to_string(base.join("status")).map_err(|_| UnqualifiedProcess)?;
+            std::fs::read_to_string(base.join("status")).map_err(Reading::CaptureStatus.named())?;
         let namespace_pid = status
             .lines()
             .find_map(|line| line.strip_prefix("NSpid:"))
             .and_then(|pids| pids.split_whitespace().last())
             .and_then(|pid| pid.parse::<u32>().ok())
             .filter(|pid| *pid > 0)
-            .ok_or(UnqualifiedProcess)?;
+            .ok_or_else(|| Reading::CaptureStatus.refuse())?;
         let executable_path =
-            std::fs::read_link(base.join("exe")).map_err(|_| UnqualifiedProcess)?;
-        let executable = File::open(base.join("exe")).map_err(|_| UnqualifiedProcess)?;
-        let metadata = executable.metadata().map_err(|_| UnqualifiedProcess)?;
+            std::fs::read_link(base.join("exe")).map_err(Reading::CaptureExecutable.named())?;
+        let executable =
+            File::open(base.join("exe")).map_err(Reading::CaptureExecutable.named())?;
+        let metadata = executable
+            .metadata()
+            .map_err(Reading::CaptureExecutable.named())?;
         if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::CaptureUnprotected.refuse());
         }
         let mut namespaces = Vec::new();
         // `ipc` is here for the dedicated-server profile's occupant accounting:
@@ -94,8 +231,9 @@ impl ProcessLease {
         // this is additive — `same_process` and `check` iterate whatever was
         // captured, and no caller assumes the set's size.
         for name in ["pid", "mnt", "net", "user", "ipc"] {
-            let file = File::open(base.join("ns").join(name)).map_err(|_| UnqualifiedProcess)?;
-            let identity = FileIdentity::of(&file)?;
+            let file = File::open(base.join("ns").join(name))
+                .map_err(Reading::CaptureNamespace.named())?;
+            let identity = FileIdentity::of(&file).map_err(Reading::CaptureNamespace.named())?;
             namespaces.push((name, file, identity));
         }
         let lease = Self {
@@ -285,20 +423,24 @@ impl ProcessLease {
 
     pub fn check(&self) -> Result<(), UnqualifiedProcess> {
         let base = PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()));
-        if start_ticks(&base)? != self.start_ticks {
-            return Err(UnqualifiedProcess);
+        if start_ticks(&base).map_err(|_| Reading::StartTicks.refuse())? != self.start_ticks {
+            return Err(Reading::StartTicks.refuse());
         }
-        let current = File::open(base.join("exe")).map_err(|_| UnqualifiedProcess)?;
-        if FileIdentity::of(&current)? != FileIdentity::of(&self.executable)?
-            || std::fs::read_link(base.join("exe")).map_err(|_| UnqualifiedProcess)?
+        let current = File::open(base.join("exe")).map_err(Reading::Executable.named())?;
+        if FileIdentity::of(&current).map_err(Reading::Executable.named())?
+            != FileIdentity::of(&self.executable).map_err(Reading::Executable.named())?
+            || std::fs::read_link(base.join("exe")).map_err(Reading::Executable.named())?
                 != self.executable_path
         {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::Executable.refuse());
         }
         for (name, held, identity) in &self.namespaces {
-            let current = File::open(base.join("ns").join(name)).map_err(|_| UnqualifiedProcess)?;
-            if FileIdentity::of(&current)? != *identity || FileIdentity::of(held)? != *identity {
-                return Err(UnqualifiedProcess);
+            let current =
+                File::open(base.join("ns").join(name)).map_err(Reading::Namespace.named())?;
+            if FileIdentity::of(&current).map_err(Reading::Namespace.named())? != *identity
+                || FileIdentity::of(held).map_err(Reading::Namespace.named())? != *identity
+            {
+                return Err(Reading::Namespace.refuse());
             }
         }
         Ok(())
@@ -349,16 +491,20 @@ impl SocketOwnerLease {
             || connection.tcp_endpoints().local() != self.local
             || connection.tcp_endpoints().peer() != self.peer
         {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::Connection.refuse());
         }
         self.check_socket()
     }
 
     fn check_socket(&self) -> Result<(), UnqualifiedProcess> {
+        // Propagated, not renamed: the owner's own reads name themselves.
         self.owner.check()?;
         let (owner, inode) = socket_owner(&self.service, self.local, self.peer)?;
-        if inode != self.socket_inode || !self.owner.same_process(&owner)? {
-            return Err(UnqualifiedProcess);
+        if inode != self.socket_inode {
+            return Err(Reading::SocketInode.refuse());
+        }
+        if !self.owner.same_process(&owner)? {
+            return Err(Reading::SocketOwner.refuse());
         }
         Ok(())
     }
@@ -384,16 +530,17 @@ fn encoded(address: SocketAddr) -> String {
 
 fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedProcess> {
     if !local.ip().is_loopback() || !peer.ip().is_loopback() || local.is_ipv4() != peer.is_ipv4() {
-        return Err(UnqualifiedProcess);
+        return Err(Reading::PeerInode.refuse());
     }
     let table = if local.is_ipv4() {
         "/proc/self/net/tcp"
     } else {
         "/proc/self/net/tcp6"
     };
-    let text = read_bounded(Path::new(table), 32 * 1024 * 1024)?;
+    let text =
+        read_bounded(Path::new(table), 32 * 1024 * 1024).map_err(Reading::PeerInode.named())?;
     let mut lines = text.lines();
-    lines.next().ok_or(UnqualifiedProcess)?;
+    lines.next().ok_or_else(|| Reading::PeerInode.refuse())?;
     let local = encoded(local);
     let peer = encoded(peer);
     let mut found = None;
@@ -401,7 +548,7 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
     for line in lines {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() < 10 {
-            return Err(UnqualifiedProcess);
+            return Err(Reading::PeerInode.refuse());
         }
         if fields[3] != "01" {
             continue;
@@ -410,16 +557,18 @@ fn peer_inode(local: SocketAddr, peer: SocketAddr) -> Result<u64, UnqualifiedPro
             client_present = true;
         }
         if fields[1] == peer && fields[2] == local {
-            let inode = fields[9].parse::<u64>().map_err(|_| UnqualifiedProcess)?;
+            let inode = fields[9]
+                .parse::<u64>()
+                .map_err(Reading::PeerInode.named())?;
             if inode == 0 || found.replace(inode).is_some() {
-                return Err(UnqualifiedProcess);
+                return Err(Reading::PeerInode.refuse());
             }
         }
     }
     if !client_present {
-        return Err(UnqualifiedProcess);
+        return Err(Reading::PeerInode.refuse());
     }
-    found.ok_or(UnqualifiedProcess)
+    found.ok_or_else(|| Reading::PeerInode.refuse())
 }
 
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<String, UnqualifiedProcess> {
@@ -595,8 +744,10 @@ pub(crate) fn observe_incidental<T>(
 ) -> Result<Option<T>, UnqualifiedProcess> {
     let result = (|| {
         let process = ProcessLease::capture(pid)?;
-        if FileIdentity::of(directory)? != FileIdentity::of(&process.directory)? {
-            return Err(UnqualifiedProcess);
+        if FileIdentity::of(directory).map_err(Reading::CaptureReplaced.named())?
+            != FileIdentity::of(&process.directory).map_err(Reading::CaptureReplaced.named())?
+        {
+            return Err(Reading::CaptureReplaced.refuse());
         }
         inspect(process)
     })();
@@ -664,17 +815,17 @@ pub(crate) fn process_scope(
                 cursor += 1;
                 continue;
             }
-            Err(_) => return Err(UnqualifiedProcess),
+            Err(_) => return Err(Reading::Scope.refuse()),
         };
         for task in tasks {
-            let task = task.map_err(|_| UnqualifiedProcess)?;
+            let task = task.map_err(Reading::Scope.named())?;
             let text = match std::fs::read_to_string(task.path().join("children")) {
                 Ok(text) if text.len() <= 65536 => text,
                 Err(error) if process_gone(&error) => continue,
-                Ok(_) | Err(_) => return Err(UnqualifiedProcess),
+                Ok(_) | Err(_) => return Err(Reading::Scope.refuse()),
             };
             for pid in text.split_whitespace() {
-                children.push(pid.parse::<u32>().map_err(|_| UnqualifiedProcess)?);
+                children.push(pid.parse::<u32>().map_err(Reading::Scope.named())?);
             }
         }
         for pid in children {
@@ -688,25 +839,30 @@ pub(crate) fn process_scope(
             // `process_scope` counts processes, and threads do not add entries
             // here, so real engines stay far below it (finding on #640).
             if scope.len() >= 4096 {
-                return Err(UnqualifiedProcess);
+                return Err(Reading::Scope.refuse());
             }
             let directory = match open_process(pid) {
                 Ok(file) => file,
                 Err(error) if process_gone(&error) => continue,
-                Err(_) => return Err(UnqualifiedProcess),
+                Err(_) => return Err(Reading::Scope.refuse()),
             };
             let stat = match std::fs::read_to_string(proc_base(&directory).join("stat")) {
                 Ok(stat) => stat,
                 Err(error) if process_gone(&error) => continue,
-                Err(_) => return Err(UnqualifiedProcess),
+                Err(_) => return Err(Reading::Scope.refuse()),
             };
             let ppid = stat
                 .rsplit_once(')')
                 .and_then(|(_, fields)| fields.split_whitespace().nth(1))
                 .and_then(|s| s.parse::<u32>().ok())
-                .ok_or(UnqualifiedProcess)?;
+                .ok_or_else(|| Reading::Scope.refuse())?;
+            // Named apart from the reads around it: this is the one refusal
+            // in the walk that a process merely coming and going can produce
+            // without any read failing — the pid was in a `children` list a
+            // moment ago and its own `stat` now names a different parent, by
+            // reparenting or by numeric reuse (#674).
             if ppid != parent_pid {
-                return Err(UnqualifiedProcess);
+                return Err(Reading::ScopeParent.refuse());
             }
             scope.push((pid, directory));
         }
@@ -884,23 +1040,26 @@ fn socket_owner(
     peer: SocketAddr,
 ) -> Result<(ProcessLease, u64), UnqualifiedProcess> {
     service.check()?;
-    let self_net = File::open("/proc/self/ns/net").map_err(|_| UnqualifiedProcess)?;
+    let self_net = File::open("/proc/self/ns/net").map_err(Reading::NetNamespace.named())?;
     let own_net = service
         .namespaces
         .iter()
         .find(|(name, _, _)| *name == "net")
-        .ok_or(UnqualifiedProcess)?;
-    if own_net.2 != FileIdentity::of(&self_net)? {
-        return Err(UnqualifiedProcess);
+        .ok_or_else(|| Reading::NetNamespace.refuse())?;
+    if own_net.2 != FileIdentity::of(&self_net).map_err(Reading::NetNamespace.named())? {
+        return Err(Reading::NetNamespace.refuse());
     }
     let inode = peer_inode(local, peer)?;
     let mut owners = socket_owners(service, inode)?;
+    // The count itself is the diagnosis, so it is what gets reported: a
+    // second holder and none at all are different accidents, and a walk that
+    // saw a task appear or exit produces one or the other (#674).
     if owners.len() != 1 {
-        return Err(UnqualifiedProcess);
+        return Err(Reading::OwnerCount(owners.len()).refuse());
     }
     service.check()?;
     if peer_inode(local, peer)? != inode {
-        return Err(UnqualifiedProcess);
+        return Err(Reading::PeerInode.refuse());
     }
     Ok((owners.remove(0), inode))
 }
@@ -915,15 +1074,15 @@ pub(crate) fn socket_owners(
         let entries = match std::fs::read_dir(proc_base(&directory).join("fd")) {
             Ok(entries) => entries,
             Err(error) if process_gone(&error) => continue,
-            Err(_) => return Err(UnqualifiedProcess),
+            Err(_) => return Err(Reading::ScopeDescriptors.refuse()),
         };
         let mut owns_socket = false;
         for entry in entries {
-            let entry = entry.map_err(|_| UnqualifiedProcess)?;
+            let entry = entry.map_err(Reading::ScopeDescriptors.named())?;
             match std::fs::read_link(entry.path()) {
                 Ok(path) => owns_socket |= path == expected,
                 Err(error) if process_gone(&error) => (),
-                Err(_) => return Err(UnqualifiedProcess),
+                Err(_) => return Err(Reading::ScopeDescriptors.refuse()),
             }
         }
         if owns_socket && let Some(lease) = observe_incidental(pid, &directory, Ok)? {
@@ -1052,6 +1211,125 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// A refusal names the read that made it, and the name survives the
+    /// collapse to `UnqualifiedProcess`.
+    ///
+    /// Three occurrences of #674 arrived as one sentence each and none of them
+    /// said which read moved, which is why a third round of the CI matrix was
+    /// needed to learn what a line of log should have said. The caller's type
+    /// is deliberately unchanged — widening it is #646 — so what this asserts
+    /// is that the name is recorded before the value is thrown away.
+    #[test]
+    fn a_refused_reading_names_itself_before_it_becomes_one_value() {
+        // A read whose refusal needs no process at all: this pair is not
+        // loopback, so the socket table is never consulted.
+        LAST_READING.with(|cell| cell.set(None));
+        assert!(
+            peer_inode(
+                "93.184.216.34:5432".parse().unwrap(),
+                "93.184.216.34:6000".parse().unwrap(),
+            )
+            .is_err()
+        );
+        assert_eq!(last_reading(), Some(Reading::PeerInode));
+
+        // And a lease whose process is gone: the held proc directory outlives
+        // the process, so the read that refuses is the one that asks what it
+        // is — not a later one that would have asked what it runs.
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
+        let lease = ProcessLease::capture(child.id()).unwrap();
+        lease.check().expect("a live child is qualified");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        LAST_READING.with(|cell| cell.set(None));
+        assert!(lease.check().is_err(), "a reaped process is not this lease");
+        assert_eq!(last_reading(), Some(Reading::StartTicks));
+    }
+
+    /// Establishing a process is named apart from re-reading one.
+    ///
+    /// `socket_owners` recaptures every holder it finds through
+    /// `observe_incidental`, so a `capture` that refuses on a **live** process
+    /// propagates straight out of the socket-owner walk. Left unnamed, that is
+    /// the one way a refusal on the path #674 lives on could still reach a CI
+    /// log carrying nothing but the outer step — found in review of this
+    /// change, which had named only the re-reads.
+    ///
+    /// `CaptureUnprotected` earns its own name rather than sharing
+    /// `CaptureExecutable`: it is the rule a lease is built on and not a read
+    /// that moved, and it is the answer #650 is looking for.
+    #[test]
+    fn establishing_a_process_is_named_apart_from_re_reading_one() {
+        // An executable a lease may not be built on. World-writable rather
+        // than non-root-owned, because the uid half of that rule is the build
+        // user's and a suite built as root would find its own binary
+        // acceptable — the mode half refuses for either of them.
+        let (mut writable, path) = spawned_writable_executable();
+        LAST_READING.with(|cell| cell.set(None));
+        let refused = ProcessLease::capture(writable.id());
+        let reading = last_reading();
+        let cleanup = writable.kill();
+        writable.wait().unwrap();
+        std::fs::remove_file(path).unwrap();
+        cleanup.unwrap();
+        assert!(refused.is_err());
+        assert_eq!(reading, Some(Reading::CaptureUnprotected));
+
+        // And no process at all to open.
+        LAST_READING.with(|cell| cell.set(None));
+        assert!(ProcessLease::capture(0).is_err());
+        assert_eq!(last_reading(), Some(Reading::CaptureOpen));
+
+        // The recapture inside the walk carries the name out rather than
+        // flattening it: a live process whose capture refuses is an error
+        // `observe_incidental` propagates, not an absence it reports.
+        let mut child = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
+        let directory = open_process(child.id()).unwrap();
+        LAST_READING.with(|cell| cell.set(None));
+        let walked = observe_incidental(child.id(), &directory, Ok);
+        assert!(walked.is_ok(), "a live, root-installed child is capturable");
+        assert_eq!(last_reading(), None, "nothing refused");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// The count is part of the name where the refusal *is* a count.
+    ///
+    /// `owner-count(0)` and `owner-count(2)` are different accidents — a walk
+    /// that saw the holder exit, and one that saw a second thread group hold
+    /// the same descriptor — and a bare "the owner could not be established"
+    /// distinguishes neither (#674).
+    #[test]
+    fn a_counted_refusal_reports_the_count_it_counted() {
+        assert_eq!(Reading::OwnerCount(0).to_string(), "owner-count(0)");
+        assert_eq!(Reading::OwnerCount(2).to_string(), "owner-count(2)");
+        assert_ne!(Reading::OwnerCount(0), Reading::OwnerCount(2));
+        // Every other reading is a plain name, and no two share one.
+        let names = [
+            Reading::StartTicks,
+            Reading::Executable,
+            Reading::Namespace,
+            Reading::Connection,
+            Reading::SocketInode,
+            Reading::SocketOwner,
+            Reading::NetNamespace,
+            Reading::PeerInode,
+            Reading::Scope,
+            Reading::ScopeParent,
+            Reading::ScopeDescriptors,
+            Reading::CaptureOpen,
+            Reading::CaptureStartTicks,
+            Reading::CaptureStatus,
+            Reading::CaptureExecutable,
+            Reading::CaptureUnprotected,
+            Reading::CaptureNamespace,
+            Reading::CaptureReplaced,
+        ]
+        .map(|reading| reading.to_string());
+        let distinct: BTreeSet<&String> = names.iter().collect();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
+    }
+
     #[test]
     fn incidental_exit_during_inspection_does_not_hide_live_failures_or_pid_replacement() {
         let mut owner = spawned_and_execed(Command::new("/usr/bin/sleep").arg("30"), "sleep");
@@ -1157,6 +1435,25 @@ mod tests {
 
     #[test]
     fn writable_executable_content_cannot_identify_a_trusted_peer() {
+        let (mut child, path) = spawned_writable_executable();
+        let lease = ProcessLease::capture(child.id());
+        let cleanup = child.kill();
+        child.wait().unwrap();
+        std::fs::remove_file(path).unwrap();
+        cleanup.unwrap();
+        assert!(lease.is_err());
+    }
+
+    /// A running process whose executable is world-writable, and therefore one
+    /// no lease may be built on whoever owns it.
+    ///
+    /// The **mode** is what makes this fixture portable, and the uid is not: a
+    /// suite built and run as root has a root-owned test binary that
+    /// `capture` accepts, so a test that reached for the test binary's own pid
+    /// to provoke this refusal would pass for the build user and fail for a
+    /// root builder (found in review of #674). `0o777` is refused by
+    /// `mode & 0o022` for either of them.
+    fn spawned_writable_executable() -> (std::process::Child, PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "pbps-untrusted-executable-{:032x}",
             rand::random::<u128>()
@@ -1167,7 +1464,7 @@ mod tests {
         // descriptor. CLOEXEC closes that inherited descriptor at exec, not
         // at fork; retry only this transient fixture error, with a deadline.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut child = loop {
+        let child = loop {
             match Command::new(&path).arg("30").spawn() {
                 Ok(child) => break child,
                 Err(error)
@@ -1181,17 +1478,12 @@ mod tests {
                 }
             }
         };
-        // The same exec window as everywhere else, and here it would let the
-        // test pass for the wrong reason: a pre-exec capture is refused
-        // because this test binary is not root-installed, which is not the
-        // refusal this test is about.
+        // The same exec window as everywhere else, and here it would let a
+        // caller pass for the wrong reason: a pre-exec capture is refused
+        // because the test binary is not root-installed, which is a different
+        // refusal — and on a root builder it would not be refused at all.
         wait_for_exec(child.id(), path.file_name().unwrap().to_str().unwrap());
-        let lease = ProcessLease::capture(child.id());
-        let cleanup = child.kill();
-        child.wait().unwrap();
-        std::fs::remove_file(path).unwrap();
-        cleanup.unwrap();
-        assert!(lease.is_err());
+        (child, path)
     }
 
     #[test]
