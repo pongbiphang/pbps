@@ -7,8 +7,11 @@ tests remain distinct from the complete public factory test.
 """
 
 import argparse
+from fixture_diagnostics import report, self_check
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -49,6 +52,16 @@ def main():
                        check=True, stdout=subprocess.DEVNULL)
     subprocess.run([sys.executable, "scripts/resolver-daemon-fixture.py"], check=True,
                    env=dict(env, DOCKER_HOST=f"unix://{socket}", DOCKER_CONTEXT=""))
+
+    def run(*args, **kwargs):
+        if args[0] == "docker":
+            args = ("docker", "--host", f"unix://{socket}", *args[1:])
+        kwargs.setdefault("text", True)
+        return subprocess.run(args, **kwargs)
+
+    # Before the tests, not after a failure: a reporter that printed nothing
+    # would be discovered by the failure it exists to explain (#724).
+    self_check(run, IMAGES[args.engine])
     for test in TESTS:
         command = ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored",
                    "--exact", "resolver::" + test, "--nocapture"]
@@ -56,7 +69,32 @@ def main():
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         print(completed.stdout, end="", flush=True)
         if completed.returncode or "test result: ok. 1 passed" not in completed.stdout:
+            # Each test owns and removes its containers, so a start that
+            # failed has already taken its engine's log with it unless it is
+            # read here. `recovery_names` is what the failure carries for
+            # exactly this: the names it could not confirm were removed.
+            for container in _recovery_names(completed.stdout):
+                report(run, container)
+                run("docker", "rm", "-f", container, check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             raise SystemExit("resolver fixture must run exactly one passing test: " + test)
+
+
+def _recovery_names(output):
+    """The container names a failed start could not confirm removed.
+
+    Read out of the test's own `StartFailure { .. recovery_names: [..] }`,
+    because the fixture does not otherwise know what the test created. Only
+    generated fixture names are ever acted on — the resolver's own prefixes —
+    so a malformed or unexpected line removes nothing rather than something
+    else's container.
+    """
+    names = []
+    for quoted in re.findall(r'recovery_names: \[([^\]]*)\]', output):
+        for name in re.findall(r'"([^"]+)"', quoted):
+            if name.startswith("pbps-resolver-") and name not in names:
+                names.append(name)
+    return names
 
 
 if __name__ == "__main__":

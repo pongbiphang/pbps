@@ -2222,6 +2222,16 @@ Three traps sat inside the fix, and each of them is a measurement:
   is to answer "what does the engine actually do" cannot have the engine change
   under it between two runs of the same commit. Bump deliberately, and run the
   live tests against the new digest first.
+- **A fixture's empty log prints as nothing, and nothing reads as "this
+  fixture does not print logs".** The resolver fixtures remove every container
+  they own, so whatever is not printed is gone. `await_engine` did interpolate
+  `docker logs` into its failure — and on the occurrence that filed #724 that
+  log came back empty, so the job showed `did not become ready (exited
+  exit=1)` followed by teardown noise, and the recorded SQL Server startup
+  crash could only be inferred. Two other paths printed no log at all. They
+  go through one reporter now, which says which of the three it found: the
+  log, `(the log is empty)`, or `(the log is unreadable: …)`. Shape 1, in the
+  output rather than in the product.
 - Find the service container by **published port**, never by
   `--filter ancestor=<image>`. That filter repeats the image reference, so the
   two spellings drift apart the moment one is pinned.

@@ -14,6 +14,7 @@ host path, volume or runtime socket is mounted into any of them.
 """
 
 import argparse
+from fixture_diagnostics import report
 import json
 import os
 from pathlib import Path
@@ -145,14 +146,14 @@ def await_engine(container, engine):
         if run("docker", "exec", container, *probe, check=False, **QUIET).returncode == 0:
             return
         time.sleep(2)
-    # Say why. The cleanup below removes the container, so a bare "did not
-    # become ready" is the last thing anyone reading CI ever sees of it.
-    state = run("docker", "inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}}",
-                container, stdout=subprocess.PIPE, check=False).stdout.strip()
-    logs = run("docker", "logs", "--tail", "40", container, stdout=subprocess.PIPE,
-               stderr=subprocess.STDOUT, check=False).stdout
-    raise RuntimeError(
-        f"owned fixture {container} did not become ready ({state})\n{logs}")
+    # Say why. The cleanup below removes the container, so whatever is not
+    # printed here is the last anyone reading CI ever sees of it. Through the
+    # shared reporter rather than inline: this used to interpolate the log into
+    # the message, and on the occurrence that filed #724 that log was empty —
+    # which printed as nothing at all, indistinguishable from a fixture that
+    # does not print logs.
+    report(run, container)
+    raise RuntimeError(f"owned fixture {container} did not become ready")
 
 
 def start_dedicated(engine, name, owned, network=None):

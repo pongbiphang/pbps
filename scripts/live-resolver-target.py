@@ -7,6 +7,7 @@ native Linux runner; it requires root and a direct native Docker daemon.
 """
 
 import argparse
+from fixture_diagnostics import report
 import json
 import os
 from pathlib import Path
@@ -101,6 +102,10 @@ def fixture(args, binary, root, owned):
             break
         time.sleep(1)
     else:
+        # This said only that it failed, and the cleanup then removed the
+        # container: an engine that crashed while starting and a fault in the
+        # fixture read identically (#724).
+        report(run, target)
         raise RuntimeError("owned native TLS fixture failed to start")
     trust = str(root / "ca.pem") if args.native_host else "/tmp/ca.pem"
     if engine == "pg":
