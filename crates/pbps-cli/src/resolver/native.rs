@@ -629,7 +629,14 @@ fn server_inode(text: &str, local: &str, peer: &str) -> Result<u64, Reading> {
             // row that says how the connection ended and which end began it,
             // and one bare name said neither.
             if !established {
-                server_state = u8::from_str_radix(fields[3], 16).ok().or(server_state);
+                // Parsed, never `.ok()`: a state this cannot read is the
+                // table being unreadable, and dropping the failure would let
+                // it arrive as `PeerServerAbsent` — a fact about the
+                // connection — or leave an earlier row's state standing in
+                // for it. Absent, unreadable and "in another state" are three
+                // things and this function answers all three.
+                server_state =
+                    Some(u8::from_str_radix(fields[3], 16).map_err(|_| Reading::PeerTable)?);
                 continue;
             }
             let inode = fields[9].parse::<u64>().map_err(|_| Reading::PeerTable)?;
@@ -1606,8 +1613,34 @@ mod tests {
         // An inode of zero is no socket at all, never a silent skip.
         let zero = row("0100007F:81E4", "0100007F:1538", "01", "0");
         assert_eq!(
-            server_inode(&table(&[client, zero]), "0100007F:1538", "0100007F:81E4"),
+            server_inode(
+                &table(&[client.clone(), zero]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
             Err(Reading::PeerServerAbsent)
+        );
+        // A state nobody could read is the table, not the connection: it
+        // must not arrive as "no row for the pair", and it must not leave an
+        // earlier row's state standing in for it.
+        let unreadable = row("0100007F:81E4", "0100007F:1538", "zz", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), unreadable.clone()]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerTable)
+        );
+        let waiting_then_unreadable = row("0100007F:81E4", "0100007F:1538", "06", "9001");
+        assert_eq!(
+            server_inode(
+                &table(&[client.clone(), waiting_then_unreadable, unreadable]),
+                "0100007F:1538",
+                "0100007F:81E4"
+            ),
+            Err(Reading::PeerTable),
+            "an earlier row's state does not answer for one that cannot be read"
         );
         // A row that is not a row, and a table with no header.
         assert_eq!(
