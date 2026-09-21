@@ -1,6 +1,8 @@
 # Compose ref-protocol measurements
 
-This experiment supports ADR-0015 decision 5 and DECISIONS 487 (#385/#386).
+This experiment records the former ADR-0015 decision 5 and DECISIONS 487
+(#385/#386). ADR-0017 supersedes the same-checkout protocol; these observations
+remain historical evidence, not current compose delivery requirements.
 It runs real Git commands in disposable repositories and a linked worktree.
 It uses Python's standard library; run it manually on Linux:
 

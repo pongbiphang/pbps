@@ -14123,3 +14123,36 @@ SPEC is in sync with all of these.
      `06` mean the engine closed first. The first draft of this said the opposite, and a
      refusal that names the wrong end sends the next investigation to the
      wrong process — worse than naming none.
+
+
+527. **Compose owns an isolated candidate and a new output branch, not the
+     source checkout.** ADR-0015 decision 5 combined the core intent/review/Git
+     workflow with a promise to synchronize working files, the user's index
+     and its current branch. Git has no transaction across those resources.
+     PR #738's repeated publication and recovery findings expose the cost of
+     that contract as well as implementation defects (#744).
+
+     [ADR-0017](ADR-0017-isolated-compose.md) replaces that promise: capture and
+     validate an immutable candidate through the ordinary CLI, show its exact
+     tree, create that tree/parent as a commit on a fresh output branch, and
+     push that same commit to one reviewed destination. The original checkout
+     keeps its edited declarations and old ids. Continuing the result requires
+     a separate checkout, explicitly explained by the UI; no automatic
+     copy-back or reset recreates the removed transaction.
+
+     This supersedes the live-placement preview proposed as decision 524 on
+     the unmerged #738 branch. Entries 523–526 are reserved by that branch;
+     their numbers are not reassigned here. Existing identity/signing,
+     subprocess, browser-security and no-unrelated-history guarantees remain.
+     A prepared ref transaction still needs a live type check: the retained
+     Git 2.43 experiment demonstrates that expected-absent creation alone
+     overwrites a dangling symbolic ref. An uncertain acknowledgment remains
+     uncertain until reconciled; a push failure never undoes the local result.
+
+     The retained `spikes/git-compose-isolated` experiment checks the mechanism
+     and its rejected alternatives with real Git and CLI, including unchanged
+     source files/index/HEAD, exact output, ref collisions, ancestry, signing
+     failure and push outcomes. It is not production crash qualification.
+     #745–#748 implement and qualify the selected protocol. The read-only UI
+     remains read-only until that delivery is complete; old experimental
+     recovery records must be recognized and refused without losing evidence.

@@ -1,0 +1,80 @@
+Environment: Linux, Git 2.43.0; CLI built from baseline 9c487db0.
+These are mechanism measurements, not production recovery qualification.
+
+Accepted mechanism
+{"git": "git version 2.43.0", "pbps": "pbps 0.0.0", "revert_ref_type_guard": false, "revert_candidate_freeze": false}
+test_candidate_excludes_unrelated_work_and_preserves_source (__main__.IsolatedCompose.test_candidate_excludes_unrelated_work_and_preserves_source) ... ok
+test_dangling_symbolic_destination_is_not_overwritten (__main__.IsolatedCompose.test_dangling_symbolic_destination_is_not_overwritten) ... ok
+test_edit_after_capture_is_excluded_from_reviewed_tree (__main__.IsolatedCompose.test_edit_after_capture_is_excluded_from_reviewed_tree) ... ok
+test_existing_direct_destination_is_not_overwritten (__main__.IsolatedCompose.test_existing_direct_destination_is_not_overwritten) ... ok
+test_failed_push_keeps_local_commit (__main__.IsolatedCompose.test_failed_push_keeps_local_commit) ... ok
+test_lost_push_acknowledgment_can_be_reconciled_without_new_commit (__main__.IsolatedCompose.test_lost_push_acknowledgment_can_be_reconciled_without_new_commit) ... ok
+test_narrow_push_also_exports_unpublished_ancestors (__main__.IsolatedCompose.test_narrow_push_also_exports_unpublished_ancestors) ... ok
+test_signer_failure_does_not_publish_a_branch (__main__.IsolatedCompose.test_signer_failure_does_not_publish_a_branch) ... ok
+test_unborn_checked_out_destination_is_refused (__main__.IsolatedCompose.test_unborn_checked_out_destination_is_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 1.082s
+
+OK
+
+Restored single-shot ref creation
+{"git": "git version 2.43.0", "pbps": "pbps 0.0.0", "revert_ref_type_guard": true, "revert_candidate_freeze": false}
+test_candidate_excludes_unrelated_work_and_preserves_source (__main__.IsolatedCompose.test_candidate_excludes_unrelated_work_and_preserves_source) ... ok
+test_dangling_symbolic_destination_is_not_overwritten (__main__.IsolatedCompose.test_dangling_symbolic_destination_is_not_overwritten) ... FAIL
+test_edit_after_capture_is_excluded_from_reviewed_tree (__main__.IsolatedCompose.test_edit_after_capture_is_excluded_from_reviewed_tree) ... ok
+test_existing_direct_destination_is_not_overwritten (__main__.IsolatedCompose.test_existing_direct_destination_is_not_overwritten) ... ok
+test_failed_push_keeps_local_commit (__main__.IsolatedCompose.test_failed_push_keeps_local_commit) ... ok
+test_lost_push_acknowledgment_can_be_reconciled_without_new_commit (__main__.IsolatedCompose.test_lost_push_acknowledgment_can_be_reconciled_without_new_commit) ... ok
+test_narrow_push_also_exports_unpublished_ancestors (__main__.IsolatedCompose.test_narrow_push_also_exports_unpublished_ancestors) ... ok
+test_signer_failure_does_not_publish_a_branch (__main__.IsolatedCompose.test_signer_failure_does_not_publish_a_branch) ... ok
+test_unborn_checked_out_destination_is_refused (__main__.IsolatedCompose.test_unborn_checked_out_destination_is_refused) ... FAIL
+
+======================================================================
+FAIL: test_dangling_symbolic_destination_is_not_overwritten (__main__.IsolatedCompose.test_dangling_symbolic_destination_is_not_overwritten)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "spikes/git-compose-isolated/measure.py", line 219, in test_dangling_symbolic_destination_is_not_overwritten
+    self.assertFalse(self.create_output(self.make_commit()))
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unborn_checked_out_destination_is_refused (__main__.IsolatedCompose.test_unborn_checked_out_destination_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "spikes/git-compose-isolated/measure.py", line 227, in test_unborn_checked_out_destination_is_refused
+    self.assertFalse(self.create_output(self.make_commit()))
+AssertionError: True is not false
+
+----------------------------------------------------------------------
+Ran 9 tests in 1.007s
+
+FAILED (failures=2)
+
+Restored source reread after preview
+{"git": "git version 2.43.0", "pbps": "pbps 0.0.0", "revert_ref_type_guard": false, "revert_candidate_freeze": true}
+test_candidate_excludes_unrelated_work_and_preserves_source (__main__.IsolatedCompose.test_candidate_excludes_unrelated_work_and_preserves_source) ... ok
+test_dangling_symbolic_destination_is_not_overwritten (__main__.IsolatedCompose.test_dangling_symbolic_destination_is_not_overwritten) ... ok
+test_edit_after_capture_is_excluded_from_reviewed_tree (__main__.IsolatedCompose.test_edit_after_capture_is_excluded_from_reviewed_tree) ... FAIL
+test_existing_direct_destination_is_not_overwritten (__main__.IsolatedCompose.test_existing_direct_destination_is_not_overwritten) ... ok
+test_failed_push_keeps_local_commit (__main__.IsolatedCompose.test_failed_push_keeps_local_commit) ... ok
+test_lost_push_acknowledgment_can_be_reconciled_without_new_commit (__main__.IsolatedCompose.test_lost_push_acknowledgment_can_be_reconciled_without_new_commit) ... ok
+test_narrow_push_also_exports_unpublished_ancestors (__main__.IsolatedCompose.test_narrow_push_also_exports_unpublished_ancestors) ... ok
+test_signer_failure_does_not_publish_a_branch (__main__.IsolatedCompose.test_signer_failure_does_not_publish_a_branch) ... ok
+test_unborn_checked_out_destination_is_refused (__main__.IsolatedCompose.test_unborn_checked_out_destination_is_refused) ... ok
+
+======================================================================
+FAIL: test_edit_after_capture_is_excluded_from_reviewed_tree (__main__.IsolatedCompose.test_edit_after_capture_is_excluded_from_reviewed_tree)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "spikes/git-compose-isolated/measure.py", line 205, in test_edit_after_capture_is_excluded_from_reviewed_tree
+    self.assertEqual(self.oid("rev-parse", commit + "^{tree}"), reviewed_tree)
+AssertionError: 'c50100995c340ba6dd9b8b967f2dece7563989e8' != 'da7024f9b699884ad91dc03c6b45a39c45d14087'
+- c50100995c340ba6dd9b8b967f2dece7563989e8
++ da7024f9b699884ad91dc03c6b45a39c45d14087
+
+
+----------------------------------------------------------------------
+Ran 9 tests in 1.087s
+
+FAILED (failures=1)

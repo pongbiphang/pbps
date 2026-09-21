@@ -48,7 +48,10 @@ saved plans, the ledger timeline and schema documentation/ERD. Open the complete
 printed URL, including its fragment. The viewer requires a per-launch token,
 exact bound Host and matching Origin, and calls the same binary for every read.
 Its page works offline. Compose and deployment actions remain later steps of
-#64; this viewer accepts no writes. See [UI.md](UI.md).
+#64; this viewer accepts no writes. #744 selects the isolated-candidate and
+new-output-branch contract in [ADR-0017](ADR-0017-isolated-compose.md). #745–#748
+implement and qualify it before compose is enabled; #494 remains the delivery
+item. See [UI.md](UI.md).
 
 ## Live tests
 
