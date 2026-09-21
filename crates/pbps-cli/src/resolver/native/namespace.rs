@@ -170,49 +170,63 @@ pub struct NamespaceProcfs<'a> {
 
 impl<'a> NamespaceProcfs<'a> {
     pub fn capture(anchor: &'a ProcessLease) -> Result<Self, NamespaceError> {
-        anchor.check().map_err(|_| NamespaceError::Anchor)?;
-        let directory = anchor.open_in_root("proc")?;
-        if rustix::fs::fstatfs(&directory)
-            .map_err(|_| NamespaceError::Unreadable)?
-            .f_type
-            != rustix::fs::PROC_SUPER_MAGIC
-        {
-            return Err(NamespaceError::View);
-        }
-        let namespace = namespace_init(&directory)?;
-        if !anchor.owns_namespace("pid", &namespace)? {
-            return Err(NamespaceError::View);
-        }
-        let view = Self {
-            identity: FileIdentity::of(&directory)?,
-            mount: mount_id(&directory)?,
-            directory: Arc::new(directory),
-            namespace: Arc::new(namespace),
-            anchor,
-        };
-        view.check()?;
-        Ok(view)
+        Self::capture_with(anchor, || {})
+    }
+
+    fn capture_with(
+        anchor: &'a ProcessLease,
+        after_check: impl FnOnce(),
+    ) -> Result<Self, NamespaceError> {
+        anchored_read(anchor, || {
+            after_check();
+            let directory = anchor.open_in_root("proc")?;
+            if rustix::fs::fstatfs(&directory)
+                .map_err(|_| NamespaceError::Unreadable)?
+                .f_type
+                != rustix::fs::PROC_SUPER_MAGIC
+            {
+                return Err(NamespaceError::View);
+            }
+            let namespace = namespace_init(&directory)?;
+            if !anchor.owns_namespace("pid", &namespace)? {
+                return Err(NamespaceError::View);
+            }
+            let view = Self {
+                identity: FileIdentity::of(&directory)?,
+                mount: mount_id(&directory)?,
+                directory: Arc::new(directory),
+                namespace: Arc::new(namespace),
+                anchor,
+            };
+            view.check()?;
+            Ok(view)
+        })
     }
 
     /// Verify the selected view is still mounted at the qualified location.
     /// A hidden process is not an absent process: hidepid views are refused,
     /// even when this observer happens to have sufficient access today.
     pub fn check(&self) -> Result<(), NamespaceError> {
-        self.anchor.check().map_err(|_| NamespaceError::Anchor)?;
-        let current = self.anchor.open_in_root("proc")?;
-        if FileIdentity::of(&current)? != self.identity
-            || mount_id(&current)? != self.mount
-            || !self
-                .anchor
-                .owns_namespace("pid", &namespace_init(&self.directory)?)?
-        {
-            return Err(NamespaceError::Replaced);
-        }
-        visible_mount(
-            &self.anchor.read_proc("mountinfo", 1024 * 1024)?,
-            self.mount,
-        )?;
-        self.anchor.check().map_err(|_| NamespaceError::Anchor)
+        self.check_with(|| {})
+    }
+
+    fn check_with(&self, after_check: impl FnOnce()) -> Result<(), NamespaceError> {
+        anchored_read(self.anchor, || {
+            after_check();
+            let current = self.anchor.open_in_root("proc")?;
+            if FileIdentity::of(&current)? != self.identity
+                || mount_id(&current)? != self.mount
+                || !self
+                    .anchor
+                    .owns_namespace("pid", &namespace_init(&self.directory)?)?
+            {
+                return Err(NamespaceError::Replaced);
+            }
+            visible_mount(
+                &self.anchor.read_proc("mountinfo", 1024 * 1024)?,
+                self.mount,
+            )
+        })
     }
 
     /// Observe tasks visible in this view without following `children`.
@@ -301,6 +315,19 @@ impl<'a> NamespaceProcfs<'a> {
         }
         Ok(())
     }
+}
+
+fn anchored_read<T>(
+    anchor: &ProcessLease,
+    read: impl FnOnce() -> Result<T, NamespaceError>,
+) -> Result<T, NamespaceError> {
+    anchor.check().map_err(|_| NamespaceError::Anchor)?;
+    let result = read();
+    // Dependent operations erase their failure reason into UnqualifiedProcess.
+    // Recheck even on error: a lost anchor must not look like an unreadable
+    // live view, while a still-qualified anchor preserves the view's error.
+    anchor.check().map_err(|_| NamespaceError::Anchor)?;
+    result
 }
 
 /// Apply a container check through held task entries, never by translating

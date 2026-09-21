@@ -28,6 +28,7 @@ ORPHAN_TEST = PREFIX + "reparenting_during_qualification_keeps_the_held_grandchi
 FOREIGN_TEST = PREFIX + "foreign_namespace_sharers_remain_visible_outside_the_container_pid_view"
 MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_descriptor_budget"
 COORDINATE_TEST = PREFIX + "detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops"
+ANCHOR_TEST = PREFIX + "anchor_loss_during_a_view_read_is_distinct_from_an_unreadable_view"
 
 
 def run(*args, **kwargs):
@@ -219,6 +220,8 @@ def main():
             test(binary, MOUNT_TEST, dict(os.environ, PBPS_NAMESPACE_MOUNT_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
             test(binary, COORDINATE_TEST, dict(os.environ, PBPS_NAMESPACE_COORDINATE_FIXTURE="1"),
+                 prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
+            test(binary, ANCHOR_TEST, dict(os.environ, PBPS_NAMESPACE_ANCHOR_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
     finally:
         remaining = []
