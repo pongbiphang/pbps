@@ -475,13 +475,43 @@ impl Compose<'_> {
         // what was laid into it.
         let changed = self.changed_by_command(&intent_directory, &recorded, &listed)?;
 
-        // Step 0: the locks.
+        // Step 0: the locks — *named in the record before they exist*.
+        //
+        // `Guard::drop` covers a refusal; it does not cover the machine
+        // stopping. A crash between creating a lock file and the next
+        // publication would otherwise leave the only durable record holding an
+        // empty `locks` list, and recovery would then remove that record and
+        // leave the lock — blocking every `git` command in the checkout until
+        // somebody found the file by hand. The record is written first, so a
+        // lock is attributable from before it is made, which is what
+        // ADR-0015's `locking` phase is for.
         let index_file = locks::index_file(self.git)?;
         let index_lock = PathBuf::from(format!("{}.lock", index_file.display()));
-        self.copy_index(&index_file, &index_lock)?;
-        record.index_lock_file = Some(index_lock.display().to_string());
-        record.index_lock_hash = Some(hash_file(&index_lock).map_err(Refusal::Io)?);
         let head_lock_file = locks::lock_file_for(self.git, "HEAD")?;
+        record.index_lock_file = Some(index_lock.display().to_string());
+        record.locks.push(RefLock {
+            reference: "HEAD".to_owned(),
+            lock_file: if head_lock_file.is_absolute() {
+                head_lock_file.display().to_string()
+            } else {
+                self.git.root().join(&head_lock_file).display().to_string()
+            },
+        });
+        records
+            .publish(record)
+            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+
+        self.copy_index(&index_file, &index_lock)?;
+        // The hash of the empty file, written before the copy is filled: the
+        // record's claim on `<index>.lock` is a hash, and a crash between
+        // creating it and filling it would otherwise leave a lock the record
+        // names but cannot prove is its own.
+        record.index_lock_hash = Some(hash_file(&index_lock).map_err(Refusal::Io)?);
+        records
+            .publish(record)
+            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.fill_index_lock(&index_file, &index_lock)?;
+        record.index_lock_hash = Some(hash_file(&index_lock).map_err(Refusal::Io)?);
         let head_lock = locks::take(
             self.git.root(),
             &head_lock_file,
@@ -503,16 +533,6 @@ impl Compose<'_> {
             head: Some(head_lock),
             branch: None,
         };
-        record.locks.push(RefLock {
-            reference: "HEAD".to_owned(),
-            lock_file: held
-                .head
-                .as_ref()
-                .expect("just taken")
-                .path()
-                .display()
-                .to_string(),
-        });
         records
             .publish(record)
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
@@ -833,8 +853,31 @@ impl Compose<'_> {
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
         self.reached(Phase::Composed);
 
-        // Step 5. `update-ref` takes `HEAD`'s lock itself when `HEAD` names
-        // the branch it moves, so the UI gives that lock up across the *whole*
+        // Step 5. The branch's lock is named in the record *before* the
+        // transaction starts, because `update-ref` takes it itself: a stop
+        // between `prepare` and `commit` leaves both `HEAD.lock` and the
+        // branch lock behind (git 2.43), and a record that named only the
+        // first would have recovery roll back, remove the record, and leave
+        // `refs/heads/<branch>.lock` blocking every update to that branch.
+        let branch_lock_file = locks::lock_file_for(self.git, &lease.reference)?;
+        record.locks.push(RefLock {
+            reference: lease.reference.clone(),
+            lock_file: if branch_lock_file.is_absolute() {
+                branch_lock_file.display().to_string()
+            } else {
+                self.git
+                    .root()
+                    .join(&branch_lock_file)
+                    .display()
+                    .to_string()
+            },
+        });
+        records
+            .publish(record)
+            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+
+        // `update-ref` takes `HEAD`'s lock itself when `HEAD` names the branch
+        // it moves, so the UI gives that lock up across the *whole*
         // transaction and retakes it afterwards.
         if let Some(head) = held.head.take() {
             head.release().map_err(|e| Refusal::Io(e.to_string()))?;
@@ -860,17 +903,12 @@ impl Compose<'_> {
                 record.id.as_bytes(),
                 &record.id,
             )?);
-            let branch_lock_file = locks::lock_file_for(self.git, &lease.reference)?;
             held.branch = Some(locks::take(
                 self.git.root(),
                 &branch_lock_file,
                 record.id.as_bytes(),
                 &record.id,
             )?);
-            record.locks.push(RefLock {
-                reference: lease.reference.clone(),
-                lock_file: branch_lock_file.display().to_string(),
-            });
             refs::post_write(self.git, lease, &commit)?;
             Ok(())
         })();
@@ -1531,10 +1569,11 @@ impl Compose<'_> {
     /// carries the file's hash after each write so recovery can still tell
     /// the UI's copy from a running `git`'s.
     fn copy_index(&self, index_file: &Path, index_lock: &Path) -> Result<(), Refusal> {
-        let taken = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(index_lock)
+            .map(drop)
             .map_err(|e| {
                 Refusal::Lock(LockRefusal::Held {
                     path: index_lock.to_path_buf(),
@@ -1545,11 +1584,17 @@ impl Compose<'_> {
                     },
                 })
             })?;
-        // Only now, with every other `git` locked out of it.
+        let _ = index_file;
+        Ok(())
+    }
+
+    /// Fill the lock with the index, now that every other `git` is locked out
+    /// of it.
+    fn fill_index_lock(&self, index_file: &Path, index_lock: &Path) -> Result<(), Refusal> {
         let bytes = std::fs::read(index_file).unwrap_or_default();
         let written = (|| {
             use std::io::Write as _;
-            let mut taken = taken;
+            let mut taken = std::fs::OpenOptions::new().write(true).open(index_lock)?;
             taken.write_all(&bytes)?;
             taken.sync_all()
         })();

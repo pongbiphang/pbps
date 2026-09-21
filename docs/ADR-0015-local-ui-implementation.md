@@ -1647,7 +1647,13 @@ has run, rather than released the moment the tip is known; and the
 deciding-ref path reporting an undo that could not finish as
 `RollbackIncomplete` and keeping its record. Both need another worktree
 moving a ref inside a window this protocol exists to close, so both are
-stated here. The
+stated here. The sixth round adds the two orderings that make a lock
+attributable before it exists: the record naming `<index>.lock` and
+`HEAD.lock` before either is created, and naming the branch's lock before
+`update-ref` starts — each closing a window in which the *machine* stops,
+which no test in this suite can arrange. What can be tested is the outcome
+they enable, and is: an interruption holding both locks leaves a record from
+which recovery clears them. The
 interruption points *within* the rollback — after the record's publication, after each undo
 operation, after its flush, after each progress update and during retention
 cleanup — are implemented and are exercised only at their two ends. The

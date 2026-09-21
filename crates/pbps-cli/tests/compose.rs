@@ -1113,3 +1113,97 @@ fn an_index_lock_another_git_holds_refuses_the_compose_and_is_left_alone() {
         "and the other git's lock is untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round six of review.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_interruption_while_holding_the_locks_leaves_a_record_that_can_clear_them() {
+    // The record names every lock before the lock exists, so a stop anywhere
+    // around step 0 leaves evidence that can free the checkout. Without it a
+    // crash there leaves `index.lock` and `HEAD.lock` blocking every `git`
+    // command with nothing on disk to explain them.
+    let checkout = Checkout::new("locks-cleared");
+    edited(&checkout);
+
+    interrupt(&checkout, "locking");
+
+    assert!(checkout.path(".git/index.lock").exists());
+    assert!(checkout.path(".git/HEAD.lock").exists());
+    let record = records_of(&checkout).remove(0);
+    let held: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(checkout.path(".git/pbps-ui/composing").join(&record)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(held["phase"], "locking");
+    assert!(
+        held["index_lock_file"]
+            .as_str()
+            .unwrap()
+            .ends_with("index.lock"),
+        "{held}"
+    );
+    assert!(
+        held["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|lock| lock["lock_file"].as_str().unwrap().ends_with("HEAD.lock")),
+        "{held}"
+    );
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+    assert!(
+        matches!(
+            recovered.first(),
+            Some(pbps_ui::compose::recover::Recovered::LocksCleared { .. })
+        ),
+        "{recovered:?}"
+    );
+    assert!(!checkout.path(".git/index.lock").exists());
+    assert!(!checkout.path(".git/HEAD.lock").exists());
+    assert!(records_of(&checkout).is_empty());
+    // And `git` is usable again.
+    checkout.git(&["status", "--porcelain"]);
+}
+
+#[test]
+fn recovery_that_cannot_finish_its_cleanup_says_so_and_keeps_the_record() {
+    // A permission error, an unreadable temporary or a full disk leaves a
+    // displaced file beside its declaration, and a record removed at that
+    // moment is the only thing that could have named it.
+    let checkout = Checkout::new("cleanup-blocked");
+    edited(&checkout);
+    interrupt(&checkout, "installed");
+
+    // A file where the retention directory has to go.
+    let previous = checkout.path(".git/pbps-ui/previous");
+    let _ = std::fs::remove_dir_all(&previous);
+    std::fs::write(&previous, b"not a directory").unwrap();
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+
+    let pbps_ui::compose::recover::Recovered::Undecided { why, .. } = &recovered[0] else {
+        panic!("expected the cleanup failure to be reported, got {recovered:?}");
+    };
+    assert!(why.contains("still beside their paths"), "{why}");
+    assert_eq!(
+        records_of(&checkout).len(),
+        1,
+        "the record is kept, because it is the only thing naming them"
+    );
+    // The commit stands and the index is installed — this is the interval
+    // finishing, not a rollback — and the displaced file is exactly where the
+    // report says it is, which is why the record has to outlive this run.
+    assert_eq!(checkout.git(&["rev-parse", "HEAD^"]).len(), 40);
+    let left: Vec<String> = std::fs::read_dir(&checkout.root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("pbps-ui"))
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+}

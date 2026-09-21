@@ -418,34 +418,27 @@ fn finish(git: &Git, git_dir: &Path, records: &Records, record: &mut Record) -> 
 
     // The cleanup step 2 owed, done by name from the record and skipped where
     // the name is already gone, so that running it twice is running it once.
+    // Whatever it cannot do is *reported*, and the record is kept for it: a
+    // permission error, an unreadable temporary or a full disk leaves a
+    // displaced file beside its declaration, and a record removed at that
+    // moment is the only thing that could have named it.
+    let mut unresolved: Vec<String> = Vec::new();
     let previous_directory = git_dir.join("pbps-ui").join("previous");
-    let _ = std::fs::create_dir_all(&previous_directory);
-    if let (Ok(root), Ok(previous)) = (
+    if let Err(e) = std::fs::create_dir_all(&previous_directory) {
+        unresolved.push(format!("the retention directory could not be made: {e}"));
+    }
+    match (
         Dir::open_root(git.root()),
         Dir::open_root(&previous_directory),
     ) {
-        for placed in &record.paths {
-            let Ok(path) = RepoPath::new(placed.path.as_bytes()) else {
-                continue;
-            };
-            let Ok((parent, _)) = root.walk_to_parent(&path) else {
-                continue;
-            };
-            let temporary = OsString::from(&placed.temporary);
-            if placed.original.is_none() {
-                let _ = parent.unlink(&temporary);
-            } else if let Ok(file) = parent.open_file(&temporary)
-                && let Ok(bytes) = file.read()
-            {
-                let name = OsString::from(format!("{}-{}", placed.temporary, record.id));
-                if let Ok(kept) = previous.create_new(&name, 0o600)
-                    && kept.write_all(&bytes).is_ok()
-                    && kept.flush().is_ok()
-                {
-                    let _ = parent.unlink(&temporary);
+        (Ok(root), Ok(previous)) => {
+            for placed in &record.paths {
+                if let Err(detail) = finish_one(&root, placed, &previous, &record.id) {
+                    unresolved.push(format!("{}: {detail}", placed.path));
                 }
             }
         }
+        _ => unresolved.push("the retention directory could not be opened".to_owned()),
     }
     for lock in &record.locks {
         if reclaimable(Path::new(&lock.lock_file), record) {
@@ -454,11 +447,53 @@ fn finish(git: &Git, git_dir: &Path, records: &Records, record: &mut Record) -> 
     }
     let _ = std::fs::remove_dir_all(git_dir.join("pbps-ui").join("intent").join(&record.id));
     let commit = record.commit.clone().unwrap_or_default();
+    if !unresolved.is_empty() {
+        return Recovered::Undecided {
+            record: record.id.clone(),
+            why: format!(
+                "the commit {commit} stands and the index is installed, but the files this \
+                 compose displaced are still beside their paths: {}. The record has been kept.",
+                unresolved.join("; ")
+            ),
+        };
+    }
     let _ = records.remove(record);
     Recovered::Finished {
         record: record.id.clone(),
         commit,
     }
+}
+
+/// One path's share of the cleanup step 2 owed.
+fn finish_one(root: &Dir, placed: &Placed, previous: &Dir, id: &str) -> Result<(), String> {
+    let path = RepoPath::new(placed.path.as_bytes()).map_err(|e| e.to_string())?;
+    let (parent, _) = root.walk_to_parent(&path).map_err(|e| e.to_string())?;
+    let temporary = OsString::from(&placed.temporary);
+    if placed.original.is_none() {
+        // The one name this UI ever unlinks: the temporary its own `link()`
+        // was made from.
+        return match parent.unlink(&temporary) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    let file = match parent.open_file(&temporary) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let bytes = file.read().map_err(|e| e.to_string())?;
+    let name = OsString::from(format!("{}-{id}", placed.temporary));
+    match previous.create_new(&name, 0o600) {
+        Ok(kept) => {
+            kept.write_all(&bytes).map_err(|e| e.to_string())?;
+            kept.flush().map_err(|e| e.to_string())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    parent.unlink(&temporary).map_err(|e| e.to_string())
 }
 
 /// A ref lock this record can prove its own.
