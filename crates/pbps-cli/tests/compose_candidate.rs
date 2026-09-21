@@ -1,5 +1,5 @@
 //! Production capture against real Git and the ordinary CLI, with scheduled
-//! editor changes. The publisher is deliberately still absent (#746).
+//! editor changes, publication acknowledgements and restart recovery.
 #![cfg(target_os = "linux")]
 
 use std::cell::RefCell;
@@ -1249,3 +1249,6 @@ fn the_browser_cannot_supply_replacement_evidence_or_arbitrary_commands() {
     assert!(serde_json::from_value::<Request>(value).is_err());
     assert!(serde_json::from_str::<Intent>(r#"{"kind":"exec","command":"anything"}"#).is_err());
 }
+
+#[path = "compose_publication/mod.rs"]
+mod publication;

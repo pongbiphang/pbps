@@ -1,6 +1,6 @@
 # ADR-0017: Compose an isolated candidate and publish a new branch
 
-- Status: candidate backend implemented; publication/recovery remain disabled
+- Status: candidate and publication backends implemented; HTTP writes remain disabled
 - Date: 2026-09-21
 - Supersedes: ADR-0015 decision 5's same-checkout publication protocol and
   PR #738's proposed DECISIONS 524 live-placement preview
@@ -124,9 +124,14 @@ not grant permission to execute repository-controlled hooks or filters.
    with an expected-absent remote lease, no tags, submodule recursion or hooks.
    Do not use the subsequently read local branch tip as the push source. A failed
    or uncertain push keeps the local commit and displays its branch/id. Query
-   that exact remote ref on retry: equal means delivered, absent permits retry
-   of the same commit, different means collision, unreadable means unknown.
-   An absent observation does not prove an earlier delivery never happened.
+   that exact remote ref on retry: equal means delivered, different means
+   collision, and unreadable means unknown. Absence after an authorized attempt
+   remains unknown: the push may have succeeded before an independent deletion.
+   Ordinary retry never recreates that ref. An informed explicit republish
+   action can authorize the same commit/ref/destination after diagnosis. Its
+   displayed generation is consumed durably before observation or push, even
+   when the action finds the commit already present; replaying the same request
+   cannot become fresh authorization after a later deletion.
 
 The selected endpoint is one credential-free literal destination, not a remote
 alias that can fan out to several `pushurl`s or change the refspec. Reuse the
@@ -147,8 +152,11 @@ features of the discarded placement protocol:
   below. Refuse rewrite rules that can redirect the chosen endpoint between
   observation and push. Freeze the destination binding, not a copy of the raw
   Git configuration or authentication material. Supply the approved endpoint
-  through the runner's environment-only remote. Authentication stays in the
-  approved environment/helper path; it is never embedded into that endpoint.
+  through the runner's environment-only remote. Disable HTTP(S) redirects for
+  observations and pushes, including inherited URL-scoped `followRedirects`
+  overrides: the configured identity does not bind a redirected repository.
+  Authentication stays in the approved environment/helper path; it is never
+  embedded into that endpoint.
 - Rebuild display URLs from scheme, host/port and path, excluding userinfo,
   query and fragment. Keep the public SSH principal in a separate labelled field
   when it is part of the durable destination. Copyable commands use only admitted
@@ -227,7 +235,7 @@ The sequence is therefore: allocate identity/name, seal and show it, confirm tha
 candidate, create its exact commit, publish its already named ref, and reconcile
 that same operation on retry/restart. Refresh creates a new candidate identity
 and requires a new confirmation. An old confirmation never targets the refreshed
-candidate. The concrete publication/retirement states remain #746/#747.
+candidate. The publication states below are implemented by #746; #747 qualifies resource durability and retirement.
 
 #746/#747 must exercise fake credential markers in userinfo, query tokens and
 helper output and assert they never appear in durable files, logs or HTTP
@@ -239,13 +247,25 @@ requirements, not properties demonstrated by the local bare-remote spike.
 
 The live error path and startup recovery use one reconciler and these outcomes:
 
-| State | Permitted next action |
-| --- | --- |
-| Prepared, publication not attempted | Confirm, refresh or discard private candidate; no source restoration. |
-| Publication may have happened | Inspect exact output ref and recorded commit. No rollback, automatic second commit or push until classified. |
-| Locally published | Report the existing commit; push/reconcile the same commit. Never remove it because push failed. |
-| Needs recovery | Preserve record and objects, name the failed/unreadable resource, permit explicit retry after diagnosis. |
-| Complete | Retire transient snapshots only after durable outcome evidence and all required cleanup succeed. |
+| Durable state | Permitted external mutation | Reconciliation and failure outcome |
+| --- | --- | --- |
+| No receipt | Import the reviewed raw tree objects; persist `Preparing` before one `commit-tree` invocation. | Failed admission cannot publish a ref. |
+| `Preparing` | Only the current authorized invocation may construct the commit. | Missing acknowledgment stays preparation-unknown; restart cannot regenerate it. |
+| `Prepared(commit)` | Prepare a no-deref create transaction, inspect collisions/checkouts while holding its lock, then persist `LocalAttempt`. | Failed prerequisite persistence aborts the transaction. The known commit remains available. |
+| `LocalAttempt(commit)` | Only the already-owned live transaction may send commit. | Exact direct ref means published; absent means unknown; symbolic, changed or unreadable evidence requires recovery. Restart never recreates the ref. |
+| `LocalPublished(commit, Unattempted)` | Revalidate endpoint/base and output ref; persist a remote attempt before a bounded expected-absent push. | Definite pre-attempt authentication/observation failure preserves the local result and permits ordinary retry. |
+| `LocalPublished(commit, Attempted(generation))` | No automatic replay. An explicit action naming this generation first persists a fresh generation, then may push the same commit. | Exact remote commit means delivered; absence remains uncertain; other/unreadable evidence remains reported. |
+| `LocalPublished(commit, Delivered(generation))` | Read/reconcile; an explicit informed republish can consume the displayed generation. | Later deletion or replacement is retained as changed evidence, never undone automatically. |
+| Private cleanup pending | Only #747's owned-resource retirement operations. | Publication and cleanup are separate facts; cleanup failure cannot erase a known commit or permit source restoration. |
+
+The stable serialized result carries an outcome discriminator, local and remote
+observations, exact operation/commit/tree/ref/destination details, a categorical
+problem and pending-cleanup status. It never returns an outer error authorizing
+rollback. Live errors, repeated confirmation, ordinary retry and restart use one
+reconciler. A durable receipt with an unknown attempt restricts retry even if the
+current ref is absent; a failed write may already have installed that receipt.
+Unknown, absent and unreadable evidence remain distinct. No source restoration
+or output-ref deletion operation exists in this publisher.
 
 Persist publication intent before the ref attempt. A missing acknowledgment,
 failed persistence after the write, or interrupted subprocess is an uncertain
@@ -345,7 +365,25 @@ The #745 candidate service and shipped form module are covered by
 `crates/pbps-cli/tests/compose_candidate.rs` (real Git and CLI) and
 `crates/pbps-ui/tests/browser.rs` (executes the shipped JavaScript with
 controlled DOM events and asynchronous responses). The viewer serves the
-module but does not mount it or expose write endpoints before #746–#748.
+module but does not mount it or expose write endpoints before #747–#748.
+
+#746 adds the repository-scoped publication service, one prepared Git ref
+transaction, durable authorization receipts and shared live/restart result
+classification. `compose_publication` drives actual local and smart-HTTP pushes,
+discarded acknowledgments followed by independent remote deletion, explicit
+republish replay, source preservation, signing, identity drift and persistence
+fault boundaries. The shipped result component renders those serialized facts,
+retains known commit details after a failed read, discovers saved operations and
+separates continuation from an explicitly authorized old-base alternative.
+The alternative also pins that base through its next preview.
+
+Receipt writes use a private temporary file, file sync, rename and directory
+sync; repository-scoped ownership uses a retained flock inode. These are the
+minimal publication prerequisites, not completed power-loss/hostile-path
+qualification. #747 still owns private-object GC roots, resource retirement,
+legacy evidence admission and lower-level ownership/durability fault seams.
+The result therefore continues to report private cleanup pending; no receipt
+forget action or write endpoint is enabled yet.
 
 Initial capture uses Linux `openat2` no-follow reads, regular UTF-8 paths and
 the files ref backend. A selected project must have committed configuration;

@@ -14328,3 +14328,33 @@ SPEC is in sync with all of these.
      extra holders, reparenting, shared/unshared thread tables and a backend
      appearing behind the scan have real-kernel regressions. No saved-plan,
      dialect, driver or deployment authorization boundary changes here.
+
+
+532. **A compose result records authorization separately from observation.**
+     (#746, ADR-0017.) Commit preparation, an exact prepared commit, local
+     publication authorization and acknowledged local publication are separate
+     durable phases. Remote delivery adds unattempted/attempted/delivered facts
+     with an action generation. A missing acknowledgment never authorizes
+     source restoration, another commit, or automatic branch recreation.
+
+     Persist local authorization while the prepared no-deref create transaction
+     holds the output-ref lock; abort if that prerequisite fails. Persist remote
+     authorization before invoking Git push. Ordinary failure and restart use
+     the same reconciler, preserving exact commit details and distinguishing
+     absent, changed and unreadable evidence. A known local result survives
+     failed push, failed result persistence and pending private cleanup.
+
+     An absent remote ref after an attempt can mean deliberate later deletion.
+     Only informed explicit republish may recreate it, using the same commit,
+     ref and endpoint. Consume the displayed action generation before checking
+     even an already-present remote: replay after later deletion cannot become
+     new permission. HTTP redirects are disabled for every observation/push,
+     including URL-scoped configuration overrides, because configuration alone
+     does not bind the redirect target. Authentication remains invocation-only.
+
+     The browser renders typed facts, offers saved-result reconciliation and
+     separate-checkout continuation, and requires explicit authorization and a
+     fresh preview for an alternative pinned to the original base. The viewer
+     still rejects writes until #747 resource durability/retirement and #748
+     integrated interruption qualification complete. No source file, index,
+     HEAD or source-branch transaction is introduced.

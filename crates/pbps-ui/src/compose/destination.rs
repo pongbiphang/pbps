@@ -2,11 +2,12 @@
 
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{Error, Result, git::Git};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Destination {
     transport: String,
     host: Option<String>,
@@ -91,6 +92,45 @@ impl Destination {
             repository,
         })
     }
+}
+
+impl Destination {
+    pub(super) fn endpoint(&self) -> Result<String> {
+        let host = self.host.as_deref().unwrap_or_default();
+        let port = self.port.map(|p| format!(":{p}")).unwrap_or_default();
+        let principal = self.principal.as_deref().unwrap_or_default();
+        match self.transport.as_str() {
+            "file" => Ok(self.repository.clone()),
+            "http" | "https" => Ok(format!(
+                "{}://{host}{port}{}",
+                self.transport, self.repository
+            )),
+            "ssh" => Ok(format!("ssh://{principal}@{host}{port}{}", self.repository)),
+            "scp" if self.port.is_none() => Ok(format!("{principal}@{host}:{}", self.repository)),
+            _ => Err(Error::new("Unsupported compose destination identity")),
+        }
+    }
+}
+
+pub(super) fn validate(destination: &Destination) -> Result<()> {
+    // Loaded evidence must remain readable when a local remote is offline.
+    // Live resolution separately checks identity before contacting it.
+    if destination.transport == "file" {
+        return if Path::new(&destination.repository).is_absolute()
+            && destination.host.is_none()
+            && destination.port.is_none()
+            && destination.principal.is_none()
+            && !destination.repository.chars().any(char::is_control)
+        {
+            Ok(())
+        } else {
+            Err(Error::new("Invalid local compose destination"))
+        };
+    }
+    if Destination::parse(&destination.endpoint()?)? != *destination {
+        return Err(Error::new("Invalid compose destination identity"));
+    }
+    Ok(())
 }
 
 pub(super) fn resolve(git: &Git, remote: &str) -> Result<Destination> {
