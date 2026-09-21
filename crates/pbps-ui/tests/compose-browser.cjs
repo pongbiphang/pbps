@@ -121,4 +121,36 @@ async function outcomes() {
   b.calls[0].resolve([receipt]); await p;
   assert(b.root.find(e => e.textContent.includes("Commit: " + "a".repeat(40))));
 }
-exercise().then(outcomes).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
+async function definiteRefusals() {
+  for (const problem of ["remote_unavailable", "signing_unavailable"]) {
+    const a = setup();
+    let p = a.form.fire("submit"); a.calls[0].resolve(preview("frozen")); await p;
+    p = a.confirm.fire("click");
+    a.calls[1].resolve({status: "refused", operation_id: "operation-frozen", local: "not_attempted",
+      remote: "not_attempted", cleanup_pending: false, problem}); await p;
+    assert.equal(a.confirm.disabled, false, "definite refusal permits confirming the retained candidate");
+    assert(a.field("message").disabled, "refusal does not reopen bound fields");
+    assert(a.root.find(e => e.dataset.action === "preview").disabled);
+    assert(a.root.find(e => e.textContent === "diff-frozen"));
+    assert(!a.root.find(e => e.dataset.action === "recover"), "a refusal has no receipt to recover");
+    await a.form.fire("submit");
+    await a.form.fire("change");
+    assert.equal(a.calls.length, 2, "a refused confirmed workflow cannot replace its frozen preview");
+    p = a.confirm.fire("click");
+    await a.confirm.fire("click");
+    assert.equal(a.calls.length, 3, "repeat clicks cannot duplicate an in-flight confirmation");
+    assert.deepEqual(a.calls[2].body, {candidate_id: "frozen"});
+    assert.equal(a.calls[2].action, "confirm");
+    if (problem === "remote_unavailable") {
+      a.calls[2].resolve({status: "delivered", operation_id: "operation-frozen", local: "present", remote: "delivered"});
+    } else {
+      a.calls[2].reject(new Error("acknowledgement lost after reconfirmation"));
+    }
+    await p;
+    assert(a.confirm.disabled, "success or uncertainty must not re-enable confirmation");
+    await a.confirm.fire("click");
+    assert.equal(a.calls.length, 3);
+    assert(a.root.find(e => e.dataset.action === "recover"));
+  }
+}
+exercise().then(outcomes).then(definiteRefusals).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });

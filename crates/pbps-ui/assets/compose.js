@@ -66,6 +66,7 @@ globalThis.PbpsCompose = Object.freeze({
     let generation = 0;
     let candidate = null;
     let confirming = false;
+    let reconfirmable = false;
     let operation = null;
     const receipts = new Map();
     const destinationText = destination => {
@@ -102,7 +103,9 @@ globalThis.PbpsCompose = Object.freeze({
         const card = make("article");
         card.append(make("p", statusText[receipt.status]), make("p", `Operation: ${receipt.operation_id}`));
         card.append(make("p", remoteText[receipt.remote] || "Remote state is unavailable."));
-        if (receipt.problem) card.append(make("p", "An operation check failed. Reconcile the saved result before proceeding."));
+        if (receipt.problem) card.append(make("p", receipt.status === "refused"
+          ? "No publication was attempted. Restore the unavailable prerequisite, then confirm this same frozen candidate again."
+          : "An operation check failed. Reconcile the saved result before proceeding."));
         if (receipt.cleanup_pending) card.append(make("p", "Private cleanup remains pending; keep this receipt."));
         const d = receipt.details;
         if (d) {
@@ -126,6 +129,7 @@ globalThis.PbpsCompose = Object.freeze({
               if (name === "alternative") {
                 // The server must admit the old base and this workflow first.
                 confirming = false;
+                reconfirmable = false;
                 operation = null;
                 candidate = null;
                 refresh.disabled = false;
@@ -143,7 +147,9 @@ globalThis.PbpsCompose = Object.freeze({
           });
           card.append(button);
         };
-        action("recover", "Reconcile saved result", {operation_id: receipt.operation_id});
+        if (receipt.status !== "refused") {
+          action("recover", "Reconcile saved result", {operation_id: receipt.operation_id});
+        }
         if (receipt.status === "prepared" || (receipt.local === "present" && receipt.remote === "not_attempted")) {
           action("retry", "Continue unattempted publication", {operation_id: receipt.operation_id});
         }
@@ -214,8 +220,9 @@ globalThis.PbpsCompose = Object.freeze({
       }
     });
     confirm.addEventListener("click", async () => {
-      if (!candidate || confirming || confirm.disabled) return;
+      if (!candidate || (confirming && !reconfirmable) || confirm.disabled) return;
       confirming = true;
+      reconfirmable = false;
       confirm.disabled = true;
       refresh.disabled = true;
       for (const field of Object.values(fields)) field.disabled = true;
@@ -226,6 +233,12 @@ globalThis.PbpsCompose = Object.freeze({
         const result = await send("confirm", {candidate_id: candidate});
         render(result);
         activity.textContent = statusText[result.status];
+        if (result.status === "refused" && result.operation_id === operation) {
+          // A definite refusal has no receipt to recover. Keep the inputs and
+          // preview frozen; only reconfirmation of this same handle is enabled.
+          reconfirmable = true;
+          confirm.disabled = false;
+        }
       } catch (_) {
         activity.textContent = "Confirmation outcome is unknown. Inspect the operation result before continuing.";
         render({status: "recovery_required", operation_id: operation, local: "unavailable",
