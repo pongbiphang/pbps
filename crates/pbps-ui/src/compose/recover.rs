@@ -117,6 +117,9 @@ pub(super) fn classify(
         Phase::Prepared { .. } if local == RefEvidence::Absent => {
             (LocalState::NotAttempted, Status::Prepared)
         }
+        Phase::Prepared { .. } if local == RefEvidence::Unreadable => {
+            (LocalState::Unavailable, Status::RecoveryRequired)
+        }
         Phase::Prepared { .. } => (LocalState::Changed, Status::RecoveryRequired),
         Phase::LocalAttempt { .. } | Phase::LocalPublished { .. } if local_matches => {
             (LocalState::Present, Status::Published)

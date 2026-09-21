@@ -847,3 +847,50 @@ fn a_refused_collision_reports_its_actual_direct_symbolic_or_unreadable_evidence
         assert_eq!(f.remote_ref(&preview.output_ref), None);
     }
 }
+
+#[test]
+fn an_unreadable_prepared_ref_remains_unavailable_and_never_claims_a_known_change() {
+    use pbps_ui::compose::RefEvidence;
+    let f = Fixture::new("prepared-unreadable");
+    let (_store, preview, candidate) = f.ready();
+    let before = f.repo.preserved();
+    let mut publisher = f.publisher();
+    let initial = publisher.confirm_observed(&candidate, &|at| {
+        at != Boundary::BeforePersist(DurableStage::LocalAttempt)
+    });
+    let absent = publisher.recover(&preview.operation_id);
+    assert_eq!(absent.status, Status::Prepared);
+    assert_eq!(absent.local, LocalState::NotAttempted);
+    assert_eq!(absent.local_evidence, RefEvidence::Absent);
+    assert_eq!(
+        absent.details.as_ref().unwrap().commit,
+        initial.details.unwrap().commit
+    );
+    let receipt = fs::read(f.record(&preview.operation_id)).unwrap();
+    drop(publisher);
+    let reference = f.repo.root.join(".git").join(&preview.output_ref);
+    fs::create_dir_all(reference.parent().unwrap()).unwrap();
+    fs::write(&reference, b"not a readable ref\n").unwrap();
+    let mut publisher = f.publisher();
+    let unreadable = publisher.recover(&preview.operation_id);
+    assert_eq!(unreadable.local, LocalState::Unavailable);
+    assert_eq!(unreadable.local_evidence, RefEvidence::Unreadable);
+    assert_eq!(unreadable.status, Status::RecoveryRequired);
+    assert_eq!(unreadable.details, absent.details);
+    assert_eq!(publisher.recover(&preview.operation_id), unreadable);
+    let retried = publisher.retry(&preview.operation_id);
+    assert_eq!(retried.local, LocalState::Unavailable);
+    assert_eq!(retried.details, absent.details);
+    assert_eq!(fs::read(&reference).unwrap(), b"not a readable ref\n");
+    assert_eq!(fs::read(f.record(&preview.operation_id)).unwrap(), receipt);
+    assert_eq!(f.remote_ref(&preview.output_ref), None);
+    fs::write(&reference, format!("{}\n", preview.base)).unwrap();
+    let changed = publisher.recover(&preview.operation_id);
+    assert_eq!(changed.local, LocalState::Changed);
+    assert_eq!(
+        changed.local_evidence,
+        RefEvidence::Direct(preview.base.clone())
+    );
+    fs::remove_file(reference).unwrap();
+    f.source_unchanged(&before);
+}
