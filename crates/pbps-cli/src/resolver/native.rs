@@ -29,8 +29,8 @@ pub use namespace::{
     NamespaceError, NamespaceProcfs, NamespaceTaskId, TaskObservation, TaskReading,
 };
 pub(crate) use private_channel::{
-    PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guarded_tasks, private_network,
-    security,
+    FORWARDER_PRIVILEGES, PrivateChannelLease, PrivateChannelProfile, WorkloadPrivileges,
+    awaiting_engine, guarded_tasks, private_network, security,
 };
 pub(crate) use target::TargetWitness;
 pub use target::{EnvironmentError, NativeTarget, NativeTargetError};

@@ -11,9 +11,33 @@ use std::io::Read as _;
 
 pub(crate) struct PrivateChannelProfile {
     pub executable: &'static str,
-    pub uid: u32,
-    pub capabilities: u64,
+    pub privileges: WorkloadPrivileges,
     pub port: u16,
+}
+
+/// Final workload authority, distinct from the root process that drops it
+/// and retains permission to terminate it at the independent deadline.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkloadPrivileges {
+    pub uid: u32,
+    pub gid: u32,
+    pub capabilities: u64,
+}
+
+pub(crate) const FORWARDER_PRIVILEGES: WorkloadPrivileges = WorkloadPrivileges {
+    uid: 65534,
+    gid: 65534,
+    capabilities: 0,
+};
+
+impl WorkloadPrivileges {
+    fn check(self, process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
+        process.check()?;
+        let status = status(process)?;
+        check_status(&status, self.uid, self.capabilities)?;
+        check_groups(&status, self.gid, false)?;
+        process.check()
+    }
 }
 
 pub(crate) struct PrivateChannelLease {
@@ -51,8 +75,8 @@ impl PrivateChannelLease {
         {
             return Err(UnqualifiedProcess);
         }
-        guard(&workload)?;
-        guard(&control)?;
+        guard(&workload, profile.privileges.capabilities)?;
+        guard(&control, FORWARDER_PRIVILEGES.capabilities)?;
         private_network(&workload)?;
         let sockets = sockets(&workload, profile.port)?;
         let mut backends = socket_owners(&workload, sockets.server)?;
@@ -82,8 +106,8 @@ impl PrivateChannelLease {
         if connection != self.connection {
             return Err(UnqualifiedProcess);
         }
-        guard(&self.workload)?;
-        guard(&self.control)?;
+        guard(&self.workload, self.profile.privileges.capabilities)?;
+        guard(&self.control, FORWARDER_PRIVILEGES.capabilities)?;
         private_network(&self.workload)?;
         self.backend.check()?;
         if self
@@ -126,13 +150,13 @@ impl PrivateChannelLease {
                 Some("cat") => readers_writers += 1,
                 _ => return Err(UnqualifiedProcess),
             }
-            security(current, 65534, 0)?;
+            FORWARDER_PRIVILEGES.check(current)?;
         }
         if shells != 1 || readers_writers != 2 {
             return Err(UnqualifiedProcess);
         }
-        guarded_tasks(&self.workload, self.profile.uid, self.profile.capabilities)?;
-        guarded_tasks(&self.control, 65534, 0)?;
+        guarded_tasks(&self.workload, self.profile.privileges)?;
+        guarded_tasks(&self.control, FORWARDER_PRIVILEGES)?;
         // Re-read after descriptor inspection so a closed/replaced socket
         // cannot be accepted from an earlier table snapshot.
         if sockets(&self.workload, self.profile.port)? != self.sockets {
@@ -157,7 +181,7 @@ pub(crate) fn awaiting_engine(
     profile: &PrivateChannelProfile,
 ) -> Result<ProcessLease, UnqualifiedProcess> {
     let root = ProcessLease::capture(pid)?;
-    guard(&root)?;
+    guard(&root, profile.privileges.capabilities)?;
     private_network(&root)?;
     let mut children = std::collections::BTreeSet::new();
     for_each_namespace_task(&root, |task, process| {
@@ -171,7 +195,7 @@ pub(crate) fn awaiting_engine(
         {
             return Err(UnqualifiedProcess);
         }
-        security(&process, profile.uid, profile.capabilities)?;
+        profile.privileges.check(&process)?;
         // Group numbers are used only while this observation owns its view.
         children.insert(task.group().number());
         Ok(())
@@ -188,20 +212,19 @@ pub(crate) fn awaiting_engine(
 /// whose credentials differ from their group's leader.
 pub(crate) fn guarded_tasks(
     root: &ProcessLease,
-    uid: u32,
-    capabilities: u64,
+    privileges: WorkloadPrivileges,
 ) -> Result<(), UnqualifiedProcess> {
-    guard(root)?;
+    guard(root, privileges.capabilities)?;
     for_each_namespace_task(root, |_, process| {
         if process.same_process(root)? {
             Ok(())
         } else {
-            security(&process, uid, capabilities)
+            privileges.check(&process)
         }
     })
 }
 
-pub(crate) fn guard(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
+fn guard(process: &ProcessLease, workload_capabilities: u64) -> Result<(), UnqualifiedProcess> {
     process.check()?;
     if process.namespace_pid() != 1
         || process
@@ -211,9 +234,19 @@ pub(crate) fn guard(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
     {
         return Err(UnqualifiedProcess);
     }
-    // SETUID/SETGID/SETPCAP/KILL, optionally NET_BIND_SERVICE for the engine.
+    // SETUID/SETGID/SETPCAP prepare the child; KILL must remain effective
+    // throughout the run because the child has a different UID (#634).
+    // Only the SQL Server bootstrap also needs NET_BIND_SERVICE. A ceiling
+    // alone would accept a guard unable to enforce its deadline (531).
     let status = status(process)?;
-    check_status(&status, 0, 0x5e0)
+    check_status(&status, 0, 0x1e0 | workload_capabilities)?;
+    check_groups(&status, 0, true)?;
+    let effective =
+        u64::from_str_radix(field(&status, "CapEff:")?, 16).map_err(|_| UnqualifiedProcess)?;
+    if effective & 0x20 == 0 {
+        return Err(UnqualifiedProcess);
+    }
+    process.check()
 }
 
 pub(crate) fn private_network(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
@@ -259,19 +292,38 @@ pub(crate) fn security(
     process.check()
 }
 
-fn check_status(text: &str, uid: u32, capabilities: u64) -> Result<(), UnqualifiedProcess> {
-    let field = |name: &str| -> Result<&str, UnqualifiedProcess> {
-        let mut values = text.lines().filter_map(|line| line.strip_prefix(name));
-        let value = values.next().ok_or(UnqualifiedProcess)?;
-        if values.next().is_some() {
-            return Err(UnqualifiedProcess);
-        }
-        Ok(value.trim())
-    };
-    if field("NoNewPrivs:")? != "1" || field("Seccomp:")? != "2" {
+fn field<'a>(text: &'a str, name: &str) -> Result<&'a str, UnqualifiedProcess> {
+    let mut values = text.lines().filter_map(|line| line.strip_prefix(name));
+    let value = values.next().ok_or(UnqualifiedProcess)?;
+    if values.next().is_some() {
         return Err(UnqualifiedProcess);
     }
-    let uids: Vec<_> = field("Uid:")?
+    Ok(value.trim())
+}
+
+fn check_groups(text: &str, gid: u32, own_group_allowed: bool) -> Result<(), UnqualifiedProcess> {
+    let gids: Vec<_> = field(text, "Gid:")?
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect();
+    if gids.len() != 4 || gids.iter().any(|value| value.as_ref().ok() != Some(&gid)) {
+        return Err(UnqualifiedProcess);
+    }
+    // setpriv clears workload groups. The root guard may retain its own
+    // runtime-resolved group, which grants no additional authority.
+    for group in field(text, "Groups:")?.split_whitespace() {
+        if !own_group_allowed || group.parse::<u32>().ok() != Some(gid) {
+            return Err(UnqualifiedProcess);
+        }
+    }
+    Ok(())
+}
+
+fn check_status(text: &str, uid: u32, capabilities: u64) -> Result<(), UnqualifiedProcess> {
+    if field(text, "NoNewPrivs:")? != "1" || field(text, "Seccomp:")? != "2" {
+        return Err(UnqualifiedProcess);
+    }
+    let uids: Vec<_> = field(text, "Uid:")?
         .split_whitespace()
         .map(str::parse::<u32>)
         .collect();
@@ -279,7 +331,7 @@ fn check_status(text: &str, uid: u32, capabilities: u64) -> Result<(), Unqualifi
         return Err(UnqualifiedProcess);
     }
     for name in ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"] {
-        let actual = u64::from_str_radix(field(name)?, 16).map_err(|_| UnqualifiedProcess)?;
+        let actual = u64::from_str_radix(field(text, name)?, 16).map_err(|_| UnqualifiedProcess)?;
         if actual & !capabilities != 0 {
             return Err(UnqualifiedProcess);
         }

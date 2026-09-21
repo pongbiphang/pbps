@@ -83,21 +83,18 @@ STORAGE = {
     "mssql": "/var/opt/mssql:rw,nosuid,nodev,noexec,size=1073741824,uid=10001,gid=0,mode=700",
 }
 
-# initdb then exec: the engine is PID 1 of its own namespace, so the bootstrap
-# shell is not left inside the scope admission walks. It listens on loopback
-# only and opens no Unix socket: the forwarder is the one way in.
+# The runtime prepares the storage for uid/gid 999. Both initdb and the engine
+# can therefore start without root or any capability; there is no privileged
+# ownership shell to qualify or leave behind (DECISIONS 531).
 POSTGRES_BOOT = """
 set -e
-install -d -o 999 -g 999 -m 700 /var/lib/postgresql/run-data
+umask 077
 printf '%s' "$PBPS_FIXTURE_PASSWORD" > /var/lib/postgresql/pw
-chown 999:999 /var/lib/postgresql/pw
-chmod 600 /var/lib/postgresql/pw
-setpriv --reuid=999 --regid=999 --clear-groups /usr/lib/postgresql/18/bin/initdb \
+/usr/lib/postgresql/18/bin/initdb \
   -D /var/lib/postgresql/run-data --auth-local=reject --auth-host=scram-sha-256 \
   --pwfile=/var/lib/postgresql/pw >/dev/null
 rm /var/lib/postgresql/pw
-exec setpriv --reuid=999 --regid=999 --clear-groups --bounding-set=-all --inh-caps=-all \
-  --ambient-caps=-all /usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/run-data \
+exec /usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/run-data \
   -c listen_addresses=127.0.0.1 -c unix_socket_directories=
 """
 
@@ -164,7 +161,7 @@ def start_dedicated(engine, name, owned, network=None):
         recipe[recipe.index("none")] = network
     common = ["--name", name, "--pull", "never", *recipe, "--tmpfs", STORAGE[engine]]
     if engine == "pg":
-        run("docker", "create", *common, "--user", "0",
+        run("docker", "create", *common, "--user", "999:999", "--cap-drop", "ALL",
             "-e", f"PBPS_FIXTURE_PASSWORD={PASSWORD}",
             "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", POSTGRES_BOOT, **QUIET)
     else:

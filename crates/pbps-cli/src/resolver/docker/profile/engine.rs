@@ -34,18 +34,24 @@ pub(in crate::resolver::docker) fn control_limits(
 pub(in crate::resolver::docker) fn private_channel_profile(
     driver: Driver,
 ) -> crate::resolver::native::PrivateChannelProfile {
-    use crate::resolver::native::PrivateChannelProfile;
+    use crate::resolver::native::{PrivateChannelProfile, WorkloadPrivileges};
     match driver {
         Driver::Postgres => PrivateChannelProfile {
             executable: "postgres",
-            uid: 999,
-            capabilities: 0,
+            privileges: WorkloadPrivileges {
+                uid: 999,
+                gid: 999,
+                capabilities: 0,
+            },
             port: 5432,
         },
         Driver::Mssql => PrivateChannelProfile {
             executable: "sqlservr",
-            uid: 10001,
-            capabilities: 0x400,
+            privileges: WorkloadPrivileges {
+                uid: 10001,
+                gid: 0,
+                capabilities: 0x400,
+            },
             port: 1433,
         },
     }
@@ -89,11 +95,7 @@ pub(in crate::resolver::docker) async fn identity(
 }
 
 pub(super) struct Bootstrap {
-    pub uid: &'static str,
-    pub gid: &'static str,
-    pub bounding: &'static str,
-    pub inheritable: &'static str,
-    pub ambient: &'static str,
+    pub privileges: crate::resolver::native::WorkloadPrivileges,
     pub storage_path: &'static str,
     pub storage_options: &'static str,
     pub program: &'static str,
@@ -101,13 +103,10 @@ pub(super) struct Bootstrap {
 }
 
 pub(super) fn bootstrap(driver: Driver, password: &str) -> Bootstrap {
+    let privileges = private_channel_profile(driver).privileges;
     match driver {
         Driver::Postgres => Bootstrap {
-            uid: "--reuid=999",
-            gid: "--regid=999",
-            bounding: "--bounding-set=-all",
-            inheritable: "--inh-caps=-all",
-            ambient: "--ambient-caps=-all",
+            privileges,
             storage_path: "/var/lib/postgresql",
             storage_options: "rw,nosuid,nodev,noexec,size=268435456,uid=999,gid=999,mode=700",
             program: "umask 077; printf '%s' \"$PBPS_BOOTSTRAP_PASSWORD\" > /var/lib/postgresql/password; unset PBPS_BOOTSTRAP_PASSWORD; /usr/lib/postgresql/18/bin/initdb -D /var/lib/postgresql/run-data --auth-local=scram-sha-256 --auth-host=scram-sha-256 --pwfile=/var/lib/postgresql/password >/dev/null 2>&1; rm /var/lib/postgresql/password; /usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/run-data -c listen_addresses=127.0.0.1 -c unix_socket_directories= >/dev/null 2>&1 & engine=$!; until test \"$(awk 'NR == 8 {print $1}' /var/lib/postgresql/run-data/postmaster.pid 2>/dev/null)\" = ready; do kill -0 \"$engine\"; sleep 0.1; done; printf 'pbps-engine-ready-v1\\n'; wait \"$engine\"",
@@ -118,11 +117,7 @@ pub(super) fn bootstrap(driver: Driver, password: &str) -> Bootstrap {
             ],
         },
         Driver::Mssql => Bootstrap {
-            uid: "--reuid=10001",
-            gid: "--regid=0",
-            bounding: "--bounding-set=-all,+net_bind_service",
-            inheritable: "--inh-caps=-all,+net_bind_service",
-            ambient: "--ambient-caps=-all,+net_bind_service",
+            privileges,
             storage_path: "/var/opt/mssql",
             storage_options: "rw,nosuid,nodev,noexec,size=1073741824,uid=10001,gid=0,mode=700",
             program: "/opt/mssql/bin/sqlservr >/dev/null 2>&1 & engine=$!; until grep -q 'SQL Server is now ready for client connections' /var/opt/mssql/log/errorlog 2>/dev/null; do kill -0 \"$engine\"; sleep 0.1; done; printf 'pbps-engine-ready-v1\\n'; wait \"$engine\"",

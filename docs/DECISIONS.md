@@ -14213,3 +14213,40 @@ SPEC is in sync with all of these.
      observations do not establish an atomic inventory, engine provenance or
      protection against the provisioning administrator. The measured Docker
      recipes and namespace fixtures qualify these distinct questions separately.
+
+531. **The launch drops to a shared workload identity before bootstrap; the
+     root deadline retains a separate, necessary authority (#742).** The
+     Docker runtime creates storage for the final UID/GID, so the fixed waiter,
+     initialization and engine need no ownership privilege. Launch arguments
+     and native qualification use one workload identity: PostgreSQL 999/999
+     with no capabilities, SQL Server 10001/0 with NET_BIND_SERVICE, and the
+     forwarder 65534/65534 with none; each clears supplementary groups. The
+     guard's ceiling is SETUID/SETGID/SETPCAP/KILL, adding NET_BIND_SERVICE only
+     for SQL Server. Measured PostgreSQL startup, SQL and forwarding still pass
+     after removing that unnecessary bit from its guard.
+
+     A maximum mask is not required authority: without effective CAP_KILL,
+     root timeout cannot kill its differently owned child (#634). Require the
+     bit before releasing the waiter and during later channel qualification,
+     and check the final workload's groups as well as all UID and capability
+     sets. The guard's own group 0 is permitted; no other task inherits its
+     exception. Wrong-group and missing-KILL real-container regressions failed
+     before these checks and passed after them. Independent deadline and
+     detached-child tests retain the actual termination control.
+
+     The supplied Docker PostgreSQL recipe uses direct uid/gid 999 and
+     cap-drop ALL with its runtime-prepared storage. Podman 4.9 rejects Docker's
+     tmpfs uid option; its measured component alternative chowns a fresh tmpfs
+     root and drops before initialization with only CHOWN/SETUID/SETGID/SETPCAP
+     (plus NET_BIND_SERVICE for SQL Server). This does not admit a Podman daemon
+     (#686) or turn an operator assertion into runtime evidence.
+
+     Parent, thread, fork and exec measurements preserve the final credential
+     and capability ceiling, no-new-privileges and the respective workload or
+     forwarder seccomp behavior. They establish inherited restrictions, not
+     atomic or permanent namespace membership. Keep task, cgroup, foreign
+     namespace, socket and exclusivity observations; runtime-exec entrants are
+     provisioned by the trusted administrator, not descended from the dropped
+     waiter. Exact policy attestation, provenance and source-handling follow-ups
+     remain independent gates. No model, driver boundary, public schema or
+     deployment authorization changes here.
