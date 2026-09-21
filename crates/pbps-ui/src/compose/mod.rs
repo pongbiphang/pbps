@@ -26,6 +26,8 @@ pub mod record;
 #[cfg(target_os = "linux")]
 pub mod refs;
 pub mod repo_path;
+#[cfg(target_os = "linux")]
+pub mod run;
 #[cfg(all(test, target_os = "linux"))]
 pub mod scratch_repo;
 #[cfg(target_os = "linux")]

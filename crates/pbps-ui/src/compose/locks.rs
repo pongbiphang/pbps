@@ -247,6 +247,12 @@ pub fn lock_file_for(git: &Git, what: &str) -> Result<PathBuf, LockRefusal> {
 
 /// The index's own path, which is not a lock: step 0 copies the index to
 /// `<index>.lock` and step 6 installs it by renaming it back.
+///
+/// Answered absolute. `git rev-parse --git-path` answers relative to the
+/// worktree root in the main worktree and absolute in a linked one
+/// (**measured**), and the UI is not standing in the worktree root — a
+/// relative answer used as a path would name a file beside whatever directory
+/// `pbps ui` was started from.
 pub fn index_file(git: &Git) -> Result<PathBuf, LockRefusal> {
     let answer = git
         .run(&["rev-parse", "--git-path", "index"])
@@ -258,7 +264,12 @@ pub fn index_file(git: &Git) -> Result<PathBuf, LockRefusal> {
         reference: "the index".to_owned(),
         detail: e.to_string(),
     })?;
-    Ok(PathBuf::from(line))
+    let path = PathBuf::from(line);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        git.root().join(path)
+    })
 }
 
 #[cfg(test)]
