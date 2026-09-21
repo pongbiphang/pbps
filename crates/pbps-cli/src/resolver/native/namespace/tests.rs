@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn anchor_loss_during_a_view_read_is_distinct_from_an_unreadable_view() {
+    if std::env::var_os("PBPS_NAMESPACE_ANCHOR_FIXTURE").is_none() {
+        return;
+    }
+    assert_eq!(
+        std::process::id(),
+        1,
+        "the fixture needs a private PID namespace"
+    );
+    for capture in [true, false] {
+        let mut child = super::super::spawned_and_execed(
+            std::process::Command::new("/bin/sleep").arg("30"),
+            "sleep",
+        );
+        let anchor = ProcessLease::capture(child.id()).unwrap();
+        let view = NamespaceProcfs::capture(&anchor).unwrap();
+        let mut acknowledged = false;
+        let exit = || {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            acknowledged = true;
+        };
+        let result = if capture {
+            NamespaceProcfs::capture_with(&anchor, exit).map(|_| ())
+        } else {
+            view.check_with(exit)
+        };
+        assert!(
+            acknowledged,
+            "the anchor exit must precede the dependent read"
+        );
+        assert!(
+            matches!(result, Err(NamespaceError::Anchor)),
+            "an anchor lost during a dependent read must be Anchor: {result:?}"
+        );
+    }
+
+    let mut child = super::super::spawned_and_execed(
+        std::process::Command::new("/bin/sleep").arg("30"),
+        "sleep",
+    );
+    let anchor = ProcessLease::capture(child.id()).unwrap();
+    let mut view = NamespaceProcfs::capture(&anchor).unwrap();
+    let directory = Arc::clone(&view.directory);
+    // A live anchor cannot turn a failed view read into an anchor failure.
+    // This held proc file gives openat2 a real ENOTDIR on the namespace read.
+    view.directory = Arc::new(open(&directory, "stat", OFlags::empty()).unwrap());
+    assert!(matches!(view.check(), Err(NamespaceError::Unreadable)));
+    anchor.check().unwrap();
+    view.directory = directory;
+    view.check().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
 fn detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops() {
     if std::env::var_os("PBPS_NAMESPACE_COORDINATE_FIXTURE").is_none() {
         return;
