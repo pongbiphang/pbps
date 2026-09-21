@@ -41,3 +41,20 @@ The server and page are designed for one user on loopback. There is no `--host`
 option. [ADR-0015](ADR-0015-local-ui-implementation.md) records the process,
 credential and browser boundaries; [DECISIONS 457](DECISIONS.md) records the HTTP
 dependency and the initial size measurement.
+
+
+## Planned compose workflow
+
+Compose is not available in this read-only viewer. The accepted design in
+[ADR-0017](ADR-0017-isolated-compose.md) captures the edited declarations,
+resolves human-supplied intent with the ordinary CLI, and shows an exact diff.
+Confirmation will publish that reviewed snapshot on a new output branch.
+Later editor changes require a refreshed preview; they are not silently added.
+
+The current checkout will keep its existing declaration edits and ids. The
+result will show the commit, local branch and remote outcome, including a local
+commit when push fails. To continue the result, open a separate checkout of
+that branch in a Git client; the page will also provide copyable worktree/UI
+commands. Reusing the old checkout for another proposal requires an explicit
+alternative-from-the-old-base action. There is no automatic reset or copy-back.
+#494 and #745–#748 track implementation and qualification.
