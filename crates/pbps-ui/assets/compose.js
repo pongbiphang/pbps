@@ -56,12 +56,13 @@ globalThis.PbpsCompose = Object.freeze({
     const details = make("pre");
     const diff = make("pre");
     const disclosure = make("p", "This creates a new output branch. Your original declarations, old identity file, staged work and current branch stay as they are. Edits after Preview are excluded until Refresh. Client hooks will not run.");
+    const remoteContract = make("p", "HTTP/SSH destinations must use ordinary branches. Symbolic branches and server-side branch remapping are unsupported; Git advertisements cannot reliably reveal them.");
     form.append(refresh, confirm);
     const results = make("section");
     const saved = make("button", "Find saved results");
     saved.type = "button";
     saved.dataset.action = "list";
-    root.replaceChildren(disclosure, form, activity, details, diff, saved, results);
+    root.replaceChildren(disclosure, remoteContract, form, activity, details, diff, saved, results);
     let generation = 0;
     let candidate = null;
     let confirming = false;

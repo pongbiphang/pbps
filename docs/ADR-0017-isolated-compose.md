@@ -173,6 +173,42 @@ features of the discarded placement protocol:
 - Disclose beside confirmation that client hooks will not run. Server/CI policy
   remains the organization's enforcement point.
 
+### Remote branch semantics
+
+HTTP/SSH publication uses the ordinary Git server contract: the selected base
+and output branch names denote direct branches, and the server does not remap
+writes to another ref through symbolic branches, `proc-receive` or equivalent
+administrative configuration. The user explicitly selected this boundary for
+#746 / PR #768 after reviewing the alternative of refusing network push until
+a separate inspection or no-deref server capability exists. The contract is
+recorded in DECISIONS 534.
+
+Git advertisements and expected-value leases do not prove this server premise.
+A real Git 2.43 local-bare and smart-HTTP experiment created a dangling symbolic
+output ref: `ls-remote --symref --refs` advertised nothing, but an expected-absent
+push created its unreviewed target and left the output ref symbolic. `--atomic`
+behaved the same way. The ordinary receive-pack update does not request
+[`REF_NO_DEREF`](https://github.com/git/git/blob/v2.43.0/builtin/receive-pack.c#L1516-L1520).
+An empty advertisement alone is therefore not a universal proof of absence.
+
+For network destinations, symbolic output branches and server-side ref remapping
+are unsupported server configurations. This is an operator/server prerequisite,
+not a promise that the client can discover and reject every violation. A server
+violating it can still redirect a write; a post-push observation cannot undo or
+justify that write. The form discloses this limitation before confirmation.
+No server attestation service, remote command executor or credential store is
+added. Visible symbolic/conflicting/unreadable advertisements still refuse,
+and endpoint binding, disabled HTTP redirects, exact-commit pushes and uncertain
+outcome rules remain required.
+
+Local filesystem destinations provide an additional capability: inspect their
+raw Git ref evidence, including dangling symrefs, compare it with the advertised
+value, and require direct absence again immediately before push. Refuse symbolic,
+unreadable or inconsistent evidence while retaining the exact local commit.
+This checks observed local collisions under the ordinary-writer boundary above;
+it does not freeze an administrator changing the remote during publication.
+The publisher never removes or rewrites a conflicting remote ref to make it fit.
+
 ### Durable identity and transient authentication
 
 The following are separate representations, not two serialized views of a raw
@@ -264,8 +300,8 @@ problem and pending-cleanup status. It never returns an outer error authorizing
 rollback. Live errors, repeated confirmation, ordinary retry and restart use one
 reconciler. A durable receipt with an unknown attempt restricts retry even if the
 current ref is absent; a failed write may already have installed that receipt.
-Unknown, absent and unreadable evidence remain distinct. No source restoration
-or output-ref deletion operation exists in this publisher.
+Unknown, absent and unreadable evidence remain distinct. Remote observations over HTTP/SSH have the server-semantic limit above.
+No source restoration or output-ref deletion operation exists in this publisher.
 
 Persist publication intent before the ref attempt. A missing acknowledgment,
 failed persistence after the write, or interrupted subprocess is an uncertain

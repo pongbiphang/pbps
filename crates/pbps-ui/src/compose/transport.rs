@@ -83,6 +83,8 @@ pub(super) fn observe(git: &Git, description: &Description, reference: &str) -> 
             }
             found = Some(RefEvidence::Direct(value.into()));
         }
+        // Network absence relies on the server's ordinary direct-branch
+        // contract, not proof against hidden remapping (DECISIONS 534).
         let advertised = found.unwrap_or(RefEvidence::Absent);
         if local.is_some_and(|local| local != advertised) {
             return Ok(RefEvidence::Unreadable);

@@ -14358,3 +14358,31 @@ SPEC is in sync with all of these.
      still rejects writes until #747 resource durability/retirement and #748
      integrated interruption qualification complete. No source file, index,
      HEAD or source-branch transaction is introduced.
+
+534. **Compose network pushes rely on ordinary direct-branch server semantics.**
+     (#746, PR #768, ADR-0017 Remote branch semantics.) The user selected
+     ordinary HTTP/SSH Git push with an explicit server prerequisite over a
+     new remote inspection/no-deref capability protocol. Selected base and
+     output branch names must denote direct branches; symbolic branches and
+     administrative write remapping are unsupported server configurations.
+     This narrows the guarantee instead of claiming those configurations can
+     always be discovered and refused by a Git client.
+
+     A real Git 2.43 local-bare and smart-HTTP experiment showed why: a dangling
+     symbolic output ref produces an empty advertisement, but an expected-absent
+     push creates its other target while leaving the output ref symbolic.
+     Atomic push does the same. Advertised values and leases are useful within
+     the server contract; they do not attest hidden ref type or implementation.
+     A server violating the premise can still redirect the write. A later read
+     cannot repair that safety claim. Disclose the premise before confirmation.
+
+     Local filesystem destinations additionally expose raw Git ref evidence.
+     Compare it with the advertisement and recheck direct absence immediately
+     before push. Symbolic, unreadable or inconsistent evidence refuses while
+     preserving the exact local commit, and retry/recovery never clears the
+     conflicting ref. Observed collision checks do not freeze a remote
+     administrator during a push. Keep endpoint identity, disabled HTTP
+     redirects, exact-commit delivery and uncertain-outcome rules independently.
+     No remote attestation service, arbitrary command executor or new credential
+     store is introduced. This decision does not enable the write endpoints
+     before #747–#748 and integrated #494 qualification.
