@@ -860,3 +860,66 @@ fn left_under(checkout: &Checkout, what: &str) -> usize {
         .map(|entries| entries.filter_map(Result::ok).count())
         .unwrap_or(0)
 }
+
+// ---------------------------------------------------------------------------
+// Round two of review: three more P1s.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_declaration_recreated_between_the_preview_and_the_commit_is_refused() {
+    // Absence has to be pinned as deliberately as content. A path the preview
+    // saw deleted has no blob to compare, and without an entry saying so, an
+    // editor recreating it in between would be committed unread.
+    let checkout = Checkout::new("pinned-absence");
+    checkout.write(
+        "schema/second.yml",
+        "table: dbo.second\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    checkout.pbps(&["plan", "--no-input"]);
+    checkout.git(&["add", "-A"]);
+    checkout.git(&["commit", "-q", "-m", "two declarations"]);
+    std::fs::remove_file(checkout.path("schema/second.yml")).unwrap();
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let preview = compose(&checkout, &git, &cli, &file)
+        .preview(&Request {
+            intent: Intent::DropTable {
+                table: "dbo.second".to_owned(),
+                reason: "no longer used".to_owned(),
+            },
+            message: "drop table dbo.second".to_owned(),
+            remote: String::new(),
+            shown: Default::default(),
+        })
+        .expect("the preview finishes");
+    assert_eq!(
+        preview.shown.get("schema/second.yml"),
+        Some(&None),
+        "absence is reported, not left out: {:?}",
+        preview.shown
+    );
+
+    // Somebody puts the declaration back while the diff is being read.
+    checkout.write(
+        "schema/second.yml",
+        "table: dbo.second\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&Request {
+            intent: Intent::DropTable {
+                table: "dbo.second".to_owned(),
+                reason: "no longer used".to_owned(),
+            },
+            message: "drop table dbo.second".to_owned(),
+            remote: String::new(),
+            shown: preview.shown.clone(),
+        })
+        .expect_err("a file that came back is not committed unread");
+    assert!(
+        refusal.to_string().contains("schema/second.yml"),
+        "{refusal}"
+    );
+}

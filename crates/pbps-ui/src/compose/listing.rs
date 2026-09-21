@@ -92,7 +92,11 @@ impl std::fmt::Display for ListingRefusal {
 
 /// The two places the CLI reads its inputs from, as the compose resolved them.
 pub struct Inputs<'a> {
-    pub declarations: &'a RepoPath,
+    /// `None` where the declarations directory *is* the worktree root, which
+    /// is what `schema_dir: .` means for a project at the root — a layout
+    /// SPEC supports and `RepoPath` cannot spell, since the empty path and
+    /// `.` are both refused.
+    pub declarations: Option<&'a RepoPath>,
     pub ids_file: &'a RepoPath,
 }
 
@@ -107,14 +111,26 @@ impl Inputs<'_> {
     /// file the user has open beside the declarations would otherwise be laid
     /// over the snapshot and committed with the intent.
     pub fn reads(&self, path: &RepoPath) -> bool {
-        path == self.ids_file
-            || (path.is_under(self.declarations.as_bytes()) && path.extension_is_declaration())
+        if path == self.ids_file {
+            return true;
+        }
+        let under = match self.declarations {
+            None => true,
+            Some(directory) => path.is_under(directory.as_bytes()),
+        };
+        under && path.extension_is_declaration()
     }
 
     fn pathspec(&self) -> Vec<String> {
-        [self.declarations, self.ids_file]
-            .iter()
-            .filter_map(|p| p.to_text().map(str::to_owned))
+        let declarations = match self.declarations {
+            // `.` is what `git` reads as "everything under here", and the
+            // commands below all run from the worktree root.
+            None => Some(".".to_owned()),
+            Some(directory) => directory.to_text().map(str::to_owned),
+        };
+        declarations
+            .into_iter()
+            .chain(self.ids_file.to_text().map(str::to_owned))
             .collect()
     }
 }
@@ -344,6 +360,35 @@ mod tests {
     }
 
     #[test]
+    fn declarations_at_the_worktree_root_are_a_place_and_not_a_missing_one() {
+        // `schema_dir: .` resolves the declarations directory to the project
+        // itself, and for a project at the worktree root that is a path no
+        // `RepoPath` can spell — the empty path and `.` are both refused, and
+        // rightly, since neither is a name. Representing it as `None` is what
+        // keeps "the root" from being read as "outside the project".
+        let ids_file = path("schema.ids.json");
+        let root = Inputs {
+            declarations: None,
+            ids_file: &ids_file,
+        };
+        assert!(root.reads(&path("customer.yml")));
+        assert!(root.reads(&path("nested/deeper/order.yaml")));
+        assert!(root.reads(&ids_file));
+        assert!(!root.reads(&path("README")));
+        assert_eq!(root.pathspec(), vec![".", "schema.ids.json"]);
+
+        // And a declarations directory that *is* named still bounds it.
+        let named = path("schema");
+        let under = Inputs {
+            declarations: Some(&named),
+            ids_file: &ids_file,
+        };
+        assert!(under.reads(&path("schema/customer.yml")));
+        assert!(!under.reads(&path("customer.yml")));
+        assert_eq!(under.pathspec(), vec!["schema", "schema.ids.json"]);
+    }
+
+    #[test]
     fn an_assume_unchanged_declaration_is_refused_where_status_says_nothing_at_all() {
         // The measured trap this module exists for: the flags that hid
         // `pbps.yml` hide a declaration just as well, and the porcelain
@@ -368,7 +413,7 @@ mod tests {
             &git,
             &tip,
             &Inputs {
-                declarations: &declarations,
+                declarations: Some(&declarations),
                 ids_file: &ids_file,
             },
             read_hashes(&scratch),
@@ -403,7 +448,7 @@ mod tests {
             &git,
             &tip,
             &Inputs {
-                declarations: &declarations,
+                declarations: Some(&declarations),
                 ids_file: &ids_file,
             },
             read_hashes(&scratch),
@@ -445,7 +490,7 @@ mod tests {
             &git,
             &tip,
             &Inputs {
-                declarations: &declarations,
+                declarations: Some(&declarations),
                 ids_file: &ids_file,
             },
             read_hashes(&scratch),
@@ -483,7 +528,7 @@ mod tests {
             &git,
             &tip,
             &Inputs {
-                declarations: &declarations,
+                declarations: Some(&declarations),
                 ids_file: &ids_file,
             },
             read_hashes(&scratch),

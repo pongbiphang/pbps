@@ -1495,6 +1495,19 @@ What this ADR reasons about and has not measured, in the order the steps of
   `120000` or `160000` entry is refused with the entry named. Supporting
   it means deciding what a commit of a link's target should mean, which
   is a question for when someone has such a layout.
+- **`schema_dir: .` is named as supported here and is not loadable.**
+  Decision 5's listing filter says it "matters most under the supported
+  `schema_dir: .`, where the pathspec is the whole project". **Measured**
+  during #494: with `schema_dir: .` and `pbps.yml` in that same directory,
+  `pbps plan` refuses before any compose is reached — `pbps_load`'s
+  `collect_yaml_files` walks the declarations directory and reads `pbps.yml`
+  as a declaration, which starts with none of `table:`, `view:`,
+  `procedure:`, `function:`, `trigger:` or `role:`. The compose side now
+  represents a declarations directory that *is* the project root rather than
+  refusing it as "outside the project", so the layout would work the moment
+  the loader allows it; making the loader allow it is a separate question and
+  a separate issue.
+
 - **A project whose declarations or ids file lie outside its directory.**
   Decision 5 snapshots the project's subtree and asks `doctor` where the
   inputs are; a `schema_dir` or `ids_file` that resolves outside the
@@ -1601,8 +1614,19 @@ twice changing nothing. An interruption inside the gap steps 5 and 6 span being
 installing the prepared index instead. A record whose process is still alive
 being left entirely alone.
 
-**Specified and implemented, not yet driven end to end.** The interruption
-points *within* the rollback — after the record's publication, after each undo
+**Specified and implemented, not yet driven end to end.** Step 5's
+deciding-ref protocol — the branch moved, then `HEAD` was redirected or a
+persistent lock could not be retaken — is implemented and its decision is a
+pure function with unit tests over every shape it distinguishes (the tip
+holding exactly the recorded entry, the same blob at another mode, a `120000`
+or `160000` entry carrying that id, a path the tip does not hold, a path step
+3 recorded no entry for, and no tip at all). What is *not* driven end to end
+is the race itself: the window between `update-ref`'s commit and the retaken
+locks is measured in milliseconds and cannot be arranged on demand, so the
+refusal it produces — which names the commit, the deciding tip and what
+became of each path, and never reports "nothing changed" — is reached in
+tests through its parts rather than through a real interleaving. The
+interruption points *within* the rollback — after the record's publication, after each undo
 operation, after its flush, after each progress update and during retention
 cleanup — are implemented and are exercised only at their two ends. The
 conflicting third-party path is refused by the per-path evidence check and is

@@ -29,10 +29,17 @@ pub struct Request {
     pub intent: Intent,
     pub message: String,
     pub remote: String,
-    /// The blob id of each file the page was shown, by path. The locks stop
-    /// `git`, not an editor saving the same file.
+    /// What the page was shown for every path the preview represented:
+    /// `Some(blob)` where the working tree held the file, and **`None` where
+    /// it did not**.
+    ///
+    /// Absence has to be pinned as deliberately as content. A declaration the
+    /// preview saw deleted, or one that did not exist yet, has no blob to
+    /// compare — and without an entry saying so, an editor recreating it
+    /// between the diff and the confirmation would be committed unread. The
+    /// locks stop `git`, not an editor.
     #[serde(default)]
-    pub shown: BTreeMap<String, String>,
+    pub shown: BTreeMap<String, Option<String>>,
 }
 
 /// How far a run goes (DECISIONS 524).
@@ -62,14 +69,15 @@ pub struct Preview {
     pub paths: Vec<String>,
     /// Prefilled from the intent, spelled the way the CLI spells it.
     pub message: String,
-    /// The blob the UI read for each path it would touch, by path.
+    /// What the working tree held for every path this preview represents:
+    /// `Some(blob)` where the file was there, `None` where it was not.
     ///
-    /// Sent back with the confirmation, where step 1 compares it against the
-    /// file as it is *then*. Without it the editor-race guard has nothing to
-    /// compare with and never fires: a save between the diff and the
-    /// confirmation would be exchanged away for bytes derived from the
-    /// earlier read, which is the one thing that guard exists to prevent.
-    pub shown: BTreeMap<String, String>,
+    /// Sent back with the confirmation, where it is compared against the
+    /// working tree as it is *then*. Without it the editor-race guard has
+    /// nothing to compare with and never fires; with only the paths that had
+    /// content, a file recreated or deleted in between is still committed
+    /// unread.
+    pub shown: BTreeMap<String, Option<String>>,
 }
 
 /// Either answer.
@@ -141,6 +149,18 @@ pub enum Refusal {
     Unrecordable(String),
     /// Another compose is running in this checkout right now.
     AlreadyComposing,
+    /// The branch moved and then something moved out from under it: `HEAD`
+    /// was redirected, the branch was moved again, or a lock could not be
+    /// retaken. The commit exists and is where `update-ref` put it, and the
+    /// checkout is *not* at it, so step 6 does not happen and nothing is
+    /// pushed — but this is emphatically not "nothing changed".
+    CommitStandsButCheckoutMoved {
+        commit: String,
+        branch: String,
+        deciding: String,
+        kept: Vec<String>,
+        undone: Vec<String>,
+    },
     Io(String),
 }
 
@@ -177,6 +197,29 @@ impl std::fmt::Display for Refusal {
             Self::AlreadyComposing => write!(
                 f,
                 "another compose is running in this checkout; wait for it to finish"
+            ),
+            Self::CommitStandsButCheckoutMoved {
+                commit,
+                branch,
+                deciding,
+                kept,
+                undone,
+            } => write!(
+                f,
+                "the commit {commit} was made on {branch}, but this checkout moved while it was \
+                 being made and is now at {deciding}. Your index was not changed and nothing was \
+                 pushed. Files kept: {}. Files put back: {}. Only you can say which of the two \
+                 states you want.",
+                if kept.is_empty() {
+                    "none".to_owned()
+                } else {
+                    kept.join(", ")
+                },
+                if undone.is_empty() {
+                    "none".to_owned()
+                } else {
+                    undone.join(", ")
+                }
             ),
             Self::Io(detail) => write!(f, "{detail}"),
         }
@@ -364,7 +407,7 @@ impl Compose<'_> {
             self.git,
             &lease.tip,
             &Inputs {
-                declarations: &declarations,
+                declarations: declarations.as_ref(),
                 ids_file: &ids_file,
             },
             |path| self.look_at(&root, path),
@@ -377,6 +420,14 @@ impl Compose<'_> {
         let (destination, remote_has_branch) = self.destination_for(request, &lease)?;
 
         // The overlay, and then the command.
+        // What the page was shown, compared against the working tree as it is
+        // now — *before* the intent command runs. Asked again under the locks
+        // below, which is where the answer is authoritative; asked here so
+        // that a file which came back while the diff was being read is named
+        // as such, rather than reaching the intent command and being refused
+        // as an intent that matches nothing.
+        self.still_as_shown(&root, request)?;
+
         self.overlay(&root, &intent_directory, &listed)?;
         self.cli.record(&snapshot_project, &request.intent)?;
 
@@ -479,7 +530,7 @@ impl Compose<'_> {
             to_place.push(Wanted {
                 path: path.clone(),
                 bytes: bytes.clone(),
-                shown: request.shown.get(&path.to_string()).cloned(),
+                shown: request.shown.get(&path.to_string()).cloned().flatten(),
             });
         }
         let untouched: Vec<&listing::Input> = listed
@@ -493,6 +544,9 @@ impl Compose<'_> {
         // same shape the attribute check was found missing on: a path this
         // compose is about to edit can be one the listing never named, and its
         // staged entry matters just as much.
+        // Again, under the locks, which is where it decides.
+        self.still_as_shown(root, request)?;
+
         let mut checked = BTreeSet::new();
         for path in listed
             .iter()
@@ -644,14 +698,19 @@ impl Compose<'_> {
                     .chain(removals.iter().map(RepoPath::to_string))
                     .collect(),
                 message: request.intent.message(),
-                shown: record
-                    .paths
+                // Every path this preview represents, content or absence,
+                // read from the working tree rather than from the record:
+                // the record holds only what step 2 placed, and a listed file
+                // or a deletion is neither.
+                shown: entries
                     .iter()
-                    .filter_map(|placed| {
-                        placed
-                            .original
-                            .as_ref()
-                            .map(|original| (placed.path.clone(), original.blob.clone()))
+                    .map(|entry| &entry.path)
+                    .chain(removals.iter())
+                    .map(|path| {
+                        (
+                            path.to_string(),
+                            self.look_at(root, path).map(|(blob, _)| blob),
+                        )
                     })
                     .collect(),
             }));
@@ -692,25 +751,39 @@ impl Compose<'_> {
         }
         prepared.commit()?;
 
-        let head_lock_file = locks::lock_file_for(self.git, "HEAD")?;
-        held.head = Some(locks::take(
-            self.git.root(),
-            &head_lock_file,
-            record.id.as_bytes(),
-            &record.id,
-        )?);
-        let branch_lock_file = locks::lock_file_for(self.git, &lease.reference)?;
-        held.branch = Some(locks::take(
-            self.git.root(),
-            &branch_lock_file,
-            record.id.as_bytes(),
-            &record.id,
-        )?);
-        record.locks.push(RefLock {
-            reference: lease.reference.clone(),
-            lock_file: branch_lock_file.display().to_string(),
-        });
-        refs::post_write(self.git, lease, &commit)?;
+        // From here the branch has moved, and every failure below is a
+        // different kind of failure from the ones above it: the commit exists
+        // and is where `update-ref` put it. Treating one of these as a
+        // pre-write refusal would restore every placed file, remove the
+        // record, and report that nothing had changed — with a commit sitting
+        // on the branch. So they all go to the deciding-ref protocol instead.
+        let retaken = (|| -> Result<(), Refusal> {
+            let head_lock_file = locks::lock_file_for(self.git, "HEAD")?;
+            held.head = Some(locks::take(
+                self.git.root(),
+                &head_lock_file,
+                record.id.as_bytes(),
+                &record.id,
+            )?);
+            let branch_lock_file = locks::lock_file_for(self.git, &lease.reference)?;
+            held.branch = Some(locks::take(
+                self.git.root(),
+                &branch_lock_file,
+                record.id.as_bytes(),
+                &record.id,
+            )?);
+            record.locks.push(RefLock {
+                reference: lease.reference.clone(),
+                lock_file: branch_lock_file.display().to_string(),
+            });
+            refs::post_write(self.git, lease, &commit)?;
+            Ok(())
+        })();
+        if retaken.is_err() {
+            return self.decide_by_the_ref_the_checkout_is_on(
+                records, record, &commit, lease, held, placement,
+            );
+        }
 
         // Step 6: the rename that is exactly the commit step of `git`'s own
         // lock. Only a compose that has never entered `rolling-back` gets here.
@@ -772,6 +845,139 @@ impl Compose<'_> {
                 .collect(),
             hooks_did_not_run: true,
         }))
+    }
+
+    /// Every path the preview pinned still holds what it held — content where
+    /// it had content, and *nothing* where it had nothing.
+    fn still_as_shown(&self, root: &Dir, request: &Request) -> Result<(), Refusal> {
+        for (path, expected) in &request.shown {
+            let Ok(named) = RepoPath::new(path.as_bytes()) else {
+                return Err(Refusal::Place(PlaceRefusal::Changed { path: path.clone() }));
+            };
+            if self.look_at(root, &named).map(|(blob, _)| blob) != *expected {
+                return Err(Refusal::Place(PlaceRefusal::Changed { path: path.clone() }));
+            }
+        }
+        Ok(())
+    }
+
+    /// What to do when the branch moved and then something else did too.
+    ///
+    /// ADR-0015 decision 5: what becomes of the placed files is decided by the
+    /// tip of the branch the checkout is *on*, held still while it decides,
+    /// and never by the assumption that it is the UI's commit. Where `HEAD`
+    /// names another ref, the placed files belong to *that* checkout now and
+    /// the branch the UI advanced has nothing to say about them.
+    ///
+    /// A chain is refused rather than chased, for the reason step 1 refuses
+    /// one: every link would have to be locked and asked again to hold one tip
+    /// still, so it decides nothing and step 2 is undone for every path. The
+    /// same answer covers a detached `HEAD` with no branch to ask about, an
+    /// unborn target, a target no tree can be read from, and a target whose
+    /// lock cannot be created because another `git` is mid-transaction on it.
+    fn decide_by_the_ref_the_checkout_is_on(
+        &self,
+        records: &Records,
+        record: &mut Record,
+        commit: &str,
+        lease: &Lease,
+        mut held: Guard,
+        placement: &mut Placement,
+    ) -> Result<Done, Refusal> {
+        let deciding = self.deciding_tip(record, lease);
+        // The whole entry set of the deciding tip for the paths in question,
+        // read as *entries*: the same blob at `100755` is a file the placed
+        // one does not match, and a `120000` or `160000` entry with that id is
+        // not a file at all.
+        let (kept, selected) = decide_paths(deciding.as_deref(), &record.paths, |tip, path| {
+            self.entry_at(tip, path)
+        });
+        for placed in &mut record.paths {
+            placed.keep = Some(kept.contains(&placed.path));
+        }
+        // Published *before* the first undo, with the complete per-path
+        // decision. A failure to publish leaves every placement as it is and
+        // reports: an undo whose direction recovery cannot know must not be
+        // started.
+        record
+            .advance(Phase::RollingBack)
+            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        records
+            .publish(record)
+            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.reached(Phase::RollingBack);
+
+        let keeping: BTreeSet<String> = kept.iter().cloned().collect();
+        placement.undo_selected(&|path: &str| keeping.contains(path));
+        // A kept path still owes step 2's retention: the file it displaced is
+        // beside it under a temporary name and must not be left there.
+        let previous_directory = self.git_dir.join("pbps-ui").join("previous");
+        let _ = std::fs::create_dir_all(&previous_directory);
+        if let Ok(previous) = Dir::open_root(&previous_directory) {
+            placement.finish(&previous);
+        }
+        // The prepared index is discarded without being installed, and the
+        // locks go with it. The record stays only if something could not be
+        // put back, which `undo_selected` reports through the page.
+        held.release();
+        let _ = records.remove(record);
+        Err(Refusal::CommitStandsButCheckoutMoved {
+            commit: commit.to_owned(),
+            branch: lease.reference.clone(),
+            deciding: deciding.unwrap_or_else(|| "a ref with no commit".to_owned()),
+            kept,
+            undone: selected,
+        })
+    }
+
+    /// The tip that decides, read from the name its own lock holds.
+    ///
+    /// `None` where nothing can be held still long enough to decide by: a
+    /// chain, a lock another `git` holds, or a target with no commit. Every
+    /// one of those undoes step 2 for every path, which asks no tip at all.
+    fn deciding_tip(&self, record: &mut Record, lease: &Lease) -> Option<String> {
+        let target = refs::head_names(self.git).ok()?;
+        let lock_file = locks::lock_file_for(self.git, &target).ok()?;
+        // Taken here the way the others are, and named in the record before it
+        // is relied on, so a crash in the rollback leaves one the record can
+        // both name and tell from another `git`'s.
+        record.locks.push(RefLock {
+            reference: target.clone(),
+            lock_file: lock_file.display().to_string(),
+        });
+        let held = locks::take(
+            self.git.root(),
+            &lock_file,
+            record.id.as_bytes(),
+            &record.id,
+        )
+        .ok()?;
+        let tip = refs::must_be_direct(self.git, &target)
+            .ok()
+            .and_then(|()| refs::tip_of(self.git, &target).ok());
+        // Held only while the question is asked; the answer is the value its
+        // lock held.
+        let _ = held.release();
+        let _ = lease;
+        tip
+    }
+
+    /// One path's whole entry in a tree: the mode and the object id.
+    fn entry_at(&self, tree_ish: &str, path: &str) -> Option<(u32, String)> {
+        let answer = self
+            .git
+            .run(&["ls-tree", "-z", tree_ish, "--", path])
+            .ok()?;
+        if !answer.ok() {
+            return None;
+        }
+        let record = answer.stdout.split(|b| *b == 0).find(|r| !r.is_empty())?;
+        let tab = record.iter().position(|b| *b == b'\t')?;
+        let head = String::from_utf8_lossy(&record[..tab]).into_owned();
+        let mut fields = head.split_whitespace();
+        let mode = u32::from_str_radix(fields.next()?, 8).ok()?;
+        let _kind = fields.next()?;
+        Some((mode, fields.next()?.to_owned()))
     }
 
     /// The destination, and whether the remote already has the branch.
@@ -911,7 +1117,7 @@ impl Compose<'_> {
         &self,
         snapshot_project: &Path,
         inputs: &super::cli::Where,
-    ) -> Result<(RepoPath, RepoPath), Refusal> {
+    ) -> Result<(Option<RepoPath>, RepoPath), Refusal> {
         // `Project::schema_dir` and `Project::ids_file` join the configured
         // path to the root, and a configured absolute path discards the root:
         // an intent command pointed at the snapshot would otherwise read the
@@ -929,7 +1135,15 @@ impl Compose<'_> {
         // Both shapes are resolved against the snapshot's project directory
         // and then required to lie under it.
         let base = snapshot_project.canonicalize().map_err(|_| outside())?;
-        let relative = |answer: &str| -> Option<RepoPath> {
+        // The answer may name the project directory itself. `schema_dir: .`
+        // is a supported layout, and for a project at the worktree root
+        // `doctor` then answers `./.`, which normalises to *nothing* relative
+        // to the root — a path `RepoPath` refuses, and rightly, since the
+        // empty path and `.` are not names. So the two answers are resolved
+        // to an `Option`: `None` is the root, which is a place, not a missing
+        // one. Requiring a `RepoPath` here refused every compose in that
+        // layout.
+        let within = |answer: &str| -> Option<PathBuf> {
             let given = Path::new(answer);
             let joined = if given.is_absolute() {
                 given.to_path_buf()
@@ -937,14 +1151,23 @@ impl Compose<'_> {
                 base.join(given)
             };
             let stripped = normalize(&joined).strip_prefix(&base).ok()?.to_owned();
-            let within = match self.project.and_then(RepoPath::to_text) {
+            Some(match self.project.and_then(RepoPath::to_text) {
                 None => stripped,
                 Some(relative) => Path::new(relative).join(stripped),
-            };
-            RepoPath::new(within.to_str()?.as_bytes()).ok()
+            })
         };
-        let declarations = relative(&inputs.declarations).ok_or_else(outside)?;
-        let ids_file = relative(&inputs.identity_file).ok_or_else(outside)?;
+        let declarations = match within(&inputs.declarations).ok_or_else(outside)? {
+            path if path.as_os_str().is_empty() => None,
+            path => Some(
+                RepoPath::new(path.to_str().ok_or_else(outside)?.as_bytes())
+                    .map_err(|_| outside())?,
+            ),
+        };
+        // The ids file is a file, so an empty answer for it is not a layout
+        // but a broken one.
+        let ids_path = within(&inputs.identity_file).ok_or_else(outside)?;
+        let ids_file = RepoPath::new(ids_path.to_str().ok_or_else(outside)?.as_bytes())
+            .map_err(|_| outside())?;
         Ok((declarations, ids_file))
     }
 
@@ -1148,6 +1371,41 @@ pub(super) fn hash_file(path: &Path) -> Result<String, String> {
     Ok(format!("{hash:016x}"))
 }
 
+/// Which placed paths the deciding tip keeps, and which are undone.
+///
+/// A pure function, because it is the one decision in this protocol that has
+/// to be right in states nobody can arrange on demand — `HEAD` redirected in
+/// a window measured in milliseconds — and a decision that can only be
+/// observed through such a race is one nothing can pin.
+///
+/// A path is kept only where the deciding tip holds **exactly** what step 3
+/// recorded for it: the mode and the object id, never the id alone, since the
+/// same blob at `100755` is a file the placed one does not match and a
+/// `120000` entry with that id is not a file at all. Everything else is
+/// undone, including every path when there is no tip to decide by.
+pub fn decide_paths(
+    deciding: Option<&str>,
+    placed: &[Placed],
+    entry_at: impl Fn(&str, &str) -> Option<(u32, String)>,
+) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut undone = Vec::new();
+    for path in placed {
+        let keep = match (deciding, &path.entry_mode, &path.entry_blob) {
+            (Some(tip), Some(mode), Some(blob)) => {
+                entry_at(tip, &path.path) == Some((*mode, blob.clone()))
+            }
+            _ => false,
+        };
+        if keep {
+            kept.push(path.path.clone());
+        } else {
+            undone.push(path.path.clone());
+        }
+    }
+    (kept, undone)
+}
+
 /// Resolve `.` and `..` without touching the filesystem.
 ///
 /// Lexical rather than `canonicalize`, because the ids file may not exist yet
@@ -1191,4 +1449,99 @@ fn walk(base: &Path, here: &Path) -> Vec<(String, Vec<u8>)> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::record::Identity;
+
+    fn placed(path: &str, mode: Option<u32>, blob: Option<&str>) -> Placed {
+        Placed {
+            path: path.to_owned(),
+            temporary: format!("{path}.tmp"),
+            original: None,
+            replacement: Identity {
+                blob: "r".to_owned(),
+                device: 1,
+                inode: 2,
+            },
+            entry_mode: mode,
+            entry_blob: blob.map(str::to_owned),
+            keep: None,
+            retained_as: None,
+            undone: false,
+        }
+    }
+
+    #[test]
+    fn a_path_is_kept_only_where_the_deciding_tip_holds_exactly_what_was_recorded() {
+        let paths = [
+            placed("schema/a.yml", Some(0o100644), Some("aaa")),
+            placed("schema/b.yml", Some(0o100644), Some("bbb")),
+        ];
+        let (kept, undone) = decide_paths(Some("tip"), &paths, |_, path| match path {
+            "schema/a.yml" => Some((0o100644, "aaa".to_owned())),
+            _ => Some((0o100644, "something else".to_owned())),
+        });
+        assert_eq!(kept, vec!["schema/a.yml"]);
+        assert_eq!(undone, vec!["schema/b.yml"]);
+    }
+
+    #[test]
+    fn the_same_blob_at_another_mode_is_a_file_the_placed_one_does_not_match() {
+        // The mode is read with the object id and not after it: a declaration
+        // committed executable is not the file that was placed, and keeping it
+        // would leave the checkout disagreeing with the tip it was kept for.
+        let paths = [placed("schema/a.yml", Some(0o100644), Some("aaa"))];
+        let (kept, undone) = decide_paths(Some("tip"), &paths, |_, _| {
+            Some((0o100755, "aaa".to_owned()))
+        });
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(undone, vec!["schema/a.yml"]);
+    }
+
+    #[test]
+    fn a_link_or_a_submodule_carrying_that_id_is_not_a_file_either() {
+        let paths = [placed("schema/a.yml", Some(0o100644), Some("aaa"))];
+        for mode in [0o120000, 0o160000] {
+            let (kept, _) =
+                decide_paths(Some("tip"), &paths, |_, _| Some((mode, "aaa".to_owned())));
+            assert!(kept.is_empty(), "mode {mode:o} was kept");
+        }
+    }
+
+    #[test]
+    fn nothing_is_kept_where_there_is_no_tip_to_decide_by() {
+        // A chain, a lock another `git` holds, a detached `HEAD` with no
+        // branch to ask about, an unborn target, a target no tree can be read
+        // from: every one of them decides nothing, so step 2 is undone for
+        // every path. The shapes differ; the answer does not.
+        let paths = [
+            placed("schema/a.yml", Some(0o100644), Some("aaa")),
+            placed("schema/b.yml", Some(0o100644), Some("bbb")),
+        ];
+        let (kept, undone) =
+            decide_paths(None, &paths, |_, _| panic!("no tip means no entry is read"));
+        assert!(kept.is_empty());
+        assert_eq!(undone.len(), 2);
+    }
+
+    #[test]
+    fn a_path_the_deciding_tip_does_not_hold_at_all_is_undone() {
+        let paths = [placed("schema/new.yml", Some(0o100644), Some("aaa"))];
+        let (kept, undone) = decide_paths(Some("tip"), &paths, |_, _| None);
+        assert!(kept.is_empty());
+        assert_eq!(undone, vec!["schema/new.yml"]);
+    }
+
+    #[test]
+    fn a_path_step_three_never_recorded_an_entry_for_is_undone_rather_than_guessed() {
+        let paths = [placed("schema/a.yml", None, None)];
+        let (kept, undone) = decide_paths(Some("tip"), &paths, |_, _| {
+            Some((0o100644, "aaa".to_owned()))
+        });
+        assert!(kept.is_empty());
+        assert_eq!(undone, vec!["schema/a.yml"]);
+    }
 }
