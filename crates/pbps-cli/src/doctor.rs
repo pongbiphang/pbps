@@ -25,6 +25,49 @@ use pbps_db::Conn;
 
 use crate::{db, output};
 
+/// A path projection, deliberately before any declaration/identity/DB read.
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct InputPaths {
+    pub mode: InputPathMode,
+    pub project_file: String,
+    pub declarations: String,
+    pub identity_file: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputPathMode {
+    PathsOnly,
+}
+
+// The default report stays byte-shape compatible. Only the explicit new flag
+// selects the path projection; zero table counts would falsely imply a load.
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum DoctorData {
+    Readiness(Diagnosis),
+    Paths(InputPaths),
+}
+
+pub fn input_paths(project: &Project, json: bool) -> anyhow::Result<()> {
+    let data = InputPaths {
+        mode: InputPathMode::PathsOnly,
+        project_file: project.config_file().display().to_string(),
+        declarations: project.schema_dir().display().to_string(),
+        identity_file: project.ids_file().display().to_string(),
+    };
+    if json {
+        output::Report::new("doctor", Vec::new(), Some(data)).emit_json()
+    } else {
+        println!(
+            "Project: {}\nDeclarations: {}\nIdentity: {}",
+            data.project_file, data.declarations, data.identity_file
+        );
+        Ok(())
+    }
+}
+
 /// Everything `doctor` learned, for `--format json`.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Diagnosis {

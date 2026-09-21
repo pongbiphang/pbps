@@ -65,7 +65,7 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 
 [ADR-0017](ADR-0017-isolated-compose.md) is accepted design for #494; the shipped
 viewer remains read-only until #745–#748 are implemented and qualified. Raw file
-capture is an explicit future orchestration responsibility, not permission to
+capture is an explicit orchestration responsibility, not permission to
 move schema interpretation into the UI (#750).
 
 | Responsibility | Owner and boundary |
@@ -82,6 +82,11 @@ crate and no YAML/model parser in the UI. Its own JSON types describe CLI report
 and operational candidate/recovery metadata, not a second schema model. Any new
 semantic question must gain a CLI subprocess answer, not a UI-side validator.
 Database transport and deployment remain outside this compose flow.
+The #745 backend uses `doctor --paths-only` to establish contained input paths
+before schema loading and `plan --no-dev` when it needs to resolve ids without
+the optional rehearsal. Its cryptographic digest and Linux filesystem/process
+dependencies do not interpret project/schema data. Node.js is a development
+test runtime for the shipped browser module, not a product dependency.
 
 ## Planned engine-assisted planning
 

@@ -1,6 +1,6 @@
 # ADR-0017: Compose an isolated candidate and publish a new branch
 
-- Status: accepted design; production compose remains unimplemented
+- Status: candidate backend implemented; publication/recovery remain disabled
 - Date: 2026-09-21
 - Supersedes: ADR-0015 decision 5's same-checkout publication protocol and
   PR #738's proposed DECISIONS 524 live-placement preview
@@ -58,16 +58,22 @@ the capture. Changes after the candidate is sealed do not enter that candidate.
    configurations. Symlinks, gitlinks, paths escaping the project, unreadable
    inputs and unqualified platforms are refusals, not omitted inputs.
 2. Read the base's raw blobs without checkout/archive transforms. Use the CLI's
-   `doctor` envelope to locate declaration and identity inputs. Configuration
+   `doctor --paths-only` envelope to locate declaration and identity inputs
+   before any declaration/identity read. Configuration
    must match the base; the complete edited declaration membership and ids are
    captured with their relevant modes and absence information. Reconcile the
    captured ids against the base under the same CLI semantics. A private
    snapshot may not fall back to live paths or a parent checkout's discovery.
 3. Run the ordinary intent command and `validate` in that isolated snapshot.
+   For declaration-only intent, `plan --no-dev` resolves ids without the
+   project's optional dev rehearsal; `plan --check` validates the result
+   against the captured base without writes or engine access.
    Build the complete resulting Git tree with a private index; all entries
    outside the permitted declaration/identity change set remain the base's
    entries. Render the diff from that exact tree with external diff and textconv
-   disabled. Never reread live bytes to construct the preview's evidence.
+   disabled and `--text` forced, including paths marked `-diff`. A binary-only
+   summary is not a review of the declaration/ids changes.
+   Never reread live bytes to construct the preview's evidence.
 4. Allocate a fresh operation id and its output name
    `refs/heads/pbps-compose/<operation-id>` before sealing the candidate. This
    allocates a name, not a Git ref. Seal the candidate on the server and show
@@ -334,6 +340,32 @@ removes that particular requirement, but Windows compose stays disabled until
 its new filesystem/ref/durability behavior has its own qualification.
 
 ## Evidence and remaining qualification
+
+The #745 candidate service and shipped form module are covered by
+`crates/pbps-cli/tests/compose_candidate.rs` (real Git and CLI) and
+`crates/pbps-ui/tests/browser.rs` (executes the shipped JavaScript with
+controlled DOM events and asynchronous responses). The viewer serves the
+module but does not mount it or expose write endpoints before #746–#748.
+
+Initial capture uses Linux `openat2` no-follow reads, regular UTF-8 paths and
+the files ref backend. A selected project must have committed configuration;
+declaration and identity paths must be distinct and contained, and the
+declaration directory cannot be the project root. The latter does not redefine
+the loader policy tracked by #739. Filter, ident and encoding attributes,
+uncommitted relevant attributes, conversion-dependent CR input, ignored new
+declarations and special index flags refuse capture. Git mode is the observed
+executable bit even when a user's ordinary Git configuration ignores modes.
+The CLI remains available for unsupported capture layouts.
+
+Each workflow retains one unconfirmed candidate for at most 24 hours. Source
+capture and the base project snapshot each have a 64 MiB budget, subprocess
+output has a 64 MiB limit per stream, and traversal is bounded by 4096 entries
+and 64 directory levels. The base tree outside the project is reused without
+materialization; its complete private index is also limited to 4096 entries.
+Confirmed candidates cannot be refreshed or expired by the
+preview service; publication/receipt retirement belongs to #746/#747.
+The private object view currently borrows base objects through an alternate;
+#747 must establish durable GC reachability before enabling operations.
 
 [`spikes/git-compose-isolated`](../spikes/git-compose-isolated/README.md) runs
 real Git and the baseline CLI against local disposable repositories. It checks
