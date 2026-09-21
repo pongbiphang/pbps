@@ -24,6 +24,8 @@ pub mod push;
 #[cfg(target_os = "linux")]
 pub mod record;
 #[cfg(target_os = "linux")]
+pub mod recover;
+#[cfg(target_os = "linux")]
 pub mod refs;
 pub mod repo_path;
 #[cfg(target_os = "linux")]

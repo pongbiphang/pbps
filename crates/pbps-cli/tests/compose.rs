@@ -139,6 +139,7 @@ fn compose<'a>(checkout: &Checkout, git: &'a Git, cli: &'a Cli, file: &'a RepoPa
         project_file: file,
         git_dir: checkout.path(".git"),
         remote_name: "pbps-ui-test".to_owned(),
+        watching: None,
     }
 }
 
@@ -353,3 +354,221 @@ fn records_of(checkout: &Checkout) -> Vec<String> {
 /// Unused today, kept because every test above reaches for the same shape.
 #[allow(dead_code)]
 fn _assert_path(_: &Path) {}
+
+// ---------------------------------------------------------------------------
+// The interruption harness ADR-0015's Limits section requires of step 4.
+// ---------------------------------------------------------------------------
+
+/// The example binary beside `pbps` in the same target directory. Cargo
+/// exposes a test's own binaries but not its examples, and the layout is the
+/// one thing about a target directory that is stable.
+fn interrupter() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_pbps"))
+        .parent()
+        .expect("the binary is in a directory")
+        .join("examples")
+        .join("compose-interrupted")
+}
+
+/// Run a compose that stops the moment it has published `phase`.
+fn interrupt(checkout: &Checkout, phase: &str) {
+    let output = Command::new(interrupter())
+        .args([
+            env!("CARGO_BIN_EXE_pbps"),
+            checkout.root.to_str().unwrap(),
+            phase,
+            "dbo.customer.customer_name",
+            "full_name",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "the compose was supposed to stop at {phase}, and finished instead: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn edited(checkout: &Checkout) {
+    checkout.write(
+        "schema/customer.yml",
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         full_name: {type: \"nvarchar(100)\", nullable: true}\nprimary_key: [id]\n",
+    );
+}
+
+#[test]
+fn an_interruption_after_placing_is_rolled_back_and_installs_no_index() {
+    let checkout = Checkout::new("interrupt-placing");
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    edited(&checkout);
+    let before = checkout.read("schema/customer.yml");
+    let ids_before = checkout.read("schema.ids.json");
+
+    interrupt(&checkout, "placing");
+
+    // The crash left a record and, since `placing` is published *before* the
+    // first exchange, nothing yet placed.
+    assert_eq!(
+        records_of(&checkout).len(),
+        1,
+        "the record survives the crash"
+    );
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert!(
+        matches!(
+            recovered[0],
+            pbps_ui::compose::recover::Recovered::RolledBack { .. }
+        ),
+        "{recovered:?}"
+    );
+
+    assert_eq!(
+        checkout.git(&["rev-parse", "HEAD"]),
+        tip,
+        "the branch did not move"
+    );
+    assert_eq!(checkout.read("schema/customer.yml"), before);
+    assert_eq!(checkout.read("schema.ids.json"), ids_before);
+    assert!(
+        !checkout.path(".git/index.lock").exists(),
+        "the prepared index was discarded, never installed"
+    );
+    assert!(records_of(&checkout).is_empty(), "and the record went last");
+
+    // Running it again changes nothing, which is what makes recovery safe to
+    // retry after a crash during recovery itself.
+    let again = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(checkout.git(&["rev-parse", "HEAD"]), tip);
+}
+
+#[test]
+fn an_interruption_between_the_branch_moving_and_the_index_is_finished_not_undone() {
+    // The gap steps 5 and 6 span: the branch is at the new commit, the working
+    // tree holds the placed files, and the index is at its old contents. The
+    // ordinary remedy — deleting the leftover lock — leaves every composed
+    // path staged as a reversion of the commit just made, which is why this is
+    // finished rather than cleaned up.
+    let checkout = Checkout::new("interrupt-composed");
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    edited(&checkout);
+
+    interrupt(&checkout, "installed");
+
+    // `installed` is published *before* the cleanup, so the crash is inside
+    // the interval, with the rename already done.
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert!(
+        matches!(
+            recovered[0],
+            pbps_ui::compose::recover::Recovered::Finished { .. }
+        ),
+        "{recovered:?}"
+    );
+
+    assert_ne!(
+        checkout.git(&["rev-parse", "HEAD"]),
+        tip,
+        "the commit stands"
+    );
+    assert_eq!(checkout.git(&["rev-parse", "HEAD^"]), tip);
+    assert_eq!(
+        checkout.git(&["status", "--porcelain"]),
+        "",
+        "and the checkout is clean, not showing the commit as a staged reversion"
+    );
+    assert!(records_of(&checkout).is_empty());
+}
+
+#[test]
+fn a_rolling_back_record_is_never_read_as_a_success_however_the_refs_look() {
+    // #152, and the one rule recovery cannot be trusted without: `HEAD` being
+    // pointed back at the composed commit must not turn a partial undo into
+    // permission to install the prepared index.
+    let checkout = Checkout::new("interrupt-rolling-back");
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    edited(&checkout);
+
+    // Stop at `composed`: the files are placed, the commit exists, the branch
+    // has not moved.
+    interrupt(&checkout, "composed");
+    let record = records_of(&checkout).remove(0);
+    let path = checkout.path(".git/pbps-ui/composing").join(&record);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let commit = json["commit"].as_str().unwrap().to_owned();
+
+    // Now make it a rolling-back record, as a refusal or a recovery would
+    // have, and put the branch *at the composed commit* — the shape that would
+    // otherwise satisfy every success check.
+    json["phase"] = serde_json::json!("rolling-back");
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    // Written straight into the ref file rather than through `update-ref`,
+    // because the crashed compose is still holding `HEAD.lock` — which is the
+    // protocol working, and not something this test should have to clear to
+    // set up the state it is about to refuse.
+    std::fs::write(checkout.path(".git/refs/heads/main"), format!("{commit}\n")).unwrap();
+    assert_eq!(checkout.git(&["rev-parse", "refs/heads/main"]), commit);
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+
+    assert!(
+        matches!(
+            recovered.first(),
+            Some(pbps_ui::compose::recover::Recovered::RolledBack { .. })
+        ),
+        "a rolling-back record resumes the rollback whatever the refs say: {recovered:?}"
+    );
+    assert!(
+        !checkout.read("schema.ids.json").contains("full_name"),
+        "the ids file holds what the compose found, not what it wrote"
+    );
+    let _ = tip;
+    assert!(
+        !checkout.path(".git/index.lock").exists(),
+        "and the prepared index was never installed"
+    );
+}
+
+#[test]
+fn a_record_whose_process_is_still_alive_is_left_entirely_alone() {
+    // A compose someone is running right now, in this UI or another launched
+    // beside it: every lock and every leftover this UI would otherwise
+    // recognise as its own kind may be that compose's, in use this instant.
+    let checkout = Checkout::new("interrupt-alive");
+    edited(&checkout);
+    interrupt(&checkout, "placing");
+    let record = records_of(&checkout).remove(0);
+    let path = checkout.path(".git/pbps-ui/composing").join(&record);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // This test process is alive, and its start time is its own.
+    json["process"]["id"] = serde_json::json!(std::process::id());
+    json["process"]["started"] = serde_json::json!(own_start_time());
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+
+    assert!(
+        matches!(
+            recovered.first(),
+            Some(pbps_ui::compose::recover::Recovered::StillRunning { .. })
+        ),
+        "{recovered:?}"
+    );
+    assert_eq!(records_of(&checkout).len(), 1, "nothing of it is reclaimed");
+}
+
+fn own_start_time() -> String {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
+    let after_name = &stat[stat.rfind(')').unwrap() + 1..];
+    after_name.split_whitespace().nth(19).unwrap().to_owned()
+}

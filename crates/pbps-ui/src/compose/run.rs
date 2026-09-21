@@ -163,6 +163,14 @@ pub struct Compose<'a> {
     pub git_dir: PathBuf,
     /// `pbps-ui-<random>`, drawn once per launch.
     pub remote_name: String,
+    /// Called with each phase after it has been published and flushed.
+    ///
+    /// The page uses it to say where a compose has got to — a compose spends
+    /// most of its time in a subprocess, and a browser waiting on a request
+    /// with nothing to show is a compose the user cannot tell from a hung one.
+    /// The interruption tests use it for the other thing a published phase
+    /// means: that the compose can be stopped here and recovered from.
+    pub watching: Option<&'a (dyn Fn(Phase) + Sync)>,
 }
 
 impl Compose<'_> {
@@ -183,6 +191,12 @@ impl Compose<'_> {
         match self.project.and_then(RepoPath::to_text) {
             None => snapshot.to_path_buf(),
             Some(relative) => snapshot.join(relative),
+        }
+    }
+
+    fn reached(&self, phase: Phase) {
+        if let Some(watching) = self.watching {
+            watching(phase);
         }
     }
 
@@ -299,6 +313,7 @@ impl Compose<'_> {
         records
             .publish(record)
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.reached(Phase::Locking);
 
         let held = Guard {
             index_lock: index_lock.clone(),
@@ -330,6 +345,7 @@ impl Compose<'_> {
             // evidence is what makes retrying an interrupted undo safe.
             if record.advance(Phase::RollingBack).is_ok() {
                 let _ = records.publish(record);
+                self.reached(Phase::RollingBack);
             }
             placement.undo_all();
         }
@@ -410,6 +426,7 @@ impl Compose<'_> {
         records
             .publish(record)
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.reached(Phase::Placing);
 
         for ready in prepared {
             placement.install(self.git, &lease.tip, ready)?;
@@ -490,6 +507,7 @@ impl Compose<'_> {
         records
             .publish(record)
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.reached(Phase::Composed);
 
         // Step 5. `update-ref` takes `HEAD`'s lock itself when `HEAD` names
         // the branch it moves, so the UI gives that lock up across the *whole*
@@ -533,6 +551,7 @@ impl Compose<'_> {
         records
             .publish(record)
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.reached(Phase::Installed);
 
         let previous_directory = self.git_dir.join("pbps-ui").join("previous");
         std::fs::create_dir_all(&previous_directory).map_err(|e| Refusal::Io(e.to_string()))?;
@@ -895,7 +914,7 @@ impl Guard {
     }
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
+pub(super) fn hash_file(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     // A cheap content identity, not a cryptographic one: what it has to do is
     // tell the UI's own copy of the index from a running `git`'s.
