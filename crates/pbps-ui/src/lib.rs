@@ -484,5 +484,16 @@ mod tests {
             !HTML.contains("https://") && !CSS.contains("https://") && !JS.contains("https://")
         );
         assert!(JS.contains("sandbox"));
+        // The confirmation sends the body the preview was made from, never one
+        // rebuilt from the form: a field edited while the preview was in
+        // flight would otherwise commit a different intent than the diff that
+        // was read. Both halves of that are shape assertions on the page,
+        // which is as much as this crate can check without a browser.
+        assert!(JS.contains("composeGeneration"));
+        assert!(JS.contains("previewed.body"));
+        assert!(
+            !JS.contains("composeRequest(\"/api/compose/record\")"),
+            "the record request must be given a body, not build one"
+        );
     }
 }

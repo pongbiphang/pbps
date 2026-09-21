@@ -1653,7 +1653,12 @@ attributable before it exists: the record naming `<index>.lock` and
 `update-ref` starts — each closing a window in which the *machine* stops,
 which no test in this suite can arrange. What can be tested is the outcome
 they enable, and is: an interruption holding both locks leaves a record from
-which recovery clears them. The
+which recovery clears them. The seventh round adds two of the same kind: an
+`update-ref --stdin` whose `commit` is answered by a deadline *after* the ref
+was installed, which is reconciled by reading the ref rather than assumed to
+have written nothing; and the deciding ref's lock being published before it
+is taken, where `HEAD` was redirected to a branch no lock in the durable
+record names. The
 interruption points *within* the rollback — after the record's publication, after each undo
 operation, after its flush, after each progress update and during retention
 cleanup — are implemented and are exercised only at their two ends. The

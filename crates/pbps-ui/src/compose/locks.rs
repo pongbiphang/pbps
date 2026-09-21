@@ -353,6 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_that_cannot_be_removed_says_so_rather_than_reporting_success() {
+        // A ref lock that survives blocks every ordinary `git` operation on
+        // that ref, and the caller is about to delete the record that would
+        // have named it. `release` has to answer, not swallow.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("stuck");
+        let held = take(&root, Path::new("HEAD.lock"), b"id\n", "id").unwrap();
+        let before = std::fs::metadata(&root).unwrap().permissions();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let refused = held.release();
+
+        std::fs::set_permissions(&root, before).unwrap();
+        assert!(
+            refused.is_err(),
+            "a lock left on disk must not read as released"
+        );
+        assert!(root.join("HEAD.lock").exists());
+    }
+
+    #[test]
     fn a_lock_for_a_packed_ref_gets_the_directory_git_would_have_made() {
         // A ref that is currently packed has no loose file and may have no
         // directory either; `git` creates it when it writes the ref, and a

@@ -795,8 +795,8 @@ impl Compose<'_> {
                 .publish(record)
                 .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
             self.reached(Phase::RollingBack);
-            let unresolved = self.put_back(placement, record);
-            held.release();
+            let mut unresolved = self.put_back(placement, record);
+            unresolved.extend(held.release());
             if !unresolved.is_empty() {
                 // A preview that could not put everything back is not a
                 // preview that changed nothing, and its record is the only
@@ -887,7 +887,25 @@ impl Compose<'_> {
             prepared.abort()?;
             return Err(Refusal::Ref(refusal));
         }
-        prepared.commit()?;
+        // An error here does **not** mean the write did not happen. The
+        // acknowledgement and the process exit are read after `commit` is
+        // sent, so a deadline — or any unexpected answer — can arrive with the
+        // ref already installed. Assuming otherwise would restore every placed
+        // file and report that nothing changed, with the commit on the branch.
+        // The ref is asked instead, which is the only thing that knows.
+        if let Err(refusal) = prepared.commit() {
+            return match refs::tip_of(self.git, &lease.reference) {
+                // The branch is where it was, so nothing was written and this
+                // is an ordinary refusal.
+                Ok(tip) if tip == lease.tip => Err(Refusal::Ref(refusal)),
+                // Anything else — the commit installed after all, some third
+                // value, or a ref that cannot be read — is a state only the
+                // deciding-ref protocol is allowed to judge.
+                Ok(_) | Err(_) => self.decide_by_the_ref_the_checkout_is_on(
+                    records, record, &commit, lease, held, placement,
+                ),
+            };
+        }
 
         // From here the branch has moved, and every failure below is a
         // different kind of failure from the ones above it: the commit exists
@@ -961,8 +979,15 @@ impl Compose<'_> {
             .chain(trouble)
             .collect();
 
-        held.release();
-        let _ = records.remove(record);
+        // A lock that will not go is not a detail: it blocks every ordinary
+        // `git` operation on that ref, and the record about to be removed is
+        // the only thing that would have named it. It is reported beside the
+        // commit, and it keeps the record.
+        let stuck = held.release();
+        if stuck.is_empty() {
+            let _ = records.remove(record);
+        }
+        let retained: Vec<String> = retained.into_iter().chain(stuck).collect();
         let _ = std::fs::remove_dir_all(intent_directory);
 
         // The push, last, and only once the checkout is the commit's. Every
@@ -1088,7 +1113,7 @@ impl Compose<'_> {
         mut held: Guard,
         placement: &mut Placement,
     ) -> Result<Done, Refusal> {
-        let (deciding, deciding_lock) = self.deciding_tip(record, lease);
+        let (deciding, deciding_lock) = self.deciding_tip(records, record, lease);
         // The whole entry set of the deciding tip for the paths in question,
         // read as *entries*: the same blob at `100755` is a file the placed
         // one does not match, and a `120000` or `160000` entry with that id is
@@ -1136,7 +1161,7 @@ impl Compose<'_> {
         // The prepared index is discarded without being installed, and the
         // locks go with it. The record stays only if something could not be
         // put back, which `undo_selected` reports through the page.
-        held.release();
+        let stuck = held.release();
         // Held from before the tip was read until after every selected path
         // has been undone: releasing it the moment the tip was read would let
         // another worktree advance that ref during the decision, and the files
@@ -1152,6 +1177,7 @@ impl Compose<'_> {
             kept,
             undone: selected,
         };
+        let unresolved: Vec<String> = unresolved.into_iter().chain(stuck).collect();
         if unresolved.is_empty() {
             let _ = records.remove(record);
             Err(why)
@@ -1172,7 +1198,12 @@ impl Compose<'_> {
     /// `None` where nothing can be held still long enough to decide by: a
     /// chain, a lock another `git` holds, or a target with no commit. Every
     /// one of those undoes step 2 for every path, which asks no tip at all.
-    fn deciding_tip(&self, record: &mut Record, lease: &Lease) -> (Option<String>, Option<Held>) {
+    fn deciding_tip(
+        &self,
+        records: &Records,
+        record: &mut Record,
+        lease: &Lease,
+    ) -> (Option<String>, Option<Held>) {
         let Ok(target) = refs::head_names(self.git) else {
             return (None, None);
         };
@@ -1182,10 +1213,23 @@ impl Compose<'_> {
         // Taken here the way the others are, and named in the record before it
         // is relied on, so a crash in the rollback leaves one the record can
         // both name and tell from another `git`'s.
+        // Named in the record and *published* before it is taken. Where
+        // `HEAD` was redirected this is a branch no lock already in the
+        // durable record names, so a stop between taking it and the next
+        // publication would leave recovery removing the record and leaving
+        // that lock — blocking every update to that branch. The same ordering
+        // as step 0's, for the same reason.
         record.locks.push(RefLock {
             reference: target.clone(),
-            lock_file: lock_file.display().to_string(),
+            lock_file: if lock_file.is_absolute() {
+                lock_file.display().to_string()
+            } else {
+                self.git.root().join(&lock_file).display().to_string()
+            },
         });
+        if records.publish(record).is_err() {
+            return (None, None);
+        }
         let Ok(held) = locks::take(
             self.git.root(),
             &lock_file,
@@ -1627,22 +1671,44 @@ struct Guard {
 
 impl Guard {
     /// Idempotent: each lock is taken out of its `Option`, and removing a
-    /// file that is already gone — which is what step 6's rename leaves —
-    /// is not an error.
-    fn release(&mut self) {
-        if let Some(head) = self.head.take() {
-            let _ = head.release();
+    /// file that is already gone — which is what step 6's rename leaves — is
+    /// not an error.
+    ///
+    /// Answers what it could *not* remove. A ref lock that survives blocks
+    /// every ordinary `git` operation on that ref, and a caller that then
+    /// deleted the record and reported success would leave it with nothing to
+    /// name it. `Drop` stays the best-effort fallback; this is the path that
+    /// has somebody to tell.
+    fn release(&mut self) -> Vec<String> {
+        let mut stuck = Vec::new();
+        for (what, lock) in [
+            ("HEAD", self.head.take()),
+            ("the branch", self.branch.take()),
+        ] {
+            if let Some(lock) = lock {
+                let path = lock.path().display().to_string();
+                if let Err(e) = lock.release() {
+                    stuck.push(format!("{what}'s lock at {path} could not be removed: {e}"));
+                }
+            }
         }
-        if let Some(branch) = self.branch.take() {
-            let _ = branch.release();
+        if let Err(e) = std::fs::remove_file(&self.index_lock)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            stuck.push(format!(
+                "the index lock at {} could not be removed: {e}",
+                self.index_lock.display()
+            ));
         }
-        let _ = std::fs::remove_file(&self.index_lock);
+        stuck
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.release();
+        // Best effort, and nobody to tell: the paths that have somebody call
+        // `release` themselves and report what it answers.
+        let _ = self.release();
     }
 }
 

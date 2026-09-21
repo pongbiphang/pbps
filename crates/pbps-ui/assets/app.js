@@ -22,7 +22,7 @@
     "rename-role": ["Old role name", "New role name", (a, b) => `rename role ${a} ${b}`],
     "drop-role": ["Role name", "Why it is being dropped", a => `drop role ${a}`]
   };
-  let context = null, previewed = null;
+  let context = null, previewed = null, composeGeneration = 0;
   let current = "status", generation = 0;
   function node(tag, text, className) {
     const el = document.createElement(tag);
@@ -126,13 +126,15 @@
       intent,
       message: byId("compose-message").value,
       remote: byId("compose-remote").value,
-      // What the preview read, sent back so the confirmation is checked
-      // against the files as they are *now*: an editor that saved while you
-      // were reading the diff is refused rather than overwritten.
-      shown: previewed ? previewed.shown : {}
+      shown: {}
     };
   }
   function describeIntent() {
+    // Every edit invalidates whatever preview is on screen *and* whatever
+    // preview is still in flight: a response that landed afterwards would
+    // otherwise re-enable the button for a diff of the old intent, while the
+    // confirmation rebuilt its body from the new fields.
+    ++composeGeneration;
     const kind = byId("compose-kind").value, shape = intents[kind];
     byId("compose-first-label").textContent = shape[0];
     byId("compose-second-label").textContent = shape[1];
@@ -149,7 +151,7 @@
     }
     return box;
   }
-  async function composeRequest(route) {
+  async function composeRequest(route, body) {
     activity.className = ""; activity.textContent = "Working…";
     content.replaceChildren(); findings.replaceChildren();
     const response = await fetch(route, {
@@ -157,7 +159,7 @@
       headers: {"X-Pbps-Token": token, "Content-Type": "application/json"},
       cache: "no-store",
       credentials: "omit",
-      body: JSON.stringify(intentBody())
+      body: JSON.stringify(body)
     });
     const answer = await response.json();
     if (!answer.ok) {
@@ -258,9 +260,16 @@
   for (const id of ["compose-first", "compose-second"]) byId(id).addEventListener("input", describeIntent);
   byId("compose").addEventListener("submit", async event => {
     event.preventDefault();
-    const preview = await composeRequest("/api/compose/preview");
+    const asked = composeGeneration, body = intentBody();
+    const preview = await composeRequest("/api/compose/preview", body);
     if (!preview) return;
-    previewed = preview;
+    if (asked !== composeGeneration) {
+      activity.textContent = "That diff was for the previous intent; ask again.";
+      return;
+    }
+    // The body is kept with the diff, not rebuilt from the form: the thing
+    // committed has to be the thing that was read.
+    previewed = {preview, body: {...body, shown: preview.shown}};
     const box = panel(`What ${preview.branch} would gain`);
     box.append(renderDiff(preview.diff));
     const list = node("ul");
@@ -272,7 +281,7 @@
   });
   byId("compose-record").addEventListener("click", async () => {
     if (!previewed) return;
-    const composed = await composeRequest("/api/compose/record");
+    const composed = await composeRequest("/api/compose/record", previewed.body);
     if (!composed) return;
     byId("compose-record").hidden = true; previewed = null;
     const box = panel("Recorded");
