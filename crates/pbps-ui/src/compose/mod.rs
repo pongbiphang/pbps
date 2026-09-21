@@ -16,6 +16,8 @@ pub mod listing;
 #[cfg(target_os = "linux")]
 pub mod locks;
 #[cfg(target_os = "linux")]
+pub mod place;
+#[cfg(target_os = "linux")]
 pub mod record;
 #[cfg(target_os = "linux")]
 pub mod refs;
@@ -24,3 +26,5 @@ pub mod repo_path;
 pub mod scratch_repo;
 #[cfg(target_os = "linux")]
 pub mod snapshot;
+#[cfg(target_os = "linux")]
+pub mod tree;
