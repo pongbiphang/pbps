@@ -366,6 +366,9 @@ jobs:
         run: sudo python3 scripts/live-resolver-server.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: Namespace procfs identity and task observation
+        if: matrix.engine == 'pg'
+        run: sudo python3 scripts/live-resolver-namespace.py --test-binary "$PBPS_FIXTURE_BINARY"
 
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.
