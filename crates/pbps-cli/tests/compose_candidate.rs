@@ -1015,21 +1015,38 @@ fn links_unreadable_inputs_and_literal_unspecified_filters_are_named_refusals() 
         if variant == "link" {
             fs::remove_file(repo.project.join("schema/t.yml")).unwrap();
             symlink("../schema.ids.json", repo.project.join("schema/t.yml")).unwrap();
-        } else if variant == "unreadable" {
-            fs::set_permissions(
-                repo.project.join("schema/t.yml"),
-                fs::Permissions::from_mode(0o0),
-            )
-            .unwrap();
         }
-        let error = match repo.store().preview(request(), SystemTime::now()) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("accepted {variant}"),
-        };
-        assert!(
-            error.contains("link") || error.contains("unreadable") || error.contains("filter"),
-            "{error}"
-        );
+        let before = repo.preserved();
+        let path = repo.project.join("schema/t.yml");
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readable_without_mode_bits = false;
+        if variant == "unreadable" {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+            // Root or DAC override can still read mode 000. Test actual access
+            // rather than treating permission bits as a guaranteed read error.
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    assert_eq!(bytes, RENAMED.as_bytes());
+                    readable_without_mode_bits = true;
+                }
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+            }
+            eprintln!("mode-000 readability: {readable_without_mode_bits}");
+        }
+        let result = repo.store().preview(request(), SystemTime::now());
+        if variant == "unreadable" {
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0);
+            // Restore only the fixture's permission change so its preserved
+            // bytes can be checked even by the unprivileged test process.
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        assert_eq!(repo.preserved(), before);
+        if readable_without_mode_bits {
+            assert!(result.unwrap().diff.contains("+  ident:"));
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(variant), "{error}");
+        }
     }
 }
 
