@@ -290,6 +290,7 @@ struct AttributeView {
     directory: PathBuf,
     index: PathBuf,
     recorded: BTreeMap<String, Option<FileBytes>>,
+    normalizer: Git,
 }
 
 impl AttributeView {
@@ -371,7 +372,12 @@ impl AttributeView {
             );
         }
         let mut recorded = blobs(git, &entries)?;
-        Ok(Self {
+        let view = Self {
+            normalizer: Git {
+                root: directory.clone(),
+                hooks: git.hooks.clone(),
+                deadline: git.deadline,
+            },
             directory,
             index,
             recorded: paths
@@ -381,7 +387,68 @@ impl AttributeView {
                     (name, bytes)
                 })
                 .collect(),
-        })
+        };
+        view.normalize_command(
+            &[
+                "init",
+                "-q",
+                "--object-format=sha256",
+                &format!("--template={}", git.hooks.display()),
+            ],
+            &[],
+            false,
+        )?;
+        fs::create_dir_all(view.directory.join(".git/info"))
+            .map_err(|_| Error::new("Could not prepare the private line-ending policy"))?;
+        Ok(view)
+    }
+
+    fn normalize_command(&self, args: &[&str], input: &[u8], autocrlf: bool) -> Result<Vec<u8>> {
+        let mut command = self.normalizer.command();
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "core.safecrlf=false",
+                "-c",
+                if autocrlf {
+                    "core.autocrlf=true"
+                } else {
+                    "core.autocrlf=false"
+                },
+            ])
+            .args(args);
+        let output = super::process::run(command, input, self.normalizer.deadline)?;
+        if !output.status.success() {
+            return Err(Error::new("Could not check the captured line endings"));
+        }
+        Ok(output.stdout)
+    }
+
+    fn converts(&self, bytes: &[u8], policy: &str, autocrlf: bool) -> Result<bool> {
+        // Only the closed, Git-resolved text policy enters this private repo.
+        // No source config/attributes/helpers are loaded, and bytes use stdin.
+        // Git itself decides CRLF/binary heuristics, including bare CR mixed
+        // with CRLF under text=auto. `input` and `true` have the same inbound
+        // normalization; checkout and safecrlf warnings are not involved.
+        fs::write(
+            self.directory.join(".git/info/attributes"),
+            format!("probe {policy} -filter -ident -working-tree-encoding\n"),
+        )
+        .map_err(|_| Error::new("Could not set the private line-ending policy"))?;
+        let raw =
+            self.normalize_command(&["hash-object", "--no-filters", "--stdin"], bytes, autocrlf)?;
+        let converted =
+            self.normalize_command(&["hash-object", "--path=probe", "--stdin"], bytes, autocrlf)?;
+        for oid in [&raw, &converted] {
+            if oid.len() != 65 || oid[64] != b'\n' || !oid[..64].iter().all(u8::is_ascii_hexdigit) {
+                return Err(Error::new("Incomplete captured line-ending evidence"));
+            }
+        }
+        Ok(raw != converted)
     }
 
     fn files(&self, root: &Root) -> Result<BTreeMap<String, Option<super::Evidence>>> {
@@ -492,7 +559,10 @@ fn manifest(
                 "" => crlf,
                 _ => true,
             };
-            if file.bytes.contains(&b'\r') && converts {
+            if converts
+                && file.bytes.windows(2).any(|bytes| bytes == b"\r\n")
+                && view.converts(&file.bytes, &line_endings[name], crlf)?
+            {
                 return Err(Error::new(
                     "Compose inputs must not require Git line-ending conversion",
                 ));

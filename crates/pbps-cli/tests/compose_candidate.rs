@@ -479,6 +479,12 @@ fn git_boolean_aliases_cannot_admit_conversion_dependent_carriage_returns() {
         let result = repo.store().preview(request(), SystemTime::now());
         if raw != ordinary {
             assert!(result.is_err(), "accepted conversion under {value}");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must not require Git line-ending conversion")
+            );
         } else {
             assert!(
                 result.is_ok(),
@@ -539,6 +545,86 @@ fn legacy_and_modern_line_ending_attributes_follow_git_precedence() {
                 result.is_ok(),
                 raw == ordinary,
                 "wrong capture admission for {path}: {attribute}, autocrlf={autocrlf}"
+            );
+            if raw != ordinary {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("must not require Git line-ending conversion")
+                );
+            }
+        }
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
+#[test]
+fn only_actual_line_ending_conversion_refuses_a_valid_declaration() {
+    for (index, (policy, autocrlf, content)) in [
+        ("text", "false", RENAMED.replace('\n', "\r")),
+        ("text", "false", RENAMED.replace('\n', "\r\n")),
+        (
+            "text=auto",
+            "false",
+            RENAMED.replacen('\n', "\r", 1).replace('\n', "\r\n"),
+        ),
+        ("text=auto", "false", RENAMED.replace('\n', "\r\n")),
+        (
+            "text",
+            "false",
+            RENAMED.replacen('\n', "\r", 1).replace('\n', "\r\n"),
+        ),
+        (
+            "!text",
+            "true",
+            RENAMED.replacen('\n', "\r", 1).replace('\n', "\r\n"),
+        ),
+        ("!text", "input", RENAMED.replace('\n', "\r")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let repo = Repository::new(&format!("actual-eol-{index}"), "");
+        git(&repo.root, &["config", "core.autocrlf", autocrlf]);
+        fs::write(
+            repo.root.join(".gitattributes"),
+            format!("schema/*.yml {policy}\n"),
+        )
+        .unwrap();
+        repo.commit();
+        repo.table(&content);
+        checked(repo.cli(&["validate"]));
+        let raw = git(&repo.root, &["hash-object", "--no-filters", "schema/t.yml"]);
+        let converted = git(
+            &repo.root,
+            &["hash-object", "--path=schema/t.yml", "schema/t.yml"],
+        );
+        let before = repo.preserved();
+        let mut store = repo.store();
+        let now = SystemTime::now();
+        let result = store.preview(request(), now);
+        assert_eq!(
+            result.is_ok(),
+            raw == converted,
+            "non-converting declaration refused or converting declaration admitted: {policy}, autocrlf={autocrlf}, {content:?}, error={:?}",
+            result.as_ref().err()
+        );
+        if let Err(error) = &result {
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not require Git line-ending conversion")
+            );
+        }
+        if let Ok(preview) = result {
+            let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+            assert_eq!(
+                git(
+                    &candidate.snapshot_repository(),
+                    &["show", &format!("{}:schema/t.yml", preview.tree)]
+                ),
+                content.as_bytes()
             );
         }
         assert_eq!(repo.preserved(), before);

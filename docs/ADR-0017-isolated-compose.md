@@ -358,6 +358,9 @@ executable bit even when a user's ordinary Git configuration ignores modes.
 Relevant attribute files are pinned as raw bytes; Git's resolved line-ending
 policy is queried using a private index and an empty worktree, without filters
 or live declaration reads. Source capture budgets include those attribute files.
+Captured bytes are refused only when Git's raw and normalized object identities
+differ in a sterile private probe with the resolved text policy; CR-only input
+and non-converting `text=auto` content remain supported.
 The CLI remains available for unsupported capture layouts.
 
 Each workflow retains one unconfirmed candidate for at most 24 hours. Source

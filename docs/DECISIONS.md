@@ -14278,6 +14278,11 @@ SPEC is in sync with all of these.
      distinguish an unset attribute from a string value literally named
      `unset`. Contained parent path components are resolved, while escapes
      beyond the project remain refusals.
+     When captured bytes contain CRLF, a sterile private Git probe compares
+     raw and converted object identities using only that closed text policy.
+     Bare CR and `text=auto` binary heuristics are Git's decisions, not a second
+     normalization implementation. The probe loads no source configuration or
+     helper and performs no checkout.
 
      Real Git/CLI scheduling tests pin source preservation and frozen output;
      browser tests execute the shipped form rather than search its source for
